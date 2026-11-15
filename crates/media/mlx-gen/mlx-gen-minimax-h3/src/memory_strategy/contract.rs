@@ -75,10 +75,8 @@ pub(super) fn strategies(streamable: bool) -> Vec<MemoryStrategyCapability> {
                 // 50-block DiT and a 50-layer transformer encoder are exactly the components this
                 // rung optimizes, and both are measured to bound ~9x.
                 //
-                // sc-18650: `streamable` is **not** the load shape alone — a configured adapter
-                // makes it false too, because a windowed block is rebuilt from the staged tier and
-                // would drop the factors. See [`streamable`] for why that gate cannot live in
-                // `route_gate`.
+                // SW-7096: a configured adapter no longer turns the rung off — the block stream
+                // re-applies its residuals to every rebuilt block. See [`streamable`].
                 MemoryStrategy::BoundedTransformerResidency if streamable => {
                     MemoryStrategySupport::Implemented
                 }
@@ -165,26 +163,16 @@ pub(super) fn adaln_component(resident_bytes: u64, pruned: bool) -> MemoryReside
     }
 }
 
-/// Rung 4's prerequisites, both of them, resolved from the spec.
+/// Rung 4's prerequisite, resolved from the spec: the deferred load shape.
 ///
-/// **The deferred load shape is necessary but not sufficient** (sc-18650). A configured adapter is
-/// the second gate, and it belongs *here* rather than only in the render: `route_gate` cannot enforce
-/// it, because [`MemoryRunContext`] carries no adapter axis at all — a selection is geometry, tier
-/// and parameters, and the adapter list is a property of the *load*. So the only place the two can
-/// be made to agree is the declaration.
-///
-/// Without this clause the contract published rung 4 `Implemented` for an adapter-carrying deferred
-/// load, `validate_selection` admitted it, the request scope opened, and
-/// `MemoryProviderContract::generation_memory` set `stream_transformer_blocks` from that engagement —
-/// whereupon `crate::model::MiniMaxH3::requested_transformer_window` refused the very selection the
-/// contract had just promised. Declaring `Missing` closes the loop at its head instead.
-///
-/// The refusal it mirrors is not a caprice: a window rebuilds each block from the staged tier per
-/// step, so a forward-time residual adapter would be dropped from every windowed block. Both
-/// precedents this provider mirrors gate on the same thing — `mlx-gen-wan`'s adapter residency mode
-/// and `mlx-gen-ltx`'s overlay legs.
+/// Until SW-7096 a configured adapter was a second gate (sc-18650): a window rebuilt each block
+/// from the staged tier and dropped the forward-time residuals, so the declaration published the
+/// rung `Missing` for an adapter-carrying load. The block stream now re-applies every configured
+/// residual to each block it rebuilds ([`crate::block_stream::DitBlockStream::materialize`]), so
+/// the adapter list no longer bears on the rung. The adapter's resident bytes are still charged as
+/// the overlay (see `components`), on both residency modes.
 pub fn streamable(spec: &LoadSpec) -> bool {
-    resolved_load_shape(spec) == LoadShape::DeferredMaterialization && spec.adapters.is_empty()
+    resolved_load_shape(spec) == LoadShape::DeferredMaterialization
 }
 
 /// Architecture axes for the MiniMax-H3 route (epic SC-22657, E2).

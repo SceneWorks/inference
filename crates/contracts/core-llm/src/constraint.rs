@@ -14,15 +14,20 @@
 
 use std::collections::HashSet;
 
+use crate::json_schema::{JsonSchema, SchemaState};
+
 /// A requested output constraint.
 ///
-/// A future variant may carry a payload (a JSON Schema, a grammar). When one does, it must be
-/// gated by its [`ConstraintKind`] and never by value — see that type's documentation for why.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A payload-carrying variant ([`Constraint::JsonSchema`]) is gated by its [`ConstraintKind`] and
+/// never by value — see that type's documentation for why.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Constraint {
     /// Output must be a single well-formed JSON value. (Object *shape* is not enforced — only that
     /// the emitted text parses.)
     Json,
+    /// Output must be a compact JSON document conforming to this schema (see
+    /// [`json_schema`](crate::json_schema) for the subset and the output form).
+    JsonSchema(JsonSchema),
 }
 
 /// The *discriminant* of a [`Constraint`] — what a provider advertises it can enforce.
@@ -43,6 +48,8 @@ pub enum Constraint {
 pub enum ConstraintKind {
     /// Well-formed JSON, shape unenforced. See [`Constraint::Json`].
     Json,
+    /// A compiled JSON Schema. See [`Constraint::JsonSchema`].
+    JsonSchema,
 }
 
 impl Constraint {
@@ -54,6 +61,7 @@ impl Constraint {
     pub fn kind(&self) -> ConstraintKind {
         match self {
             Constraint::Json => ConstraintKind::Json,
+            Constraint::JsonSchema(_) => ConstraintKind::JsonSchema,
         }
     }
 }
@@ -80,21 +88,70 @@ pub struct ConstraintDecodeTable {
 /// [`JsonState`]. Each step, [`JsonConstraint::allowed`] returns a per-vocab mask of which token ids
 /// keep the output a valid JSON prefix; after the sampler picks one, [`JsonConstraint::accept`]
 /// advances the grammar. The backend's sampler consumes the mask (it owns no JSON policy).
+///
+/// The same driver enforces a [`Constraint::JsonSchema`] ([`JsonConstraint::for_constraint`]):
+/// only the grammar behind [`JsonConstraint::allowed`] changes, so a backend wires one seam for
+/// every constraint kind.
 pub struct JsonConstraint<'a> {
     table: &'a ConstraintDecodeTable,
-    state: JsonState,
+    grammar: Grammar,
     stop_ids: HashSet<u32>,
     allow: Vec<bool>,
+}
+
+/// The grammar a [`JsonConstraint`] drives, with its live state.
+enum Grammar {
+    Json(JsonState),
+    Schema(JsonSchema, SchemaState),
+}
+
+impl Grammar {
+    fn advance(&self, piece: &str) -> Option<Self> {
+        Some(match self {
+            Grammar::Json(state) => Grammar::Json(state.advance(piece)?),
+            Grammar::Schema(schema, state) => {
+                Grammar::Schema(schema.clone(), schema.advance(*state, piece)?)
+            }
+        })
+    }
+
+    fn admits(&self, piece: &str) -> bool {
+        match self {
+            Grammar::Json(state) => state.advance(piece).is_some(),
+            Grammar::Schema(schema, state) => schema.advance(*state, piece).is_some(),
+        }
+    }
+
+    fn can_stop(&self) -> bool {
+        match self {
+            Grammar::Json(state) => state.can_stop(),
+            Grammar::Schema(schema, state) => schema.can_stop(*state),
+        }
+    }
 }
 
 impl<'a> JsonConstraint<'a> {
     /// Start a JSON constraint over `table`. `stop_ids` (EOS/stop tokens) are allowed only once the
     /// JSON value is complete ([`JsonState::can_stop`]).
     pub fn new(table: &'a ConstraintDecodeTable, stop_ids: impl IntoIterator<Item = u32>) -> Self {
+        Self::for_constraint(&Constraint::Json, table, stop_ids)
+    }
+
+    /// Start enforcing `constraint` over `table`. `stop_ids` are allowed only once the document
+    /// is complete.
+    pub fn for_constraint(
+        constraint: &Constraint,
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+    ) -> Self {
         let allow = vec![false; table.pieces.len()];
+        let grammar = match constraint {
+            Constraint::Json => Grammar::Json(JsonState::start()),
+            Constraint::JsonSchema(schema) => Grammar::Schema(schema.clone(), schema.start()),
+        };
         Self {
             table,
-            state: JsonState::start(),
+            grammar,
             stop_ids: stop_ids.into_iter().collect(),
             allow,
         }
@@ -103,7 +160,7 @@ impl<'a> JsonConstraint<'a> {
     /// The allow mask for the current step: `allow[id]` is true iff token `id` is permitted next.
     /// Stop tokens are gated on [`JsonState::can_stop`]; special/added tokens are never JSON content.
     pub fn allowed(&mut self) -> &[bool] {
-        let can_stop = self.state.can_stop();
+        let can_stop = self.grammar.can_stop();
         for (id, slot) in self.allow.iter_mut().enumerate() {
             let id_u = id as u32;
             *slot = if self.stop_ids.contains(&id_u) {
@@ -111,7 +168,7 @@ impl<'a> JsonConstraint<'a> {
             } else if self.table.special.contains(&id_u) {
                 false
             } else {
-                self.state.advance(&self.table.pieces[id]).is_some()
+                self.grammar.admits(&self.table.pieces[id])
             };
         }
         &self.allow
@@ -120,8 +177,8 @@ impl<'a> JsonConstraint<'a> {
     /// Advance the grammar after the sampler chooses `token_id`.
     pub fn accept(&mut self, token_id: u32) {
         if let Some(piece) = self.table.pieces.get(token_id as usize) {
-            if let Some(next) = self.state.advance(piece) {
-                self.state = next;
+            if let Some(next) = self.grammar.advance(piece) {
+                self.grammar = next;
             }
         }
     }
@@ -131,14 +188,14 @@ impl<'a> JsonConstraint<'a> {
     /// Providers use this at a reasoning-to-answer boundary when one decoded token contains both
     /// the closing reasoning marker and the first bytes of the JSON answer.
     pub fn allows_text(&self, text: &str) -> bool {
-        self.state.advance(text).is_some()
+        self.grammar.admits(text)
     }
 
     /// Append already-decoded JSON text, returning whether it preserved a valid prefix.
     pub fn accept_text(&mut self, text: &str) -> bool {
-        match self.state.advance(text) {
+        match self.grammar.advance(text) {
             Some(next) => {
-                self.state = next;
+                self.grammar = next;
                 true
             }
             None => false,
@@ -147,7 +204,7 @@ impl<'a> JsonConstraint<'a> {
 
     /// Whether the JSON value is currently complete (a stop token would be valid here).
     pub fn can_stop(&self) -> bool {
-        self.state.can_stop()
+        self.grammar.can_stop()
     }
 }
 
@@ -727,5 +784,55 @@ mod tests {
         c.accept(0); // "true" -> complete top-level value
         assert!(c.can_stop());
         assert!(c.allowed()[1], "stop allowed once the value is complete");
+    }
+    #[test]
+    fn schema_constraint_masks_keys_enum_and_whitespace() {
+        let schema = crate::JsonSchema::compile(&serde_json::json!({
+            "type": "object",
+            "properties": {"r": {"type": "string", "enum": ["1:1", "16:9"]}},
+            "required": ["r"],
+            "additionalProperties": false
+        }))
+        .unwrap();
+        // ids: 0="{\"r\":" 1="{" 2=" " 3="\"1" 4=":1\"" 5="6:9\"" 6="0" 7="}" 8="\n" 9=eos
+        // 10="{\"s\":" 11="\"16:9\"}"
+        let t = table(&[
+            "{\"r\":",
+            "{",
+            " ",
+            "\"1",
+            ":1\"",
+            "6:9\"",
+            "0",
+            "}",
+            "\n",
+            "",
+            "{\"s\":",
+            "\"16:9\"}",
+        ]);
+        let mut c = JsonConstraint::for_constraint(&Constraint::JsonSchema(schema), &t, [9u32]);
+        let m = c.allowed().to_vec();
+        assert!(m[0] && m[1], "the object opens, in one token or two");
+        assert!(!m[2] && !m[8], "no leading whitespace");
+        assert!(!m[10], "an undeclared key is masked");
+        assert!(!m[9], "no stop before the document");
+        c.accept(0);
+        let m = c.allowed().to_vec();
+        assert!(m[3] && m[11], "an enum value may start or complete here");
+        assert!(!m[2], "no whitespace after the colon");
+        c.accept(3); // "\"1"
+        let m = c.allowed().to_vec();
+        assert!(m[4] && m[5], "both enum values remain");
+        assert!(!m[6], "\"10\" is not in the enum");
+        c.accept(5); // "6:9\""
+        let m = c.allowed().to_vec();
+        assert!(m[7] && !m[9], "the object must close before stopping");
+        c.accept(7);
+        assert!(c.can_stop());
+        let m = c.allowed().to_vec();
+        assert!(
+            m[9] && !m[2] && !m[8],
+            "only stop once complete, no trailing whitespace"
+        );
     }
 }

@@ -69,19 +69,19 @@ pub const PUBLISHED_DIT_TENSORS: usize = 638;
 /// The handles are refcounted copies of the arrays the built modules hold, so keeping them costs
 /// nothing; each group is dropped once verified.
 #[derive(Debug, Clone, Default)]
-struct UnverifiedSources {
+pub(crate) struct UnverifiedSources {
     /// The 17 projections and the 21 refiner tensors: resident for the whole request, first
     /// consumed by [`MiniMaxH3Dit::embed_context`].
-    head: Vec<(String, Array)>,
+    pub(crate) head: Vec<(String, Array)>,
     /// `transformer_blocks.{i}.adaln_proj.*`: first consumed by the AdaLN precompute (or, under
     /// [`AdaLnResidency::Resident`], per step), and evicted right after the precompute.
-    adaln: Vec<(String, Array)>,
+    pub(crate) adaln: Vec<(String, Array)>,
     /// The ten body tensors of every block: first consumed by denoise step 1.
-    body: Vec<(String, Array)>,
+    pub(crate) body: Vec<(String, Array)>,
 }
 
 impl UnverifiedSources {
-    fn partition(entries: Vec<(String, Array)>) -> Self {
+    pub(crate) fn partition(entries: Vec<(String, Array)>) -> Self {
         let mut groups = Self::default();
         for (key, array) in entries {
             let group = if key.contains(".adaln_proj.") {
@@ -97,7 +97,7 @@ impl UnverifiedSources {
     }
 
     /// Evaluate + verify one group and release its handles.
-    fn verify(group: &mut Vec<(String, Array)>) -> Result<()> {
+    pub(crate) fn verify(group: &mut Vec<(String, Array)>) -> Result<()> {
         {
             let mut named: Vec<(&str, &Array)> = group
                 .iter()
@@ -283,6 +283,15 @@ impl MiniMaxH3Dit {
     /// Whether this load defers block materialization.
     pub fn is_deferred(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// Evaluate the adapter residuals a deferred load holds for its streamed blocks (SW-7096).
+    /// A no-op on a resident load, whose residuals live on its blocks.
+    pub fn materialize_streamed_adapters(&self) -> Result<()> {
+        match &self.stream {
+            Some(stream) => stream.adapters().materialize(),
+            None => Ok(()),
+        }
     }
 
     /// The two residency modes are mutually exclusive, and a load that satisfied both would bound
@@ -714,6 +723,17 @@ impl AdaptableHost for MiniMaxH3Dit {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
             ["transformer_blocks", i, rest @ ..] => {
+                // SW-7096: a deferred load holds no blocks; its residuals go to the stream, which
+                // re-applies them to each block a window rebuilds.
+                if let Some(stream) = self.stream.as_mut() {
+                    // The video surface keeps `adaln_proj` non-addressable (sc-26688), on both
+                    // residency modes, so a deferred load must not admit what a resident one
+                    // refuses.
+                    if rest.first() == Some(&"adaln_proj") {
+                        return None;
+                    }
+                    return stream.adaptable_mut(path);
+                }
                 let idx: usize = i.parse().ok()?;
                 self.blocks.get_mut(idx)?.adaptable_mut(rest)
             }

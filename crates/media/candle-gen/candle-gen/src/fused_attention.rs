@@ -115,6 +115,12 @@ pub fn training_sdpa_budgeted_bhsd(
     crate::attention::sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
 }
 
+/// The most score elements one [`training_sdpa_standard_bhsd`] call's reference owner holds at
+/// once, in its forward and in its backward recompute (its query tiles never exceed it, whatever
+/// the caller's budget): the bound a trainer's memory estimate prices training attention at.
+pub const TRAINING_SCORE_TILE_ELEMENTS: u64 =
+    crate::reference_training_attention::REFERENCE_SCORE_TILE_ELEMENTS;
+
 /// Known standard composable-softmax training contract. Reference uses a single
 /// dense autograd owner instead of retaining every score intermediate per layer.
 /// Arbitrary softmax callbacks must use `training_sdpa_bhsd` above.

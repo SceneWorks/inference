@@ -295,6 +295,10 @@ enum NoGo {
     /// interleaves audio rows that have no picture at all. No holdout R^2 was ever measured for
     /// it and none is quoted.
     MinimaxH3Joint,
+    /// MiniMax-H3-Image's 24-channel image space (SW-7091). Excluded on its shape, as H3 video's
+    /// is: the 2-D VAE decodes through a 24-layer ViT whose output projection performs all 16x
+    /// spatial upsampling, so there is no linear latent→pixel map to fit. Never measured.
+    MinimaxH3ImageVit,
     /// The frozen MOSS pipeline exposes final images/latents only. Its small decoder has no
     /// authenticated preview projection; another FLUX.2 decoder's coefficients do not transfer.
     MossImage,
@@ -308,7 +312,7 @@ impl NoGo {
     /// Every variant, so a test can quantify over the whole enum rather than over a hand-listed
     /// subset that a new variant silently escapes. `the_recorded_no_go_measurements_stay_labelled_
     /// fit_versus_holdout` iterates this and pins which rows carry numbers.
-    const ALL: [NoGo; 10] = [
+    const ALL: [NoGo; 11] = [
         NoGo::Ltx,
         NoGo::Mage,
         NoGo::Mochi,
@@ -317,6 +321,7 @@ impl NoGo {
         NoGo::SvdTemporal,
         NoGo::Seedvr2SuperResolution,
         NoGo::MinimaxH3Joint,
+        NoGo::MinimaxH3ImageVit,
         NoGo::MossImage,
         NoGo::Supra2,
     ];
@@ -346,7 +351,7 @@ impl NoGo {
                      candle-side adjudication sc-16954",
             ),
             NoGo::Seedvr2SuperResolution => None,
-            NoGo::MinimaxH3Joint | NoGo::MossImage | NoGo::Supra2 => None,
+            NoGo::MinimaxH3Joint | NoGo::MinimaxH3ImageVit | NoGo::MossImage | NoGo::Supra2 => None,
         }
     }
 
@@ -367,6 +372,7 @@ impl NoGo {
             | NoGo::SvdTemporal
             | NoGo::Seedvr2SuperResolution
             | NoGo::MinimaxH3Joint
+            | NoGo::MinimaxH3ImageVit
             | NoGo::MossImage
             | NoGo::Supra2 => None,
         }
@@ -415,6 +421,12 @@ impl NoGo {
                          is no per-frame linear latent→pixel map to fit, and the packed sequence \
                          interleaves audio rows that carry no picture at all"
                     }
+                    NoGo::MinimaxH3ImageVit => {
+                        "MiniMax-H3-Image's 24-channel image space — NEVER measured, and excluded \
+                         on its SHAPE: the 2-D VAE decodes through a 24-layer ViT whose output \
+                         projection performs all 16x spatial upsampling, so there is no linear \
+                         latent→pixel map to fit (SW-7091)"
+                    }
                     NoGo::Seedvr2SuperResolution => {
                         "a one-step super-resolution upscaler over a low-resolution input — no \
                          multi-step progression exists to preview, and NO holdout number was ever \
@@ -443,7 +455,7 @@ impl NoGo {
 /// method makes one viable it reopens as a **new** story with a **new** measurement; nothing here
 /// is "to be decided".
 ///
-/// Twenty-five ids across eleven crates. The crate set is *derived* from these ids by
+/// Twenty-six ids across eleven crates. The crate set is *derived* from these ids by
 /// `no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` rather than restated, so a new
 /// registration in one of those crates joins the scan automatically.
 const PREVIEW_INERT_ROUTE_IDS: &[(&str, NoGo)] = &[
@@ -462,6 +474,7 @@ const PREVIEW_INERT_ROUTE_IDS: &[(&str, NoGo)] = &[
     // decision carries forward; adding the provider is not authorization to rerun that fit.
     ("ltx_2_5_distilled", NoGo::Ltx),
     ("minimax_h3", NoGo::MinimaxH3Joint),
+    ("minimax_h3_image", NoGo::MinimaxH3ImageVit),
     ("mochi_1", NoGo::Mochi),
     ("moss_image_base", NoGo::MossImage),
     ("moss_image_sft", NoGo::MossImage),
@@ -4074,7 +4087,7 @@ fn no_no_go_family_acquires_a_preview_fit_or_a_fit_producer() {
             "candle-gen-svd",
             "candle-gen-wan",
         ],
-        "the 25 no-go ids must resolve to exactly these eleven crates — a mismatch means an id \
+        "the 26 no-go ids must resolve to exactly these eleven crates — a mismatch means an id \
              moved crates or a crate acquired a route that is not accounted for"
     );
 

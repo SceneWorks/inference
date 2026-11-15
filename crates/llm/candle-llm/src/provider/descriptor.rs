@@ -97,7 +97,7 @@ pub(super) fn provider_descriptor_on(backend: core_llm::DecodeBackend) -> TextLl
             // MTP head is advertised at load through the legacy `mtp` field.
             speculative: vec![prompt_lookup_capabilities(backend)],
             // JSON-constrained decoding.
-            supported_constraints: vec![ConstraintKind::Json],
+            supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
         },
     }
 }

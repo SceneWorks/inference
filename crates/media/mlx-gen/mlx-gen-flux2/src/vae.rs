@@ -22,13 +22,7 @@ use mlx_gen::Result;
 
 // N=1 dispatch retains FP32 accumulation on NAX; ordinary matrix multiplication
 // may use TF32 despite FP32 storage. The precise encoder opts into this policy.
-fn precise_linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
-    let output = weight.matmul(&x.expand_dims(-1)?)?.squeeze_axes(&[-1])?;
-    Ok(match bias {
-        Some(bias) => add(&output, bias)?,
-        None => output,
-    })
-}
+use mlx_gen::nn::linear_precise as precise_linear;
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;

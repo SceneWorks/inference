@@ -98,6 +98,14 @@ pub const DENSE_BY_POLICY: &[&str] = &[
     "norm_out.linear",
 ];
 
+/// Prefix of MiniMax-H3-Image's per-step output heads (`pdd_proj_out.{i}.weight`, float32,
+/// `[96, 5376]`). Dense in every tier, like `proj_out`: they are the model's own velocity output,
+/// and [`crate::dit::heads::PddHeads`] reads them with a raw `Weights::require`. Unlike the exact
+/// names above this is a prefix, because the head index runs `0..num_pdd_heads` -- and it is **not**
+/// optional: each head's 5376-wide input divides [`GROUP_SIZE`], so the shape guard of
+/// [`mlx_gen::quant::quantize_map`] would pack it and a raw `require` would then read u32 codes.
+pub const DENSE_PDD_HEAD_PREFIX: &str = "pdd_proj_out.";
+
 /// Norm suffixes that pass through dense. All are 1-D and therefore already unpackable by
 /// [`mlx_gen::quant::quantize_map`]'s shape guard; listing them makes the policy legible.
 pub const DENSE_NORM_SUFFIXES: &[&str] = &[
@@ -127,6 +135,7 @@ pub fn is_adaln_target(base: &str) -> bool {
 /// [`is_adaln_target`] packs in its own pass at its own width.
 pub fn is_dit_linear_target(base: &str) -> bool {
     !DENSE_BY_POLICY.contains(&base)
+        && !base.starts_with(DENSE_PDD_HEAD_PREFIX)
         && !DENSE_NORM_SUFFIXES.iter().any(|s| base.ends_with(s))
         && !is_adaln_target(base)
 }
@@ -343,6 +352,36 @@ pub fn quantize_minimax_h3_dit(
 
     write_index(dst, &weight_map, total_size)?;
     Ok(written)
+}
+
+/// Pre-quantize a MiniMax-H3-**Image** snapshot's `transformer_diffusers/` into one tier directory
+/// `dst_tier`, laid out as [`gen_core_h3::h3_image_tier`] publishes it:
+/// `dst_tier/transformer_diffusers/` (the packed shards, the marked `config.json`, the index) and,
+/// when the snapshot carries one, `dst_tier/pdd_fused_heads.safetensors` copied byte for byte.
+///
+/// The policy is H3's, applied by [`quantize_minimax_h3_dit`] unchanged: block and token-refiner
+/// attention/feed-forward and the per-block AdaLN projection are packed at the tier width (AdaLN at
+/// `adaln.bits`), while `proj_in`, `context_embedder`, `time_embedder`, `norm_out.linear`, every
+/// norm and the six `pdd_proj_out.{i}` heads stay dense. The text encoder is **not** converted
+/// here: every tier reads MiniMax-H3's own tier artifact (see
+/// [`gen_core_h3::h3_image_tier::ImageTier::text_encoder`]).
+///
+/// `src_root` is the `MiniMaxAI/MiniMax-H3-Image` snapshot root. Returns the emitted DiT shards.
+pub fn quantize_minimax_h3_image_dit(
+    src_root: &Path,
+    dst_tier: &Path,
+    bits: i32,
+    adaln: AdaLnTierPolicy,
+    on_shard: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    use gen_core_h3::h3_image_tier::{DIT_DIR, PDD_FUSED_HEADS_FILE};
+    let src = src_root.join(DIT_DIR);
+    let shards = quantize_minimax_h3_dit(&src, &dst_tier.join(DIT_DIR), bits, adaln, on_shard)?;
+    let heads = src_root.join(PDD_FUSED_HEADS_FILE);
+    if heads.is_file() {
+        std::fs::copy(&heads, dst_tier.join(PDD_FUSED_HEADS_FILE))?;
+    }
+    Ok(shards)
 }
 
 /// Write the DiT's safetensors index describing the emitted shard set.
@@ -633,6 +672,62 @@ mod tests {
                 !(is_dit_linear_target(base) && is_adaln_target(base)),
                 "{base:?} is matched by BOTH passes"
             );
+        }
+    }
+
+    /// MiniMax-H3-Image: the 644-tensor `transformer_diffusers` name set splits into the packed set
+    /// (block + refiner attention/FFN and the per-block AdaLN projection) and a dense residue that
+    /// holds every I/O projection and all six per-step heads.
+    #[test]
+    fn image_dit_pdd_heads_and_io_stay_dense_and_the_blocks_pack() {
+        use crate::dit::config::MiniMaxH3ImageDitConfig;
+        use crate::h3_image::MiniMaxH3ImageDit;
+        let names = MiniMaxH3ImageDit::names(&MiniMaxH3ImageDitConfig::default());
+        assert_eq!(names.len(), 644);
+        let packs = |base: &str| is_dit_linear_target(base) || is_adaln_target(base);
+        let mut packed = 0;
+        for name in &names {
+            let Some(base) = name.strip_suffix(".weight") else {
+                continue;
+            };
+            if base.starts_with("pdd_proj_out.") {
+                assert!(!packs(base), "{name} must stay dense");
+            }
+            if packs(base) {
+                packed += 1;
+                assert!(
+                    base.starts_with("transformer_blocks.") || base.starts_with("token_refiner."),
+                    "{name} packs but is neither a block nor a refiner projection"
+                );
+            }
+        }
+        for dense in [
+            "proj_in",
+            "context_embedder",
+            "time_embedder.linear_1",
+            "time_embedder.linear_2",
+            "norm_out.linear",
+            "pdd_proj_out.0",
+            "pdd_proj_out.5",
+        ] {
+            assert!(!packs(dense), "{dense} must stay dense");
+        }
+        // 50 blocks x (to_q, to_k, to_v, to_out.0, ff.net.0.proj, ff.net.2, adaln) + 2 refiner
+        // blocks x 6.
+        assert_eq!(packed, 50 * 7 + 2 * 6);
+        // The backend-neutral statement of the policy (the Candle converter's) agrees on every name.
+        for name in &names {
+            if let Some(base) = name.strip_suffix(".weight") {
+                let shared = gen_core_h3::h3_image_tier::dit_pack_bits(base, 4, 8);
+                let here = if is_adaln_target(base) {
+                    Some(8)
+                } else if is_dit_linear_target(base) {
+                    Some(4)
+                } else {
+                    None
+                };
+                assert_eq!(shared, here, "{name}");
+            }
         }
     }
 

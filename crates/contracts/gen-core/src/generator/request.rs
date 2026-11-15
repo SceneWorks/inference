@@ -31,6 +31,13 @@ pub struct GenerationRequest {
     pub sampler: Option<String>,
     pub scheduler: Option<String>,
     pub scheduler_shift: Option<f32>,
+    /// MiniMax-H3-Image's sampler with its parameters (SW-7106): `None` runs the sampler
+    /// [`sampler`](Self::sampler) names — `"lcm"` or no name runs the default LCM
+    /// (`s_noise` 1.1 → `s_noise_end` 0.9, no clipping), `"euler"` the released Euler; `Some` selects one explicitly and, for LCM, sets `s_noise` (> 0), `s_noise_end`
+    /// (>= 0) and `noise_clip_std` (>= 0, 0 = off). A `sampler` name that disagrees is refused.
+    /// Gated by [`Capabilities::supports_h3_image_sampler`]: every other model refuses a `Some` on
+    /// the shared floor. Contract and step: [`crate::h3_image::H3ImageSampler`].
+    pub h3_image_sampler: Option<crate::h3_image::H3ImageSampler>,
 
     /// Guidance method — how the conditional and unconditional model predictions are combined (epic
     /// 7434, the fourth orthogonal sampling layer). `"cfg"` (plain) | `"cfg_rescale"` (Lin et al.
@@ -397,6 +404,7 @@ impl Default for GenerationRequest {
             sampler: None,
             scheduler: None,
             scheduler_shift: None,
+            h3_image_sampler: None,
             guidance_method: None,
             guidance_eta: None,
             guidance_momentum: None,
@@ -560,6 +568,8 @@ impl GenerationRequest {
             timestep_to_start_cfg: _,
             sampler: _,
             scheduler: _,
+            // Its floats join the floor through its own helper below.
+            h3_image_sampler,
             guidance_method: _,
             // A string list and a unit enum (sc-25681): no floats to classify. `cfg_interval`'s two
             // bounds join the float floor below.
@@ -636,6 +646,9 @@ impl GenerationRequest {
             text_style_gain,
         } = self;
         if let Some(nonfinite) = moss_image.as_ref().and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
+        if let Some(nonfinite) = h3_image_sampler.and_then(|v| v.first_nonfinite_float()) {
             return Some(nonfinite);
         }
         let floats: [(&'static str, Option<f32>); 16] = [

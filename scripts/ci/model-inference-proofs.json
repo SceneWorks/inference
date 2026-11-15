@@ -61150,6 +61150,114 @@
     "package": "candle-gen-minimax-h3",
     "target": "candle_gen_minimax_h3",
     "target_kind": "lib",
+    "fqn": "dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed converted H3 video/audio/DiT/LoRA goldens or deterministic synthetic learned modules, CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/block.rs::dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/heads.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed converted H3 video/audio/DiT/LoRA goldens or deterministic synthetic learned modules, CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
     "fqn": "dit::heads::tests::norm_out_modulation_is_shift_then_scale",
     "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/heads.rs",
     "cargo_target_metadata": {
@@ -61521,6 +61629,60 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers.rs::dit::layers::tests::the_packed_forward_matches_a_dense_reference",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed converted H3 video/audio/DiT/LoRA goldens or deterministic synthetic learned modules, CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
       "requirements": []
     }
   },
@@ -127184,6 +127346,100 @@
           "role": "tokenizer",
           "readers": [
             "crates/llm/candle-llm/tests/nvfp4_evidence.rs::render_prompt::std::fs::read_to_string@4822"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "minimax_h3_image_pe",
+    "target_kind": "test",
+    "fqn": "minimax_h3_image_pe_quality_against_nvfp4",
+    "source": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs",
+    "cargo_target_metadata": {
+      "name": "minimax_h3_image_pe",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4; source setup helpers=var; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4",
+    "required_environment": [
+      "MINIMAX_PE_LABEL",
+      "MINIMAX_PE_OUTPUT",
+      "MINIMAX_PE_PROMPTS",
+      "MINIMAX_PE_TIER"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [
+      "CANDLE_LLM_DEVICE"
+    ],
+    "default_configuration": null,
+    "configurations": {
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4/source-fixed-candle-cuda",
+        "environment": {
+          "CANDLE_LLM_DEVICE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "source-controls",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4",
+      "requirements": [
+        {
+          "slot": "source-observable-142c1c42b74f74e6291dd39e969f5449da3a7c71e1c2925267067d00da8c6059",
+          "role": "model-weights",
+          "readers": [
+            "candle-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "source-observable-eaaba8bc2b67e8d1ad447042f90b6b356b33578d8a4b06c09cbf8df711747412",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "minimax-pe-provider-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -201218,6 +201474,96 @@
       "fixture_kind": "source-defined",
       "requirements": [],
       "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::norm_out_modulation_is_shift_then_scale@357ee804490c4a10d24bd982d6bf5606f23fa65061642cd1f8d7424c548d16aa"
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/block.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/block.rs::dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would@e1c72466808ab14e52be6d549c4016a52c0d737f666b9a7737a7d9d44a3f72da"
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/heads.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight@dea1a6d29d7bb1ba39763e13f36409c72332966a7ed687852118498f71273607"
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::heads::tests::a_float32_head_projects_at_full_float32_precision",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/heads.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/dit/heads.rs::dit::heads::tests::a_float32_head_projects_at_full_float32_precision@eab058be28932f27870040082afb2826a090324b06ed518ffd4d92b84beb0b2f"
     }
   },
   {
@@ -281193,6 +281539,81 @@
     ]
   },
   {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "minimax_h3_image_pe::minimax_h3_image_pe_quality_against_nvfp4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "MiniMax-H3-Image-PE prompt set + the tier at MINIMAX_PE_TIER",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MiniMax-H3-Image-PE weights: see the module docs for the MINIMAX_PE_* variables",
+      "env_gates": [
+        "MINIMAX_PE_LABEL",
+        "MINIMAX_PE_OUTPUT",
+        "MINIMAX_PE_PROMPTS",
+        "MINIMAX_PE_TIER"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/tests/minimax_h3_image_pe.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe::minimax_h3_image_pe_quality_against_nvfp4@c1b788b99b1489517629a802e840d756a5e71cd96cc4117c9101a4be6d6d598c",
+      "requirements": [
+        {
+          "slot": "model-weight-collections",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-configurations",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file",
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
     "package": "candle-gen-moss-image",
     "target": "candle_gen_moss_image",
     "target_kind": "lib",
@@ -311637,5 +312058,3308 @@
     "optional_environment": [
       "H3_RESIDENCY_ARITHMETIC_MANIFEST"
     ]
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Real MiniMax-H3-Image 2-D VAE decode half, F32, against the hash-pinned diffusers reference (SW-7089); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_VAE_REFERENCE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source_default_cpu",
+    "configurations": {
+      "source_default_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae/source_default_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_metal": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae/source_selected_metal",
+        "environment": {},
+        "cargo_features": [
+          "metal",
+          "model-inference-proof"
+        ],
+        "backend": "candle-metal",
+        "expected_devices": [
+          "candle-metal"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+      "requirements": [
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image 2-D VAE decode half, 16 MP tiled vs untiled CUDA pool peak (SW-7089); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+      "requirements": [
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_dit_first_step_matches_the_official_diffusers_transformer",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers DiT, bf16, steps 0 and 3 against the hash-pinned diffusers reference (SW-7091); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_dit_first_step_matches_the_official_diffusers_transformer",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_dit_first_step_matches_the_official_diffusers_transformer",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_DIT_REFERENCE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source_default_cpu",
+    "configurations": {
+      "source_default_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_dit_first_step_matches_the_official_diffusers_transformer/source_default_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_dit_first_step_matches_the_official_diffusers_transformer/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_metal": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_dit_first_step_matches_the_official_diffusers_transformer/source_selected_metal",
+        "environment": {},
+        "cargo_features": [
+          "metal",
+          "model-inference-proof"
+        ],
+        "backend": "candle-metal",
+        "expected_devices": [
+          "candle-metal"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_dit_first_step_matches_the_official_diffusers_transformer",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_edit_first_step_matches_the_official_diffusers_transformer",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers DiT, bf16, 3-reference edit steps 0 and 3 against the hash-pinned diffusers edit reference (SW-7092); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_first_step_matches_the_official_diffusers_transformer",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_first_step_matches_the_official_diffusers_transformer",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_EDIT_REFERENCE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source_default_cpu",
+    "configurations": {
+      "source_default_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_first_step_matches_the_official_diffusers_transformer/source_default_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_first_step_matches_the_official_diffusers_transformer/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_metal": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_first_step_matches_the_official_diffusers_transformer/source_selected_metal",
+        "environment": {},
+        "cargo_features": [
+          "metal",
+          "model-inference-proof"
+        ],
+        "backend": "candle-metal",
+        "expected_devices": [
+          "candle-metal"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_first_step_matches_the_official_diffusers_transformer",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_edit_reference_latents_match_the_official_diffusers_vae",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Real MiniMax-H3-Image vae_diffusers encode half, f32, three references against the hash-pinned diffusers edit reference (SW-7092); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_reference_latents_match_the_official_diffusers_vae",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_reference_latents_match_the_official_diffusers_vae",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_EDIT_REFERENCE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source_default_cpu",
+    "configurations": {
+      "source_default_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_reference_latents_match_the_official_diffusers_vae/source_default_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_reference_latents_match_the_official_diffusers_vae/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_metal": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_reference_latents_match_the_official_diffusers_vae/source_selected_metal",
+        "environment": {},
+        "cargo_features": [
+          "metal",
+          "model-inference-proof"
+        ],
+        "backend": "candle-metal",
+        "expected_devices": [
+          "candle-metal"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_reference_latents_match_the_official_diffusers_vae",
+      "requirements": [
+        {
+          "slot": "h3-image-vae-encode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_edit_presentation_matches_the_processor_template",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "MiniMax-H3-Image tokenizer/ edit presentation against the hash-pinned diffusers edit reference (SW-7092); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_presentation_matches_the_processor_template",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_presentation_matches_the_processor_template",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_EDIT_REFERENCE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source_default_cpu",
+    "configurations": {
+      "source_default_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_presentation_matches_the_processor_template/source_default_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_presentation_matches_the_processor_template/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_metal": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_presentation_matches_the_processor_template/source_selected_metal",
+        "environment": {},
+        "cargo_features": [
+          "metal",
+          "model-inference-proof"
+        ],
+        "backend": "candle-metal",
+        "expected_devices": [
+          "candle-metal"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_presentation_matches_the_processor_template",
+      "requirements": [
+        {
+          "slot": "h3-image-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/tokenizer-pair"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-edit-reference",
+          "role": "reference",
+          "readers": [
+            "candle-gen-minimax-h3::tests::common::Golden::load/reference"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_text_to_image_renders_2048_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner + DiT + 2-D VAE, bf16 2048x2048 text-to-image render on CUDA (SW-7091); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_text_to_image_renders_2048_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_text_to_image_renders_2048_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_text_to_image_renders_2048_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_text_to_image_renders_2048_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_sampler_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner + DiT + 2-D VAE, bf16 2048x2048 sampler A/B (euler vs lcm 1.1->0.9, 2 prompts x 2 seeds) on CUDA (SW-7106); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_sampler_real.rs::h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_sampler_real.rs::h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_sampler_real.rs::h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_sampler_real.rs::h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ bf16 on CUDA plus seeded synthetic LoRAs in the diffusers/PEFT, kohya lora_unet_ and ComfyUI layouts (SW-7096); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ bf16 on CUDA (three full loads through ImageDit) plus seeded synthetic LoRAs on the per-step heads, AdaLN projections, time embedder and I/O projections (SW-7096); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ bf16 (first three blocks) loaded resident on CUDA and on the host streamed through rung 4's one-block window, plus seeded synthetic PEFT and kohya LoRAs (SW-7096); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_t2i_renders_2048_q8_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner (MiniMax-H3's own q8 text encoder) + the converted q8 DiT + 2-D VAE, 2048x2048 text-to-image render on CUDA (SW-7093); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q8_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q8_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_TIER_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q8_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q8_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_t2i_renders_2048_q4_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner (MiniMax-H3's own q4 text encoder) + the converted q4 DiT + 2-D VAE, 2048x2048 text-to-image render on CUDA (SW-7093); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q4_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q4_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_TIER_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q4_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_2048_q4_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner + DiT + 2-D VAE, bf16 4096x4096 (16 MP) text-to-image render admitted against the card's free memory and run through the streamed one-block window on CUDA (SW-7095); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case; the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_edit_renders_three_references_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner + vision tower + DiT + 2-D VAE encode/decode, bf16 3-reference 1024x768 edit render on CUDA (SW-7092); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_renders_three_references_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_renders_three_references_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_renders_three_references_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_edit_renders_three_references_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-encode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_dit_names_match_the_published_index",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "transformer_diffusers/diffusion_pytorch_model.safetensors.index.json and config.json of MiniMaxAI/MiniMax-H3-Image@492fd8c4",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); index only",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_edit_presentation_matches_the_processor_template",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus the hash-pinned diffusers edit reference from crates/media/mlx-gen/tools/dump_minimax_h3_image_edit_real.py",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_EDIT_REFERENCE"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT (tokenizer/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE; tokenizer only",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_dit_first_step_matches_diffusers",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus the hash-pinned diffusers reference from crates/media/mlx-gen/tools/dump_minimax_h3_image_dit_real.py",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_DIT_REFERENCE"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot + a DiT reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); ~40 GB resident",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_edit_first_step_matches_diffusers",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 over a 3-reference edit sequence plus the hash-pinned diffusers edit reference from crates/media/mlx-gen/tools/dump_minimax_h3_image_edit_real.py",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_EDIT_REFERENCE"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_IMAGE_EDIT_REFERENCE; ~40 GB resident",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_edit_reference_latents_match_diffusers",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real f32 vae_diffusers/ encode half of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus the hash-pinned diffusers edit reference from crates/media/mlx-gen/tools/dump_minimax_h3_image_edit_real.py",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_EDIT_REFERENCE"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT (vae_diffusers/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_t2i_renders_2048_bf16",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ shards 1-12",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/); full 2048\u00b2 render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_sampler_real::h3_image_sampler_ab_renders_2048_bf16",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ shards 1-12",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job, sampler A/B step)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/); eight 2048\u00b2 renders",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_sampler_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 (first three blocks) plus seeded synthetic LoRAs written to RUNNER_TEMP in the diffusers/PEFT, kohya lora_unet_ and ComfyUI layouts (SW-7096)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three resident blocks",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_lora_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 (first three blocks, resident and rebuilt through DitBlockStream) plus seeded synthetic PEFT and kohya LoRAs written to RUNNER_TEMP (SW-7096)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three resident blocks",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_lora_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 (three full loads through ImageDenoiser) plus seeded synthetic LoRAs on pdd_proj_out.2, adaln_proj.linear, time_embedder.linear_2, norm_out.linear, proj_in and context_embedder written to RUNNER_TEMP (SW-7096)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three full image-DiT loads",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_lora_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_t2i_renders_2048_q8",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q8 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads) plus its vae_diffusers/, tokenizer/ and MiniMax-H3's own SceneWorks/minimax-h3-mlx@137ce668 q8/text_encoder/ shards 1-12 (SW-7093)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, tier render (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_TIER_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q8 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q8 text encoder (MINIMAX_H3_TIER_SNAPSHOT); full 2048\u00b2 render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_t2i_renders_2048_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads) plus its vae_diffusers/, tokenizer/ and MiniMax-H3's own SceneWorks/minimax-h3-mlx@137ce668 q4/text_encoder/ shards 1-12 (SW-7093)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, tier render (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_TIER_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); full 2048\u00b2 render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_streamed_dit_matches_resident_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads) loaded resident and deferred (rung 4, window 1); synthetic text rows and latents (SW-7094)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, q4 tier step (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT twice",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_t2i_renders_16mp_streamed_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads) plus its vae_diffusers/, tokenizer/ and MiniMax-H3's own SceneWorks/minimax-h3-mlx@137ce668 q4/text_encoder/ shards 1-12 ; DeferredMaterialization load, 4096x4096 admitted on rung 4 (SW-7094)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, 16 MP streamed render (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_TIER_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); 16 MP streamed render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_bounded_attention_real::h3_image_rung3_lowers_the_denoise_peak_at_image_geometry",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads); synthetic 512-token text rows and latents at 2048 and 4096 px (SW-7094)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, rung 3 lowers the image-geometry denoise peak bit-exactly (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "SW-7094: needs MINIMAX_H3_IMAGE_TIERS_ROOT (the converted q4 image DiT) + Metal; loads the 50-block DiT once per arm",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_bounded_attention_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_edit_renders_three_references_bf16",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ shards 1-12 and 14 (vision tower), 3-reference edit",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/ shards 1-12 and 14); full edit render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Real MiniMax-H3-Image 2-D VAE decode half against the hash-pinned diffusers reference (SW-7089); crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot + a reference decode (MINIMAX_H3_IMAGE_VAE_REFERENCE)",
+      "env_gates": [
+        "MINIMAX_H3_IMAGE_VAE_REFERENCE"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "requirements": [
+        {
+          "slot": "h3-image-vae-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_paths"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_decode_matches_the_official_diffusers_vae"
+    },
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_VAE_REFERENCE"
+    ]
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Real MiniMax-H3-Image 2-D VAE decode half, 16 MP tiled vs untiled Metal peak (SW-7089); crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); 16 MP decode twice",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "requirements": [
+        {
+          "slot": "h3-image-vae-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_paths"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weights::image_vae_tiled_decode_lowers_the_16mp_peak"
+    },
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ]
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/ converted to the q4 tier, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ (shards 1-12 and the vision tower); procedurally drawn dataset",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT, the q4 DiT tier and MINIMAX_H3_SNAPSHOT's text encoder; trains 2048\u00b2 twice and renders once",
+      "env_gates": [],
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_train_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/ converted to the q4 tier, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ (shards 1-12 and the vision tower); procedurally drawn dataset",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT, the q4 DiT tier and MINIMAX_H3_SNAPSHOT's text encoder; trains a 2048\u00b2 edit pair and renders once",
+      "env_gates": [],
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_train_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 transformer_diffusers/ converted to the q4 tier; seeded synthetic context and latents",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident",
+      "env_gates": [],
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/real_tests.rs"
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_train_lora_load_real::h3_image_mlx_trained_lora_installs_on_the_real_dit_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_lora_load_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ bf16 on CUDA plus the LoRA the MLX H3-Image trainer saved (SW-7097, minimax-h3-image-trained-lora artifact); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_lora_load_real.rs::h3_image_train_lora_load_real::h3_image_mlx_trained_lora_installs_on_the_real_dit_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_lora_load_real.rs::h3_image_train_lora_load_real::h3_image_mlx_trained_lora_installs_on_the_real_dit_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TRAINED_LORA"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_lora_load_real.rs::h3_image_train_lora_load_real::h3_image_mlx_trained_lora_installs_on_the_real_dit_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_lora_load_real.rs::h3_image_train_lora_load_real::h3_image_mlx_trained_lora_installs_on_the_real_dit_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/real_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ converted to the q4 tier by the candle converter, on CUDA; seeded synthetic context and latents (SW-7098); crates/media/candle-gen/candle-gen-minimax-h3/src/training/real_tests.rs::training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/real_tests.rs::training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/real_tests.rs::training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/real_tests.rs::training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/ converted to the q4 tier, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ on CUDA; procedurally drawn dataset (SW-7098); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case; the trainer's caption phase streams the text encoder, which keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, VAE encode, streamed DiT train and preview render) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/ converted to the q4 tier, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ and vision tower on CUDA; procedurally drawn edit pair (SW-7098); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case; the trainer's caption phase streams the text encoder, which keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, VAE encode, streamed DiT train and preview render) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_train_real.rs::h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_candle_lora_load_real::h3_image_candle_trained_lora_installs_on_the_real_dit",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 transformer_diffusers/ bf16 plus the LoRA the Candle H3-Image trainer saved (SW-7098, minimax-h3-image-candle-trained-lora artifact)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profiles (mlx-minimax-h3-image-train-load job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_CANDLE_TRAINED_LORA",
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT and the Candle-trained adapter (MINIMAX_H3_IMAGE_CANDLE_TRAINED_LORA); 66 GB bf16 DiT",
+      "env_gates": [],
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profiles with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_candle_lora_load_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 2048x2048 t2i from a fresh process at the rung admission selects against the device memory limit (AT1)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/); full 2048\u00b2 render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 4096x4096 t2i from a fresh process at the rung admission selects against the device memory limit (AT1)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/); full 4096\u00b2 render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 6272x2688 t2i from a fresh process at the rung admission selects against the device memory limit (AT1)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/); full 6272x2688 render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus shard 14 (vision tower); 1024x1024 edit of three procedural shape references, each reference's hue required in the output (AT3)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/ shards 1-12 and 14); full edit render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_refuses_the_unsupported_requests",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12; the registered generator's request refusals and a deferred-DiT strict LoRA install refusing an unmatched key (AT6)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT (text_encoder/); one deferred DiT load",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_16mp_with_two_loras_streams_and_tiles",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus two pinned community H3-Image LoRAs (minimax-h3-image-community-lora-* rows); DeferredMaterialization 4096x4096 admitted on rung 4 under a budget the staged rung cannot hold (AT8)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_COMMUNITY_LORAS",
+      "MINIMAX_H3_IMAGE_AT8_LORAS"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT + MINIMAX_H3_IMAGE_COMMUNITY_LORAS; 16 MP streamed render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_community_loras_apply",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus every pinned community H3-Image LoRA (minimax-h3-image-community-lora-* rows); one bare and one per-LoRA 1024x1024 render (AT11)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_COMMUNITY_LORAS"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT + MINIMAX_H3_IMAGE_COMMUNITY_LORAS; one 1024\u00b2 render per LoRA plus a bare one",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus the minimax-h3-image-pe profile's own PE expansion of a short t2i prompt; short and expanded 2048x2048 renders compared by luma Laplacian energy (AT9)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image-pe real-weights profile (SW-7104 acceptance)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_PE_LABEL",
+      "MINIMAX_H3_IMAGE_PE_SHORT_PROMPT",
+      "MINIMAX_H3_IMAGE_PE_EXPANDED_FILE"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_SNAPSHOT + the PE evidence (MINIMAX_H3_IMAGE_PE_*); two 2048\u00b2 renders",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image-pe real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 2048x2048 t2i from a fresh process at the rung admission selects against the card's actually-free memory (AT1); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "admitted_resident_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy_cuda/admitted_resident_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects a resident, staged, bounded-decode or bounded-attention rung: every learned boundary runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "admitted_streamed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy_cuda/admitted_streamed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects bounded transformer residency: the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_2048_at_the_admitted_strategy_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 4096x4096 t2i from a fresh process at the rung admission selects against the card's actually-free memory (AT1); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "admitted_resident_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy_cuda/admitted_resident_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects a resident, staged, bounded-decode or bounded-attention rung: every learned boundary runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "admitted_streamed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy_cuda/admitted_streamed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects bounded transformer residency: the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_4096_at_the_admitted_strategy_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 6272x2688 t2i from a fresh process at the rung admission selects against the card's actually-free memory (AT1); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "admitted_resident_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy_cuda/admitted_resident_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects a resident, staged, bounded-decode or bounded-attention rung: every learned boundary runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "admitted_streamed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy_cuda/admitted_streamed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects bounded transformer residency: the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_t2i_6272x2688_at_the_admitted_strategy_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus shard 14 (vision tower); 1024x1024 edit of three procedural shape references, each reference's hue required in the output (AT3); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "admitted_resident_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references_cuda/admitted_resident_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects a resident, staged, bounded-decode or bounded-attention rung: every learned boundary runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "admitted_streamed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references_cuda/admitted_streamed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects bounded transformer residency: the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_edit_draws_on_each_of_three_references_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-encode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_refuses_the_unsupported_requests_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12; the loaded generator's request refusals and a host-loaded DiT strict LoRA install refusing an unmatched key (AT6); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_refuses_the_unsupported_requests_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_refuses_the_unsupported_requests_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_refuses_the_unsupported_requests_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case; request validation and a host-loaded DiT strict LoRA install, no learned tensor (checked with --no-learned-work)",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_refuses_the_unsupported_requests_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_16mp_with_two_loras_streams_and_tiles_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus two pinned community H3-Image LoRAs (minimax-h3-image-community-lora-* rows); DeferredMaterialization 4096x4096 admitted on rung 4 under a budget the staged rung cannot hold (AT8); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_16mp_with_two_loras_streams_and_tiles_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_16mp_with_two_loras_streams_and_tiles_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_COMMUNITY_LORAS",
+      "MINIMAX_H3_IMAGE_AT8_LORAS"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_16mp_with_two_loras_streams_and_tiles_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case; the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_16mp_with_two_loras_streams_and_tiles_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_community_loras_apply_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus every pinned community H3-Image LoRA (minimax-h3-image-community-lora-* rows); one bare and one per-LoRA 1024x1024 render (AT11); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_community_loras_apply_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_community_loras_apply_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_COMMUNITY_LORAS"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "admitted_resident_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_community_loras_apply_cuda/admitted_resident_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects a resident, staged, bounded-decode or bounded-attention rung: every learned boundary runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "admitted_streamed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_community_loras_apply_cuda/admitted_streamed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects bounded transformer residency: the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_community_loras_apply_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus the minimax-h3-image-pe profile's own PE expansion of a short t2i prompt; short and expanded 2048x2048 renders compared by luma Laplacian energy (AT9); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_PE_LABEL",
+      "MINIMAX_H3_IMAGE_PE_SHORT_PROMPT",
+      "MINIMAX_H3_IMAGE_PE_EXPANDED_FILE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "admitted_resident_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda/admitted_resident_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects a resident, staged, bounded-decode or bounded-attention rung: every learned boundary runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "admitted_streamed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda/admitted_streamed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case when admission selects bounded transformer residency: the streamed text encoder keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, streamed DiT, VAE decode) runs on CUDA",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
   }
 ]

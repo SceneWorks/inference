@@ -361,6 +361,59 @@ fn qwen35_workspace_estimate_is_checked_and_keeps_ordinary_requests_available() 
 }
 
 #[test]
+fn schema_constraint_applies_after_reasoning_closes_and_survives_rewind() {
+    let schema = core_llm::JsonSchema::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {"r": {"type": "string", "enum": ["1:1"]}},
+        "required": ["r"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let constraint = core_llm::Constraint::JsonSchema(schema);
+    // ids: 0="plan" 1="</think>" 2="\n\n" 3="{\"r\":" 4="\"1:1\"" 5="}" 6=eos 7="{\"x\":"
+    // 8="</think>{\"r\":"
+    let table = core_llm::ConstraintDecodeTable {
+        pieces: vec![
+            "plan".into(),
+            "</think>".into(),
+            "\n\n".into(),
+            "{\"r\":".into(),
+            "\"1:1\"".into(),
+            "}".into(),
+            String::new(),
+            "{\"x\":".into(),
+            "</think>{\"r\":".into(),
+        ],
+        special: [6].into_iter().collect(),
+    };
+    let mut mask = JsonMask::for_constraint(&constraint, &table, [6], true);
+    let m = mask.allowed().to_vec();
+    assert!(m[0] && m[2] && m[7], "reasoning text is free");
+    assert!(
+        m[1] && m[8],
+        "the reasoning may close, alone or with a valid answer start"
+    );
+    assert!(!m[6], "EOS cannot end an open reasoning block");
+    mask.accept(0);
+    mask.accept(1);
+    let checkpoint = mask.checkpoint();
+    let m = mask.allowed().to_vec();
+    assert!(m[3], "the answer opens with the schema's first key");
+    assert!(!m[2], "no whitespace after </think>");
+    assert!(!m[7], "an undeclared key is masked");
+    mask.accept(3);
+    mask.accept(4);
+    mask.accept(5);
+    assert!(mask.allowed()[6], "stop once the document is complete");
+    mask.rewind(checkpoint);
+    let m = mask.allowed().to_vec();
+    assert!(
+        m[3] && !m[6] && !m[2],
+        "rewind restores the schema state, not plain JSON"
+    );
+}
+
+#[test]
 fn reasoning_boundary_commits_same_token_json_in_release_builds() {
     let table = core_llm::ConstraintDecodeTable {
         pieces: vec!["</think>{}".into(), String::new(), "{".into()],
@@ -6757,4 +6810,28 @@ fn no_dense_kv_copy_survives_a_paged_compressed_attention_call() {
     );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call");
+}
+
+/// SW-7099: a ModelOpt NVFP4 snapshot is refused by name before admission or any weight read —
+/// MLX loads the converted tier, never the packed U8 codes as dense weights.
+#[test]
+fn a_modelopt_nvfp4_snapshot_is_refused_by_name_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16},
+    });
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    let spec = core_llm::LoadSpec::dense(dir.path().display().to_string());
+    match super::LlamaProvider::load(&spec) {
+        Err(core_llm::Error::Unsupported(why)) => {
+            assert!(
+                why.starts_with("nvfp4: ") && why.contains("ModelOpt"),
+                "{why}"
+            )
+        }
+        Err(other) => panic!("expected the by-name refusal, got {other}"),
+        Ok(_) => panic!("a ModelOpt NVFP4 snapshot loaded on MLX"),
+    }
 }

@@ -70,6 +70,9 @@ mod load_admission_probe;
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
 
+#[path = "minimax_h3_image_pe.rs"]
+mod minimax_h3_image_pe;
+
 #[path = "moe_routing.rs"]
 mod moe_routing;
 

@@ -52,7 +52,7 @@ use candle_gen::{CandleError, Result, Weights};
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
-use crate::dit::block::DitBlock;
+use crate::dit::block::{AdaLnModulation, DitBlock};
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
 use crate::dit::curve::CurveAdaLn;
 use crate::dit::heads::{AdaLayerNormOut, DitProjections, NormOutModulation};
@@ -82,7 +82,9 @@ pub struct MiniMaxH3Dit {
 impl MiniMaxH3Dit {
     /// Move only shared/root modules after the host stack and its residuals are prepared.
     /// Block bases are already in runtime format: window execution transfers bytes, never repacks.
-    pub(crate) fn prepare_streamed(&mut self, device: &Device, window: usize) -> Result<()> {
+    /// Rung 4's DiT step: the generator calls it inside a [`crate::StreamedRequestScope`] on a
+    /// host-loaded DiT with its adapters installed.
+    pub fn prepare_streamed(&mut self, device: &Device, window: usize) -> Result<()> {
         let _ = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
         self.projections = self.projections.copy_to_device(device)?;
         self.refiner = self.refiner.copy_to_device(device)?;
@@ -211,7 +213,9 @@ impl MiniMaxH3Dit {
                 config_path.display()
             ))
         })?;
-        let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
+        // `_class_name` decides the variant: MiniMax-H3-Image's `transformer_diffusers/` parses as
+        // the image transformer (no audio, per-step heads), everything else as H3 video.
+        let cfg = MiniMaxH3DitConfig::from_partition_json(&text)?;
         let shards = candle_gen::loader::sorted_safetensors(dir, "minimax-h3 dit")?;
         // Header-only scan first: a pruned (sc-26684) checkpoint is refused here, from the
         // safetensors headers alone, if its reduced topology is incomplete or inconsistent —
@@ -257,8 +261,13 @@ impl MiniMaxH3Dit {
     ///
     /// The exhaustive mapping: any `transformer/` tensor outside this set would be silently ignored,
     /// which is the failure mode this list exists to make testable.
+    /// On the image transformer ([`crate::dit::DitVariant::Image`]) the top-level set is
+    /// [`DitProjections::names_image`] — 644 names at the shipped geometry.
     pub fn names(cfg: &MiniMaxH3DitConfig) -> Vec<String> {
-        let mut v = DitProjections::names();
+        let mut v = match cfg.num_pdd_heads() {
+            Some(heads) => DitProjections::names_image(heads),
+            None => DitProjections::names(),
+        };
         v.extend(TokenRefiner::names("token_refiner", cfg));
         for i in 0..cfg.num_layers {
             v.extend(DitBlock::names(&format!("transformer_blocks.{i}")));
@@ -342,6 +351,8 @@ impl MiniMaxH3Dit {
     pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
         match self.curve {
             Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            // SW-7096: the image transformer addresses every linear it has.
+            None if !self.cfg.has_audio() => crate::adapters::AdaLnSurface::ImageAllLinears,
             None => crate::adapters::AdaLnSurface::FullTimestepMlp,
         }
     }
@@ -372,13 +383,41 @@ impl MiniMaxH3Dit {
     /// else — in particular not `adaln_proj`, not the 17 input/output projections, and not any norm.
     /// See [`crate::adapters::adapter_target_paths`], which enumerates exactly this set from the
     /// config and is asserted to resolve here.
+    ///
+    /// **The image transformer adds every other linear it has** (SW-7096): each block's
+    /// `adaln_proj.linear`, `proj_in`, `context_embedder`, `time_embedder.linear_{1,2}`,
+    /// `norm_out.linear` and every `pdd_proj_out.{i}` head (a PEFT `nn.ModuleList`, one module per
+    /// head). The image denoiser precomputes its six timesteps' modulation from `time_embedder`
+    /// once, after the install, so those tables carry the residuals. The video transformer keeps
+    /// the sc-26688 surface above unchanged.
     pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        let image = !self.cfg.has_audio() && self.curve.is_none();
         match path {
+            ["transformer_blocks", idx, "adaln_proj", "linear"] if image => {
+                let i: usize = idx.parse().ok()?;
+                let device = self.device.clone();
+                self.blocks.get_mut(i)?.adaln_adaptable_mut(&device)
+            }
             ["transformer_blocks", idx, rest @ ..] => {
                 let i: usize = idx.parse().ok()?;
                 self.blocks.get_mut(i)?.adaptable_mut(rest)
             }
             ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            ["proj_in"] if image => self.projections.proj_in.adaptable_mut(),
+            ["context_embedder"] if image => self.projections.context_embedder.adaptable_mut(),
+            ["time_embedder", linear] if image => self
+                .projections
+                .time_embedder
+                .as_mut()?
+                .linear_mut(linear)?
+                .adaptable_mut(),
+            ["norm_out", "linear"] if image => {
+                self.projections.norm_out.linear_mut()?.adaptable_mut()
+            }
+            ["pdd_proj_out", idx] if image => {
+                let i: usize = idx.parse().ok()?;
+                self.projections.pdd_proj_out.get_mut(i)?.adaptable_mut()
+            }
             _ => None,
         }
     }
@@ -390,6 +429,18 @@ impl MiniMaxH3Dit {
             b.clear_adapters();
         }
         self.refiner.clear_adapters();
+        let p = &mut self.projections;
+        p.proj_in.clear_adapters();
+        p.context_embedder.clear_adapters();
+        if let Some(t) = p.time_embedder.as_mut() {
+            t.clear_adapters();
+        }
+        if let Some(l) = p.norm_out.linear_mut() {
+            l.clear_adapters();
+        }
+        for head in &mut p.pdd_proj_out {
+            head.clear_adapters();
+        }
     }
 
     /// How many projections currently carry at least one residual — the count a caller checks
@@ -521,9 +572,17 @@ impl MiniMaxH3Dit {
         let audio = self
             .projections
             .audio_proj_in
+            .as_ref()
+            .ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3 dit: this transformer has no audio stream (MiniMax-H3-Image); \
+                     drive it through `forward_image`"
+                        .into(),
+                )
+            })?
             .forward(packed.audio_rows)?
             .to_dtype(stream)?;
-        let mut x = scatter_rows(
+        let x = scatter_rows(
             packed.text_rows,
             &video,
             &audio,
@@ -538,10 +597,66 @@ impl MiniMaxH3Dit {
             drop(audio);
         }
 
-        // 2. The stack. The AdaLN index bounds-check runs ONCE here rather than per block: it is a
-        //    blocking D2H readback, and all 50 blocks gather with the same index tensor against
-        //    same-shaped tables, so the per-block placement repeated the stall 50× per step for
-        //    one answer.
+        // 2. The stack.
+        let x = self.run_stack(
+            x,
+            packed.adaln_indices,
+            packed.tables,
+            blocks,
+            veda,
+            cancel,
+            None,
+        )?;
+        // 3. The shared output norm, then the two heads over their own rows. Gathering before
+        //    projecting is bit-identical to the reference's project-then-gather (both heads are
+        //    row-wise affine maps) and skips the text rows' outputs, which it discards.
+        let x = self
+            .projections
+            .norm_out
+            .apply(&x, norm_out, packed.timestep_indices)?;
+        let seq_len = x.dims()[1];
+        let video_out =
+            self.projections
+                .output_head(None)?
+                .forward(&crate::denoise::packing::gather_rows(
+                    &x,
+                    packed.video_indices,
+                    seq_len,
+                )?)?;
+        let audio_out = self
+            .projections
+            .audio_proj_out
+            .as_ref()
+            .ok_or_else(|| {
+                CandleError::Msg("minimax-h3 dit: this transformer has no audio_proj_out".into())
+            })?
+            .forward(&crate::denoise::packing::gather_rows(
+                &x,
+                packed.audio_indices,
+                seq_len,
+            )?)?;
+        Ok((video_out, audio_out))
+    }
+
+    /// The 50-block stack over an already-scattered packed sequence `x` — the one block loop both
+    /// [`Self::forward_packed`] (H3 video) and [`Self::forward_image`] (MiniMax-H3-Image) run.
+    ///
+    /// `observe`, when given, sees the residual stream after every layer (`layer`, output) — the
+    /// stage taps the image DiT's real-weight parity gate reports with.
+    #[allow(clippy::too_many_arguments)]
+    fn run_stack(
+        &self,
+        x: Tensor,
+        adaln_indices: &Tensor,
+        tables: &MmRopeTables,
+        blocks: BlockModulation<'_>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
+        cancel: Option<&CancelFlag>,
+        mut observe: Option<&mut LayerObserver<'_>>,
+    ) -> Result<Tensor> {
+        // The AdaLN index bounds-check runs ONCE here rather than per block: it is a blocking D2H
+        // readback, and all 50 blocks gather with the same index tensor against same-shaped
+        // tables, so the per-block placement repeated the stall 50× per step for one answer.
         let modulation_rows = match blocks {
             BlockModulation::Cached(cache) => cache.modulation(0)?.scale_msa.dims()[0],
             // One table row block per timestep row of `temb` — `AdaLnProjection::forward` rejects
@@ -551,20 +666,11 @@ impl MiniMaxH3Dit {
                 coords.dims().first().copied().unwrap_or(0) * MODALITY_NUM
             }
         };
-        crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
+        crate::dit::block::check_adaln_indices(adaln_indices, modulation_rows)?;
         let sync_between_layers = layer_cancel_needs_sync(x.dims()[1]);
-        let apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
+        let mut apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
             for layer in range {
-                let transferred;
-                let block = if self.stream_window.is_some() {
-                    transferred = self.blocks[layer].copy_to_device(&self.device)?;
-                    tracing::trace!(event="h3_transformer_window_materialized", component="dit",
-                        first_block=layer, block_count=1, base_bytes=transferred.body_nbytes(),
-                        device=?self.device.location(), "Materialized prepared DiT body window");
-                    &transferred
-                } else {
-                    &self.blocks[layer]
-                };
+                let block = self.window_block(layer)?;
                 if let Some(cancel) = cancel {
                     if sync_between_layers {
                         self.device.synchronize()?;
@@ -577,35 +683,38 @@ impl MiniMaxH3Dit {
                     BlockModulation::Cached(cache) => block.forward_veda(
                         &x,
                         cache.modulation(layer)?,
-                        packed.adaln_indices,
+                        adaln_indices,
                         &self.rope,
-                        packed.tables,
+                        tables,
                         veda.map(|(runtime, step)| (runtime, layer, step)),
                         cancel,
                     )?,
                     BlockModulation::Temb(temb) => block.forward_veda(
                         &x,
                         &block.modulation(temb)?,
-                        packed.adaln_indices,
+                        adaln_indices,
                         &self.rope,
-                        packed.tables,
+                        tables,
                         veda.map(|(runtime, step)| (runtime, layer, step)),
                         cancel,
                     )?,
                     BlockModulation::CurveCoords(coords) => block.forward_veda(
                         &x,
                         &block.curve_modulation(coords)?,
-                        packed.adaln_indices,
+                        adaln_indices,
                         &self.rope,
-                        packed.tables,
+                        tables,
                         veda.map(|(runtime, step)| (runtime, layer, step)),
                         cancel,
                     )?,
                 };
+                if let Some(observe) = observe.as_mut() {
+                    observe(layer, &x)?;
+                }
             }
             Ok(x)
         };
-        x = if let Some(window) = self.stream_window {
+        let x = if let Some(window) = self.stream_window {
             let plan = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
             let default_cancel = CancelFlag::default();
             candle_gen::block_window::run_windowed(
@@ -619,32 +728,177 @@ impl MiniMaxH3Dit {
         } else {
             apply(x, 0..self.blocks.len())?
         };
-        // 3. The shared output norm, then the two heads over their own rows. Gathering before
-        //    projecting is bit-identical to the reference's project-then-gather (both heads are
-        //    row-wise affine maps) and skips the text rows' outputs, which it discards.
+        Ok(x)
+    }
+
+    /// Block `layer` as one forward runs it: the resident block, or — streamed (rung 4) — a device
+    /// copy of the host-resident block and its adapter factors, dropped by the caller after use.
+    pub(crate) fn window_block(&self, layer: usize) -> Result<std::borrow::Cow<'_, DitBlock>> {
+        let block = self.blocks.get(layer).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "minimax-h3 dit: block {layer} is outside the {}-block stack",
+                self.blocks.len()
+            ))
+        })?;
+        if self.stream_window.is_none() {
+            return Ok(std::borrow::Cow::Borrowed(block));
+        }
+        let transferred = block.copy_to_device(&self.device)?;
+        tracing::trace!(event="h3_transformer_window_materialized", component="dit",
+            first_block=layer, block_count=1, base_bytes=transferred.body_nbytes(),
+            device=?self.device.location(), "Materialized prepared DiT body window");
+        Ok(std::borrow::Cow::Owned(transferred))
+    }
+
+    /// Whether the blocks stay on the host and run through a device window (rung 4).
+    pub(crate) fn is_streamed(&self) -> bool {
+        self.stream_window.is_some()
+    }
+
+    /// The image transformer's stack input: `proj_in` over the packed image rows, cast to the text
+    /// stream's dtype, scattered with the refined text rows into one `[1, seq_len, hidden]`
+    /// sequence — the first stage of [`Self::forward_image`], shared with the trainer (SW-7098).
+    pub(crate) fn image_stack_input(
+        &self,
+        image_rows: &Tensor,
+        text_rows: &Tensor,
+        text_indices: &[u32],
+        image_indices: &[u32],
+    ) -> Result<Tensor> {
+        let image = self
+            .projections
+            .proj_in
+            .forward(image_rows)?
+            .to_dtype(text_rows.dtype())?;
+        scatter_blocks(&[
+            (text_rows, text_indices, "text"),
+            (&image, image_indices, "image"),
+        ])
+    }
+
+    /// **One MiniMax-H3-Image evaluation** (SW-7091): `MiniMaxH3ImageTransformer2DModel.forward`
+    /// over the `[text | image]` packed sequence, with the output projection of sampling step
+    /// `pdd_step` — `pdd_proj_out.{pdd_step}`.
+    ///
+    /// The same modules as [`Self::forward_packed`], minus the audio stream: `proj_in` (float32)
+    /// on the image rows cast to the text stream's dtype, the scatter, the shared block stack,
+    /// `norm_out`, then the step's head over the image rows only (gather-then-project, the same
+    /// identity the video path documents). Returns the `[1, image_rows, patch_dim]` velocity at the
+    /// head's float32.
+    pub fn forward_image(
+        &self,
+        packed: &ImageForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        pdd_step: usize,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Tensor> {
+        self.forward_image_traced(packed, blocks, norm_out, pdd_step, cancel, None)
+    }
+
+    /// [`Self::forward_image`], also recording the stages `trace` asks for (the residual stream
+    /// after its listed layers, and `norm_out`'s output — the head's input).
+    pub fn forward_image_traced(
+        &self,
+        packed: &ImageForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        pdd_step: usize,
+        cancel: Option<&CancelFlag>,
+        mut trace: Option<&mut ImageDitTrace>,
+    ) -> Result<Tensor> {
+        if self.cfg.has_audio() {
+            return Err(CandleError::Msg(
+                "minimax-h3 dit: forward_image needs the image transformer; this is the \
+                 audio+video one"
+                    .into(),
+            ));
+        }
+        // Resolve the head FIRST: a step past the last head is refused before 50 blocks run.
+        let head = self.projections.output_head(Some(pdd_step))?;
+        let x = self.image_stack_input(
+            packed.image_rows,
+            packed.text_rows,
+            packed.text_indices,
+            packed.image_indices,
+        )?;
+        let mut record = |layer: usize, x: &Tensor| -> Result<()> {
+            if let Some(trace) = trace.as_deref_mut() {
+                if trace.layers.contains(&layer) {
+                    trace.hidden.push((layer, x.clone()));
+                }
+            }
+            Ok(())
+        };
+        let x = self.run_stack(
+            x,
+            packed.adaln_indices,
+            packed.tables,
+            blocks,
+            None,
+            cancel,
+            Some(&mut record),
+        )?;
         let x = self
             .projections
             .norm_out
             .apply(&x, norm_out, packed.timestep_indices)?;
+        if let Some(trace) = trace {
+            trace.pre_head = Some(x.clone());
+        }
         let seq_len = x.dims()[1];
-        let video_out =
-            self.projections
-                .proj_out
-                .forward(&crate::denoise::packing::gather_rows(
-                    &x,
-                    packed.video_indices,
-                    seq_len,
-                )?)?;
-        let audio_out =
-            self.projections
-                .audio_proj_out
-                .forward(&crate::denoise::packing::gather_rows(
-                    &x,
-                    packed.audio_indices,
-                    seq_len,
-                )?)?;
-        Ok((video_out, audio_out))
+        head.forward(&crate::denoise::packing::gather_rows(
+            &x,
+            packed.image_indices,
+            seq_len,
+        )?)
     }
+}
+
+/// What [`MiniMaxH3Dit`]'s block loop calls after every layer when observed: `(layer, output)`.
+type LayerObserver<'a> = dyn FnMut(usize, &Tensor) -> Result<()> + 'a;
+
+/// The intermediate stages one [`MiniMaxH3Dit::forward_image_traced`] records: the residual stream
+/// after each of [`Self::layers`] (`[1, seq_len, hidden_size]`, in layer order) and `norm_out`'s
+/// output over the whole packed sequence. Diagnostic only — the real-weight parity gate compares
+/// each against the reference's own tensors so a miss names the stage it enters at.
+#[derive(Debug, Default)]
+pub struct ImageDitTrace {
+    /// Layers whose output to record.
+    pub layers: Vec<usize>,
+    /// `(layer, residual stream after it)` for every recorded layer.
+    pub hidden: Vec<(usize, Tensor)>,
+    /// `norm_out`'s output — the step head's input — once the forward has run.
+    pub pre_head: Option<Tensor>,
+}
+
+impl ImageDitTrace {
+    /// A trace recording the residual stream after each of `layers`.
+    pub fn new(layers: &[usize]) -> Self {
+        Self {
+            layers: layers.to_vec(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Everything one [`MiniMaxH3Dit::forward_image`] needs besides the weights and the modulation.
+#[derive(Debug)]
+pub struct ImageForward<'a> {
+    /// `[1, image_indices.len(), in_channels · prod(patch)]` patchified image rows (float32).
+    pub image_rows: &'a Tensor,
+    /// `[1, text_indices.len(), hidden_size]` — already `context_embedder` + `token_refiner`.
+    pub text_rows: &'a Tensor,
+    /// `[seq_len]` — `timestep_index · MODALITY_NUM + token_tag`, what the blocks gather with.
+    pub adaln_indices: &'a Tensor,
+    /// `[seq_len]` — the **bare** timestep index, what `norm_out` gathers with.
+    pub timestep_indices: &'a Tensor,
+    /// MM-RoPE tables over the packed sequence's position grid.
+    pub tables: &'a MmRopeTables,
+    /// Rows the text condition occupies.
+    pub text_indices: &'a [u32],
+    /// Rows the image occupies.
+    pub image_indices: &'a [u32],
 }
 
 /// Everything one [`MiniMaxH3Dit::forward_packed`] needs besides the weights and the modulation.
@@ -713,14 +967,20 @@ fn scatter_rows(
     video_indices: &[u32],
     audio_indices: &[u32],
 ) -> Result<Tensor> {
-    let seq_len = text_indices.len() + video_indices.len() + audio_indices.len();
+    scatter_blocks(&[
+        (text, text_indices, "text"),
+        (video, video_indices, "video"),
+        (audio, audio_indices, "audio"),
+    ])
+}
+
+/// [`scatter_rows`] over any number of `(rows, indices, name)` blocks, concatenated in order — the
+/// single gather through an inverse permutation both the three-stream H3 video sequence and the
+/// two-stream MiniMax-H3-Image sequence are built with.
+fn scatter_blocks(blocks: &[(&Tensor, &[u32], &str)]) -> Result<Tensor> {
+    let seq_len: usize = blocks.iter().map(|(_, idx, _)| idx.len()).sum();
     let mut inverse = vec![u32::MAX; seq_len];
-    for (source, &dest) in text_indices
-        .iter()
-        .chain(video_indices)
-        .chain(audio_indices)
-        .enumerate()
-    {
+    for (source, &dest) in blocks.iter().flat_map(|(_, idx, _)| idx.iter()).enumerate() {
         if dest as usize >= seq_len {
             return Err(CandleError::Msg(format!(
                 "minimax-h3 dit: row {dest} is outside [0, {seq_len})"
@@ -735,14 +995,11 @@ fn scatter_rows(
     }
     if inverse.contains(&u32::MAX) {
         return Err(CandleError::Msg(
-            "minimax-h3 dit: the three index tensors do not cover every row".into(),
+            "minimax-h3 dit: the index tensors do not cover every row".into(),
         ));
     }
-    for (block, rows, what) in [
-        (text, text_indices.len(), "text"),
-        (video, video_indices.len(), "video"),
-        (audio, audio_indices.len(), "audio"),
-    ] {
+    for &(block, idx, what) in blocks {
+        let rows = idx.len();
         let s = block.dims();
         if s.len() != 3 || s[0] != 1 || s[1] != rows {
             return Err(CandleError::Msg(format!(
@@ -750,8 +1007,9 @@ fn scatter_rows(
             )));
         }
     }
-    let sources = Tensor::cat(&[text, video, audio], 1)?.contiguous()?;
-    let perm = Tensor::from_vec(inverse, (seq_len,), text.device())?;
+    let parts: Vec<&Tensor> = blocks.iter().map(|(t, _, _)| *t).collect();
+    let sources = Tensor::cat(&parts, 1)?.contiguous()?;
+    let perm = Tensor::from_vec(inverse, (seq_len,), parts[0].device())?;
     Ok(sources.index_select(&perm, 1)?)
 }
 
@@ -1108,6 +1366,363 @@ impl JointVelocity for JointDit {
     }
 }
 
+/// Tensors the published MiniMax-H3-Image `transformer_diffusers/` partition carries:
+/// `50 · 12 + 21 + 23` — the H3 block stack and refiner plus [`DitProjections::names_image`].
+pub const PUBLISHED_IMAGE_DIT_TENSORS: usize = 644;
+
+/// **MiniMax-H3-Image's DiT as the six-step loop's velocity model** (SW-7091).
+///
+/// The [`JointDit`] counterpart for one `text2image` request: the refined text rows, the rotary
+/// tables and the whole schedule's modulation are built once, and a step is "project, scatter, 50
+/// blocks, norm, the step's head".
+///
+/// The fixed schedule enumerates every timestep the run evaluates at (six, plus an edit's
+/// reference rows' constant `0.999`), so construction always takes the precompute-and-evict
+/// lever: [`AdaLnCache::precompute_and_evict`] projects the six timesteps' modulation for every
+/// block and releases `adaln_proj` (26.02 GB at the shipped geometry, the same tensors H3 video
+/// evicts).
+pub struct ImageDit {
+    dit: MiniMaxH3Dit,
+    tables: MmRopeTables,
+    text_rows: Tensor,
+    cache: AdaLnCache,
+    norm_out: NormOutModulation,
+    temb: Tensor,
+    row_classes: Vec<u32>,
+    token_tags: Vec<u32>,
+    text_indices: Vec<u32>,
+    image_indices: Vec<u32>,
+    released_bytes: usize,
+    forwards: usize,
+    cancel: Option<CancelFlag>,
+}
+
+impl ImageDit {
+    /// Build the velocity model for one request.
+    ///
+    /// * `context` — `[1, num_text_tokens, text_dim]`, the conditioner's layer-50 hidden state;
+    /// * `timesteps` — the schedule's `t = 1 − σ` per step
+    ///   ([`gen_core_h3::h3_schedule::SigmaSchedule::timesteps`]); step `i` is evaluated at
+    ///   `timesteps[i]` through head `i`, so there must be no more steps than heads.
+    ///
+    /// Consumes the model because the eviction mutates it irreversibly.
+    pub fn new(
+        mut dit: MiniMaxH3Dit,
+        layout: &crate::image_pipeline::ImageLayout,
+        context: &Tensor,
+        timesteps: &[f32],
+    ) -> Result<Self> {
+        // SW-7095, rung 4: the streamed precompute observes the active request's cancel flag.
+        let cancel = if dit.stream_window.is_some() {
+            crate::block_stream::current()
+                .ok_or_else(|| {
+                    CandleError::Msg(
+                        "minimax-h3-image dit: streamed AdaLN requires an active request".into(),
+                    )
+                })?
+                .cancel
+        } else {
+            CancelFlag::default()
+        };
+        let ImageModulation {
+            cache,
+            norm_out,
+            temb,
+            released_bytes,
+        } = image_modulation(
+            &mut dit,
+            timesteps,
+            layout.num_reference_rows() > 0,
+            &cancel,
+        )?;
+        let text_rows = dit.embed_context(context)?;
+        if text_rows.dims()[1] != layout.num_text_tokens() {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3-image dit: the context carries {} rows but the layout declares {} \
+                 text rows",
+                text_rows.dims()[1],
+                layout.num_text_tokens()
+            )));
+        }
+        let device = dit.device.clone();
+        let tables = dit.rope.tables_from_rows(layout.position_ids(), &device)?;
+        Ok(Self {
+            dit,
+            tables,
+            text_rows,
+            cache,
+            norm_out,
+            temb,
+            row_classes: layout.row_classes(),
+            token_tags: layout.token_tags().to_vec(),
+            text_indices: layout.text_indices().to_vec(),
+            image_indices: layout.image_indices().to_vec(),
+            released_bytes,
+            forwards: 0,
+            cancel: None,
+        })
+    }
+
+    /// Attach the request's cancel flag, observed between layers as on [`JointDit`].
+    pub fn set_cancel(&mut self, cancel: &CancelFlag) {
+        self.cancel = Some(cancel.clone());
+    }
+
+    /// Bytes of `adaln_proj` weight the eviction released.
+    pub fn released_bytes(&self) -> usize {
+        self.released_bytes
+    }
+
+    /// Model evaluations run so far — exactly one per step.
+    pub fn forwards(&self) -> usize {
+        self.forwards
+    }
+
+    /// The DiT itself.
+    pub fn dit(&self) -> &MiniMaxH3Dit {
+        &self.dit
+    }
+
+    /// The timestep embedding the whole run's modulation was projected from —
+    /// `[num_distinct_timesteps, time_embed_dim]`, rows in
+    /// [`TimestepSchedule::distinct_timesteps`] order.
+    pub fn temb(&self) -> &Tensor {
+        &self.temb
+    }
+
+    /// The block stack's precomputed modulation (and the schedule it is keyed on).
+    pub fn adaln_cache(&self) -> &AdaLnCache {
+        &self.cache
+    }
+
+    /// `norm_out`'s per-timestep `(shift, scale)` table.
+    pub fn norm_out_modulation(&self) -> &NormOutModulation {
+        &self.norm_out
+    }
+
+    /// Block `layer` alone at sampling step `step`, over a packed residual stream `hidden`
+    /// (`[1, seq_len, hidden_size]`, the stream dtype) — the diagnostic the real-weight edit gate
+    /// runs from the reference's own block input, to separate the block's compute from the error
+    /// it inherits (SW-7092). `modulation` defaults to the block's cached tables; a caller may hand
+    /// in tables of the cache's shape instead (the reference's own projection). Not counted as a
+    /// forward.
+    pub fn block_forward(
+        &self,
+        step: usize,
+        layer: usize,
+        hidden: &Tensor,
+        modulation: Option<&AdaLnModulation>,
+    ) -> Result<Tensor> {
+        let block = self.dit.blocks.get(layer).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "minimax-h3-image dit: block {layer} is outside the {}-block stack",
+                self.dit.blocks.len()
+            ))
+        })?;
+        let device = self.dit.device.clone();
+        let adaln_indices = self.cache.schedule().adaln_indices(
+            step,
+            &self.row_classes,
+            &self.token_tags,
+            &device,
+        )?;
+        let modulation = match modulation {
+            Some(m) => m,
+            None => self.cache.modulation(layer)?,
+        };
+        crate::dit::block::check_adaln_indices(&adaln_indices, modulation.scale_msa.dims()[0])?;
+        let transferred;
+        let block = if self.dit.stream_window.is_some() {
+            transferred = block.copy_to_device(&device)?;
+            &transferred
+        } else {
+            block
+        };
+        block.forward(
+            hidden,
+            modulation,
+            &adaln_indices,
+            &self.dit.rope,
+            &self.tables,
+        )
+    }
+
+    /// One step's velocity, also recording the stages `trace` asks for — the diagnostic twin of
+    /// [`crate::image_pipeline::ImageVelocity::forward`], counted as a forward the same way.
+    pub fn forward_traced(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        trace: &mut ImageDitTrace,
+    ) -> Result<Tensor> {
+        self.forward_inner(step, image_rows, Some(trace))
+    }
+
+    fn forward_inner(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        trace: Option<&mut ImageDitTrace>,
+    ) -> Result<Tensor> {
+        self.forwards += 1;
+        let device = self.dit.device.clone();
+        let adaln_indices = self.cache.schedule().adaln_indices(
+            step,
+            &self.row_classes,
+            &self.token_tags,
+            &device,
+        )?;
+        let timestep_indices = AdaLayerNormOut::timestep_indices_from_adaln(&adaln_indices)?;
+        let packed = ImageForward {
+            image_rows,
+            text_rows: &self.text_rows,
+            adaln_indices: &adaln_indices,
+            timestep_indices: &timestep_indices,
+            tables: &self.tables,
+            text_indices: &self.text_indices,
+            image_indices: &self.image_indices,
+        };
+        self.dit.forward_image_traced(
+            &packed,
+            BlockModulation::Cached(&self.cache),
+            &self.norm_out,
+            step,
+            self.cancel.as_ref(),
+            trace,
+        )
+    }
+}
+
+/// One image request's whole-schedule modulation: the block stack's AdaLN tables over every
+/// distinct timestep the run evaluates at (the six steps, plus an edit's reference rows' constant
+/// `0.999`), `norm_out`'s table from the same timestep embedding, and the bytes the precompute
+/// released. Every block's `adaln_proj` is evicted afterwards — resident, by the
+/// precompute-and-evict lever; streamed (rung 4), one host block at a time through the device
+/// window, observing `cancel`. Shared by [`ImageDit::new`] and the trainer (SW-7098), so a training
+/// step gathers the modulation the render does.
+pub(crate) struct ImageModulation {
+    pub(crate) cache: AdaLnCache,
+    pub(crate) norm_out: NormOutModulation,
+    pub(crate) temb: Tensor,
+    pub(crate) released_bytes: usize,
+}
+
+/// See [`ImageModulation`]. `timesteps` are the schedule's `t = 1 − σ`, one per step, at most one
+/// per output head.
+pub(crate) fn image_modulation(
+    dit: &mut MiniMaxH3Dit,
+    timesteps: &[f32],
+    has_references: bool,
+    cancel: &CancelFlag,
+) -> Result<ImageModulation> {
+    let heads = dit.cfg.num_pdd_heads().ok_or_else(|| {
+        CandleError::Msg(
+            "minimax-h3-image dit: ImageDit needs the image transformer; this is the \
+                 audio+video one"
+                .into(),
+        )
+    })?;
+    if timesteps.is_empty() || timesteps.len() > heads {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3-image dit: {} sampling steps for a checkpoint with {heads} per-step \
+                 heads",
+            timesteps.len()
+        )));
+    }
+    if dit.curve.is_some() {
+        return Err(CandleError::Msg(
+            "minimax-h3-image dit: the modulation-pruned DiT path is not wired for the image \
+                 transformer"
+                .into(),
+        ));
+    }
+    // Row class 0 is the step's timestep, which every text and generated row sits at; an
+    // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
+    // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`). One step per head.
+    let schedule = TimestepSchedule::new(
+        timesteps
+            .iter()
+            .map(|&t| {
+                if has_references {
+                    vec![t, candle_gen::gen_core::h3_image::REFERENCE_NOISE_AUG]
+                } else {
+                    vec![t]
+                }
+            })
+            .collect(),
+    )?;
+    let device = dit.device.clone();
+    let (cache, released_bytes, norm_out, temb) = if let Some(window) = dit.stream_window {
+        // SW-7095, rung 4: the blocks stay on the host in runtime format. Each block's
+        // `adaln_proj` is copied to the device, projected over the whole schedule and dropped
+        // — one block at a time, exactly as H3 video's `JointDit` streamed precompute — then
+        // every host projection is released. The device never held the 26 GB, so no device
+        // eviction saving is claimed.
+        let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
+        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+        let layers = candle_gen::block_window::run_windowed(
+            &device,
+            &plan,
+            cancel,
+            Vec::with_capacity(dit.blocks.len()),
+            || Ok(()),
+            |mut layers, _, range| {
+                for layer in range {
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    layers.push(dit.blocks[layer].modulation_for_window(&temb, &device)?);
+                }
+                Ok(layers)
+            },
+        )?;
+        let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
+        for block in &mut dit.blocks {
+            block.evict_adaln();
+        }
+        (cache, 0, norm_out, temb)
+    } else {
+        let mut captured: Option<Tensor> = None;
+        let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
+            CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
+        })?;
+        let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
+            &mut dit.blocks,
+            schedule,
+            AdaLnResidency::PrecomputeAndEvict,
+            &device,
+            |ts| {
+                let temb = embedder.forward(ts, &device)?;
+                captured = Some(temb.clone());
+                Ok(temb)
+            },
+        )?;
+        let temb = captured.ok_or_else(|| {
+            CandleError::Msg(
+                "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
+                     embedding"
+                    .into(),
+            )
+        })?;
+        // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
+        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        (cache, released_bytes, norm_out, temb)
+    };
+    Ok(ImageModulation {
+        cache,
+        norm_out,
+        temb,
+        released_bytes,
+    })
+}
+
+impl crate::image_pipeline::ImageVelocity for ImageDit {
+    fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor> {
+        self.forward_inner(step, image_rows, None)
+    }
+}
+
 /// Packed-sequence length from which [`MiniMaxH3Dit`]'s per-layer cancel check synchronizes the
 /// device first. Below it a whole forward is short enough that the denoise loop's per-step
 /// synchronize already bounds cancel latency; at and above it (every multi-second canvas, and the
@@ -1149,6 +1764,42 @@ mod tests {
             .filter(|n| n.starts_with("transformer_blocks."))
             .count();
         assert_eq!((top, refiner, blocks), (17, 21, 600));
+    }
+
+    /// SW-7091: the image transformer's declared set is the published 644 of
+    /// `transformer_diffusers/` — the same 21 refiner and 600 block names, and 23 top-level ones
+    /// with no audio tensor and no `proj_out`.
+    #[test]
+    fn the_declared_image_names_are_the_published_six_hundred_and_forty_four() {
+        let cfg = MiniMaxH3DitConfig::image();
+        let names = MiniMaxH3Dit::names(&cfg);
+        assert_eq!(names.len(), PUBLISHED_IMAGE_DIT_TENSORS);
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "no name is declared twice");
+        let top: Vec<&String> = names
+            .iter()
+            .filter(|n| !n.starts_with("transformer_blocks.") && !n.starts_with("token_refiner."))
+            .collect();
+        assert_eq!(top.len(), 23);
+        assert!(top
+            .iter()
+            .all(|n| !n.contains("audio") && !n.starts_with("proj_out.")));
+        assert!(names.contains(&"pdd_proj_out.5.weight".to_string()));
+        assert!(!names.contains(&"pdd_proj_out.6.weight".to_string()));
+        let video = MiniMaxH3Dit::names(&MiniMaxH3DitConfig::default());
+        let shared = |v: &[String]| -> Vec<String> {
+            v.iter()
+                .filter(|n| n.starts_with("transformer_blocks.") || n.starts_with("token_refiner."))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            shared(&names),
+            shared(&video),
+            "the stack is H3's, name for name"
+        );
     }
 }
 
@@ -1221,6 +1872,200 @@ mod veda_controls_tests {
         }
         Weights::from_map(map)
     }
+
+    /// SW-7096 AC1 at every tier: the diffusers/PEFT, kohya `lora_unet_` and ComfyUI (fused
+    /// `qkv_proj`) spellings of one `to_q` factor pair install through the production installer
+    /// onto a dense, a q8 and a q4 `to_q`, fold to the same `[in, out]` delta, and stacked together
+    /// keep their own scales in file order. Nothing is executed: the residuals are read back as
+    /// installed, so this holds without a forward.
+    #[test]
+    #[ignore = "constructs complete synthetic DiTs to install adapters; dispatched only by the manual H3 native suite"]
+    fn three_layouts_install_on_every_tier_with_their_own_scales() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, hidden, rank) = (96usize, 64usize, 2usize);
+        let seeded = |shape: &[usize], seed: u32| {
+            let n: usize = shape.iter().product();
+            let values: Vec<f32> = (0..n as u32)
+                .map(|i| ((i.wrapping_mul(2_654_435_761) ^ seed) % 997) as f32 / 997.0 - 0.5)
+                .collect();
+            Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+        };
+        let write = |name: &str, tensors: Vec<(String, Tensor)>, meta: &[(&str, &str)]| {
+            let bytes: Vec<(String, Vec<usize>, Vec<u8>)> = tensors
+                .iter()
+                .map(|(k, t)| {
+                    let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    (
+                        k.clone(),
+                        t.dims().to_vec(),
+                        v.into_iter().flat_map(f32::to_le_bytes).collect(),
+                    )
+                })
+                .collect();
+            let views: Vec<(String, safetensors::tensor::TensorView)> = bytes
+                .iter()
+                .map(|(k, shape, raw)| {
+                    let view = safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        shape.clone(),
+                        raw,
+                    )
+                    .unwrap();
+                    (k.clone(), view)
+                })
+                .collect();
+            let meta: std::collections::HashMap<String, String> = meta
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            let path = dir.path().join(name);
+            safetensors::serialize_to_file(views, &Some(meta), &path).unwrap();
+            path
+        };
+        let scalar = |v: f32| Tensor::new(&[v], &Device::Cpu).unwrap();
+        let qkv: Vec<(Tensor, Tensor)> = (0..3)
+            .map(|i| {
+                (
+                    seeded(&[rank, hidden], 10 * i),
+                    seeded(&[inner, rank], 10 * i + 1),
+                )
+            })
+            .collect();
+        let (down, up) = qkv[0].clone();
+        let r = rank.to_string();
+        let peft = write(
+            "peft.safetensors",
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight".into(),
+                    down.clone(),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight".into(),
+                    up.clone(),
+                ),
+            ],
+            &[("alpha", &r)],
+        );
+        let stem = "lora_unet_transformer_blocks_0_attn_to_q";
+        let kohya = write(
+            "kohya.safetensors",
+            vec![
+                (format!("{stem}.lora_down.weight"), down),
+                (format!("{stem}.lora_up.weight"), up),
+                (format!("{stem}.alpha"), scalar(rank as f32)),
+            ],
+            &[("ss_network_module", "networks.lora")],
+        );
+        // ComfyUI's fused projection: concatenated downs, a block-diagonal up, alpha x 3.
+        let fused_down = Tensor::cat(&[&qkv[0].0, &qkv[1].0, &qkv[2].0], 0).unwrap();
+        let zero = Tensor::zeros((inner, rank), DType::F32, &Device::Cpu).unwrap();
+        let rows: Vec<Tensor> = (0..3)
+            .map(|i| {
+                let parts: Vec<&Tensor> = (0..3)
+                    .map(|j| if i == j { &qkv[i].1 } else { &zero })
+                    .collect();
+                Tensor::cat(&parts, 1).unwrap()
+            })
+            .collect();
+        let fused_up = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
+        let comfy = write(
+            "comfyui.safetensors",
+            vec![
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight".into(),
+                    fused_down,
+                ),
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight".into(),
+                    fused_up,
+                ),
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.alpha".into(),
+                    scalar(3.0 * rank as f32),
+                ),
+            ],
+            &[],
+        );
+        let spec = |path: &std::path::PathBuf, scale: f32| {
+            AdapterSpec::new(path.clone(), scale, AdapterKind::Lora)
+        };
+        let to_q = ["transformer_blocks", "0", "attn", "to_q"];
+        let installed = |dit: &mut MiniMaxH3Dit, path: &[&str]| -> Vec<(f64, Vec<f32>)> {
+            dit.adaptable_mut(path)
+                .unwrap()
+                .adapters()
+                .iter()
+                .map(|r| {
+                    let d = __model_proof_output!(r.delta())
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap();
+                    (r.scale(), d.to_vec1::<f32>().unwrap())
+                })
+                .collect()
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        for bits in [None, Some(8), Some(4)] {
+            let fresh = || {
+                let w = weights_on(bits, &Device::Cpu);
+                MiniMaxH3Dit::from_weights(&w, &config(), &Device::Cpu, DType::F32).unwrap()
+            };
+            let mut folds = Vec::new();
+            for path in [&peft, &kohya, &comfy] {
+                let mut dit = fresh();
+                assert_eq!(
+                    dit.adaptable_mut(&to_q).unwrap().is_packed(),
+                    bits.is_some()
+                );
+                crate::adapters::apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
+                    .unwrap_or_else(|e| panic!("{bits:?} {}: {e}", path.display()));
+                let mut got = installed(&mut dit, &to_q);
+                assert_eq!(got.len(), 1, "{bits:?} {}", path.display());
+                folds.push(got.remove(0).1);
+            }
+            let peak = folds[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.0);
+            for (name, fold) in [("kohya", &folds[1]), ("comfyui", &folds[2])] {
+                assert!(
+                    max_diff(fold, &folds[0]) <= 1e-6 * peak,
+                    "{bits:?}: {name} folds unlike PEFT"
+                );
+            }
+
+            let mut dit = fresh();
+            let scales = [0.25f32, 0.5, 1.5];
+            let specs: Vec<AdapterSpec> = [&peft, &kohya, &comfy]
+                .into_iter()
+                .zip(scales)
+                .map(|(path, scale)| spec(path, scale))
+                .collect();
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &specs).unwrap();
+            let stacked = installed(&mut dit, &to_q);
+            let want: Vec<f64> = scales.iter().map(|&s| f64::from(s)).collect();
+            assert_eq!(
+                stacked.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                want,
+                "{bits:?}: every file at its own scale, in order"
+            );
+            for (_, fold) in &stacked {
+                assert!(max_diff(fold, &folds[0]) <= 1e-6 * peak, "{bits:?}");
+            }
+            // Only the fused file reaches to_k, at its own scale.
+            let to_k = installed(&mut dit, &["transformer_blocks", "0", "attn", "to_k"]);
+            assert_eq!(to_k.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1.5]);
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales");
+    }
+
     fn layout_on(mode: usize, channels: usize, dev: &Device) -> PackedLayout {
         let geometry = JointGeometry::new(5, 2, 2).unwrap();
         let anchors = match mode {

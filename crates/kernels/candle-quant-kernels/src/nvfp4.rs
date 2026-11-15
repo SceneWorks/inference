@@ -299,6 +299,88 @@ impl Nvfp4Tensor {
         round_up(rows, SF_ATOM_ROWS) * round_up(n_blocks, SF_ATOM_COLS)
     }
 
+    /// Build the canonical container from a **ModelOpt** NVFP4 checkpoint triple (`quant_method:
+    /// modelopt`, `quant_algo: NVFP4`, group 16 — the layout NVIDIA ModelOpt exports and SGLang /
+    /// vLLM read): `<stem>.weight` U8 `[rows, cols / 2]`, `<stem>.weight_scale` F8_E4M3
+    /// `[rows, cols / 16]` and the F32 scalar `<stem>.weight_scale_2`.
+    ///
+    /// No weight or scale is requantized; two facts make this a byte-level import:
+    ///
+    /// 1. **Nibble order.** ModelOpt packs `(q[2j+1] << 4) | q[2j]` — the even K element in the
+    ///    **low** nibble, the container's own order — so the payload is copied verbatim.
+    /// 2. **Block scales.** ModelOpt stores them **linear row-major** `[rows, cols / 16]` (the
+    ///    serving engines swizzle at load). They are written through [`Self::scale_offset_for`]
+    ///    into the container's padded 128×4 atom layout.
+    ///
+    /// `weight_scale_2` is the dequant multiplier (`w = e2m1 · e4m3(scale) · weight_scale_2`), the
+    /// same convention as [`Self::global_scale`]. The activation `input_scale` ModelOpt also stores
+    /// is not consumed: the W4A4 forward quantizes activations with their own per-call scale.
+    ///
+    /// Strict, because an imported checkpoint is untrusted input: every length must match the
+    /// shape, `cols` must be a whole number of 16-element blocks and the scale must be finite and
+    /// non-negative.
+    pub fn from_modelopt_parts(
+        packed: &[u8],
+        linear_scales: &[u8],
+        weight_scale_2: f32,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if rows == 0 || cols == 0 || !cols.is_multiple_of(NVFP4_BLOCK) {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 ModelOpt weight shape must be non-zero with whole 16-element blocks, got \
+                 [{rows}, {cols}]"
+            )));
+        }
+        let packed_len = rows
+            .checked_mul(cols / 2)
+            .ok_or_else(|| candle_core::Error::Msg("nvfp4 ModelOpt weight size overflow".into()))?;
+        if packed.len() != packed_len {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 ModelOpt packed weight has {} bytes, expected {packed_len} for [{rows}, \
+                 {cols}]",
+                packed.len()
+            )));
+        }
+        let blocks = cols / NVFP4_BLOCK;
+        if linear_scales.len() != rows * blocks {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 ModelOpt block scales have {} bytes, expected {} ([{rows}, {blocks}])",
+                linear_scales.len(),
+                rows * blocks
+            )));
+        }
+        if !weight_scale_2.is_finite() {
+            return Err(candle_core::Error::Msg(non_finite_msg(
+                "ModelOpt weight_scale_2",
+                weight_scale_2,
+            )));
+        }
+        if weight_scale_2 < 0.0 {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 ModelOpt weight_scale_2 must be non-negative, got {weight_scale_2}"
+            )));
+        }
+        let sf_rows = round_up(rows, SF_ATOM_ROWS);
+        let sf_cols = round_up(blocks, SF_ATOM_COLS);
+        let mut scales = vec![0u8; sf_rows * sf_cols];
+        for r in 0..rows {
+            for blk in 0..blocks {
+                scales[Self::scale_offset_for(r, blk, sf_rows)] = linear_scales[r * blocks + blk];
+            }
+        }
+        Ok(Self {
+            rows,
+            cols,
+            cols_padded: cols,
+            packed: packed.to_vec(),
+            scales,
+            sf_rows,
+            sf_cols,
+            global_scale: weight_scale_2,
+        })
+    }
+
     /// Offline pack a dense `[rows, cols]` weight tensor (bf16 or f32, any device) to NVFP4. The tensor
     /// is materialized to CPU f32; `bf16` inputs are upcast exactly.
     pub fn pack(weight: &Tensor) -> Result<Self> {
@@ -810,5 +892,75 @@ mod tests {
         let (low, high) = (byte0 & 0x0F, byte0 >> 4);
         assert_eq!(low & 0x08, 0x00, "col 0 (+6) low nibble positive");
         assert_eq!(high & 0x08, 0x08, "col 1 (-6) high nibble negative");
+    }
+
+    // ---- ModelOpt NVFP4 import ----------------------------------------------------------------
+
+    /// A hand-built ModelOpt triple dequantizes to `e2m1 · e4m3(scale) · weight_scale_2`, reading
+    /// the low nibble as the even column and the linear `[rows, cols / 16]` scale grid by row.
+    #[test]
+    fn modelopt_parts_dequantize_by_hand() -> Result<()> {
+        let (rows, cols) = (2, 32);
+        let mut packed = vec![0u8; rows * cols / 2];
+        // Row 0, columns 0/1: codes 0x2 (+1.0) low, 0xB (-1.5) high.
+        packed[0] = 0xB2;
+        // Row 1, columns 16/17 (second block): codes 0x7 (+6.0) low, 0x1 (+0.5) high.
+        packed[16 + 8] = 0x17;
+        // Linear scales: row 0 = [2.0, 1.0], row 1 = [1.0, 0.5] (E4M3 0x40 = 2.0, 0x38 = 1.0,
+        // 0x30 = 0.5).
+        let scales = [0x40, 0x38, 0x38, 0x30];
+        let t = Nvfp4Tensor::from_modelopt_parts(&packed, &scales, 0.25, rows, cols)?;
+        assert_eq!((t.sf_rows, t.sf_cols, t.cols_padded), (128, 4, cols));
+        assert_eq!(
+            t.packed, packed,
+            "the nibble payload is already the container's order"
+        );
+        let w = t.dequantize_to_vec();
+        assert_eq!(w[0], 1.0 * 2.0 * 0.25);
+        assert_eq!(w[1], -1.5 * 2.0 * 0.25);
+        assert_eq!(w[cols + 16], 6.0 * 0.5 * 0.25);
+        assert_eq!(w[cols + 17], 0.5 * 0.5 * 0.25);
+        let nonzero = w.iter().filter(|v| **v != 0.0).count();
+        assert_eq!(nonzero, 4, "every other element is code 0");
+        Ok(())
+    }
+
+    /// A multi-atom grid (two row atoms × two block atoms) lands every linear scale at its own
+    /// swizzled offset: re-packing the dequantized ModelOpt weight is a byte-identical round trip
+    /// through the codec's own packer only if the layouts agree, so compare scale by scale instead.
+    #[test]
+    fn modelopt_linear_scales_land_on_the_swizzled_grid() -> Result<()> {
+        let (rows, cols) = (256, 128);
+        let blocks = cols / NVFP4_BLOCK;
+        let packed: Vec<u8> = (0..rows * cols / 2).map(|i| (i % 251) as u8).collect();
+        let linear: Vec<u8> = (0..rows * blocks).map(|i| (i % 0x7E) as u8).collect();
+        let t = Nvfp4Tensor::from_modelopt_parts(&packed, &linear, 1.0, rows, cols)?;
+        for r in [0, 1, 31, 32, 127, 128, 200, 255] {
+            for blk in 0..blocks {
+                assert_eq!(t.scales[t.scale_offset(r, blk)], linear[r * blocks + blk]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn modelopt_parts_refuse_malformed_input() {
+        let ok = |p: &[u8], s: &[u8], g: f32, r: usize, c: usize| {
+            Nvfp4Tensor::from_modelopt_parts(p, s, g, r, c)
+        };
+        let packed = vec![0u8; 16];
+        let scales = vec![0x38u8; 2];
+        assert!(ok(&packed, &scales, 1.0, 1, 32).is_ok());
+        assert!(ok(&packed, &scales, 1.0, 1, 24).is_err(), "partial block");
+        assert!(
+            ok(&packed[..15], &scales, 1.0, 1, 32).is_err(),
+            "short payload"
+        );
+        assert!(
+            ok(&packed, &scales[..1], 1.0, 1, 32).is_err(),
+            "short scales"
+        );
+        assert!(ok(&packed, &scales, f32::NAN, 1, 32).is_err(), "NaN scale");
+        assert!(ok(&packed, &scales, -1.0, 1, 32).is_err(), "negative scale");
     }
 }

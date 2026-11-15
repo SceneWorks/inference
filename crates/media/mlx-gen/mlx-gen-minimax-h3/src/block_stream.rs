@@ -51,12 +51,25 @@
 //! tensors this module streams are the residency. The refiner additionally runs **once per request**
 //! rather than once per step, so windowing it would pay a re-materialization to bound bytes that a
 //! single window already bounds.
+//!
+//! # Adapters ride along with every rebuilt block (SW-7096)
+//!
+//! A window rebuilds each block from the staged tier, so a forward-time residual installed on a
+//! resident block would be lost. [`DitBlockStream`] therefore owns a [`StreamedBlockAdapters`]
+//! overlay: the strict install ([`crate::adapters::apply_minimax_h3_adapters`]) folds every
+//! `transformer_blocks.{i}.…` factor into a shape-only slot instead of into a block, and
+//! [`DitBlockStream::materialize`] pushes that slot's residuals onto the freshly rebuilt block
+//! before it runs. The residual form is the same one the resident path installs —
+//! `base(x) + Σ adapter.residual(x)` over an untouched (dense or packed) base — so the streamed
+//! output with a LoRA is the resident output with that LoRA, on every tier.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::block_residency::{run_windowed, BlockPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
@@ -79,6 +92,122 @@ pub struct DitBlockStream {
     dir: PathBuf,
     dtype: Dtype,
     cfg: MiniMaxH3DitConfig,
+    /// The configured adapters' residuals for the streamed blocks, re-applied to each block as a
+    /// window rebuilds it. Empty on an un-adapted render.
+    adapters: StreamedBlockAdapters,
+    /// The staged directory's tensor headers (names, dtypes, shapes — no data), read on the first
+    /// adapter probe: what [`AdaptableHost::adaptable_facts`] answers a leaf's packed status from.
+    headers: std::sync::OnceLock<std::sync::Arc<StagedHeaders>>,
+}
+
+type StagedHeaders = BTreeMap<String, mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>;
+
+/// The adapter residuals of a streamed block stack, keyed by `(block, leaf)` (SW-7096).
+///
+/// Each slot is an [`AdaptableLinear`] over a **shape-only** base: a lazy zero array of the
+/// leaf's logical `[out, in]` shape that is never evaluated, so it costs no memory. The shape is
+/// what the shared LoKr install reads (`AdaptableLinear::base_shape`); the forward never runs on a
+/// slot. Only the residuals pushed onto a slot are used — [`DitBlockStream::materialize`] copies
+/// them onto the rebuilt block's matching leaf.
+#[derive(Clone, Default)]
+pub struct StreamedBlockAdapters {
+    slots: BTreeMap<(usize, &'static str), AdaptableLinear>,
+}
+
+impl std::fmt::Debug for StreamedBlockAdapters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedBlockAdapters")
+            .field("slots", &self.slots.len())
+            .field("residuals", &self.residual_count())
+            .finish()
+    }
+}
+
+impl StreamedBlockAdapters {
+    /// Residuals held across every slot.
+    pub fn residual_count(&self) -> usize {
+        self.slots.values().map(|slot| slot.adapters().len()).sum()
+    }
+
+    /// Whether no residual is held.
+    pub fn is_empty(&self) -> bool {
+        self.residual_count() == 0
+    }
+
+    /// Evaluate every held residual's own arrays (never a base). Called once at load, so a
+    /// window's per-block eval never pulls a lazy adapter-file read into the block stream.
+    pub fn materialize(&self) -> Result<()> {
+        for slot in self.slots.values() {
+            slot.materialize_adapters()?;
+        }
+        Ok(())
+    }
+}
+
+/// The streamed block stack as an adapter target (SW-7096): `transformer_blocks.{i}.<leaf>` resolves
+/// to block `i`'s slot. Any model that streams its blocks through a [`DitBlockStream`] — H3 video's
+/// deferred DiT today, the image DiT's once it streams — routes its block paths here, so the
+/// strict install lands every block residual in the overlay that [`DitBlockStream::materialize`]
+/// re-applies.
+impl AdaptableHost for DitBlockStream {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", i, rest @ ..] => {
+                let index: usize = i.parse().ok()?;
+                self.adapter_slot_mut(index, rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// The probe answers from the **staged** projection, not from the slot's shape-only dense
+    /// base: a Q4/Q8 tier's leaf reports `is_quantized`, so the shared LyCORIS install keeps a
+    /// LoKr's structured Kronecker factors exactly as on the resident packed block (and as
+    /// admission prices it) instead of building a full `[out, in]` delta per streamed leaf.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<mlx_gen::adapters::LinearFacts> {
+        let ["transformer_blocks", i, rest @ ..] = path else {
+            return None;
+        };
+        let index: usize = i.parse().ok()?;
+        let (name, _) = block_leaf_shape(&self.cfg, &rest.join("."))?;
+        let headers = self.staged_headers().ok()?;
+        let staged = mlx_gen::adapters::facts::linear_header_facts(
+            &headers,
+            &format!("transformer_blocks.{index}.{name}"),
+            crate::quant::GROUP_SIZE,
+            None,
+        )
+        .ok()?;
+        let slot = mlx_gen::adapters::LinearFacts::of(self.adapter_slot_mut(index, rest)?);
+        (staged.base_shape == slot.base_shape).then_some(mlx_gen::adapters::LinearFacts {
+            is_quantized: staged.is_quantized,
+            ..slot
+        })
+    }
+}
+
+/// The AdaLN projection's leaf path inside a block.
+pub const ADALN_LEAF: &str = "adaln_proj.linear";
+
+/// The logical `[out, in]` shape of one adaptable block leaf, or `None` for a path that is not one
+/// of [`crate::adapters::BLOCK_TARGETS`].
+fn block_leaf_shape(cfg: &MiniMaxH3DitConfig, leaf: &str) -> Option<(&'static str, [i32; 2])> {
+    let hidden = cfg.hidden_size;
+    let inner = cfg.inner_dim();
+    let ffn = cfg.ffn_dim;
+    let (name, shape) = match leaf {
+        "attn.to_q" => ("attn.to_q", [inner, hidden]),
+        "attn.to_k" => ("attn.to_k", [inner, hidden]),
+        "attn.to_v" => ("attn.to_v", [inner, hidden]),
+        "attn.to_out.0" => ("attn.to_out.0", [hidden, inner]),
+        "ff.net.0.proj" => ("ff.net.0.proj", [2 * ffn, hidden]),
+        "ff.net.2" => ("ff.net.2", [hidden, ffn]),
+        // SW-7096: the AdaLN projection — re-applied by `materialize_adaln`, not by the body
+        // rebuild. Only a host that admits AdaLN adapters (the image DiT) routes here.
+        ADALN_LEAF => (ADALN_LEAF, [cfg.adaln_out_features(), cfg.time_embed_dim]),
+        _ => return None,
+    };
+    Some((name, shape))
 }
 
 impl DitBlockStream {
@@ -98,7 +227,75 @@ impl DitBlockStream {
             dir: dir.to_path_buf(),
             dtype,
             cfg,
+            adapters: StreamedBlockAdapters::default(),
+            headers: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The adapter slot for block `index`'s leaf `leaf` (`["attn", "to_q"]` …), created on first
+    /// use. `None` for an out-of-range block or a leaf that is not adapter-addressable, which the
+    /// strict install reports as unmatched — exactly what the resident block would answer.
+    pub fn adapter_slot_mut(
+        &mut self,
+        index: usize,
+        leaf: &[&str],
+    ) -> Option<&mut AdaptableLinear> {
+        if index >= self.n_blocks() {
+            return None;
+        }
+        let (name, [out, inp]) = block_leaf_shape(&self.cfg, &leaf.join("."))?;
+        match self.adapters.slots.entry((index, name)) {
+            std::collections::btree_map::Entry::Occupied(slot) => Some(slot.into_mut()),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let base = Array::zeros::<f32>(&[out, inp]).ok()?;
+                Some(slot.insert(AdaptableLinear::dense(base, None)))
+            }
+        }
+    }
+
+    /// The staged directory's tensor headers, read once.
+    fn staged_headers(&self) -> Result<std::sync::Arc<StagedHeaders>> {
+        if let Some(headers) = self.headers.get() {
+            return Ok(headers.clone());
+        }
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&self.dir)
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "minimax-h3 block stream: reading {} headers: {error}",
+                    self.dir.display()
+                ))
+            })?
+            .into_iter()
+            .map(|h| (h.name.clone(), h))
+            .collect();
+        Ok(self
+            .headers
+            .get_or_init(|| std::sync::Arc::new(headers))
+            .clone())
+    }
+
+    /// The adapter residuals this stream re-applies to every rebuilt block.
+    pub fn adapters(&self) -> &StreamedBlockAdapters {
+        &self.adapters
+    }
+
+    /// Push block `index`'s held residuals onto its freshly rebuilt `block`.
+    fn install_adapters(&self, block: &mut DitBlock, index: usize) -> Result<()> {
+        for ((_, leaf), slot) in self.adapters.slots.range((index, "")..(index + 1, "")) {
+            if slot.adapters().is_empty() || *leaf == ADALN_LEAF {
+                continue;
+            }
+            let segs: Vec<&str> = leaf.split('.').collect();
+            let target = block.adaptable_mut(&segs).ok_or_else(|| {
+                Error::Msg(format!(
+                    "minimax-h3 block stream: block {index} has no adaptable leaf {leaf}"
+                ))
+            })?;
+            for adapter in slot.adapters() {
+                target.push(adapter.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Blocks in the streamed stack — `num_layers`, 50 shipped.
@@ -134,11 +331,13 @@ impl DitBlockStream {
     /// the failure `run_windowed`'s own doc warns about.
     pub fn materialize(&self, view: &mut Weights, index: usize) -> Result<DitBlock> {
         let prefix = format!("transformer_blocks.{index}");
-        let block = DitBlock::from_weights_body_only(view, &prefix, &self.cfg, self.dtype)?;
+        let mut block = DitBlock::from_weights_body_only(view, &prefix, &self.cfg, self.dtype)?;
         // sc-23402: force + GPU-verify this block's ten source tensors (sc-22414) before its
         // prefix is drained — one block per eval, which is also the sc-23108 submission bound.
         view.materialize_accessed()?;
         view.remove_prefix(&format!("{prefix}."));
+        // SW-7096: the rebuilt block carries the configured adapters, exactly as the resident one.
+        self.install_adapters(&mut block, index)?;
         Ok(block)
     }
 
@@ -148,7 +347,14 @@ impl DitBlockStream {
     /// call this — see the module docs.
     pub fn materialize_adaln(&self, view: &mut Weights, index: usize) -> Result<AdaLnProjection> {
         let prefix = format!("transformer_blocks.{index}.adaln_proj.linear");
-        let projection = AdaLnProjection::from_weights(view, &prefix, &self.cfg, self.dtype)?;
+        let mut projection = AdaLnProjection::from_weights(view, &prefix, &self.cfg, self.dtype)?;
+        // SW-7096: an AdaLN residual is re-applied here, so the windowed precompute's tables
+        // carry it exactly as the resident precompute's do.
+        if let Some(slot) = self.adapters.slots.get(&(index, ADALN_LEAF)) {
+            for adapter in slot.adapters() {
+                projection.linear_mut().push(adapter.clone());
+            }
+        }
         // sc-23402: the projection's two source tensors, forced and GPU-verified (sc-22414) before
         // the precompute consumes them and the prefix is drained.
         view.materialize_accessed()?;
@@ -273,6 +479,121 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("config.json"), "{error}");
+    }
+
+    /// SW-7096: the stream is an adapter host over exactly the six adaptable leaves of each of its
+    /// blocks, at each leaf's logical shape; everything else is unmatched, as on a resident block.
+    /// SW-7096: the stream's probe reports each leaf's **staged** packed status, read off the
+    /// headers, so a LoKr install over a Q4/Q8 stream keeps structured factors as on the resident
+    /// packed block. A dense leaf stays dense; a leaf whose headers are absent is no target.
+    #[test]
+    fn stream_adapter_probe_reports_the_staged_packed_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let tensors: &[(&str, &str, &[usize])] = &[
+            ("transformer_blocks.0.attn.to_q.weight", "BF16", &[128, 128]),
+            ("transformer_blocks.1.attn.to_q.weight", "U32", &[128, 16]),
+            ("transformer_blocks.1.attn.to_q.scales", "BF16", &[128, 2]),
+            ("transformer_blocks.1.attn.to_q.biases", "BF16", &[128, 2]),
+        ];
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_usize;
+        for (name, dtype, shape) in tensors {
+            let len = shape.iter().product::<usize>() * if *dtype == "U32" { 4 } else { 2 };
+            header.insert(
+                (*name).into(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len]}),
+            );
+            offset += len;
+        }
+        let json = serde_json::Value::Object(header).to_string().into_bytes();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        let cfg = MiniMaxH3DitConfig {
+            num_attention_heads: 1,
+            attention_head_dim: 128,
+            hidden_size: 128,
+            num_layers: 3,
+            ..MiniMaxH3DitConfig::default()
+        };
+        let mut stream = DitBlockStream::new(dir.path(), Dtype::Bfloat16, cfg).unwrap();
+        let facts = |stream: &mut DitBlockStream, block: &str| {
+            stream.adaptable_facts(&["transformer_blocks", block, "attn", "to_q"])
+        };
+        let dense = facts(&mut stream, "0").expect("dense leaf");
+        assert!(!dense.is_quantized);
+        assert_eq!(dense.base_shape, vec![128, 128]);
+        let packed = facts(&mut stream, "1").expect("packed leaf");
+        assert!(packed.is_quantized, "the staged q4 leaf is packed");
+        assert_eq!(packed.base_shape, vec![128, 128]);
+        assert!(facts(&mut stream, "2").is_none(), "no staged header");
+        assert!(stream.adapters().is_empty(), "probing holds no residual");
+    }
+
+    #[test]
+    fn stream_adapter_slots_cover_exactly_the_block_leaves() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let cfg = MiniMaxH3DitConfig::default();
+        let mut stream = DitBlockStream::new(dir.path(), Dtype::Bfloat16, cfg.clone()).unwrap();
+        for (leaf, shape) in [
+            ("attn.to_q", [7168, 5376]),
+            ("attn.to_k", [7168, 5376]),
+            ("attn.to_v", [7168, 5376]),
+            ("attn.to_out.0", [5376, 7168]),
+            ("ff.net.0.proj", [28672, 5376]),
+            ("ff.net.2", [5376, 14336]),
+        ] {
+            let path = format!("transformer_blocks.49.{leaf}");
+            let segs: Vec<&str> = path.split('.').collect();
+            let slot = stream
+                .adaptable_mut(&segs)
+                .unwrap_or_else(|| panic!("{path}"));
+            assert_eq!(slot.base_shape(), shape.to_vec(), "{path}");
+        }
+        for unmatched in [
+            "transformer_blocks.50.attn.to_q",
+            "transformer_blocks.0.attn.qkv_proj",
+            "token_refiner.refiner_blocks.0.attn.to_q",
+            "proj_in",
+        ] {
+            let segs: Vec<&str> = unmatched.split('.').collect();
+            assert!(stream.adaptable_mut(&segs).is_none(), "{unmatched}");
+        }
+        // SW-7096: the AdaLN projection has a slot too, re-applied by `materialize_adaln`; the video
+        // host keeps it unreachable, the image host routes to it.
+        let adaln = stream
+            .adaptable_mut(&["transformer_blocks", "7", "adaln_proj", "linear"])
+            .expect("adaln slot");
+        assert_eq!(adaln.base_shape(), vec![96768, 2688]);
+        assert!(
+            stream.adapters().is_empty(),
+            "creating slots holds no residual"
+        );
+        // Residuals pushed onto a slot are what `materialize` re-applies to the rebuilt block
+        // (proven against real weights in `tests/h3_image_lora_real.rs`, which ordinary CI does
+        // not run because it rebuilds blocks).
+        let q = ["transformer_blocks", "3", "attn", "to_q"];
+        for rank in [2, 3] {
+            stream
+                .adaptable_mut(&q)
+                .unwrap()
+                .push(mlx_gen::adapters::Adapter::Lora {
+                    a: Array::zeros::<f32>(&[5376, rank]).unwrap(),
+                    b: Array::zeros::<f32>(&[rank, 7168]).unwrap(),
+                    scale: 0.5,
+                });
+        }
+        assert_eq!(stream.adapters().residual_count(), 2);
+        assert_eq!(stream.adaptable_mut(&q).unwrap().adapters().len(), 2);
+        let cloned = stream.clone();
+        assert_eq!(
+            cloned.adapters().residual_count(),
+            2,
+            "a cloned stream keeps the overlay"
+        );
     }
 
     #[test]

@@ -263,6 +263,59 @@ fn load_memory_requirements_remain_checked() {
 }
 
 #[test]
+fn schema_constraint_applies_after_reasoning_closes_and_survives_rewind() {
+    let schema = core_llm::JsonSchema::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {"r": {"type": "string", "enum": ["1:1"]}},
+        "required": ["r"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let constraint = core_llm::Constraint::JsonSchema(schema);
+    // ids: 0="plan" 1="</think>" 2="\n\n" 3="{\"r\":" 4="\"1:1\"" 5="}" 6=eos 7="{\"x\":"
+    // 8="</think>{\"r\":"
+    let table = core_llm::ConstraintDecodeTable {
+        pieces: vec![
+            "plan".into(),
+            "</think>".into(),
+            "\n\n".into(),
+            "{\"r\":".into(),
+            "\"1:1\"".into(),
+            "}".into(),
+            String::new(),
+            "{\"x\":".into(),
+            "</think>{\"r\":".into(),
+        ],
+        special: [6].into_iter().collect(),
+    };
+    let mut mask = JsonMask::for_constraint(&constraint, &table, [6], true);
+    let m = mask.allowed().to_vec();
+    assert!(m[0] && m[2] && m[7], "reasoning text is free");
+    assert!(
+        m[1] && m[8],
+        "the reasoning may close, alone or with a valid answer start"
+    );
+    assert!(!m[6], "EOS cannot end an open reasoning block");
+    mask.accept(0);
+    mask.accept(1);
+    let checkpoint = mask.checkpoint();
+    let m = mask.allowed().to_vec();
+    assert!(m[3], "the answer opens with the schema's first key");
+    assert!(!m[2], "no whitespace after </think>");
+    assert!(!m[7], "an undeclared key is masked");
+    mask.accept(3);
+    mask.accept(4);
+    mask.accept(5);
+    assert!(mask.allowed()[6], "stop once the document is complete");
+    mask.rewind(checkpoint);
+    let m = mask.allowed().to_vec();
+    assert!(
+        m[3] && !m[6] && !m[2],
+        "rewind restores the schema state, not plain JSON"
+    );
+}
+
+#[test]
 fn reasoning_boundary_commits_same_token_json_in_release_builds() {
     let table = core_llm::ConstraintDecodeTable {
         pieces: vec!["</think>{}".into(), String::new(), "{".into()],
@@ -5641,5 +5694,119 @@ mod prefix_cache {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it");
+    }
+}
+
+/// The synthetic qwen3_5 snapshot as a ModelOpt NVFP4 checkpoint: every NVFP4-eligible
+/// projection (and the untied head when `convert_head`) a published triple. `eligible_head` widens
+/// the synthetic head (50 rows, which NVFP4 keeps dense) to 64 rows; only admission reads it.
+/// Returns the snapshot and the staged NVFP4 bytes of its triples.
+fn modelopt_qwen35_snapshot(convert_head: bool, eligible_head: bool) -> (tempfile::TempDir, u64) {
+    use crate::primitives::projection::nvfp4_device_bytes;
+    use candle_core::{DType, Device};
+    let dense = qwen35_snapshot(false, false, true);
+    let mut tensors =
+        candle_core::safetensors::load(dense.path().join("model.safetensors"), &Device::Cpu)
+            .unwrap();
+    if eligible_head {
+        let cols = tensors["lm_head.weight"].dims2().unwrap().1;
+        let head = Tensor::zeros((64, cols), DType::BF16, &Device::Cpu).unwrap();
+        tensors.insert("lm_head.weight".into(), head);
+    }
+    let keys: Vec<String> = tensors.keys().cloned().collect();
+    let (mut expected, mut converted) = (0u64, 0usize);
+    for key in keys {
+        let quantized = crate::models::qwen35::quantizes_tensor(&key)
+            || (convert_head && key == "lm_head.weight");
+        let (rows, cols) = match tensors[&key].dims2() {
+            Ok(dims) if quantized => dims,
+            _ => continue,
+        };
+        let Some(bytes) = nvfp4_device_bytes(rows, cols) else {
+            continue;
+        };
+        let stem = key.strip_suffix(".weight").unwrap().to_string();
+        tensors.insert(
+            key.clone(),
+            Tensor::zeros((rows, cols / 2), DType::U8, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            format!("{stem}.weight_scale"),
+            Tensor::zeros((rows, cols / 16), DType::U8, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            format!("{stem}.weight_scale_2"),
+            Tensor::new(1.0f32, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            format!("{stem}.input_scale"),
+            Tensor::new(1.0f32, &Device::Cpu).unwrap(),
+        );
+        expected += bytes;
+        converted += 1;
+    }
+    assert!(
+        converted > 0,
+        "the synthetic decoder has NVFP4-eligible projections"
+    );
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dense.path().join("config.json")).unwrap())
+            .unwrap();
+    config["quantization_config"] = serde_json::json!({
+        "quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16,
+    });
+    let dir = dense.path();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+    (dense, expected)
+}
+
+/// SW-7099 review: a ModelOpt checkpoint's head without `.weight_scale` loads dense, so it is
+/// never priced as an NVFP4 copy — where the same head published as a triple is.
+#[test]
+fn a_modelopt_snapshots_dense_head_is_not_priced_as_nvfp4() {
+    let (with_head, staged_with_head) = modelopt_qwen35_snapshot(true, true);
+    let (snapshot, staged) = modelopt_qwen35_snapshot(false, true);
+    assert!(
+        staged_with_head > staged,
+        "the synthetic head is NVFP4-eligible"
+    );
+    let copy = |dir: &std::path::Path| {
+        super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true)
+            .unwrap()
+            .quantized_copy_bytes
+    };
+    assert_eq!(copy(snapshot.path()), staged);
+    assert_eq!(copy(with_head.path()), staged_with_head);
+}
+
+/// SW-7099: a ModelOpt NVFP4 qwen3_5 snapshot is priced as the load builds it — every published
+/// triple staged at its logical shape as the resident NVFP4 operand, the triples themselves held
+/// on the host and never cast — and a device that cannot serve NVFP4 refuses it by name instead
+/// of reading the packed codes as dense weights.
+#[test]
+fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell() {
+    let (dense, expected) = modelopt_qwen35_snapshot(true, false);
+    let dir = dense.path();
+
+    let estimate = super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true).unwrap();
+    assert_eq!(estimate.quantized_copy_bytes, expected);
+
+    if crate::backend::backend_capabilities().nvfp4.supported {
+        return; // A Blackwell host loads it; the refusal is the other hosts' half.
+    }
+    match super::LlamaProvider::load(&spec_at(dir, None)) {
+        Err(error) => {
+            let error = error.to_string();
+            assert!(
+                error.contains("nvfp4: ") && error.contains("ModelOpt"),
+                "{error}"
+            );
+        }
+        Ok(_) => panic!("a ModelOpt NVFP4 snapshot loaded without an NVFP4 device"),
+    }
+    match super::LlamaProvider::load(&spec_at(dir, Some(core_llm::Quantize::Q8))) {
+        Err(error) => assert!(error.to_string().contains("ModelOpt"), "{error}"),
+        Ok(_) => panic!("a ModelOpt NVFP4 snapshot was re-quantized to Q8"),
     }
 }
