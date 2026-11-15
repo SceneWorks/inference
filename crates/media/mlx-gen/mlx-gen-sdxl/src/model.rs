@@ -1261,6 +1261,10 @@ impl mlx_gen::gen_core::Generator for Sdxl {
                     "Sdxl.load_quantization_policy",
                     &self.loaded_spec.quantize,
                 );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Sdxl.applied_adapter_controls",
+                    &self.loaded_spec.adapters,
+                );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_observed(req, &mut progress)

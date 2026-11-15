@@ -111,6 +111,7 @@ pub struct QwenImageEdit {
     memory_strategy: gen_core::MemoryProviderContract,
     precision: Precision,
     quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
 }
 
 /// The heavy render-phase components (the edit MMDiT transformer, the VAE, and the optional PiD
@@ -186,6 +187,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -423,6 +425,10 @@ impl Generator for QwenImageEdit {
                 mlx_gen::image_execution::policy_debug(
                     "QwenImageEdit.loaded_sequential_residency",
                     &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "QwenImageEdit.applied_adapter_controls",
+                    &self.adapters,
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));

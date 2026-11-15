@@ -111,6 +111,7 @@ pub struct ZImage {
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     /// Shared request-scoped residency. The first warm request populates the pair; staged requests
     /// evict it before loading either phase.
     residency: Residency<TextEncoder, ZImageHeavyOwned>,
@@ -140,6 +141,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(ZImage {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         loaded_tier,
+        adapters: spec.adapters.clone(),
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -174,6 +176,10 @@ impl Generator for ZImage {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            mlx_gen::image_execution::applied_adapter_controls(
+                "ZImage.applied_adapter_controls",
+                &self.adapters,
+            );
             let mut progress =
                 |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
             self.generate_impl(req, &mut progress).map_err(Into::into)

@@ -651,6 +651,10 @@ impl Generator for QwenImage21 {
                     "QwenImage21.load_quantization_policy",
                     &self.spec.quantize,
                 );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "QwenImage21.applied_adapter_controls",
+                    &self.spec.adapters,
+                );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_with_report_observed(req, &mut progress)

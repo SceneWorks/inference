@@ -99,6 +99,7 @@ pub struct ZImageControl {
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     /// Request-scoped residency shared with the Turbo control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
@@ -125,6 +126,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(ZImageControl {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         loaded_tier,
+        adapters: spec.adapters.clone(),
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -382,6 +384,10 @@ impl Generator for ZImageControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            mlx_gen::image_execution::applied_adapter_controls(
+                "ZImageControl.applied_adapter_controls",
+                &self.adapters,
+            );
             let mut progress =
                 |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
             self.generate_impl(req, &mut progress).map_err(Into::into)

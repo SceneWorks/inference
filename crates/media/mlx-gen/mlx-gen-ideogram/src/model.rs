@@ -126,6 +126,7 @@ pub struct Ideogram4 {
     /// The numeric tier this load runs at, kept for the contract's own safety gate.
     precision: Precision,
     quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     residency: Residency<Ideogram4Text, Ideogram4HeavyOwned>,
 }
 
@@ -162,6 +163,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(IDEOGRAM_4_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
         residency: build_residency(spec, false)?,
     }))
 }
@@ -199,6 +201,7 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
         residency: build_residency(spec, true)?,
     }))
 }
@@ -377,6 +380,10 @@ impl Generator for Ideogram4 {
                 mlx_gen::image_execution::policy_debug(
                     "Ideogram4.loaded_sequential_residency",
                     &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Ideogram4.applied_adapter_controls",
+                    &self.adapters,
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));

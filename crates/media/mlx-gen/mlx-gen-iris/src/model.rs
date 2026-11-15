@@ -806,6 +806,10 @@ impl Generator for Iris3b {
                     "Iris3b.load_quantization_policy",
                     &self.spec.quantize,
                 );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Iris3b.applied_adapter_controls",
+                    &self.spec.adapters,
+                );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_with_report_observed(req, &mut progress)

@@ -228,6 +228,17 @@ pub fn policy_debug(name: &str, value: &impl std::fmt::Debug) {
     policy(name, Value::String(format!("{value:?}")));
 }
 
+/// Capture effective controls for a provider that strictly installs its adapter stack.
+/// The caller records this only for paths that consume every listed adapter.
+pub fn applied_adapter_controls(name: &str, adapters: &[crate::AdapterSpec]) {
+    let controls: Vec<_> = adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect();
+    policy_debug(name, &controls);
+}
+
 /// Exact IEEE-754 representation of an effective scalar consumed by the provider.
 pub fn scalar(name: &str, value: f32) {
     match ExecutionFact::f32_bits(value) {
@@ -499,6 +510,34 @@ impl Observations {
 mod tests {
     use super::*;
     use crate::{Capabilities, Image, Modality};
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_kind_and_order() {
+        use crate::runtime::AdapterKind;
+        let first = crate::AdapterSpec::new("first.safetensors".into(), 0.5, AdapterKind::Lora);
+        let second = crate::AdapterSpec::new("second.safetensors".into(), 1.0, AdapterKind::Lokr);
+        let capture = |adapters: &[crate::AdapterSpec]| {
+            complete_image_attempt(&descriptor(), &CancelFlag::new(), || {
+                applied_adapter_controls("adapters", adapters);
+                observe(1);
+                Ok(output())
+            })
+            .unwrap()
+            .execution
+            .resolved()
+            .unwrap()
+            .quality_policy
+            .clone()
+        };
+        let base = capture(&[first.clone(), second.clone()]);
+        let mut scaled = first.clone();
+        scaled.scale = 0.75;
+        assert_ne!(base, capture(&[scaled, second.clone()]));
+        let mut different_kind = first.clone();
+        different_kind.kind = AdapterKind::Lokr;
+        assert_ne!(base, capture(&[different_kind, second.clone()]));
+        assert_ne!(base, capture(&[second, first]));
+    }
 
     fn descriptor() -> ModelDescriptor {
         ModelDescriptor {

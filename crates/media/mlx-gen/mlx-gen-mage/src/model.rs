@@ -1139,6 +1139,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
+        adapters: spec.adapters.clone(),
         memory_strategy_contract,
         residency,
     }))
@@ -1281,6 +1282,7 @@ pub struct MageFlow {
     variant: MageVariant,
     descriptor: ModelDescriptor,
     tier: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     memory_strategy_contract: MemoryProviderContract,
     residency: Residency<crate::MageTextEncoder, MageHeavyOwned>,
 }
@@ -1494,6 +1496,10 @@ impl Generator for MageFlow {
             &req.cancel,
             || {
                 mlx_gen::image_execution::policy_debug("MageFlow.tier", &self.tier);
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "MageFlow.applied_adapter_controls",
+                    &self.adapters,
+                );
                 mlx_gen::image_execution::policy_debug(
                     "MageFlow.loaded_sequential_residency",
                     &self.residency.is_sequential(),

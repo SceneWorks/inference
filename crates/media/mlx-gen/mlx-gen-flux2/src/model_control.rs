@@ -117,6 +117,7 @@ pub struct Flux2DevControl {
     memory_strategy: gen_core::MemoryProviderContract,
     memory_numeric_tier: gen_core::MemoryNumericTier,
     tokenizer: Option<TextTokenizer>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     residency: Residency<Flux2TextOwned, Flux2ControlHeavyOwned>,
 }
 
@@ -167,6 +168,7 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::registered_dev_control_contract(spec)?,
         memory_numeric_tier,
         tokenizer: Some(tokenizer),
+        adapters: spec.adapters.clone(),
         residency: build_control_residency_with_source(spec, text_encoder_source)?,
     }))
 }
@@ -272,6 +274,7 @@ impl Flux2DevControl {
                 FLUX2_DEV_CONTROL_ID,
             )?,
             tokenizer: None,
+            adapters: spec.adapters.clone(),
             residency: Residency::sequential(
                 || {
                     Err(Error::Msg(
@@ -628,6 +631,10 @@ impl Generator for Flux2DevControl {
                 mlx_gen::image_execution::policy_debug(
                     "Flux2DevControl.loaded_sequential_residency",
                     &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Flux2DevControl.applied_adapter_controls",
+                    &self.adapters,
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
