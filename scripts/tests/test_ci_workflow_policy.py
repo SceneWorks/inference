@@ -890,8 +890,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # reference cache miss, separately from the `mlx-minimax-h3-image` gate job;
         # 47 since SW-7097 added the dispatch-only `mlx-minimax-h3-image-train` job;
         # 48 since SW-7098 added the dispatch-only `mlx-minimax-h3-image-train-load` job;
-        # 49 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-publish` job.
-        MACOS_HUB_LOCK: 49,
+        # 49 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-publish` job;
+        # 50 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-pe-render` job.
+        MACOS_HUB_LOCK: 50,
         # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
         # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
@@ -907,8 +908,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 23 since SW-7097 added the dispatch-only `candle-minimax-h3-image-train` job;
         # 24 since SW-7098's Candle trainer gates install the lock in that job too;
         # 26 since SW-7104's `candle-minimax-h3-image-pe-publish` installs it to publish and again
-        # in its snapshot materialization.
-        WINDOWS_HUB_LOCK: 26,
+        # in its snapshot materialization;
+        # 27 since SW-7104 added the dispatch-only `candle-minimax-h3-image-pe-render` job.
+        WINDOWS_HUB_LOCK: 27,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1579,9 +1581,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # 47 macOS / 23 Windows after SW-7097 added the H3-Image trainer pair; 48 / 24 after SW-7098
         # added the MLX load of the Candle-trained adapter and the Candle trainer gates; 49 / 26
         # after SW-7104 added the tier publication pair (its Windows job installs the client to
-        # publish and again in the PE lane's own materialization script).
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 49)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 26)
+        # publish and again in the PE lane's own materialization script); 50 / 27 after SW-7104
+        # added the PE-expansion render pair.
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 50)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 27)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(

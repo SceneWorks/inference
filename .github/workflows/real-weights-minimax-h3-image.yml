@@ -4,8 +4,10 @@ name: Real-weight validation (MiniMax-H3-Image)
 # `minimax-h3-image` job after its `validate-selection` barrier, with the dispatched `profile`:
 #
 # * `minimax-h3-image` — the diffusers reference, the MLX and Candle VAE / DiT parity / t2i / edit /
-#   tier / LoRA / sampler A/B gates (SW-7089..7096, SW-7106);
-# * `minimax-h3-image-pe` — the H3-Image-PE NVFP4 reference and tier scoring (SW-7099);
+#   tier / LoRA / sampler A/B gates (SW-7089..7096, SW-7106) and the feature acceptance renders
+#   (SW-7104: AT1/AT2, AT3, AT6, AT8, AT11);
+# * `minimax-h3-image-pe` — the H3-Image-PE NVFP4 reference and tier scoring (SW-7099), then each
+#   backend renders a short prompt and its PE expansion (SW-7104, AT9);
 # * `minimax-h3-image-train` — the SW-7097 trainer: on the MLX real-weights Mac (the
 #   `mlx-minimax-h3-image` job's label), materialize the snapshot and MiniMax-H3's text encoder,
 #   convert the q4 DiT tier, and run the gradient-correctness, t2i train/reproduce/resume and edit
@@ -111,6 +113,15 @@ jobs:
         with:
           name: minimax-h3-image-sampler-ab-mlx
           path: ${{ runner.temp }}/minimax-h3-image-sampler-ab
+      # SW-7104: feature SW-F363's acceptance renders (AT1, AT3, AT6, AT8, AT11).
+      - name: Run the acceptance renders
+        if: ${{ !cancelled() }}
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-acceptance-renders.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: minimax-h3-image-acceptance-mlx
+          path: ${{ runner.temp }}/minimax-h3-image-acceptance
 
   candle-minimax-h3-image:
     needs: [minimax-h3-image-reference]
@@ -150,6 +161,16 @@ jobs:
         with:
           name: minimax-h3-image-sampler-ab-candle
           path: ${{ runner.temp }}/minimax-h3-image-sampler-ab
+      # SW-7104: feature SW-F363's acceptance renders (AT2, AT3, AT6, AT8, AT11).
+      - name: Run the acceptance renders
+        if: ${{ !cancelled() }}
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-acceptance-renders.cmd
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: minimax-h3-image-acceptance-cuda
+          path: ${{ runner.temp }}/minimax-h3-image-acceptance
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -256,6 +277,73 @@ jobs:
           path: ${{ runner.temp }}/minimax-pe-mlx-evidence
           if-no-files-found: error
           retention-days: 30
+
+  # SW-7104 (AT9): each backend renders a short t2i prompt and its PE expansion from the PE jobs'
+  # own evidence (Candle: the native NVFP4 run; MLX: its q8 tier) at one seed, and the expanded
+  # render must carry more detail. The expansions themselves - t2i and the 2-reference edit - are
+  # the PE jobs' fixed set.
+  candle-minimax-h3-image-pe-render:
+    needs: candle-minimax-h3-image-pe
+    name: Candle H3-Image renders the PE expansion (CUDA)
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image-pe' && needs.candle-minimax-h3-image-pe.outputs.nvfp4_reference == 'true' }}
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 240
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CUDA_COMPUTE_CAP: "80"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-render\install-reviewed-cpython-3-12.cmd
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: minimax-h3-image-pe-cuda-evidence
+          path: ${{ runner.temp }}/minimax-pe-cuda-evidence
+      - name: Render the short and the expanded prompt
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-render\render-the-short-and-the-expanded-prompt.cmd
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: minimax-h3-image-pe-render-cuda
+          path: ${{ runner.temp }}/minimax-h3-image-acceptance
+
+  mlx-minimax-h3-image-pe-render:
+    needs: mlx-minimax-h3-image-pe
+    name: MLX H3-Image renders the PE expansion
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image-pe' }}
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: minimax-h3-image-pe-mlx-evidence
+          path: ${{ runner.temp }}/minimax-pe-mlx-evidence
+      - name: Materialize the image weights
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe-render/materialize-the-image-weights.sh
+      - name: Set up the MLX build environment
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe-render/set-up-the-mlx-build-environment.sh
+      - name: Render the short and the expanded prompt
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe-render/render-the-short-and-the-expanded-prompt.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: minimax-h3-image-pe-render-mlx
+          path: ${{ runner.temp }}/minimax-h3-image-acceptance
 
   mlx-minimax-h3-image-train:
     name: MLX H3-Image trainer gates
