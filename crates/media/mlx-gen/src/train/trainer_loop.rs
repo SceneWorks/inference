@@ -684,7 +684,7 @@ pub fn run_train_loop<F: TrainLoopFamily + ?Sized>(
     }
     // Keep the terminal optimizer/factors as well as the inference export. A completed
     // run can then be forked into a longer schedule without replaying its last interval.
-    if steps_run == cfg.steps && !cfg.full_finetune {
+    if steps_run == cfg.steps && start_step < cfg.steps && !cfg.full_finetune {
         family.save_checkpoint(CheckpointAt {
             output_dir: &req.output_dir,
             stem,

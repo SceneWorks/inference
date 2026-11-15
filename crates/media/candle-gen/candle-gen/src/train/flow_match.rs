@@ -1506,7 +1506,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // Flush any pending (sub-`accum`) accumulation so the final partial step is applied. Average by the
     // ACTUAL `pending` micro-count, not the nominal `accum`, so this tail update is a true mean of the
     // grads it holds rather than a `pending/accum`-underweighted step (F-034, sc-9018).
-    let mut terminal_checkpoint_saved = false;
+    let mut terminal_checkpoint_saved = start_step == cfg.steps;
     if accumulated.is_some() {
         apply_update(
             &mut opt,
@@ -2634,6 +2634,37 @@ mod tests {
         let metadata = crate::gen_core::safetensors_file_metadata(&snapshot).unwrap();
         assert_eq!(metadata["step"], "5");
         assert_eq!(metadata["update_idx"], "2");
+    }
+
+    #[test]
+    fn terminal_resume_can_retry_export_without_republishing_the_checkpoint() {
+        let model = MockTrainer {
+            device: Device::Cpu,
+            steps_seen: Cell::new(0),
+            saves: Cell::new(0),
+            cache_len: 2,
+        };
+        let (_fixture, mut req) = mock_request(2, 4, 1, 0, CancelFlag::new());
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
+        let checkpoint = req.output_dir.join(format!(
+            "{}-step000004.resume.safetensors",
+            file_stem(&req.file_name)
+        ));
+        let before = std::fs::read(&checkpoint).unwrap();
+        req.config.resume = true;
+        let mut trained = false;
+        run_flow_match_training(
+            &model,
+            &req,
+            &mut |event| {
+                trained |= matches!(event, TrainingProgress::Training { .. });
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!trained);
+        assert_eq!(model.saves.get(), 2, "the terminal export is retried");
+        assert_eq!(std::fs::read(checkpoint).unwrap(), before);
     }
 
     /// `save_every` writes intermediate checkpoints (at steps that are multiples below the last) plus
