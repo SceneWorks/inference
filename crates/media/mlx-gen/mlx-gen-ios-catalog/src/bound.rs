@@ -5,6 +5,9 @@
 //! BEFORE reaching the provider, and preserves the caller's real cancellation handle.
 use crate::ios_admission::{work_binding, IosWork};
 use gen_core_iris::depth::{DepthOutput, DepthRequest, IrisDepthEstimator};
+use mlx_gen::gen_core::generator::CompletedGeneration;
+#[cfg(test)]
+use mlx_gen::gen_core::generator::{ExecutionIdentity, ExecutionUnavailable};
 use mlx_gen::gen_core::*;
 
 fn generation_binding(req: &GenerationRequest) -> [u8; 32] {
@@ -303,6 +306,25 @@ impl Generator for BoundGenerator {
     ) -> Result<GenerationReport> {
         self.run_generation(req, |inner, exact| {
             inner.generate_with_report(exact, progress)
+        })
+    }
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.run_generation(req, |inner, exact| {
+            inner.generate_with_execution_report(exact, progress)
+        })
+    }
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        chunk: &mut dyn FnMut(AudioChunk),
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.run_generation(req, |inner, exact| {
+            inner.generate_streaming_with_execution_report(exact, chunk, progress)
         })
     }
     fn open_conversation(

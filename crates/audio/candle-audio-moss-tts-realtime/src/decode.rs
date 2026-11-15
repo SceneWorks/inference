@@ -411,6 +411,11 @@ impl Decoder {
         // `_REP_PENALTY`) were removed by sc-27267 (and are banned as src reads by
         // `scripts/check-workspace.py`): ambient host env must not change the sampled audio.
         let params = DEFAULT_PARAMS;
+        params.observe_execution("moss-tts-realtime");
+        candle_audio::execution::policy(
+            "decode",
+            serde_json::json!({"budget":max_frames,"config":format!("{:?}",self.cfg)}),
+        );
         // Optional minimum-length EOS suppression (off by default — reference parity, sc-13570): with
         // a nonzero floor, audio-EOS on codebook 0 is masked for the first `min_frames` steps (capped
         // at half the budget). The reference applies no floor; correct delay-pattern conditioning

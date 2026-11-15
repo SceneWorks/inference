@@ -187,6 +187,23 @@ pub fn decode_tokens(
         observer,
     } = hooks;
     let sampling = request.sampling;
+    if sampling.temperature() == 0.0 {
+        candle_audio::execution::no_draws("YuE2 temperature-zero categorical decode is greedy");
+    } else {
+        candle_audio::execution::require_seed(match request.phase {
+            Phase::Abc => "yue2-abc",
+            Phase::Semantic => "yue2-semantic",
+        });
+    }
+    candle_audio::execution::runtime(lm.device(), lm.dtype());
+    candle_audio::execution::sampling(
+        "yue2-ar",
+        serde_json::json!({"settings":format!("{sampling:?}"),"guidance_bits":request.guidance.map(|g|g.scale.to_bits()),"legacy_off":request.legacy_off}),
+    );
+    candle_audio::execution::policy(
+        "yue2-ar",
+        serde_json::json!({"legacy_off":request.legacy_off,"prefix_tokens":request.prefix.len()}),
+    );
     let model_arith = arith_of(lm.dtype())?;
     let score_arith = if request.legacy_off {
         model_arith

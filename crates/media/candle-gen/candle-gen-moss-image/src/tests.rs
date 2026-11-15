@@ -481,6 +481,52 @@ fn failure_and_cancel_clear_completed_receipt_and_allow_reentry() {
     assert!(g.validate(&GenerationRequest::default()).is_ok());
 }
 #[test]
+fn completed_entrypoints_never_reuse_a_previous_receipt_after_rejection_or_cancel() {
+    let g = synthetic_generator();
+    let invalid = GenerationRequest {
+        width: 17,
+        ..Default::default()
+    };
+    for streaming in [false, true] {
+        candle_gen::lock_recover(&g.state).report = Some(synthetic_report());
+        let result = if streaming {
+            g.generate_streaming_with_execution_report(
+                &invalid,
+                &mut |_| panic!("image request has no audio chunks"),
+                &mut |_| {},
+            )
+        } else {
+            g.generate_with_execution_report(&invalid, &mut |_| {})
+        };
+        assert!(result.is_err());
+        assert!(g.moss_image_execution_report().is_none());
+    }
+    let cancelled = GenerationRequest::default();
+    cancelled.cancel.cancel();
+    candle_gen::lock_recover(&g.state).report = Some(synthetic_report());
+    assert!(matches!(
+        g.generate_with_execution_report(&cancelled, &mut |_| {}),
+        Err(gen_core::Error::Canceled)
+    ));
+    assert!(g.moss_image_execution_report().is_none());
+    // Edit validation fails before loading a renderer or accessing model tensors.
+    candle_gen::lock_recover(&g.state).report = Some(synthetic_report());
+    assert!(g
+        .generate_moss_image_edit_with_execution_report(
+            &GenerationRequest::default(),
+            MossImageEditInputs::default(),
+            &mut |_| {},
+        )
+        .is_err());
+    assert!(g.moss_image_execution_report().is_none());
+    assert!(g.moss_image_edit_execution_report().is_none());
+    assert!(g
+        .generate_with_execution_report(&invalid, &mut |_| {})
+        .is_err());
+    assert!(g.moss_image_execution_report().is_none());
+}
+
+#[test]
 fn supplied_embeddings_compact_noncontiguous_masks_and_hash_exact_inputs() {
     let mut values = vec![0f32; 2 * 3 * 4096];
     for (i, v) in values.iter_mut().enumerate() {

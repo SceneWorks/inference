@@ -323,6 +323,29 @@ impl TextLlm for StarVector1bProvider {
         Ok(())
     }
 
+    fn plan_execution(
+        &self,
+        _request: &core_llm::TextLlmRequest,
+    ) -> core_llm::Result<core_llm::ExecutionIdentity> {
+        Ok(core_llm::token_execution::unavailable(
+            "token_runtime_plan_unavailable",
+            "Sampler fallback, prefix reuse and adaptive decode are observed only during execution",
+            "completed_decode_path",
+        ))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        request: &core_llm::TextLlmRequest,
+        events: &mut dyn FnMut(core_llm::StreamEvent),
+    ) -> core_llm::Result<core_llm::CompletedTextLlm> {
+        let scope = core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.generate(request, &mut |event| {
+            core_llm::token_execution::without_observations(|| events(event))
+        })?;
+        scope.finish_text(output, self.descriptor())
+    }
+
     fn generate(
         &self,
         request: &TextLlmRequest,
@@ -347,6 +370,30 @@ impl StarVectorProvider for StarVector1bProvider {
     fn starvector_descriptor(&self) -> &StarVectorDescriptor {
         &self.starvector
     }
+    fn plan_svg_execution(
+        &self,
+        _request: &core_llm::StarVectorRequest,
+    ) -> core_llm::Result<core_llm::ExecutionIdentity> {
+        Ok(core_llm::token_execution::unavailable(
+            "svg_runtime_plan_unavailable",
+            "The bounded SVG decoder must execute before its sampler and terminal policy are known",
+            "completed_svg_decode",
+        ))
+    }
+
+    fn generate_svg_with_execution_report(
+        &self,
+        request: &core_llm::StarVectorRequest,
+        events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
+    ) -> core_llm::Result<core_llm::CompletedStarVector> {
+        let scope = core_llm::token_execution::TokenExecutionScope::new();
+        let (output, record) = self.generate_svg_inner(request, &mut |event| {
+            core_llm::token_execution::without_observations(|| events(event))
+        })?;
+        let decode = record;
+        scope.finish_svg(output, decode.as_ref(), core_llm::TextLlm::descriptor(self))
+    }
+
     fn generate_svg(
         &self,
         request: &StarVectorRequest,

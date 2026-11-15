@@ -931,10 +931,11 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          # sc-27303: mlx-llm's campaign-harness tests compile only under its opt-in `campaign`
-          # feature; keep running them whenever mlx-llm is in scope.
+          # These integration test targets import helpers behind opt-in test features.
+          # Enable them only when the corresponding package is in the selected test scope.
           for package in "${packages[@]}"; do
-            if [[ "$package" == mlx-llm ]]; then packages+=(--features mlx-llm/campaign); break; fi
+            if [[ "$package" == mlx-llm ]]; then packages+=(--features mlx-llm/campaign); fi
+            if [[ "$package" == mlx-gen ]]; then packages+=(--features mlx-gen/test-support); fi
           done
           # Keep the opt-in CV forward path compiled without executing learned code.
           for package in "${packages[@]}"; do

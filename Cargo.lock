@@ -365,6 +365,7 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

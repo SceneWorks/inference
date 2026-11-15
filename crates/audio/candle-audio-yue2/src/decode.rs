@@ -295,6 +295,13 @@ pub fn decode_latents(
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Result<DecodedAudio, VaeError> {
     latents.verify()?;
+    candle_audio::execution::runtime(vae.device(), vae.dtype());
+    candle_audio::execution::sampling(
+        "yue2-vae",
+        serde_json::json!({"mode":"deterministic-latent-decode"}),
+    );
+    candle_audio::execution::no_draws("VAE decodes fixed latents without sampling");
+    candle_audio::execution::policy("yue2-decode", serde_json::json!(format!("{options:?}")));
     // Refuse a changed CUDA BF16 handle before staging decoder input on that device.
     vae.check_cuda_bf16_math()?;
     let z = latents
@@ -346,6 +353,40 @@ pub fn decode_latents(
             vae_dtype: vae.dtype(),
         },
     })
+}
+
+/// Decode native latents with the original waveform/metadata and a same-attempt execution report.
+/// The legacy decoder remains available with its original `VaeError` return type.
+pub fn decode_latents_with_execution_report(
+    vae: &Yue2Vae,
+    latents: &AcousticLatents,
+    options: &DecodeOptions,
+    cancel: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> candle_audio::gen_core::Result<candle_audio::execution::CompletedNative<DecodedAudio>> {
+    candle_audio::execution::capture_native(
+        &crate::provider::descriptor(),
+        cancel,
+        || {
+            decode_latents(
+                vae,
+                latents,
+                options,
+                &|| candle_audio::execution::callback(cancel),
+                &mut |completed, total| {
+                    candle_audio::execution::callback(|| on_progress(completed, total))
+                },
+            )
+            .map_err(crate::engine::vae_error)
+        },
+        |value| {
+            Some(candle_audio::execution::NativeOutput::pcm(
+                value.samples(),
+                SAMPLE_RATE,
+                AUDIO_CHANNELS as u16,
+            ))
+        },
+    )
 }
 
 /// Planar `[2, S]` raw decoder output → interleaved, clamped samples plus the clamped count.

@@ -46,6 +46,19 @@ impl Sampler {
         }
     }
 
+    /// Host metadata from this actual sampler; no model execution is needed to test the receipt.
+    fn observe_execution(&self, seed: u64) {
+        mlx_gen::image_execution::scalar("pid_timescale", self.timescale);
+        mlx_gen::image_execution::policy_debug("pid_epsilon_draws", &self.num_eps());
+        mlx_gen::image_execution::policy_debug("pid_output_clamp", &"[-1,1]");
+        mlx_gen::image_execution::policy_debug("pid_dtypes", &"network=bf16;noise=f32");
+        mlx_gen::image_execution::sampled_decode(
+            if self.sde { "pid_sde" } else { "pid_ode" }.into(),
+            &self.t_list, seed,
+            "mlx-split-key-normal-v1;noise=split(key(seed),2).0;epsilon=repeated-split(rest,2).0;full-image-noise-independent-of-tiling",
+        );
+    }
+
     /// Number of denoising steps (`len(t_list) − 1`).
     pub fn steps(&self) -> usize {
         self.t_list.len().saturating_sub(1)
@@ -214,7 +227,10 @@ impl Sampler {
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         let (noise, eps) = self.draw_noise_eps(b, h, w, seed)?;
-        self.run(net, &noise, &eps, caption, lq_latent, sigma, cancel)
+        let out = self.run(net, &noise, &eps, caption, lq_latent, sigma, cancel)?;
+        mlx_gen::image_execution::policy_debug("pid_forward_tiled", &false);
+        self.observe_execution(seed);
+        Ok(out)
     }
 
     /// Tiled production entry (sc-10087): identical seeded noise/ε draw as [`Self::sample`] (full-res, so
@@ -238,8 +254,101 @@ impl Sampler {
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         let (noise, eps) = self.draw_noise_eps(b, h, w, seed)?;
-        self.run_tiled(
+        let out = self.run_tiled(
             net, &noise, &eps, caption, lq_latent, sigma, tile, overlap, cancel,
-        )
+        )?;
+        self.observe_execution(seed);
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use mlx_gen::gen_core::generator::{ExecutionFact, ExecutionRandomness, NumericScheduleDigest};
+    use mlx_gen::{Capabilities, GenerationOutput, Image, Modality, ModelDescriptor};
+
+    #[test]
+    fn completed_pid_observation_uses_sampler_schedule_and_shared_decoder_seed() {
+        let descriptor = ModelDescriptor {
+            id: "pid_probe",
+            family: "probe",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        for sample_type in [SampleType::Sde, SampleType::Ode] {
+            let mut cfg = SamplerConfig::distill_4step();
+            cfg.sample_type = sample_type;
+            cfg.student_t_list = vec![0.9, 0.4, 0.0];
+            cfg.fm_timescale = 321.0;
+            let sampler = Sampler::new(&cfg);
+            let report = mlx_gen::image_execution::complete_image_attempt(
+                &descriptor,
+                &CancelFlag::new(),
+                || {
+                    for seed in [9, 10] {
+                        mlx_gen::image_execution::sampled_native(
+                            "euler",
+                            "Sigma",
+                            mlx_rs::Dtype::Float32,
+                            &[1.0, 0.0],
+                            seed,
+                        );
+                    }
+                    // Production shares one PiD decoder (and therefore its seed) across the count loop.
+                    sampler.observe_execution(9);
+                    sampler.observe_execution(9);
+                    Ok(GenerationOutput::Images(vec![
+                        Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![0; 3]
+                        };
+                        2
+                    ]))
+                },
+            )
+            .unwrap();
+            let resolved = report.execution.resolved().unwrap();
+            let ExecutionRandomness::Draws { draws, scheme } = &resolved.randomness else {
+                panic!()
+            };
+            assert_eq!(
+                draws
+                    .iter()
+                    .map(|draw| (draw.output_index, draw.seed))
+                    .collect::<Vec<_>>(),
+                vec![(0, Some(9)), (1, Some(10)), (0, Some(9)), (1, Some(9))]
+            );
+            assert!(scheme.contains("full-image-noise-independent-of-tiling"));
+            assert_eq!(
+                resolved.provider_choices["pid_timescale"],
+                ExecutionFact::f32_bits(321.0).unwrap()
+            );
+            let ExecutionFact::Resolved { value: stages } =
+                &resolved.provider_choices["auxiliary_decode"]
+            else {
+                panic!()
+            };
+            assert_eq!(
+                stages[0]["schedule"]["sha256"],
+                NumericScheduleDigest::f32_values(&cfg.student_t_list)
+                    .unwrap()
+                    .sha256
+            );
+            assert_eq!(
+                stages[0]["sampling"],
+                if sample_type == SampleType::Sde {
+                    "pid_sde"
+                } else {
+                    "pid_ode"
+                }
+            );
+        }
     }
 }
