@@ -23,6 +23,7 @@ pub(crate) struct MageHeavy {
 
 pub struct MagePipeline {
     unobserved_adapter_count: usize,
+    loaded_quant: Option<Quant>,
     text: MageTextEncoder,
     transformer: MageTransformer,
     vae: MageVae,
@@ -60,6 +61,7 @@ impl MagePipeline {
         .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(Self {
             unobserved_adapter_count: adapters.len(),
+            loaded_quant: quant,
             text: MageTextEncoder::load_component_with_quant(
                 &dirs.text_encoder,
                 false,
@@ -147,15 +149,14 @@ impl MagePipeline {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(
+        crate::quant::capture_direct_with_loaded_quant(
             &crate::descriptor(),
             &candle_gen::gen_core::CancelFlag::default(),
+            self.loaded_quant,
+            self.unobserved_adapter_count,
+            "MagePipeline",
+            "mage/pipeline/generate",
             || {
-                candle_gen::execution::unobserved_adapters(
-                    self.unobserved_adapter_count,
-                    "MagePipeline",
-                );
-                candle_gen::execution::policy("direct_route", "mage/pipeline/generate".into());
                 let image = self
                     .generate(
                         prompt,

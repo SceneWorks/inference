@@ -50,6 +50,7 @@ impl MageEditVariant {
 
 pub struct MageEdit {
     unobserved_adapter_count: usize,
+    loaded_quant: Option<Quant>,
     text: MageTextEncoder,
     transformer: MageTransformer,
     vae: MageVae,
@@ -107,6 +108,7 @@ impl MageEdit {
         .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(Self {
             unobserved_adapter_count: adapters.len(),
+            loaded_quant: quant,
             text: MageTextEncoder::load_component_with_quant(
                 &dirs.text_encoder,
                 true,
@@ -187,25 +189,31 @@ impl MageEdit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor_edit(), cancel, || {
-            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "MageEdit");
-            candle_gen::execution::policy("direct_route", "mage/edit_provider/edit".into());
-            let image = self
-                .edit(
-                    instruction,
-                    negative_instruction,
-                    references,
-                    width,
-                    height,
-                    steps,
-                    guidance,
-                    seed,
-                    cancel,
-                    &mut report_progress,
-                )
-                .map_err(candle_gen::CandleError::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
-        })
+        crate::quant::capture_direct_with_loaded_quant(
+            &crate::descriptor_edit(),
+            cancel,
+            self.loaded_quant,
+            self.unobserved_adapter_count,
+            "MageEdit",
+            "mage/edit_provider/edit",
+            || {
+                let image = self
+                    .edit(
+                        instruction,
+                        negative_instruction,
+                        references,
+                        width,
+                        height,
+                        steps,
+                        guidance,
+                        seed,
+                        cancel,
+                        &mut report_progress,
+                    )
+                    .map_err(candle_gen::CandleError::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -405,26 +413,32 @@ impl MageEdit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor_edit(), cancel, || {
-            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "MageEdit");
-            candle_gen::execution::policy("direct_route", "mage/edit_from_reference_tokens".into());
-            let image = self
-                .edit_from_reference_tokens(
-                    instruction,
-                    negative_instruction,
-                    references,
-                    ref_tokens,
-                    width,
-                    height,
-                    steps,
-                    guidance,
-                    seed,
-                    cancel,
-                    &mut report_progress,
-                )
-                .map_err(candle_gen::CandleError::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
-        })
+        crate::quant::capture_direct_with_loaded_quant(
+            &crate::descriptor_edit(),
+            cancel,
+            self.loaded_quant,
+            self.unobserved_adapter_count,
+            "MageEdit",
+            "mage/edit_from_reference_tokens",
+            || {
+                let image = self
+                    .edit_from_reference_tokens(
+                        instruction,
+                        negative_instruction,
+                        references,
+                        ref_tokens,
+                        width,
+                        height,
+                        steps,
+                        guidance,
+                        seed,
+                        cancel,
+                        &mut report_progress,
+                    )
+                    .map_err(candle_gen::CandleError::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

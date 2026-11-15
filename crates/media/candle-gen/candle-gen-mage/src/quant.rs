@@ -45,6 +45,24 @@ pub(crate) fn component_quant(component: PrecisionFloorComponent, selected: Quan
     effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
 }
 
+/// Capture a direct Mage output with the tier retained after both quantized components loaded.
+pub(crate) fn capture_direct_with_loaded_quant(
+    descriptor: &candle_gen::gen_core::ModelDescriptor,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    loaded_quant: Option<Quant>,
+    adapter_count: usize,
+    owner: &'static str,
+    route: &'static str,
+    body: impl FnOnce() -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_direct(descriptor, cancel, || {
+        candle_gen::execution::unobserved_adapters(adapter_count, owner);
+        candle_gen::execution::policy("loaded/loaded_quant", format!("{loaded_quant:?}").into());
+        candle_gen::execution::policy("direct_route", route.into());
+        body()
+    })
+}
+
 /// Shape-inferred loader used by the Mage transformer before its optional fold. Physical q4/q8
 /// tiers carry MLX affine packed triples; dense upstream snapshots carry only `.weight` (+ bias).
 /// The packed branch derives each tensor's true width from its shapes in the shared repacker, so the
@@ -107,6 +125,57 @@ pub(crate) fn quantize_onto(linear: &mut QLinear, quant: Quant, device: &Device)
         }
     }
     linear.quantize_dequant_onto(quant, device)
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use candle_gen::gen_core::{generator::ExecutionFact, GenerationOutput, Image};
+
+    #[test]
+    fn direct_generation_and_both_edit_routes_report_loaded_tier() {
+        for (route, descriptor) in [
+            ("mage/pipeline/generate", crate::descriptor()),
+            ("mage/edit_provider/edit", crate::descriptor_edit()),
+            ("mage/edit_from_reference_tokens", crate::descriptor_edit()),
+        ] {
+            let mut identities = Vec::new();
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let completed = capture_direct_with_loaded_quant(
+                    &descriptor,
+                    &candle_gen::gen_core::CancelFlag::default(),
+                    quant,
+                    0,
+                    "Mage fixture",
+                    route,
+                    || {
+                        candle_gen::execution::draw("fixture", 1, 0);
+                        candle_gen::execution::rng_scheme("fixture-metadata-v1");
+                        candle_gen::execution::schedule("fixture", &[1.0, 0.0], "fixture");
+                        candle_gen::execution::runtime(&Device::Cpu, candle_core::DType::F32);
+                        Ok(GenerationOutput::Images(vec![Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![0; 3],
+                        }]))
+                    },
+                )
+                .expect("a synthetic image produces an attempt-local report");
+                let identity = completed.execution.resolved().expect("resolved execution");
+                let ExecutionFact::Resolved { value } = &identity.quality_policy else {
+                    panic!("quality policy must be resolved");
+                };
+                assert_eq!(value["operations"]["direct_route"][0]["value"], route);
+                assert_eq!(
+                    value["operations"]["loaded/loaded_quant"][0]["value"],
+                    format!("{quant:?}")
+                );
+                identities.push(identity.clone());
+            }
+            assert_ne!(identities[0], identities[1], "None and Q4 must differ");
+            assert_ne!(identities[1], identities[2], "Q4 and Q8 must differ");
+        }
+    }
 }
 
 /// Move a still-dense projection onto the target device.
