@@ -277,6 +277,45 @@ impl XcodecDecoder {
         }
         Ok(Some(wave))
     }
+
+    /// Complete native PCM decoding while retaining the legacy optional waveform result.
+    /// The caller's embedding has no bound originating generation receipt.
+    pub fn decode_embedding_chunked_with_execution_report(
+        &self,
+        embedding: &Tensor,
+        chunk_frames: usize,
+        context_frames: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>, AudioError> {
+        capture_embedding_pcm(cancel, |probe| {
+            self.decode_embedding_chunked(embedding, chunk_frames, context_frames, probe)
+        })
+    }
+}
+
+fn capture_embedding_pcm(
+    cancel: &dyn Fn() -> bool,
+    decode: impl FnOnce(&dyn Fn() -> bool) -> Result<Option<Vec<f32>>, AudioError>,
+) -> Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>, AudioError> {
+    // Xcodec is shared by all YuE variants, so a stage-only call cannot attest a variant id.
+    let mut descriptor = crate::model::descriptor_for(crate::config::Variant::ALL[0]);
+    descriptor.id = "yue_xcodec_decode";
+    descriptor.capabilities.audio_sample_rates = vec![SAMPLE_RATE];
+    candle_audio::execution::capture_native(
+        &descriptor,
+        cancel,
+        || {
+            candle_audio::execution::unavailable(
+                "native YuE xcodec embedding has no bound originating generation receipt or provider variant",
+            );
+            decode(&|| candle_audio::execution::callback(cancel))
+        },
+        |value| {
+            value
+                .as_ref()
+                .map(|pcm| candle_audio::execution::NativeOutput::pcm(pcm, SAMPLE_RATE, 1))
+        },
+    )
 }
 
 impl CodecDecoder for XcodecDecoder {
@@ -366,6 +405,30 @@ impl CodecDecoder for StubCodec {
 mod tests {
     use super::*;
     use candle_audio::candle_core::safetensors::save;
+
+    #[test]
+    fn native_embedding_pcm_report_preserves_output_and_rejects_canceled_attempts() {
+        use candle_audio::gen_core::generator::ExecutionIdentity;
+        use std::cell::Cell;
+
+        let completed = capture_embedding_pcm(&|| false, |_| Ok(Some(vec![0.25, -0.5]))).unwrap();
+        assert_eq!(completed.output, Some(vec![0.25, -0.5]));
+        let ExecutionIdentity::Unavailable { reason } = completed.execution else {
+            panic!("an unbound embedding must not yield a resolved execution identity")
+        };
+        assert!(reason
+            .detail
+            .contains("no bound originating generation receipt"));
+
+        let canceled = Cell::new(false);
+        let late = capture_embedding_pcm(&|| canceled.get(), |_| {
+            canceled.set(true);
+            Ok(Some(vec![1.0]))
+        });
+        assert!(matches!(late, Err(AudioError::Canceled)));
+        let none = capture_embedding_pcm(&|| false, |_| Ok(None));
+        assert!(matches!(none, Err(AudioError::Canceled)));
+    }
 
     /// Tiny synthetic widths — the production loader reads widths from the tensors, so a
     /// few-hundred-KB checkpoint exercises the real load + decode path.

@@ -519,11 +519,13 @@ NEUTRAL_TEST_PACKAGES = {
     'core-llm', 'core-llm-testkit', 'sceneworks-load-progress',
     'sceneworks-gen-core', 'sceneworks-gen-core-testkit',
     'sceneworks-gen-core-dist', 'sceneworks-gen-core-telemetry',
-    'sceneworks-gen-core-checkpoint', 'sceneworks-gen-core-family',
+    'sceneworks-gen-core-checkpoint', 'sceneworks-gen-core-supra2-policy',
+    'sceneworks-gen-core-family',
     'sceneworks-gen-core-flux3', 'sceneworks-gen-core-h3',
     'sceneworks-gen-core-image', 'sceneworks-gen-core-iris',
     'sceneworks-gen-core-ltx', 'sceneworks-gen-core-memory-wan',
-    'sceneworks-gen-core-moss-image', 'sceneworks-gen-core-tokenizer',
+    'sceneworks-gen-core-moss-image', 'sceneworks-gen-core-moss-image-policy',
+    'sceneworks-gen-core-tokenizer',
     'sceneworks-gen-core-train',
 }
 

@@ -493,6 +493,11 @@ pub fn generate(
         if !diff_patch.is_empty() {
             let report = crate::lora::merge_diff_patch_adapters(&mut w, &diff_patch)?;
             crate::lora::report_outcome(&report, crate::pipeline::MODEL_ID)?;
+            mlx_gen::video_execution::adapter_stack(
+                "scail2_diff_patch_adapters",
+                serde_json::json!({"outcome":format!("{report:?}")}),
+                report.merged_weights + report.merged_biases,
+            );
         }
         let mut d = Scail2Dit::from_weights(&w, cfg)?;
         // f32 matmul compute (sc-5681). The bf16 path overflows to NaN at long sequences: traced to a
@@ -513,10 +518,15 @@ pub fn generate(
         // this provider's own default and the environment for the two knobs it selects — while a
         // request that selects neither leaves `SCAIL2_MEM_DEFAULT` exactly as it was. The values are
         // already domain-admitted by the shared request floor against `EXECUTION_SURFACE`.
-        d.set_memory_config(DitMemoryConfig::with_request(
+        let resolved_memory = DitMemoryConfig::with_request(
             DitMemoryConfig::from_env(SCAIL2_MEM_DEFAULT),
             job.memory.as_ref(),
-        ));
+        );
+        mlx_gen::video_execution::policy(
+            "scail2_transformer",
+            serde_json::json!({"memory":format!("{resolved_memory:?}"),"compute_bf16":compute_bf16,"quant":format!("{quant:?}"),"segment_len":job.segment_len,"segment_overlap":job.segment_overlap}),
+        );
+        d.set_memory_config(resolved_memory);
         // Quantize the attention + FFN Linears in place (Q4 default in the SceneWorks worker). The
         // packed Q4/Q8 weights are what stays resident; the bf16 source is freed in `quantize`.
         if let Some(q) = quant {
@@ -531,11 +541,16 @@ pub fn generate(
         // silently drops — on a format/prefix mismatch or an unmatched target. (The diff-patch
         // lightning files were already merged into the dense weights above, sc-5684.)
         if !residual.is_empty() {
-            mlx_gen::adapters::loader::apply_adapters_strict(
+            let report = mlx_gen::adapters::loader::apply_adapters_strict(
                 &mut d,
                 &residual,
                 crate::pipeline::MODEL_ID,
             )?;
+            mlx_gen::video_execution::adapter_stack(
+                "scail2_residual_adapters",
+                serde_json::json!({"outcome":format!("{report:?}")}),
+                report.applied,
+            );
         }
         d
     };
@@ -619,11 +634,23 @@ pub fn generate(
 
         // Seeded init noise (per-segment key; exact RNG values differ mlx-rs vs torch, as expected).
         let key = random::key(job.seed.wrapping_add(seg_idx as u64))?;
+        mlx_gen::video_execution::draw(
+            0,
+            "scail2_segment_normal",
+            job.seed.wrapping_add(seg_idx as u64),
+        );
         let noise = random::normal::<f32>(&[16, lat_t, lat_h, lat_w], None, None, Some(&key))?;
 
         // --- denoise (plain CFG, clean-history pinned) ---
         let mut sched = make_scheduler(job.sampler, NUM_TRAIN_TIMESTEPS);
         sched.set_timesteps(job.steps, job.shift);
+        mlx_gen::video_execution::sampling(
+            "scail2_segment",
+            &format!("{:?}", job.sampler),
+            "flow_velocity",
+            serde_json::json!({"shift_bits":job.shift.to_bits(),"guidance_bits":job.guidance.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("scail2_segment", sched.sigmas());
         let timesteps: Vec<f32> = sched.timesteps().to_vec();
         // F-096: report progress over the WHOLE job (steps × segments), not per segment — the old
         // per-segment `Step{i, steps}` restarted at 1/N on every segment boundary, so a multi-segment
@@ -725,6 +752,10 @@ pub fn generate(
         let video = {
             // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
             let cfg = decode_tiling(out_height, out_width, out_frames)?;
+            mlx_gen::video_execution::policy(
+                "scail2_decode",
+                serde_json::json!({"tiling":format!("{cfg:?}"),"segment":seg_idx,"latent_shape":z_shape}),
+            );
             match cfg.as_ref() {
                 // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
                 Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel))?,

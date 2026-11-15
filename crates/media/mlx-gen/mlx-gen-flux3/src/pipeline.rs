@@ -222,7 +222,8 @@ pub fn denoise_one_with_references(
     let channels = dit.config().image_in_channels;
     let ids = image_ids(h, w, dit.config().image_rope_scale as f32);
     let z = noise(seed, h, w, channels)?;
-    match params.guidance {
+    let schedule = params.schedule()?;
+    let output = match params.guidance {
         Some(guidance) => denoise_cfg_with_references(
             dit,
             text,
@@ -233,23 +234,34 @@ pub fn denoise_one_with_references(
             })?,
             &z,
             &ids,
-            &params.schedule()?,
+            &schedule,
             guidance,
             references,
             cancel,
             on_step,
         ),
         None => denoise_flow_map_with_references(
-            dit,
-            text,
-            &z,
-            &ids,
-            &params.schedule()?,
-            references,
-            cancel,
-            on_step,
+            dit, text, &z, &ids, &schedule, references, cancel, on_step,
         ),
+    }?;
+    mlx_gen::image_execution::sampled_native_with_rng(
+        if params.guidance.is_some() {
+            "flux3-euler-cfg-v1"
+        } else {
+            "flux3-flow-map-v1"
+        },
+        "native-timestep-and-target",
+        output.dtype(),
+        &schedule,
+        seed,
+        "mlx-keyed-normal-f32-v1;initial=output-seed;no-step-draws",
+    );
+    mlx_gen::image_execution::policy_debug("flux3.compute_dtype", &dit.compute_dtype());
+    mlx_gen::image_execution::policy_debug("flux3.reference_tokens", &references.is_some());
+    if let Some(guidance) = params.guidance {
+        mlx_gen::image_execution::scalar("flux3.guidance", guidance);
     }
+    Ok(output)
 }
 
 /// Render one image: [`denoise_one`] → decode → RGB8 (the caller reports `Decoding`).

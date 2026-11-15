@@ -113,6 +113,10 @@ impl VedaRuntime {
         if !request.enabled {
             return None;
         }
+        candle_gen::execution::policy(
+            "h3_veda_controls",
+            serde_json::json!(format!("{request:?}")),
+        );
         let result = (|| -> Result<Prepared> {
             request
                 .validate(layers, usize::MAX)

@@ -392,7 +392,16 @@ fn prefill_cfg_mask(
 
 impl Stage1Model for Stage1Lm {
     fn begin_render(&mut self, seed: u64, max_positions: usize) -> gen_core::Result<()> {
-        self.rng = SplitMix64::new(seed);
+        self.rng = SplitMix64::new(candle_audio::execution::seed(
+            "yue-stage1",
+            "splitmix64",
+            seed,
+        ));
+        candle_audio::execution::runtime(self.model.device(), self.model.compute_dtype());
+        candle_audio::execution::policy(
+            "stage1-kv",
+            candle_audio::execution::json!({"capacity":max_positions.min(self.context_limit),"context_limit":self.context_limit}),
+        );
         self.history.clear();
         self.window.clear();
         // Size the KV cache to this render, never past the model context. Production loads a
@@ -497,6 +506,10 @@ impl Stage1Model for Stage1Lm {
         self.penalty_window
             .extend(self.window.iter().map(|&t| t as i32));
         let logits = self.feed()?;
+        candle_audio::execution::sampling(
+            "yue-stage1",
+            candle_audio::execution::json!({"temperature_bits":d.temperature.to_bits(),"top_p_bits":d.top_p.to_bits(),"top_k":d.top_k,"repetition_penalty_bits":d.repetition_penalty.to_bits(),"min_new_tokens":d.min_new_tokens,"cfg_bits":segment.guidance_scale.map(f32::to_bits)}),
+        );
         self.segment = Some(Segment {
             scale: segment.guidance_scale,
             params: SamplingParams {

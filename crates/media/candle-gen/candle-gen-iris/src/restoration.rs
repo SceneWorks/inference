@@ -14,8 +14,8 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, Image, LoadSpec, Progress, Transform, TransformCapabilities, TransformDescriptor,
-    TransformRegistration, TransformRequest,
+    self, CompletedTransform, Image, LoadSpec, Progress, Transform, TransformCapabilities,
+    TransformDescriptor, TransformRegistration, TransformRequest,
 };
 use candle_gen::{CandleError as Error, Result};
 use gen_core_iris::{
@@ -180,16 +180,17 @@ impl IrisRestorer {
         &self,
         req: &TransformRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+    ) -> Result<(Image, RestorationPlan)> {
         let plan = self.plan(req)?;
-        Ok(restore(
+        let image = restore(
             &req.image,
             &plan,
             self.settings.sigma,
             &req.cancel,
             on_progress,
             &mut |tile, h, w| self.velocity(tile, h, w).map_err(Into::into),
-        )?)
+        )?;
+        Ok((image, plan))
     }
 }
 
@@ -207,7 +208,40 @@ impl Transform for IrisRestorer {
         req: &TransformRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<Image> {
-        self.apply_impl(req, on_progress).map_err(Into::into)
+        self.apply_impl(req, on_progress)
+            .map(|(image, _)| image)
+            .map_err(Into::into)
+    }
+
+    fn apply_with_execution_report(
+        &self,
+        req: &TransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CompletedTransform> {
+        let (image, plan) = self.apply_impl(req, on_progress)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let execution = contract::completed_execution_identity(
+            &plan,
+            &image,
+            self.descriptor.backend,
+            concat!(
+                env!("CARGO_PKG_NAME"),
+                "@",
+                env!("CARGO_PKG_VERSION"),
+                ":restore-v1"
+            ),
+            self.settings.model_time(&self.config),
+            self.settings.sigma,
+            serde_json::json!({
+                "compute_dtype": format!("{:?}", compute_dtype(&self.spec)),
+                "device": format!("{:?}", self.dit.device()),
+                "quantize": "none",
+                "load_shape": format!("{:?}", self.spec.load_shape),
+            }),
+        )?;
+        CompletedTransform::new(image, execution, self.descriptor())
     }
 }
 

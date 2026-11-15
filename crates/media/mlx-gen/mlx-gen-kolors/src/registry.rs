@@ -401,7 +401,7 @@ impl Generator for KolorsGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -426,6 +426,49 @@ impl Generator for KolorsGenerator {
             &self.memory_strategy,
             context,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "KolorsGenerator.default_stage_residency",
+                    &self.default_stage_residency,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "KolorsGenerator.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "KolorsGenerator.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "KolorsGenerator.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl KolorsGenerator {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -552,6 +595,7 @@ impl KolorsGenerator {
     fn resolve_request<'r>(&self, req: &'r GenerationRequest) -> Result<KolorsRequest<'r>> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let cfg = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        mlx_gen::image_execution::scalar("kolors.cfg", cfg);
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
@@ -566,7 +610,9 @@ impl KolorsGenerator {
             crate::memory_strategy::stage_residency(req, self.default_stage_residency);
         let window = crate::memory_strategy::transformer_window(req)?;
         let dit_window = window.and_then(|w| w.dit());
+        mlx_gen::image_execution::policy_debug("kolors.dit_window", &dit_window);
         let text_window = window.and_then(|w| w.text_encoder());
+        mlx_gen::image_execution::policy_debug("kolors.text_window", &text_window);
         // Two fail-closed guards a calibration harness driving `generate` with a hand-built
         // `GenerationMemory` must still cross — it never went through `safety_check`.
         if window.is_some() && !self.streamable {
@@ -629,6 +675,10 @@ impl KolorsGenerator {
     ) -> Result<GenerationOutput> {
         let req = request.req;
         let heavy = &heavy_owned.heavy;
+        mlx_gen::image_execution::policy_debug(
+            "kolors.native_factory",
+            &"leading-euler-discrete-v1",
+        );
         let mode = prepare_conditioning(request.mode, heavy_owned)?;
         let init = build_init_latents(request, heavy, &mode)?;
         let vp_plan = resolve_vp_plan(request, heavy, &mode)?;
@@ -655,17 +705,31 @@ impl KolorsGenerator {
         for i in 0..req.count {
             let seed = request.base_seed.wrapping_add(i as u64);
             random::seed(seed)?;
-            mlx_gen_sdxl::stages::run_output(&plan, seed, on_progress, |latents, on_progress| {
-                images.push(mlx_gen_sdxl::stages::decode_output(
-                    heavy.vae(),
-                    &latents,
-                    pid_ref,
-                    request.decode_tiling.as_ref(),
-                    &req.cancel,
-                    on_progress,
-                )?);
-                Ok(())
-            })?;
+            mlx_gen::image_execution::with_primary_rng_scheme(
+                if request.use_curated {
+                    "mlx-global-normal-initial-v1;curated-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64"
+                } else {
+                    "mlx-global-normal-initial-v1;no-step-draws"
+                },
+                || {
+                    mlx_gen_sdxl::stages::run_output(
+                        &plan,
+                        seed,
+                        on_progress,
+                        |latents, on_progress| {
+                            images.push(mlx_gen_sdxl::stages::decode_output(
+                                heavy.vae(),
+                                &latents,
+                                pid_ref,
+                                request.decode_tiling.as_ref(),
+                                &req.cancel,
+                                on_progress,
+                            )?);
+                            Ok(())
+                        },
+                    )
+                },
+            )?;
         }
         Ok(GenerationOutput::Images(images))
     }

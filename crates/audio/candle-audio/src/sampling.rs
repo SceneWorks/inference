@@ -23,6 +23,20 @@ pub struct SamplingParams {
     pub repetition_window: usize,
 }
 
+impl SamplingParams {
+    /// Record the values the decoder consumes, preserving floating-point bits.
+    pub fn observe_execution(&self, stage: &str) {
+        crate::execution::sampling(
+            stage,
+            serde_json::json!({
+                "temperature_bits":self.temperature.to_bits(),"top_p_bits":self.top_p.to_bits(),
+                "top_k":self.top_k,"repetition_penalty_bits":self.repetition_penalty.to_bits(),
+                "repetition_window":self.repetition_window,
+            }),
+        );
+    }
+}
+
 /// A tiny deterministic PRNG (splitmix64) — no external deps, reproducible from a `u64` seed.
 #[derive(Debug, Clone)]
 pub struct Rng {
@@ -32,6 +46,11 @@ pub struct Rng {
 impl Rng {
     /// Seed the PRNG. A `None` request seed maps to a fixed constant so decoding stays deterministic.
     pub fn seed(seed: u64) -> Self {
+        crate::execution::seed(
+            "moss-channel-tokens",
+            "splitmix64-xor-golden-ratio-v1",
+            seed,
+        );
         // Mix the seed so seed 0 is not a degenerate all-zero state.
         Self {
             state: seed ^ 0x9E37_79B9_7F4A_7C15,

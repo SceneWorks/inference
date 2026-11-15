@@ -118,6 +118,13 @@ impl SvdPipeline {
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
         let sched = EdmSchedule::karras(steps, &self.scheduler);
+        mlx_gen::video_execution::sampling(
+            "svd_native",
+            "edm_euler",
+            "edm_v_prediction",
+            serde_json::json!({"min_guidance_bits":min_g.to_bits(),"max_guidance_bits":max_g.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("svd_native", &sched.sigmas);
 
         // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
         let embeds2 = concatenate_axis(&[&zeros_like(image_embeds)?, image_embeds], 0)?; // [2, ctx, 1024]
@@ -187,6 +194,13 @@ impl SvdPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let sched = EdmSchedule::karras(steps, &self.scheduler);
+        mlx_gen::video_execution::curated_sampling(
+            "svd_curated",
+            sampler_name,
+            "edm_v_prediction",
+            serde_json::json!({"min_guidance_bits":min_g.to_bits(),"max_guidance_bits":max_g.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("svd_curated", &sched.sigmas);
         let ms = EdmModelSampling::svd();
         // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
         let embeds2 = concatenate_axis(&[&zeros_like(image_embeds)?, image_embeds], 0)?;

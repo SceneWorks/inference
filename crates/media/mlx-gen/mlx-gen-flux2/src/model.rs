@@ -761,18 +761,24 @@ impl Flux2 {
         req: &GenerationRequest,
     ) -> Result<String> {
         if !req.enhance_prompt {
-            req.prompt_enhancement
-                .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
-                    &req.prompt,
-                ));
+            observe_enhancement_outcome("absent", &req.prompt);
+            mlx_gen::image_execution::without_capture(|| {
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
+                        &req.prompt,
+                    ))
+            });
             return Ok(req.prompt.clone());
         }
         if !self.variant.is_dev() {
-            req.prompt_enhancement
-                .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
-                    &req.prompt,
-                    "unsupported_variant",
-                ));
+            observe_enhancement_outcome("unsupported_variant", &req.prompt);
+            mlx_gen::image_execution::without_capture(|| {
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        "unsupported_variant",
+                    ))
+            });
             return Ok(req.prompt.clone());
         }
         match self
@@ -780,24 +786,26 @@ impl Flux2 {
             .map(|output| classify_upsample_output(&req.prompt, output))
         {
             Ok(Ok(p)) => {
+                observe_enhancement_outcome("enhanced", &p);
                 // The log record is machine-parsed on the `ENHANCED_PROMPT:` prefix; sanitize the
                 // model-generated text so an embedded newline can't split the record or forge a
                 // second prefix line (the returned `p` itself is unchanged) (L-log-injection).
                 eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&p));
-                req.prompt_enhancement
-                    .emit(mlx_gen::gen_core::PromptEnhancementReport::enhanced(
-                        &req.prompt,
-                        &p,
-                    ));
+                mlx_gen::image_execution::without_capture(|| {
+                    req.prompt_enhancement.emit(
+                        mlx_gen::gen_core::PromptEnhancementReport::enhanced(&req.prompt, &p),
+                    )
+                });
                 Ok(p)
             }
             Ok(Err(reason)) => {
+                observe_enhancement_outcome(reason, &req.prompt);
                 eprintln!("ENHANCER_FALLBACK:{reason}");
-                req.prompt_enhancement
-                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
-                        &req.prompt,
-                        reason,
-                    ));
+                mlx_gen::image_execution::without_capture(|| {
+                    req.prompt_enhancement.emit(
+                        mlx_gen::gen_core::PromptEnhancementReport::fallback(&req.prompt, reason),
+                    )
+                });
                 Ok(req.prompt.clone())
             }
             Err(Error::Canceled) => Err(Error::Canceled),
@@ -805,12 +813,21 @@ impl Flux2 {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
+                observe_enhancement_outcome("enhancer_error", &req.prompt);
+                mlx_gen::image_execution::unavailable(
+                    "flux2_prompt_enhancement_failed",
+                    "The caption decoder failed and its completed token execution is unavailable",
+                    "prompt_enhancement_execution",
+                );
                 eprintln!("ENHANCER_FALLBACK:{}", sanitize_log_text(&e.to_string()));
-                req.prompt_enhancement
-                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
-                        &req.prompt,
-                        "enhancer_error",
-                    ));
+                mlx_gen::image_execution::without_capture(|| {
+                    req.prompt_enhancement.emit(
+                        mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                            &req.prompt,
+                            "enhancer_error",
+                        ),
+                    )
+                });
                 Ok(req.prompt.clone())
             }
         }
@@ -986,19 +1003,7 @@ impl Generator for Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        let snapshot_root = match &self.loaded_spec.weights {
-            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
-        };
-        mlx_gen::sc20686::observe_generation(
-            snapshot_root,
-            &req.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(req),
-            on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
-        )
-        .map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1062,6 +1067,65 @@ impl Generator for Flux2 {
             return crate::memory_strategy::begin_dev_request(contract, context, expected_tier);
         }
         crate::memory_strategy::begin_klein_request(&self.loaded_spec, contract, context)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.memory_numeric_tier",
+                    &self.memory_numeric_tier,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Flux2.applied_adapter_controls",
+                    &self.loaded_spec.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Flux2 {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        let snapshot_root = match &self.loaded_spec.weights {
+            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
+        };
+        mlx_gen::sc20686::observe_generation(
+            snapshot_root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -1147,6 +1211,7 @@ impl Flux2 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let transformer_window = request_transformer_window(self.variant, &self.loaded_spec, req)?;
+        mlx_gen::image_execution::policy_debug("flux2.transformer_window", &transformer_window);
         // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
         // sampler and diffusion. Calling `default_seed` independently in those phases makes a
         // request irreproducible and lets its provenance name only one of two actual seeds.
@@ -1165,6 +1230,7 @@ impl Flux2 {
         }
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        mlx_gen::image_execution::scalar("flux2.guidance", guidance);
 
         // Request-selected staging (or the Sequential load default) loads the text encoder
         // (+ dev vision tower/projector), runs any caption upsample + the prompt encode, materializes,
@@ -1251,6 +1317,7 @@ impl Flux2 {
         let vae = &heavy.vae;
         let cond = self.prepare_conditioning(vae, req, request.steps)?;
         let mem = self.memory_config(&prompt_embeds, &cond, req);
+        mlx_gen::image_execution::policy_debug("flux2.resolved_memory", &mem);
         let render = Flux2Render {
             model: self,
             transformer: &heavy.transformer,
@@ -1294,6 +1361,9 @@ impl Flux2 {
             capture_sigma,
         )?;
         let img_guidance = image_guidance(req, cond.reference.is_some());
+        if let Some(scale) = img_guidance {
+            mlx_gen::image_execution::scalar("flux2.image_guidance", scale);
+        }
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -4568,5 +4638,61 @@ mod tests {
                 variant.id()
             );
         }
+    }
+}
+
+fn observe_enhancement_outcome(outcome: &str, caption: &str) {
+    use sha2::{Digest, Sha256};
+    mlx_gen::image_execution::policy(
+        "flux2.prompt_enhancement_outcome",
+        serde_json::json!({
+            "outcome": outcome,
+            "effective_caption_sha256": format!("{:x}", Sha256::digest(caption.as_bytes())),
+        }),
+    );
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = descriptor_dev();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_enhancement_distinguishes_absence_fallback_and_effective_caption() {
+        let absent = capture(|| observe_enhancement_outcome("absent", "cat"));
+        let fallback = capture(|| observe_enhancement_outcome("unsupported_variant", "cat"));
+        let enhanced = capture(|| observe_enhancement_outcome("enhanced", "striped cat"));
+        let other = capture(|| observe_enhancement_outcome("enhanced", "tabby cat"));
+        let quality = |report: &mlx_gen::gen_core::generator::ExecutionIdentity| {
+            report.resolved().unwrap().quality_policy.clone()
+        };
+        assert_ne!(quality(&absent), quality(&fallback));
+        assert_ne!(quality(&fallback), quality(&enhanced));
+        assert_ne!(quality(&enhanced), quality(&other));
     }
 }

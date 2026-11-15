@@ -453,7 +453,11 @@ impl CausalConditionalCfm {
         let device = mu.device();
         let (_, feats, tlen) = mu.dims3()?;
         // z ~ N(0, I), seeded (the gen-core reproducibility law).
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+            "chatterbox/flow.rs",
+            "rand-0.9-StdRng",
+            seed,
+        ));
         let noise: Vec<f32> = (0..feats * tlen)
             .map(|_| rng.sample(StandardNormal))
             .collect();
@@ -466,6 +470,18 @@ impl CausalConditionalCfm {
 
         let schedule = CfmSchedule::cosine(self.steps);
         let cfg = self.inference_cfg_rate;
+        candle_audio::execution::runtime(device, mu.dtype());
+        candle_audio::execution::sampling(
+            "chatterbox-cfm",
+            serde_json::json!({"steps":schedule.num_steps(),"cfg_bits":cfg.to_bits()}),
+        );
+        candle_audio::execution::schedule(
+            "chatterbox-cfm-euler",
+            &(0..=schedule.num_steps())
+                .map(|k| schedule.t(k))
+                .collect::<Vec<_>>(),
+            "conditional-velocity",
+        );
         for k in 0..schedule.num_steps() {
             let t = schedule.t(k);
             let dt = schedule.dt(k);

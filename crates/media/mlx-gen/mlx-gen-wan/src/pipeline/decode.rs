@@ -12,6 +12,10 @@ pub fn decode_to_frames(
     tiling: Option<&TilingConfig>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Array> {
+    mlx_gen::video_execution::policy(
+        "wan_vae_decode",
+        serde_json::json!({"tiling":format!("{tiling:?}"),"latent_dtype":format!("{:?}",latents.dtype())}),
+    );
     // Honor cancellation before the (dominant-cost, sc-4998) decode stage (F-014).
     if cancel.is_some_and(CancelFlag::is_cancelled) {
         return Err(Error::Canceled);
@@ -45,6 +49,10 @@ pub fn decode_to_frames_22(
     tiling: Option<&TilingConfig>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Array> {
+    mlx_gen::video_execution::policy(
+        "wan_vae_decode",
+        serde_json::json!({"tiling":format!("{tiling:?}"),"latent_dtype":format!("{:?}",latents.dtype())}),
+    );
     // Honor cancellation before the (dominant-cost, sc-4998) decode stage (F-014).
     if cancel.is_some_and(CancelFlag::is_cancelled) {
         return Err(Error::Canceled);

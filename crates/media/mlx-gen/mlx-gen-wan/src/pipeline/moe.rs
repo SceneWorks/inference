@@ -98,6 +98,13 @@ pub fn denoise_moe(
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
+    mlx_gen::video_execution::sampling(
+        "wan",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"low_guidance_bits":low.guidance.to_bits(),"high_guidance_bits":high.guidance.to_bits(),"shift_bits":shift.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan", sched.sigmas());
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`. Scoped +
@@ -172,6 +179,13 @@ pub fn denoise_moe_curated(
         grid,
     )?;
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    mlx_gen::video_execution::curated_sampling(
+        "wan_curated",
+        sampler_name,
+        "flow_velocity",
+        serde_json::json!({"low_guidance_bits":low.guidance.to_bits(),"high_guidance_bits":high.guidance.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
     let nt = num_train_timesteps as f32;
     mlx_gen::run_flow_sampler(
         mlx_gen::SamplerRun {
@@ -222,6 +236,13 @@ pub(crate) fn denoise_moe_curated_swapped(
     // initially loaded high expert here avoids a second load before the first evaluation.
     let mut active = Some((transformer, cache, guidance, true));
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    mlx_gen::video_execution::curated_sampling(
+        "wan_curated",
+        sampler_name,
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
     let nt = num_train_timesteps as f32;
     let result = mlx_gen::run_flow_sampler(
         mlx_gen::SamplerRun {

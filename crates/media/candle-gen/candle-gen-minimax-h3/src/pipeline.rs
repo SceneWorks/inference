@@ -473,6 +473,8 @@ pub fn initial_latents(
         g.latent_width,
     );
     let n = shape.1 * shape.2 * shape.3 * shape.4;
+    candle_gen::execution::draw("h3_video_latents", seed, 0);
+    candle_gen::execution::runtime(device, candle_gen::candle_core::DType::F32);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let video = Tensor::from_vec(seeded_normal_vec(&mut rng, n), shape, device)?;
     let video_rows = patchify_video_latents(&video, patch)?;
@@ -480,6 +482,7 @@ pub fn initial_latents(
     // A separate stream, keyed off the same request seed: the two modalities are drawn from one
     // seed but must not share samples, or the soundtrack's noise would be a reshaped copy of the
     // picture's.
+    candle_gen::execution::draw("h3_audio_latents", seed.wrapping_add(1), 0);
     let mut arng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(1));
     let audio_shape = (
         1usize,
@@ -539,6 +542,16 @@ pub fn render_latents_with_observer(
     on_observed_step: Option<&mut dyn FnMut(usize, std::time::Duration)>,
 ) -> Result<RenderedLatents> {
     let g = *layout.geometry();
+    candle_gen::execution::schedule(
+        "h3_video_euler_v1",
+        schedule.video().sigmas(),
+        "flow_velocity",
+    );
+    candle_gen::execution::schedule(
+        "h3_audio_euler_v1",
+        schedule.audio().sigmas(),
+        "flow_velocity",
+    );
     let adaln = adaln_schedule(schedule)?;
     let (video, audio) = crate::denoise::denoise_av_with_observer(
         model,
@@ -1388,5 +1401,42 @@ mod tests {
         // = 7_944 rows.
         assert_eq!(before - after, 14_360 + 7_944);
         assert_eq!((before, after), (123_000, 100_696));
+    }
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+    fn output() -> candle_gen::gen_core::GenerationOutput {
+        candle_gen::gen_core::GenerationOutput::Video {
+            frames: vec![candle_gen::gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }],
+            fps: 24,
+            audio: None,
+        }
+    }
+
+    #[test]
+    fn reports_distinct_video_and_audio_streams_in_actual_order() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        let geometry = resolve_geometry(64, 64, 124).unwrap();
+        let _ = initial_latents(&geometry, PATCH_SIZE, u64::MAX, &Device::Cpu).unwrap();
+        candle_gen::execution::schedule("fixture", &[1.0, 0.0], "flow");
+        candle_gen::execution::policy("fixture", serde_json::json!("no_model"));
+        let identity = attempt.finish_image(&crate::model::descriptor(), &output());
+        let candle_gen::gen_core::generator::ExecutionRandomness::Draws { draws, .. } =
+            &identity.resolved().unwrap().randomness
+        else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].purpose, "h3_video_latents");
+        assert_eq!(draws[0].seed, Some(u64::MAX));
+        assert_eq!(draws[1].purpose, "h3_audio_latents");
+        assert_eq!(draws[1].seed, Some(0));
+        assert!(draws.iter().all(|draw| draw.output_index == 0));
     }
 }

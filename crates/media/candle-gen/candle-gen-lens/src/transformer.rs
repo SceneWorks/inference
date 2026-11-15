@@ -873,6 +873,11 @@ impl LensTransformer {
         let txt_len = text_feats[0].dim(1)?;
 
         let mut hidden = self.img_in.forward(hidden_states)?;
+        candle_gen::execution::component_runtime(
+            "lens/transformer",
+            hidden.device(),
+            hidden.dtype(),
+        );
 
         // Multi-layer text front-end: per-layer RMSNorm (eps 1e-5) → channel-concat → txt_in.
         let mut normed = Vec::with_capacity(self.cfg.num_text_layers);

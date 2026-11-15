@@ -1171,10 +1171,12 @@ impl Pipeline {
             DEFAULT_STEPS
         });
         let guidance = req.guidance.map(|g| g as f64).unwrap_or(DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("sdxl/pipeline/guidance", format!("{guidance:?}").into());
         // Lightning is a distilled, classifier-free sampler — it never runs CFG (the worker sends
         // guidance 1.0 for `realvisxl_lightning`, and CFG on a CFG-free checkpoint degrades output).
         // The DDIM path honors the request guidance exactly as before.
         let use_guide = !lightning && guidance > 1.0;
+        candle_gen::execution::policy("sdxl/pipeline/use_guide", format!("{use_guide:?}").into());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let total = steps as u32;
         let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
@@ -1200,7 +1202,7 @@ impl Pipeline {
             // non-ancestral solver (DDIM, or the deterministic Lightning Euler), the whole generation
             // is a pure function of `(seed, request)` — same seed ⇒ same image, any launch.
             let n = 4 * lat_h * lat_w;
-            let mut rng = StdRng::seed_from_u64(seed);
+            let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sdxl/pipeline", seed));
             let noise = candle_gen::seeded_normal_vec(&mut rng, n);
             let init = Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?
                 .to_device(&self.device)?;
@@ -1280,6 +1282,14 @@ impl Pipeline {
         // `LightningPolicy` coefficients rather than a σ array. One frame per iteration, so there is
         // no multi-eval repeat to dedup; the counter still bounds and dedups on principle.
         let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
+        candle_gen::execution::schedule(
+            "sdxl-lightning-euler",
+            &(0..=policy.num_steps())
+                .filter_map(|i| policy.sigma(i))
+                .collect::<Vec<_>>(),
+            "epsilon",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         for i in 0..policy.num_steps() {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);

@@ -906,3 +906,50 @@ fn metadata_resolution_does_not_allocate_mlx_or_submit_metal() {
         assert_eq!(mlx_rs::memory::get_peak_memory(), before);
     });
 }
+
+#[test]
+fn execution_rng_identifies_actual_default_acceleration_and_cfgpp_fallbacks() {
+    let native = ResolvedSampling::resolve(&GenerationRequest::default()).unwrap();
+    assert_eq!(native.route(), SamplingRoute::Ancestral);
+    assert_eq!(
+        native.route().execution_rng_scheme(),
+        "mlx-global-normal-v1;initial-then-ancestral-step-draws"
+    );
+    for (name, steps, route) in [
+        ("lcm", 8, SamplingRoute::Lcm),
+        ("lightning", 4, SamplingRoute::Lightning),
+        ("hyper", 4, SamplingRoute::Hyper),
+    ] {
+        let selected = ResolvedSampling::resolve(&GenerationRequest {
+            sampler: Some(name.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(selected.steps(), steps);
+        assert_eq!(selected.route(), route);
+        assert_ne!(
+            selected.route().execution_rng_scheme(),
+            native.route().execution_rng_scheme()
+        );
+    }
+    for (sampler, expected) in [
+        ("euler", SamplingRoute::CfgPp(Solver::Euler)),
+        ("heun", SamplingRoute::Curated(Solver::Heun)),
+    ] {
+        let selected = ResolvedSampling::resolve(&GenerationRequest {
+            sampler: Some(sampler.into()),
+            guidance: Some(7.0),
+            guidance_method: Some("cfg_pp".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(selected.route(), expected);
+        assert_eq!(
+            selected
+                .route()
+                .execution_rng_scheme()
+                .contains("no-step-draws"),
+            sampler == "euler"
+        );
+    }
+}

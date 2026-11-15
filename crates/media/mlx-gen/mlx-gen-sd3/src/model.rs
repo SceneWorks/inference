@@ -334,7 +334,7 @@ impl Generator for Sd3Large {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -363,6 +363,49 @@ impl Generator for Sd3Large {
         };
         crate::memory_strategy::begin_request(&self.loaded_spec, contract, context)
     }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Sd3Large.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sd3Large.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sd3Large.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Sd3Large.applied_adapter_controls",
+                    &self.loaded_spec.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Sd3Large {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
 }
 
 impl Sd3Large {
@@ -385,6 +428,7 @@ impl Sd3Large {
         let guidance = req
             .guidance
             .unwrap_or_else(|| self.variant.default_guidance());
+        mlx_gen::image_execution::scalar("sd3.guidance", guidance);
         let cfg_on = guidance != 1.0;
 
         // img2img (epic 8588 slice A4, sc-10189): a single `Conditioning::Reference` seeds the denoise
@@ -395,6 +439,7 @@ impl Sd3Large {
         // Seed-independent; resolved above the residency lifecycle.
         let reference = single_reference(req)?;
         let strength = img2img_strength(reference.and_then(|(_, s)| s), req.strength);
+        mlx_gen::image_execution::scalar("sd3.strength", strength);
         let sampler_name = req.sampler.as_deref();
 
         self.residency.run(
@@ -459,8 +504,15 @@ impl Sd3Large {
                 )?)?;
 
                 let attention = crate::memory_strategy::attention_plan(req);
+
+                mlx_gen::image_execution::policy_debug("sd3.attention", &attention.budget);
                 let transformer_window = crate::memory_strategy::transformer_window(req)?;
+                mlx_gen::image_execution::policy_debug(
+                    "sd3.transformer_window",
+                    &transformer_window,
+                );
                 let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+                mlx_gen::image_execution::policy_debug("sd3.decode_tiling", &decode_tiling);
                 let mut reference_preparer = MlxReferencePreparer {
                     vae: &heavy.vae,
                     width: req.width,

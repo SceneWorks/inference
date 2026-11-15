@@ -143,7 +143,23 @@ pub struct Flux2Edit {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
+fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = match variant {
+        Flux2Variant::Klein9b => crate::descriptor_klein(),
+        Flux2Variant::Dev => crate::descriptor_dev(),
+    };
+    descriptor.id = match variant {
+        Flux2Variant::Klein9b => crate::sc20686_observer::PRODUCT_ROUTE_ID,
+        Flux2Variant::Dev => crate::config::FLUX2_DEV_EDIT_ID,
+    };
+    descriptor
+}
+
 impl Flux2Edit {
+    fn variant_descriptor(&self) -> candle_gen::gen_core::ModelDescriptor {
+        edit_report_descriptor(self.variant)
+    }
+
     /// Load the **klein** edit backbone (dense) with the VAE encoder enabled (the reference encode);
     /// distilled — guidance 1.0 (CFG-free), > 1 adds a negative pass.
     pub fn load(paths: &Flux2EditPaths) -> Result<Self> {
@@ -451,6 +467,24 @@ impl Flux2Edit {
 
     /// Generate one edited image. `references` (≥ 1) condition the denoise via reference token concat;
     /// the worker pre-fits them to the render size, but this re-resizes defensively.
+    /// Bind a completed image to observations from this same edit attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &Flux2EditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        crate::complete_bespoke_image(
+            &self.variant_descriptor(),
+            &req.cancel,
+            "flux2/edit_provider/generate",
+            "candle-gen-flux2/src/edit_provider.rs: loaded reference/adapter and decoder choices have no complete execution receipt",
+            || self.generate(req, references, &mut report_progress),
+        )
+    }
+
     pub fn generate(
         &self,
         req: &Flux2EditRequest,
@@ -477,6 +511,25 @@ impl Flux2Edit {
     /// Execute the exact edit request admitted at load. The context identity and request geometry are
     /// rechecked immediately before execution; the request is serialized and the device is fenced on
     /// success, cancellation, and error.
+    /// Bind an admitted edit's output to observations from that same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux2EditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        crate::complete_bespoke_image(
+            &self.variant_descriptor(),
+            &req.cancel,
+            "flux2/edit_provider/generate_with_memory_context",
+            "candle-gen-flux2/src/edit_provider.rs: loaded reference/adapter and decoder choices have no complete execution receipt",
+            || self.generate_with_memory_context(context, req, references, &mut report_progress),
+        )
+    }
+
     pub fn generate_with_memory_context(
         &self,
         context: &MemoryRunContext,
@@ -1146,6 +1199,21 @@ pub(crate) fn preprocess_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_report_identifies_the_edit_route() {
+        assert_eq!(
+            edit_report_descriptor(Flux2Variant::Klein9b).id,
+            "flux2_klein_9b_edit"
+        );
+        assert_eq!(
+            edit_report_descriptor(Flux2Variant::Dev).id,
+            "flux2_dev_edit"
+        );
+        for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
+            assert_eq!(edit_report_descriptor(variant).backend, "candle");
+        }
+    }
 
     fn admitted_edit_context(reference_count: u32) -> MemoryRunContext {
         let mut spec = candle_gen::gen_core::LoadSpec::new(

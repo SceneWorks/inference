@@ -577,6 +577,12 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
+        candle_gen::execution::policy(
+            "wan_denoise",
+            serde_json::json!({
+                "guidance_bits": guidance.to_bits(), "i2v_mask": ti2v.is_some()
+            }),
+        );
         let steps = knobs.steps;
         let shift = knobs.shift;
         // Text K/V is invariant for the full request. Keep the cache local to this denoise call so it
@@ -1023,6 +1029,21 @@ fn needs_ti2v_encoder(req: &GenerationRequest) -> bool {
     })
 }
 
+pub(crate) fn capture_wan_execution<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    loaded_adapter_count: usize,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        // Dense folds and packed residual installs do not retain a byte-bound applied stack.
+        candle_gen::execution::unobserved_adapters(
+            loaded_adapter_count,
+            "candle-gen-wan/src/lib.rs or wan14b.rs",
+        );
+    })
+}
+
 impl Generator for WanGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -1155,6 +1176,14 @@ impl Generator for WanGenerator {
         Ok(())
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_wan_execution(self, req, on_progress, self.adapters.len())
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
@@ -1190,6 +1219,10 @@ impl Generator for WanGenerator {
             // cache warmed by an earlier Resident request; otherwise it would load TE/DiT/VAE beside
             // the still-resident aggregate and invalidate the published phase envelope.
             let effective_offload = self.request_offload(req);
+            candle_gen::execution::policy(
+                "wan_offload",
+                serde_json::json!(format!("{effective_offload:?}")),
+            );
             let (frames, fps) = match effective_offload {
                 OffloadPolicy::Sequential => {
                     release_warm_cache_for_staged(&self.components, || {
@@ -1713,6 +1746,68 @@ mod tests {
     use candle_gen::candle_core::safetensors as cst;
     use candle_gen::gen_core::ConditioningKind;
     use std::collections::HashMap;
+
+    struct AdapterReportFixture(ModelDescriptor);
+
+    impl Generator for AdapterReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+
+        fn validate(&self, _req: &GenerationRequest) -> gen_core::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            candle_gen::execution::rng_scheme("adapter-report-fixture");
+            candle_gen::execution::draw("initial_noise", 7, 0);
+            candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+            candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(GenerationOutput::Video {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }],
+                fps: 1,
+                audio: None,
+            })
+        }
+    }
+
+    #[test]
+    fn wan_video_reports_refuse_loaded_adapters_without_receipt_but_allow_clean_attempts() {
+        use candle_gen::gen_core::generator::ExecutionIdentity;
+
+        let req = GenerationRequest::default();
+        for descriptor in [
+            descriptor(),
+            wan14b::descriptor_t2v_14b(),
+            wan14b::descriptor_i2v_14b(),
+        ] {
+            let fixture = AdapterReportFixture(descriptor);
+            let clean = capture_wan_execution(&fixture, &req, &mut |_| {}, 0).unwrap();
+            assert!(matches!(
+                clean.execution,
+                ExecutionIdentity::Resolved { .. }
+            ));
+            for count in [1, 2] {
+                let adapted = capture_wan_execution(&fixture, &req, &mut |_| {}, count).unwrap();
+                let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+                    panic!("loaded adapters need an applied-stack receipt")
+                };
+                assert!(reason
+                    .missing_facts
+                    .iter()
+                    .any(|fact| fact.contains(&format!("selected adapter count {count}"))));
+            }
+        }
+    }
 
     #[test]
     fn combined_conditioning_latents_is_checked() {

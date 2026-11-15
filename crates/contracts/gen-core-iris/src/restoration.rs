@@ -20,10 +20,16 @@
 pub use super::downstream::{EmptyPrompt, EMPTY_PROMPT_FILE};
 use super::downstream::{TaskExport, TaskSettings};
 use super::{IrisConfig, IrisTask};
+use gen_core::generator::{
+    ExecutionFact, ExecutionIdentity, ExecutionRandomness, ExecutionReplaySupport,
+    ExecutionUnavailable, ResolvedExecutionIdentity, EXECUTION_IDENTITY_VERSION,
+};
 use gen_core::media::Image;
 use gen_core::runtime::{CancelFlag, LoadSpec, Progress};
 use gen_core::transform::{InputBudget, InputSizing, TargetSize, TransformRequest};
 use gen_core::{Error, Result};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 /// The REQUESTED stack of each colour-fix worker thread (one per RGB channel). Equal to std's
 /// default for these targets (Rust ac68 `library/std/src/sys/thread/unix.rs:20-26`,
@@ -327,6 +333,89 @@ pub struct RestorationPlan {
     /// Tile left offsets (empty when the padded image is a single tile).
     pub tile_cols: Vec<u32>,
     pub color_fix: bool,
+}
+
+/// Facts observed from the completed restoration's actual plan and loaded provider. The caller
+/// supplies its effective numeric execution policy (precision, tier and residency) from the
+/// loaded model, never from an untrusted request. Bitwise replay remains unclaimed.
+pub fn completed_execution_identity(
+    plan: &RestorationPlan,
+    image: &Image,
+    backend: &str,
+    runtime_id: &str,
+    model_time: f32,
+    sigma: f64,
+    numeric_policy: Value,
+) -> Result<ExecutionIdentity> {
+    if image.width != plan.output.width || image.height != plan.output.height {
+        return Err(Error::Msg(
+            "completed restoration output differs from its executed plan".into(),
+        ));
+    }
+    if !model_time.is_finite()
+        || !sigma.is_finite()
+        || numeric_policy
+            .as_object()
+            .is_none_or(|policy| policy.is_empty())
+    {
+        return Err(Error::Msg(
+            "completed restoration numeric facts are unavailable".into(),
+        ));
+    }
+    if numeric_policy
+        .get("device")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Ok(ExecutionIdentity::unavailable(ExecutionUnavailable {
+            code: "restoration_device_unavailable".into(),
+            detail: "The selected execution device was not observed".into(),
+            missing_facts: vec!["selected_execution_device".into()],
+        }));
+    }
+    let identity = ResolvedExecutionIdentity {
+        version: EXECUTION_IDENTITY_VERSION,
+        provider_id: MODEL_ID.into(),
+        backend: backend.into(),
+        runtime_id: runtime_id.into(),
+        sampling: ExecutionFact::resolved(json!({"method":"one_step_velocity","forwards":plan.forward_count()})),
+        schedule: ExecutionFact::f32_bits(model_time)?,
+        estimator: ExecutionFact::resolved(json!("velocity_x_minus_sigma_v")),
+        randomness: ExecutionRandomness::NoDraws {
+            reason: "Iris restoration uses one deterministic velocity evaluation per tile and no RNG".into(),
+        },
+        deterministic_replay: ExecutionReplaySupport::NonDeterministic {
+            reason: "bitwise replay across backend, device and floating-point runtime has not been qualified".into(),
+        },
+        geometry: ExecutionFact::resolved(json!({
+            "source":[plan.source.width,plan.source.height],
+            "input":[plan.input.width,plan.input.height],
+            "processing":[plan.processing.width,plan.processing.height],
+            "padded":[plan.padded.width,plan.padded.height],
+            "output":[image.width,image.height],
+            "tile_rows":plan.tile_rows.len(),"tile_cols":plan.tile_cols.len(),
+        })),
+        quality_policy: ExecutionFact::resolved(json!({
+            "input_sizing":match plan.input_sizing {
+                InputSizing::Budgeted => "budgeted",
+                InputSizing::Original => "original",
+            },
+            "budget_applied":plan.budget_applied,
+            "scale_f64_bits":format!("f64:{:016x}",plan.scale.to_bits()),
+            "enlarged":plan.enlarged,"tile":plan.tile,"stride":plan.stride,
+            "patch":plan.patch,"color_fix":plan.color_fix,"single_pass":plan.single_pass(),
+            "sigma_f64_bits":format!("f64:{:016x}",sigma.to_bits()),
+            "numeric":numeric_policy,
+        })),
+        output_policy: ExecutionFact::resolved(json!({"format":"rgb8","channels":Image::CHANNELS})),
+        provider_choices: BTreeMap::new(),
+        output_units: 1,
+    };
+    let execution = ExecutionIdentity::Resolved {
+        identity: Box::new(identity),
+    };
+    execution.validate(MODEL_ID, backend, 1)?;
+    Ok(execution)
 }
 
 /// Canonical indexed tile positions. Same start/stride/flush-last ordering as `tile_positions`,
@@ -1358,6 +1447,69 @@ mod tests {
             input_sizing,
             color_fix: true,
         }
+    }
+
+    #[test]
+    fn completed_restoration_reports_only_observed_plan_and_conservative_replay() {
+        let plan = plan(
+            Dims::new(256, 256),
+            &RestorationOptions::default(),
+            TileGeometry::RELEASE,
+            MODEL_ID,
+        )
+        .unwrap();
+        let image = Image {
+            width: plan.output.width,
+            height: plan.output.height,
+            pixels: vec![0; plan.output.width as usize * plan.output.height as usize * 3],
+        };
+        let report = completed_execution_identity(
+            &plan,
+            &image,
+            "candle",
+            "candle-iris@1:restore-v1",
+            500.0,
+            0.5,
+            json!({"compute_dtype":"Bf16","device":"Cpu"}),
+        )
+        .unwrap();
+        let actual = report.resolved().unwrap();
+        assert_eq!(actual.output_units, 1);
+        assert_eq!(
+            actual.geometry,
+            ExecutionFact::resolved(json!({
+                "source":[256,256],"input":[256,256],"processing":[1024,1024],
+                "padded":[1024,1024],"output":[1024,1024],"tile_rows":0,"tile_cols":0,
+            }))
+        );
+        assert!(matches!(
+            actual.randomness,
+            ExecutionRandomness::NoDraws { .. }
+        ));
+        assert!(!actual.deterministic_replay.is_deterministic());
+        let unknown_device = completed_execution_identity(
+            &plan,
+            &image,
+            "mlx",
+            "mlx-iris@1:restore-v1",
+            500.0,
+            0.5,
+            json!({"compute_dtype":"Bf16","device_observation":{"state":"unavailable"}}),
+        )
+        .unwrap();
+        assert!(unknown_device.resolved().is_none());
+        let mut wrong = image.clone();
+        wrong.width += 1;
+        assert!(completed_execution_identity(
+            &plan,
+            &wrong,
+            "candle",
+            "runtime",
+            500.0,
+            0.5,
+            json!({"device":"Cpu"})
+        )
+        .is_err());
     }
 
     #[test]

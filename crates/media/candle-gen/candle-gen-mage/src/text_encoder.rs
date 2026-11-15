@@ -21,6 +21,7 @@ use crate::config::{
 };
 
 pub struct MageTextEncoder {
+    packed_source: bool,
     model: BooguTextEncoder,
     tokenizer: Tokenizer,
     vision: Option<VisionTower>,
@@ -114,11 +115,16 @@ impl MageTextEncoder {
         )
         .map_err(|e| Error::Msg(format!("mage: load text_encoder/tokenizer.json: {e}")))?;
         Ok(Self {
+            packed_source: weights.packed().is_some(),
             model,
             tokenizer,
             vision,
             device: device.clone(),
         })
+    }
+
+    pub(crate) fn has_packed_source(&self) -> bool {
+        self.packed_source
     }
 
     /// Return `[1, <=2048, 2560]` final post-RMSNorm conditioning after dropping the frozen

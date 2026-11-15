@@ -109,7 +109,7 @@ pub use audio_dsp::{
 pub use audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 pub use audio_transform::{
     AudioTarget, AudioTransform, AudioTransformCapabilities, AudioTransformDescriptor,
-    AudioTransformKind, AudioTransformRequest,
+    AudioTransformKind, AudioTransformRequest, CompletedAudioTransform,
 };
 pub use caption::{
     apply_caption_trigger_words, CaptionCapabilities, CaptionFinishReason, CaptionOptions,
@@ -319,8 +319,8 @@ pub use transcribe::{
     TranscriptOutput, TranscriptSegment, TranscriptWord,
 };
 pub use transform::{
-    InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
-    TransformRequest,
+    CompletedTransform, InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities,
+    TransformDescriptor, TransformRequest,
 };
 
 /// gen-core's package version, for the version-skew runtime guard (sc-4482).

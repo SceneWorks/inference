@@ -498,6 +498,12 @@ pub fn denoise_reported(
     let references = inputs.references.as_ref();
     // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
     let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
+    mlx_gen::image_execution::policy_debug("qwen-image-2-1.kv_cached", &cached);
+    mlx_gen::image_execution::policy_debug(
+        "qwen-image-2-1.negative_branch",
+        &inputs.negative_embeds.is_some(),
+    );
+    mlx_gen::image_execution::scalar("qwen-image-2-1.effective_cfg_scale", scale);
     *report = DenoiseReport {
         kv_cache: if cached {
             KvCachePath::Cached

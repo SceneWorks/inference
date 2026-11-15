@@ -110,6 +110,13 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
+    mlx_gen::video_execution::sampling(
+        "ltx_denoise",
+        "distilled_euler",
+        "denoised_x0",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise", sigmas);
     let dt = latents.dtype();
     let sh = latents.shape();
     let (b, c, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
@@ -195,6 +202,10 @@ pub(crate) fn decode_to_frames_with_tiling(
         Some(config) => Some(*config),
         None => auto_tiling_budgeted_ltx(out_h, out_w, out_f)?,
     };
+    mlx_gen::video_execution::policy(
+        "ltx_vae_decode",
+        serde_json::json!({"tiling":format!("{selected:?}"),"latent_dtype":format!("{:?}",latents.dtype())}),
+    );
     let decoded = match selected {
         Some(cfg) => vae.decode_tiled(latents, &cfg, cancel)?,
         None => vae.decode(latents)?,
@@ -732,6 +743,13 @@ pub fn denoise_av(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
+    mlx_gen::video_execution::sampling(
+        "ltx_denoise_av",
+        "distilled_euler",
+        "denoised_x0",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise_av", sigmas);
     let dt = video.dtype();
     let v = video.shape();
     let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
@@ -805,6 +823,13 @@ pub fn denoise_av_dev(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
+    mlx_gen::video_execution::sampling(
+        "ltx_denoise_av_dev",
+        "distilled_euler",
+        "denoised_x0",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise_av_dev", sigmas);
     let dt = video.dtype();
     let v = video.shape();
     let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
@@ -925,6 +950,13 @@ pub fn denoise_av_curated(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<(Array, Array)> {
+    mlx_gen::video_execution::curated_sampling(
+        "ltx_denoise_av_curated",
+        sampler_name,
+        "flow_velocity",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise_av_curated", sigmas);
     let dt = video.dtype();
     let v = video.shape();
     let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
@@ -1035,6 +1067,13 @@ pub fn denoise_av_tokens(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Array)> {
+    mlx_gen::video_execution::sampling(
+        "ltx_denoise_av_tokens",
+        "distilled_euler",
+        "denoised_x0",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise_av_tokens", sigmas);
     let dt = video.latent.dtype();
     let a = audio.shape();
     let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
@@ -1123,6 +1162,13 @@ pub fn denoise_av_tokens_dev(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Array)> {
+    mlx_gen::video_execution::sampling(
+        "ltx_denoise_av_tokens_dev",
+        "distilled_euler",
+        "denoised_x0",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise_av_tokens_dev", sigmas);
     let dt = video.latent.dtype();
     let a = audio.shape();
     let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
@@ -1265,6 +1311,13 @@ pub fn denoise_tokens_rf_ancestral(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Option<Array>)> {
+    mlx_gen::video_execution::sampling(
+        "ltx_denoise_tokens_rf_ancestral",
+        "rf_ancestral",
+        "denoised_x0",
+        serde_json::json!({}),
+    );
+    mlx_gen::video_execution::schedule("ltx_denoise_tokens_rf_ancestral", sigmas);
     let dt = video.latent.dtype();
     let mut vtok = video.latent.clone();
     let mut alat = audio.as_ref().map(|a| a.latent.clone());
@@ -1274,6 +1327,13 @@ pub fn denoise_tokens_rf_ancestral(
     });
     let rope_epoch = Some(dit.next_rope_epoch());
     let seeded_normal = |shape: &[i32], step: usize, modality: u64| -> Result<Array> {
+        mlx_gen::video_execution::draw(
+            0,
+            &format!("ltx_dfr_ancestral_modality_{modality}"),
+            noise_seed
+                .wrapping_add(2 * step as u64)
+                .wrapping_add(modality),
+        );
         let key = mlx_rs::random::key(
             noise_seed
                 .wrapping_add(2 * step as u64)
@@ -1487,6 +1547,10 @@ pub fn generate_av_latents_for_variant(
     // an RAII guard restores the render thread's prior setting on return.
     let _compile_glue = crate::CompileGlueGuard::enable();
     let execution_plan = crate::dev_sampler::ExecutionPlan::for_variant(variant);
+    mlx_gen::video_execution::policy(
+        "ltx_execution_plan",
+        serde_json::json!({"plan":format!("{execution_plan:?}")}),
+    );
     let stage1_sigmas = execution_plan.sigmas.as_slice();
     // Stage 1: video init = conditioned+noised (replace-latent) or pure noise (T2V); audio = noise.
     let (vlat1, vstate1): (Array, Option<I2vConditioning>) = {
@@ -1695,6 +1759,10 @@ pub fn generate_av_latents_iclora(
     let _compile_glue = crate::CompileGlueGuard::enable();
     let (c, f, h1, w1) = grid_dims;
     let execution_plan = crate::dev_sampler::ExecutionPlan::for_variant(variant);
+    mlx_gen::video_execution::policy(
+        "ltx_execution_plan",
+        serde_json::json!({"plan":format!("{execution_plan:?}")}),
+    );
     let stage1_sigmas = execution_plan.sigmas.as_slice();
 
     // Stage 1: build the base token state from the noise grid + main positions, append each clip as

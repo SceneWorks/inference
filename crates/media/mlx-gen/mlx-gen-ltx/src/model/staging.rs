@@ -72,6 +72,10 @@ impl Ltx {
         } else {
             crate::memory_strategy_2_5::TransformerExecution::default()
         };
+        mlx_gen::video_execution::policy(
+            "ltx_transformer",
+            serde_json::json!({"execution":format!("{execution:?}"),"precision":format!("{:?}",self.dit_prec)}),
+        );
         let mut transformer = if memory.stream_transformer_blocks {
             if self.descriptor.id != MODEL_25_ID {
                 return Err(Error::Unsupported(
@@ -337,6 +341,11 @@ impl Ltx {
                     let shape = latents.shape();
                     let noise_shape = decoder.config().noise_shape(shape[2], shape[3], shape[4]);
                     let key = random::key(seed.wrapping_add(4))?;
+                    mlx_gen::video_execution::draw(
+                        0,
+                        "ltx_diffusion_decoder_normal",
+                        seed.wrapping_add(4),
+                    );
                     let noise = random::normal::<f32>(
                         &[
                             shape[0],
@@ -350,6 +359,10 @@ impl Ltx {
                         Some(&key),
                     )?;
                     let pixels = decode_diffvae_budgeted(*mode, |mode| {
+                        mlx_gen::video_execution::policy(
+                            "ltx_diffusion_decoder",
+                            serde_json::json!({"mode":format!("{mode:?}"),"noise_shape":noise_shape}),
+                        );
                         decoder.decode_budgeted(latents, &noise, mode)
                     })?;
                     to_uint8_frames(&pixels)
