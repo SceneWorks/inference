@@ -474,6 +474,9 @@ impl TextLlm for JoyCaptionProvider {
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
+        if request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
         scope.finish_text(output, self.descriptor())
     }
 

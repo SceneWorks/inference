@@ -762,19 +762,23 @@ impl Flux2 {
     ) -> Result<String> {
         if !req.enhance_prompt {
             observe_enhancement_outcome("absent", &req.prompt);
-            req.prompt_enhancement
-                .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
-                    &req.prompt,
-                ));
+            mlx_gen::image_execution::without_capture(|| {
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
+                        &req.prompt,
+                    ))
+            });
             return Ok(req.prompt.clone());
         }
         if !self.variant.is_dev() {
             observe_enhancement_outcome("unsupported_variant", &req.prompt);
-            req.prompt_enhancement
-                .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
-                    &req.prompt,
-                    "unsupported_variant",
-                ));
+            mlx_gen::image_execution::without_capture(|| {
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        "unsupported_variant",
+                    ))
+            });
             return Ok(req.prompt.clone());
         }
         match self
@@ -787,21 +791,21 @@ impl Flux2 {
                 // model-generated text so an embedded newline can't split the record or forge a
                 // second prefix line (the returned `p` itself is unchanged) (L-log-injection).
                 eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&p));
-                req.prompt_enhancement
-                    .emit(mlx_gen::gen_core::PromptEnhancementReport::enhanced(
-                        &req.prompt,
-                        &p,
-                    ));
+                mlx_gen::image_execution::without_capture(|| {
+                    req.prompt_enhancement.emit(
+                        mlx_gen::gen_core::PromptEnhancementReport::enhanced(&req.prompt, &p),
+                    )
+                });
                 Ok(p)
             }
             Ok(Err(reason)) => {
                 observe_enhancement_outcome(reason, &req.prompt);
                 eprintln!("ENHANCER_FALLBACK:{reason}");
-                req.prompt_enhancement
-                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
-                        &req.prompt,
-                        reason,
-                    ));
+                mlx_gen::image_execution::without_capture(|| {
+                    req.prompt_enhancement.emit(
+                        mlx_gen::gen_core::PromptEnhancementReport::fallback(&req.prompt, reason),
+                    )
+                });
                 Ok(req.prompt.clone())
             }
             Err(Error::Canceled) => Err(Error::Canceled),
@@ -816,11 +820,14 @@ impl Flux2 {
                     "prompt_enhancement_execution",
                 );
                 eprintln!("ENHANCER_FALLBACK:{}", sanitize_log_text(&e.to_string()));
-                req.prompt_enhancement
-                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
-                        &req.prompt,
-                        "enhancer_error",
-                    ));
+                mlx_gen::image_execution::without_capture(|| {
+                    req.prompt_enhancement.emit(
+                        mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                            &req.prompt,
+                            "enhancer_error",
+                        ),
+                    )
+                });
                 Ok(req.prompt.clone())
             }
         }

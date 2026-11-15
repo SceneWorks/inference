@@ -3145,9 +3145,19 @@ impl TextLlm for LlamaProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(requested) = self.load_report.requested {
+            scope.observe_numeric_policy(serde_json::json!({
+                "requested_quantization": format!("{requested:?}"),
+                "resident_projection_quantized": self.is_quantized(),
+                "device": "metal",
+            }));
+        }
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
+        if request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
         scope.finish_text(output, self.descriptor())
     }
 

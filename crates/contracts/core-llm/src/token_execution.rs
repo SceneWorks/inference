@@ -18,6 +18,7 @@ use crate::{
 struct Observations {
     id: usize,
     suspended: bool,
+    numeric_policy: Option<Value>,
     samplers: Vec<Value>,
     seeds: Vec<u64>,
     stochastic: Vec<bool>,
@@ -53,6 +54,18 @@ impl TokenExecutionScope {
             id
         });
         Self(id, PhantomData)
+    }
+
+    /// Record the loaded weight and device policy, rather than inferring it from the request.
+    pub fn observe_numeric_policy(&self, policy: Value) {
+        ATTEMPTS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let frame = stack
+                .iter_mut()
+                .find(|frame| frame.id == self.0)
+                .expect("owned scope");
+            frame.numeric_policy = Some(policy);
+        });
     }
 
     /// No request fields enter this report. The sampler, seed and budgets come from the decode
@@ -143,6 +156,9 @@ impl TokenExecutionScope {
         ATTEMPTS.with(|stack| {
             let stack = stack.borrow();
             let observed = stack.iter().find(|frame| frame.id == self.0).expect("owned token execution scope");
+            let Some(numeric_policy) = observed.numeric_policy.as_ref() else {
+                return unavailable("token_numeric_policy_unavailable", "The loaded projection format and device were not observed", "loaded_numeric_policy");
+            };
             // Multiple decoder invocations can belong to nested unreported calls or a pipeline.
             // Without an explicit output mapping they cannot be attributed to this output.
             if observed.seeds.len() != 1 {
@@ -162,7 +178,7 @@ impl TokenExecutionScope {
                 }] }},
                 deterministic_replay: token_replay_support(decode, &observed.policies),
                 geometry: ExecutionFact::not_applicable("token source output has no raster geometry"),
-                quality_policy: ExecutionFact::resolved(json!({"decode":format!("{decode:?}"), "kv_cache":kv})),
+                quality_policy: ExecutionFact::resolved(json!({"decode":format!("{decode:?}"), "kv_cache":kv,"loaded_numeric_policy":numeric_policy})),
                 output_policy: ExecutionFact::resolved(json!({"decoder_policies":observed.policies,"completed":output})),
                 provider_choices: Default::default(), output_units:1,
             }) }
@@ -381,6 +397,11 @@ pub fn unavailable(code: &str, detail: &str, missing: &str) -> ExecutionIdentity
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_scope() -> TokenExecutionScope {
+        let scope = TokenExecutionScope::new();
+        scope.observe_numeric_policy(json!({"loaded_format":"fixture_dense","device":"cpu"}));
+        scope
+    }
     fn descriptor() -> TextLlmDescriptor {
         TextLlmDescriptor {
             id: "native-test".into(),
@@ -410,8 +431,34 @@ mod tests {
         );
     }
     #[test]
-    fn actual_seed_controls_and_runtime_fallback_are_bound_to_output() {
+    fn loaded_numeric_tiers_change_identity_and_missing_policy_is_unavailable() {
+        let run = |tier| {
+            let scope = TokenExecutionScope::new();
+            scope.observe_numeric_policy(json!({"projection_quantization":tier,"device":"cpu"}));
+            observe(123);
+            scope
+                .finish_text(output(), &descriptor())
+                .unwrap()
+                .execution
+        };
+        let q4 = run("Q4");
+        let q8 = run("Q8");
+        assert_ne!(
+            q4.resolved().unwrap().quality_policy,
+            q8.resolved().unwrap().quality_policy
+        );
+
         let scope = TokenExecutionScope::new();
+        observe(123);
+        let missing = scope
+            .finish_text(output(), &descriptor())
+            .unwrap()
+            .execution;
+        assert!(missing.resolved().is_none());
+    }
+    #[test]
+    fn actual_seed_controls_and_runtime_fallback_are_bound_to_output() {
+        let scope = fixture_scope();
         observe(123);
         observe_token_prompt_boundary(577);
         let completed = scope.finish_text(output(), &descriptor()).unwrap();
@@ -441,7 +488,7 @@ mod tests {
     }
     #[test]
     fn cancellation_retry_and_missing_sampler_never_reuse_success() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe(1);
         assert!(scope
             .finish_text(output(), &descriptor())
@@ -449,7 +496,7 @@ mod tests {
             .execution
             .resolved()
             .is_some());
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe(2);
         let mut cancelled = output();
         cancelled.finish_reason = Some(FinishReason::Cancelled);
@@ -459,24 +506,24 @@ mod tests {
             .execution
             .resolved()
             .is_none());
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         assert!(scope
             .finish_text(output(), &descriptor())
             .unwrap()
             .execution
             .resolved()
             .is_none());
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe(3);
         let out = scope.finish_text(output(), &descriptor()).unwrap();
         assert!(format!("{:?}", out.execution.resolved().unwrap().randomness).contains("Some(3)"));
     }
     #[test]
     fn nested_scopes_and_panic_do_not_contaminate_caller() {
-        let outer = TokenExecutionScope::new();
+        let outer = fixture_scope();
         observe(1);
         let _ = std::panic::catch_unwind(|| {
-            let _inner = TokenExecutionScope::new();
+            let _inner = fixture_scope();
             observe(2);
             panic!("fixture");
         });
@@ -486,7 +533,7 @@ mod tests {
             .execution
             .resolved()
             .is_some());
-        let fresh = TokenExecutionScope::new();
+        let fresh = fixture_scope();
         assert!(fresh
             .finish_text(output(), &descriptor())
             .unwrap()
@@ -496,7 +543,7 @@ mod tests {
     }
     #[test]
     fn ambiguous_streams_and_absent_decode_fail_closed() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe(1);
         observe(2);
         assert!(scope
@@ -505,7 +552,7 @@ mod tests {
             .execution
             .resolved()
             .is_none());
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe(1);
         let mut missing = output();
         missing.decode = None;
@@ -725,6 +772,7 @@ mod document_tests {
     #[test]
     fn completed_svg_keeps_observed_facts_without_claiming_bitwise_replay() {
         let scope = TokenExecutionScope::new();
+        scope.observe_numeric_policy(json!({"loaded_format":"fixture_dense","device":"cpu"}));
         observe_token_seed(Sampling::default(), 41, 19, &[]);
         let svg = StarVectorOutput {
             svg: Some("<svg/>".into()),

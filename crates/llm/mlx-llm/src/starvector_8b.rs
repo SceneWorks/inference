@@ -385,6 +385,9 @@ impl TextLlm for StarVector8bProvider {
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
+        if request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
         scope.finish_text(output, self.descriptor())
     }
 
@@ -435,6 +438,9 @@ impl StarVectorProvider for StarVector8bProvider {
         let (output, record) = self.generate_svg_inner(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
+        if request.text_request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
         let decode = record;
         scope.finish_svg(output, decode.as_ref(), core_llm::TextLlm::descriptor(self))
     }

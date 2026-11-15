@@ -1489,6 +1489,9 @@ mod execution_seed_tests {
     fn actual_config_seed_and_fallback_are_observed_without_model_execution() {
         for seed in [Some(71), None] {
             let scope = core_llm::token_execution::TokenExecutionScope::new();
+            scope.observe_numeric_policy(
+                serde_json::json!({"projection_quantization":"fixture_dense","device":"metal"}),
+            );
             let config = GenerationConfig {
                 seed,
                 sampling: SamplingParams {
