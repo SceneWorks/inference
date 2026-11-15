@@ -780,6 +780,46 @@ impl SenseNovaUnderstanding {
     }
 
     /// Progress-capable sibling preserving the original entry point.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        question: &str,
+        images: &[Tensor],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        options: T2iOptions,
+        cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(String, candle_llm::core_llm::ExecutionIdentity)> {
+        let scope = candle_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.run_vqa_with_progress(
+            context,
+            request,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            options,
+            cancel,
+            &mut |event| {
+                candle_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        let execution = scope.finish_document(
+            MODEL_ID,
+            "candle",
+            serde_json::json!({"format":"text","trim_whitespace":true,"think_mode":false}),
+        );
+        execution
+            .validate(MODEL_ID, "candle", 1)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_vqa_with_progress(
         &self,
@@ -852,6 +892,48 @@ impl SenseNovaUnderstanding {
     }
 
     /// Progress-capable sibling preserving the original entry point.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(InterleaveOutput, candle_llm::core_llm::ExecutionIdentity)> {
+        let scope = candle_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.run_interleave_with_progress(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            cancel,
+            &mut |event| {
+                candle_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        let execution = scope.finish_document(MODEL_ID, "candle", serde_json::json!({"format":"interleaved_document","image_encoding":"model_space_rgb_nchw","image_dtypes":output.images.iter().map(|image| format!("{:?}",image.dtype())).collect::<Vec<_>>(),"image_count":output.images.len(),"image_shapes":output.images.iter().map(|image| image.dims()).collect::<Vec<_>>()}));
+        execution
+            .validate(MODEL_ID, "candle", 1)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_interleave_with_progress(
         &self,

@@ -359,6 +359,7 @@ pub struct StarVectorBoundedStream<'a> {
 impl<'a> StarVectorBoundedStream<'a> {
     /// Start an empty bounded stream for an already-validated request.
     pub fn new(request: &'a StarVectorRequest) -> Self {
+        crate::token_execution::observe_svg_policy(request);
         Self {
             request,
             source: String::new(),

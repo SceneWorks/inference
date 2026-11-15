@@ -20,6 +20,7 @@
 //! The pixel path is the `fm_head` → unpatchify (`use_pixel_head = false`); the conv decoders and the
 //! dynamic-μ schedule are dead code for this checkpoint.
 
+use mlx_llm::core_llm::token_execution as execution;
 use mlx_rs::ops::{add, divide, matmul, minimum, multiply, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
@@ -772,6 +773,10 @@ impl T2iModel {
 
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
+        execution::observe_image_schedule(&timesteps);
+        execution::observe_document_policy(
+            serde_json::json!({"denoise_options":format!("{opts:?}"),"noise_scale_bits":noise_scale.to_bits(),"width":width,"height":height}),
+        );
         // Constant noise-scale conditioning token (added to every step's timestep embedding).
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
@@ -1442,6 +1447,9 @@ impl T2iModel {
         cancel: Option<&CancelFlag>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<String> {
+        execution::observe_document_policy(
+            serde_json::json!({"effective_options":format!("{opts:?}"),"native_route":"sensenova_understanding"}),
+        );
         // Preprocess any source images.
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1613,6 +1621,9 @@ impl T2iModel {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
+        execution::observe_document_policy(
+            serde_json::json!({"effective_options":format!("{opts:?}"),"native_route":"sensenova_understanding"}),
+        );
         let cell = self.patch_size * self.merge_size;
         if width % cell != 0 || height % cell != 0 {
             return Err(Error::Msg(format!(
@@ -1759,6 +1770,23 @@ impl T2iModel {
                     opts.seed.wrapping_add(images.len() as u64),
                 )?,
             };
+            if execution::observing() {
+                if init_noises.is_some_and(|noises| images.len() < noises.len()) {
+                    execution::observe_document_image(
+                        images.len(),
+                        "explicit-f32-noise-sha256",
+                        None,
+                        Some(base_noise.as_slice::<f32>()),
+                    );
+                } else {
+                    execution::observe_document_image(
+                        images.len(),
+                        "splitmix64-box-muller-v1",
+                        Some(opts.seed.wrapping_add(images.len() as u64)),
+                        None,
+                    );
+                }
+            }
             // F-136 (sc-11133): fold this image's `1..=num_steps` denoise onto the aggregate bar —
             // offset by the steps already completed (`images.len() × num_steps`), total pinned to
             // `max_images × num_steps` — so the interleave path reports one monotone progression
@@ -1869,6 +1897,10 @@ impl T2iModel {
 
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
+        execution::observe_image_schedule(&timesteps);
+        execution::observe_document_policy(
+            serde_json::json!({"denoise_options":format!("{opts:?}"),"noise_scale_bits":noise_scale.to_bits(),"width":width,"height":height}),
+        );
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);

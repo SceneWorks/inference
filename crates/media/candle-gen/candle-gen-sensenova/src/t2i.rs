@@ -28,6 +28,7 @@ use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::preview::{PreviewCounter, PreviewHook};
 use candle_gen::{CandleError, Result};
+use candle_llm::core_llm::token_execution as execution;
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::config::NeoChatConfig;
@@ -617,6 +618,10 @@ impl T2iModel {
 
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
+        execution::observe_image_schedule(&timesteps);
+        execution::observe_document_policy(
+            serde_json::json!({"denoise_options":format!("{opts:?}"),"noise_scale_bits":noise_scale.to_bits(),"width":width,"height":height}),
+        );
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let needs_cfg = opts.cfg_scale > 1.0 && cache_uncond.is_some();
@@ -1070,6 +1075,9 @@ impl T2iModel {
         cancel: Option<&CancelFlag>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<String> {
+        execution::observe_document_policy(
+            serde_json::json!({"effective_options":format!("{opts:?}"),"native_route":"sensenova_understanding"}),
+        );
         let attention = self.attention_plan(opts, cancel);
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1254,6 +1262,10 @@ impl T2iModel {
         let mut image = (base_noise * noise_scale as f64)?;
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
+        execution::observe_image_schedule(&timesteps);
+        execution::observe_document_policy(
+            serde_json::json!({"denoise_options":format!("{opts:?}"),"noise_scale_bits":noise_scale.to_bits(),"width":width,"height":height}),
+        );
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);
@@ -1496,6 +1508,9 @@ impl T2iModel {
         preview: &PreviewHook<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
+        execution::observe_document_policy(
+            serde_json::json!({"effective_options":format!("{opts:?}"),"native_route":"sensenova_understanding"}),
+        );
         let cell = self.cell();
         if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
             return Err(CandleError::Msg(format!(
@@ -1634,6 +1649,12 @@ impl T2iModel {
                 opts.seed.wrapping_add(images.len() as u64),
                 &self.device,
             )?;
+            execution::observe_document_image(
+                images.len(),
+                "rand-StdRng-seeded-normal-v1",
+                Some(opts.seed.wrapping_add(images.len() as u64)),
+                None,
+            );
             let offset = images.len().saturating_mul(opts.num_steps) as u32;
             let total = max_images.saturating_mul(opts.num_steps) as u32;
             let mut progress = |event| match event {
