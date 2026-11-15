@@ -319,8 +319,8 @@ pub use transcribe::{
     TranscriptOutput, TranscriptSegment, TranscriptWord,
 };
 pub use transform::{
-    InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
-    TransformRequest,
+    CompletedTransform, InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities,
+    TransformDescriptor, TransformRequest,
 };
 
 /// gen-core's package version, for the version-skew runtime guard (sc-4482).
