@@ -29,6 +29,7 @@ set "MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--syn
 set "MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--SimpleTuner--minimax-h3-image-domokun-2048\snapshots\57214626f457eac87077c7035bb1b64d5264ebf3"
 set "MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--ShootTheSound--Fizgig-MiniMax-H3-Image-Training-Adapter\snapshots\f1a4547596faeb98bae568dd28da296c49fbe0a1"
 set "MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--linoyts--MiniMax-H3-Image-pDMD-2steps\snapshots\c07d96e5635311ed007d44654c2f98cc8d6e0a1e"
+set "MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--akhaliq--MiniMax-H3-Image-Character-Swap\snapshots\0b7f918092f9e23c01ca62b63d7c17e4fce6faa9"
 if not exist "%H3I_OUT%" mkdir "%H3I_OUT%"
 "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
 set "HF_HUB_DISABLE_XET=1"
@@ -41,8 +42,9 @@ call :materialize tanaami "%MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT%" || exit /b 
 call :materialize domokun "%MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT%" || exit /b 1
 call :materialize fizgig "%MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT%" || exit /b 1
 call :materialize pdmd "%MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT%" || exit /b 1
+call :materialize character-swap "%MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT%" || exit /b 1
 set "PYTHONPATH="
-set "MINIMAX_H3_IMAGE_COMMUNITY_LORAS=tanaami=%MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT%\tanaami_h3_image_lora_2000.safetensors;domokun=%MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT%\pytorch_lora_weights.safetensors;fizgig=%MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT%\fizgig_minimax_h3_image_training_adapter.safetensors;pdmd=%MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT%\pytorch_lora_weights.safetensors"
+set "MINIMAX_H3_IMAGE_COMMUNITY_LORAS=tanaami=%MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT%\tanaami_h3_image_lora_2000.safetensors;domokun=%MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT%\pytorch_lora_weights.safetensors;fizgig=%MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT%\fizgig_minimax_h3_image_training_adapter.safetensors;pdmd=%MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT%\pytorch_lora_weights.safetensors;character-swap=%MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT%\lora\h3_image_character_swap_diffusers.safetensors"
 set "MINIMAX_H3_IMAGE_AT8_LORAS=tanaami,domokun"
 
 set "CUDA_DEVICE_ORDER=PCI_BUS_ID"

@@ -14,7 +14,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{AdapterKind, AdapterSpec};
-use mlx_gen_minimax_h3::adapters::{apply_minimax_h3_adapters, BLOCK_TARGETS};
+use mlx_gen_minimax_h3::adapters::{apply_minimax_h3_image_adapters, BLOCK_TARGETS};
 use mlx_gen_minimax_h3::h3_image::MiniMaxH3ImageDit;
 
 fn env_path(name: &str) -> PathBuf {
@@ -78,7 +78,7 @@ fn h3_image_candle_trained_lora_installs_on_the_real_dit() {
     );
     let mut dit = MiniMaxH3ImageDit::load(&root, Dtype::Bfloat16).expect("load the image DiT");
     let bare = block0_leaves(&mut dit);
-    let report = apply_minimax_h3_adapters(
+    let report = apply_minimax_h3_image_adapters(
         &mut dit,
         &[AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)],
     )

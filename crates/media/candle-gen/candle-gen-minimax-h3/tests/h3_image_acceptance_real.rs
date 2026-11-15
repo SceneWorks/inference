@@ -597,7 +597,7 @@ fn h3_image_refuses_the_unsupported_requests_cuda() {
         .collect();
     let path = dir.path().join("unmatched.safetensors");
     safetensors::serialize_to_file(views, &None, &path).expect("write the LoRA");
-    let message = candle_gen_minimax_h3::adapters::apply_minimax_h3_adapters(
+    let message = candle_gen_minimax_h3::adapters::apply_minimax_h3_image_adapters(
         &mut dit,
         &[AdapterSpec::new(path, 1.0, AdapterKind::Lora)],
     )

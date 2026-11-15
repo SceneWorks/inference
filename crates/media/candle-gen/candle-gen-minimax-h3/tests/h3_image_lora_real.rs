@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen_minimax_h3::adapters::{apply_minimax_h3_adapters, BLOCK_TARGETS};
+use candle_gen_minimax_h3::adapters::{apply_minimax_h3_image_adapters, BLOCK_TARGETS};
 use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
 
 const BLOCKS: usize = 2;
@@ -267,7 +267,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
     let bare = leaf_outputs(&mut dit, &device);
 
     let peft = write_peft(&cfg, dir.path(), 1, BLOCKS);
-    apply_minimax_h3_adapters(&mut dit, &[spec(peft, 1.0)]).expect("PEFT install");
+    apply_minimax_h3_image_adapters(&mut dit, &[spec(peft, 1.0)]).expect("PEFT install");
     let with_peft = leaf_outputs(&mut dit, &device);
     let moved = rel(&with_peft, &bare);
     println!("[sw-7096 candle] LoRA moves the leaf outputs by rel-max-abs {moved:.3e}");
@@ -279,7 +279,8 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
     for kohya in [true, false] {
         dit.clear_adapters();
         let native = write_native(&cfg, dir.path(), 1, kohya, BLOCKS);
-        let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("install");
+        let report =
+            apply_minimax_h3_image_adapters(&mut dit, &[spec(native, 1.0)]).expect("install");
         assert_eq!(report.applied, BLOCKS * BLOCK_TARGETS.len());
         let drift = rel(&leaf_outputs(&mut dit, &device), &with_peft);
         let name = if kohya { "kohya" } else { "comfyui" };
@@ -302,7 +303,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
             spec(path, 0.1 * (i + 1) as f32)
         })
         .collect();
-    apply_minimax_h3_adapters(&mut dit, &specs).expect("ten stacked LoRAs");
+    apply_minimax_h3_image_adapters(&mut dit, &specs).expect("ten stacked LoRAs");
     for leaf in BLOCK_TARGETS {
         let path = format!("transformer_blocks.0.{leaf}");
         let segs: Vec<&str> = path.split('.').collect();
@@ -365,7 +366,7 @@ fn block_outputs(root: &Path, device: &Device, specs: &[AdapterSpec], streamed: 
     )
     .expect("load the image DiT");
     if !specs.is_empty() {
-        let report = apply_minimax_h3_adapters(&mut dit, specs).expect("install");
+        let report = apply_minimax_h3_image_adapters(&mut dit, specs).expect("install");
         assert_eq!(
             report.applied,
             specs.len() * BLOCK_TARGETS.len() * STREAM_BLOCKS,
@@ -489,7 +490,7 @@ fn velocities(
         MiniMaxH3Dit::load_from_dir(root.join("transformer_diffusers"), device, DType::BF16)
             .expect("load the image DiT");
     if !specs.is_empty() {
-        apply_minimax_h3_adapters(&mut dit, specs).expect("install");
+        apply_minimax_h3_image_adapters(&mut dit, specs).expect("install");
     }
     let cfg = dit.config().clone();
     let layout = ImageLayout::text_to_image(8, 16, 16, cfg.patch_size).expect("layout");
@@ -614,7 +615,7 @@ fn h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda() {
     let mut dit =
         MiniMaxH3Dit::load_from_dir(root.join("transformer_diffusers"), &device, DType::BF16)
             .expect("load the image DiT");
-    let error = apply_minimax_h3_adapters(&mut dit, &[spec(missing, 1.0)])
+    let error = apply_minimax_h3_image_adapters(&mut dit, &[spec(missing, 1.0)])
         .unwrap_err()
         .to_string();
     assert!(error.contains("proj_out"), "{error}");
@@ -644,7 +645,8 @@ fn h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda() {
     }
     let native = dir.path().join("native-comfy.safetensors");
     write(&native, &t, &[("alpha", &RANK.to_string())]);
-    let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("native install");
+    let report =
+        apply_minimax_h3_image_adapters(&mut dit, &[spec(native, 1.0)]).expect("native install");
     assert_eq!(
         report.applied,
         6 + 4,

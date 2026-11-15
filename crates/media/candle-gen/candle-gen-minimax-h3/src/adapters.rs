@@ -76,9 +76,19 @@
 //! `alpha = rank` folds the 8-step file **16× too strong**; one that defaults a missing rank to 1.0
 //! folds it **128×**. Neither errors.
 //!
-//! [`resolve_alpha`] is the fix, and its fallback is the whole point: **[`DEFAULT_LORA_ALPHA`] = 8,
-//! never rank.** Alpha differs *per file inside one repo*, so it is read from the file every time —
-//! measured by sc-18724 across the published set:
+//! [`resolve_alpha`] reads the declared value, and the fallback for a file that declares none is a
+//! **per-family policy**, [`AbsentLoraAlpha`]:
+//!
+//! * **H3 video — [`AbsentLoraAlpha::H3_VIDEO`] = [`DEFAULT_LORA_ALPHA`] = 8, never rank.** That is
+//!   upstream `inference_minimax_h3.py`'s assumption, and the published `…_4step_v0.1` turbo file
+//!   ships no alpha and must fold at `8/128` (measured in sc-18724).
+//! * **H3-Image — [`AbsentLoraAlpha::H3_IMAGE`] = the target's rank** (fold `1.0`): the
+//!   diffusers / PEFT / ComfyUI convention the image LoRAs are trained under. The rank is the one of
+//!   the module the alpha describes — for a fused ComfyUI `attn.qkv_proj` that is the FUSED rank,
+//!   resolved before the split, so the block-diagonal `÷3` still lands every q/k/v target on `1.0`.
+//!
+//! A declared alpha always wins over either fallback. Alpha differs *per file inside one repo*, so it
+//! is read from the file every time — measured by sc-18724 across the published video set:
 //!
 //! | file | `__metadata__` | rank (from shapes) | effective scale at strength 1.0 |
 //! | --- | --- | --- | --- |
@@ -97,7 +107,7 @@
 //! Alpha reaches a target through exactly one ordering, [`resolve_target_alpha`]:
 //!
 //! ```text
-//! per-target `.alpha` tensor  →  PEFT `lora_adapter_metadata`  →  __metadata__["alpha"]  →  DEFAULT_LORA_ALPHA
+//! per-target `.alpha` tensor  →  PEFT `lora_adapter_metadata`  →  __metadata__["alpha"]  →  AbsentLoraAlpha
 //! ```
 //!
 //! **[`convert_comfyui_key_space`] resolves the same chain**, before it splits a fused `qkv_proj`,
@@ -128,10 +138,39 @@ use crate::dit::model::MiniMaxH3Dit;
 /// The alpha upstream's `inference_minimax_h3.py` assumes when a LoRA declares none —
 /// `DEFAULT_LORA_ALPHA = 8`.
 ///
-/// **This is the fallback, and it is deliberately not the rank.** Falling back to the rank makes
-/// `alpha/rank == 1.0`, which is the correct answer for exactly one of the published turbo files and
-/// 16× too strong for the rest.
+/// **This is the H3 VIDEO fallback ([`AbsentLoraAlpha::H3_VIDEO`]), and it is deliberately not the
+/// rank.** Falling back to the rank makes `alpha/rank == 1.0`, which is the correct answer for
+/// exactly one of the published turbo files and 16× too strong for the rest. H3-Image does not use
+/// it: see [`AbsentLoraAlpha::H3_IMAGE`].
 pub const DEFAULT_LORA_ALPHA: f32 = 8.0;
+
+/// What alpha a target folds at when its LoRA declares none anywhere — no per-target `.alpha`, no
+/// PEFT `lora_adapter_metadata` alpha and no `__metadata__["alpha"]`. The policy is per family,
+/// chosen by the install entry point ([`apply_minimax_h3_adapters`] for video,
+/// [`apply_minimax_h3_image_adapters`] for H3-Image).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AbsentLoraAlpha {
+    /// A fixed alpha, whatever the rank. H3 video uses [`DEFAULT_LORA_ALPHA`] (upstream's 8).
+    Fixed(f32),
+    /// `alpha = rank` of the module the alpha describes, so the fold is exactly `1.0` — the
+    /// diffusers / PEFT / ComfyUI convention H3-Image LoRAs are trained under.
+    Rank,
+}
+
+impl AbsentLoraAlpha {
+    /// H3 video: upstream's [`DEFAULT_LORA_ALPHA`].
+    pub const H3_VIDEO: Self = Self::Fixed(DEFAULT_LORA_ALPHA);
+    /// H3-Image: the community `alpha = rank` convention.
+    pub const H3_IMAGE: Self = Self::Rank;
+
+    /// The fallback alpha for a module of rank `rank`.
+    pub fn alpha_at_rank(self, rank: f32) -> f32 {
+        match self {
+            Self::Fixed(alpha) => alpha,
+            Self::Rank => rank,
+        }
+    }
+}
 
 /// The top-level `__metadata__` key lightx2v stamps the alpha into, as a **string**.
 pub const ALPHA_METADATA_KEY: &str = "alpha";
@@ -520,27 +559,79 @@ pub fn resolve_rank(path: &str, down: &Tensor, meta_rank: Option<&str>) -> Resul
     Ok(rank as f32)
 }
 
-/// The file-level LoRA alpha: top-level `__metadata__["alpha"]`, falling back to
-/// [`DEFAULT_LORA_ALPHA`] — **not** to the rank.
+/// The file-level LoRA alpha a file **declares**: top-level `__metadata__["alpha"]`, or `None` when
+/// the key is absent. The fallback for `None` is the family's [`AbsentLoraAlpha`], applied per target
+/// by [`resolve_target_alpha`] at that target's rank.
 ///
 /// An `alpha` that is present but unparseable or non-finite is an **error**, not a fall-through to
-/// the default: a typo'd stamp silently folding at 8 is the same class of bug this function exists
-/// to close.
-pub fn resolve_alpha(meta: &HashMap<String, String>) -> Result<f32> {
-    let Some(raw) = meta.get(ALPHA_METADATA_KEY) else {
-        return Ok(DEFAULT_LORA_ALPHA);
-    };
-    let alpha = raw.trim().parse::<f32>().map_err(|_| {
+/// the fallback: a typo'd stamp silently folding at the default is the same class of bug this
+/// function exists to close. See [`parse_alpha_metadata`] for the accepted spelling.
+pub fn resolve_alpha(meta: &HashMap<String, String>) -> Result<Option<f32>> {
+    meta.get(ALPHA_METADATA_KEY)
+        .map(|raw| parse_alpha_metadata(raw))
+        .transpose()
+}
+
+/// Parse a `__metadata__["alpha"]` string: a finite number at the start (after optional
+/// whitespace), followed by the end of the string or by whitespace and arbitrary trailing text.
+/// `"8"`, `" 8 "`, `"128"` and the community spelling `"16 (scaling 1.0)"`
+/// (akhaliq/MiniMax-H3-Image-Character-Swap) all parse; a string with no leading number (`""`,
+/// `"abc 16"`, `"nan"`, `"inf"`), a number glued to more text (`"0x10"`, `"1_000"`, `"16/32"`), or a
+/// non-finite number is an error naming the key and quoting the raw value.
+pub fn parse_alpha_metadata(raw: &str) -> Result<f32> {
+    let refuse = || {
         CandleError::Msg(format!(
-            "minimax_h3 adapter: __metadata__[\"{ALPHA_METADATA_KEY}\"] = {raw:?} is not a number"
+            "minimax_h3 adapter: __metadata__[\"{ALPHA_METADATA_KEY}\"] = {raw:?} does not begin \
+             with a finite number"
         ))
-    })?;
+    };
+    let s = raw.trim_start();
+    let number = leading_number(s).ok_or_else(refuse)?;
+    if !s[number.len()..]
+        .chars()
+        .next()
+        .is_none_or(char::is_whitespace)
+    {
+        return Err(refuse());
+    }
+    let alpha = number.parse::<f32>().map_err(|_| refuse())?;
     if !alpha.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3 adapter: __metadata__[\"{ALPHA_METADATA_KEY}\"] = {alpha} is not finite"
-        )));
+        return Err(refuse());
     }
     Ok(alpha)
+}
+
+/// The longest leading decimal literal of `s` — optional sign, digits with an optional fraction, and
+/// an optional exponent that has digits — or `None` when `s` does not start with one. Spelled-out
+/// specials (`nan`, `inf`) carry no digit and are never a literal here.
+fn leading_number(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    let digits = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+    let mut end = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let int_end = digits(end);
+    let mut any_digit = int_end > end;
+    end = int_end;
+    if b.get(end) == Some(&b'.') {
+        let frac_end = digits(end + 1);
+        any_digit |= frac_end > end + 1;
+        end = frac_end;
+    }
+    if !any_digit {
+        return None;
+    }
+    if matches!(b.get(end), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(b.get(end + 1), Some(b'+' | b'-')));
+        let exp_end = digits(end + 1 + sign);
+        if exp_end > end + 1 + sign {
+            end = exp_end;
+        }
+    }
+    Some(&s[..end])
 }
 
 /// `alpha/rank` — the fold the residual carries, computed in f64 then narrowed, matching a
@@ -553,8 +644,12 @@ pub fn alpha_rank_fold(alpha: f32, rank: f32) -> f32 {
 /// **The one alpha precedence chain**, used by both the install and the ComfyUI conversion:
 ///
 /// ```text
-/// per-target `.alpha` tensor  →  PEFT `lora_adapter_metadata`  →  __metadata__["alpha"]  →  DEFAULT_LORA_ALPHA
+/// per-target `.alpha` tensor  →  PEFT `lora_adapter_metadata`  →  __metadata__["alpha"]  →  absent.alpha_at_rank(rank)
 /// ```
+///
+/// `rank` is the rank of the module the resolved alpha describes; it is read only by the
+/// [`AbsentLoraAlpha::Rank`] fallback. For a fused ComfyUI `attn.qkv_proj` that is the fused rank,
+/// resolved before the split.
 ///
 /// Factored out because the *conversion* has to resolve it too, and resolving only part of it there
 /// is the sc-19443 review's measured silent-corruption bug: `convert_comfyui_key_space` used to see
@@ -565,9 +660,18 @@ pub fn alpha_rank_fold(alpha: f32, rank: f32) -> f32 {
 /// error, folding attention **3× too strong** against its own FFN.
 ///
 /// `file_alpha` is the caller's already-resolved [`resolve_alpha`] result, so a malformed
-/// `__metadata__["alpha"]` is still an error rather than a fall-through to the default.
-pub fn resolve_target_alpha(in_band: Option<f32>, blob_alpha: Option<f32>, file_alpha: f32) -> f32 {
-    in_band.or(blob_alpha).unwrap_or(file_alpha)
+/// `__metadata__["alpha"]` is still an error rather than a fall-through to the fallback.
+pub fn resolve_target_alpha(
+    in_band: Option<f32>,
+    blob_alpha: Option<f32>,
+    file_alpha: Option<f32>,
+    absent: AbsentLoraAlpha,
+    rank: f32,
+) -> f32 {
+    in_band
+        .or(blob_alpha)
+        .or(file_alpha)
+        .unwrap_or_else(|| absent.alpha_at_rank(rank))
 }
 
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
@@ -684,8 +788,9 @@ fn is_block_diagonal(up: &Tensor, out: usize, r: usize) -> Result<bool> {
 ///      **The alpha that gets divided is the fully resolved one**, which is why `meta` is a
 ///      parameter rather than something the caller applies afterwards. It comes from
 ///      [`resolve_target_alpha`]: the in-band `.alpha` tensor, else the PEFT
-///      `lora_adapter_metadata` blob, else the file's top-level `__metadata__["alpha"]`, else
-///      [`DEFAULT_LORA_ALPHA`] — and a per-target `.alpha` is emitted on **every** converted qkv
+///      `lora_adapter_metadata` blob, else the file's top-level `__metadata__["alpha"]`, else the
+///      family's `absent` fallback at the FUSED rank (so [`AbsentLoraAlpha::Rank`] gives `3r` and
+///      each split target folds `r/r = 1.0`) — and a per-target `.alpha` is emitted on **every** converted qkv
 ///      target, unconditionally. Resolving only the in-band spelling here (sc-19443's first cut)
 ///      left the other three routing around the `÷3` entirely: the file installed `Ok` and folded
 ///      attention 3× too strong, measured at rel-max-abs `2.007e0` against its own diffusers twin.
@@ -710,6 +815,7 @@ fn is_block_diagonal(up: &Tensor, out: usize, r: usize) -> Result<bool> {
 pub fn convert_comfyui_key_space(
     tensors: &HashMap<String, Tensor>,
     meta: &HashMap<String, String>,
+    absent: AbsentLoraAlpha,
 ) -> Result<HashMap<String, Tensor>> {
     // The file-level alpha sources, resolved ONCE. `resolve_alpha` still errors on a malformed
     // stamp, so a typo'd `__metadata__["alpha"]` fails here rather than folding at the default.
@@ -810,7 +916,8 @@ pub fn convert_comfyui_key_space(
         let (blob_alpha, _) = blob
             .as_ref()
             .map_or((None, None), |c| c.effective(&fused_path));
-        let fused_alpha = resolve_target_alpha(parts.alpha, blob_alpha, file_alpha);
+        let fused_alpha =
+            resolve_target_alpha(parts.alpha, blob_alpha, file_alpha, absent, r_fused as f32);
         for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
             let stem = format!("{container}.attn.{name}");
             let (a, b) = if block_diagonal {
@@ -861,6 +968,7 @@ pub fn convert_comfyui_key_space(
 pub fn convert_minimax_h3_trainer_key_space(
     tensors: &HashMap<String, Tensor>,
     meta: &HashMap<String, String>,
+    absent: AbsentLoraAlpha,
 ) -> Result<(HashMap<String, Tensor>, MiniMaxH3TrainerLayout, Vec<f32>)> {
     let entries = tensors
         .iter()
@@ -875,7 +983,11 @@ pub fn convert_minimax_h3_trainer_key_space(
     .map_err(|error| CandleError::Msg(format!("minimax_h3 trainer adapter: {error}")))?;
 
     let (raw, alphas) = unflatten_minimax_h3_trainer_tensors(tensors)?;
-    Ok((convert_comfyui_key_space(&raw, meta)?, layout, alphas))
+    Ok((
+        convert_comfyui_key_space(&raw, meta, absent)?,
+        layout,
+        alphas,
+    ))
 }
 
 /// Rewrite already-validated trainer tensor names into the dotted raw-module intermediate. Kept
@@ -1182,10 +1294,13 @@ fn apply_one_lokr(
 /// and SwiGLU half swap, and every other target already names the module it installs on. Every
 /// target gets an
 /// explicit `.alpha` — its own in-band one, else the one [`resolve_target_alpha`] resolves from
-/// `meta` — so no later stage depends on reading the original header.
+/// `meta`, else the family's `absent` fallback at that stem's `lora_down` rank (its leading dim) —
+/// so no later stage depends on reading the original header. A stem with no `lora_down` gets no
+/// alpha: it is an orphan the install refuses as unmatched.
 pub fn convert_kohya_key_space(
     tensors: &HashMap<String, Tensor>,
     meta: &HashMap<String, String>,
+    absent: AbsentLoraAlpha,
 ) -> Result<HashMap<String, Tensor>> {
     let pairs =
         rewrite_minimax_h3_kohya_keys(tensors.keys().map(String::as_str)).map_err(|unmatched| {
@@ -1223,12 +1338,19 @@ pub fn convert_kohya_key_space(
         out.insert(dotted, tensor);
     }
     for (stem, has_alpha) in stems {
-        if !has_alpha {
-            let path = normalize_minimax_h3_key(&stem);
-            let blob_alpha = blob.as_ref().and_then(|c| c.effective(&path).0);
-            let alpha = resolve_target_alpha(None, blob_alpha, file_alpha);
-            out.insert(format!("{stem}.alpha"), Tensor::new(&[alpha], &device)?);
+        if has_alpha {
+            continue;
         }
+        let Some(rank) = out
+            .get(&format!("{stem}.lora_down.weight"))
+            .and_then(|down| down.dims().first().copied())
+        else {
+            continue;
+        };
+        let path = normalize_minimax_h3_key(&stem);
+        let blob_alpha = blob.as_ref().and_then(|c| c.effective(&path).0);
+        let alpha = resolve_target_alpha(None, blob_alpha, file_alpha, absent, rank as f32);
+        out.insert(format!("{stem}.alpha"), Tensor::new(&[alpha], &device)?);
     }
     Ok(out)
 }
@@ -1253,6 +1375,7 @@ fn apply_one_lora(
     tensors: &HashMap<String, Tensor>,
     meta: &HashMap<String, String>,
     scale: f32,
+    absent: AbsentLoraAlpha,
     report: &mut MiniMaxH3LoraReport,
 ) -> Result<()> {
     let device = host.device().clone();
@@ -1272,7 +1395,8 @@ fn apply_one_lora(
     // The file-level alpha sources, read ONCE per file — the whole point of this module. The PEFT
     // `lora_adapter_metadata` blob (sc-5374) is honored when present because a peft-saved file is a
     // legitimate input and the MLX twin honors it; the published turbo files carry none, so they
-    // land on the `__metadata__["alpha"]` read and its `DEFAULT_LORA_ALPHA` fallback.
+    // land on the `__metadata__["alpha"]` read and, when that is absent too, the family's `absent`
+    // fallback at the target's rank.
     let file_alpha = resolve_alpha(meta)?;
     let blob = LoraAdapterMeta::from_file_metadata(meta);
     let meta_rank = meta.get(RANK_METADATA_KEY).map(String::as_str);
@@ -1302,11 +1426,12 @@ fn apply_one_lora(
             }
         }
         // Precedence: per-target `.alpha` tensor → the PEFT blob → the file's top-level
-        // `__metadata__["alpha"]` → `DEFAULT_LORA_ALPHA`. The last step is the correction: it never
-        // falls back to `rank`. A converted ComfyUI file always carries a per-target `.alpha` on its
+        // `__metadata__["alpha"]` → the family's `absent` fallback: H3 video falls back to
+        // `DEFAULT_LORA_ALPHA`, never to `rank`; H3-Image falls back to this target's factor rank
+        // (fold 1.0). A converted ComfyUI file always carries a per-target `.alpha` on its
         // qkv targets, so the split-adjusted value wins here and the undivided file-level one is
         // unreachable — see [`convert_comfyui_key_space`].
-        let alpha = resolve_target_alpha(parts.alpha, blob_alpha, file_alpha);
+        let alpha = resolve_target_alpha(parts.alpha, blob_alpha, file_alpha, absent, rank);
         let segs: Vec<&str> = path.split('.').collect();
         if path == NATIVE_OUTPUT_HEAD {
             let fold = alpha_rank_fold(alpha, rank);
@@ -1375,9 +1500,41 @@ fn apply_one_lora(
 /// A genuine LoKr file routes by its contents through the structured Kronecker seam before the LoRA
 /// path. The exact H3 trainer namespace is classified first so a mixed trainer/LoKr file cannot use
 /// one valid factor pair to route around the trainer's complete-layout validation.
+///
+/// # The absent-alpha policy
+///
+/// This entry is the **H3 video** install: a LoRA that declares no alpha anywhere folds at
+/// [`AbsentLoraAlpha::H3_VIDEO`] (upstream's [`DEFAULT_LORA_ALPHA`]). The H3-Image generator
+/// installs through [`apply_minimax_h3_image_adapters`] instead, whose fallback is the rank.
 pub fn apply_minimax_h3_adapters(
     host: &mut MiniMaxH3Dit,
     specs: &[AdapterSpec],
+) -> Result<MiniMaxH3LoraReport> {
+    apply_minimax_h3_adapters_with(host, specs, VIDEO_ABSENT_ALPHA)
+}
+
+/// The **H3-Image** install: [`apply_minimax_h3_adapters`] with the [`AbsentLoraAlpha::H3_IMAGE`]
+/// fallback, so a LoRA that declares no alpha anywhere folds at `alpha = rank` (1.0) — the
+/// diffusers / PEFT / ComfyUI convention. A declared alpha is honoured exactly as on video.
+pub fn apply_minimax_h3_image_adapters(
+    host: &mut MiniMaxH3Dit,
+    specs: &[AdapterSpec],
+) -> Result<MiniMaxH3LoraReport> {
+    apply_minimax_h3_adapters_with(host, specs, IMAGE_ABSENT_ALPHA)
+}
+
+/// The policy [`apply_minimax_h3_adapters`] (H3 video) passes — a test seam, since no Candle host
+/// can be built without a model fixture.
+pub(crate) const VIDEO_ABSENT_ALPHA: AbsentLoraAlpha = AbsentLoraAlpha::H3_VIDEO;
+/// The policy [`apply_minimax_h3_image_adapters`] (H3-Image) passes.
+pub(crate) const IMAGE_ABSENT_ALPHA: AbsentLoraAlpha = AbsentLoraAlpha::H3_IMAGE;
+
+/// [`apply_minimax_h3_adapters`] with an explicit [`AbsentLoraAlpha`] policy, threaded through every
+/// conversion (kohya, ComfyUI, trainer) and the install.
+pub fn apply_minimax_h3_adapters_with(
+    host: &mut MiniMaxH3Dit,
+    specs: &[AdapterSpec],
+    absent: AbsentLoraAlpha,
 ) -> Result<MiniMaxH3LoraReport> {
     let mut report = MiniMaxH3LoraReport::default();
     for spec in specs {
@@ -1422,7 +1579,7 @@ pub fn apply_minimax_h3_adapters(
         let kohya = if space == MiniMaxH3LoraKeySpace::Kohya {
             report.converted_from_kohya += 1;
             Some(
-                convert_kohya_key_space(&af.tensors, &af.meta).map_err(|error| {
+                convert_kohya_key_space(&af.tensors, &af.meta, absent).map_err(|error| {
                     CandleError::Msg(format!("{error} (file {})", spec.path.display()))
                 })?,
             )
@@ -1446,7 +1603,7 @@ pub fn apply_minimax_h3_adapters(
         let comfy = !trainer && is_comfyui_key_space(source.keys().map(String::as_str));
         let tensors = if trainer {
             let (converted, layout, alphas) =
-                convert_minimax_h3_trainer_key_space(&af.tensors, &af.meta)?;
+                convert_minimax_h3_trainer_key_space(&af.tensors, &af.meta, absent)?;
             if is_comfyui_key_space(converted.keys().map(String::as_str)) {
                 return Err(CandleError::Msg(format!(
                     "minimax_h3 adapter {}: the trainer conversion left a fused or unrenamed module behind",
@@ -1462,7 +1619,7 @@ pub fn apply_minimax_h3_adapters(
             // `af.meta` is the ORIGINAL file's header: the converted map is rebuilt key by key and
             // carries no metadata of its own, so the alpha the conversion divides has to come from
             // the file the user supplied.
-            let converted = convert_comfyui_key_space(source, &af.meta)?;
+            let converted = convert_comfyui_key_space(source, &af.meta, absent)?;
             if is_comfyui_key_space(converted.keys().map(String::as_str)) {
                 return Err(CandleError::Msg(format!(
                     "minimax_h3 adapter {}: the ComfyUI conversion left a fused or unrenamed \
@@ -1475,7 +1632,7 @@ pub fn apply_minimax_h3_adapters(
         } else {
             source.clone()
         };
-        apply_one_lora(host, &tensors, &af.meta, spec.scale, &mut report)?;
+        apply_one_lora(host, &tensors, &af.meta, spec.scale, absent, &mut report)?;
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something.
         if report.applied == before {
             let fresh = &report.unmatched_paths[before_unmatched..];
@@ -1591,6 +1748,199 @@ mod alias_tests {
         assert!(!routed.iter().any(|t| t.contains("norm_out.norm")));
     }
 
+    /// The absent-alpha policy is per family: H3 video folds `8/rank`, H3-Image folds exactly 1.0
+    /// (`alpha = rank`). A declared alpha wins over both, at every precedence step.
+    #[test]
+    fn absent_alpha_policy_is_per_family() {
+        for rank in [4.0f32, 16.0, 128.0] {
+            let video = resolve_target_alpha(None, None, None, AbsentLoraAlpha::H3_VIDEO, rank);
+            assert_eq!(alpha_rank_fold(video, rank), alpha_rank_fold(8.0, rank));
+            let image = resolve_target_alpha(None, None, None, AbsentLoraAlpha::H3_IMAGE, rank);
+            assert_eq!(alpha_rank_fold(image, rank), 1.0);
+            for absent in [AbsentLoraAlpha::H3_VIDEO, AbsentLoraAlpha::H3_IMAGE] {
+                assert_eq!(
+                    resolve_target_alpha(Some(3.0), Some(5.0), Some(7.0), absent, rank),
+                    3.0
+                );
+                assert_eq!(
+                    resolve_target_alpha(None, Some(5.0), Some(7.0), absent, rank),
+                    5.0
+                );
+                assert_eq!(
+                    resolve_target_alpha(None, None, Some(7.0), absent, rank),
+                    7.0
+                );
+            }
+        }
+    }
+
+    /// `__metadata__["alpha"]` accepts a leading finite number with trailing text, and refuses
+    /// anything without one — naming the key and quoting the raw value.
+    #[test]
+    fn alpha_metadata_accepts_a_leading_number_only() {
+        for (raw, want) in [
+            ("8", 8.0f32),
+            ("128", 128.0),
+            (" 8 ", 8.0),
+            ("16 (scaling 1.0)", 16.0),
+            ("0.5", 0.5),
+            ("1e1 note", 10.0),
+        ] {
+            assert_eq!(parse_alpha_metadata(raw).unwrap(), want, "{raw:?}");
+        }
+        for bad in [
+            "",
+            "   ",
+            "abc 16",
+            "nan",
+            "inf",
+            "-inf",
+            "NaN 8",
+            "1e400",
+            "eight",
+            ".",
+            "0x10",
+            "1_000",
+            "16/32",
+            "16(scaling 1.0)",
+            "16abc",
+        ] {
+            let error = parse_alpha_metadata(bad).unwrap_err().to_string();
+            assert!(
+                error.contains("__metadata__[\"alpha\"]") && error.contains(&format!("{bad:?}")),
+                "{bad:?}: {error}"
+            );
+        }
+        let meta = HashMap::from([("alpha".to_string(), "16 (scaling 1.0)".to_string())]);
+        assert_eq!(resolve_alpha(&meta).unwrap(), Some(16.0));
+        assert_eq!(resolve_alpha(&HashMap::new()).unwrap(), None);
+    }
+
+    /// A fused ComfyUI `attn.qkv_proj` with no alpha anywhere, under the H3-Image policy: the
+    /// fallback is the FUSED rank, resolved before the split, so every split q/k/v target folds at
+    /// exactly 1.0 — for the block-diagonal form (rank ÷ 3, alpha ÷ 3) and the shared-`A` form.
+    #[test]
+    fn a_fused_qkv_without_alpha_folds_one_per_split_target_under_rank() {
+        let dev = Device::Cpu;
+        let (r, out, inp) = (2usize, 4usize, 8usize);
+        // Block-diagonal `B [3·out, 3r]`: row block i is non-zero only in column block i.
+        let mut bd = vec![0.0f32; 3 * out * 3 * r];
+        for row in 0..3 * out {
+            let block = row / out;
+            for col in block * r..(block + 1) * r {
+                bd[row * 3 * r + col] = 1.0 + (row + col) as f32;
+            }
+        }
+        let ones = |shape: &[usize]| Tensor::ones(shape, DType::F32, &dev).unwrap();
+        let cases = [
+            (
+                ones(&[3 * r, inp]),
+                Tensor::from_vec(bd, (3 * out, 3 * r), &dev).unwrap(),
+            ),
+            (ones(&[r, inp]), ones(&[3 * out, r])),
+        ];
+        for (down, up) in cases {
+            let tensors = HashMap::from([
+                ("blocks.0.attn.qkv_proj.lora_down.weight".to_string(), down),
+                ("blocks.0.attn.qkv_proj.lora_up.weight".to_string(), up),
+            ]);
+            let converted =
+                convert_comfyui_key_space(&tensors, &HashMap::new(), AbsentLoraAlpha::H3_IMAGE)
+                    .unwrap();
+            for name in ["to_q", "to_k", "to_v"] {
+                let stem = format!("transformer_blocks.0.attn.{name}");
+                let split_rank = converted[&format!("{stem}.lora_A.weight")].dims()[0];
+                assert_eq!(split_rank, r, "{stem}");
+                let alpha = converted[&format!("{stem}.alpha")]
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()[0];
+                assert_eq!(
+                    alpha_rank_fold(alpha, split_rank as f32),
+                    1.0,
+                    "{stem}: alpha {alpha}"
+                );
+            }
+        }
+    }
+
+    /// A kohya file naming the native fused `attn.qkv_proj` with no alpha anywhere, under the
+    /// H3-Image policy: the kohya rewrite emits the FUSED rank as the stem's alpha and the ComfyUI
+    /// split then divides it with the rank, so each q/k/v target folds at exactly 1.0 — for the
+    /// block-diagonal and the shared-`A` forms.
+    #[test]
+    fn a_kohya_fused_qkv_without_alpha_folds_one_per_split_target_under_rank() {
+        let dev = Device::Cpu;
+        let (r, out, inp) = (2usize, 4usize, 8usize);
+        let mut bd = vec![0.0f32; 3 * out * 3 * r];
+        for row in 0..3 * out {
+            let block = row / out;
+            for col in block * r..(block + 1) * r {
+                bd[row * 3 * r + col] = 1.0 + (row + col) as f32;
+            }
+        }
+        let ones = |shape: &[usize]| Tensor::ones(shape, DType::F32, &dev).unwrap();
+        let cases = [
+            (
+                ones(&[3 * r, inp]),
+                Tensor::from_vec(bd, (3 * out, 3 * r), &dev).unwrap(),
+            ),
+            (ones(&[r, inp]), ones(&[3 * out, r])),
+        ];
+        let meta = HashMap::new();
+        for (down, up) in cases {
+            let tensors = HashMap::from([
+                (
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight".to_string(),
+                    down,
+                ),
+                (
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight".to_string(),
+                    up,
+                ),
+            ]);
+            let rewritten =
+                convert_kohya_key_space(&tensors, &meta, AbsentLoraAlpha::H3_IMAGE).unwrap();
+            assert!(is_comfyui_key_space(rewritten.keys().map(String::as_str)));
+            let converted =
+                convert_comfyui_key_space(&rewritten, &meta, AbsentLoraAlpha::H3_IMAGE).unwrap();
+            for name in ["to_q", "to_k", "to_v"] {
+                let stem = format!("transformer_blocks.0.attn.{name}");
+                let split_rank = converted[&format!("{stem}.lora_A.weight")].dims()[0];
+                assert_eq!(split_rank, r, "{stem}");
+                let alpha = converted[&format!("{stem}.alpha")]
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()[0];
+                assert_eq!(
+                    alpha_rank_fold(alpha, split_rank as f32),
+                    1.0,
+                    "{stem}: alpha {alpha}"
+                );
+            }
+        }
+    }
+
+    /// The H3-Image install entry passes the `alpha = rank` policy and the video entry upstream's
+    /// fixed 8. No Candle `MiniMaxH3Dit` host can be built without a model fixture (those tests are
+    /// manual-dispatch only), so this pins the policy constants both entries pass, and what each
+    /// folds an absent alpha to.
+    #[test]
+    fn each_install_entry_passes_its_family_absent_alpha_policy() {
+        assert_eq!(IMAGE_ABSENT_ALPHA, AbsentLoraAlpha::Rank);
+        assert_eq!(
+            VIDEO_ABSENT_ALPHA,
+            AbsentLoraAlpha::Fixed(DEFAULT_LORA_ALPHA)
+        );
+        let rank = 16.0;
+        let fold =
+            |absent| alpha_rank_fold(resolve_target_alpha(None, None, None, absent, rank), rank);
+        assert_eq!(fold(IMAGE_ABSENT_ALPHA), 1.0);
+        assert_eq!(fold(VIDEO_ABSENT_ALPHA), DEFAULT_LORA_ALPHA / rank);
+    }
+
     /// SW-7096: a generic kohya file is rewritten on both module spellings, every target leaves
     /// with an explicit alpha, and an unknown layout is refused naming each unmatched key.
     #[test]
@@ -1620,7 +1970,7 @@ mod alias_tests {
             ),
         ]);
         let meta = HashMap::new();
-        let out = convert_kohya_key_space(&tensors, &meta).unwrap();
+        let out = convert_kohya_key_space(&tensors, &meta, AbsentLoraAlpha::H3_VIDEO).unwrap();
         let mut keys: Vec<&str> = out.keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(
@@ -1640,6 +1990,12 @@ mod alias_tests {
             alpha("transformer_blocks.1.ff.net.2.alpha"),
             DEFAULT_LORA_ALPHA
         );
+        // H3-Image: the same stem without an alpha gets its own lora_down rank (2), so it folds
+        // at 1.0; the in-band alpha is still kept.
+        let image = convert_kohya_key_space(&tensors, &meta, AbsentLoraAlpha::H3_IMAGE).unwrap();
+        let image_alpha = |k: &str| image[k].flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+        assert_eq!(image_alpha("transformer_blocks.1.ff.net.2.alpha"), 2.0);
+        assert_eq!(image_alpha("transformer_blocks.0.attn.qkv_proj.alpha"), 3.0);
         // A converted native file is still a ComfyUI-space map, so the qkv split runs on it.
         assert!(is_comfyui_key_space(out.keys().map(String::as_str)));
 
@@ -1647,7 +2003,7 @@ mod alias_tests {
             "lora_unet_final_layer_linear.lora_down.weight".into(),
             t(&[2, 8]),
         );
-        let error = convert_kohya_key_space(&tensors, &meta)
+        let error = convert_kohya_key_space(&tensors, &meta, AbsentLoraAlpha::H3_VIDEO)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1686,9 +2042,9 @@ mod alias_tests {
             })
             .collect();
         let meta = HashMap::new();
-        let mut out = convert_kohya_key_space(&tensors, &meta)?;
+        let mut out = convert_kohya_key_space(&tensors, &meta, AbsentLoraAlpha::H3_VIDEO)?;
         if is_comfyui_key_space(out.keys().map(String::as_str)) {
-            out = convert_comfyui_key_space(&out, &meta)?;
+            out = convert_comfyui_key_space(&out, &meta, AbsentLoraAlpha::H3_VIDEO)?;
         }
         Ok(out
             .keys()
@@ -1797,7 +2153,8 @@ mod alias_tests {
             ),
         ]);
         assert!(is_comfyui_key_space(comfy.keys().map(String::as_str)));
-        let converted = convert_comfyui_key_space(&comfy, &HashMap::new()).unwrap();
+        let converted =
+            convert_comfyui_key_space(&comfy, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO).unwrap();
         let paths: BTreeSet<String> = converted
             .keys()
             .filter_map(|k| classify_key(k))

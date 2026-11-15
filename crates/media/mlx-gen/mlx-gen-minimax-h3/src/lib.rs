@@ -155,8 +155,10 @@
 //!
 //! - [`adapters`] carries the key→module map for the **diffusers** key space the lightx2v turbo
 //!   checkpoints publish, and the alpha resolution those checkpoints need: rank from the factor
-//!   shapes, alpha from the top-level `__metadata__`, and a fallback of **8** — upstream's
-//!   `DEFAULT_LORA_ALPHA` — rather than the rank.
+//!   shapes, alpha from the top-level `__metadata__`, and, for H3 video, a fallback of **8** —
+//!   upstream's `DEFAULT_LORA_ALPHA` — rather than the rank. H3-Image installs through
+//!   `apply_minimax_h3_image_adapters`, whose fallback is the community `alpha = rank`
+//!   (`AbsentLoraAlpha`).
 //!
 //! That fallback is the whole slice. `lightx2v/Minimax-h3-Turbo` stamps alpha as a bare
 //! `__metadata__` string with no `rank` key, no per-target `.alpha` and no `lora_adapter_metadata`
@@ -213,8 +215,9 @@ pub mod vae;
 pub mod vae_encoder;
 
 pub use adapters::{
-    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, classify_unmatched_target,
-    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank, AdaLnSurface,
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters,
+    apply_minimax_h3_image_adapters, classify_unmatched_target, is_comfyui_key_space,
+    normalize_minimax_h3_key, resolve_alpha, resolve_rank, AbsentLoraAlpha, AdaLnSurface,
     MiniMaxH3LoraReport, UnmatchedTargetClass, ALPHA_METADATA_KEY, BLOCK_TARGETS,
     DEFAULT_LORA_ALPHA, PREFIXES, RANK_METADATA_KEY,
 };

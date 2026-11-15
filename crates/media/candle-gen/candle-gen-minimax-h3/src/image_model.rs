@@ -425,8 +425,9 @@ impl MiniMaxH3Image {
         let mut dit = self.load_dit(load_device, DType::BF16)?;
         if !self.spec.adapters.is_empty() {
             // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
-            // render here rather than producing an image the LoRA barely touched.
-            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.spec.adapters)?;
+            // render here rather than producing an image the LoRA barely touched. The image
+            // entry's absent-alpha fallback is `alpha = rank` (the diffusers/PEFT convention).
+            crate::adapters::apply_minimax_h3_image_adapters(&mut dit, &self.spec.adapters)?;
         }
         if let Some(policy) = policy {
             if policy.cancel.is_cancelled() {

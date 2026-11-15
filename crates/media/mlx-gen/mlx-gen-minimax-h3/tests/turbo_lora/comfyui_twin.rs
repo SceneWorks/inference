@@ -318,7 +318,8 @@ fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_ab
         unflatten_minimax_h3_trainer_tensors(&trainer).expect("exact trainer unflatten");
     assert_eq!(alphas, vec![FC1_ALPHA, FUSED_ALPHA]);
 
-    let got = convert_comfyui_key_space(&raw).expect("trainer conversion");
+    let got =
+        convert_comfyui_key_space(&raw, AbsentLoraAlpha::H3_VIDEO).expect("trainer conversion");
     assert_eq!(got.keys().count(), 12, "q/k/v and fc1 each carry A/B/alpha");
     for (index, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
         for (suffix, expected) in [
@@ -552,7 +553,7 @@ pub(super) fn assert_alpha_resolves_before_the_split(spelling: AlphaSpelling) {
 
     let read = |file: &PathBuf, key: &str| -> f32 {
         let w = Weights::from_file(file).unwrap();
-        let converted = convert_comfyui_key_space(&w).unwrap();
+        let converted = convert_comfyui_key_space(&w, AbsentLoraAlpha::H3_VIDEO).unwrap();
         converted
             .require(key)
             .unwrap_or_else(|_| panic!("no converted alpha at {key}"))
@@ -633,7 +634,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
 
     let read_alpha = |file: &PathBuf| -> f32 {
         let w = Weights::from_file(file).unwrap();
-        let converted = convert_comfyui_key_space(&w).unwrap();
+        let converted = convert_comfyui_key_space(&w, AbsentLoraAlpha::H3_VIDEO).unwrap();
         converted
             .require("transformer_blocks.0.attn.to_q.alpha")
             .expect("the converted per-target alpha")
@@ -719,7 +720,7 @@ fn block_diagonality_is_measured_on_the_bytes_not_inferred_from_the_shape() {
         Array::from_slice(&[48.0f32], &[1]),
     );
 
-    let converted = convert_comfyui_key_space(&w).unwrap();
+    let converted = convert_comfyui_key_space(&w, AbsentLoraAlpha::H3_VIDEO).unwrap();
     let a = converted
         .require("transformer_blocks.0.attn.to_q.lora_A.weight")
         .unwrap();
@@ -742,7 +743,7 @@ fn block_diagonality_is_measured_on_the_bytes_not_inferred_from_the_shape() {
 
 /// `Weights` is not `Debug`, so `unwrap_err` is unavailable — match the error out by hand.
 pub(super) fn expect_conversion_error(w: &Weights) -> String {
-    match convert_comfyui_key_space(w) {
+    match convert_comfyui_key_space(w, AbsentLoraAlpha::H3_VIDEO) {
         Ok(_) => panic!("a malformed fused qkv must be refused, not silently split"),
         Err(e) => e.to_string(),
     }
