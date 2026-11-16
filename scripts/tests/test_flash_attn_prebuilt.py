@@ -24,6 +24,7 @@ class FlashAttnPrebuiltTests(unittest.TestCase):
             for name in packer.NOTICES:
                 (crate / name).write_text("license fixture\n")
             source_hash = packer.source_sha256(crate)
+            self.assertEqual(source_hash, "7b57f69c6a761c344990d5a8c3df399390aa9633b6e0615363f0bd472253d95e")
             build = root / "build"
             build.mkdir()
             (build / "libflashattention.a").write_bytes(b"archive fixture")

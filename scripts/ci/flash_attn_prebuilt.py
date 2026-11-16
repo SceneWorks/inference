@@ -22,8 +22,9 @@ NOTICES = ("LICENSE-MIT", "LICENSE-APACHE", "LICENSE-FLASH-ATTENTION", "LICENSE-
 
 def source_sha256(crate=CRATE):
     digest = hashlib.sha256()
-    for path in sorted([crate / "build.rs", crate / "Cargo.toml", *(crate / "kernels").iterdir(),
-                        *(crate / name for name in NOTICES)]):
+    files = [crate / "build.rs", crate / "Cargo.toml", *(crate / "kernels").iterdir(),
+             *(crate / name for name in NOTICES)]
+    for path in sorted(files, key=lambda path: path.relative_to(crate).as_posix()):
         if not path.is_file():
             continue
         digest.update(path.relative_to(crate).as_posix().encode())

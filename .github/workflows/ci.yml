@@ -1454,6 +1454,7 @@ jobs:
           } elseif ($LASTEXITCODE -ne 0) {
             throw 'FlashAttention archive verification failed'
           }
+          exit 0
       - name: Compile Candle CUDA packages and test binaries (no GPU required)
         shell: cmd
         run: |

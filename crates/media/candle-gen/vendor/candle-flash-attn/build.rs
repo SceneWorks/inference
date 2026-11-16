@@ -82,7 +82,7 @@ fn source_sha256() -> Result<String> {
             files.push(path);
         }
     }
-    files.sort();
+    files.sort_by_key(|path| path.to_string_lossy().replace('\\', "/"));
     let mut hash = Sha256::new();
     for path in files {
         hash.update(path.to_string_lossy().replace('\\', "/").as_bytes());
@@ -206,6 +206,7 @@ fn link_prebuilt(target: &str) -> Result<bool> {
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
     for kernel_file in KERNEL_FILES.iter() {
         println!("cargo::rerun-if-changed={kernel_file}");
     }
