@@ -657,35 +657,53 @@ impl MiniMaxH3ImageTrainer {
         let cfg = &req.config;
         let device = self.generator.device();
         let patch = self.dit_cfg.patch_size;
-        let mut conditioned: Vec<(Tensor, Vec<u32>, Vec<Tensor>)> =
-            Vec::with_capacity(req.items.len());
-        {
+        let count = req.items.len() as u32;
+        let total = count.saturating_mul(2);
+        on_progress(TrainingProgress::Caching { current: 0, total });
+        let conditioned = {
             let _scope = streamed_scope(&req.cancel, device)?;
-            let mut no_progress = |_: gen_core::Progress| {};
-            for item in &req.items {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
+            if !plan.edit {
+                self.generator
+                    .encode_training_captions(&req.items, &req.cancel, |current| {
+                        on_progress(TrainingProgress::Caching {
+                            current: current as u32,
+                            total,
+                        });
+                    })?
+            } else {
+                // Edit conditioning alternates vision, text and reference VAE phases. Keep
+                // its sequential lifetime so a cached host encoder cannot increase its peak.
+                let mut conditioned = Vec::with_capacity(req.items.len());
+                let mut no_progress = |_: gen_core::Progress| {};
+                for (index, item) in req.items.iter().enumerate() {
+                    if req.cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
+                    let references = item
+                        .reference_image_paths
+                        .iter()
+                        .map(|p| decode_image(p))
+                        .collect::<Result<Vec<_>>>()?;
+                    let refs: Vec<&Image> = references.iter().collect();
+                    // The render's own conditioning: the vision tower, the conditioner and each
+                    // reference's posterior sample (`reference_noise` stream 0 at the run seed).
+                    conditioned.push(self.generator.encode_conditioning(
+                        &item.caption,
+                        &refs,
+                        cfg.seed,
+                        &mut no_progress,
+                    )?);
+                    on_progress(TrainingProgress::Caching {
+                        current: index as u32 + 1,
+                        total,
+                    });
                 }
-                let references = item
-                    .reference_image_paths
-                    .iter()
-                    .map(|p| decode_image(p))
-                    .collect::<Result<Vec<_>>>()?;
-                let refs: Vec<&Image> = references.iter().collect();
-                // The render's own conditioning: the vision tower, the conditioner and each
-                // reference's posterior sample (`reference_noise` stream 0 at the run seed).
-                conditioned.push(self.generator.encode_conditioning(
-                    &item.caption,
-                    &refs,
-                    cfg.seed,
-                    &mut no_progress,
-                )?);
+                conditioned
             }
-        }
+        };
         crate::dit::release_device_memory(device)?;
 
         let encoder = MiniMaxH3ImageVaeEncoder::load(self.generator.root(), device)?;
-        let total = req.items.len() as u32;
         let mut entries = Vec::with_capacity(req.items.len() * plan.edges.len());
         let mut text = Vec::with_capacity(req.items.len());
         for (index, (item, (context, tags, references))) in
@@ -695,7 +713,7 @@ impl MiniMaxH3ImageTrainer {
                 return Err(Error::Canceled);
             }
             on_progress(TrainingProgress::Caching {
-                current: index as u32 + 1,
+                current: count + index as u32 + 1,
                 total,
             });
             let target = if item.is_edit_pair() {

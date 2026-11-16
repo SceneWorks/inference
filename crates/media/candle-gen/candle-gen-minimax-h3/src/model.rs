@@ -693,6 +693,22 @@ pub(crate) fn run_conditioner(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<candle_gen::candle_core::Tensor> {
+    with_conditioner(te_dir, device, |te| {
+        candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
+            None => te.forward(ids, mask),
+            Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
+        })
+    })
+}
+
+/// Keep one prepared conditioner alive for a phase containing multiple independent prompts.
+/// The streamed route still keeps its stack on the host and copies only the current layer.
+/// Release the stack before returning, including when a prompt fails or is cancelled.
+pub(crate) fn with_conditioner<T>(
+    te_dir: &Path,
+    device: &Device,
+    encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
+) -> Result<T> {
     let cfg = MiniMaxH3TeConfig::from_component_dir(te_dir)?;
     let shards = candle_gen::loader::sorted_safetensors(te_dir, "minimax-h3 te")?;
     let prefixes = lm_prefixes(LM_PREFIX, &cfg);
@@ -717,15 +733,11 @@ pub(crate) fn run_conditioner(
         }
         te.prepare_streamed(&cfg, device)?;
     }
-    let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
-        None => te.forward(ids, mask),
-        Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
-    })?;
-    // candle is eager, so `context` is already materialized here and dropping the encoder
-    // genuinely frees its weights — there is no lazy graph holding them alive.
+    let result = encode(&te);
+    // Candle is eager: no output retains the encoder's weights or a lazy forward graph.
     drop(te);
     crate::dit::release_device_memory(device)?;
-    Ok(context)
+    result
 }
 
 /// Whether the resolved source supports byte-preserving host-to-device block migration.
@@ -3244,11 +3256,10 @@ mod tests {
     /// size: deliberately blunt, in exchange for being exact about the regression that was live.
     fn staged_phases() -> [(&'static str, &'static [Phase]); 5] {
         [
-            // `encode_prompt` delegates its one phase to `run_conditioner` (SW-7091), the text-only
-            // conditioner pass MiniMax-H3-Image's `text2image` shares, so the phase is pinned where
-            // the map and the release now live.
+            // Both single-prompt renders and the training caption batch delegate their
+            // conditioner lifetime to this scope; pin the map and release at their owner.
             (
-                "fn run_conditioner(",
+                "fn with_conditioner<T>(",
                 &[(
                     "the 66.7 GB Qwen3-VL-32B text encoder",
                     TE_MAPS,

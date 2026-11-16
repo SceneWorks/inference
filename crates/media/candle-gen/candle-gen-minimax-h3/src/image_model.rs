@@ -342,6 +342,41 @@ impl MiniMaxH3Image {
         })
     }
 
+    /// Cache a text-to-image dataset with one tokenizer and one host-resident conditioner.
+    /// No VAE or DiT is loaded until the entire caption phase has released the encoder.
+    pub(crate) fn encode_training_captions(
+        &self,
+        items: &[candle_gen::gen_core::train::TrainingItem],
+        cancel: &candle_gen::gen_core::CancelFlag,
+        mut on_caption: impl FnMut(usize),
+    ) -> Result<Vec<(Tensor, Vec<u32>, Vec<Tensor>)>> {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let phase = PhaseLog::start("text_encoder");
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let result = crate::model::with_conditioner(&self.text_encoder_dir, &self.device, |te| {
+            let mut contexts = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let (ids, mask) = tok.encode_prompt_truncated(
+                    &item.caption,
+                    contract::MAX_PROMPT_TOKENS,
+                    &self.device,
+                )?;
+                let context = __model_proof_output!(te.forward(&ids, &mask))?;
+                let n = context.dims()[1];
+                contexts.push((context, vec![contract::TEXT_TAG as u32; n], Vec::new()));
+                on_caption(index + 1);
+            }
+            Ok(contexts)
+        });
+        phase.done();
+        result
+    }
+
     /// Map the validated DiT partition onto `device` with its block stack at `dtype` — the one
     /// image DiT load site, shared by the render and the trainer (SW-7098).
     pub(crate) fn load_dit(&self, device: &Device, dtype: DType) -> Result<MiniMaxH3Dit> {
@@ -892,6 +927,163 @@ mod tests {
             .components
             .insert("transformer".into(), WeightsSource::Dir("/x".into()));
         assert!(load_image(&other).is_err());
+    }
+
+    /// Small real tensor/tokenizer fixture: exercise the production batch and loader on CPU.
+    fn caption_fixture() -> (tempfile::TempDir, MiniMaxH3Image) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let te_dir = root.join(IMAGE_TEXT_ENCODER);
+        let tok_dir = root.join("tokenizer");
+        std::fs::create_dir_all(&te_dir).unwrap();
+        std::fs::create_dir_all(&tok_dir).unwrap();
+        std::fs::write(
+            te_dir.join("config.json"),
+            r#"{
+            "hidden_size":8,"num_hidden_layers":50,"num_attention_heads":2,
+            "num_key_value_heads":1,"head_dim":4,"intermediate_size":12,"vocab_size":16,
+            "rope_scaling":{"mrope_section":[1,1,0],"mrope_interleaved":true}
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tok_dir.join("tokenizer.json"),
+            r#"{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"[UNK]":0,"red":1,"blue":2},"unk_token":"[UNK]"}
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tok_dir.join("tokenizer_config.json"),
+            r#"{"additional_special_tokens":["<d>"]}"#,
+        )
+        .unwrap();
+        let mut weights = std::collections::HashMap::new();
+        let mut add = |name: String, shape: &[usize]| {
+            let values: Vec<f32> = (0..shape.iter().product())
+                .map(|i| (i as f32 * 0.37 + 0.1).sin() * 0.02)
+                .collect();
+            weights.insert(name, Tensor::from_vec(values, shape, &Device::Cpu).unwrap());
+        };
+        let prefix = crate::text_encoder::LM_PREFIX;
+        add(format!("{prefix}.embed_tokens.weight"), &[16, 8]);
+        for i in 0..50 {
+            let layer = format!("{prefix}.layers.{i}");
+            for (name, shape) in [
+                ("input_layernorm", vec![8]),
+                ("post_attention_layernorm", vec![8]),
+                ("self_attn.q_proj", vec![8, 8]),
+                ("self_attn.k_proj", vec![4, 8]),
+                ("self_attn.v_proj", vec![4, 8]),
+                ("self_attn.o_proj", vec![8, 8]),
+                ("self_attn.q_norm", vec![4]),
+                ("self_attn.k_norm", vec![4]),
+                ("mlp.gate_proj", vec![12, 8]),
+                ("mlp.up_proj", vec![12, 8]),
+                ("mlp.down_proj", vec![8, 12]),
+            ] {
+                add(format!("{layer}.{name}.weight"), &shape);
+            }
+        }
+        candle_gen::candle_core::safetensors::save(&weights, te_dir.join("model.safetensors"))
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let model = MiniMaxH3Image {
+            descriptor: image_descriptor(),
+            root: root.clone(),
+            dit_dir: root.join(IMAGE_DIT_PARTITION),
+            text_encoder_dir: te_dir,
+            device: Device::Cpu,
+            contract: crate::image_memory_strategy::weights_free_contract(&spec).unwrap(),
+            spec,
+            load_shape: LoadShape::DeferredMaterialization,
+            memory_facts: None,
+        };
+        (tmp, model)
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn training_captions_reuse_one_encoder_and_match_individual_conditioning() {
+        let (_tmp, model) = caption_fixture();
+        let items: Vec<_> = ["red", "blue red", "red"]
+            .iter()
+            .map(|caption| {
+                candle_gen::gen_core::train::TrainingItem::captioned(
+                    "unused.png".into(),
+                    (*caption).into(),
+                )
+            })
+            .collect();
+        let mut noop = |_| {};
+        let expected: Vec<_> = items
+            .iter()
+            .map(|item| {
+                model
+                    .encode_conditioning(&item.caption, &[], 0, &mut noop)
+                    .unwrap()
+            })
+            .collect();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let mut progress = Vec::new();
+        let req = crate::training::preview_request("", 0, (0, 0), &[], cancel.clone());
+        let _scope =
+            crate::StreamedRequestScope::enter(&req, model.load_shape, &model.device).unwrap();
+        let actual = model
+            .encode_training_captions(&items, &cancel, |current| {
+                progress.push(current);
+                if current == 1 {
+                    // A second load would now fail. The prepared host stack must serve the rest.
+                    std::fs::remove_file(model.text_encoder_dir.join("model.safetensors")).unwrap();
+                    std::fs::remove_file(model.root.join("tokenizer/tokenizer.json")).unwrap();
+                }
+            })
+            .unwrap();
+        assert_eq!(progress, vec![1, 2, 3]);
+        for ((context, tags, refs), (expected, expected_tags, _)) in actual.iter().zip(expected) {
+            assert_eq!(
+                context.to_vec3::<f32>().unwrap(),
+                expected.to_vec3::<f32>().unwrap()
+            );
+            assert_eq!(*tags, expected_tags);
+            assert!(refs.is_empty());
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED image_model::tests::training_captions_reuse_one_encoder_and_match_individual_conditioning");
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn training_caption_cancellation_stops_before_the_next_item() {
+        let (_tmp, model) = caption_fixture();
+        let items = vec![
+            candle_gen::gen_core::train::TrainingItem::captioned(
+                "unused.png".into(),
+                "red".into()
+            );
+            2
+        ];
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let mut progress = Vec::new();
+        let result = model.encode_training_captions(&items, &cancel, |current| {
+            progress.push(current);
+            cancel.cancel();
+        });
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(progress, vec![1]);
+        // Pre-cancelled input must not load tokenizer or encoder assets.
+        std::fs::remove_file(model.root.join("tokenizer/tokenizer_config.json")).unwrap();
+        assert!(matches!(
+            model.encode_training_captions(&items, &cancel, |_| {}),
+            Err(CandleError::Canceled)
+        ));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED image_model::tests::training_caption_cancellation_stops_before_the_next_item");
     }
 
     /// The edit reads its VAE patch size from the resolved DiT — a staged tier directory — so a
