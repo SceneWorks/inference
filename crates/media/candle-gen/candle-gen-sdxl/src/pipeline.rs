@@ -1126,11 +1126,6 @@ impl Pipeline {
         unet: &SdxlUnet,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
-        let representation = match unet {
-            SdxlUnet::Stock(_) | SdxlUnet::Vendored(_) => "dense",
-            SdxlUnet::Packed(_) => "packed",
-        };
-        candle_gen::execution::policy("sdxl/unet/representation", representation.into());
         if req.use_pid && self.pid_spec.is_none() {
             return Err(CandleError::Msg(
                 "sdxl: PiD requested but no PiD decoder loaded".into(),
@@ -1174,6 +1169,12 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
         mut consume: impl FnMut(Tensor, &mut dyn FnMut(Progress)) -> Result<T>,
     ) -> Result<Vec<T>> {
+        // Both cached resident components and staged components enter here.
+        let representation = match unet {
+            SdxlUnet::Stock(_) | SdxlUnet::Vendored(_) => "dense",
+            SdxlUnet::Packed(_) => "packed",
+        };
+        candle_gen::execution::policy("sdxl/unet/representation", representation.into());
         // sc-6128: a `lightning` request runs the few-step Euler-trailing path. Every other render —
         // the omitted-sampler default AND every explicit curated solver name (incl. `ddim`) — routes
         // through the unified curated `Sampler` over `DiscreteModelSampling` (EPS), epic 7114 P4 / sc-7124.
