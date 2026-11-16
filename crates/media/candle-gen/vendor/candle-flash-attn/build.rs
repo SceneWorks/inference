@@ -9,6 +9,13 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
 const CUTLASS_COMMIT: &str = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
+const NOTICE_FILES: [&str; 5] = [
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "LICENSE-FLASH-ATTENTION",
+    "LICENSE-CUTLASS.txt",
+    "AUTHORS-FLASH-ATTENTION",
+];
 
 const KERNEL_FILES: [&str; 37] = [
     "kernels/flash_api.cu",
@@ -67,15 +74,8 @@ fn file_sha256(path: &std::path::Path) -> Result<String> {
 // Match scripts/ci/flash_attn_prebuilt.py. The source key includes every CUDA source/header,
 // the CUTLASS pin and the flags in this build script, but not checkout-specific paths.
 fn source_sha256() -> Result<String> {
-    let mut files = vec![
-        PathBuf::from("build.rs"),
-        PathBuf::from("Cargo.toml"),
-        PathBuf::from("LICENSE-MIT"),
-        PathBuf::from("LICENSE-APACHE"),
-        PathBuf::from("LICENSE-FLASH-ATTENTION"),
-        PathBuf::from("LICENSE-CUTLASS.txt"),
-        PathBuf::from("AUTHORS-FLASH-ATTENTION"),
-    ];
+    let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml")];
+    files.extend(NOTICE_FILES.iter().map(|name| PathBuf::from(*name)));
     for entry in fs::read_dir("kernels")? {
         let path = entry?.path();
         if path.is_file() {
@@ -206,6 +206,10 @@ fn link_prebuilt(target: &str) -> Result<bool> {
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=Cargo.toml");
+    for notice in NOTICE_FILES {
+        println!("cargo::rerun-if-changed={notice}");
+    }
     println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
     for kernel_file in KERNEL_FILES.iter() {
         println!("cargo::rerun-if-changed={kernel_file}");
