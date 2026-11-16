@@ -314716,7 +314716,7 @@
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
-    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus the minimax-h3-image-pe profile's own PE expansion of a short t2i prompt; short and expanded 2048x2048 renders compared by luma Laplacian energy (AT9)",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus the minimax-h3-image-pe profile's own PE expansion of a short t2i prompt; short and expanded 2048x2048 renders, expansion longer than the short prompt, both renders complete (AT9; detail judged by human review)",
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; RUN RECORD line per render; minimax-h3-image-pe real-weights profile (SW-7104 acceptance)",
     "cargo_features": [
@@ -315392,7 +315392,7 @@
     "backend": null,
     "expected_devices": [],
     "cargo_features": [],
-    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus the minimax-h3-image-pe profile's own PE expansion of a short t2i prompt; short and expanded 2048x2048 renders compared by luma Laplacian energy (AT9); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
+    "fixture_identity": "real bf16 transformer_diffusers/, vae_diffusers/ and tokenizer/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 plus MiniMax-H3@939557dc text_encoder/ shards 1-12 plus the minimax-h3-image-pe profile's own PE expansion of a short t2i prompt; short and expanded 2048x2048 renders, expansion longer than the short prompt, both renders complete (AT9; detail judged by human review); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
     "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_acceptance_real.rs::h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda",
     "required_environment": [
       "MINIMAX_H3_IMAGE_SNAPSHOT",
