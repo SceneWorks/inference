@@ -365,6 +365,7 @@ dependencies = [
  "candle-nn",
  "core-llm",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -485,6 +486,7 @@ dependencies = [
  "candle-core",
  "cudaforge",
  "half",
+ "sha2",
 ]
 
 [[package]]
@@ -927,6 +929,7 @@ dependencies = [
  "sceneworks-gen-core-telemetry",
  "sceneworks-gen-core-testkit",
  "sceneworks-gen-core-tokenizer",
+ "sceneworks-gen-core-train",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1146,6 +1149,7 @@ dependencies = [
  "rayon",
  "sceneworks-gen-core-family",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]
@@ -1458,6 +1462,7 @@ dependencies = [
  "minijinja-contrib",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
@@ -2950,6 +2955,7 @@ dependencies = [
  "sceneworks-gen-core-h3",
  "sceneworks-gen-core-telemetry",
  "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-train",
  "serde_json",
  "sha2",
  "tempfile",
@@ -4031,6 +4037,7 @@ dependencies = [
  "core-llm",
  "libc",
  "safetensors 0.4.5",
+ "sceneworks-gen-core-moss-image-policy",
  "sceneworks-load-progress",
  "serde",
  "serde_json",
@@ -4046,6 +4053,7 @@ version = "0.1.0"
 dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-supra2-policy",
  "sceneworks-load-progress",
  "serde",
  "serde_json",
@@ -4155,11 +4163,28 @@ dependencies = [
  "image",
  "libc",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-moss-image-policy",
  "sceneworks-gen-core-train",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "sceneworks-gen-core-moss-image-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sceneworks-gen-core-supra2-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

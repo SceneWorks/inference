@@ -79,14 +79,50 @@ const PREFIXES: [&str; 4] = [
     "transformer.",
     "model.",
 ];
+/// The native (`transformer/`, ComfyUI) names of MiniMax-H3's top-level linears and their
+/// diffusers names (SW-7096). Each pair is a pure rename: the published H3-Image `transformer/`
+/// and `transformer_diffusers/` tensors are byte-identical under it. Both backends' installers
+/// (`normalize_minimax_h3_key`) and this pricer apply the same table. `final_layer.video_out` is
+/// not here: it is the base single output head, which a PDD release replaces per step — see
+/// [`NATIVE_OUTPUT_HEAD`].
+pub const NATIVE_TOP_LEVEL: [(&str, &str); 5] = [
+    ("condition_proj", "context_embedder"),
+    ("video_patch_proj", "proj_in"),
+    ("time_embedder.proj_in", "time_embedder.linear_1"),
+    ("time_embedder.proj_out", "time_embedder.linear_2"),
+    ("final_layer.adaln_proj.linear", "norm_out.linear"),
+];
+
+/// The native single output head (SW-7096). A LoRA on it applies to **every** per-step head
+/// `pdd_proj_out.{i}` the host carries (ComfyUI patches a single-head `video_out` LoRA onto the
+/// base every step's head is built from); a host with no per-step heads leaves it unmatched.
+pub const NATIVE_OUTPUT_HEAD: &str = "final_layer.video_out";
+
+/// The per-step heads [`NATIVE_OUTPUT_HEAD`] fans out to.
+const PER_STEP_HEAD_PREFIX: &str = "pdd_proj_out.";
+
+/// Strip a known namespace prefix, then map a native top-level name to its diffusers module —
+/// the installers' `normalize_minimax_h3_key`.
 fn normalize(path: &str) -> String {
-    PREFIXES
+    let stem = PREFIXES
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
-        .unwrap_or(path)
+        .unwrap_or(path);
+    NATIVE_TOP_LEVEL
+        .iter()
+        .find_map(|(native, diffusers)| (stem == *native).then_some(*diffusers))
+        .unwrap_or(stem)
         .to_string()
 }
-fn raw_container(path: &str) -> String {
+/// Map a leading raw H3 block container to its diffusers spelling: `blocks.{i}.` →
+/// `transformer_blocks.{i}.` and `token_refiner.blocks.{i}.` → `token_refiner.refiner_blocks.{i}.`.
+/// Canonical, nested and unknown containers pass through unchanged, and only the leading container
+/// is rewritten, so a full key (role suffix included) normalizes the same as its module path.
+///
+/// One function for both backends' installers (every rewritten kohya target and every ComfyUI
+/// target) and this pricer, so the container a LoRA is installed on and the one it is priced on
+/// cannot drift apart.
+pub fn normalize_raw_container(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("blocks.") {
         format!("transformer_blocks.{rest}")
     } else if let Some(rest) = path.strip_prefix("token_refiner.blocks.") {
@@ -118,7 +154,7 @@ fn lora_key(key: &str) -> Option<(String, bool)> {
 /// so the larger supported route is used without reading any weight tensor. This
 /// bounds both shared-A and block-diagonal files, never rejects either representation.
 fn lora_routes(path: &str) -> Vec<String> {
-    let path = raw_container(path);
+    let path = normalize_raw_container(path);
     for (raw, runtime) in [
         (".attn.out_proj", ".attn.to_out.0"),
         (".mlp.fc1", ".ff.net.0.proj"),
@@ -272,12 +308,25 @@ fn price_lora(
     targets: &[H3AdapterTarget],
     out: &mut Vec<H3AdapterProjectionMemory>,
 ) -> Result<u64> {
-    let trainer = weightsmeta::classify_minimax_h3_trainer_namespace(
+    // SW-7096: the same key-space decision the installs make — the strict census only for the
+    // stamped trainer export, the shared kohya rewrite for any other `lora_unet_` file.
+    let space = weightsmeta::classify_minimax_h3_lora_key_space(
         file.tensors.iter().map(|h| h.name.as_str()),
         file.metadata.get("ss_network_module").map(String::as_str),
         file.metadata.get("networkType").map(String::as_str),
     )
     .map_err(invalid)?;
+    let trainer = space == weightsmeta::MiniMaxH3LoraKeySpace::Trainer;
+    let kohya = space == weightsmeta::MiniMaxH3LoraKeySpace::Kohya;
+    if kohya {
+        weightsmeta::rewrite_minimax_h3_kohya_keys(file.tensors.iter().map(|h| h.name.as_str()))
+            .map_err(|unmatched| {
+                invalid(format!(
+                    "{} kohya key(s) name no MiniMax-H3 module: {unmatched:?}",
+                    unmatched.len()
+                ))
+            })?;
+    }
     if trainer {
         weightsmeta::validate_minimax_h3_trainer_layout(
             file.tensors
@@ -309,6 +358,9 @@ fn price_lora(
                     )),
                 }
             })
+        } else if kohya {
+            weightsmeta::minimax_h3_kohya_key_to_dotted(&h.name)
+                .and_then(|dotted| lora_key(&dotted))
         } else {
             lora_key(&h.name)
         };
@@ -334,12 +386,33 @@ fn price_lora(
             return Err(invalid(format!("rank mismatch {path}")));
         }
         let (dw, uw) = (width(down)?, width(up)?);
-        let routes = lora_routes(&path);
-        let fused = routes.len() == 3;
+        let fan_out = path == NATIVE_OUTPUT_HEAD;
+        let routes = if fan_out {
+            // The installers push the same factors onto every per-step head; each head is priced
+            // as its own target (its own prepared pair and forward scratch).
+            let heads: Vec<String> = targets
+                .iter()
+                .filter(|t| t.path.starts_with(PER_STEP_HEAD_PREFIX))
+                .map(|t| t.path.clone())
+                .collect();
+            if heads.is_empty() {
+                return Err(invalid(format!(
+                    "target {path} has no per-step head to fan out to"
+                )));
+            }
+            heads
+        } else {
+            lora_routes(&path)
+        };
+        let fused = !fan_out && routes.len() == 3;
         if fused && source_output % 3 != 0 {
             return Err(invalid("unequal fused QKV outputs"));
         }
-        let output = source_output / routes.len() as u64;
+        let output = if fused {
+            source_output / 3
+        } else {
+            source_output
+        };
         // Swapped FFN up factors and fused split conversions can independently own
         // their source-shaped copy, before final orientation/fold/device transfer.
         if fused || path.ends_with(".mlp.fc1") {
@@ -682,6 +755,104 @@ mod tests {
         }
     }
 
+    /// The shared container normalizer rewrites only a leading raw block container.
+    #[test]
+    fn raw_block_containers_normalize_and_everything_else_passes_through() {
+        for (raw, want) in [
+            (
+                "blocks.4.adaln_proj.linear.lora_up.weight",
+                "transformer_blocks.4.adaln_proj.linear.lora_up.weight",
+            ),
+            (
+                "token_refiner.blocks.1.attn.to_q",
+                "token_refiner.refiner_blocks.1.attn.to_q",
+            ),
+            (
+                "transformer_blocks.0.ff.net.2",
+                "transformer_blocks.0.ff.net.2",
+            ),
+            (
+                "token_refiner.refiner_blocks.0.attn.to_out.0",
+                "token_refiner.refiner_blocks.0.attn.to_out.0",
+            ),
+            (
+                "unrelated.token_refiner.blocks.0.attn.out_proj",
+                "unrelated.token_refiner.blocks.0.attn.out_proj",
+            ),
+            ("norm_out.linear", "norm_out.linear"),
+        ] {
+            assert_eq!(normalize_raw_container(raw), want, "{raw}");
+        }
+    }
+
+    /// SW-7096: a LoRA on the native top-level names prices against the diffusers module the
+    /// installers adapt — `condition_proj` is `context_embedder` — and the native single output
+    /// head `final_layer.video_out` fans out to every per-step head at its full width.
+    #[test]
+    fn native_top_level_names_price_on_the_modules_the_installers_adapt() {
+        let targets = [
+            target("context_embedder", 8, 12, false),
+            target("pdd_proj_out.0", 8, 6, false),
+            target("pdd_proj_out.1", 8, 6, false),
+        ];
+        for backend in [CANDLE, MLX] {
+            let f = file(vec![
+                h(
+                    "diffusion_model.condition_proj.lora_down.weight",
+                    Dtype::BF16,
+                    &[3, 8],
+                ),
+                h(
+                    "diffusion_model.condition_proj.lora_up.weight",
+                    Dtype::BF16,
+                    &[12, 3],
+                ),
+                h(
+                    "diffusion_model.final_layer.video_out.lora_down.weight",
+                    Dtype::BF16,
+                    &[2, 8],
+                ),
+                h(
+                    "diffusion_model.final_layer.video_out.lora_up.weight",
+                    Dtype::BF16,
+                    &[6, 2],
+                ),
+            ]);
+            let p = profile_from_headers(backend, &[f], &targets).unwrap();
+            let mut priced: Vec<_> = p
+                .projections
+                .iter()
+                .map(|m| (m.target.path.as_str(), m.installed_bytes))
+                .collect();
+            priced.sort();
+            assert_eq!(
+                priced,
+                [
+                    ("context_embedder", (8 + 12) * 3 * 2),
+                    ("pdd_proj_out.0", (8 + 6) * 2 * 2),
+                    ("pdd_proj_out.1", (8 + 6) * 2 * 2),
+                ]
+            );
+        }
+        // A host with no per-step heads has nothing for the output head to land on.
+        let f = file(vec![
+            h(
+                "diffusion_model.final_layer.video_out.lora_down.weight",
+                Dtype::BF16,
+                &[2, 8],
+            ),
+            h(
+                "diffusion_model.final_layer.video_out.lora_up.weight",
+                Dtype::BF16,
+                &[6, 2],
+            ),
+        ]);
+        let e = profile_from_headers(CANDLE, &[f], &targets[..1])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("per-step head"), "{e}");
+    }
+
     #[test]
     fn tiny_lokr_file_retains_actual_dense_delta_on_mlx() {
         let path = "transformer_blocks.0.attn.to_q";
@@ -770,6 +941,83 @@ mod tests {
         // Shared-A rank-six route bounds block-diagonal rank-two conversion as well.
         assert_eq!(p.resident_bytes, 3 * (8 + 12) * 6 * 2 + (8 + 32) * 2 * 6);
         assert_eq!(p.projections.len(), 4);
+    }
+
+    /// SW-7096: a generic kohya file prices through the shared rewrite exactly as its dotted
+    /// twin, and one key naming no module refuses the file rather than pricing part of it.
+    #[test]
+    fn generic_kohya_prices_like_its_dotted_twin_and_refuses_unknown_keys() {
+        let dotted = file(vec![
+            h(
+                "blocks.0.attn.qkv_proj.lora_down.weight",
+                Dtype::BF16,
+                &[6, 8],
+            ),
+            h(
+                "blocks.0.attn.qkv_proj.lora_up.weight",
+                Dtype::BF16,
+                &[36, 6],
+            ),
+            h(
+                "transformer_blocks.0.ff.net.2.lora_down.weight",
+                Dtype::BF16,
+                &[2, 32],
+            ),
+            h(
+                "transformer_blocks.0.ff.net.2.lora_up.weight",
+                Dtype::BF16,
+                &[8, 2],
+            ),
+        ]);
+        let mut kohya = file(vec![
+            h(
+                "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight",
+                Dtype::BF16,
+                &[6, 8],
+            ),
+            h(
+                "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight",
+                Dtype::BF16,
+                &[36, 6],
+            ),
+            h("lora_unet_blocks_0_attn_qkv_proj.alpha", Dtype::F32, &[]),
+            h(
+                "lora_unet_transformer_blocks_0_ff_net_2.lora_down.weight",
+                Dtype::BF16,
+                &[2, 32],
+            ),
+            h(
+                "lora_unet_transformer_blocks_0_ff_net_2.lora_up.weight",
+                Dtype::BF16,
+                &[8, 2],
+            ),
+        ]);
+        kohya
+            .metadata
+            .insert("ss_network_module".into(), "networks.lora".into());
+        let mut targets = ["to_q", "to_k", "to_v"]
+            .into_iter()
+            .map(|n| target(&format!("transformer_blocks.0.attn.{n}"), 8, 12, true))
+            .collect::<Vec<_>>();
+        targets.push(target("transformer_blocks.0.ff.net.2", 32, 8, false));
+        for backend in [MLX, CANDLE] {
+            let want =
+                profile_from_headers(backend, std::slice::from_ref(&dotted), &targets).unwrap();
+            let got =
+                profile_from_headers(backend, std::slice::from_ref(&kohya), &targets).unwrap();
+            assert_eq!(got.resident_bytes, want.resident_bytes);
+            assert_eq!(got.projections.len(), 4);
+        }
+        let mut unknown = kohya.clone();
+        unknown.tensors.push(h(
+            "lora_unet_final_layer_linear.lora_down.weight",
+            Dtype::BF16,
+            &[2, 8],
+        ));
+        let error = profile_from_headers(MLX, &[unknown], &targets)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lora_unet_final_layer_linear"), "{error}");
     }
 
     #[test]

@@ -176,6 +176,18 @@ impl KolorsEulerSampler {
 }
 
 impl DiffusionSampler for KolorsEulerSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        let mut values = vec![
+            self.init_noise_sigma,
+            self.start_sigma,
+            mlx_gen::sampler::sampling_dtype_code(self.model_dtype) as f32,
+        ];
+        for (i, &time) in self.timesteps.iter().enumerate() {
+            values.extend([time, self.sigmas[i], self.sigmas[i + 1]]);
+        }
+        Some(("kolors-leading-euler-time-sigma-triples-v1", values))
+    }
+
     fn num_steps(&self) -> usize {
         self.timesteps.len()
     }

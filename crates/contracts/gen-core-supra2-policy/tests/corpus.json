@@ -1,0 +1,208 @@
+[
+  {
+    "name": "published defaults",
+    "request": {},
+    "expected": {
+      "ok": {
+        "steps": 50,
+        "guidance": 3.0,
+        "use_cfg": true,
+        "seed": 0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "name": "explicit sampling and seed",
+    "request": {
+      "steps": 7,
+      "guidance": 1.0,
+      "seed": 42,
+      "count": 3
+    },
+    "expected": {
+      "ok": {
+        "steps": 7,
+        "guidance": 1.0,
+        "use_cfg": false,
+        "seed": 42,
+        "count": 3
+      }
+    }
+  },
+  {
+    "name": "zero count retains native normalization",
+    "request": {
+      "count": 0
+    },
+    "expected": {
+      "ok": {
+        "steps": 50,
+        "guidance": 3.0,
+        "use_cfg": true,
+        "seed": 0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "name": "maximum image batch",
+    "request": {
+      "count": 64
+    },
+    "expected": {
+      "ok": {
+        "steps": 50,
+        "guidance": 3.0,
+        "use_cfg": true,
+        "seed": 0,
+        "count": 64
+      }
+    }
+  },
+  {
+    "name": "finite negative guidance is preserved",
+    "request": {
+      "guidance": -2.0
+    },
+    "expected": {
+      "ok": {
+        "steps": 50,
+        "guidance": -2.0,
+        "use_cfg": false,
+        "seed": 0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "name": "CFG strictly above one",
+    "request": {
+      "guidance": 1.5
+    },
+    "expected": {
+      "ok": {
+        "steps": 50,
+        "guidance": 1.5,
+        "use_cfg": true,
+        "seed": 0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "name": "empty negative prompt",
+    "request": {
+      "negative_prompt": ""
+    },
+    "expected": {
+      "ok": {
+        "steps": 50,
+        "guidance": 3.0,
+        "use_cfg": true,
+        "seed": 0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "name": "maximum integer controls",
+    "request": {
+      "steps": 4294967295,
+      "seed": 18446744073709551615
+    },
+    "expected": {
+      "ok": {
+        "steps": 4294967295,
+        "guidance": 3.0,
+        "use_cfg": true,
+        "seed": 18446744073709551615,
+        "count": 1
+      }
+    }
+  },
+  {
+    "name": "wrong width",
+    "request": {
+      "width": 512
+    },
+    "expected": {
+      "error": "supra2: native resolution is 256x256 only (got 512x256)"
+    }
+  },
+  {
+    "name": "wrong height",
+    "request": {
+      "height": 128
+    },
+    "expected": {
+      "error": "supra2: native resolution is 256x256 only (got 256x128)"
+    }
+  },
+  {
+    "name": "zero steps",
+    "request": {
+      "steps": 0
+    },
+    "expected": {
+      "error": "supra2: steps must be at least 1"
+    }
+  },
+  {
+    "name": "excess count",
+    "request": {
+      "count": 65
+    },
+    "expected": {
+      "error": "supra2: at most 64 images per request (got 65)"
+    }
+  },
+  {
+    "name": "negative prompt",
+    "request": {
+      "negative_prompt": "blurry"
+    },
+    "expected": {
+      "error": "supra2: negative prompts are not part of the published interface (CFG uses the checkpoint's unconditional embedding)"
+    }
+  },
+  {
+    "name": "whitespace negative remains nonempty",
+    "request": {
+      "negative_prompt": " "
+    },
+    "expected": {
+      "error": "supra2: negative prompts are not part of the published interface (CFG uses the checkpoint's unconditional embedding)"
+    }
+  },
+  {
+    "name": "prompt batch",
+    "request": {
+      "prompt_batch_present": true
+    },
+    "expected": {
+      "error": "supra2: one text prompt per request; prompt batches and image conditioning are unsupported"
+    }
+  },
+  {
+    "name": "conditioning",
+    "request": {
+      "conditioning_present": true
+    },
+    "expected": {
+      "error": "supra2: one text prompt per request; prompt batches and image conditioning are unsupported"
+    }
+  },
+  {
+    "name": "error precedence remains geometry first",
+    "request": {
+      "width": 0,
+      "steps": 0,
+      "count": 65,
+      "negative_prompt": "bad"
+    },
+    "expected": {
+      "error": "supra2: native resolution is 256x256 only (got 0x256)"
+    }
+  }
+]

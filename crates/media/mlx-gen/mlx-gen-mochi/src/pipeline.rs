@@ -39,6 +39,13 @@ pub fn denoise(
 ) -> Result<Array> {
     let mut sched = MochiScheduler::new();
     sched.set_timesteps(steps, shift);
+    mlx_gen::video_execution::sampling(
+        "mochi",
+        "flow_euler",
+        "velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("mochi", sched.sigmas());
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     let mut latents = init_latents.clone();
@@ -85,6 +92,10 @@ pub fn decode_to_frames(
     // (the scail2 precedent — retained cache otherwise stacks on top of the decode high-water).
     mlx_rs::memory::clear_cache();
     let video = vae.decode_chunked(latents, DEFAULT_DECODE_CHUNK_FRAMES, Some(cancel))?;
+    mlx_gen::video_execution::policy(
+        "mochi_decode",
+        serde_json::json!({"chunk_frames":DEFAULT_DECODE_CHUNK_FRAMES,"latent_dtype":format!("{:?}",latents.dtype())}),
+    );
     to_uint8_frames(&video)
 }
 

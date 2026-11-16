@@ -150,8 +150,14 @@ fn reduced_projection_keeps_precise_vector_dispatch_on_every_metal_family() {
     let source = include_str!("../src/dit/pruned_adaln.rs");
     let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        compact.contains(".matmul(&coords.expand_dims(-1)?)?.squeeze_axes(&[-1])?"),
-        "the source-wide F32 reduced projection must use the precise N=1 dispatch"
+        compact.contains("mlx_gen::nn::linear_precise(coords,&self.weight,Some(&self.bias))"),
+        "the source-wide F32 reduced projection must use the shared precise N=1 dispatch"
+    );
+    let shared = include_str!("../../src/nn.rs");
+    let shared: String = shared.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        shared.contains("w.matmul(&x.expand_dims(-1)?)?.squeeze_axes(&[-1])?"),
+        "the shared precise linear must project each row as an N=1 column vector"
     );
     assert!(
         !compact.contains("mlx_gen::nn::linear(coords,&self.weight,&self.bias)"),

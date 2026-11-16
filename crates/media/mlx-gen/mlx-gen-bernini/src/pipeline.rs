@@ -6,6 +6,21 @@
 //! the dual-expert CFG `denoise_moe` replaced by `denoise_bernini` (per-step
 //! [`crate::forward::guided_velocity`] over the resolved [`Mode`]).
 
+/// Metadata from the same stored configuration and quantizer passed to expert construction.
+pub(crate) fn expert_weight_policy(
+    config: &WanModelConfig,
+    quant: Option<Quant>,
+) -> serde_json::Value {
+    serde_json::json!({"dense_dtype":"Bfloat16", "stored":format!("{:?}",config.quantization),
+        "applied_quant_bits":quant.map(Quant::bits), "affine_group_size":mlx_gen::quant::DEFAULT_GROUP_SIZE})
+}
+
+pub(crate) fn planner_weight_policy(quant: Option<Quant>) -> serde_json::Value {
+    serde_json::json!({"llm_quant_bits":quant.map(Quant::bits),
+        "dense_components":["vision", "connector", "clip_diff"],
+        "affine_group_size":mlx_gen::quant::DEFAULT_GROUP_SIZE})
+}
+
 use std::path::PathBuf;
 
 use mlx_rs::memory::clear_cache;
@@ -231,6 +246,13 @@ fn denoise_bernini(
     sched.set_timesteps(steps, shift);
     let timesteps = sched.timesteps().to_vec();
     let sigmas = sched.sigmas().to_vec();
+    mlx_gen::video_execution::sampling(
+        "bernini_renderer",
+        "unipc",
+        "flow_velocity_apg",
+        serde_json::json!({"omega_scale_bits":omega_scale.to_bits(),"guidance":format!("{base_g:?}"),"mode":format!("{mode:?}"),"momentum_bits":momentum.to_bits(),"boundary_bits":boundary.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("bernini_renderer", &sigmas);
 
     let mut latent = init_noise.clone();
     let mut switched = false;
@@ -354,6 +376,13 @@ pub fn denoise_bernini_wvitcfg(
     sched.set_timesteps(steps, shift);
     let timesteps = sched.timesteps().to_vec();
     let sigmas = sched.sigmas().to_vec();
+    mlx_gen::video_execution::sampling(
+        "bernini_renderer",
+        "unipc",
+        "flow_velocity_apg",
+        serde_json::json!({"omega_scale_bits":omega_scale.to_bits(),"guidance":format!("{base_g:?}"),"mode":format!("{mode:?}"),"boundary_bits":boundary.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("bernini_renderer", &sigmas);
 
     let mut latent = init_noise.clone();
     let mut switched = false;
@@ -403,7 +432,30 @@ pub fn denoise_bernini_wvitcfg(
 // sc-15528, but until this impl existed the production route reached none of it — the registry
 // declaration was real and the loaded generator was silent about it. Same reason chroma spells its
 // `Generator` out by hand (SC-15520).
+impl BerniniRenderer {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
 impl Generator for BerniniRenderer {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -417,7 +469,9 @@ impl Generator for BerniniRenderer {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -594,6 +648,7 @@ impl BerniniRenderer {
         // Seeded init noise (spatial, f32). Bit-parity vs torch needs the reference's CPU-MT19937
         // draw injected; the coherence bar uses the MLX RNG.
         let key = random::key(seed)?;
+        mlx_gen::video_execution::draw(0, "bernini_renderer_initial_normal", seed);
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         // --- Stage 2: load both experts, APG denoise (→ experts freed) ---
@@ -609,12 +664,20 @@ impl BerniniRenderer {
         // experts are deferred here, so the bound is over the full 80-block trunk, not one expert.
         let window = crate::memory_strategy::transformer_window_size(req)?;
         let attn_budget = crate::memory_strategy::attention_budget(req);
+        mlx_gen::video_execution::policy(
+            "bernini_experts",
+            serde_json::json!({"window":window,"attention_budget":format!("{attn_budget:?}")}),
+        );
         let plan = window
             .map(|size| BlockPlan::new(cfg.num_layers, size))
             .transpose()?;
         let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
             let path = self.root.join(name);
             let w = Weights::from_file(&path)?;
+            mlx_gen::video_execution::policy(
+                "bernini_expert_weights",
+                expert_weight_policy(cfg, self.quant),
+            );
             if window.is_some() {
                 let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
                 // No adapters can reach here (`supports_lora: false`), and the stream refuses an
@@ -729,6 +792,40 @@ impl BerniniRenderer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_report_weight_tiers_distinguish_dense_and_affine_defaults() {
+        let cfg = tiny_cfg();
+        let dense = super::expert_weight_policy(&cfg, None);
+        let q4 = super::expert_weight_policy(&cfg, Some(mlx_gen::Quant::Q4));
+        let q8 = super::expert_weight_policy(&cfg, Some(mlx_gen::Quant::Q8));
+        assert!(dense["applied_quant_bits"].is_null());
+        assert_eq!(q4["applied_quant_bits"], 4);
+        assert_eq!(q8["applied_quant_bits"], 8);
+        assert_ne!(dense, q4);
+        assert_ne!(q4, q8);
+        let mut packed = cfg.clone();
+        packed.quantization = Some(mlx_gen_wan::config::WanQuant {
+            bits: 4,
+            group_size: 32,
+        });
+        let stored_q4 = super::expert_weight_policy(&packed, None);
+        assert_ne!(stored_q4, dense);
+        assert_ne!(stored_q4, q4);
+        assert!(stored_q4["applied_quant_bits"].is_null());
+        assert_eq!(
+            super::planner_weight_policy(None)["llm_quant_bits"],
+            serde_json::Value::Null
+        );
+        assert_ne!(
+            super::planner_weight_policy(Some(mlx_gen::Quant::Q4)),
+            super::planner_weight_policy(Some(mlx_gen::Quant::Q8))
+        );
+        assert_eq!(
+            super::planner_weight_policy(Some(mlx_gen::Quant::Q4))["dense_components"],
+            serde_json::json!(["vision", "connector", "clip_diff"])
+        );
+    }
+
     use super::*;
     use mlx_rs::ops::multiply;
 

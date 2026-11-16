@@ -491,6 +491,23 @@ fn run_ar_loop_conditioned(
     mut denoise: impl FnMut(&Array, f32, usize, bool) -> Result<Array>,
 ) -> Result<Array> {
     let step_ts = schedule.step_timesteps();
+    let execution_sigmas: Vec<f64> = step_ts
+        .iter()
+        .map(|&t| schedule.sigma_at_timestep(t))
+        .chain(std::iter::once(0.0))
+        .collect();
+    mlx_gen::video_execution::schedule_f64("krea_realtime_sigmas", &execution_sigmas);
+    mlx_gen::video_execution::sampling(
+        "krea_realtime",
+        "self_forcing_euler_renoise",
+        "flow_x0",
+        serde_json::json!({"context_start":start_token_offset}),
+    );
+    mlx_gen::video_execution::schedule_f64("krea_realtime_timesteps", step_ts);
+    mlx_gen::video_execution::policy(
+        "krea_realtime_causal",
+        serde_json::json!({"frames_per_block":frames_per_block,"init_source":init_source.is_some(),"do_kv_recomp":do_kv_recomp,"context_noise_bits":context_noise.to_bits()}),
+    );
     if step_ts.is_empty() {
         return Err(Error::Msg("krea AR: empty denoising schedule".into()));
     }
@@ -514,6 +531,7 @@ fn run_ar_loop_conditioned(
     // `noise[:, block]`), and carry a split PRNG key for the per-step renoise draws — all seed-derived.
     let mut key = random::key(params.seed)?;
     let (noise_key, next) = random::split(&key, 2)?;
+    mlx_gen::video_execution::draw(0, "krea_split_chain_initial_left_then_right", params.seed);
     key = next;
     let full_noise =
         random::normal::<f32>(&[c, num_frames as i32, h, w], None, None, Some(&noise_key))?;
@@ -568,6 +586,13 @@ fn run_ar_loop_conditioned(
                 // Renoise x0 to the next step's noise level with fresh seed-derived Gaussian noise.
                 let sigma_next = schedule.sigma_at_timestep(step_ts[i + 1]);
                 let (eps_key, next) = random::split(&key, 2)?;
+                mlx_gen::video_execution::draw(
+                    0,
+                    &format!(
+                        "krea_split_chain_renoise_left_then_right:frame_{frame_cursor}:step_{i}"
+                    ),
+                    params.seed,
+                );
                 key = next;
                 let eps = random::normal::<f32>(x0_i.shape(), None, None, Some(&eps_key))?;
                 cur = renoise_step(&x0_i, &eps, sigma_next)?;

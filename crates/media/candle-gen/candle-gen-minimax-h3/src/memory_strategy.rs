@@ -10,14 +10,18 @@ mod execution;
 mod routes;
 mod streaming;
 
-pub(crate) use execution::active_context;
 pub use execution::begin_request;
+pub(crate) use execution::{activate as activate_request_scope, active_context};
 pub use routes::MEMORY_BEHAVIOR;
 #[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
 pub(crate) use streaming::proof_dit_inventory;
 #[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
 pub(crate) use streaming::proof_text_encoder_inventory;
 pub use streaming::{host_peak_bytes, streaming_host_peak_bytes};
+// Shared with the MiniMax-H3-Image contract (SW-7095): the same block stack, loaders and adapter
+// install, priced by the same header-only inventory.
+pub(crate) use adapters::profile_for as adapter_profile_for;
+pub(crate) use streaming::{dit_window_for, runtime_payloads, text_encoder_stream};
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
@@ -435,14 +439,14 @@ impl ComponentBytes {
     }
 }
 
-fn native_backend() -> candle_gen::gen_core::h3_memory::NativeBackend {
+pub(crate) fn native_backend() -> candle_gen::gen_core::h3_memory::NativeBackend {
     candle_gen::gen_core::h3_memory::NativeBackend::Candle {
         tile_rows: candle_gen::quant::w4a8_int8::TILE_ROWS as u64,
         workspace_bytes: candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64,
     }
 }
 
-fn dit_allocation(
+pub(crate) fn dit_allocation(
     path: &std::path::Path,
     pruned: bool,
 ) -> candle_gen::gen_core::Result<gen_core_h3::h3_memory::NativeComponentAllocation> {
@@ -2101,6 +2105,39 @@ mod tests {
                 .support,
             MemoryStrategySupport::Missing
         );
+    }
+
+    /// SW-7096: a configured adapter does not take rung 4 away. The streamed window copies each
+    /// host-resident block **with its installed residuals** to the device
+    /// (`LinearNoBias::copy_to_device`), so the declaration and the admission are the same with
+    /// and without a LoRA — the MLX sibling now holds the same rule.
+    #[test]
+    fn rung_four_stays_implemented_with_adapters_configured() {
+        let spec = weightless_spec().with_adapters(vec![
+            lora_at("/nonexistent/style.safetensors".into()),
+            lora_at("/nonexistent/turbo.safetensors".into()),
+        ]);
+        let contract = weights_free_contract(&spec).expect("weights-free contract");
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(contract.lifecycle.transformer_window_materialization);
+        for fixture in routes::registered_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        {
+            assert_eq!(
+                safety_check(&spec, &contract, &fixture.context),
+                MemorySafetyDecision::Accept
+            );
+        }
     }
 
     // --- AC3: weights-free conformance, and a malformed contract fails ---------------------------

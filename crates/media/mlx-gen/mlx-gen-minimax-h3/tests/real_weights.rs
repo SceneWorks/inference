@@ -2171,3 +2171,176 @@ origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         "MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiling_is_inert_below_one_tile"
     );
 }
+
+// ── SW-7089: MiniMax-H3-Image 2-D VAE decoder ────────────────────────────────────────────────────
+
+/// Peak-relative max-abs-diff bound for the image VAE against diffusers, at f32. Same class of
+/// bound as the video decode gate: a layout error (wrong rotary axis count, wrong unpatchify
+/// permute, a mis-planned tile seam) diverges by orders of magnitude, reduced-precision Metal
+/// matmul by ~1e-3.
+const IMAGE_VAE_TOL: f32 = 2e-2;
+
+/// The committed producer whose output the image gate accepts; see `producer_sha256` below.
+const IMAGE_VAE_PRODUCER: &[u8] = include_bytes!("../../tools/dump_minimax_h3_image_vae_real.py");
+
+fn image_snapshot() -> std::path::PathBuf {
+    let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT must point at a MiniMaxAI/MiniMax-H3-Image snapshot root (the \
+         dir holding `vae_diffusers/`). This test is #[ignore]d and asserts rather than skips."
+    );
+    let path = std::path::PathBuf::from(raw);
+    assert!(
+        path.join("vae_diffusers").join("config.json").is_file(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT={} has no vae_diffusers/config.json",
+        path.display()
+    );
+    path
+}
+
+fn image_peak_rel(got: &Array, want: &Array) -> f32 {
+    let got = got.as_dtype(Dtype::Float32).unwrap();
+    let diff = mlx_rs::ops::subtract(&got, want).unwrap().abs().unwrap();
+    let peak: f32 = want.abs().unwrap().max(None).unwrap().item();
+    diff.max(None).unwrap().item::<f32>() / peak
+}
+
+/// AC1 (MLX): the 2-D decoder, tiled and untiled, against the official diffusers
+/// `AutoencoderKLMiniMaxH3Image` on the published `vae_diffusers/` bytes.
+///
+/// The reference comes from `tools/dump_minimax_h3_image_vae_real.py` and must carry that file's
+/// exact SHA-256 (`producer_sha256`), so a reference made by an older or edited producer is
+/// refused rather than compared.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot + a reference decode (MINIMAX_H3_IMAGE_VAE_REFERENCE)"]
+fn image_vae_decode_matches_the_official_diffusers_vae() {
+    use mlx_gen_minimax_h3::MiniMaxH3ImageVae;
+    use sha2::{Digest, Sha256};
+
+    let root = image_snapshot();
+    let reference_path = std::env::var("MINIMAX_H3_IMAGE_VAE_REFERENCE").unwrap_or_default();
+    assert!(
+        !reference_path.is_empty(),
+        "MINIMAX_H3_IMAGE_VAE_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_image_vae_real.py; this test asserts rather than skips."
+    );
+    let r = Weights::from_file(&reference_path)
+        .unwrap_or_else(|e| panic!("load {reference_path}: {e}"));
+    assert_eq!(
+        r.metadata("reference").unwrap_or_default(),
+        "diffusers.AutoencoderKLMiniMaxH3Image",
+        "the reference must come from the official image VAE class"
+    );
+    let pinned = format!("{:x}", Sha256::digest(IMAGE_VAE_PRODUCER));
+    assert_eq!(
+        r.metadata("producer_sha256").unwrap_or_default(),
+        pinned,
+        "the reference was produced by a different dump_minimax_h3_image_vae_real.py than the \
+         committed one; re-produce it"
+    );
+
+    let vae = MiniMaxH3ImageVae::load(&root, Dtype::Float32).unwrap();
+    assert!(
+        vae.tiling().enabled,
+        "the shipped image VAE tiles by default"
+    );
+
+    let small = r.require("in.small").unwrap();
+    let got = vae.decode(small).unwrap();
+    let want = r.require("out.small").unwrap();
+    assert_eq!(got.shape(), want.shape(), "small decode shape");
+    let small_rel = image_peak_rel(&got, want);
+
+    let tiled_in = r.require("in.tiled").unwrap();
+    let got_tiled = vae.decode(tiled_in).unwrap();
+    let want_tiled = r.require("out.tiled").unwrap();
+    assert_eq!(got_tiled.shape(), want_tiled.shape(), "tiled decode shape");
+    assert_eq!(got_tiled.shape(), &[1, 3, 384, 640]);
+    let tiled_rel = image_peak_rel(&got_tiled, want_tiled);
+
+    let untiled = vae.clone().with_tiling(SpatialTiling::disabled());
+    let got_untiled = untiled.decode(tiled_in).unwrap();
+    let want_untiled = r.require("out.untiled").unwrap();
+    let untiled_rel = image_peak_rel(&got_untiled, want_untiled);
+    // The two reference branches really differ at this canvas, so the tiled gate is not passing
+    // on an untiled decode.
+    let branch_gap = image_peak_rel(want_tiled, want_untiled);
+
+    println!(
+        "image VAE vs diffusers AutoencoderKLMiniMaxH3Image (bound {IMAGE_VAE_TOL:.0e}): small \
+         {small_rel:.3e}, tiled {tiled_rel:.3e}, untiled {untiled_rel:.3e}; reference tiled-vs-untiled \
+         gap {branch_gap:.3e}"
+    );
+    assert!(
+        small_rel < IMAGE_VAE_TOL,
+        "small decode diverges by {small_rel:.3e}"
+    );
+    assert!(
+        tiled_rel < IMAGE_VAE_TOL,
+        "tiled decode diverges by {tiled_rel:.3e}"
+    );
+    assert!(
+        untiled_rel < IMAGE_VAE_TOL,
+        "untiled decode diverges by {untiled_rel:.3e}"
+    );
+    assert!(
+        branch_gap > IMAGE_VAE_TOL,
+        "the reference's tiled and untiled decodes differ by only {branch_gap:.3e}, so this \
+         canvas does not distinguish the branches"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED real_weights::image_vae_decode_matches_the_official_diffusers_vae"
+    );
+}
+
+/// AC2 (MLX): at 16 MP (a 256x256 latent -> 4096x4096 px) the shipped 256 / 64 tiled decode — the
+/// family's BoundedDecode — peaks below the untiled decode. Both runs hold the same resident
+/// weights; the peak is reset before each and read after the output is forced.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); 16 MP decode twice"]
+fn image_vae_tiled_decode_lowers_the_16mp_peak() {
+    use mlx_gen_minimax_h3::MiniMaxH3ImageVae;
+    use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+
+    let root = image_snapshot();
+    let vae = MiniMaxH3ImageVae::load(&root, Dtype::Float32).unwrap();
+    let (h, w) = (256, 256);
+    let n = (24 * h * w) as usize;
+    let vals: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+    let latents = Array::from_slice(&vals, &[1, 24, h, w]);
+    mlx_rs::transforms::eval([&latents]).unwrap();
+
+    let measure = |label: &str, vae: &MiniMaxH3ImageVae| -> usize {
+        clear_cache();
+        reset_peak_memory();
+        let started = Instant::now();
+        let out = vae.decode(&latents).unwrap();
+        mlx_rs::transforms::eval([&out]).unwrap();
+        let peak = get_peak_memory();
+        assert_eq!(out.shape(), &[1, 3, 4096, 4096], "{label} decode shape");
+        let mean: f32 = out.abs().unwrap().mean(None).unwrap().item();
+        assert!(
+            mean.is_finite() && mean > 0.0,
+            "{label} decode is degenerate: {mean}"
+        );
+        println!(
+            "16 MP {label} decode: peak {:.3} GiB in {:.1} s",
+            peak as f64 / (1u64 << 30) as f64,
+            started.elapsed().as_secs_f64()
+        );
+        peak
+    };
+    let tiled_peak = measure("tiled 256/64", &vae);
+    let untiled_vae = vae.clone().with_tiling(SpatialTiling::disabled());
+    let untiled_peak = measure("untiled", &untiled_vae);
+    assert!(
+        tiled_peak < untiled_peak,
+        "the bounded (tiled) decode peaked at {tiled_peak} B, not below the untiled {untiled_peak} B"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED real_weights::image_vae_tiled_decode_lowers_the_16mp_peak"
+    );
+}

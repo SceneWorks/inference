@@ -291,6 +291,45 @@ fn no_preparer_msg(spec: &PrepareSpec, all: &[&SnapshotPreparerRegistration]) ->
     )
 }
 
+/// Refuse a preparation output directory a write would corrupt (SW-7099 review): `out_dir` must be
+/// empty or absent, and neither `source` nor inside it. A loader reads every `*.safetensors` in a
+/// snapshot directory, so a shard left by an earlier write would load beside the new ones (and can
+/// win); an output inside the source would be read back as part of it. Backends call this before
+/// they write — never on a passthrough, which writes nothing.
+pub fn check_prepare_output(source: &Path, out_dir: &Path) -> Result<()> {
+    let source = source.canonicalize()?;
+    // `out_dir` may not exist yet: resolve its nearest existing ancestor, then re-append the rest.
+    let mut ancestor = out_dir.to_path_buf();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let (Some(name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) else {
+            break;
+        };
+        missing.push(name.to_owned());
+        ancestor = if parent.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            parent.to_path_buf()
+        };
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    resolved.extend(missing.iter().rev());
+    if resolved.starts_with(&source) {
+        return Err(Error::InvalidRequest(format!(
+            "output directory {} is the source {} or inside it",
+            out_dir.display(),
+            source.display()
+        )));
+    }
+    if out_dir.exists() && std::fs::read_dir(out_dir)?.next().is_some() {
+        return Err(Error::InvalidRequest(format!(
+            "output directory {} is not empty",
+            out_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +365,41 @@ mod tests {
         assert!(pb.exists(), "dropping one guard must not disturb the other");
         drop(b);
         assert!(!pb.exists(), "second fixture survived: {}", pb.display());
+    }
+
+    #[test]
+    fn a_prepare_output_must_be_empty_and_outside_the_source() {
+        let root = fixture_dir("output");
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("model.safetensors"), b"x").unwrap();
+        // Absent, and empty, outputs beside the source are accepted.
+        check_prepare_output(&src, &root.path().join("out/q4")).unwrap();
+        std::fs::create_dir_all(root.path().join("empty")).unwrap();
+        check_prepare_output(&src, &root.path().join("empty")).unwrap();
+        // The source itself, a directory inside it (existing or not), and a non-empty output are
+        // refused.
+        for out in [
+            src.clone(),
+            src.join("q4"),
+            src.join("."),
+            root.path().join("src/../src/a"),
+        ] {
+            let err = check_prepare_output(&src, &out).unwrap_err();
+            assert!(
+                err.to_string().contains("inside it"),
+                "{}: {err}",
+                out.display()
+            );
+        }
+        std::fs::create_dir_all(src.join("existing")).unwrap();
+        let err = check_prepare_output(&src, &src.join("existing")).unwrap_err();
+        assert!(err.to_string().contains("inside it"), "{err}");
+        let stale = root.path().join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("model.safetensors"), b"old").unwrap();
+        let err = check_prepare_output(&src, &stale).unwrap_err();
+        assert!(err.to_string().contains("not empty"), "{err}");
     }
 
     fn write(path: &Path, bytes: &[u8]) {

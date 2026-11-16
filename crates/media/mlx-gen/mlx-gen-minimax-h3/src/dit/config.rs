@@ -215,6 +215,146 @@ impl MiniMaxH3DitConfig {
     }
 }
 
+/// The `_class_name` of MiniMax-H3-**Image**'s `transformer_diffusers/config.json`.
+pub const IMAGE_DIT_CLASS_NAME: &str = "MiniMaxH3ImageTransformer2DModel";
+
+/// Geometry of `MiniMaxH3ImageTransformer2DModel` (`transformer_diffusers/config.json`).
+///
+/// The image DiT is the H3 block stack without its audio stream, so its geometry is H3's
+/// [`MiniMaxH3DitConfig`] with `audio_in_channels` 0 (there are no audio projections to size) plus
+/// the number of per-step output heads the checkpoint was distilled with. Every shared layer
+/// ([`crate::dit::DitBlock`], [`crate::dit::TokenRefiner`], [`crate::dit::MmRope`]) reads `base`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MiniMaxH3ImageDitConfig {
+    /// The shared block-stack geometry. `audio_in_channels` is always 0.
+    pub base: MiniMaxH3DitConfig,
+    /// `num_pdd_heads`: one output head per distilled sampling step. Shipped: 6.
+    pub num_pdd_heads: i32,
+}
+
+impl Default for MiniMaxH3ImageDitConfig {
+    fn default() -> Self {
+        Self {
+            base: MiniMaxH3DitConfig {
+                audio_in_channels: 0,
+                ..MiniMaxH3DitConfig::default()
+            },
+            num_pdd_heads: 6,
+        }
+    }
+}
+
+impl MiniMaxH3ImageDitConfig {
+    /// Reject a geometry the image forward cannot express.
+    pub fn validate(&self) -> Result<()> {
+        self.base.validate()?;
+        if self.base.audio_in_channels != 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3-image dit: the image DiT has no audio stream, got audio_in_channels {}",
+                self.base.audio_in_channels
+            )));
+        }
+        if self.num_pdd_heads <= 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3-image dit: num_pdd_heads must be positive, got {}",
+                self.num_pdd_heads
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse `transformer_diffusers/config.json`.
+    ///
+    /// Every H3 key except `audio_in_channels` is required, plus `num_pdd_heads`. A config naming
+    /// any other `_class_name`, or carrying `audio_in_channels`, is refused: the H3 video config
+    /// would otherwise parse here and run the image forward over an audio-bearing checkpoint.
+    pub fn from_diffusers_json(text: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| Error::Msg(format!("minimax-h3-image dit config: {e}")))?;
+        if let Some(class) = v.get("_class_name").and_then(serde_json::Value::as_str) {
+            if class != IMAGE_DIT_CLASS_NAME {
+                return Err(Error::Msg(format!(
+                    "minimax-h3-image dit config: _class_name is {class:?}, expected \
+                     {IMAGE_DIT_CLASS_NAME:?}"
+                )));
+            }
+        }
+        let mut obj = v
+            .as_object()
+            .cloned()
+            .ok_or_else(|| Error::Msg("minimax-h3-image dit config: not a JSON object".into()))?;
+        if obj.contains_key("audio_in_channels") {
+            return Err(Error::Msg(
+                "minimax-h3-image dit config: unexpected audio_in_channels; the image DiT has no \
+                 audio stream"
+                    .into(),
+            ));
+        }
+        let num_pdd_heads = obj
+            .get("num_pdd_heads")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                Error::Msg(
+                    "minimax-h3-image dit config: missing or non-numeric `num_pdd_heads`".into(),
+                )
+            })? as i32;
+        obj.insert("audio_in_channels".into(), 0.into());
+        let base =
+            MiniMaxH3DitConfig::from_diffusers_json(&serde_json::Value::Object(obj).to_string())?;
+        let cfg = Self {
+            base,
+            num_pdd_heads,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod image_tests {
+    use super::*;
+
+    /// The published `transformer_diffusers/config.json` at `492fd8c4`, verbatim.
+    pub(crate) const IMAGE_DIT_JSON: &str = r#"{
+        "_class_name": "MiniMaxH3ImageTransformer2DModel", "_diffusers_version": "0.42.0.dev0",
+        "num_attention_heads": 56, "attention_head_dim": 128, "hidden_size": 5376,
+        "num_layers": 50, "num_refiner_layers": 2, "ffn_dim": 14336, "in_channels": 24,
+        "patch_size": [1, 2, 2], "text_dim": 5120, "freq_dim": 256,
+        "time_embed_hidden_dim": 5376, "time_embed_dim": 2688, "rope_freq_dim": 16,
+        "rope_theta": 10000.0, "norm_eps": 1e-05, "qk_norm_eps": 1e-05,
+        "final_norm_eps": 1e-05, "num_pdd_heads": 6
+    }"#;
+
+    #[test]
+    fn parses_the_published_image_config() {
+        let cfg = MiniMaxH3ImageDitConfig::from_diffusers_json(IMAGE_DIT_JSON).unwrap();
+        assert_eq!(cfg, MiniMaxH3ImageDitConfig::default());
+        // AdaLN width 6 · 3 · 5376: H3's three-modality table, with image rows tagged as video.
+        assert_eq!(cfg.base.adaln_out_features(), 96_768);
+        assert_eq!(cfg.base.video_patch_dim(), 96);
+        assert_eq!(cfg.num_pdd_heads, 6);
+    }
+
+    #[test]
+    fn refuses_the_video_config_and_audio_keys() {
+        let video = IMAGE_DIT_JSON.replace(IMAGE_DIT_CLASS_NAME, "MiniMaxH3Transformer3DModel");
+        let e = MiniMaxH3ImageDitConfig::from_diffusers_json(&video).unwrap_err();
+        assert!(e.to_string().contains("_class_name"), "{e}");
+        let audio = IMAGE_DIT_JSON.replace(
+            "\"in_channels\": 24,",
+            "\"in_channels\": 24, \"audio_in_channels\": 32,",
+        );
+        let e = MiniMaxH3ImageDitConfig::from_diffusers_json(&audio).unwrap_err();
+        assert!(e.to_string().contains("audio_in_channels"), "{e}");
+        let no_heads = IMAGE_DIT_JSON.replace(", \"num_pdd_heads\": 6", "");
+        let e = MiniMaxH3ImageDitConfig::from_diffusers_json(&no_heads).unwrap_err();
+        assert!(e.to_string().contains("num_pdd_heads"), "{e}");
+        // The shared keys stay required.
+        let no_theta = IMAGE_DIT_JSON.replace("\"rope_theta\": 10000.0,", "");
+        assert!(MiniMaxH3ImageDitConfig::from_diffusers_json(&no_theta).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

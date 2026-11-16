@@ -1058,9 +1058,13 @@ mod tests {
             .join("\n");
         assert_eq!(
             stripped.matches("fn generate").count(),
-            4,
-            "control_provider.rs must expose exactly the three planned entry points plus the one \
-             scoped body this row reasons about"
+            5,
+            "control_provider.rs must expose exactly the three planned entry points, the attempt-report \
+             wrapper, and the one scoped body this row reasons about"
+        );
+        assert!(
+            stripped.contains(".generate_with_injector_planned(\n"),
+            "the attempt-report wrapper must delegate to the unscoped planned entry point"
         );
         assert_eq!(
             stripped

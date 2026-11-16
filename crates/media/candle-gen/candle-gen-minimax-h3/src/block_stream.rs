@@ -20,12 +20,18 @@ pub(crate) fn current() -> Option<Policy> {
     ACTIVE.with(|active| active.borrow().clone())
 }
 
-pub(crate) struct RequestGuard {
+/// The request scope rung 4 runs inside: while it lives, the text encoder and the DiT read the
+/// one-block window policy `request.memory` selects. The generator enters it per request; a
+/// real-weights gate that drives the streamed DiT directly enters it the same way.
+pub struct RequestGuard {
     device: candle_gen::candle_core::Device,
 }
 
 impl RequestGuard {
-    pub(crate) fn enter(
+    /// Install `request`'s window policy on this thread for the guard's lifetime. A request that
+    /// does not stream installs none; streaming needs a deferred load, both transformers and a
+    /// one-block window, and a scope is refused while another is active on the thread.
+    pub fn enter(
         request: &GenerationRequest,
         shape: LoadShape,
         device: &candle_gen::candle_core::Device,
@@ -56,6 +62,13 @@ impl RequestGuard {
                 })
             })
             .transpose()?;
+        candle_gen::execution::policy(
+            "h3_transformer_residency",
+            serde_json::json!({
+                "block_window": policy.as_ref().map(|p| p.window),
+                "load_shape": format!("{shape:?}"), "component_offload": "sequential"
+            }),
+        );
         ACTIVE.with(|active| {
             if active.borrow().is_some() {
                 return Err(CandleError::Msg(

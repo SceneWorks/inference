@@ -42,6 +42,17 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// both FLUX.1 variants (dev + schnell) — they share the FLUX.1 VAE latent space.
 pub const PID_BACKBONE: &str = "flux";
 
+/// A completed FLUX.1 render has strict-applied every load-time adapter in this order.
+pub(crate) fn applied_adapter_controls(
+    spec: &LoadSpec,
+) -> Vec<(usize, mlx_gen::runtime::AdapterKind, f32)> {
+    spec.adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect()
+}
+
 pub fn descriptor_schnell() -> ModelDescriptor {
     descriptor_for(FluxVariant::Schnell)
 }
@@ -500,11 +511,7 @@ impl Generator for Flux1 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
-        self.generate_planned(req, &plan, None, on_progress)?
-            .output
-            .ok_or_else(|| gen_core::Error::Msg("FLUX.1 render produced no images".into()))
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn generate_planned(
@@ -530,6 +537,7 @@ impl Generator for Flux1 {
                 ))
             })?;
             let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
+            mlx_gen::image_execution::scalar("flux.ip_scale", scale);
             match req.true_cfg {
                 Some(cfg) if self.variant.supports_guidance() => {
                     // The negative IP branch uses a black image, not a missing injector.
@@ -607,6 +615,55 @@ impl Generator for Flux1 {
             &self.memory_strategy,
             context,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.applied_adapter_controls",
+                    &applied_adapter_controls(&self.loaded_spec),
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Flux1 {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        // The plan freezes the trajectory before any reference or prompt encode; every encode then
+        // runs inside the plan's Conditioning phase.
+        self.validate(req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("FLUX.1 render produced no images".into()))
     }
 }
 
@@ -701,8 +758,10 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let transformer_window = self.requested_transformer_window(req, None)?;
+        mlx_gen::image_execution::policy_debug("flux.transformer_window", &transformer_window);
         let streamable = transformer_window.is_some();
         let stage_residency = matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential);
+        mlx_gen::image_execution::policy_debug("flux.stage_residency", &stage_residency);
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 + CLIP
         // encoders, encodes the prompt, materializes, then DROPS them + `clear_cache()` before the
         // DiT/VAE load — the peak-bounding win. Under `Resident` it borrows the warm encoders and runs
@@ -918,6 +977,9 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let transformer_window = self.requested_transformer_window(req, None)?;
+        mlx_gen::image_execution::scalar("flux.true_cfg", true_cfg);
+        mlx_gen::image_execution::policy_debug("flux.true_cfg_start", &timestep_to_start_cfg);
+        mlx_gen::image_execution::policy_debug("flux.transformer_window", &transformer_window);
         let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
@@ -1067,6 +1129,7 @@ impl Flux1 {
         let plan = run.plan();
         let sampler_name = plan.sampler();
         let guidance = plan.guidance();
+        mlx_gen::image_execution::scalar("flux.embedded_guidance", guidance);
         let sigmas = plan.sigmas();
         // Native VAE tiling is a clean-base mechanism. PiD keeps its own checked decode route and
         // never receives a native VAE tile geometry; overlay-bearing contracts leave rung 2 Missing.
@@ -1252,6 +1315,8 @@ fn decode_latents_via_seam(
     native_tiling: Option<&mlx_gen::TilingConfig>,
     cancel: &mlx_gen::CancelFlag,
 ) -> Result<Array> {
+    mlx_gen::image_execution::policy_debug("flux.native_decode_tiling", &native_tiling);
+    mlx_gen::image_execution::policy_debug("flux.decode_override", &decoder_override.is_some());
     let decoder = decoder_override.unwrap_or(native);
     mlx_gen::ensure_decoder_compatible(expected_latent_space, decoder)?;
     let decoded = match native_tiling {
@@ -1467,6 +1532,32 @@ mod tests {
     use super::*;
     use crate::config::{FLUX1_DEV_ID, FLUX1_SCHNELL_ID};
     use std::cell::Cell;
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_and_order() {
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let first = AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora);
+        let second = AdapterSpec::new("/fixture/two".into(), 1.0, AdapterKind::Lokr);
+        let source = LoadSpec::new(WeightsSource::Dir("/fixture/base".into()))
+            .with_adapters(vec![first.clone(), second.clone()]);
+        let scaled = LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+            AdapterSpec::new(first.path, 0.75, first.kind),
+            second.clone(),
+        ]);
+        let reversed =
+            LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+                second,
+                AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora),
+            ]);
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&scaled)
+        );
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&reversed)
+        );
+    }
 
     #[test]
     fn loaded_generator_accepts_native_and_pid_requests_when_pid_is_available() {

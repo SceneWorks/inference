@@ -2678,6 +2678,117 @@ expected_files = [
   "tokenizer/tokenizer_config.json",
 ]
 
+# SW-7089 — MiniMax-H3-Image's VAE (`vae_diffusers/`, `AutoencoderKLMiniMaxH3Image`): the 2-D ViT
+# decoder's real-weight parity and 16 MP bounded-decode gates in the `mlx-minimax-h3-image` and
+# `candle-minimax-h3-image` jobs (`profile: minimax-h3-image`). Only the diffusers-converted VAE
+# (2.34 GB, all F32) is fetched; the native `vae/` copy, the DiT and the text encoder are left out.
+[[models]]
+key = "minimax-h3-image"
+repository = "MiniMaxAI/MiniMax-H3-Image"
+revision = "492fd8c4eca666f1085f57e30738c1e0d86b3439"
+license = "MiniMax-H3-Image Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_SNAPSHOT"]
+download_files = ["vae_diffusers/*"]
+expected_files = [
+  "vae_diffusers/config.json",
+  "vae_diffusers/diffusion_pytorch_model.safetensors",
+]
+
+# SW-7090 — MiniMax-H3-Image's DiT (`transformer_diffusers/`, `MiniMaxH3ImageTransformer2DModel`,
+# 66 GB bf16 in 12 shards) and its tokenizer, for the first-step DiT parity and the 2048² t2i
+# render in the `minimax-h3-image` profile. The native `transformer/` copy and this repository's
+# own `text_encoder/` are left out: the text encoder is MiniMax-H3's byte-identical copy, read from
+# the `minimax-h3-text-encoder` row.
+[[models]]
+key = "minimax-h3-image-dit"
+repository = "MiniMaxAI/MiniMax-H3-Image"
+revision = "492fd8c4eca666f1085f57e30738c1e0d86b3439"
+license = "MiniMax-H3-Image Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_SNAPSHOT"]
+download_files = ["transformer_diffusers/*", "tokenizer/*"]
+expected_files = [
+  "transformer_diffusers/config.json",
+  "transformer_diffusers/diffusion_pytorch_model.safetensors.index.json",
+  "transformer_diffusers/diffusion_pytorch_model-00001-of-00012.safetensors",
+  "transformer_diffusers/diffusion_pytorch_model-00012-of-00012.safetensors",
+  "tokenizer/tokenizer.json",
+  "tokenizer/tokenizer_config.json",
+]
+
+# SW-7104 (AT8, AT11) — community MiniMax-H3-Image LoRAs from the Hub, one row per file, covering
+# every layout the H3-Image adapter loader accepts: diffusers/PEFT (prefixed and bare), kohya
+# `lora_unet_`, and ComfyUI (with and without per-module alpha). Searched 2026-11-15 over the Hub's
+# `MiniMax-H3-Image` / `h3-image` / `base_model:MiniMaxAI/MiniMax-H3-Image` listings and read each
+# candidate's safetensors header; LoKr files (ai-toolkit `lokr_w1`/`lokr_w2`) are not an accepted
+# layout and are not listed. akhaliq/MiniMax-H3-Image-Character-Swap stamps
+# `__metadata__["alpha"] = "16 (scaling 1.0)"`, which the loader reads as its leading number 16
+# (run 43708981217 refused it before that parse). Only the one LoRA file of each repository is
+# fetched. The
+# `minimax-h3-image` profile's acceptance step materializes them on both hosts.
+[[models]]
+# ComfyUI layout (`diffusion_model.blocks.*` native modules, fused qkv, no alpha; ai-toolkit), 155 MB, rank 16.
+key = "minimax-h3-image-community-lora-tanaami"
+repository = "syntaxdiffusion/tanaami-style-h3-image-lora"
+revision = "3804b381526a3e537c7961942ba4861a831b2d39"
+license = "MiniMax-H3-Image Community License Agreement (Hub tag `other`)"
+size_class = "small"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT"]
+download_files = ["tanaami_h3_image_lora_2000.safetensors"]
+expected_files = ["tanaami_h3_image_lora_2000.safetensors"]
+
+[[models]]
+# ComfyUI layout with per-module `.alpha` (`diffusion_model.blocks.*`; SimpleTuner), 310 MB, rank 32.
+key = "minimax-h3-image-community-lora-domokun"
+repository = "SimpleTuner/minimax-h3-image-domokun-2048"
+revision = "57214626f457eac87077c7035bb1b64d5264ebf3"
+license = "MiniMax-H3-Image Community License Agreement (Hub tag `other`)"
+size_class = "small"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT"]
+download_files = ["pytorch_lora_weights.safetensors"]
+expected_files = ["pytorch_lora_weights.safetensors"]
+
+[[models]]
+# kohya layout (`lora_unet_blocks_*`, `lora_down` / `lora_up` / `alpha`), 149 MB, rank 16.
+key = "minimax-h3-image-community-lora-fizgig"
+repository = "ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter"
+revision = "f1a4547596faeb98bae568dd28da296c49fbe0a1"
+license = "MiniMax-H3-Image Community License Agreement (Hub tag `other`)"
+size_class = "small"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT"]
+download_files = ["fizgig_minimax_h3_image_training_adapter.safetensors"]
+expected_files = ["fizgig_minimax_h3_image_training_adapter.safetensors"]
+
+[[models]]
+# diffusers/PEFT layout (`transformer.transformer_blocks.*` and `transformer.token_refiner.*`, alpha in metadata), 1.38 GB, rank 128.
+key = "minimax-h3-image-community-lora-pdmd"
+repository = "linoyts/MiniMax-H3-Image-pDMD-2steps"
+revision = "c07d96e5635311ed007d44654c2f98cc8d6e0a1e"
+license = "MiniMax-H3-Image Community License Agreement (Hub tag `other`)"
+size_class = "medium"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT"]
+download_files = ["pytorch_lora_weights.safetensors"]
+expected_files = ["pytorch_lora_weights.safetensors"]
+
+[[models]]
+# diffusers layout with bare module paths (`transformer_blocks.*`, `token_refiner.*`, no `transformer.` prefix), 173 MB, rank 16.
+key = "minimax-h3-image-community-lora-character-swap"
+repository = "akhaliq/MiniMax-H3-Image-Character-Swap"
+revision = "0b7f918092f9e23c01ca62b63d7c17e4fce6faa9"
+license = "MiniMax-H3-Image Community License Agreement (Hub tag `other`)"
+size_class = "small"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT"]
+download_files = ["lora/h3_image_character_swap_diffusers.safetensors"]
+expected_files = ["lora/h3_image_character_swap_diffusers.safetensors"]
+
 # ── MiniMax-H3 VRAM campaign (sc-20754) ──────────────────────────────────────────────────────────
 #
 # A dedicated exact allow-list keeps the normal `minimax-h3` header/decode slice small. The CUDA
@@ -2802,6 +2913,22 @@ expected_files = [
   "text_encoder/model-00012-of-00014.safetensors",
 ]
 
+# SW-7092 — MiniMax-H3's Qwen3-VL vision tower: all 351 `model.visual.*` tensors live in text-encoder
+# shard 14 and nowhere else (`mlx-gen-minimax-h3` `text_encoder::VISION_SHARD`). MiniMax-H3-Image's
+# `edit` runs every reference through it, so the `minimax-h3-image` profile's edit renders fetch it
+# into the same pinned MiniMax-H3 snapshot as the `minimax-h3-text-encoder` row; the `t2va` lanes
+# that read only shards 1-12 keep not fetching it.
+[[models]]
+key = "minimax-h3-vision-tower"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+download_files = ["text_encoder/model-00014-of-00014.safetensors"]
+expected_files = ["text_encoder/model-00014-of-00014.safetensors"]
+
 # ── MiniMax-H3 DiT component (sc-19558) ──────────────────────────────────────────────────────────
 #
 # THE GAP THIS CLOSES. Two `#[ignore]`d candle gates read HEADERS ONLY and were nevertheless
@@ -2924,6 +3051,71 @@ expected_files = [
   "q4/transformer/diffusion_pytorch_model.safetensors.index.json",
   "q4/transformer_ref/config.json",
   "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+# SW-7093 -- MiniMax-H3's **existing** packed text encoder, one row per tier (~31.1 GB q8, ~16.5 GB q4;
+# language-model shards 1-12, the layer-50 tap the image generator reads). Every MiniMax-H3-Image tier
+# resolves its text encoder here, never to a copy in the image repository: the `minimax-h3-image`
+# profile stages `{tier}/text_encoder` of this snapshot as the `text_encoder` component beside the
+# tier's converted DiT.
+[[models]]
+key = "minimax-h3-mlx-te-q8"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_TIER_SNAPSHOT"]
+download_files = [
+  "q8/text_encoder/config.json",
+  "q8/text_encoder/model.safetensors.index.json",
+  "q8/text_encoder/model-00001-of-00014.safetensors",
+  "q8/text_encoder/model-00002-of-00014.safetensors",
+  "q8/text_encoder/model-00003-of-00014.safetensors",
+  "q8/text_encoder/model-00004-of-00014.safetensors",
+  "q8/text_encoder/model-00005-of-00014.safetensors",
+  "q8/text_encoder/model-00006-of-00014.safetensors",
+  "q8/text_encoder/model-00007-of-00014.safetensors",
+  "q8/text_encoder/model-00008-of-00014.safetensors",
+  "q8/text_encoder/model-00009-of-00014.safetensors",
+  "q8/text_encoder/model-00010-of-00014.safetensors",
+  "q8/text_encoder/model-00011-of-00014.safetensors",
+  "q8/text_encoder/model-00012-of-00014.safetensors",
+]
+expected_files = [
+  "q8/text_encoder/config.json",
+  "q8/text_encoder/model-00001-of-00014.safetensors",
+  "q8/text_encoder/model-00012-of-00014.safetensors",
+]
+
+[[models]]
+key = "minimax-h3-mlx-te-q4"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_TIER_SNAPSHOT"]
+download_files = [
+  "q4/text_encoder/config.json",
+  "q4/text_encoder/model.safetensors.index.json",
+  "q4/text_encoder/model-00001-of-00014.safetensors",
+  "q4/text_encoder/model-00002-of-00014.safetensors",
+  "q4/text_encoder/model-00003-of-00014.safetensors",
+  "q4/text_encoder/model-00004-of-00014.safetensors",
+  "q4/text_encoder/model-00005-of-00014.safetensors",
+  "q4/text_encoder/model-00006-of-00014.safetensors",
+  "q4/text_encoder/model-00007-of-00014.safetensors",
+  "q4/text_encoder/model-00008-of-00014.safetensors",
+  "q4/text_encoder/model-00009-of-00014.safetensors",
+  "q4/text_encoder/model-00010-of-00014.safetensors",
+  "q4/text_encoder/model-00011-of-00014.safetensors",
+  "q4/text_encoder/model-00012-of-00014.safetensors",
+]
+expected_files = [
+  "q4/text_encoder/config.json",
+  "q4/text_encoder/model-00001-of-00014.safetensors",
+  "q4/text_encoder/model-00012-of-00014.safetensors",
 ]
 
 # ── MiniMax-H3 Veda dense-vs-sparse A/B inputs (epic sc-25140, sc-25777) ─────────────────────────
@@ -3343,3 +3535,37 @@ profiles = ["supra2"]
 environment = ["SUPRA2_VAE_SNAPSHOT"]
 download_files = ["config.json", "diffusion_pytorch_model.safetensors"]
 expected_files = ["config.json", "diffusion_pytorch_model.safetensors"]
+
+# SW-7099 (feature SW-F363): the MiniMax-H3-Image prompt expander as published — ModelOpt NVFP4
+# weights, its vision tower, tokenizer/chat template and the `prompt/` files the adapter
+# (`core_llm::minimax_h3_image_pe`) verifies against `prompt/manifest.json`. The
+# `minimax-h3-image-pe` profile runs it natively on the Blackwell CUDA box, converts it to the
+# bf16 / Q8 / Q4 tiers on both runners and scores each tier against the NVFP4 run.
+[[models]]
+key = "minimax-h3-image-pe"
+repository = "MiniMaxAI/MiniMax-H3-Image-PE"
+revision = "35603d4b63949afa12cb098227fffefedf081afa"
+license = "LicenseRef-MiniMax-H3-Image-Community"
+size_class = "large"
+profiles = ["minimax-h3-image-pe"]
+environment = ["MINIMAX_PE_SNAPSHOT"]
+download_files = ["*.json", "*.jinja", "*.safetensors", "prompt/*", "prompt/t2i/*", "prompt/edit/*"]
+expected_files = [
+  "config.json",
+  "generation_config.json",
+  "hf_quant_config.json",
+  "model.safetensors.index.json",
+  "model-00001-of-00004.safetensors",
+  "model-00002-of-00004.safetensors",
+  "model-00003-of-00004.safetensors",
+  "model-00004-of-00004.safetensors",
+  "processor_config.json",
+  "chat_template.jinja",
+  "tokenizer.json",
+  "tokenizer_config.json",
+  "prompt/manifest.json",
+  "prompt/t2i/system_prompt.txt",
+  "prompt/t2i/task_prompt.txt",
+  "prompt/t2i/request_params.json",
+  "prompt/edit/task_prompt.txt",
+]

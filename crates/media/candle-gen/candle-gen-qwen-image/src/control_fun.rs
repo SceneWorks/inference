@@ -53,6 +53,12 @@ pub const CONTROL_IN_DIM: usize =
 /// Default conditioning scale on the VACE hints.
 pub const DEFAULT_CONTROL_SCALE: f32 = 1.0;
 
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor();
+    descriptor.id = "qwen_image_control";
+    descriptor
+}
+
 /// Paths to the Qwen-Image 2512-Fun control checkpoints.
 pub struct QwenFunControlPaths {
     /// The `Qwen/Qwen-Image-2512` diffusers snapshot dir (`text_encoder/`, `transformer/`, `vae/`,
@@ -155,6 +161,7 @@ fn load_selected_text_encoder(
 /// The loaded Qwen-Image 2512-Fun control model: the reused base text encoder / DiT / VAE-decoder, plus
 /// the VAE encoder (to encode the control hint) and the VACE control branch.
 pub struct QwenFunControl {
+    unobserved_adapter_count: usize,
     device: Device,
     te: QwenTextEncoder,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
@@ -206,6 +213,7 @@ impl QwenFunControl {
 
         let tokenizer = control_common::load_tokenizer(&text_encoder, &te_cfg, LABEL)?;
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             device,
             te,
             tokenizer,
@@ -272,6 +280,29 @@ impl QwenFunControl {
     /// / depth image at the request size — input-agnostic, no kind argument) via the 2512-Fun VACE
     /// branch. VAE-encodes + packs the control hint to the 132-ch control context once, then runs the
     /// control denoise (the control branch runs on both CFG passes).
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &QwenFunControlRequest,
+        control: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.unobserved_adapter_count,
+                "QwenFunControl",
+            );
+            candle_gen::execution::policy("direct_route", "qwen-image/control_fun/generate".into());
+            let image = self
+                .generate(req, control, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &QwenFunControlRequest,
@@ -285,7 +316,8 @@ impl QwenFunControl {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         let pos = self.encode(&req.prompt)?;
-        let neg = if req.guidance != 1.0 {
+        let guidance = candle_gen::execution::f32_policy("qwen/direct_guidance", req.guidance);
+        let neg = if guidance != 1.0 {
             let n = if req.negative.trim().is_empty() {
                 NEGATIVE_FALLBACK
             } else {
@@ -351,7 +383,7 @@ impl QwenFunControl {
                     lat_h,
                     lat_w,
                     Some((&self.controlnet, &control_cond)),
-                    req.control_scale,
+                    candle_gen::execution::f32_policy("qwen/control_scale", req.control_scale),
                 )?;
                 match &neg {
                     Some(neg) => {
@@ -362,7 +394,10 @@ impl QwenFunControl {
                             lat_h,
                             lat_w,
                             Some((&self.controlnet, &control_cond)),
-                            req.control_scale,
+                            candle_gen::execution::f32_policy(
+                                "qwen/control_scale",
+                                req.control_scale,
+                            ),
                         )?;
                         Ok(pipeline::compute_guided_noise(
                             &pos_v,
@@ -402,6 +437,13 @@ fn require_prompt(prompt: &str) -> Result<()> {
 mod tests {
     use super::*;
     use candle_gen::gen_core::Image;
+
+    #[test]
+    fn direct_control_report_names_control_engine() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "qwen_image_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
 
     #[test]
     fn selected_text_encoder_is_exact_and_dense_only() {

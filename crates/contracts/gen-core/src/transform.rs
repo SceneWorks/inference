@@ -6,9 +6,45 @@
 //! target size + softness → restored image, 1-step, its own VAE+transformer, fixed text
 //! embedding). Scope is image→image; a video restorer would extend this later, not now.
 
+use crate::generator::ExecutionIdentity;
 use crate::media::Image;
 use crate::runtime::{CancelFlag, Progress};
 use crate::Result;
+
+/// One successful transform and the execution facts from that same attempt. An error or
+/// cancellation returns neither image nor report; providers do not keep a mutable last report.
+#[derive(Debug)]
+pub struct CompletedTransform {
+    pub image: Image,
+    pub execution: ExecutionIdentity,
+}
+
+impl CompletedTransform {
+    pub fn new(
+        image: Image,
+        execution: ExecutionIdentity,
+        descriptor: &TransformDescriptor,
+    ) -> Result<Self> {
+        let bytes = usize::try_from(image.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(image.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(Image::CHANNELS))
+            .ok_or_else(|| {
+                crate::Error::Msg("completed transform image dimensions overflow".into())
+            })?;
+        if bytes == 0 || image.pixels.len() != bytes {
+            return Err(crate::Error::Msg(
+                "completed transform needs a nonempty RGB image matching its dimensions".into(),
+            ));
+        }
+        execution.validate(descriptor.id, descriptor.backend, 1)?;
+        Ok(Self { image, execution })
+    }
+}
 
 /// A non-prompt image→image transform (super-resolution / restoration).
 pub trait Transform {
@@ -16,6 +52,23 @@ pub trait Transform {
     fn validate(&self, req: &TransformRequest) -> Result<()>;
     fn apply(&self, req: &TransformRequest, on_progress: &mut dyn FnMut(Progress))
         -> Result<Image>;
+    /// Additive same-attempt result. The default is explicit about missing provider facts; a
+    /// provider overrides this only when it can report values observed on its completed path.
+    fn apply_with_execution_report(
+        &self,
+        req: &TransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedTransform> {
+        let image = self.apply(req, on_progress)?;
+        if req.cancel.is_cancelled() {
+            return Err(crate::Error::Canceled);
+        }
+        CompletedTransform::new(
+            image,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
+    }
 }
 
 /// A transform request — `Default`-able like [`GenerationRequest`](crate::generator::GenerationRequest).
@@ -104,4 +157,96 @@ pub struct TransformCapabilities {
     pub input_budget: Option<InputBudget>,
     /// Honours [`TransformRequest::color_fix`].
     pub supports_color_fix: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct Stub {
+        descriptor: TransformDescriptor,
+        calls: Cell<u32>,
+    }
+
+    impl Transform for Stub {
+        fn descriptor(&self) -> &TransformDescriptor {
+            &self.descriptor
+        }
+        fn validate(&self, _req: &TransformRequest) -> Result<()> {
+            Ok(())
+        }
+        fn apply(
+            &self,
+            req: &TransformRequest,
+            _progress: &mut dyn FnMut(Progress),
+        ) -> Result<Image> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if req.cancel.is_cancelled() {
+                return Err(crate::Error::Canceled);
+            }
+            if call == 2 {
+                return Err(crate::Error::Msg("failed tile".into()));
+            }
+            Ok(Image {
+                width: 1,
+                height: 1,
+                pixels: vec![1, 2, 3],
+            })
+        }
+    }
+
+    #[test]
+    fn default_report_is_same_attempt_and_unavailable_after_success_only() {
+        let stub = Stub {
+            descriptor: TransformDescriptor {
+                id: "stub",
+                family: "test",
+                backend: "candle",
+                capabilities: TransformCapabilities::default(),
+            },
+            calls: Cell::new(0),
+        };
+        let req = TransformRequest::default();
+        let first = stub.apply_with_execution_report(&req, &mut |_| {}).unwrap();
+        assert_eq!(first.image.pixels, [1, 2, 3]);
+        assert!(first.execution.resolved().is_none());
+        assert!(stub.apply_with_execution_report(&req, &mut |_| {}).is_err());
+        let retry = stub.apply_with_execution_report(&req, &mut |_| {}).unwrap();
+        assert!(retry.execution.resolved().is_none());
+        assert_eq!(stub.calls.get(), 3);
+        req.cancel.cancel();
+        assert!(matches!(
+            stub.apply_with_execution_report(&req, &mut |_| {}),
+            Err(crate::Error::Canceled)
+        ));
+        assert_eq!(stub.calls.get(), 4);
+    }
+
+    #[test]
+    fn completed_transform_requires_one_real_rgb_output() {
+        let descriptor = TransformDescriptor {
+            id: "stub",
+            family: "test",
+            backend: "candle",
+            capabilities: TransformCapabilities::default(),
+        };
+        assert!(CompletedTransform::new(
+            Image::default(),
+            ExecutionIdentity::provider_default(),
+            &descriptor
+        )
+        .is_err());
+        assert!(CompletedTransform::new(
+            Image {
+                width: 1,
+                height: 1,
+                pixels: vec![1, 2]
+            },
+            ExecutionIdentity::provider_default(),
+            &descriptor,
+        )
+        .is_err());
+    }
 }

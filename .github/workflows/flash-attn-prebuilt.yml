@@ -1,0 +1,135 @@
+name: Prebuilt FlashAttention
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/flash-attn-prebuilt.yml
+      - crates/media/candle-gen/vendor/candle-flash-attn/**
+      - scripts/ci/flash_attn_prebuilt.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/flash-attn-prebuilt.yml
+      - crates/media/candle-gen/vendor/candle-flash-attn/**
+      - scripts/ci/flash_attn_prebuilt.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flash-attn-prebuilt-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows:
+    # Build scripts execute on this persistent runner; never run fork PR code here.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, Windows, X64, cuda]
+    timeout-minutes: 120
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+      CARGO_BUILD_JOBS: "12"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: ./.github/actions/cleanup-runner-storage
+      # The runner's global sccache wrapper can reset during heavy CUDA builds.
+      - name: Disable unstable sccache wrapper
+        shell: powershell
+        run: Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+      - name: Select Git Bash on Windows
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Build and package the Windows archive (no GPU execution)
+        shell: cmd
+        run: |
+          call "%VCVARS%" || exit /b 1
+          set NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64
+          set CANDLE_FLASH_ATTN_BUILD_DIR=%RUNNER_TOOL_CACHE%\candle-flash-attn-objects\%RUNNER_NAME%
+          if not exist "%CANDLE_FLASH_ATTN_BUILD_DIR%" mkdir "%CANDLE_FLASH_ATTN_BUILD_DIR%" || exit /b 1
+          cargo build --locked -p candle-flash-attn || exit /b 1
+          python3 scripts\ci\flash_attn_prebuilt.py --directory "%CANDLE_FLASH_ATTN_BUILD_DIR%" --output "%RUNNER_TEMP%\flash-attn-x86_64-pc-windows-msvc.tar.gz" --target x86_64-pc-windows-msvc --revision %GITHUB_SHA% || exit /b 1
+          mkdir "%RUNNER_TEMP%\flash-attn-verify" || exit /b 1
+          tar -xzf "%RUNNER_TEMP%\flash-attn-x86_64-pc-windows-msvc.tar.gz" -C "%RUNNER_TEMP%\flash-attn-verify" || exit /b 1
+          set CANDLE_FLASH_ATTN_PREBUILT_DIR=%RUNNER_TEMP%\flash-attn-verify
+          cargo clean -p candle-flash-attn || exit /b 1
+          cargo build --locked -p candle-flash-attn >"%RUNNER_TEMP%\flash-attn-link.log" 2>&1 || (type "%RUNNER_TEMP%\flash-attn-link.log" & exit /b 1)
+          type "%RUNNER_TEMP%\flash-attn-link.log"
+          findstr /c:"linking verified prebuilt FlashAttention archive" "%RUNNER_TEMP%\flash-attn-link.log" || exit /b 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flash-attn-windows
+          path: ${{ runner.temp }}/flash-attn-x86_64-pc-windows-msvc.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CUDA_COMPUTE_CAP: "80"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "12.9.1"
+          method: network
+          linux-local-args: '["--toolkit"]'
+      - name: Build and package the Linux archive (no GPU execution)
+        run: |
+          set -euo pipefail
+          export CANDLE_FLASH_ATTN_BUILD_DIR="$RUNNER_TEMP/flash-attn-build-$GITHUB_RUN_ID"
+          mkdir -p "$CANDLE_FLASH_ATTN_BUILD_DIR"
+          cargo build --locked -p candle-flash-attn
+          python3 scripts/ci/flash_attn_prebuilt.py --directory "$CANDLE_FLASH_ATTN_BUILD_DIR" --output "$RUNNER_TEMP/flash-attn-x86_64-unknown-linux-gnu.tar.gz" --target x86_64-unknown-linux-gnu --revision "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/flash-attn-verify"
+          tar -xzf "$RUNNER_TEMP/flash-attn-x86_64-unknown-linux-gnu.tar.gz" -C "$RUNNER_TEMP/flash-attn-verify"
+          export CANDLE_FLASH_ATTN_PREBUILT_DIR="$RUNNER_TEMP/flash-attn-verify"
+          cargo clean -p candle-flash-attn
+          cargo build --locked -p candle-flash-attn 2>&1 | tee "$RUNNER_TEMP/flash-attn-link.log"
+          grep -q 'linking verified prebuilt FlashAttention archive' "$RUNNER_TEMP/flash-attn-link.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flash-attn-linux
+          path: ${{ runner.temp }}/flash-attn-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: flash-attn-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish immutable revision assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -s artifacts/flash-attn-x86_64-pc-windows-msvc.tar.gz
+          test -s artifacts/flash-attn-x86_64-unknown-linux-gnu.tar.gz
+          source_hash="$(tar -xOzf artifacts/flash-attn-x86_64-unknown-linux-gnu.tar.gz flash-attn-prebuilt.txt | sed -n 's/^source_sha256=//p')"
+          test "${#source_hash}" = 64
+          windows_hash="$(tar -xOzf artifacts/flash-attn-x86_64-pc-windows-msvc.tar.gz flash-attn-prebuilt.txt | sed -n 's/^source_sha256=//p')"
+          test "$source_hash" = "$windows_hash"
+          if gh release view "flash-attn-$source_hash" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "FlashAttention source $source_hash is already published"
+            exit 0
+          fi
+          gh release create "flash-attn-$source_hash" artifacts/*.tar.gz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "FlashAttention $source_hash" --notes "Source-built FlashAttention-2 CUDA archives for source digest $source_hash at inference revision $GITHUB_SHA. Includes provenance, checksums and third-party notices." --latest=false

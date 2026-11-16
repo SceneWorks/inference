@@ -313,6 +313,28 @@ impl MiniMaxH3Tokenizer {
         Self::to_arrays(self.encode(&Self::render_with_images(prompt, num_image_tokens))?)
     }
 
+    /// The MiniMax-H3-Image **`edit`** presentation (SW-7092, `MiniMaxH3ImageEditTextEncoderStep`):
+    /// per reference a `"Picture i: "` label and a `<|image_pad|>` vision block of
+    /// `num_image_tokens[i]` pads, then the prompt verbatim — no chat template, no special tokens,
+    /// label and prompt each truncated to 4096 ids ([`mlx_gen::gen_core::h3_image::edit_presentation`]).
+    /// Returns `(ids, tags)`: vision-block rows image-tagged, label and prompt rows text-tagged.
+    pub fn image_edit_ids(
+        &self,
+        prompt: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<(Vec<i32>, Vec<i32>)> {
+        let specials = mlx_gen::gen_core::h3_image::VisionBlockIds {
+            vision_start: self.special_id(VISION_START)?,
+            image_pad: self.special_id(IMAGE_PAD)?,
+            vision_end: self.special_id(VISION_END)?,
+        };
+        mlx_gen::gen_core::h3_image::edit_presentation(prompt, num_image_tokens, specials, |text| {
+            self.encode(text)
+                .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))
+        })
+        .map_err(Error::from)
+    }
+
     /// Resolve one special token's id from the loaded vocabulary.
     ///
     /// Read rather than hardcoded, for the same reason [`SpecialTokens::derive`] exists:

@@ -189,7 +189,9 @@ impl QwenTextEncoder {
         for layer in &self.layers {
             hidden = layer.forward(&hidden, &self.rotary, &mask)?;
         }
-        __model_proof_output!(self.norm.forward(&hidden))
+        let output = __model_proof_output!(self.norm.forward(&hidden))?;
+        crate::observe_component_precision("text_encoder", output.device(), output.dtype());
+        Ok(output)
     }
 
     /// `input_ids` `[1, S]` → `prompt_embeds` `[1, S − drop_idx, 3584]` (f32): the last layer's normed

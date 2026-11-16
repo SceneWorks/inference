@@ -27,6 +27,35 @@
 //! the VAE posterior MEAN (no sampling, no device RNG — sc-8988), so the control latent is fully
 //! deterministic and launch-portable.
 
+fn resolved_control_guidance(value: f32) -> f64 {
+    candle_gen::execution::f32_policy("flux/control_guidance", value) as f64
+}
+
+fn resolved_control_scale(requested: Option<f32>) -> f64 {
+    candle_gen::execution::f64_policy(
+        "flux/control_scale",
+        requested.unwrap_or(DEFAULT_CONTROL_SCALE) as f64,
+    )
+}
+
+fn observe_injector(injector: Option<&dyn DitImageInjector>) {
+    match injector {
+        None => candle_gen::execution::policy("flux/control_injector", "none".into()),
+        Some(injector) => match injector.execution_policy() {
+            Some(value) => candle_gen::execution::policy("flux/control_injector", value),
+            None => candle_gen::execution::unavailable(
+                "FLUX control DitImageInjector does not expose its applied settings",
+            ),
+        },
+    }
+}
+
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor_dev();
+    descriptor.id = "flux1_dev_control";
+    descriptor
+}
+
 #[cfg(test)]
 use crate::vae::native::{DiagonalGaussian, Encoder};
 use candle_core::{DType, Device, Tensor};
@@ -437,6 +466,36 @@ impl Flux1DevControl {
         self.branch.num_residuals()
     }
 
+    /// [`generate_with_injector_planned`](Self::generate_with_injector_planned), completed as a
+    /// standalone route with observations from this same attempt.
+    pub fn generate_with_injector_planned_with_execution_report(
+        &self,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
+            candle_gen::execution::policy(
+                "direct_route",
+                "flux/control_provider/generate_with_injector_planned".into(),
+            );
+            let image = self
+                .generate_with_injector_planned(
+                    req,
+                    control_image,
+                    injector,
+                    plan,
+                    &mut report_progress,
+                )
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     /// Generate one control-conditioned image from the trajectory [`compile_control_plan`] froze
     /// before load. `control_image` is the preprocessed pose/canny/depth hint (the worker pre-fits it
     /// to the render size; this re-resizes defensively). `injector` optionally threads an identity
@@ -589,7 +648,7 @@ impl Flux1DevControl {
         // which the engine proves is byte-identical to the base forward ("control off"). The old code
         // treated 0.0 as "unset" and silently steered at 0.7, contradicting the engine's own ablation
         // semantics (scale 0 ≡ base; see `control_parity` / `control_real_weights`).
-        let control_scale = req.control_scale.unwrap_or(DEFAULT_CONTROL_SCALE) as f64;
+        let control_scale = resolved_control_scale(req.control_scale);
 
         // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
         self.backbone
@@ -617,6 +676,8 @@ impl Flux1DevControl {
         // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
+        resolved_control_guidance(plan.guidance());
+        observe_injector(injector);
         let images = run.images_with_denoise_phases(
             on_progress,
             |seed| {
@@ -889,6 +950,13 @@ mod tests {
         assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
     }
 
+    #[test]
+    fn direct_control_report_names_control_engine() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "flux1_dev_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
+
     /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5, pose).
     /// `control_scale` defaults to `None` (absent) — resolved to [`DEFAULT_CONTROL_SCALE`] at generate
     /// time (sc-9024: absent ≠ an explicit 0.0).
@@ -1038,5 +1106,84 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED control_provider::tests::control_encode_takes_the_posterior_mean");
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_control_distinguishes_absent_zero_and_unknown_injector() {
+        let report = |scale| {
+            candle_gen::testkit::execution_policy(|| {
+                resolved_control_scale(scale);
+                observe_injector(None);
+            })
+        };
+        assert_eq!(report(None), report(Some(DEFAULT_CONTROL_SCALE)));
+        assert_ne!(report(None), report(Some(0.0)));
+        let guidance = |value| {
+            candle_gen::testkit::execution_policy(|| {
+                resolved_control_guidance(value);
+            })
+        };
+        assert_ne!(guidance(3.5), guidance(4.5));
+        struct Known(f32);
+        impl DitImageInjector for Known {
+            fn execution_policy(&self) -> Option<serde_json::Value> {
+                Some(serde_json::json!({"weight_bits": self.0.to_bits()}))
+            }
+            fn after_double(
+                &self,
+                _: usize,
+                _: &Tensor,
+            ) -> candle_gen::candle_core::Result<Option<Tensor>> {
+                unreachable!()
+            }
+            fn injects_after_single(&self, _: usize) -> bool {
+                unreachable!()
+            }
+            fn after_single(
+                &self,
+                _: usize,
+                _: &Tensor,
+            ) -> candle_gen::candle_core::Result<Option<Tensor>> {
+                unreachable!()
+            }
+        }
+        let injected = |weight| {
+            candle_gen::testkit::execution_policy(|| {
+                observe_injector(Some(&Known(weight)));
+            })
+        };
+        assert_ne!(injected(0.5), injected(0.75));
+        struct Unknown;
+        impl DitImageInjector for Unknown {
+            fn after_double(
+                &self,
+                _: usize,
+                _: &Tensor,
+            ) -> candle_gen::candle_core::Result<Option<Tensor>> {
+                unreachable!()
+            }
+            fn injects_after_single(&self, _: usize) -> bool {
+                unreachable!()
+            }
+            fn after_single(
+                &self,
+                _: usize,
+                _: &Tensor,
+            ) -> candle_gen::candle_core::Result<Option<Tensor>> {
+                unreachable!()
+            }
+        }
+        let report = candle_gen::testkit::execution_policy(|| {
+            resolved_control_scale(None);
+            observe_injector(Some(&Unknown));
+        });
+        assert!(matches!(
+            report,
+            candle_gen::gen_core::generator::ExecutionIdentity::Unavailable { .. }
+        ));
     }
 }

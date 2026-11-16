@@ -124,6 +124,14 @@ impl MochiScheduler {
                 self.sigmas_f64.len().saturating_sub(1)
             )));
         }
+        if i == 0 {
+            candle_gen::execution::schedule_f64(
+                "mochi_flow_euler_v1",
+                &self.sigmas_f64,
+                "inverse_flow_velocity",
+            );
+            candle_gen::execution::runtime(sample.device(), sample.dtype());
+        }
         let dt = self.sigmas_f64[i + 1] - self.sigmas_f64[i];
         let x_next = (sample + model_output.affine(dt, 0.0)?)?;
         self.step_index += 1;

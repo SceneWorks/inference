@@ -284,6 +284,7 @@ pub(crate) fn encode_residency(
 ) -> Result<ResidencyContext> {
     if raw {
         let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+        candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
         let (context, negative) = encode_base_contexts(text, req, guidance)?;
         Ok(ResidencyContext::Raw {
             context,
@@ -1232,6 +1233,7 @@ pub(crate) fn render_three_stage_with_native(
     facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Vec<Image>> {
     let memory = req.memory.unwrap_or_default();
+    candle_gen::execution::policy("krea/pipeline/memory", format!("{memory:?}").into());
     candle_gen::check_cancel(&req.cancel)?;
 
     enter_loading_boundary(
@@ -1310,6 +1312,10 @@ pub(crate) fn render_three_stage_with_native(
     } else {
         candle_gen::ATTN_SCORES_BUDGET
     };
+    candle_gen::execution::policy(
+        "krea/pipeline/attention_budget",
+        format!("{attention_budget:?}").into(),
+    );
     // SC-15510's rule: `None` means "the provider's own historical constant", so an untouched request
     // is byte-for-byte unaffected. A value only ever arrives here after the request scope re-validated
     // it against the published candidates, which for this realization is `[1]` alone — see
@@ -1320,6 +1326,10 @@ pub(crate) fn render_three_stage_with_native(
         .transformer_window_size
         .map(|w| w as usize)
         .unwrap_or(crate::transformer::DEFAULT_TRANSFORMER_WINDOW);
+    candle_gen::execution::policy(
+        "krea/pipeline/transformer_window",
+        format!("{transformer_window:?}").into(),
+    );
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let preview = crate::preview::hook(&req.preview);
@@ -1367,7 +1377,9 @@ pub(crate) fn render_three_stage_with_native(
     let vae = open_decode_component(req, memory, on_progress, || load_vae(root, device))?;
     let images = latents
         .iter()
-        .map(|latent| {
+        .enumerate()
+        .map(|(output_index, latent)| {
+            candle_gen::execution::output_index(output_index);
             candle_gen::check_cancel(&req.cancel)?;
             enter_decode_boundary(req, memory, on_progress)?;
             let tile = memory.tile_vae_decode.then_some((
@@ -1509,14 +1521,18 @@ fn tap_gain_weights(gain: f32, n: usize) -> Vec<f32> {
 /// the context untouched (the no-op fast path), so plain requests pay nothing. Takes the raw
 /// `Option<f32>` (not a `GenerationRequest`) so the bespoke pose-control request can share it. Krea-
 /// only: reached only from the candle-gen-krea render paths.
+pub(crate) fn effective_style_gain(gain: Option<f32>) -> f32 {
+    let effective = gain.filter(|g| (*g - 1.0).abs() > 1e-4).unwrap_or(1.0);
+    candle_gen::execution::f32_policy("krea/text_style_gain", effective)
+}
+
 pub(crate) fn maybe_apply_style_gain(context: Tensor, gain: Option<f32>) -> Result<Tensor> {
-    match gain {
-        Some(g) if (g - 1.0).abs() > 1e-4 => {
-            let n = context.dim(2)?;
-            apply_tap_weights(&context, &tap_gain_weights(g, n))
-        }
-        _ => Ok(context),
+    let gain = effective_style_gain(gain);
+    if gain == 1.0 {
+        return Ok(context);
     }
+    let n = context.dim(2)?;
+    apply_tap_weights(&context, &tap_gain_weights(gain, n))
 }
 
 /// Encode the positive prompt to the DiT context and apply the optional text-style gain — the single
@@ -1737,7 +1753,9 @@ fn render_img2img_from_context(
     // The clean reference latent (seed-independent): LANCZOS-resize → `[-1,1]` pixels → the normalized
     // 16-ch latent (f32, the noise's dtype for the blend + sampler).
     let init_pixels = preprocess_img2img_init(reference, req.width, req.height, device)?;
-    let clean = vae_encoder.encode(&init_pixels)?.to_dtype(DType::F32)?;
+    let clean = vae_encoder.encode(&init_pixels)?;
+    candle_gen::execution::component_runtime("krea/vae_encoder", clean.device(), clean.dtype());
+    let clean = clean.to_dtype(DType::F32)?;
 
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
         comps.pid.as_deref(),
@@ -1823,6 +1841,7 @@ pub fn render_base(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
     let (context, neg_context) = candle_gen::gen_core::with_prompt_encoding(
         on_progress,
         || -> std::result::Result<_, candle_gen::CandleError> {
@@ -2193,6 +2212,7 @@ fn render_multiphase_driver<T>(
             let start = phase.slice.start.min(end);
             let sub = &sigmas[start..=end];
             let guidance = phase.guidance;
+            candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
             latent = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -2342,6 +2362,7 @@ pub fn render_base_img2img(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
 
     // The conditional + unconditional condition encoding (seed-independent), identical to `render_base`
     // (the shared `encode_base_contexts` seam): img2img changes only the init latent + schedule start,
@@ -2417,7 +2438,9 @@ fn render_base_img2img_from_contexts(
     // The clean reference latent (seed-independent): LANCZOS-resize → `[-1,1]` pixels → the normalized
     // 16-ch latent (f32, the noise's dtype for the blend + sampler).
     let init_pixels = preprocess_img2img_init(reference, req.width, req.height, device)?;
-    let clean = vae_encoder.encode(&init_pixels)?.to_dtype(DType::F32)?;
+    let clean = vae_encoder.encode(&init_pixels)?;
+    candle_gen::execution::component_runtime("krea/vae_encoder", clean.device(), clean.dtype());
+    let clean = clean.to_dtype(DType::F32)?;
 
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
         comps.pid.as_deref(),
@@ -2581,6 +2604,7 @@ pub(crate) fn encode_edit_context(
     let guidance = req
         .guidance
         .unwrap_or(if distilled { 0.0 } else { RAW_GUIDANCE });
+    candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
 
     // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
     let vision = text.vision()?;
@@ -2770,7 +2794,13 @@ fn encode_references(
     let mut out = Vec::with_capacity(references.len());
     for im in references {
         let pixels = image_to_pixels(im, width, height, device)?;
-        out.push(vae_encoder.encode(&pixels)?);
+        let encoded = vae_encoder.encode(&pixels)?;
+        candle_gen::execution::component_runtime(
+            "krea/vae_encoder",
+            encoded.device(),
+            encoded.dtype(),
+        );
+        out.push(encoded);
     }
     Ok(out)
 }
@@ -2838,6 +2868,7 @@ fn encode_vision(
             im.width as usize,
             device,
         )?;
+        candle_gen::execution::component_runtime("krea/vision", embeds.device(), embeds.dtype());
         g.n_per_ref
             .push(crate::vision::merged_token_count(grid, merge));
         g.embeds.push(embeds);
@@ -3012,7 +3043,7 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
         (width / SPATIAL_SCALE) as usize,
     );
     let n = LATENT_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("krea/pipeline", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
@@ -3034,6 +3065,11 @@ fn decode_via_seam(
     if cancel.is_some_and(gen_core::CancelFlag::is_cancelled) {
         return Err(CandleError::Canceled);
     }
+    let component = if decoder.is_some() {
+        "krea/pid_decoder"
+    } else {
+        "krea/vae"
+    };
     let decoder: &dyn LatentDecoder = decoder.unwrap_or(native);
     candle_gen::ensure_decoder_compatible(
         Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -3053,6 +3089,7 @@ fn decode_via_seam(
         }
         None => decoder.decode(latents)?,
     };
+    candle_gen::execution::component_runtime(component, decoded.device(), decoded.dtype());
     Ok(decoded.to_dtype(DType::F32)?)
 }
 
@@ -3335,6 +3372,63 @@ mod tests {
         assert_eq!(to_image(&got).unwrap(), expected_pid);
         assert_eq!(native.calls.get(), 0);
         assert_eq!(pid.calls.get(), 1);
+    }
+
+    #[test]
+    fn decode_report_binds_selected_component_before_output_promotion() {
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+
+        let device = Device::Cpu;
+        let latents = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        for (pid_selected, expected_component, dtype) in [
+            (false, "krea/vae", DType::BF16),
+            (true, "krea/pid_decoder", DType::F32),
+        ] {
+            let native = DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), dtype, &device).unwrap());
+            let pid = pid_selected
+                .then(|| DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), dtype, &device).unwrap()));
+            let completed = candle_gen::execution::capture_direct(
+                &crate::descriptor(),
+                &gen_core::CancelFlag::default(),
+                || {
+                    candle_gen::execution::rng_scheme("fixture");
+                    candle_gen::execution::draw("noise", 7, 0);
+                    candle_gen::execution::schedule("euler", &[1.0, 0.0], "flow");
+                    decode_via_seam(
+                        &native,
+                        pid.as_ref().map(|decoder| decoder as &dyn LatentDecoder),
+                        &latents,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    Ok(gen_core::GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .unwrap();
+            let ExecutionIdentity::Resolved { identity } = completed.execution else {
+                panic!("completed stub report should resolve")
+            };
+            let ExecutionFact::Resolved { value } = identity.quality_policy else {
+                panic!("quality policy")
+            };
+            let operations = &value["operations"];
+            assert_eq!(
+                operations[format!("compute_component/{expected_component}")][0]["value"]["dtype"],
+                format!("{dtype:?}")
+            );
+            let other = if pid_selected {
+                "krea/vae"
+            } else {
+                "krea/pid_decoder"
+            };
+            let other_key = format!("compute_component/{other}");
+            assert!(operations.get(other_key.as_str()).is_none());
+        }
     }
 
     /// **sc-21484 follow-up: the production single-file load is what publishes the facts.**
@@ -4261,5 +4355,20 @@ mod tests {
             pixels: vec![0u8; 10],
         };
         assert!(preprocess_img2img_init(&bad, 4, 4, &Device::Cpu).is_err());
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_style_gain_records_effective_noop_and_override() {
+        let report = |gain| {
+            candle_gen::testkit::execution_policy(|| {
+                effective_style_gain(gain);
+            })
+        };
+        assert_eq!(report(None), report(Some(1.00005)));
+        assert_ne!(report(None), report(Some(0.75)));
     }
 }

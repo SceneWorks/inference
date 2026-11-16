@@ -813,6 +813,10 @@ impl ChunkSolver {
             keys_total,
             lm.dtype(),
         )?;
+        candle_audio::execution::policy(
+            "yue2-attention",
+            serde_json::json!({"query_rows":rows,"keys":keys_total}),
+        );
         for (i, layer) in lm.layers().iter().enumerate() {
             let p = layer.nar.as_ref().ok_or_else(|| {
                 gen_core::Error::Msg(
@@ -859,10 +863,17 @@ impl ChunkSolver {
             .and_then(|t| t.to_dtype(lm.dtype()))
             .map_err(&err)?;
         let dt = 1.0 / steps as f64;
+        let mut executed_times = Vec::with_capacity(steps * 2);
+        candle_audio::execution::runtime(lm.device(), lm.dtype());
+        candle_audio::execution::sampling(
+            "yue2-midpoint",
+            serde_json::json!({"steps":steps,"dt_bits":dt.to_bits()}),
+        );
         for step in 0..steps {
             check_cancel(hooks.cancelled)?;
             let t = 1.0 - step as f64 * dt;
             let raw = clamped_logit(t) as f32;
+            executed_times.push(raw);
             let first = self.velocity(nar, &state, raw, tile)?;
             hooks.observer.on_evaluation(&Evaluation {
                 chunk,
@@ -875,6 +886,7 @@ impl ChunkSolver {
             let mid = (&state - (first * (dt / 2.0)).map_err(&err)?).map_err(&err)?;
             check_cancel(hooks.cancelled)?;
             let raw_mid = clamped_logit(t - dt / 2.0) as f32;
+            executed_times.push(raw_mid);
             let second = self.velocity(nar, &mid, raw_mid, tile)?;
             hooks.observer.on_evaluation(&Evaluation {
                 chunk,
@@ -890,6 +902,11 @@ impl ChunkSolver {
                 .observer
                 .on_progress(chunk * steps + step + 1, chunks * steps);
         }
+        candle_audio::execution::schedule_f32(
+            "yue2-midpoint-executed-times",
+            &executed_times,
+            "velocity-midpoint-logit-time-clamp20",
+        );
         let result = state
             .to_dtype(DType::F32)
             .and_then(|t| t.to_device(&Device::Cpu))
@@ -1019,6 +1036,17 @@ pub fn synthesize(
     mut hooks: SynthesisHooks<'_>,
 ) -> gen_core::Result<Synthesis> {
     crate::fp8::restore_ar_bf16(&mut nar.lm)?;
+    candle_audio::execution::runtime(nar.lm.device(), nar.lm.dtype());
+    candle_audio::execution::noise(
+        "yue2-acoustic",
+        "splitmix64-box-muller-row-major-or-explicit",
+        request.noise.sha256(),
+    );
+    candle_audio::execution::sampling("yue2-midpoint", serde_json::json!({"steps":request.steps}));
+    candle_audio::execution::policy(
+        "yue2-nar",
+        serde_json::json!({"options":format!("{options:?}"),"context":request.context}),
+    );
     let start = Instant::now();
     let refuse = |what: String| Err(gen_core::Error::Msg(format!("YuE2 acoustic: {what}")));
     if request.prefix.is_empty() || request.codes.is_empty() {

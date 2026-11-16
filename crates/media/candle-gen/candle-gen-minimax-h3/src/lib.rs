@@ -129,9 +129,15 @@ pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
 pub mod config;
+pub mod convert;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
+pub mod image_memory_strategy;
+pub mod image_model;
+pub mod image_pipeline;
+pub mod image_sampler;
+pub mod image_vae;
 pub mod keyframe;
 pub mod layout;
 pub mod memory_strategy;
@@ -145,15 +151,16 @@ pub mod spatial_tiling;
 pub mod tensor;
 pub mod text_encoder;
 pub mod tier;
+pub mod training;
 pub mod vae;
 pub mod vae_encoder;
 pub mod veda;
 
 pub use adapters::{
-    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, classify_unmatched_target,
-    convert_comfyui_key_space, is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha,
-    resolve_rank, AdaLnSurface, MiniMaxH3LoraReport, UnmatchedTargetClass, BLOCK_TARGETS,
-    DEFAULT_LORA_ALPHA,
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters,
+    apply_minimax_h3_image_adapters, classify_unmatched_target, convert_comfyui_key_space,
+    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank, AbsentLoraAlpha,
+    AdaLnSurface, MiniMaxH3LoraReport, UnmatchedTargetClass, BLOCK_TARGETS, DEFAULT_LORA_ALPHA,
 };
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
@@ -167,6 +174,7 @@ pub use audio_vae_encoder::{
     DacEncoder, EncoderBlock, MiniMaxH3AudioVaeEncoder, ResidualUnit, WnConv1d, ATTN_PROJ_HEADS,
     LAYER_NORM_EPS, MLP_RATIO,
 };
+pub use block_stream::RequestGuard as StreamedRequestScope;
 pub use blocks::{blend, TransformerBlock};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use conditioning::{
@@ -176,11 +184,12 @@ pub use conditioning::{
     KEYFRAME_NOISE_AUG_T,
 };
 pub use config::{
-    MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
-    DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA,
+    DecoderLayout, MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS,
+    DECODER_NUM_LAYERS, DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA,
     ENCODER_BLOCK_OUT_CHANNELS, ENCODER_IN_CHANNELS, ENCODER_LAYERS_PER_BLOCK, ENCODER_NORM_EPS,
     ENCODER_NORM_NUM_GROUPS, ENCODER_SPATIAL_DOWNSAMPLE_FACTORS,
-    ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS, LATENTS_MEAN, LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP,
+    ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS, IMAGE_DECODER_NUM_HEADS, IMAGE_DECODER_NUM_LAYERS,
+    IMAGE_DECODER_ROPE_DIM_RATIO, LATENTS_MEAN, LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP,
     VAE_RATIO, VAE_RATIO_T,
 };
 pub use decoder::ViT3dDecoder;
@@ -193,6 +202,16 @@ pub use dit::{
     release_device_memory, AdaLnCache, AdaLnResidency, DitBlock, JointDit, KeyframeAnchor,
     MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, ReferenceLatentGeometry, TimestepSchedule,
     TokenRefiner, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
+};
+pub use image_model::{
+    image_descriptor, MiniMaxH3Image, IMAGE_DIT_PARTITION, IMAGE_MODEL_ID, IMAGE_REGISTRATION,
+};
+pub use image_pipeline::{
+    reference_condition_rows, reference_vae_pixels, resize_reference, ImageLayout, ImageVelocity,
+};
+pub use image_vae::{
+    bounded_decode_parameters as image_bounded_decode_parameters, MiniMaxH3ImageVae,
+    MiniMaxH3ImageVaeEncoder, IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT,
 };
 pub use keyframe::{
     anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,
@@ -222,7 +241,7 @@ pub use reference::{
     MAX_TOTAL_REFERENCES, MAX_VIDEO_REFERENCES, REFERENCE_IMAGE_SHORT_EDGE, VIDEO_SAMPLE_FPS,
     VISION_TEMPORAL_PATCH,
 };
-pub use rope::{create_token_ids, Rope3d, RopeTables};
+pub use rope::{create_token_ids, create_token_ids_2d, Rope3d, RopeTables};
 pub use text_encoder::{
     encode_grounded, encode_grounded_from_vision, lm_prefixes, load_vision_tower,
     minimax_h3_vision_config, run_vision, GroundedVision, MiniMaxH3TeConfig, MiniMaxH3TextEncoder,
@@ -277,7 +296,12 @@ pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry.register_generator(model::REGISTRATION);
+    let registry = registry
+        .register_generator(model::REGISTRATION)
+        // SW-7091: MiniMax-H3-Image text-to-image, its own engine id and image descriptor.
+        .register_generator(image_model::IMAGE_REGISTRATION)
+        // SW-7098: the MiniMax-H3-Image LoRA/LoKr trainer, at the generator's id.
+        .register_trainer(training::TRAINER_REGISTRATION);
     // The fleet shape (see candle-gen-flux): the memory route rides `register_providers` only on
     // the build that can execute it; every other platform appends the same weights-free surfaces
     // through `register_memory_contract_surfaces` from the catalog, and registering both would be
@@ -295,6 +319,9 @@ pub fn register_memory_contract_surfaces(
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_strategy(image_memory_strategy::IMAGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(image_memory_strategy::IMAGE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(image_memory_strategy::IMAGE_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle MiniMax-H3 provider catalog.

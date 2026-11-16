@@ -514,6 +514,7 @@ impl SvdUnet {
     ) -> Result<Tensor> {
         let (b, f, in_ch, h, w) = sample.dims5()?;
         let device = sample.device();
+        candle_gen::execution::runtime(device, self.dtype);
         let sample = sample.to_dtype(self.dtype)?;
         let image_embeds = image_embeds.to_dtype(self.dtype)?;
 

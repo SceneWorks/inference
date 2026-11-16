@@ -158,7 +158,7 @@ pub(crate) fn seeded_noise(
     dtype: DType,
 ) -> Result<Tensor> {
     let n = channels * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("flux/flux1_load", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(noise, (1, channels, lat_h, lat_w), &Device::Cpu)?
         .to_device(device)?

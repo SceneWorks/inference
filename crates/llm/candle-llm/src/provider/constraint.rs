@@ -6,6 +6,7 @@ use super::*;
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
 pub(super) struct JsonMask<'a> {
     inner: JsonConstraint<'a>,
+    constraint: Constraint,
     table: &'a ConstraintDecodeTable,
     stop_ids: Vec<u32>,
     accepted: Vec<i32>,
@@ -16,14 +17,26 @@ pub(super) struct JsonMask<'a> {
 }
 
 impl<'a> JsonMask<'a> {
+    #[cfg(test)]
     pub(super) fn new(
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+        reasoning: bool,
+    ) -> Self {
+        Self::for_constraint(&Constraint::Json, table, stop_ids, reasoning)
+    }
+
+    /// Enforce `constraint` (any [`Constraint`] kind) once the reasoning block, if open, closes.
+    pub(super) fn for_constraint(
+        constraint: &Constraint,
         table: &'a ConstraintDecodeTable,
         stop_ids: impl IntoIterator<Item = u32>,
         reasoning: bool,
     ) -> Self {
         let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
         Self {
-            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            inner: JsonConstraint::for_constraint(constraint, table, stop_ids.iter().copied()),
+            constraint: constraint.clone(),
             table,
             stop_ids,
             accepted: Vec::new(),
@@ -96,7 +109,11 @@ impl RewindableConstraintMask for JsonMask<'_> {
 
     fn rewind(&mut self, checkpoint: usize) {
         self.accepted.truncate(checkpoint);
-        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        self.inner = JsonConstraint::for_constraint(
+            &self.constraint,
+            self.table,
+            self.stop_ids.iter().copied(),
+        );
         self.reasoning_tail.clear();
         self.reasoning = self.initial_reasoning;
         // Replay committed tokens to restore both the reasoning phase and JSON grammar.

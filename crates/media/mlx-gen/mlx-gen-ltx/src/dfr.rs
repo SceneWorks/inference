@@ -509,6 +509,7 @@ pub fn denoise_dfr_tile(
     // anchors, the replace-latent state pins the image frames instead of re-noising them (the
     // reference's per-tile image conditionings + the stage noiser).
     let key = mlx_rs::random::key(job.noise_seed)?;
+    mlx_gen::video_execution::draw(0, "ltx_dfr_tile_entry", job.noise_seed);
     let noise = mlx_rs::random::normal::<f32>(sh, None, None, Some(&key))?
         .as_dtype(job.tile_video.dtype())?;
     let mut state = if job.image_keyframes.is_empty() {
@@ -608,6 +609,7 @@ pub fn noise_slot_tokens(state: &VideoTokenState, sigma: f32, seed: u64) -> Resu
     };
     let dt = state.latent.dtype();
     let key = mlx_rs::random::key(seed)?;
+    mlx_gen::video_execution::draw(0, "ltx_dfr_slot_noise", seed);
     let noise = mlx_rs::random::normal::<f32>(state.latent.shape(), None, None, Some(&key))?
         .as_dtype(dt)?;
     let sigma = Array::from_slice(&[sigma], &[1]).as_dtype(dt)?;

@@ -131,6 +131,10 @@ impl Wan14b {
         };
         let mut w = Weights::from_file(self.root.join(file))?;
         let prequantized = cfg.quantization.is_some();
+        mlx_gen::video_execution::policy(
+            "wan_expert_weight_tier",
+            serde_json::json!({"stored":format!("{:?}",cfg.quantization),"applied":format!("{:?}",self.quant)}),
+        );
         let has_adapters = !self.adapters.is_empty();
         // DENSE bf16 snapshot: FOLD this expert's LoRA/LoKr into the weights BEFORE building (fold,
         // then `spec.quantize` may quantize the merged weight) — mirrors `merge_adapters`, per expert.
@@ -195,6 +199,17 @@ impl Wan14b {
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
         let mut sched = make_scheduler(kind, num_train_timesteps);
         sched.set_timesteps(steps, shift);
+        mlx_gen::video_execution::sampling(
+            "wan_moe_swapped",
+            &format!("{kind:?}"),
+            "flow_velocity",
+            serde_json::json!({"low_guidance_bits":low_gs.to_bits(),"high_guidance_bits":high_gs.to_bits(),"boundary_bits":boundary_timestep.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("wan_moe_swapped", sched.sigmas());
+        mlx_gen::video_execution::policy(
+            "wan_moe_residency",
+            serde_json::json!({"expert_swap":true}),
+        );
         let timesteps: Vec<f32> = sched.timesteps().to_vec();
         // High runs `0..k` (`t ≥ boundary`), low runs `k..steps` — the single high→low crossing.
         let k = crossing_index(&timesteps, boundary_timestep);

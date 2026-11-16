@@ -14,6 +14,15 @@ use candle_core::{DType, Device, Tensor};
 use crate::error::{Error, Result};
 use crate::primitives::quant::ggml_block_storage;
 
+/// Whether `name` is part of a ModelOpt NVFP4 projection triple (SW-7099) that
+/// [`Weights::from_dir`] keeps on the host: a companion scale ([`core_llm::modelopt::is_companion`])
+/// or a rank-2 U8 `.weight` (packed E2M1 codes — a dense projection is never U8, and a stored GGML
+/// block tensor is rank 3).
+pub(crate) fn modelopt_host_tensor(name: &str, is_u8: bool, shape: &[usize]) -> bool {
+    core_llm::modelopt::is_companion(name)
+        || (is_u8 && shape.len() == 2 && name.ends_with(".weight"))
+}
+
 /// A loaded set of named weight tensors, plus the device they live on.
 #[derive(Debug)]
 pub struct Weights {
@@ -44,6 +53,18 @@ impl Weights {
         })
     }
 
+    /// Load one shard onto the host with [`Weights::from_dir`]'s placement rules — a ModelOpt
+    /// NVFP4 triple as raw bytes (E4M3 scales as U8 codes). The ModelOpt converter reads shards
+    /// through this (SW-7099).
+    pub fn from_file_host_raw(path: impl AsRef<Path>) -> Result<Self> {
+        let mut tensors = HashMap::new();
+        load_shard_into(path.as_ref(), &Device::Cpu, &mut tensors)?;
+        Ok(Self {
+            tensors,
+            device: Device::Cpu,
+        })
+    }
+
     /// Load and merge every `*.safetensors` shard in a snapshot directory onto `device`.
     ///
     /// A prepared tier's stored GGML block tensors (sc-19375: `U8` `[.., rows, blocks,
@@ -68,20 +89,7 @@ impl Weights {
         let __input_paths = shards.clone(); // deterministic merge order
         let mut tensors = HashMap::new();
         for shard in shards {
-            let read = |e: candle_core::Error| {
-                Error::Msg(format!("load_safetensors {}: {e}", shard.display()))
-            };
-            // `candle_core::safetensors::load`, but choosing each tensor's device.
-            let data = std::fs::read(&shard)?;
-            let file = SliceSafetensors::new(&data).map_err(read)?;
-            for (name, view) in file.tensors() {
-                let is_u8 = DType::try_from(view.dtype()).is_ok_and(|d| d == DType::U8);
-                let target = match ggml_block_storage(is_u8, view.shape()) {
-                    Some(_) => &Device::Cpu,
-                    None => device,
-                };
-                tensors.insert(name, view.load(target).map_err(read)?);
-            }
+            load_shard_into(&shard, device, &mut tensors)?;
         }
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
@@ -184,6 +192,43 @@ impl Weights {
     pub fn into_map(self) -> HashMap<String, Tensor> {
         self.tensors
     }
+}
+
+/// Read one safetensors shard into `tensors`: each tensor onto `device`, except a stored GGML
+/// block tensor and a ModelOpt NVFP4 triple, which stay on the host (see [`Weights::from_dir`]).
+fn load_shard_into(
+    shard: &Path,
+    device: &Device,
+    tensors: &mut HashMap<String, Tensor>,
+) -> Result<()> {
+    let read =
+        |e: candle_core::Error| Error::Msg(format!("load_safetensors {}: {e}", shard.display()));
+    // `candle_core::safetensors::load`, but choosing each tensor's device.
+    let data = std::fs::read(shard)?;
+    let file = SliceSafetensors::new(&data).map_err(read)?;
+    for (name, view) in file.tensors() {
+        let is_u8 = DType::try_from(view.dtype()).is_ok_and(|d| d == DType::U8);
+        // A ModelOpt NVFP4 triple (SW-7099) stays on the host as raw bytes: the loader
+        // re-tiles it into the resident NVFP4 operand (`crate::modelopt`), so a device
+        // copy would only be a second residency. The E4M3 block scales are kept as their
+        // U8 codes — they are byte-level scale codes, never values to convert.
+        if modelopt_host_tensor(&name, is_u8, view.shape()) {
+            let dtype = match DType::try_from(view.dtype()).map_err(read)? {
+                DType::F8E4M3 => DType::U8,
+                other => other,
+            };
+            let tensor = Tensor::from_raw_buffer(view.data(), dtype, view.shape(), &Device::Cpu)
+                .map_err(read)?;
+            tensors.insert(name, tensor);
+            continue;
+        }
+        let target = match ggml_block_storage(is_u8, view.shape()) {
+            Some(_) => &Device::Cpu,
+            None => device,
+        };
+        tensors.insert(name, view.load(target).map_err(read)?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

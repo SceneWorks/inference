@@ -697,6 +697,10 @@ impl SvdVae {
             f as i32,
         )?;
 
+        candle_gen::execution::policy(
+            "svd_decode_chunk",
+            serde_json::json!({"frames": f, "plan": format!("{cfg:?}")}),
+        );
         let mut decode_tile = |tile: &Tensor| -> CResult<Tensor> {
             check_cancel(cancel)?;
             on_progress(Progress::Decoding);

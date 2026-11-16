@@ -1952,7 +1952,15 @@ impl LlamaProvider {
             moe_tables = decoder.moe_indexed_table_bytes();
             hidden_steps |=
                 matches!(&decoder, PricedDecoder::Qwen35(cfg, _) if cfg.mtp_num_hidden_layers > 0);
-            let format = decoder.format(requested);
+            // A ModelOpt NVFP4 snapshot's own format is NVFP4 (SW-7099), as `load_dir` loads it.
+            let modelopt = config
+                .as_ref()
+                .is_some_and(|c| matches!(core_llm::modelopt::modelopt_nvfp4(c), Ok(Some(_))));
+            let format = if modelopt {
+                requested.or(Some(CopyFormat::Nvfp4))
+            } else {
+                decoder.format(requested)
+            };
             let builds = matches!(
                 decoder,
                 PricedDecoder::Causal(_) | PricedDecoder::Qwen35(..)
@@ -1968,7 +1976,9 @@ impl LlamaProvider {
                 let (cast, held) = if cuda {
                     (
                         snapshot_cast_copy_bytes(&tensors, &consumed).ok_or_else(overflow)?,
-                        stored_block_bytes(&tensors).ok_or_else(overflow)?,
+                        stored_block_bytes(&tensors)
+                            .and_then(|b| b.checked_add(modelopt_host_bytes(&tensors)?))
+                            .ok_or_else(overflow)?,
                     )
                 } else {
                     (0, 0)
@@ -2045,6 +2055,37 @@ impl LlamaProvider {
         } else {
             Architecture::from_config(&cfg_value).map_err(|e| to_core(e.into()))?
         };
+        // A ModelOpt NVFP4 snapshot (SW-7099) is executed only as published: its own format is
+        // NVFP4, so the device must serve NVFP4 — settled here, before any weight is read.
+        let modelopt_format = if core_llm::modelopt::modelopt_nvfp4(&cfg_value)
+            .map_err(CoreError::Unsupported)?
+            .is_some()
+        {
+            if arch != Architecture::Qwen35 {
+                return Err(CoreError::Unsupported(format!(
+                    "nvfp4: ModelOpt NVFP4 checkpoints are read for the qwen3_5 decoder only, \
+                     not `{}`",
+                    arch.family()
+                )));
+            }
+            match requested {
+                Some(format) if format.is_nvfp4() => Some(format.clone()),
+                Some(other) => {
+                    return Err(CoreError::Unsupported(format!(
+                        "{} (requested {other:?})",
+                        core_llm::modelopt::dense_runtime_refusal("a non-NVFP4 Candle load")
+                    )))
+                }
+                None => Some(ProjectionFormat::nvfp4(device).map_err(|why| {
+                    CoreError::Unsupported(format!(
+                        "{} ({why})",
+                        core_llm::modelopt::dense_runtime_refusal("this device")
+                    ))
+                })?),
+            }
+        } else {
+            None
+        };
         let (weights, prism) = if is_prism {
             let checkpoint =
                 crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
@@ -2069,6 +2110,7 @@ impl LlamaProvider {
             // A bare persisted block (a tier prepared before sc-19375, dense-rounded weights) is
             // not honoured here, so such a tier keeps loading dense exactly as it did.
             let format = match (prism.is_some(), requested) {
+                _ if modelopt_format.is_some() => modelopt_format.clone(),
                 (false, None) => {
                     crate::prepare::persisted_ggml_blocks(&cfg_value).map(ProjectionFormat::from)
                 }

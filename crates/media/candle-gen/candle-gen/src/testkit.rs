@@ -1618,3 +1618,34 @@ mod semantic_variant_tests {
         );
     }
 }
+
+/// Capture only execution policy metadata for portable provider-boundary tests.
+/// This injects fixture facts and never allocates tensors or runs a sampler/model.
+pub fn execution_policy(body: impl FnOnce()) -> crate::gen_core::generator::ExecutionIdentity {
+    use crate::gen_core::{Capabilities, Modality, ModelDescriptor};
+    let descriptor = ModelDescriptor {
+        id: "policy-fixture",
+        family: "fixture",
+        backend: "candle",
+        modality: Modality::Image,
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
+        control_kinds: None,
+        required_components: &[],
+        capabilities: Capabilities::default(),
+    };
+    let attempt = crate::execution::Attempt::begin();
+    body();
+    crate::execution::draw("fixture", 1, 0);
+    crate::execution::rng_scheme("fixture-metadata-v1");
+    crate::execution::schedule("fixture", &[1.0, 0.0], "fixture");
+    crate::execution::runtime(&Device::Cpu, DType::F32);
+    attempt.finish_image(
+        &descriptor,
+        &crate::gen_core::GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        }]),
+    )
+}

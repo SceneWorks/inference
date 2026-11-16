@@ -848,8 +848,12 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
     );
 
     let af = candle_gen::train::merge::read_adapter(&comfy_path).expect("read back");
-    let converted =
-        convert_comfyui_key_space(&af.tensors, &af.meta).expect("the ComfyUI conversion");
+    let converted = convert_comfyui_key_space(
+        &af.tensors,
+        &af.meta,
+        candle_gen_minimax_h3::adapters::AbsentLoraAlpha::H3_VIDEO,
+    )
+    .expect("the ComfyUI conversion");
     assert!(
         !is_comfyui_key_space(converted.keys().map(String::as_str)),
         "the conversion must leave no ComfyUI module behind"

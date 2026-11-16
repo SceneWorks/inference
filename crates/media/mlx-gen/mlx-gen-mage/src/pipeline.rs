@@ -271,6 +271,18 @@ pub(crate) fn denoise_generation_phase(
                 });
             },
         )?;
+        mlx_gen::image_execution::policy_debug("mage.memory", &memory);
+        mlx_gen::image_execution::scalar("mage.cfg", cfg);
+        for sample in pack_samples {
+            mlx_gen::image_execution::sampled_native_with_rng(
+                "mage-euler-v1",
+                "noise-fraction",
+                tokens.dtype(),
+                &sigmas,
+                sample.seed as u64,
+                "mage-gaussian-shading-v1;seed=wrapping-i64;gs-key=provider-resolved",
+            );
+        }
         let boundaries = encoded
             .pack
             .grids
@@ -473,6 +485,10 @@ pub(crate) fn denoise_edit_phase(
             total: steps as u32,
         });
     }
+    mlx_gen::image_execution::policy_debug("mage.memory", &memory);
+    mlx_gen::image_execution::scalar("mage.cfg", cfg);
+    mlx_gen::image_execution::sampled_native_with_rng("mage-edit-euler-v1", "noise-fraction", target.dtype(), &sigmas, seed as u64,
+        "mage-gaussian-shading-v1;seed=wrapping-i64;reference-vae-posterior=seed;gs-key=provider-resolved");
     Ok(DenoisedEdit {
         target,
         reference_tokens,
@@ -1460,6 +1476,7 @@ fn initial_tokens_for_grid(
     key: &GsKey,
     dtype: Dtype,
 ) -> Result<Array> {
+    mlx_gen::image_execution::policy_debug("mage.resolved_gs_key", key);
     encode_noise(
         (LATENT_CHANNELS as usize, gh as usize, gw as usize),
         key,

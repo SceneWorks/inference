@@ -90,12 +90,17 @@ impl KeyframeNoise {
                 let base = KEYFRAME_ENCODE_SEED.wrapping_add((index as u64).wrapping_mul(2));
                 let k0 = mlx_rs::random::key(base)?;
                 let k1 = mlx_rs::random::key(base.wrapping_add(1))?;
+                mlx_gen::video_execution::draw(0, "h3_keyframe_posterior", base);
+                mlx_gen::video_execution::draw(0, "h3_keyframe_augmentation", base.wrapping_add(1));
                 Ok((
                     mlx_rs::random::normal::<f32>(shape, None, None, Some(&k0))?,
                     mlx_rs::random::normal::<f32>(shape, None, None, Some(&k1))?,
                 ))
             }
             Self::Provided(pair) => {
+                mlx_gen::video_execution::unavailable(
+                    "h3 provided keyframe noise bytes have no digest",
+                );
                 let (posterior, aug) = pair.as_ref();
                 for (what, t) in [("posterior", posterior), ("augmentation", aug)] {
                     if t.shape() != shape {

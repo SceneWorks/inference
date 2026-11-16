@@ -433,6 +433,33 @@ impl IpAdapterFlux {
         })
     }
 
+    /// [`generate_planned`](Self::generate_planned), completed as a standalone route with
+    /// observations from this same attempt.
+    pub fn generate_planned_with_execution_report(
+        &self,
+        req: &IpAdapterFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(
+            &crate::descriptor_for(self.variant),
+            &req.cancel,
+            || {
+                candle_gen::execution::policy(
+                    "direct_route",
+                    "flux/ip_provider/generate_planned".into(),
+                );
+                let image = self
+                    .generate_planned(req, reference, plan, &mut report_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     /// Reference-image T2I from the trajectory [`compile_ip_plan`] froze before load: condition the
     /// FLUX generation on `reference`'s CLIP-ViT-L identity tokens at `req.ip_adapter_scale` (a single
     /// distilled forward per step — no true-CFG).
@@ -554,6 +581,7 @@ impl IpAdapterFlux {
         // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
+        self.variant.resolved_guidance(Some(req.guidance));
         let images = run.images_with_denoise_phases(
             on_progress,
             |seed| {

@@ -77,6 +77,42 @@ impl TextLlm for LlamaProvider {
         })
     }
 
+    fn plan_execution(
+        &self,
+        _request: &core_llm::TextLlmRequest,
+    ) -> core_llm::Result<core_llm::ExecutionIdentity> {
+        Ok(core_llm::token_execution::unavailable(
+            "token_runtime_plan_unavailable",
+            "Sampler fallback, prefix reuse and adaptive decode are observed only during execution",
+            "completed_decode_path",
+        ))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        request: &core_llm::TextLlmRequest,
+        events: &mut dyn FnMut(core_llm::StreamEvent),
+    ) -> core_llm::Result<core_llm::CompletedTextLlm> {
+        let scope = core_llm::token_execution::TokenExecutionScope::new();
+        if let (Some(requested), Some(_)) =
+            (self.load_record.requested, self.load_record.census.as_ref())
+        {
+            let report = self.load_record.report();
+            scope.observe_numeric_policy(serde_json::json!({
+                "requested_quantization": format!("{requested:?}"),
+                "resident_projections": format!("{:?}", report.projections),
+                "device": format!("{:?}", self.model.device()),
+            }));
+        }
+        let output = self.generate(request, &mut |event| {
+            core_llm::token_execution::without_observations(|| events(event))
+        })?;
+        if request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
+        scope.finish_text(output, self.descriptor())
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,
@@ -372,12 +408,13 @@ impl TextLlm for LlamaProvider {
         // Structured-output constraint: build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
             self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
-        let mut json_mask = match req.constraint {
-            Some(Constraint::Json) => {
+        let mut json_mask = match &req.constraint {
+            Some(constraint) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask::new(
+                Some(JsonMask::for_constraint(
+                    constraint,
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
                     constraint_starts_in_reasoning,

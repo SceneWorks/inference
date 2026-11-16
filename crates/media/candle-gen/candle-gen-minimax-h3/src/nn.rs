@@ -22,6 +22,20 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
     Ok((x * sigmoid(x)?)?)
 }
 
+/// SiLU computed in float32 and rounded **once** to `x`'s dtype — PyTorch's bf16 `F.silu`
+/// numerics, which the DiT's SwiGLU (`hidden_states * F.silu(gate)`) reproduces (SW-7092).
+///
+/// [`silu`] rounds `sigmoid` to the input dtype and then rounds the product again. Each float32
+/// temporary is dropped as soon as its consumer has run, so the peak over the bf16 [`silu`] is
+/// 4 bytes per element (the widened input and the float32 result coexist; the bf16 path held a
+/// bf16 sigmoid and product). At float32 both casts are identities.
+pub fn silu_f32_rounded(x: &Tensor) -> Result<Tensor> {
+    let wide = x.to_dtype(DType::F32)?;
+    let activated = wide.silu()?;
+    drop(wide);
+    Ok(activated.to_dtype(x.dtype())?)
+}
+
 /// `y = x · Wᵀ` for a stored `[out, in]` weight, no bias, over the **last** axis of `x` (any
 /// leading dims).
 ///
@@ -103,12 +117,13 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
 /// * **CUDA + `flash-attn` build + bf16/f16** — the fused FlashAttention-2 kernel
 ///   ([`candle_gen::sdpa_dispatch_bhsd`]). No `[B, H, Sq, Sk]` scores tensor exists, so the i32
 ///   hazard below does not arise; the cancel flag is checked once per call (one call = one layer).
-/// * **everything else** (CPU, Metal, a non-flash build, f32) — the shared i32-overflow-safe
-///   budgeted helper (sc-9116) with the fused `softmax_last_dim`, now the **cancel-aware**
-///   `sdpa_planned_bhsd`: with `cancel` attached a tripped flag stops the next query-chunk launch
-///   and surfaces as [`CandleError::Canceled`](candle_gen::CandleError::Canceled). On CUDA that
-///   check runs at enqueue time; the DiT's per-layer synchronize (`dit::model`) is what keeps the
-///   host from queueing more than one layer ahead of the device.
+/// * **everything else** (CPU, Metal, a non-flash build, f32) — the materialized, query-chunked
+///   fallback (`sdpa_materialized`) under the shared i32-overflow-safe budget (sc-9116): with
+///   `cancel` attached a tripped flag stops the next query-chunk launch and surfaces as
+///   [`CandleError::Canceled`](candle_gen::CandleError::Canceled). On CUDA that check runs at
+///   enqueue time; the DiT's per-layer synchronize (`dit::model`) is what keeps the host from
+///   queueing more than one layer ahead of the device. For bf16/f16 operands it computes the
+///   scores and the softmax in **f32**, as the fused kernel and MLX's fused SDPA do (SW-7091).
 ///
 /// The budget matters on the fallback even at modest geometries: a real decode carries `T·H·W + 5`
 /// tokens for a 16×-downsampled canvas, and that path materializes `[B, H, block, Sk]`.
@@ -123,6 +138,9 @@ pub fn sdpa_planned(
     let (b, h, sq, _) = q.dims4()?;
     let sk = k.dim(2)?;
     let (query_rows, score_elements) = materializing_chunk_shape(b, h, sq, sk, plan.budget)?;
+    if differentiable_attention() {
+        return differentiable_sdpa(q, k, v, scale, plan);
+    }
     let force_materialized = force_materialized_attention();
     let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
     let materialized =
@@ -139,16 +157,8 @@ pub fn sdpa_planned(
         score_elements = plan.budget.max_score_elements(),
         "minimax-h3: attention route"
     );
-    let out = if force_materialized {
-        candle_gen::attention::sdpa_planned_bhsd(
-            q,
-            k,
-            v,
-            scale,
-            None,
-            candle_gen::candle_nn::ops::softmax_last_dim,
-            plan,
-        )
+    let out = if materialized {
+        sdpa_materialized(q, k, v, scale, plan)
     } else {
         candle_gen::sdpa_dispatch_bhsd(
             q,
@@ -166,6 +176,75 @@ pub fn sdpa_planned(
         if materialized { score_elements } else { 0 },
     )?;
     Ok(out)
+}
+
+/// The materialized, query-chunked attention fallback over `[B, H, S, D]` (any strides).
+///
+/// **f32** operands take the shared `sdpa_planned_bhsd` verbatim. **bf16/f16** operands keep the
+/// scores, the `scale` and the softmax in f32 and round only the probabilities to the value dtype
+/// for `probs · v` — the FlashAttention-2 kernel's numerics (f32 `S`, f32 softmax, half `P`, f32
+/// GEMM accumulation), so both CUDA routes share them. MLX's fused SDPA likewise never rounds the
+/// scores (SW-7091).
+///
+/// The half-dtype score path this replaces rounded `q·kᵀ` to bf16, rounded again on `· scale`, and
+/// softmaxed those: bf16 keeps 8 mantissa bits, so a logit of 16 carries an absolute error up to
+/// 1/16, a ~6% error in its probability, on every key of every layer. The CUDA DiT gate (built
+/// without `flash-attn`, so on this route) measured a step-3 block-49 residual error of rel-L2
+/// 2.0e-1 against the float32 diffusers reference of the published MiniMax-H3-Image DiT, twice
+/// MLX's 9.9e-2 on the same inputs, with the two backends level through block 24.
+///
+/// Memory: `kᵀ` is held once at f32 (twice its half-dtype copy) and each query chunk is upcast on
+/// its own; per score element at most 8 bytes are live (f32 scores + f32 probabilities, then f32 +
+/// half probabilities), inside the 16 bytes per score `h3_memory::window` prices for this route.
+fn sdpa_materialized(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: AttentionPlan<'_>,
+) -> Result<Tensor> {
+    use candle_gen::candle_nn::ops::softmax_last_dim;
+    if q.dtype() == DType::F32 {
+        return candle_gen::attention::sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            softmax_last_dim,
+            plan,
+        );
+    }
+    let (b, h, sq, _) = q.dims4()?;
+    let sk = k.dim(2)?;
+    // A cast writes a contiguous tensor, so the f32 `kᵀ` and each f32 query chunk are their own
+    // GEMM operands with no separate `contiguous` copy.
+    let k_t = k.transpose(2, 3)?.to_dtype(DType::F32)?;
+    let v = v.contiguous()?;
+    let attend = |start: usize, len: usize| -> Result<Tensor> {
+        let probs = {
+            let q = q.narrow(2, start, len)?.to_dtype(DType::F32)?;
+            let scores = (q.matmul(&k_t)? * scale)?;
+            softmax_last_dim(&scores)?
+        };
+        Ok(probs.to_dtype(v.dtype())?.matmul(&v)?)
+    };
+    let block = plan.budget.query_block_rows((b * h * sk) as u64, sq as u64) as usize;
+    if block >= sq {
+        // One pass, like the shared helper's unbounded fast path: no per-chunk cancel check.
+        return attend(0, sq);
+    }
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    while start < sq {
+        if plan.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let len = block.min(sq - start);
+        blocks.push(attend(start, len)?);
+        start += len;
+    }
+    Ok(Tensor::cat(&blocks, 2)?)
 }
 
 /// Masked TE attention always uses the shared materializing plan. Record its actual largest
@@ -288,6 +367,82 @@ pub fn attention_execution_report() -> AttentionExecutionReport {
     ATTENTION_EXECUTION.with(|r| *r.borrow())
 }
 
+thread_local! {
+    static DIFFERENTIABLE_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COMPOSABLE_TRAINING_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Inside [`with_differentiable_attention`], take the unbounded composable softmax attention
+/// instead of the bounded owner — the reference the real-weights gate compares the owner's
+/// backward with, block by block (SW-7098). Test-only.
+#[cfg(test)]
+pub(crate) fn with_composable_training_attention<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPOSABLE_TRAINING_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(COMPOSABLE_TRAINING_ATTENTION.replace(true));
+    f()
+}
+
+/// Run `f` with every DiT attention on this thread differentiable and bounded by design
+/// (SW-7098): [`differentiable_sdpa`]. The fused FlashAttention kernel and `softmax_last_dim` have
+/// no backward. The previous setting is restored on exit, panics included.
+pub(crate) fn with_differentiable_attention<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIFFERENTIABLE_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(DIFFERENTIABLE_ATTENTION.replace(true));
+    f()
+}
+
+fn differentiable_attention() -> bool {
+    DIFFERENTIABLE_ATTENTION.get()
+}
+
+/// The training attention: the shared standard-softmax training SDPA
+/// ([`candle_gen::fused_attention::training_sdpa_standard_bhsd`]), whose reference owner keeps only
+/// q / k / v and the output in the graph and recomputes the probabilities per query tile in the
+/// backward, so no call ever holds more than
+/// [`candle_gen::fused_attention::TRAINING_SCORE_TILE_ELEMENTS`] scores and no block retains its
+/// `[heads, S, S]` scores. The operands are taken to float32 first, so the scores and the softmax
+/// stay in float32 as on the render's materialized route ([`sdpa_materialized`]).
+fn differentiable_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: AttentionPlan<'_>,
+) -> Result<Tensor> {
+    let dtype = q.dtype();
+    if COMPOSABLE_TRAINING_ATTENTION.get() {
+        let out = candle_gen::attention::sdpa_planned_bhsd(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            &v.to_dtype(DType::F32)?,
+            scale,
+            None,
+            |s| candle_gen::candle_nn::ops::softmax(s, D::Minus1),
+            plan,
+        )?;
+        return Ok(out.to_dtype(dtype)?);
+    }
+    let out = candle_gen::fused_attention::training_sdpa_standard_bhsd(
+        &q.to_dtype(DType::F32)?,
+        &k.to_dtype(DType::F32)?,
+        &v.to_dtype(DType::F32)?,
+        scale,
+        None,
+        plan,
+    )?;
+    Ok(out.to_dtype(dtype)?)
+}
+
 fn force_materialized_attention() -> bool {
     #[cfg(any(test, feature = "model-inference-proof"))]
     {
@@ -400,6 +555,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(flat(&got), flat(&want));
+    }
+
+    /// SW-7091: half-dtype attention keeps its scores and softmax in f32. The CPU backend has no
+    /// bf16 GEMM, so this runs f16 with logits large enough that an f16 score's rounding step
+    /// moves the softmax: the old half-score route lands far from the f32
+    /// computation over the same rounded operands, while this route stays at the half
+    /// probabilities' own rounding — single-pass and query-chunked alike.
+    #[test]
+    fn half_attention_computes_its_scores_in_f32() {
+        let dev = Device::Cpu;
+        let bhsd = |seed: f64, gain: f64| {
+            Tensor::arange(0f32, 2.0 * 9.0 * 16.0, &dev)
+                .unwrap()
+                .affine(0.37, seed)
+                .unwrap()
+                .sin()
+                .unwrap()
+                .affine(gain, 0.0)
+                .unwrap()
+                .reshape((1, 2, 9, 16))
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+        };
+        let (q, k, v) = (bhsd(0.1, 6.0), bhsd(0.7, 6.0), bhsd(1.3, 1.0));
+        let scale = 0.25;
+        let f32_of = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
+        let want = flat(
+            &candle_gen::candle_nn::ops::softmax_last_dim(
+                &(f32_of(&q).matmul(&f32_of(&k).t().unwrap()).unwrap() * scale).unwrap(),
+            )
+            .unwrap()
+            .matmul(&f32_of(&v))
+            .unwrap(),
+        );
+        let err = |got: &Tensor| {
+            flat(&f32_of(got))
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+        };
+        let half_scores = candle_gen::attention::sdpa_planned_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            None,
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(1 << 20, false)),
+        )
+        .unwrap();
+        let whole = sdpa_materialized(
+            &q,
+            &k,
+            &v,
+            scale,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(1 << 20, false)),
+        )
+        .unwrap();
+        // 2 heads x 9 keys = 18 elements per query row: 2-row chunks plus a one-row tail.
+        let chunked = sdpa_materialized(
+            &q,
+            &k,
+            &v,
+            scale,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(36, false)),
+        )
+        .unwrap();
+        assert_eq!(whole.dtype(), DType::F16);
+        let (old, new, chunk) = (err(&half_scores), err(&whole), err(&chunked));
+        println!("max |error|: half scores {old:.3e}, f32 scores {new:.3e}, chunked {chunk:.3e}");
+        assert!(
+            new < 2e-3 && chunk < 2e-3,
+            "f32 scores: {new:.3e} / chunked {chunk:.3e}"
+        );
+        assert!(
+            old > 4.0 * new,
+            "half scores {old:.3e} vs f32 scores {new:.3e}"
+        );
+
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(36, false))
+            .with_cancel(&cancel);
+        assert!(matches!(
+            sdpa_materialized(&q, &k, &v, scale, plan),
+            Err(candle_gen::CandleError::Canceled)
+        ));
     }
 
     fn flat(t: &Tensor) -> Vec<f32> {
@@ -523,6 +766,31 @@ mod tests {
         let y = linear(&x, &w, &b).unwrap();
         assert_eq!(y.dims(), &[1, 2, 3, 4, 7]);
         assert!((flat(&y)[0] - 5.0).abs() < 1e-6);
+    }
+
+    /// SW-7092: the SwiGLU's SiLU is the float32 SiLU rounded once to bf16 — element for element —
+    /// and that differs from the bf16 `x · sigmoid(x)` somewhere, so the change is observable.
+    #[test]
+    fn the_f32_silu_rounds_once_to_bf16() {
+        let v: Vec<f32> = (0..4096)
+            .map(|i| 12.0 * ((i as f32 * 0.618_034 + 0.3).fract() * 2.0 - 1.0))
+            .collect();
+        let x = Tensor::from_vec(v, 4096, &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let got = silu_f32_rounded(&x).unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        let want = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .silu()
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let wide = |t: &Tensor| flat(&t.to_dtype(DType::F32).unwrap());
+        assert_eq!(wide(&got), wide(&want));
+        assert_ne!(wide(&got), wide(&silu(&x).unwrap()));
     }
 
     #[test]

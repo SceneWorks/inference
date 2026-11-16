@@ -2,7 +2,36 @@
 
 use super::*;
 
+impl Ltx25 {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        // The load-time metadata checks above prove the provider is a split 2.5 route; this is the
+        // matching runtime reachability seam, where its Gemma-4, split DiT, component VAE/audio and
+        // spatial-upscaler are actually materialised and driven through the ordinary LTX pipeline.
+        let route = build_ltx25(&self.spec, Rc::clone(&self.enhancer_cache))
+            .map_err(mlx_gen::gen_core::Error::from)?;
+        debug_assert_eq!(route.transformer_variant(), self.variant);
+        route.generate(req, on_progress)
+    }
+}
+
 impl Generator for Ltx25 {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_with_report(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -38,14 +67,9 @@ impl Generator for Ltx25 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        // The load-time metadata checks above prove the provider is a split 2.5 route; this is the
-        // matching runtime reachability seam, where its Gemma-4, split DiT, component VAE/audio and
-        // spatial-upscaler are actually materialised and driven through the ordinary LTX pipeline.
-        let route = build_ltx25(&self.spec, Rc::clone(&self.enhancer_cache))
-            .map_err(mlx_gen::gen_core::Error::from)?;
-        debug_assert_eq!(route.transformer_variant(), self.variant);
-        route.generate(req, on_progress)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     fn generate_with_report(
@@ -321,7 +345,30 @@ pub(super) fn validate_request_for(
 // Hand-written rather than `impl_generator!`: SC-19109 makes the memory contract a property of the
 // loaded provider, not only a static registry row. The ordinary descriptor/validate/generate arms
 // are the same delegation the macro emitted.
+impl Ltx {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress, &mut Vec::new())
+            .map_err(Into::into)
+    }
+}
+
 impl Generator for Ltx {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_with_report(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -350,8 +397,9 @@ impl Generator for Ltx {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress, &mut Vec::new())
-            .map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     /// The render plus its non-fatal warnings (sc-27451): a best-effort 2.3 prompt enhancement that
