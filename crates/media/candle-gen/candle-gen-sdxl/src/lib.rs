@@ -277,13 +277,15 @@ fn qualified_replay_route(req: &GenerationRequest, identity: &ResolvedExecutionI
         })
         && scheme
             == "candle-ordered-provider-streams-v1:rand-0.9-StdRng-rand_distr-StandardNormal-f32"
-        && !draws.is_empty()
-        && draws.iter().all(|draw| {
-            draw.output_index == 0
-                && draw.purpose == "sdxl/pipeline"
-                && draw.seed == req.seed
-                && draw.noise_sha256.is_none()
-        })
+        && matches!(draws.as_slice(), [outer, inner]
+            if outer.output_index == 0
+                && outer.purpose == "image_initial_noise"
+                && outer.seed == req.seed
+                && outer.noise_sha256.is_none()
+                && inner.output_index == 0
+                && inner.purpose == "sdxl/pipeline"
+                && inner.seed == req.seed
+                && inner.noise_sha256.is_none())
 }
 
 pub use memory_strategy::{
@@ -1691,7 +1693,8 @@ mod tests {
                 "schedule":{"count":21,"element":"f32_le_bits","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]},
             "estimator": {"state":"resolved","value":["eps"]},
             "randomness": {"kind":"draws","scheme":"candle-ordered-provider-streams-v1:rand-0.9-StdRng-rand_distr-StandardNormal-f32",
-                "draws":[{"output_index":0,"purpose":"sdxl/pipeline","seed":16402,"noise_sha256":null}]},
+                "draws":[{"output_index":0,"purpose":"image_initial_noise","seed":16402,"noise_sha256":null},
+                         {"output_index":0,"purpose":"sdxl/pipeline","seed":16402,"noise_sha256":null}]},
             "deterministic_replay": {"kind":"non_deterministic","reason":"candle-execution-v1 observes execution choices but has no provider/runtime deterministic-kernel attestation; exact replay is not supported"},
             "geometry": {"state":"resolved","value":[{"width":1024,"height":1024,"channels":3,"format":"rgb8"}]},
             "quality_policy": {"state":"resolved","value":{"compute":[{"device":"Cuda(0)","dtype":"F16"}],"operations":{}}},
@@ -1704,6 +1707,11 @@ mod tests {
         changed.randomness = ExecutionRandomness::NoDraws {
             reason: "unobserved".into(),
         };
+        assert!(!qualified_replay_route(&request, &changed));
+        let mut changed = identity();
+        if let ExecutionRandomness::Draws { draws, .. } = &mut changed.randomness {
+            draws.swap(0, 1);
+        }
         assert!(!qualified_replay_route(&request, &changed));
         let mut changed = identity();
         changed.sampling = ExecutionFact::resolved(serde_json::json!(["euler"]));
