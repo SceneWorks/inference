@@ -682,6 +682,20 @@ pub fn run_train_loop<F: TrainLoopFamily + ?Sized>(
     if steps_run == 0 {
         return Err(Error::Canceled);
     }
+    // Keep the terminal optimizer/factors as well as the inference export. A completed
+    // run can then be forked into a longer schedule without replaying its last interval.
+    if steps_run == cfg.steps && start_step < cfg.steps && !cfg.full_finetune {
+        family.save_checkpoint(CheckpointAt {
+            output_dir: &req.output_dir,
+            stem,
+            step: steps_run,
+            update_idx,
+            accum,
+            opt: &opt,
+            params: &params,
+        })?;
+        on_progress(TrainingProgress::Checkpoint { step: steps_run });
+    }
     on_progress(TrainingProgress::Saving);
     let adapter_path = family.save_final(&params)?;
     Ok(TrainingOutput {
@@ -914,8 +928,8 @@ mod tests {
         assert_eq!(family.steps, (1..=7).collect::<Vec<_>>());
         // Updates at the window ends 3, 6 and the partial final window at 7.
         assert_eq!(family.updates, vec![0, 1, 2]);
-        // save_every = 2, never on the final step; the update index after each step.
-        assert_eq!(family.checkpoints, vec![(2, 0), (4, 1), (6, 2)]);
+        // Intermediate cadence plus the complete terminal optimizer/factors.
+        assert_eq!(family.checkpoints, vec![(2, 0), (4, 1), (6, 2), (7, 3)]);
         assert_eq!(family.previews, vec![3, 6]);
         assert_eq!(family.finals, 1);
         assert_eq!((out.steps, out.final_loss), (7, 7.0));
