@@ -543,6 +543,8 @@ impl IpAdapterFlux {
                 .to_dtype(self.dtype)?;
             candle_gen::check_cancel(&req.cancel)?;
             let tokens = self.adapter.tokens(&embeds)?;
+            // Finish the queued encoder kernels inside Conditioning.
+            self.device.synchronize()?;
             Ok::<_, CandleError>((t5, clip, tokens))
         })?;
         let injector = FluxIpInjector::new(&self.adapter, tokens, req.ip_adapter_scale as f64);

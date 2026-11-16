@@ -608,6 +608,8 @@ impl Flux1DevControl {
                 req.height,
                 &req.cancel,
             )?;
+            // Finish the queued encoder and control-latent kernels inside Conditioning.
+            self.device.synchronize()?;
             Ok::<_, CandleError>((t5, clip, heavy, control_latent))
         })?;
 

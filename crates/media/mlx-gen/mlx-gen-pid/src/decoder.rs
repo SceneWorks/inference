@@ -66,6 +66,15 @@ impl PidDecoder {
         }
     }
 
+    /// Evaluate this generation's caption embeddings now. MLX builds the Gemma caption forward
+    /// lazily when the decoder is minted; a provider calls this inside its Conditioning phase so
+    /// that text-encoder work is attributed to Conditioning instead of running inside the first
+    /// decode. Evaluating earlier computes the same values and copies nothing.
+    pub fn materialize_caption(&self) -> Result<()> {
+        self.caption_embs.eval()?;
+        Ok(())
+    }
+
     /// Bind a cooperative cancellation handle (F-006). Callers that go through
     /// [`crate::resolve_pid_decoder`] get this wired from `req.cancel` automatically; direct
     /// struct-API callers (e.g. InstantID) can opt in with their request's flag.

@@ -663,7 +663,9 @@ impl PulidFlux {
         self.backbone
             .validate_native_vae_request(req.use_pid, &req.cancel)?;
 
-        let (pulid_ca, t5_emb, clip_emb) = run.encode(|| {
+        // Identity, text and the PiD caption encode (minting the decoder runs Gemma) are all
+        // conditioning; the queued kernels finish before the phase closes.
+        let (pulid_ca, t5_emb, clip_emb, pid_decoder) = run.encode(|| {
             let id_embedding = self.compute_id_embedding_with_cancel(reference, &req.cancel)?;
             let pulid_ca = identity_stage(&req.cancel, || {
                 PulidCa::from_weights(
@@ -680,14 +682,15 @@ impl PulidFlux {
                 &req.cancel,
                 on_progress,
             )?;
-            Ok::<_, CandleError>((pulid_ca, t5_emb, clip_emb))
+            let pid_decoder = self.pid_decoder_for(req)?;
+            self.device.synchronize()?;
+            Ok::<_, CandleError>((pulid_ca, t5_emb, clip_emb, pid_decoder))
         })?;
         let heavy = self.backbone.load_heavy(&req.cancel)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
-        let pid_decoder = self.pid_decoder_for(req)?;
         let images = run.images_with_denoise_phases(
             on_progress,
             |seed| {
@@ -820,6 +823,37 @@ fn validate_request_geometry(
 
 #[cfg(test)]
 mod tests {
+    /// The identity embedding, the text encode and the PiD decoder mint (which runs the Gemma
+    /// caption encode) all happen inside `run.encode`, which synchronizes before Conditioning
+    /// closes; nothing learned runs between Conditioning and the first denoise phase. Pinned
+    /// against the shipped source; nothing executes.
+    #[test]
+    fn pulid_conditioning_work_stays_inside_the_conditioning_phase() {
+        let source = include_str!("pulid_flux.rs");
+        let shipped = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let render = &shipped[shipped
+            .find("let (pulid_ca, t5_emb, clip_emb, pid_decoder) = run.encode(|| {")
+            .unwrap()..];
+        let end = "Ok::<_, CandleError>((pulid_ca, t5_emb, clip_emb, pid_decoder))";
+        let closure = &render[..render.find(end).unwrap()];
+        let identity = closure
+            .find("self.compute_id_embedding_with_cancel(")
+            .unwrap();
+        let text = closure
+            .find("encode_text_with_memory_and_progress(")
+            .unwrap();
+        let pid = closure.find("self.pid_decoder_for(req)?").unwrap();
+        let sync = closure.find("self.device.synchronize()?;").unwrap();
+        assert!(identity < sync && text < sync && pid < sync);
+        let between = &render
+            [render.find(end).unwrap()..render.find("run.images_with_denoise_phases(").unwrap()];
+        assert!(
+            !between.contains("pid_decoder_for("),
+            "PiD mint escaped Conditioning"
+        );
+        assert_eq!(shipped.matches("self.pid_decoder_for(req)").count(), 1);
+    }
+
     use super::*;
 
     #[derive(Default)]

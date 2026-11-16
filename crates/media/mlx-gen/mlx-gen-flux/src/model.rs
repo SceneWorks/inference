@@ -9,6 +9,7 @@ use mlx_gen::{
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
     Precision, Progress, Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
+use mlx_gen_pid::decoder::PidDecoder;
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
@@ -706,6 +707,10 @@ impl Flux1 {
         // encoders, encodes the prompt, materializes, then DROPS them + `clear_cache()` before the
         // DiT/VAE load — the peak-bounding win. Under `Resident` it borrows the warm encoders and runs
         // the identical encode/denoise/decode with no eval/clear.
+        // PiD's Gemma caption encode is text conditioning too, and its engine arrives with the heavy
+        // bundle: a PiD request keeps Conditioning open across the residency handoff until the
+        // decoder (and its caption) is prepared.
+        let hold_conditioning = conditioning_started || req.use_pid;
         let result = self.residency.run_request_scoped(
             stage_residency,
             streamable,
@@ -713,7 +718,10 @@ impl Flux1 {
             req.use_pid,
             on_progress,
             |text: &FluxTextOwned| {
-                if conditioning_started {
+                if hold_conditioning {
+                    if !conditioning_started {
+                        run.begin_conditioning()?;
+                    }
                     text.encode_materialized(&req.prompt)
                 } else {
                     run.encode(|| text.encode_materialized(&req.prompt))
@@ -730,7 +738,8 @@ impl Flux1 {
             },
             |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
                 let prepared = prepare()?;
-                if conditioning_started {
+                let pid_decoder = self.conditioned_pid_decoder(run, req, heavy.pid.as_ref())?;
+                if hold_conditioning {
                     run.end_conditioning()?;
                 }
                 let injector = borrow(&prepared);
@@ -755,7 +764,7 @@ impl Flux1 {
                     run,
                     req,
                     &heavy.vae,
-                    heavy.pid.as_ref(),
+                    pid_decoder,
                     on_progress,
                     |x_in, _t, timestep, guidance| {
                         transformer.forward_injected_memory_windowed(
@@ -912,6 +921,8 @@ impl Flux1 {
         let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
+        // As in the single-branch path, a PiD request holds Conditioning through decoder preparation.
+        let hold_conditioning = conditioning_started || req.use_pid;
         let result = self.residency.run_request_scoped(
             matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
             streamable,
@@ -924,7 +935,10 @@ impl Flux1 {
                     let (neg_embeds, neg_pooled) = text.encode_materialized(neg_prompt)?;
                     Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
                 };
-                if conditioning_started {
+                if hold_conditioning {
+                    if !conditioning_started {
+                        run.begin_conditioning()?;
+                    }
                     encode_text()
                 } else {
                     run.encode(encode_text)
@@ -939,7 +953,8 @@ impl Flux1 {
             },
             |heavy, (pos_embeds, pos_pooled, neg_embeds, neg_pooled), on_progress| {
                 let prepared = prepare()?;
-                if conditioning_started {
+                let pid_decoder = self.conditioned_pid_decoder(run, req, heavy.pid.as_ref())?;
+                if hold_conditioning {
                     run.end_conditioning()?;
                 }
                 let (pos_injector, neg_injector) = borrow(&prepared);
@@ -962,7 +977,7 @@ impl Flux1 {
                     run,
                     req,
                     &heavy.vae,
-                    heavy.pid.as_ref(),
+                    pid_decoder,
                     on_progress,
                     |x_in, t, timestep, guidance| {
                         let pos = transformer.forward_injected_memory_windowed(
@@ -1016,24 +1031,43 @@ impl Flux1 {
     /// render closure passes either the warm-resident bundle or the just-loaded `Sequential` one
     /// (sc-10840). `validate` is done by the public callers before the residency seam runs, so it is
     /// not re-checked here.
+    /// Mint the request's PiD decoder (or `None` for the native VAE) and evaluate its Gemma
+    /// caption embeddings. Called inside the Conditioning phase: the caption encode is text
+    /// conditioning, not decode work.
+    fn conditioned_pid_decoder(
+        &self,
+        run: &gen_core::RenderRun<'_, '_>,
+        req: &GenerationRequest,
+        pid: Option<&PidEngine>,
+    ) -> Result<Option<PidDecoder>> {
+        let plan = run.plan();
+        let decoder = resolve_pid_decoder_at_sigma(
+            pid,
+            req,
+            plan.base_seed(),
+            self.descriptor.id,
+            plan.capture_sigma(),
+        )?;
+        if let Some(decoder) = &decoder {
+            decoder.materialize_caption()?;
+        }
+        Ok(decoder)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_denoise_with(
         &self,
         run: &gen_core::RenderRun<'_, '_>,
         req: &GenerationRequest,
         vae: &Vae,
-        pid: Option<&PidEngine>,
+        pid_decoder: Option<PidDecoder>,
         on_progress: &mut dyn FnMut(Progress),
         mut velocity_fn: impl FnMut(&Array, usize, f32, f32) -> Result<Array>,
     ) -> Result<GenerationOutput> {
         let plan = run.plan();
-        let base_seed = plan.base_seed();
-        let capture_sigma = plan.capture_sigma();
         let sampler_name = plan.sampler();
         let guidance = plan.guidance();
         let sigmas = plan.sigmas();
-        let pid_decoder =
-            resolve_pid_decoder_at_sigma(pid, req, base_seed, self.descriptor.id, capture_sigma)?;
         // Native VAE tiling is a clean-base mechanism. PiD keeps its own checked decode route and
         // never receives a native VAE tile geometry; overlay-bearing contracts leave rung 2 Missing.
         let native_tiling = match &pid_decoder {
@@ -1858,6 +1892,43 @@ mod tests {
         assert!(
             helper.contains("mlx_rs::transforms::eval([&prompt_embeds, &pooled_prompt_embeds])"),
             "encode_materialized must evaluate both embeddings before returning: {helper}"
+        );
+
+        // PiD's Gemma caption encode is text conditioning as well. The decoder is minted only by
+        // `conditioned_pid_decoder`, which evaluates the caption, and each heavy closure mints it
+        // before Conditioning closes; a PiD request holds Conditioning open across the handoff.
+        assert_eq!(model.matches("resolve_pid_decoder_at_sigma(").count(), 1);
+        let pid = &model[model.find("fn conditioned_pid_decoder(").unwrap()..];
+        let pid = &pid[..pid.find("\n    }").unwrap()];
+        assert!(
+            pid.contains("resolve_pid_decoder_at_sigma(") && pid.contains("materialize_caption()")
+        );
+        assert_eq!(
+            model
+                .matches("let hold_conditioning = conditioning_started || req.use_pid;")
+                .count(),
+            2
+        );
+        let mut closures = 0;
+        for (at, _) in
+            model.match_indices("self.conditioned_pid_decoder(run, req, heavy.pid.as_ref())?;")
+        {
+            let rest = &model[at..];
+            let close = rest
+                .find("run.end_conditioning()?;")
+                .expect("Conditioning closes after PiD");
+            let denoise = rest
+                .find("self.run_denoise_with(")
+                .expect("denoise follows");
+            assert!(
+                close < denoise,
+                "PiD decoder must be prepared before Conditioning closes"
+            );
+            closures += 1;
+        }
+        assert_eq!(
+            closures, 2,
+            "both prepared-injector heavy closures prepare PiD in Conditioning"
         );
     }
 
