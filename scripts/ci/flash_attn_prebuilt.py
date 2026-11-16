@@ -17,12 +17,13 @@ import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CRATE = ROOT / "crates/media/candle-gen/vendor/candle-flash-attn"
-LICENSES = ("LICENSE-MIT", "LICENSE-APACHE", "LICENSE-FLASH-ATTENTION", "LICENSE-CUTLASS.txt")
+NOTICES = ("LICENSE-MIT", "LICENSE-APACHE", "LICENSE-FLASH-ATTENTION", "LICENSE-CUTLASS.txt", "AUTHORS-FLASH-ATTENTION")
 
 
 def source_sha256(crate=CRATE):
     digest = hashlib.sha256()
-    for path in sorted([crate / "build.rs", crate / "Cargo.toml", *(crate / "kernels").iterdir()]):
+    for path in sorted([crate / "build.rs", crate / "Cargo.toml", *(crate / "kernels").iterdir(),
+                        *(crate / name for name in NOTICES)]):
         if not path.is_file():
             continue
         digest.update(path.relative_to(crate).as_posix().encode())
@@ -96,7 +97,7 @@ def pack(crate, directory, output, target, revision):
         info = tarfile.TarInfo("flash-attn-prebuilt.txt")
         info.size = len(data)
         bundle.addfile(info, io.BytesIO(data))
-        for name in LICENSES:
+        for name in NOTICES:
             bundle.add(crate / name, arcname=name)
     print(f"packaged {output} ({archive.stat().st_size} archive bytes)")
 

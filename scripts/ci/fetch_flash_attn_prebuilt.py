@@ -13,10 +13,10 @@ import tempfile
 import urllib.error
 import urllib.request
 
-from flash_attn_prebuilt import CRATE, LICENSES, source_sha256
+from flash_attn_prebuilt import CRATE, NOTICES, source_sha256
 
 
-NAMES = {"libflashattention.a", "flash-attn-prebuilt.txt", *LICENSES}
+NAMES = {"libflashattention.a", "flash-attn-prebuilt.txt", *NOTICES}
 
 
 def digest_file(path):

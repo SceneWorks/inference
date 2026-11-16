@@ -67,7 +67,15 @@ fn file_sha256(path: &std::path::Path) -> Result<String> {
 // Match scripts/ci/flash_attn_prebuilt.py. The source key includes every CUDA source/header,
 // the CUTLASS pin and the flags in this build script, but not checkout-specific paths.
 fn source_sha256() -> Result<String> {
-    let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml")];
+    let mut files = vec![
+        PathBuf::from("build.rs"),
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("LICENSE-MIT"),
+        PathBuf::from("LICENSE-APACHE"),
+        PathBuf::from("LICENSE-FLASH-ATTENTION"),
+        PathBuf::from("LICENSE-CUTLASS.txt"),
+        PathBuf::from("AUTHORS-FLASH-ATTENTION"),
+    ];
     for entry in fs::read_dir("kernels")? {
         let path = entry?.path();
         if path.is_file() {

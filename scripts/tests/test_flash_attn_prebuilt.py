@@ -21,7 +21,7 @@ class FlashAttnPrebuiltTests(unittest.TestCase):
             (crate / "build.rs").write_text("const FLAGS: &str = \"sm_80+sm_90+sm_120\";\n")
             (crate / "Cargo.toml").write_text("[package]\nname = \"candle-flash-attn\"\n")
             (crate / "kernels/flash.cu").write_text("// fixture\n")
-            for name in packer.LICENSES:
+            for name in packer.NOTICES:
                 (crate / name).write_text("license fixture\n")
             source_hash = packer.source_sha256(crate)
             build = root / "build"
