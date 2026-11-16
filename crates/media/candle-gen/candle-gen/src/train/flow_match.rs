@@ -1150,6 +1150,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // A PEFT checkpoint cadence may fall mid-accumulation. Delay the corresponding resume bundle
     // until the next completed optimizer boundary instead of snapshotting without pending grads.
     let mut resume_due = false;
+    let mut terminal_checkpoint_saved = start_step == cfg.steps;
     let schedule = item_major_schedule(T::LABEL, cache.len(), &cfg.training_buckets(), cfg.seed)?;
     // Epic 2123 E8: references per (item, bucket) entry once, the alternation over the schedule's
     // windows. sc-24832: the job's subject masks (restricted normal loss) reach every reference,
@@ -1495,6 +1496,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 &fingerprint,
             )?;
             resume_due = false;
+            terminal_checkpoint_saved = step == cfg.steps;
         }
     }
 
@@ -1506,7 +1508,6 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // Flush any pending (sub-`accum`) accumulation so the final partial step is applied. Average by the
     // ACTUAL `pending` micro-count, not the nominal `accum`, so this tail update is a true mean of the
     // grads it holds rather than a `pending/accum`-underweighted step (F-034, sc-9018).
-    let mut terminal_checkpoint_saved = start_step == cfg.steps;
     if accumulated.is_some() {
         apply_update(
             &mut opt,
@@ -2634,6 +2635,31 @@ mod tests {
         let metadata = crate::gen_core::safetensors_file_metadata(&snapshot).unwrap();
         assert_eq!(metadata["step"], "5");
         assert_eq!(metadata["update_idx"], "2");
+    }
+
+    #[test]
+    fn terminal_boundary_checkpoint_due_from_mid_window_is_not_saved_twice() {
+        let model = MockTrainer {
+            device: Device::Cpu,
+            steps_seen: Cell::new(0),
+            saves: Cell::new(0),
+            cache_len: 2,
+        };
+        let (_fixture, req) = mock_request(2, 6, 3, 4, CancelFlag::new());
+        let output = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
+        let snapshot = req.output_dir.join(format!(
+            "{}-step000006.resume.safetensors",
+            file_stem(&req.file_name)
+        ));
+        let metadata = crate::gen_core::safetensors_file_metadata(&snapshot).unwrap();
+        assert_eq!(metadata["step"], "6");
+        assert_eq!(metadata["update_idx"], "2");
+        assert_eq!(output.steps, 6);
+        assert_eq!(
+            model.saves.get(),
+            2,
+            "one intermediate and the final export"
+        );
     }
 
     #[test]
