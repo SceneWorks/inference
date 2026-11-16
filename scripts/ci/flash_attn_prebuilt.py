@@ -51,7 +51,7 @@ def cuda_version():
                 if candidate.is_file():
                     nvcc = str(candidate)
                     break
-    output = subprocess.check_output([nvcc or "nvcc", "--version"], text=True)
+    output = subprocess.check_output([nvcc or "nvcc", "--version"], text=True, encoding="utf-8")
     match = re.search(r"release ([0-9]+\.[0-9]+)", output)
     if not match:
         raise ValueError("cannot determine nvcc release")
@@ -60,12 +60,12 @@ def cuda_version():
 
 def host_compiler_version(target):
     if target.endswith("-msvc"):
-        result = subprocess.run(["cl"], capture_output=True, text=True, check=False)
+        result = subprocess.run(["cl"], capture_output=True, text=True, encoding="utf-8", check=False)
         match = re.search(r"Version ([0-9.]+)", result.stdout + result.stderr)
         if not match:
             raise ValueError("cannot determine MSVC version; run vcvars64 first")
         return match.group(1)
-    return subprocess.check_output(["g++", "-dumpfullversion"], text=True).strip().split()[0]
+    return subprocess.check_output(["g++", "-dumpfullversion"], text=True, encoding="utf-8").strip().split()[0]
 
 
 def manifest_text(crate, archive, target, revision):

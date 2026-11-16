@@ -509,8 +509,8 @@ REVIEWED_STORAGE_CLEANUP = {
 # also wrap an arbitrary command for local use, so ordinary CI only permits its
 # fixed --github-env mode. A source change requires a fresh model-free review.
 REVIEWED_FLASH_PREBUILT = {
-    'scripts/ci/flash_attn_prebuilt.py': 'f4067f8876d99719f33f814268047caf5d8272c7980320dc49b8c854296e2702',
-    'scripts/ci/fetch_flash_attn_prebuilt.py': '8e98166d1bf40345e8deeaf6b46f58008339f71eb447d473762808b693a8b5f2',
+    'scripts/ci/flash_attn_prebuilt.py': 'af1d43aeb03d5664b8910613831a5c37e7b708ae4a858ee2980e6fe34eb8dd3c',
+    'scripts/ci/fetch_flash_attn_prebuilt.py': 'a62d338af735b551b6a02f5249b9003e857a867466957e89fdd2b81565a79bdb',
 }
 
 

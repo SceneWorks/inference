@@ -18,11 +18,11 @@ class FlashAttnPrebuiltTests(unittest.TestCase):
             root = pathlib.Path(temp)
             crate = root / "crate"
             (crate / "kernels").mkdir(parents=True)
-            (crate / "build.rs").write_text("const FLAGS: &str = \"sm_80+sm_90+sm_120\";\n")
-            (crate / "Cargo.toml").write_text("[package]\nname = \"candle-flash-attn\"\n")
-            (crate / "kernels/flash.cu").write_text("// fixture\n")
+            (crate / "build.rs").write_text("const FLAGS: &str = \"sm_80+sm_90+sm_120\";\n", encoding="utf-8")
+            (crate / "Cargo.toml").write_text("[package]\nname = \"candle-flash-attn\"\n", encoding="utf-8")
+            (crate / "kernels/flash.cu").write_text("// fixture\n", encoding="utf-8")
             for name in packer.NOTICES:
-                (crate / name).write_text("license fixture\n")
+                (crate / name).write_text("license fixture\n", encoding="utf-8")
             source_hash = packer.source_sha256(crate)
             self.assertEqual(source_hash, "7b57f69c6a761c344990d5a8c3df399390aa9633b6e0615363f0bd472253d95e")
             build = root / "build"

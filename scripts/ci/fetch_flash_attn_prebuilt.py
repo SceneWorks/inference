@@ -33,7 +33,7 @@ def validate(directory, source_hash, target):
     if any(not p.is_file() or p.is_symlink() for p in directory.iterdir()):
         raise ValueError("FlashAttention package contains a non-file")
     fields = {}
-    for line in (directory / "flash-attn-prebuilt.txt").read_text().splitlines():
+    for line in (directory / "flash-attn-prebuilt.txt").read_text(encoding="utf-8").splitlines():
         key, separator, value = line.partition("=")
         if not separator or key in fields:
             raise ValueError("invalid FlashAttention manifest")
@@ -94,7 +94,7 @@ def main():
     if directory:
         print(f"FlashAttention prebuilt: {directory}", file=sys.stderr)
         if args.github_env:
-            with pathlib.Path(os.environ["GITHUB_ENV"]).open("a") as output:
+            with pathlib.Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
                 output.write(f"CANDLE_FLASH_ATTN_PREBUILT_DIR={directory}\n")
     else:
         print("FlashAttention prebuilt unavailable; compiling from source", file=sys.stderr)

@@ -90,7 +90,7 @@ fn lifetime<'a>(x: &'a str) -> &'a str { x }
 class WorkflowPolicy(unittest.TestCase):
     def test_flash_archive_builder_excludes_fork_prs_from_self_hosted_windows(self):
         import yaml
-        workflow = yaml.safe_load((ROOT / '.github/workflows/flash-attn-prebuilt.yml').read_text())
+        workflow = yaml.safe_load((ROOT / '.github/workflows/flash-attn-prebuilt.yml').read_text(encoding='utf-8'))
         context = {'github.repository': {'SceneWorks/inference'}}
         fork = {**context, 'github.event.pull_request.head.repo.full_name': {'other/fork'}}
         same_repo = {**context, 'github.event.pull_request.head.repo.full_name': {'SceneWorks/inference'}}
