@@ -94,15 +94,11 @@ impl TextLlm for LlamaProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
-        if let (Some(requested), Some(_)) =
-            (self.load_record.requested, self.load_record.census.as_ref())
+        if let Some(policy) = self
+            .load_record
+            .numeric_policy(format!("{:?}", self.model.device()))
         {
-            let report = self.load_record.report();
-            scope.observe_numeric_policy(serde_json::json!({
-                "requested_quantization": format!("{requested:?}"),
-                "resident_projections": format!("{:?}", report.projections),
-                "device": format!("{:?}", self.model.device()),
-            }));
+            scope.observe_numeric_policy(policy);
         }
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))

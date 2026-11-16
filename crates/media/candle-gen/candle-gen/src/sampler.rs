@@ -244,6 +244,13 @@ pub fn run_curated_sampler_spans(
     let solver = resolved_solver(sampler_name);
     let sampler = solver.boxed::<CandleLatentOps>();
     let mut state = SolverRunState::new(sampler.solver(), sigmas);
+    if let Some(run) = phase_scope {
+        // A planned render iterates its plan's seeds, not `for_each_image_seed`, so its
+        // per-image initial-noise draw is recorded here, before this output's runtime and
+        // schedule, as `for_each_image_seed` does: output index = seed - plan base seed.
+        let index = seed.wrapping_sub(run.plan().base_seed()) as usize;
+        crate::execution::draw("image_initial_noise", seed, index);
+    }
     crate::execution::runtime(latents.device(), latents.dtype());
     crate::execution::schedule(solver.name(), sigmas, &format!("{:?}", ms.prediction()));
 
@@ -857,6 +864,98 @@ mod tests {
 
     fn t(v: &[f32]) -> Tensor {
         Tensor::from_vec(v.to_vec(), v.len(), &Device::Cpu).unwrap()
+    }
+
+    /// The planned (spans) path iterates the plan's seeds rather than `for_each_image_seed`, so it
+    /// must record each image's initial-noise draw itself; without it a planned render's report is
+    /// Unavailable. Tiny CPU latent and a zero-velocity stand-in predictor: no model weights.
+    #[test]
+    fn planned_spans_path_records_each_image_draw() {
+        use gen_core::generator::{ExecutionIdentity, ExecutionRandomness};
+        let descriptor = gen_core::ModelDescriptor {
+            id: "spans_probe",
+            family: "probe",
+            backend: "candle",
+            modality: gen_core::Modality::Image,
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            capabilities: gen_core::Capabilities {
+                max_count: 2,
+                ..Default::default()
+            },
+        };
+        let req = gen_core::GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 2,
+            seed: Some(40),
+            ..Default::default()
+        };
+        let plan = gen_core::RenderPlan::base_image(
+            &descriptor,
+            &req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 0.0,
+                sigmas: vec![1.0, 0.5, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+        let completed = crate::execution::capture_direct(&descriptor, &req.cancel, || {
+            crate::execution::rng_scheme("fixture-metadata-v1");
+            let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+            run.encode(|| Ok::<_, gen_core::Error>(()))?;
+            let images = run.images_with_denoise_phases(
+                &mut |_| {},
+                |_seed| Ok::<_, gen_core::Error>(t(&[0.25, -0.5])),
+                |seed, latent, progress| {
+                    run.begin_denoise_phase(0)?;
+                    run_flow_sampler_spans(
+                        Some("euler"),
+                        TimestepConvention::Sigma,
+                        plan.denoise_sigmas(),
+                        &plan.denoise_spans(),
+                        Some(&run),
+                        true,
+                        latent,
+                        seed,
+                        &req.cancel,
+                        progress,
+                        None,
+                        |x, _| x.zeros_like().map_err(Into::into),
+                    )
+                    .map_err(gen_core::Error::from)
+                },
+                |_, _, _| {
+                    Ok(gen_core::Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    })
+                },
+            )?;
+            Ok(gen_core::GenerationOutput::Images(images))
+        })
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = completed.execution else {
+            panic!("unresolved: {:?}", completed.execution)
+        };
+        let ExecutionRandomness::Draws { draws, .. } = identity.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(
+            draws
+                .iter()
+                .map(|draw| (draw.seed, draw.output_index))
+                .collect::<Vec<_>>(),
+            [(Some(40), 0), (Some(41), 1)]
+        );
     }
     fn vec1(x: &Tensor) -> Vec<f32> {
         x.flatten_all().unwrap().to_vec1::<f32>().unwrap()

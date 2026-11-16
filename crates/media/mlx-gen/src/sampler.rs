@@ -879,7 +879,8 @@ pub fn run_flow_sampler_with_latent_hook_spans(
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler_with_latent_hook_spans(
+    let (sampler, sigmas, seed, dtype) = (run.sampler_name, run.sigmas, run.seed, latents.dtype());
+    let output = run_curated_sampler_with_latent_hook_spans(
         run,
         &ms,
         latents,
@@ -887,7 +888,11 @@ pub fn run_flow_sampler_with_latent_hook_spans(
         phase_scope,
         on_latent,
         predict,
-    )
+    )?;
+    // The same successful-sampling observation as the unscoped wrapper: a planned render that
+    // skipped it would report its device, solver, schedule and seed as unobserved.
+    crate::image_execution::sampled_flow(sampler, conv, dtype, sigmas, seed);
+    Ok(output)
 }
 
 // =================================================================================================
@@ -1409,6 +1414,63 @@ impl DiffusionSampler for FlowMatchSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The planned (spans) FLOW path must record the same successful-sampling observation as the
+    /// unscoped wrapper; without it a planned render's report is Unavailable. Tiny CPU-sized
+    /// latent and a constant-velocity stand-in predictor: no model weights.
+    #[test]
+    fn flow_spans_path_records_the_sampling_observation() {
+        use gen_core::{Capabilities, Modality, ModelDescriptor};
+        let descriptor = ModelDescriptor {
+            id: "spans_probe",
+            family: "probe",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        let sigmas = [1.0_f32, 0.5, 0.0];
+        let cancel = CancelFlag::new();
+        let completed =
+            crate::image_execution::complete_image_attempt(&descriptor, &cancel, || {
+                // A provider always records its own quality policy; the probe stands in for it.
+                crate::image_execution::policy("probe.decode", serde_json::json!("untiled"));
+                let mut progress = |_: Progress| {};
+                run_flow_sampler_with_latent_hook_spans(
+                    SamplerRun {
+                        sampler_name: Some("euler"),
+                        sigmas: &sigmas,
+                        seed: 31,
+                        cancel: &cancel,
+                        on_progress: &mut progress,
+                    },
+                    TimestepConvention::Sigma,
+                    Array::from_slice(&[0.25_f32, -0.5], &[1, 2]),
+                    &[0..1, 1..2],
+                    None,
+                    |_, _| {},
+                    |x, _| Ok(x.multiply(Array::from_f32(0.0))?),
+                )?;
+                Ok(gen_core::GenerationOutput::Images(vec![gen_core::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            })
+            .unwrap();
+        let report = completed
+            .execution
+            .resolved()
+            .unwrap_or_else(|| panic!("unresolved: {:?}", completed.execution));
+        let gen_core::generator::ExecutionRandomness::Draws { draws, .. } = &report.randomness
+        else {
+            panic!("draws")
+        };
+        assert_eq!(draws[0].seed, Some(31));
+    }
 
     #[test]
     fn scoped_span_evaluates_final_output_before_leaving_its_phase() {
