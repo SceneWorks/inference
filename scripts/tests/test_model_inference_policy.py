@@ -88,6 +88,16 @@ fn lifetime<'a>(x: &'a str) -> &'a str { x }
 
 
 class WorkflowPolicy(unittest.TestCase):
+    def test_flash_archive_builder_excludes_fork_prs_from_self_hosted_windows(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / '.github/workflows/flash-attn-prebuilt.yml').read_text())
+        context = {'github.repository': {'SceneWorks/inference'}}
+        fork = {**context, 'github.event.pull_request.head.repo.full_name': {'other/fork'}}
+        same_repo = {**context, 'github.event.pull_request.head.repo.full_name': {'SceneWorks/inference'}}
+        self.assertFalse(policy.automatic_jobs(workflow, 'pull_request', fork)['windows'])
+        self.assertTrue(policy.automatic_jobs(workflow, 'pull_request', same_repo)['windows'])
+        self.assertTrue(policy.automatic_jobs(workflow, 'push', context)['windows'])
+
     def test_direct_backend_defaults_listing_and_compact_selector_bypasses_are_rejected(self):
         for command in (
             'cargo test --lib --tests',
