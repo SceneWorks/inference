@@ -119,6 +119,11 @@ def push_route_proof(root: Path = ROOT) -> dict:
             expected = ("\n    branches: ['**']\n    paths:"
                         "\n      - .github/workflows/moss-transport-cpu.yml"
                         "\n      - scripts/ci/moss-native-terminal.ps1")
+        elif path.name == "flash-attn-prebuilt.yml":
+            expected = ("\n    branches: [main]\n    paths:"
+                        "\n      - .github/workflows/flash-attn-prebuilt.yml"
+                        "\n      - crates/media/candle-gen/vendor/candle-flash-attn/**"
+                        "\n      - scripts/ci/flash_attn_prebuilt.py")
         else:
             expected = None
         if (expected is None and pushes) or (expected is not None and pushes != [expected]):

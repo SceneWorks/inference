@@ -172,9 +172,14 @@ class HostedCpuRoutingTests(unittest.TestCase):
             root = Path(directory)
             destination = root / ".github/workflows"
             destination.mkdir(parents=True)
-            for name in ("ci.yml", "kv-poc-campaign.yml", "moss-transport-cpu.yml"):
+            for name in ("ci.yml", "kv-poc-campaign.yml", "moss-transport-cpu.yml", "flash-attn-prebuilt.yml"):
                 (destination / name).write_text((WORKFLOW.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
             self.assertTrue(profile.push_route_proof(root)["matches_push_trigger"])
+            flash = destination / "flash-attn-prebuilt.yml"
+            flash.write_text(flash.read_text(encoding="utf-8").replace("    branches: [main]", "    branches: ['**']", 1), encoding="utf-8")
+            with self.assertRaisesRegex(UnitFailure, "re-admit"):
+                profile.push_route_proof(root)
+            flash.write_text((WORKFLOW.parent / "flash-attn-prebuilt.yml").read_text(encoding="utf-8"), encoding="utf-8")
             path = destination / "ci.yml"
             path.write_text(path.read_text(encoding="utf-8").replace("\n    branches: [main]", "\n    branches: ['**']", 1), encoding="utf-8")
             with self.assertRaisesRegex(UnitFailure, "re-admit"):

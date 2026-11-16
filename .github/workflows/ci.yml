@@ -1444,6 +1444,17 @@ jobs:
           $dir = Join-Path $env:RUNNER_TOOL_CACHE "candle-flash-attn-objects\$env:RUNNER_NAME"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           "CANDLE_FLASH_ATTN_BUILD_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+      - name: Fetch verified FlashAttention archive when published
+        shell: powershell
+        run: |
+          $cache = Join-Path $env:RUNNER_TOOL_CACHE "candle-flash-attn-prebuilt\$env:RUNNER_NAME"
+          python3 scripts/ci/fetch_flash_attn_prebuilt.py --target x86_64-pc-windows-msvc --cache "$cache" --github-env
+          if ($LASTEXITCODE -eq 1) {
+            Write-Warning 'No published archive for this FlashAttention source; compiling from source'
+          } elseif ($LASTEXITCODE -ne 0) {
+            throw 'FlashAttention archive verification failed'
+          }
+          exit 0
       - name: Compile Candle CUDA packages and test binaries (no GPU required)
         shell: cmd
         run: |
