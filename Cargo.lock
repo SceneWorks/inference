@@ -486,6 +486,7 @@ dependencies = [
  "candle-core",
  "cudaforge",
  "half",
+ "sha2",
 ]
 
 [[package]]

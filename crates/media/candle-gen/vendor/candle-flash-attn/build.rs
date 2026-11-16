@@ -1,8 +1,13 @@
 // Build script to run nvcc and generate the C glue code for launching the flash-attention kernel.
 // The cuda build time is very long so one can set the CANDLE_FLASH_ATTN_BUILD_DIR environment
 // variable in order to cache the compiled artifacts and avoid recompiling too often.
-use cudaforge::{KernelBuilder, Result};
+use anyhow::Result;
+use cudaforge::KernelBuilder;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::Command;
 const CUTLASS_COMMIT: &str = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
 
 const KERNEL_FILES: [&str; 37] = [
@@ -45,6 +50,152 @@ const KERNEL_FILES: [&str; 37] = [
     "kernels/flash_fwd_hdim96_bf16_causal_sm80.cu",
 ];
 
+fn file_sha256(path: &std::path::Path) -> Result<String> {
+    let mut input = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+// Match scripts/ci/flash_attn_prebuilt.py. The source key includes every CUDA source/header,
+// the CUTLASS pin and the flags in this build script, but not checkout-specific paths.
+fn source_sha256() -> Result<String> {
+    let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml")];
+    for entry in fs::read_dir("kernels")? {
+        let path = entry?.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    let mut hash = Sha256::new();
+    for path in files {
+        hash.update(path.to_string_lossy().replace('\\', "/").as_bytes());
+        hash.update([0]);
+        hash.update(fs::read(path)?);
+        hash.update([0]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn nvcc_version() -> Option<String> {
+    let nvcc = std::env::var_os("NVCC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            ["CUDA_HOME", "CUDA_PATH"]
+                .iter()
+                .filter_map(|key| std::env::var_os(key))
+                .map(|root| {
+                    PathBuf::from(root).join("bin").join(if cfg!(windows) {
+                        "nvcc.exe"
+                    } else {
+                        "nvcc"
+                    })
+                })
+                .find(|path| path.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("nvcc"));
+    let output = Command::new(nvcc).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.split("release ")
+        .nth(1)?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .map(str::to_owned)
+}
+
+fn host_compiler_version(target: &str) -> Option<String> {
+    let output = if target.contains("msvc") {
+        Command::new("cl").output().ok()?
+    } else {
+        Command::new("g++").arg("-dumpfullversion").output().ok()?
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if target.contains("msvc") {
+        text.split("Version ")
+            .nth(1)?
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)
+    } else {
+        text.trim().split_whitespace().next().map(str::to_owned)
+    }
+}
+
+fn link_prebuilt(target: &str) -> Result<bool> {
+    println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_PREBUILT_DIR");
+    let Some(directory) = std::env::var_os("CANDLE_FLASH_ATTN_PREBUILT_DIR") else {
+        return Ok(false);
+    };
+    let directory = PathBuf::from(directory);
+    let manifest = directory.join("flash-attn-prebuilt.txt");
+    let archive = directory.join("libflashattention.a");
+    println!("cargo::rerun-if-changed={}", manifest.display());
+    println!("cargo::rerun-if-changed={}", archive.display());
+    if !manifest.is_file() || !archive.is_file() {
+        println!("cargo::warning=FlashAttention prebuilt is incomplete; compiling from source");
+        return Ok(false);
+    }
+    let manifest_text = fs::read_to_string(manifest)?;
+    let fields: std::collections::HashMap<_, _> = manifest_text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let source = source_sha256()?;
+    let cap = std::env::var("CUDA_COMPUTE_CAP").unwrap_or_default();
+    let cuda_version = nvcc_version();
+    let compiler_version = host_compiler_version(target);
+    let matches = fields.get("format") == Some(&"1")
+        && fields.get("source_sha256").copied() == Some(source.as_str())
+        && fields.get("target").copied() == Some(target)
+        // A cap-80 fatbin contains sm_80, sm_90, sm_120 and compute_120.
+        // Only these known baselines keep candle-gen's source-derived dispatch guard honest.
+        && fields.get("cuda_compute_cap") == Some(&"80")
+        && (cap.is_empty() || cap == "80" || cap == "120")
+        && cuda_version.as_deref().is_some()
+        && fields.get("cuda_version").copied() == cuda_version.as_deref()
+        && compiler_version.as_deref().is_some()
+        && fields.get("host_compiler_version").copied() == compiler_version.as_deref();
+    if !matches {
+        println!("cargo::warning=FlashAttention prebuilt does not match source, target or toolchain; compiling from source");
+        return Ok(false);
+    }
+    let expected = fields
+        .get("archive_sha256")
+        .ok_or_else(|| anyhow::anyhow!("prebuilt manifest lacks archive_sha256"))?;
+    let actual = file_sha256(&archive)?;
+    anyhow::ensure!(
+        &actual == expected,
+        "FlashAttention prebuilt archive checksum mismatch"
+    );
+    println!(
+        "cargo::rustc-link-search={}",
+        directory.canonicalize()?.display()
+    );
+    println!("cargo::rustc-link-lib=flashattention");
+    println!("cargo::rustc-link-lib=dylib=cudart");
+    if !target.contains("msvc") {
+        println!("cargo::rustc-link-lib=dylib=stdc++");
+    }
+    println!("cargo::warning=linking verified prebuilt FlashAttention archive");
+    Ok(true)
+}
+
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
     for kernel_file in KERNEL_FILES.iter() {
@@ -69,6 +220,10 @@ fn main() -> Result<()> {
     // CUDA_COMPUTE_CAP arch via its per-object arch.)
     println!("cargo::rerun-if-changed=kernels");
     println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_BUILD_DIR");
+    let target = std::env::var("TARGET")?;
+    if link_prebuilt(&target)? {
+        return Ok(());
+    }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let build_dir = match std::env::var("CANDLE_FLASH_ATTN_BUILD_DIR") {
         Err(_) =>

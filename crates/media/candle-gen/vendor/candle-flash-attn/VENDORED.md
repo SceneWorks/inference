@@ -31,6 +31,15 @@ needs a matching `[patch]` line for the fork to take effect.
    arch in its per-object key already; an nvcc *toolkit* upgrade is not — clear the cache dir.)
 5. `Cargo.toml` declares `license = "(MIT OR Apache-2.0) AND BSD-3-Clause"` (upstream: `MIT OR
    Apache-2.0`), which is what the crate actually distributes — see *Licensing* below.
+6. `build.rs` accepts `CANDLE_FLASH_ATTN_PREBUILT_DIR` for a published Windows MSVC or Linux GNU
+   archive. It verifies the archive checksum, the exact vendored source digest, target, CUDA
+   version, host compiler version, and cap-80 fatbin baseline before linking. An absent or
+   incompatible archive builds from source; corruption fails. The `flash-attn-prebuilt.yml`
+   workflow packages the archive and notices under a release tag keyed by source digest, so an
+   inference pin change outside this crate reuses the same binary. `scripts/ci/fetch_flash_attn_prebuilt.py`
+   provides a local and CI fetcher; for example, on an x86-64 Linux host with CUDA 12.9:
+
+       python3 scripts/ci/fetch_flash_attn_prebuilt.py --target x86_64-unknown-linux-gnu -- cargo build --locked -p candle-flash-attn
 
 ## Licensing
 
