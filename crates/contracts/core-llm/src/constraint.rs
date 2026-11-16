@@ -12,7 +12,7 @@
 //! implementation in the workspace: `sceneworks-gen-core` re-exports it (`gen_core::JsonState`)
 //! instead of keeping its historical duplicate.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::json_schema::{JsonSchema, SchemaState};
 
@@ -97,6 +97,24 @@ pub struct JsonConstraint<'a> {
     grammar: Grammar,
     stop_ids: HashSet<u32>,
     allow: Vec<bool>,
+    /// Masks already computed, keyed by the grammar state they were computed for. A mask is a
+    /// pure function of that state (every piece's admission and the stop gate read nothing
+    /// else), so a state seen before — every token inside one long string value, say — reuses
+    /// its mask instead of re-running the grammar over the whole vocabulary.
+    masks: HashMap<GrammarKey, Vec<bool>>,
+    /// Insertion order of `masks`, oldest first, for the bounded eviction.
+    mask_order: VecDeque<GrammarKey>,
+}
+
+/// How many distinct grammar states' masks a [`JsonConstraint`] keeps (one byte per vocabulary
+/// id each: ~8 MiB for a 248k vocabulary at this bound).
+const MASK_CACHE_STATES: usize = 32;
+
+/// The part of a [`Grammar`] its mask depends on (the schema program is fixed per constraint).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GrammarKey {
+    Json(JsonState),
+    Schema(SchemaState),
 }
 
 /// The grammar a [`JsonConstraint`] drives, with its live state.
@@ -128,6 +146,21 @@ impl Grammar {
             Grammar::Schema(schema, state) => schema.can_stop(*state),
         }
     }
+
+    fn key(&self) -> GrammarKey {
+        match self {
+            Grammar::Json(state) => GrammarKey::Json(*state),
+            Grammar::Schema(_, state) => GrammarKey::Schema(*state),
+        }
+    }
+
+    /// This grammar back at its start state.
+    fn restarted(&self) -> Self {
+        match self {
+            Grammar::Json(_) => Grammar::Json(JsonState::start()),
+            Grammar::Schema(schema, _) => Grammar::Schema(schema.clone(), schema.start()),
+        }
+    }
 }
 
 impl<'a> JsonConstraint<'a> {
@@ -154,12 +187,44 @@ impl<'a> JsonConstraint<'a> {
             grammar,
             stop_ids: stop_ids.into_iter().collect(),
             allow,
+            masks: HashMap::new(),
+            mask_order: VecDeque::new(),
         }
+    }
+
+    /// Return to the start of the document, keeping the masks already computed (they depend
+    /// only on the grammar state, not on how it was reached). A rewinding caller replays its
+    /// committed tokens from here instead of building a new constraint.
+    pub fn restart(&mut self) {
+        self.grammar = self.grammar.restarted();
     }
 
     /// The allow mask for the current step: `allow[id]` is true iff token `id` is permitted next.
     /// Stop tokens are gated on [`JsonState::can_stop`]; special/added tokens are never JSON content.
     pub fn allowed(&mut self) -> &[bool] {
+        let key = self.grammar.key();
+        if !self.masks.contains_key(&key) {
+            self.compute_allowed();
+            if self.mask_order.len() >= MASK_CACHE_STATES {
+                if let Some(oldest) = self.mask_order.pop_front() {
+                    if let Some(reuse) = self.masks.remove(&oldest) {
+                        // Recycle the evicted buffer as the next scratch mask.
+                        let fresh = std::mem::replace(&mut self.allow, reuse);
+                        self.masks.insert(key, fresh);
+                        self.mask_order.push_back(key);
+                        return &self.masks[&key];
+                    }
+                }
+            }
+            let fresh = std::mem::replace(&mut self.allow, vec![false; self.table.pieces.len()]);
+            self.masks.insert(key, fresh);
+            self.mask_order.push_back(key);
+        }
+        &self.masks[&key]
+    }
+
+    /// Compute the current state's mask into the scratch `allow` buffer.
+    fn compute_allowed(&mut self) {
         let can_stop = self.grammar.can_stop();
         for (id, slot) in self.allow.iter_mut().enumerate() {
             let id_u = id as u32;
@@ -171,7 +236,6 @@ impl<'a> JsonConstraint<'a> {
                 self.grammar.admits(&self.table.pieces[id])
             };
         }
-        &self.allow
     }
 
     /// Advance the grammar after the sampler chooses `token_id`.
@@ -219,7 +283,7 @@ const MAX_DEPTH: u8 = 64;
 /// with [`JsonState::advance`], and gate the stop token on [`JsonState::can_stop`]. `Copy` (the
 /// open-container stack is packed into a `u64` bit-stack, one bit per depth) so per-step masking
 /// over a 100k+ token vocab is a register copy, not a heap allocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JsonState {
     /// Container kinds, innermost at bit `depth-1`: 0 = object, 1 = array.
     stack: u64,
@@ -228,7 +292,7 @@ pub struct JsonState {
     mode: Mode,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Mode {
     Value,
     ArrayFirst,
@@ -241,14 +305,14 @@ enum Mode {
     AfterValue,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Esc {
     None,
     Backslash,
     Unicode(u8),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum NumPart {
     Sign,
     IntZero,
@@ -774,6 +838,49 @@ mod tests {
         assert!(m[1], "after '{{' an empty object close is allowed");
         assert!(!m[5], "a bare number is not a valid object key");
         assert!(!m[7], "stop not allowed mid-object");
+    }
+
+    /// A remembered mask equals the one computed from scratch for the same state: drive one
+    /// long-lived constraint through a document (repeated string states hit the cache; more
+    /// distinct states than the cache holds force evictions; `restart` keeps it across a replay)
+    /// and compare every step against a fresh constraint brought to the same point.
+    #[test]
+    fn remembered_masks_match_fresh_ones() {
+        let pieces = [
+            "{", "}", "[", "]", "\"", "a", " b", ":", ",", "1", "2.5", "e", "-", "true", "nul",
+            "l", "\\", "u", "0", "\"}", "", " ",
+        ];
+        let t = table(&pieces);
+        let eos = (pieces.len() - 1) as u32 - 1; // "" is the stop token
+        let mut doc: Vec<u32> = vec![0, 4, 5, 4, 7, 2];
+        // A deep array of numbers and strings: many distinct depth states (> the cache bound).
+        for depth in 0..40u32 {
+            doc.extend([if depth % 2 == 0 { 2 } else { 2 }]);
+        }
+        for _ in 0..40 {
+            doc.extend([3]);
+        }
+        doc.extend([8, 4, 5, 6, 6, 6, 6, 16, 4, 5, 6, 4, 8, 9, 8, 10, 8, 13, 1]);
+        let mut live = JsonConstraint::new(&t, [eos]);
+        let mut accepted = Vec::new();
+        for (step, &id) in doc.iter().enumerate() {
+            let mut fresh = JsonConstraint::new(&t, [eos]);
+            for &a in &accepted {
+                fresh.accept(a);
+            }
+            assert_eq!(live.allowed(), fresh.allowed(), "step {step}");
+            if step == doc.len() / 2 {
+                // A rewind's replay: back to the start, then the committed tokens again.
+                live.restart();
+                for &a in &accepted {
+                    live.accept(a);
+                }
+                assert_eq!(live.allowed(), fresh.allowed(), "after restart at {step}");
+            }
+            live.accept(id);
+            accepted.push(id);
+        }
+        assert!(live.masks.len() <= MASK_CACHE_STATES);
     }
 
     #[test]
