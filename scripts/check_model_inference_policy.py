@@ -505,6 +505,14 @@ REVIEWED_STORAGE_CLEANUP = {
     'scripts/runner-storage-cleanup.test.mjs': '7d2e2101535e13a095dea5e5e8937e02776f415b7ee901130876e593d2b8e2a8',
 }
 
+# These exact sources package and fetch a static CUDA archive. The fetcher's CLI can
+# also wrap an arbitrary command for local use, so ordinary CI only permits its
+# fixed --github-env mode. A source change requires a fresh model-free review.
+REVIEWED_FLASH_PREBUILT = {
+    'scripts/ci/flash_attn_prebuilt.py': 'f4067f8876d99719f33f814268047caf5d8272c7980320dc49b8c854296e2702',
+    'scripts/ci/fetch_flash_attn_prebuilt.py': '8e98166d1bf40345e8deeaf6b46f58008339f71eb447d473762808b693a8b5f2',
+}
+
 
 def reviewed_storage_cleanup(root: Path) -> bool:
     for relative, digest in REVIEWED_STORAGE_CLEANUP.items():
@@ -591,7 +599,7 @@ class RunGraph:
                  'sysctl sw_vers vm_stat pmset lsof kill wait disown command type hash '
                  'git rustup rustc cmake ninja make xcodebuild xcode-select xcrun '
                  'curl wget tar unzip zip zstd gzip gunzip install file security codesign '
-                 'uv pip pip3 sudo timeout nice nproc free nvidia-smi jq ls :'.split())
+                 'uv pip pip3 sudo timeout nice nproc free nvidia-smi jq ls findstr :'.split())
     PYTHON = re.compile(r'^(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?|py)$', re.I)
     SHELL = {'bash', 'sh', 'zsh', 'pwsh', 'powershell', 'cmd', 'call', '.', 'source', '&'}
 
@@ -745,6 +753,9 @@ class RunGraph:
         if leaf == 'lms' and args[:1] == ['ps']:
             self.finding('ordinary', chain, 'source-proven lms tool lookup followed by process inventory only')
             return  # process inventory, not load/generate
+        if leaf == 'gh' and args[:2] in (['release', 'view'], ['release', 'create']) and len(args) > 2 and args[2].startswith('flash-attn-'):
+            self.finding('ordinary', chain, 'FlashAttention archive release lookup/publication')
+            return
         if leaf == 'cp' and len(args) >= 2 and args[-2] in self.test_artifacts:
             self.test_artifacts[args[-1]] = self.test_artifacts[args[-2]]
         if leaf == 'eval':
@@ -784,6 +795,17 @@ class RunGraph:
             return
         if not path.is_file():
             self.finding('unknown', chain, 'unresolved script: ' + name)
+            return
+        if relative in REVIEWED_FLASH_PREBUILT:
+            reviewed = all((self.root / name).is_file() and hashlib.sha256((self.root / name).read_bytes()).hexdigest() == digest
+                           for name, digest in REVIEWED_FLASH_PREBUILT.items())
+            pack_args = len(args) == 8 and set(args[::2]) == {'--directory', '--output', '--target', '--revision'}
+            fetch_args = len(args) == 5 and args[:1] == ['--target'] and args[2:3] == ['--cache'] and args[4] == '--github-env'
+            if reviewed and ((relative.endswith('/flash_attn_prebuilt.py') and pack_args)
+                             or (relative.endswith('/fetch_flash_attn_prebuilt.py') and fetch_args)):
+                self.finding('ordinary', chain, 'exact-source static FlashAttention archive packaging or fetch')
+            else:
+                self.finding('unknown', chain, 'unreviewed FlashAttention source or command mode')
             return
         # The exact reviewed suite runner may execute only literal audited-safe mode in
         # ordinary CI. Its executable argv is built from Cargo compiler-artifact records,

@@ -174,6 +174,20 @@ for line in result.stdout.splitlines():
 
 
 class WorkflowExecutionGraph(unittest.TestCase):
+    def test_flash_archive_scripts_only_allow_reviewed_ci_modes(self):
+        graph = policy.RunGraph(ROOT)
+        graph.script('scripts/ci/flash_attn_prebuilt.py',
+                     ['--directory', 'objects', '--output', 'flash.tar.gz', '--target', 'x86_64-unknown-linux-gnu', '--revision', 'a' * 40], ())
+        self.assertFalse([item for item in graph.findings if item[0] == 'unknown'])
+        graph = policy.RunGraph(ROOT)
+        graph.script('scripts/ci/fetch_flash_attn_prebuilt.py',
+                     ['--target', 'x86_64-pc-windows-msvc', '--cache', 'cache', '--github-env'], ())
+        self.assertFalse([item for item in graph.findings if item[0] == 'unknown'])
+        graph = policy.RunGraph(ROOT)
+        graph.script('scripts/ci/fetch_flash_attn_prebuilt.py',
+                     ['--target', 'x86_64-pc-windows-msvc', '--', 'cargo', 'test'], ())
+        self.assertTrue([item for item in graph.findings if item[0] == 'unknown'])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

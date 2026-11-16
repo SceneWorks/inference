@@ -50,8 +50,8 @@ jobs:
         run: |
           call "%VCVARS%" || exit /b 1
           set NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64
-          set CANDLE_FLASH_ATTN_BUILD_DIR=%RUNNER_TEMP%\flash-attn-build-%GITHUB_RUN_ID%
-          mkdir "%CANDLE_FLASH_ATTN_BUILD_DIR%" || exit /b 1
+          set CANDLE_FLASH_ATTN_BUILD_DIR=%RUNNER_TOOL_CACHE%\candle-flash-attn-objects\%RUNNER_NAME%
+          if not exist "%CANDLE_FLASH_ATTN_BUILD_DIR%" mkdir "%CANDLE_FLASH_ATTN_BUILD_DIR%" || exit /b 1
           cargo build --locked -p candle-flash-attn || exit /b 1
           python3 scripts\ci\flash_attn_prebuilt.py --directory "%CANDLE_FLASH_ATTN_BUILD_DIR%" --output "%RUNNER_TEMP%\flash-attn-x86_64-pc-windows-msvc.tar.gz" --target x86_64-pc-windows-msvc --revision %GITHUB_SHA% || exit /b 1
           mkdir "%RUNNER_TEMP%\flash-attn-verify" || exit /b 1
