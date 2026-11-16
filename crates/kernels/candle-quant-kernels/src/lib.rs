@@ -59,6 +59,7 @@ pub mod decode_attention;
 pub mod flux3_quant;
 pub mod fused_decode;
 pub mod gated_delta;
+pub mod gdn_prep;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
@@ -93,6 +94,9 @@ pub use fused_decode::{
 pub use gated_delta::{
     gated_delta_available, gated_delta_serves_key_dim, gated_delta_step, GatedDeltaRing, GatedDeltaState, GATED_DELTA_MAX_KEY_DIM,
     GATED_DELTA_SRC,
+};
+pub use gdn_prep::{
+    gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_qkv, gdn_qkv_serves_key_dim, GDN_PREP_SRC,
 };
 pub use moe_gemv::{
     ggml_kernel, indexed_workspace_bytes, IndexedExperts, IndexedFormat, MoeGemvError,

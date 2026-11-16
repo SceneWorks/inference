@@ -460,6 +460,20 @@ impl GatedDeltaNet {
         };
         let (conv_out, conv_trace) =
             causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+        // Fused preparation (bit-identical to the chains below) when it serves this layer.
+        let q_scale = (self.head_k_dim as f64).powf(-0.5);
+        if let Some(prepared) = self.fused_prep(&conv_out, &a_in, &b_in, q_scale)? {
+            let (q, k, v, g, beta) = prepared;
+            let y = if crate::primitives::in_prefill() {
+                cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
+            } else {
+                cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
+            };
+            let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
+            return Ok(self
+                .out_proj
+                .forward(&out.reshape((b, s, self.value_dim))?)?);
+        }
         let qc = conv_out
             .narrow(2, 0, self.key_dim)?
             .contiguous()?
@@ -506,6 +520,42 @@ impl GatedDeltaNet {
             .out_proj
             .forward(&out.reshape((b, s, self.value_dim))?)?;
         Ok(result)
+    }
+}
+
+impl GatedDeltaNet {
+    /// The recurrence inputs `(q, k, v, g, beta)` (all `F32`) from the fused preparation kernels,
+    /// when they serve this layer (bf16 on CUDA, a key head they fit): bit-identical to the
+    /// `l2norm` / `affine` / `sigmoid` / `compute_g` / `to_dtype` chains in
+    /// [`forward_at`](Self::forward_at). `None` keeps those chains.
+    #[allow(clippy::type_complexity)]
+    fn fused_prep(
+        &self,
+        conv_out: &Tensor,
+        a_in: &Tensor,
+        b_in: &Tensor,
+        q_scale: f64,
+    ) -> Result<Option<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
+        let served = crate::primitives::gated_delta::fused_prep_serves(conv_out)
+            && candle_quant_kernels::gdn_qkv_serves_key_dim(self.head_k_dim)
+            && [a_in, b_in, &self.a_log, &self.dt_bias]
+                .iter()
+                .all(|t| t.dtype() == DType::BF16);
+        if !served {
+            return Ok(None);
+        }
+        let (q, k, v) = candle_quant_kernels::gdn_qkv(
+            conv_out,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
+            1e-6,
+            q_scale,
+        )?;
+        let (g, beta) =
+            candle_quant_kernels::gdn_gates(a_in, b_in, &self.a_log, &self.dt_bias)?;
+        Ok(Some((q, k, v, g, beta)))
     }
 }
 
@@ -3686,6 +3736,126 @@ pub(crate) mod tests {
     use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// The fused GDN input preparation (conv + SiLU, q/k L2 norms, gates) is bit-identical to the
+    /// op chains `GatedDeltaNet::forward_at` runs without it, over decode, verify and prefill
+    /// step lengths, with zeros and large magnitudes in the inputs.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fused_gdn_prep_matches_the_op_chains_bit_for_bit() {
+        use crate::primitives::gated_delta::{causal_depthwise_conv_traced, with_unfused_prep};
+        let Ok(device) = crate::device::new_cuda_for_test() else {
+            eprintln!("skipped: no CUDA device");
+            return;
+        };
+        if candle_quant_kernels::gdn_prep_available(&device).is_err() {
+            eprintln!("skipped: the fused kernels do not compile here");
+            return;
+        }
+        let mut seed = 0x2545_f491u32;
+        let mut sample = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let x = ((seed % 20001) as f32 / 10000.0 - 1.0) * scale;
+                    match i % 97 {
+                        0 => 0.0,
+                        1 => x * 40.0,
+                        _ => x,
+                    }
+                })
+                .collect()
+        };
+        let bf = |v: Vec<f32>, dims: &[usize]| {
+            Tensor::from_vec(v, dims, &device)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let bits16 = |t: &Tensor| -> Vec<u16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        let bits32 = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        let (b, hk, hv, dv, kk) = (1usize, 2usize, 6usize, 32usize, 4usize);
+        for dk in [64usize, 128] {
+            let c = 2 * hk * dk + hv * dv;
+            let q_scale = (dk as f64).powf(-0.5);
+            for s in [1usize, 4, 9] {
+                let x = bf(sample(b * s * c, 2.0), &[b, s, c]);
+                let state = bf(sample(b * (kk - 1) * c, 2.0), &[b, kk - 1, c]);
+                let w = bf(sample(c * kk, 0.6), &[c, kk]);
+                let (fused_out, fused_trace) =
+                    causal_depthwise_conv_traced(&x, &w, &state).unwrap();
+                let (ref_out, ref_trace) =
+                    with_unfused_prep(|| causal_depthwise_conv_traced(&x, &w, &state)).unwrap();
+                assert_eq!(bits16(&fused_out), bits16(&ref_out), "conv dk {dk} s {s}");
+                for ti in 0..s {
+                    assert_eq!(
+                        bits16(&fused_trace.tail_after(ti).unwrap()),
+                        bits16(&ref_trace.tail_after(ti).unwrap()),
+                        "conv tail {ti} dk {dk} s {s}"
+                    );
+                }
+
+                let (q, k, v) =
+                    candle_quant_kernels::gdn_qkv(&ref_out, hk, dk, hv, dv, 1e-6, q_scale).unwrap();
+                let split = |at: usize, len: usize, heads: usize, d: usize| {
+                    ref_out
+                        .narrow(2, at, len)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                        .reshape((b, s, heads, d))
+                        .unwrap()
+                };
+                let rq = l2norm(&split(0, hk * dk, hk, dk), 1e-6)
+                    .unwrap()
+                    .affine(q_scale, 0.0)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let rk = l2norm(&split(hk * dk, hk * dk, hk, dk), 1e-6)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let rv = split(2 * hk * dk, hv * dv, hv, dv)
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                assert_eq!(bits32(&q), bits32(&rq), "q dk {dk} s {s}");
+                assert_eq!(bits32(&k), bits32(&rk), "k dk {dk} s {s}");
+                assert_eq!(bits32(&v), bits32(&rv), "v dk {dk} s {s}");
+
+                let a = bf(sample(b * s * hv, 6.0), &[b, s, hv]);
+                let bb = bf(sample(b * s * hv, 6.0), &[b, s, hv]);
+                let a_log = bf(sample(hv, 1.5), &[hv]);
+                let dt_bias = bf(sample(hv, 2.0), &[hv]);
+                let (g, beta) = candle_quant_kernels::gdn_gates(&a, &bb, &a_log, &dt_bias).unwrap();
+                let rg = compute_g(&a, &a_log, &dt_bias)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let rbeta = sigmoid(&bb).unwrap().to_dtype(DType::F32).unwrap();
+                assert_eq!(bits32(&g), bits32(&rg), "g dk {dk} s {s}");
+                assert_eq!(bits32(&beta), bits32(&rbeta), "beta dk {dk} s {s}");
+            }
+        }
+    }
 
     /// SW-7099 review: in a ModelOpt checkpoint a weight without `.weight_scale` (a dense
     /// `lm_head`) loads dense under the load's quantized format, where a dense checkpoint's

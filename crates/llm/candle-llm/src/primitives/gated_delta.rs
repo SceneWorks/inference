@@ -336,6 +336,39 @@ fn per_token(
     Ok((y, state))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch keeping the GDN input preparation on its op chains on this thread, so a
+    /// test can compare the fused kernels against them.
+    static FORCE_UNFUSED_PREP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the GDN input preparation on its op chains (this thread only).
+#[cfg(test)]
+pub(crate) fn with_unfused_prep<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_UNFUSED_PREP.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_UNFUSED_PREP.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether the fused GDN input-preparation kernels ([`candle_quant_kernels::gdn_conv_silu`],
+/// `gdn_qkv`, `gdn_gates`) serve `x`: a `BF16` tensor on a CUDA device whose kernels compile.
+/// They are bit-identical to the op chains they replace, so this is a pure speed choice.
+pub(crate) fn fused_prep_serves(x: &Tensor) -> bool {
+    #[cfg(test)]
+    if FORCE_UNFUSED_PREP.with(std::cell::Cell::get) {
+        return false;
+    }
+    x.device().is_cuda()
+        && x.dtype() == DType::BF16
+        && candle_quant_kernels::gdn_prep_available(x.device()).is_ok()
+}
+
 /// Whether the fused recurrence kernel serves this step: a CUDA device whose kernel compiles,
 /// `F32` operands and ring, and a key head it fits. Anything else takes the op-chain reference.
 fn fused_step_serves(q: &Tensor, ssm: &Tensor, g: &Tensor) -> bool {
@@ -678,6 +711,19 @@ pub fn causal_depthwise_conv_traced(
 ) -> Result<(Tensor, ConvTrace)> {
     let (_b, s, c) = x.dims3()?;
     let kk = weight.dim(1)?; // kernel size K (weight is [C, K])
+    if fused_prep_serves(x) && weight.dtype() == DType::BF16 && conv_state.dtype() == DType::BF16
+    {
+        // One kernel for the concat, the K-tap conv and the SiLU, bit-identical to the chain below.
+        let (cat, out) = candle_quant_kernels::gdn_conv_silu(conv_state, x, weight)?;
+        return Ok((
+            out,
+            ConvTrace {
+                cat,
+                tokens: s,
+                tail: kk - 1,
+            },
+        ));
+    }
     let cat = Tensor::cat(&[conv_state, x], 1)?; // [B, S+K-1, C]
     let mut acc: Option<Tensor> = None;
     for j in 0..kk {
