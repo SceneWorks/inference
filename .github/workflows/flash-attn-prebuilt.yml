@@ -1,6 +1,11 @@
 name: Prebuilt FlashAttention
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/flash-attn-prebuilt.yml
+      - crates/media/candle-gen/vendor/candle-flash-attn/**
+      - scripts/ci/flash_attn_prebuilt.py
   push:
     branches: [main]
     paths:
