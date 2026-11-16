@@ -54,6 +54,9 @@ use crate::image_vae::{MiniMaxH3ImageVae, MiniMaxH3ImageVaeEncoder, IMAGE_VAE_CO
 use crate::model::{require_component_shards, resolve_seed, run_conditioner, PhaseLog};
 use crate::text_encoder::MiniMaxH3Tokenizer;
 
+/// Caption context, per-row modality tags, and ordered reference latents.
+type ImageConditioning = (Tensor, Vec<u32>, Vec<Tensor>);
+
 /// The engine id. A separate family from H3 video (`minimax_h3`): a different checkpoint, a
 /// different modality and a different request contract.
 pub const IMAGE_MODEL_ID: &str = "minimax_h3_image";
@@ -257,7 +260,7 @@ impl MiniMaxH3Image {
         references: &[&candle_gen::gen_core::Image],
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<(Tensor, Vec<u32>, Vec<Tensor>)> {
+    ) -> Result<ImageConditioning> {
         let vision_images = references
             .iter()
             .map(|r| resize_reference(r, contract::reference_vision_size(r.width, r.height)))
@@ -319,7 +322,7 @@ impl MiniMaxH3Image {
         references: &[&candle_gen::gen_core::Image],
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<(Tensor, Vec<u32>, Vec<Tensor>)> {
+    ) -> Result<ImageConditioning> {
         Ok(if references.is_empty() {
             let phase = PhaseLog::start("text_encoder");
             let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
@@ -349,7 +352,7 @@ impl MiniMaxH3Image {
         items: &[candle_gen::gen_core::train::TrainingItem],
         cancel: &candle_gen::gen_core::CancelFlag,
         mut on_caption: impl FnMut(usize),
-    ) -> Result<Vec<(Tensor, Vec<u32>, Vec<Tensor>)>> {
+    ) -> Result<Vec<ImageConditioning>> {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
