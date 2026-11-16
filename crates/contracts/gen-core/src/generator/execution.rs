@@ -457,6 +457,67 @@ mod tests {
     }
 
     #[test]
+    fn default_planned_report_never_claims_resolved_facts() {
+        struct Planned(ModelDescriptor);
+        impl Generator for Planned {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &self.0
+            }
+            fn validate(&self, _req: &GenerationRequest) -> Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _req: &GenerationRequest,
+                _on_progress: &mut dyn FnMut(Progress),
+            ) -> Result<GenerationOutput> {
+                unreachable!("the planned entry owns execution")
+            }
+            fn generate_planned(
+                &self,
+                _request: &GenerationRequest,
+                _plan: &crate::RenderPlan,
+                _scope: Option<&mut dyn crate::MemoryRequestScope>,
+                _on_progress: &mut dyn FnMut(Progress),
+            ) -> Result<crate::GenerationReport> {
+                Ok(crate::GenerationReport::from_output(
+                    GenerationOutput::Images(vec![crate::Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    }]),
+                ))
+            }
+        }
+        let request = GenerationRequest {
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        let plan = crate::RenderPlan::base_image(
+            &descriptor(),
+            &request,
+            crate::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 0.0,
+                sigmas: vec![1.0, 0.0],
+                executed_steps: 1,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+        let completed = Planned(descriptor())
+            .generate_planned_with_execution_report(&request, &plan, None, &mut |_| {})
+            .unwrap();
+        assert!(matches!(
+            completed.execution,
+            ExecutionIdentity::Unavailable { .. }
+        ));
+    }
+
+    #[test]
     fn failed_attempt_has_no_completed_report() {
         struct Failing(ModelDescriptor);
         impl Generator for Failing {

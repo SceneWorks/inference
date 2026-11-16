@@ -348,6 +348,31 @@ pub fn capture_with<G: Generator + ?Sized>(
     CompletedGeneration::new(generation, execution, generator.descriptor())
 }
 
+/// The admitted-runner counterpart of [`capture_with`]: one attempt around the provider's
+/// planned body, so observations made inside the scope's Conditioning/Denoise/Decode phases bind
+/// to this output. The consumer's progress callback stays outside the attempt.
+pub fn capture_planned_with<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    plan: &gen_core::RenderPlan,
+    scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+    on_progress: &mut dyn FnMut(Progress),
+    loaded_policy: impl FnOnce(),
+) -> gen_core::Result<CompletedGeneration> {
+    let attempt = Attempt::begin();
+    loaded_policy();
+    let generation = generator.generate_planned(req, plan, scope, &mut |progress| {
+        outside_attempt(|| on_progress(progress));
+    })?;
+    if req.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    let observations = attempt.finish();
+    let images = output_facts(generation.output.as_ref());
+    let execution = observations.identity(generator.descriptor(), &images);
+    CompletedGeneration::new(generation, execution, generator.descriptor())
+}
+
 fn output_facts(output: Option<&GenerationOutput>) -> Vec<Value> {
     match output {
         Some(GenerationOutput::Images(images)) => images
@@ -531,6 +556,91 @@ mod tests {
         ) -> gen_core::Result<CompletedGeneration> {
             capture(self, req, progress)
         }
+        fn generate_planned(
+            &self,
+            req: &GenerationRequest,
+            plan: &gen_core::RenderPlan,
+            scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+            progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<gen_core::GenerationReport> {
+            // Metadata only: the admitted phases wrap the same fixture body.
+            let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+            run.encode(|| {
+                policy("fixture/conditioning", json!("inside"));
+                Ok::<_, gen_core::Error>(())
+            })?;
+            let mut outputs = run.images(
+                progress,
+                |_seed| Ok::<_, gen_core::Error>(()),
+                |_seed, (), progress| self.generate(req, progress),
+                |_seed, output, _progress| {
+                    policy("fixture/decode", json!("inside"));
+                    Ok(output)
+                },
+            )?;
+            Ok(gen_core::GenerationReport::from_output(outputs.remove(0)))
+        }
+        fn generate_planned_with_execution_report(
+            &self,
+            req: &GenerationRequest,
+            plan: &gen_core::RenderPlan,
+            scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+            progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<CompletedGeneration> {
+            capture_planned_with(self, req, plan, scope, progress, || {
+                policy("fixture/loaded", json!("at_load"));
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PhaseLog(Vec<(bool, gen_core::MemoryPhase)>);
+    impl gen_core::MemoryRequestScope for PhaseLog {
+        fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+            unreachable!("the runner configures before the provider runs")
+        }
+        fn enter_phase(&mut self, phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+            self.0.push((true, phase));
+            Ok(())
+        }
+        fn leave_phase(&mut self, phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+            self.0.push((false, phase));
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: gen_core::MemoryGeometry,
+        ) -> gen_core::Result<()> {
+            unreachable!("the fixture has no tiled decode")
+        }
+        fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+            unreachable!("the fixture has no attention budget")
+        }
+        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+            unreachable!("the fixture streams no transformer blocks")
+        }
+        fn finish(&mut self, _: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+            unreachable!("the runner owns finish")
+        }
+    }
+
+    fn fixture_plan(req: &GenerationRequest) -> gen_core::RenderPlan {
+        gen_core::RenderPlan::base_image(
+            &DESCRIPTOR,
+            req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 0.0,
+                sigmas: vec![1.0, 0.25, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap()
     }
 
     fn resolved(completed: CompletedGeneration) -> Box<ResolvedExecutionIdentity> {
@@ -929,6 +1039,66 @@ mod tests {
         let missing = make(2).missing;
         assert_eq!(missing.len(), 1);
         assert!(missing[0].contains("byte-bound installation receipt"));
+    }
+
+    #[test]
+    fn admitted_planned_entry_reports_the_whole_scoped_attempt() {
+        let req = GenerationRequest {
+            width: 512,
+            height: 512,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let plan = fixture_plan(&req);
+        let mut scope = PhaseLog::default();
+        let identity = resolved(
+            Fixture
+                .generate_planned_with_execution_report(&req, &plan, Some(&mut scope), &mut |_| {
+                    // The consumer's callback is not this provider's execution.
+                    policy("consumer/callback", json!("outside"));
+                    draw("consumer_callback", 100, 99);
+                })
+                .unwrap(),
+        );
+        use gen_core::MemoryPhase::{Conditioning, Decode, Denoise};
+        assert_eq!(
+            scope.0,
+            [
+                (true, Conditioning),
+                (false, Conditioning),
+                (true, Denoise),
+                (false, Denoise),
+                (true, Decode),
+                (false, Decode),
+            ]
+        );
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("quality policy")
+        };
+        let operations = &value["operations"];
+        for inside in ["fixture/loaded", "fixture/conditioning", "fixture/decode"] {
+            assert!(operations.get(inside).is_some(), "{inside}: {operations}");
+        }
+        assert!(operations.get("consumer/callback").is_none());
+        let ExecutionRandomness::Draws { draws, .. } = identity.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(5));
+
+        let canceled = GenerationRequest {
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        let signal = canceled.cancel.clone();
+        let result = Fixture.generate_planned_with_execution_report(
+            &canceled,
+            &fixture_plan(&canceled),
+            None,
+            &mut |_| signal.cancel(),
+        );
+        assert!(matches!(result, Err(gen_core::Error::Canceled)));
     }
 
     #[test]

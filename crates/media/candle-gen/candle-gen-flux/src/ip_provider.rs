@@ -433,31 +433,56 @@ impl IpAdapterFlux {
         })
     }
 
-    /// [`generate_planned`](Self::generate_planned), completed as a standalone route with
-    /// observations from this same attempt.
-    pub fn generate_planned_with_execution_report(
+    /// Reference-image T2I from a pre-load plan, completed with observations from this same attempt.
+    pub fn generate_with_execution_report(
         &self,
         req: &IpAdapterFluxRequest,
         reference: &Image,
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        let mut report_progress =
-            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(
-            &crate::descriptor_for(self.variant),
+        self.complete_ip_image(
             &req.cancel,
-            || {
-                candle_gen::execution::policy(
-                    "direct_route",
-                    "flux/ip_provider/generate_planned".into(),
-                );
-                let image = self
-                    .generate_planned(req, reference, plan, &mut report_progress)
-                    .map_err(candle_gen::gen_core::Error::from)?;
-                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            "flux/ip_provider/generate",
+            on_progress,
+            |progress| self.generate_planned(req, reference, plan, progress),
+        )
+    }
+
+    /// The admitted entry, completed with observations from this same attempt — including the
+    /// work inside its Conditioning/Denoise/Decode scopes.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &IpAdapterFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        self.complete_ip_image(
+            &req.cancel,
+            "flux/ip_provider/generate_with_memory_context",
+            on_progress,
+            |progress| {
+                self.generate_with_memory_context_planned(context, req, reference, plan, progress)
             },
         )
+    }
+
+    fn complete_ip_image(
+        &self,
+        cancel: &CancelFlag,
+        route: &'static str,
+        on_progress: &mut dyn FnMut(Progress),
+        run: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Image>,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor_for(self.variant), cancel, || {
+            candle_gen::execution::policy("direct_route", route.into());
+            let image = run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
     }
 
     /// Reference-image T2I from the trajectory [`compile_ip_plan`] froze before load: condition the

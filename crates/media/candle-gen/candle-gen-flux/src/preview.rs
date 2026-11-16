@@ -1058,13 +1058,24 @@ mod tests {
             .join("\n");
         assert_eq!(
             stripped.matches("fn generate").count(),
-            5,
-            "control_provider.rs must expose exactly the three planned entry points, the attempt-report \
-             wrapper, and the one scoped body this row reasons about"
+            8,
+            "control_provider.rs must expose exactly the three planned entry points, their four \
+             attempt-report wrappers, and the one scoped body this row reasons about"
         );
-        assert!(
-            stripped.contains(".generate_with_injector_planned(\n"),
-            "the attempt-report wrapper must delegate to the unscoped planned entry point"
+        assert_eq!(
+            stripped
+                .matches("self.generate_with_injector_planned(")
+                .count(),
+            2,
+            "both unadmitted attempt-report wrappers must delegate to the unscoped planned entry"
+        );
+        assert_eq!(
+            stripped
+                .matches("self.generate_with_injector_memory_context_planned(")
+                .count(),
+            3,
+            "the plain admitted entry and both admitted attempt-report wrappers must delegate to \
+             the injector-aware admitted entry"
         );
         assert_eq!(
             stripped

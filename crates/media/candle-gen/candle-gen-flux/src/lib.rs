@@ -245,18 +245,36 @@ pub struct FluxGenerator {
     load_binding: gen_core::RenderLoadBinding,
 }
 
+impl FluxGenerator {
+    /// Load-time selections bound to every reported attempt.
+    fn observe_loaded(&self) {
+        self.pipe.observe_adapter_provenance();
+        candle_gen::execution::policy(
+            "loaded/loaded_quant",
+            format!("{:?}", self.loaded_quant).into(),
+        );
+    }
+}
+
 impl Generator for FluxGenerator {
     fn generate_with_execution_report(
         &self,
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
-            self.pipe.observe_adapter_provenance();
-            candle_gen::execution::policy(
-                "loaded/loaded_quant",
-                format!("{:?}", self.loaded_quant).into(),
-            );
+        candle_gen::execution::capture_with(self, req, on_progress, || self.observe_loaded())
+    }
+
+    /// The admitted runner's entry: the same planned body, captured as one attempt.
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            self.observe_loaded()
         })
     }
 

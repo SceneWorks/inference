@@ -212,6 +212,29 @@ pub trait Generator {
         )))
     }
 
+    /// [`generate_planned`](Self::generate_planned) with an attempt-local execution report — the
+    /// admitted-runner counterpart of [`generate_with_execution_report`](Self::generate_with_execution_report).
+    /// The capture covers the whole planned attempt, including work inside the scope's
+    /// Conditioning/Denoise/Decode phases. The default never claims resolved facts; repository
+    /// providers with a render-plan executor override it to capture their actual choices.
+    fn generate_planned_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        plan: &crate::RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        let generation = self.generate_planned(request, plan, scope, on_progress)?;
+        if request.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        CompletedGeneration::new(
+            generation,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
+    }
+
     /// **Incremental / low-latency audio synthesis** (sc-12846) — the streaming counterpart of
     /// [`generate`](Self::generate), the audio analog of `core_llm`'s token-streaming
     /// [`TextLlm::generate`](crate::core_llm::TextLlm::generate). A realtime/streaming provider

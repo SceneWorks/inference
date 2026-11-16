@@ -56,6 +56,22 @@ fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
     descriptor
 }
 
+/// Run one control entry as a single reported attempt. The consumer's progress callback stays
+/// outside it; observations from every phase of the planned body bind to the returned image.
+fn complete_control_image(
+    cancel: &CancelFlag,
+    route: &'static str,
+    on_progress: &mut dyn FnMut(Progress),
+    run: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Image>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    let mut report_progress = |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+    candle_gen::execution::capture_direct(&control_report_descriptor(), cancel, || {
+        candle_gen::execution::policy("direct_route", route.into());
+        let image = run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
+        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+    })
+}
+
 #[cfg(test)]
 use crate::vae::native::{DiagonalGaussian, Encoder};
 use candle_core::{DType, Device, Tensor};
@@ -466,9 +482,27 @@ impl Flux1DevControl {
         self.branch.num_residuals()
     }
 
-    /// [`generate_with_injector_planned`](Self::generate_with_injector_planned), completed as a
-    /// standalone route with observations from this same attempt.
-    pub fn generate_with_injector_planned_with_execution_report(
+    /// Plain control from a pre-load plan, completed with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        complete_control_image(
+            &req.cancel,
+            "flux/control_provider/generate",
+            on_progress,
+            |progress| {
+                self.generate_with_injector_planned(req, control_image, None, plan, progress)
+            },
+        )
+    }
+
+    /// Identity stacked on control (or plain control with `None`), completed with observations
+    /// from this same attempt.
+    pub fn generate_with_injector_with_execution_report(
         &self,
         req: &Flux1ControlRequest,
         control_image: &Image,
@@ -476,24 +510,69 @@ impl Flux1DevControl {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        let mut report_progress =
-            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
-            candle_gen::execution::policy(
-                "direct_route",
-                "flux/control_provider/generate_with_injector_planned".into(),
-            );
-            let image = self
-                .generate_with_injector_planned(
+        complete_control_image(
+            &req.cancel,
+            "flux/control_provider/generate_with_injector",
+            on_progress,
+            |progress| {
+                self.generate_with_injector_planned(req, control_image, injector, plan, progress)
+            },
+        )
+    }
+
+    /// The admitted plain-control entry, completed with observations from this same attempt —
+    /// including the work inside its Conditioning/Denoise/Decode scopes.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        complete_control_image(
+            &req.cancel,
+            "flux/control_provider/generate_with_memory_context",
+            on_progress,
+            |progress| {
+                self.generate_with_injector_memory_context_planned(
+                    context,
+                    req,
+                    control_image,
+                    None,
+                    plan,
+                    progress,
+                )
+            },
+        )
+    }
+
+    /// The admitted identity-on-control entry, completed with observations from this same attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_injector_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        complete_control_image(
+            &req.cancel,
+            "flux/control_provider/generate_with_injector_memory_context",
+            on_progress,
+            |progress| {
+                self.generate_with_injector_memory_context_planned(
+                    context,
                     req,
                     control_image,
                     injector,
                     plan,
-                    &mut report_progress,
+                    progress,
                 )
-                .map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
-        })
+            },
+        )
     }
 
     /// Generate one control-conditioned image from the trajectory [`compile_control_plan`] froze
@@ -955,6 +1034,58 @@ mod tests {
         let descriptor = control_report_descriptor();
         assert_eq!(descriptor.id, "flux1_dev_control");
         assert_eq!(descriptor.backend, "candle");
+    }
+
+    /// Metadata only: the admitted route's report binds every observation the planned body makes
+    /// to this attempt's image, names main's route, and leaves the consumer callback outside.
+    #[test]
+    fn admitted_control_report_binds_the_planned_attempt() {
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+        let cancel = CancelFlag::default();
+        let completed = complete_control_image(
+            &cancel,
+            "flux/control_provider/generate_with_memory_context",
+            &mut |_| candle_gen::execution::policy("consumer/callback", true.into()),
+            |progress| {
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                candle_gen::execution::rng_scheme("fixture-metadata-v1");
+                candle_gen::execution::draw("fixture", 7, 0);
+                candle_gen::execution::schedule("euler", &[1.0, 0.0], "Flow");
+                resolved_control_guidance(3.5);
+                observe_injector(None);
+                progress(Progress::Step {
+                    current: 1,
+                    total: 1,
+                });
+                Ok(Image {
+                    width: 2,
+                    height: 1,
+                    pixels: vec![0; 6],
+                })
+            },
+        )
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = completed.execution else {
+            panic!("expected a resolved report: {:?}", completed.execution)
+        };
+        let ExecutionFact::Resolved { value } = &identity.quality_policy else {
+            panic!("quality policy")
+        };
+        let operations = &value["operations"];
+        assert_eq!(
+            operations["direct_route"][0]["value"],
+            "flux/control_provider/generate_with_memory_context"
+        );
+        assert!(operations.get("flux/control_guidance").is_some());
+        assert!(operations.get("flux/control_injector").is_some());
+        assert!(operations.get("consumer/callback").is_none());
+        assert!(complete_control_image(
+            &cancel,
+            "flux/control_provider/generate",
+            &mut |_| {},
+            |_| Err(CandleError::Msg("fixture failure".into())),
+        )
+        .is_err());
     }
 
     /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5, pose).

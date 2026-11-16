@@ -624,7 +624,7 @@ impl PulidFlux {
     }
 
     /// Bind a completed planned image to observations from this same PuLID attempt.
-    pub fn generate_planned_with_execution_report(
+    pub fn generate_with_execution_report(
         &self,
         req: &PulidFluxRequest,
         reference: &Image,
@@ -633,7 +633,7 @@ impl PulidFlux {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        complete_pulid_image(&req.cancel, "pulid/pulid_flux/generate_planned", || {
+        complete_pulid_image(&req.cancel, "pulid/pulid_flux/generate", || {
             self.generate_planned(req, reference, plan, &mut report_progress)
         })
     }
@@ -659,7 +659,7 @@ impl PulidFlux {
     }
 
     /// Bind an admitted planned PuLID render's output to observations from that same attempt.
-    pub fn generate_with_memory_context_planned_with_execution_report(
+    pub fn generate_with_memory_context_with_execution_report(
         &self,
         context: &MemoryRunContext,
         req: &PulidFluxRequest,
@@ -671,7 +671,7 @@ impl PulidFlux {
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         complete_pulid_image(
             &req.cancel,
-            "pulid/pulid_flux/generate_with_memory_context_planned",
+            "pulid/pulid_flux/generate_with_memory_context",
             || {
                 self.generate_with_memory_context_planned(
                     context,

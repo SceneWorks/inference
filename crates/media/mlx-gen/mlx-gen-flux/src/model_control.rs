@@ -511,6 +511,28 @@ impl ControlBranch for Flux1DevControl {
     }
 }
 
+impl Flux1DevControl {
+    /// Load-time selections bound to every reported attempt.
+    fn observe_loaded(&self) {
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.loaded_sequential_residency",
+            &self.residency.is_sequential(),
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.load_precision_policy",
+            &self.loaded_spec.precision,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.load_quantization_policy",
+            &self.loaded_spec.quantize,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.applied_adapter_controls",
+            &crate::model::applied_adapter_controls(&self.loaded_spec),
+        );
+    }
+}
+
 impl Generator for Flux1DevControl {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -579,27 +601,31 @@ impl Generator for Flux1DevControl {
             self.descriptor(),
             &req.cancel,
             || {
-                mlx_gen::image_execution::policy_debug(
-                    "Flux1DevControl.loaded_sequential_residency",
-                    &self.residency.is_sequential(),
-                );
-                mlx_gen::image_execution::policy_debug(
-                    "Flux1DevControl.load_precision_policy",
-                    &self.loaded_spec.precision,
-                );
-                mlx_gen::image_execution::policy_debug(
-                    "Flux1DevControl.load_quantization_policy",
-                    &self.loaded_spec.quantize,
-                );
-                mlx_gen::image_execution::policy_debug(
-                    "Flux1DevControl.applied_adapter_controls",
-                    &crate::model::applied_adapter_controls(&self.loaded_spec),
-                );
+                self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_observed(req, &mut progress)
                     .map(mlx_gen::gen_core::GenerationReport::from_output)
             },
+        )
+    }
+
+    /// The admitted runner's entry: the same planned body, captured as one attempt that covers
+    /// the work inside its Conditioning/Denoise/Decode scopes.
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || self.observe_loaded(),
         )
     }
 }

@@ -346,6 +346,20 @@ pub(crate) fn compile_plan(
     Ok(Some(compile_constructed_plan(req)?.bind_load(spec)))
 }
 
+impl PulidFlux {
+    /// Load-time selections bound to every reported attempt.
+    fn observe_loaded(&self) {
+        mlx_gen::image_execution::policy_debug(
+            "PulidFlux.load_precision_policy",
+            &self.loaded_spec.precision,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "PulidFlux.load_quantization_policy",
+            &self.loaded_spec.quantize,
+        );
+    }
+}
+
 impl Generator for PulidFlux {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -418,19 +432,31 @@ impl Generator for PulidFlux {
             self.descriptor(),
             &req.cancel,
             || {
-                mlx_gen::image_execution::policy_debug(
-                    "PulidFlux.load_precision_policy",
-                    &self.loaded_spec.precision,
-                );
-                mlx_gen::image_execution::policy_debug(
-                    "PulidFlux.load_quantization_policy",
-                    &self.loaded_spec.quantize,
-                );
+                self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_observed(req, &mut progress)
                     .map(mlx_gen::gen_core::GenerationReport::from_output)
             },
+        )
+    }
+
+    /// The admitted runner's entry: the same planned body, captured as one attempt that covers
+    /// the work inside its Conditioning/Denoise/Decode scopes.
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || self.observe_loaded(),
         )
     }
 }
