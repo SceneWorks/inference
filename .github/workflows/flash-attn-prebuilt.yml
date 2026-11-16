@@ -33,6 +33,11 @@ jobs:
       - name: Disable unstable sccache wrapper
         shell: powershell
         run: Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+      - name: Select Git Bash on Windows
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
@@ -45,6 +50,13 @@ jobs:
           mkdir "%CANDLE_FLASH_ATTN_BUILD_DIR%" || exit /b 1
           cargo build --locked -p candle-flash-attn || exit /b 1
           python3 scripts\ci\flash_attn_prebuilt.py --directory "%CANDLE_FLASH_ATTN_BUILD_DIR%" --output "%RUNNER_TEMP%\flash-attn-x86_64-pc-windows-msvc.tar.gz" --target x86_64-pc-windows-msvc --revision %GITHUB_SHA% || exit /b 1
+          mkdir "%RUNNER_TEMP%\flash-attn-verify" || exit /b 1
+          tar -xzf "%RUNNER_TEMP%\flash-attn-x86_64-pc-windows-msvc.tar.gz" -C "%RUNNER_TEMP%\flash-attn-verify" || exit /b 1
+          set CANDLE_FLASH_ATTN_PREBUILT_DIR=%RUNNER_TEMP%\flash-attn-verify
+          cargo clean -p candle-flash-attn || exit /b 1
+          cargo build --locked -p candle-flash-attn >"%RUNNER_TEMP%\flash-attn-link.log" 2>&1 || (type "%RUNNER_TEMP%\flash-attn-link.log" & exit /b 1)
+          type "%RUNNER_TEMP%\flash-attn-link.log"
+          findstr /c:"linking verified prebuilt FlashAttention archive" "%RUNNER_TEMP%\flash-attn-link.log" || exit /b 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flash-attn-windows
@@ -74,6 +86,12 @@ jobs:
           mkdir -p "$CANDLE_FLASH_ATTN_BUILD_DIR"
           cargo build --locked -p candle-flash-attn
           python3 scripts/ci/flash_attn_prebuilt.py --directory "$CANDLE_FLASH_ATTN_BUILD_DIR" --output "$RUNNER_TEMP/flash-attn-x86_64-unknown-linux-gnu.tar.gz" --target x86_64-unknown-linux-gnu --revision "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/flash-attn-verify"
+          tar -xzf "$RUNNER_TEMP/flash-attn-x86_64-unknown-linux-gnu.tar.gz" -C "$RUNNER_TEMP/flash-attn-verify"
+          export CANDLE_FLASH_ATTN_PREBUILT_DIR="$RUNNER_TEMP/flash-attn-verify"
+          cargo clean -p candle-flash-attn
+          cargo build --locked -p candle-flash-attn 2>&1 | tee "$RUNNER_TEMP/flash-attn-link.log"
+          grep -q 'linking verified prebuilt FlashAttention archive' "$RUNNER_TEMP/flash-attn-link.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flash-attn-linux
