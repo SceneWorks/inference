@@ -203,6 +203,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
+use candle_gen::gen_core::generator::{
+    ExecutionFact, ExecutionIdentity, ExecutionRandomness, ExecutionReplaySupport,
+    ResolvedExecutionIdentity,
+};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
@@ -215,6 +219,72 @@ use pipeline::{Components, Pipeline, SdxlComponents};
 /// worker maps both `sdxl` and `realvisxl` onto engine id `"sdxl"`, so — exactly like
 /// `mlx-gen-sdxl` — this crate registers a SINGLE descriptor under `"sdxl"`.
 pub const MODEL_ID: &str = "sdxl";
+
+/// The no-adapter 1024² DDIM route was qualified with two fresh final PNGs on one
+/// physical GPU and a pinned runtime. Other SDXL routes retain their typed refusal.
+fn qualified_replay_route(req: &GenerationRequest, identity: &ResolvedExecutionIdentity) -> bool {
+    let generic_refusal = "candle-execution-v1 observes execution choices but has no provider/runtime deterministic-kernel attestation; exact replay is not supported";
+    if !matches!(&identity.deterministic_replay, ExecutionReplaySupport::NonDeterministic { reason } if reason == generic_refusal)
+        || identity.provider_id != MODEL_ID
+        || identity.backend != "candle"
+        || identity.runtime_id != "candle-execution-v1"
+        || identity.output_units != 1
+        || req.width != 1024
+        || req.height != 1024
+        || req.count != 1
+        || req.steps != Some(20)
+        || req.guidance.map(f32::to_bits) != Some(7.5f32.to_bits())
+        || req.sampler.as_deref() != Some("ddim")
+        || req.scheduler.as_deref() != Some("normal")
+        || req.seed.is_none()
+        || req.enhance_prompt
+        || !req.conditioning.is_empty()
+        || !req.prompt_batch.is_empty()
+        || req.moss_image.is_some()
+    {
+        return false;
+    }
+    let ExecutionFact::Resolved { value: sampling } = &identity.sampling else {
+        return false;
+    };
+    let ExecutionFact::Resolved { value: schedule } = &identity.schedule else {
+        return false;
+    };
+    let ExecutionFact::Resolved { value: geometry } = &identity.geometry else {
+        return false;
+    };
+    let ExecutionFact::Resolved { value: quality } = &identity.quality_policy else {
+        return false;
+    };
+    let ExecutionRandomness::Draws { scheme, draws } = &identity.randomness else {
+        return false;
+    };
+    sampling == &serde_json::json!(["ddim"])
+        && schedule.as_array().is_some_and(|entries| {
+            entries.len() == 1
+                && entries[0]["sampler"] == "ddim"
+                && entries[0]["schedule"]["count"] == 21
+                && entries[0]["schedule"]["element"] == "f32_le_bits"
+        })
+        && geometry
+            == &serde_json::json!([{"width":1024,"height":1024,"channels":3,"format":"rgb8"}])
+        && quality["compute"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["device"]
+                    .as_str()
+                    .is_some_and(|device| device.starts_with("Cuda"))
+            })
+        })
+        && scheme
+            == "candle-ordered-provider-streams-v1:rand-0.9-StdRng-rand_distr-StandardNormal-f32"
+        && !draws.is_empty()
+        && draws.iter().all(|draw| {
+            draw.output_index == 0
+                && draw.purpose == "sdxl/pipeline"
+                && draw.seed == req.seed
+                && draw.noise_sha256.is_none()
+        })
+}
 
 pub use memory_strategy::{
     provider_contract_for_spec,
@@ -372,14 +442,33 @@ impl Generator for SdxlGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let mut completed = candle_gen::execution::capture_with(self, req, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-sdxl/src/lib.rs",
             );
             candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
             candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
-        })
+        })?;
+        if self.adapters.is_empty()
+            && self.pid_spec.is_none()
+            && self.ldm.is_none()
+            && self.quant.is_none()
+            && self.dtype == DType::F16
+        {
+            if let ExecutionIdentity::Resolved { identity } = &mut completed.execution {
+                if qualified_replay_route(req, identity) {
+                    identity.deterministic_replay = ExecutionReplaySupport::Deterministic {
+                        scope: "same_device_pinned_runtime".into(),
+                    };
+                }
+            }
+        }
+        gen_core::generator::CompletedGeneration::new(
+            completed.generation,
+            completed.execution,
+            self.descriptor(),
+        )
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
@@ -1578,5 +1667,56 @@ mod tests {
                 || err.contains("cannot find the file"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn exact_replay_declaration_requires_the_qualified_observed_route() {
+        let request = GenerationRequest {
+            prompt: "an apple".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(16402),
+            steps: Some(20),
+            guidance: Some(7.5),
+            sampler: Some("ddim".into()),
+            scheduler: Some("normal".into()),
+            ..Default::default()
+        };
+        let identity = || {
+            serde_json::from_value::<ResolvedExecutionIdentity>(serde_json::json!({
+            "version": 1, "provider_id": "sdxl", "backend": "candle", "runtime_id": "candle-execution-v1",
+            "sampling": {"state":"resolved","value":["ddim"]},
+            "schedule": {"state":"resolved","value":[{"sampler":"ddim","estimator":"eps",
+                "schedule":{"count":21,"element":"f32_le_bits","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]},
+            "estimator": {"state":"resolved","value":["eps"]},
+            "randomness": {"kind":"draws","scheme":"candle-ordered-provider-streams-v1:rand-0.9-StdRng-rand_distr-StandardNormal-f32",
+                "draws":[{"output_index":0,"purpose":"sdxl/pipeline","seed":16402,"noise_sha256":null}]},
+            "deterministic_replay": {"kind":"non_deterministic","reason":"candle-execution-v1 observes execution choices but has no provider/runtime deterministic-kernel attestation; exact replay is not supported"},
+            "geometry": {"state":"resolved","value":[{"width":1024,"height":1024,"channels":3,"format":"rgb8"}]},
+            "quality_policy": {"state":"resolved","value":{"compute":[{"device":"Cuda(0)","dtype":"F16"}],"operations":{}}},
+            "output_policy": {"state":"resolved","value":[{"width":1024,"height":1024,"channels":3,"format":"rgb8"}]},
+            "provider_choices": {}, "output_units": 1
+        })).unwrap()
+        };
+        assert!(qualified_replay_route(&request, &identity()));
+        let mut changed = identity();
+        changed.randomness = ExecutionRandomness::NoDraws {
+            reason: "unobserved".into(),
+        };
+        assert!(!qualified_replay_route(&request, &changed));
+        let mut changed = identity();
+        changed.sampling = ExecutionFact::resolved(serde_json::json!(["euler"]));
+        assert!(!qualified_replay_route(&request, &changed));
+        let mut changed = identity();
+        changed.deterministic_replay = ExecutionReplaySupport::NonDeterministic {
+            reason: "provider-specific limit".into(),
+        };
+        assert!(!qualified_replay_route(&request, &changed));
+        let changed = GenerationRequest {
+            count: 2,
+            ..request.clone()
+        };
+        assert!(!qualified_replay_route(&changed, &identity()));
     }
 }
