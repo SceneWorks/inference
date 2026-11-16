@@ -720,10 +720,10 @@ fn expansion_is_longer(short: &str, expanded: &str) -> bool {
 
 #[test]
 fn at9_expansion_must_be_longer_than_the_short_prompt() {
-    let short = "a red bicycle leaning against a brick wall";
+    let short = "a red bicycle leaning against a brick fence";
     assert!(expansion_is_longer(
         short,
-        "A red bicycle with a worn leather saddle leans against a weathered brick wall."
+        "A red bicycle with a worn leather saddle leans against a weathered brick fence."
     ));
     assert!(!expansion_is_longer(short, short));
     assert!(!expansion_is_longer(short, "  a red bicycle  "));
