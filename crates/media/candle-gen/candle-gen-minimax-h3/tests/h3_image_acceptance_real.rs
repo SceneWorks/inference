@@ -799,6 +799,41 @@ fn expansion_is_longer(short: &str, expanded: &str) -> bool {
     expanded.trim().chars().count() > short.trim().chars().count()
 }
 
+/// Mean absolute per-channel difference between two equally sized 8-bit RGB buffers. AT9 uses it
+/// to prove the expanded conditioning reached the render: identical images (a generator ignoring
+/// the prompt) score 0.
+fn mean_abs_pixel_difference(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "renders must have the same size to compare"
+    );
+    if a.is_empty() {
+        return 0.0;
+    }
+    let total: u64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| u64::from(x.abs_diff(*y)))
+        .sum();
+    total as f64 / a.len() as f64
+}
+
+/// The smallest mean per-channel difference AT9 accepts between the short- and expanded-prompt
+/// renders. Two different prompts at one seed differ by tens of levels; 2.0 only rejects a render
+/// that ignored the expansion.
+const AT9_MIN_RENDER_DIFFERENCE: f64 = 2.0;
+
+#[test]
+fn at9_identical_renders_fail_the_difference_check() {
+    let a = vec![10u8, 20, 30, 40, 50, 60];
+    assert_eq!(mean_abs_pixel_difference(&a, &a), 0.0);
+    assert!(mean_abs_pixel_difference(&a, &a) < AT9_MIN_RENDER_DIFFERENCE);
+    let b = vec![35u8, 45, 55, 15, 25, 85];
+    assert_eq!(mean_abs_pixel_difference(&a, &b), 25.0);
+    assert!(mean_abs_pixel_difference(&a, &b) >= AT9_MIN_RENDER_DIFFERENCE);
+}
+
 #[test]
 fn at9_expansion_must_be_longer_than_the_short_prompt() {
     let short = "a red bicycle leaning against a brick fence";
@@ -869,6 +904,13 @@ fn h3_image_pe_expanded_prompt_renders_more_detail_cuda() {
         for render in [&plain, &rich] {
             assert_eq!((render.image.width, render.image.height), (2048, 2048));
         }
+        let difference = mean_abs_pixel_difference(&plain.image.pixels, &rich.image.pixels);
+        println!("AT9 mean per-channel difference short vs expanded: {difference:.2}");
+        assert!(
+            difference >= AT9_MIN_RENDER_DIFFERENCE,
+            "AT9: the expanded-prompt render is (near-)identical to the short-prompt render \
+             ({difference:.2} < {AT9_MIN_RENDER_DIFFERENCE}); the expansion did not reach the generator"
+        );
         #[cfg(feature = "model-inference-proof")]
         println!(
             "\nMODEL_INFERENCE_BODY_COMPLETED h3_image_acceptance_real::h3_image_pe_expanded_prompt_renders_more_detail_cuda"
