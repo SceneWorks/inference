@@ -336,6 +336,21 @@ fn per_token(
     Ok((y, state))
 }
 
+/// Whether the fused recurrence kernel serves this step: a CUDA device whose kernel compiles,
+/// `F32` operands and ring, and a key head it fits. Anything else takes the op-chain reference.
+fn fused_step_serves(q: &Tensor, ssm: &Tensor, g: &Tensor) -> bool {
+    #[cfg(test)]
+    if FORCE_PER_TOKEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    q.device().is_cuda()
+        && q.dtype() == DType::F32
+        && g.dtype() == DType::F32
+        && ssm.dtype() == DType::F32
+        && q.dim(3).is_ok_and(candle_quant_kernels::gated_delta_serves_key_dim)
+        && candle_quant_kernels::gated_delta_available(q.device()).is_ok()
+}
+
 /// The shortest run of un-checkpointed tokens the recurrence computes chunkwise (one full
 /// chunk); shorter runs step per token.
 pub const CHUNKED_PREFILL_MIN_TOKENS: usize = GDN_CHUNK;
@@ -781,6 +796,25 @@ impl StateRing {
         Ok(())
     }
 
+    /// The conv half of [`write`](Self::write) (the fused recurrence writes the SSM half).
+    fn write_conv(&self, position: i32, conv: &Tensor) -> Result<()> {
+        let slot = self.slot(position);
+        self.conv
+            .slice_set(&conv.contiguous()?.unsqueeze(0)?, 0, slot)?;
+        Ok(())
+    }
+
+    /// The conv half of [`write_at`](Self::write_at).
+    fn write_conv_at(&self, slot: &Tensor, conv: &Tensor) -> Result<()> {
+        candle_quant_kernels::write_rows_at(
+            &self.conv,
+            &conv.contiguous()?.unsqueeze(0)?,
+            slot,
+            0,
+        )?;
+        Ok(())
+    }
+
     /// [`write`](Self::write) into the slot the device `u32` `slot` names (sc-24441).
     fn write_at(&self, slot: &Tensor, conv: &Tensor, ssm: &Tensor) -> Result<()> {
         #[cfg(test)]
@@ -1111,6 +1145,74 @@ impl DeltaNetCache {
                 ring.lo = ring.lo.max(offset + t.min(slots) as i32 + 1 - slots as i32);
                 let ring = &*ring;
                 let first_write = t.saturating_sub(slots);
+                if !runs_chunked(first_write.min(t), q.device())
+                    && fused_step_serves(q, &ring.ssm, g)
+                {
+                    // The fused recurrence: one kernel over the step's tokens,
+                    // writing each token's state into its ring slot; the conv tails are written
+                    // as the reference sink writes them.
+                    let run = (|| -> Result<(Tensor, (Tensor, Tensor))> {
+                        for ti in first_write..t {
+                            match positions {
+                                Some(p) => ring.write_conv_at(&p.ring_write(ti)?, &conv.tail_after(ti)?)?,
+                                None => ring.write_conv(offset + ti as i32 + 1, &conv.tail_after(ti)?)?,
+                            }
+                        }
+                        let write = match positions {
+                            Some(p) => p.ring_writes(t)?,
+                            None => {
+                                let slots: Vec<u32> = (0..t)
+                                    .map(|ti| ring.slot(offset + ti as i32 + 1) as u32)
+                                    .collect();
+                                Tensor::from_vec(slots, t, ring.ssm.device())?
+                            }
+                        };
+                        let read;
+                        let state = match (positions, self.ssm_state.as_ref()) {
+                            (Some(p), _) if offset > 0 => {
+                                read = p.ring_read()?;
+                                candle_quant_kernels::GatedDeltaState::Slot {
+                                    ring: &ring.ssm,
+                                    index: &read,
+                                }
+                            }
+                            (None, Some(live)) if offset > 0 => {
+                                candle_quant_kernels::GatedDeltaState::Tensor(live)
+                            }
+                            _ => candle_quant_kernels::GatedDeltaState::Zero,
+                        };
+                        let y = candle_quant_kernels::gated_delta_step(
+                            q,
+                            k,
+                            v,
+                            g,
+                            beta,
+                            state,
+                            candle_quant_kernels::GatedDeltaRing {
+                                ssm: &ring.ssm,
+                                write: &write,
+                                first_write,
+                            },
+                        )?;
+                        Ok((y, ring.views(next)?))
+                    })();
+                    let (y, (conv_state, ssm_state)) = match run {
+                        Ok(out) => out,
+                        Err(e) => {
+                            if clobbers_live {
+                                self.conv_state = None;
+                                self.ssm_state = None;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let ring = self.ring.as_mut().expect("the ring branch");
+                    ring.lo = ring.lo.max(next + 1 - ring.slots as i32).max(1);
+                    self.conv_state = Some(conv_state);
+                    self.ssm_state = Some(ssm_state);
+                    self.offset = next;
+                    return Ok(y);
+                }
                 let mut sink = |ti: usize, state: &Tensor| -> Result<()> {
                     if ti < first_write {
                         return Ok(());
@@ -2072,6 +2174,102 @@ mod tests {
                 "ssm after {n}: {}",
                 max_abs_diff(&ssm, &fssm)
             );
+        }
+    }
+
+    /// The fused CUDA recurrence is bit-identical to the op chain it replaces: the same outputs
+    /// and the same ringed states through a prompt, single-token decodes, a speculative verify
+    /// step, a rollback into it and decoding on from there, for every served key width (GQA x3).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fused_recurrence_matches_the_op_chain_bit_for_bit() {
+        let Ok(device) = crate::device::new_cuda_for_test() else {
+            eprintln!("skipped: no CUDA device");
+            return;
+        };
+        if candle_quant_kernels::gated_delta_available(&device).is_err() {
+            eprintln!("skipped: the fused kernel does not compile here");
+            return;
+        }
+        let (b, hk, hv, dv, conv_dim) = (1usize, 2usize, 6usize, 16usize, 8usize);
+        for dk in [32usize, 64, 128, 256] {
+            let total = 12usize;
+            let mut seed = 0x9e37_79b9u32 ^ dk as u32;
+            let mut sample = |n: usize, scale: f32, bias: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        bias + ((seed % 20001) as f32 / 10000.0 - 1.0) * scale
+                    })
+                    .collect()
+            };
+            let q = Tensor::from_vec(sample(total * hk * dk, 0.1, 0.0), (b, total, hk, dk), &device).unwrap();
+            let k = Tensor::from_vec(sample(total * hk * dk, 0.1, 0.0), (b, total, hk, dk), &device).unwrap();
+            let v = Tensor::from_vec(sample(total * hv * dv, 1.0, 0.0), (b, total, hv, dv), &device).unwrap();
+            let g = Tensor::from_vec(sample(total * hv, 0.04, 0.95), (b, total, hv), &device).unwrap();
+            let beta = Tensor::from_vec(sample(total * hv, 0.4, 0.5), (b, total, hv), &device).unwrap();
+            let x = Tensor::from_vec(sample(total * conv_dim, 1.0, 0.0), (b, total, conv_dim), &device).unwrap();
+            let weight = Tensor::from_vec(sample(conv_dim * RK, 0.5, 0.0), (conv_dim, RK), &device).unwrap();
+            let spec = RingSpec {
+                slots: 6,
+                conv_dims: (b, RK - 1, conv_dim),
+                conv_dtype: DType::F32,
+                ssm_dims: (b, hv, dv, dk),
+                ssm_dtype: DType::F32,
+                device: device.clone(),
+            };
+            // (start, len) per advance; `None` rolls back to that position instead.
+            let plan: [(usize, usize, Option<i32>); 7] = [
+                (0, 3, None),
+                (3, 1, None),
+                (4, 1, None),
+                (5, 4, None),
+                (0, 0, Some(7)),
+                (7, 1, None),
+                (8, 4, None),
+            ];
+            let run = |cache: &mut DeltaNetCache| -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+                let mut seen = Vec::new();
+                for &(start, len, rollback) in &plan {
+                    if let Some(n) = rollback {
+                        cache.rollback_to(n).unwrap();
+                        continue;
+                    }
+                    let conv_state = match cache.conv_state() {
+                        Some(c) => c.clone(),
+                        None => Tensor::zeros((b, RK - 1, conv_dim), DType::F32, &device).unwrap(),
+                    };
+                    let (_out, trace) =
+                        causal_depthwise_conv_traced(&narrow_t(&x, start, len), &weight, &conv_state)
+                            .unwrap();
+                    let y = cache
+                        .advance(
+                            &trace,
+                            &narrow_t(&q, start, len),
+                            &narrow_t(&k, start, len),
+                            &narrow_t(&v, start, len),
+                            &narrow_t(&g, start, len),
+                            &narrow_t(&beta, start, len),
+                        )
+                        .unwrap();
+                    let (conv, ssm) = live(cache).unwrap();
+                    seen.push((host(&y), conv, ssm));
+                }
+                seen
+            };
+            let mut fused = DeltaNetCache::with_ring(spec.clone()).unwrap();
+            let fused_seen = run(&mut fused);
+            let mut reference = DeltaNetCache::with_ring(spec).unwrap();
+            let reference_seen = with_per_token_reference(|| run(&mut reference));
+            for (i, (f, r)) in fused_seen.iter().zip(&reference_seen).enumerate() {
+                let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&f.0), bits(&r.0), "dk {dk} step {i}: y");
+                assert_eq!(bits(&f.1), bits(&r.1), "dk {dk} step {i}: conv tail");
+                assert_eq!(bits(&f.2), bits(&r.2), "dk {dk} step {i}: ssm state");
+            }
+            assert_eq!(fused.restorable(), reference.restorable());
         }
     }
 
