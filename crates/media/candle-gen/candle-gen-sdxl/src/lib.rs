@@ -275,6 +275,19 @@ fn qualified_replay_route(req: &GenerationRequest, identity: &ResolvedExecutionI
                     .is_some_and(|device| device.starts_with("Cuda"))
             })
         })
+        && [
+            "sdxl/clip_l/representation",
+            "sdxl/clip_bigg/representation",
+            "sdxl/unet/representation",
+        ]
+        .iter()
+        .all(|key| {
+            quality["operations"][key]
+                .as_array()
+                .is_some_and(|observations| {
+                    observations.len() == 1 && observations[0]["value"] == "dense"
+                })
+        })
         && scheme
             == "candle-ordered-provider-streams-v1:rand-0.9-StdRng-rand_distr-StandardNormal-f32"
         && matches!(draws.as_slice(), [outer, inner]
@@ -1697,7 +1710,11 @@ mod tests {
                          {"output_index":0,"purpose":"sdxl/pipeline","seed":16402,"noise_sha256":null}]},
             "deterministic_replay": {"kind":"non_deterministic","reason":"candle-execution-v1 observes execution choices but has no provider/runtime deterministic-kernel attestation; exact replay is not supported"},
             "geometry": {"state":"resolved","value":[{"width":1024,"height":1024,"channels":3,"format":"rgb8"}]},
-            "quality_policy": {"state":"resolved","value":{"compute":[{"device":"Cuda(0)","dtype":"F16"}],"operations":{}}},
+            "quality_policy": {"state":"resolved","value":{"compute":[{"device":"Cuda(0)","dtype":"F16"}],"operations":{
+                "sdxl/clip_l/representation":[{"value":"dense","repetitions":1}],
+                "sdxl/clip_bigg/representation":[{"value":"dense","repetitions":1}],
+                "sdxl/unet/representation":[{"value":"dense","repetitions":1}]
+            }}},
             "output_policy": {"state":"resolved","value":[{"width":1024,"height":1024,"channels":3,"format":"rgb8"}]},
             "provider_choices": {}, "output_units": 1
         })).unwrap()
@@ -1707,6 +1724,12 @@ mod tests {
         changed.randomness = ExecutionRandomness::NoDraws {
             reason: "unobserved".into(),
         };
+        assert!(!qualified_replay_route(&request, &changed));
+        let mut changed = identity();
+        if let ExecutionFact::Resolved { value } = &mut changed.quality_policy {
+            value["operations"]["sdxl/unet/representation"][0]["value"] =
+                serde_json::json!("packed");
+        }
         assert!(!qualified_replay_route(&request, &changed));
         let mut changed = identity();
         if let ExecutionRandomness::Draws { draws, .. } = &mut changed.randomness {
