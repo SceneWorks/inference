@@ -364,6 +364,7 @@ impl LatentDecoder for SdxlLatentDecoder<'_> {
 
 /// Which of the two SDXL CLIP encoders — selects the tokenizer repo, the snapshot weights subpath,
 /// and which `StableDiffusionConfig` clip config to use.
+#[derive(Clone, Copy)]
 pub(crate) enum Clip {
     /// CLIP-L (`text_encoder/`) — `openai/clip-vit-large-patch14` tokenizer.
     L,
@@ -504,6 +505,7 @@ pub(crate) struct Components {
 pub(crate) enum SdxlUnet {
     Stock(Arc<UNet2DConditionModel>),
     Vendored(Arc<VendoredUNet>),
+    Packed(Arc<VendoredUNet>),
 }
 
 impl SdxlUnet {
@@ -518,7 +520,9 @@ impl SdxlUnet {
     ) -> Result<Tensor> {
         match self {
             Self::Stock(u) => Ok(u.forward(xs, timestep, encoder_hidden_states)?),
-            Self::Vendored(u) => Ok(u.forward(xs, timestep, encoder_hidden_states)?),
+            Self::Vendored(u) | Self::Packed(u) => {
+                Ok(u.forward(xs, timestep, encoder_hidden_states)?)
+            }
         }
     }
 }
@@ -646,6 +650,8 @@ impl Pipeline {
         uncond: &str,
     ) -> Result<Tensor> {
         let (plan_l, plan_g) = self.chunk_plans(toks)?;
+        Self::record_text_representation(Clip::L, &models.0);
+        Self::record_text_representation(Clip::BigG, &models.1);
         let chunks = long_prompt::common_chunks(
             &[(&plan_l, &toks.tok_l), (&plan_g, &toks.tok_g)],
             &[uncond, prompt],
@@ -696,6 +702,7 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let text_model = self.load_text_model(which)?;
+        Self::record_text_representation(which, &text_model);
         let result = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
             self.encode_loaded(&text_model, tokenizer, plan, prompt, uncond, chunks)
         });
@@ -707,6 +714,18 @@ impl Pipeline {
             self.load_text_model(Clip::L)?,
             self.load_text_model(Clip::BigG)?,
         ))
+    }
+
+    fn record_text_representation(which: Clip, model: &CandleModule) {
+        let key = match which {
+            Clip::L => "sdxl/clip_l/representation",
+            Clip::BigG => "sdxl/clip_bigg/representation",
+        };
+        let representation = match model {
+            CandleModule::Stock(_) => "dense",
+            CandleModule::Vendored(_) => "packed_or_imported",
+        };
+        candle_gen::execution::policy(key, representation.into());
     }
 
     fn load_text_model(&self, which: Clip) -> Result<CandleModule> {
@@ -887,7 +906,7 @@ impl Pipeline {
                     } else {
                         self.load_packed_unet_with_adapters(&packed_file, group_size)?
                     };
-                    SdxlUnet::Vendored(Arc::new(vendored))
+                    SdxlUnet::Packed(Arc::new(vendored))
                 }
                 None => {
                     let unet_file =
@@ -1150,6 +1169,12 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
         mut consume: impl FnMut(Tensor, &mut dyn FnMut(Progress)) -> Result<T>,
     ) -> Result<Vec<T>> {
+        // Both cached resident components and staged components enter here.
+        let representation = match unet {
+            SdxlUnet::Stock(_) | SdxlUnet::Vendored(_) => "dense",
+            SdxlUnet::Packed(_) => "packed",
+        };
+        candle_gen::execution::policy("sdxl/unet/representation", representation.into());
         // sc-6128: a `lightning` request runs the few-step Euler-trailing path. Every other render —
         // the omitted-sampler default AND every explicit curated solver name (incl. `ddim`) — routes
         // through the unified curated `Sampler` over `DiscreteModelSampling` (EPS), epic 7114 P4 / sc-7124.
