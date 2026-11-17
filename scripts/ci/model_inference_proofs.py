@@ -1739,6 +1739,9 @@ def main() -> int:
                 asset_setup = 'cohort-training'
             if bespoke_training_bindings(rows, args.backend) is not None:
                 asset_setup = 'bespoke-training'
+            from scripts.ci.prepare_mlx_training_proof_assets import exact_bindings as mlx_training_bindings
+            if mlx_training_bindings(rows, args.backend, value.get('runner')) is not None:
+                asset_setup = 'mlx-training'
             if (args.backend == 'candle-cuda' and len(rows) == 1
                     and rows[0]['package'] == 'candle-gen-krea'
                     and rows[0]['fqn'] == 'imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose'):

@@ -171,6 +171,14 @@ jobs:
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
         run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+      - name: Bind pinned provisioned bounded MLX training inputs
+        if: matrix.asset_setup == 'mlx-training' && runner.os == 'macOS'
+        shell: bash
+        env:
+          MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+        run: |
+          python3.12 -I scripts/ci/model_inference_proofs.py --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
+          python3.12 -I scripts/ci/prepare_mlx_training_proof_assets.py --plan "$RUNNER_TEMP/model-proof-plan.json"
       - name: Bind pinned installed bespoke bounded training inputs
         if: matrix.asset_setup == 'bespoke-training' && runner.os == 'Windows'
         shell: cmd

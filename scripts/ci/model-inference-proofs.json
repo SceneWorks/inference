@@ -192898,7 +192898,8 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
-      "model-inference-proof"
+      "model-inference-proof",
+      "mlx-gen/test-support"
     ],
     "route_metadata": {
       "ignore_reason": "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT); renders previews",
@@ -231371,7 +231372,8 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
-      "model-inference-proof"
+      "model-inference-proof",
+      "mlx-gen/test-support"
     ],
     "route_metadata": {
       "ignore_reason": "needs real stabilityai/stable-diffusion-3.5-medium weights + Metal; run as its own process",
@@ -250995,7 +250997,8 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
-      "model-inference-proof"
+      "model-inference-proof",
+      "mlx-gen/test-support"
     ],
     "route_metadata": {
       "ignore_reason": "needs the converted Wan2.2-T2V-A14B MoE bf16 checkpoint",
@@ -314940,6 +314943,79 @@
       ]
     },
     "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_acceptance_real.rs"
+  },
+  {
+    "package": "mlx-gen-moss-image",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::moss_bounded_training_trains_a_portrait",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "bounded SW-7172 canvas proof: 4-step 256-edge MOSS-Image Base LoRA (SFT shared components) on a 256x384 three-band portrait; one in-training preview at item 0 canvas; adapter save/reload and one 256x384 sample",
+    "configuration_source": "body-local construction",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "model inference; explicit model-proof workflow",
+      "env_gates": [],
+      "route": "explicit model-proof workflow (mlx-training asset binding on the provisioned Mac)"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-moss-image/tests/real_weights.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_training_trains_a_portrait",
+      "requirements": [
+        {
+          "slot": "moss-actual-native-model-files",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen-moss-image::loader::read_weights"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "moss-actual-parsed-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "mlx-gen-moss-image::text_encoder::tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "moss-saved-adapter-roundtrip",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "preview_0.png",
+      "adapter_sample.png"
+    ]
   },
   {
     "package": "candle-gen-minimax-h3",
