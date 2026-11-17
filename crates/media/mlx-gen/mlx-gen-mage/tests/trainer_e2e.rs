@@ -27,24 +27,56 @@ fn base_snapshot() -> String {
         .expect("set MAGE_BASE_SNAPSHOT to the full microsoft/Mage-Flow-Base snapshot root")
 }
 
-/// Two solid-colour swatch PNGs + captions in `dir`.
-fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+/// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a 2:3 portrait of three
+/// distinct horizontal bands (blue / cream / green), item 1 a solid red square swatch, so every run
+/// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
+/// centre-cropped square) is visible in its latents — and the previews, which render at item 0's
+/// canvas, are themselves portrait. The square side is `edge` and the portrait is that width × 1.5:
+/// the canvas never upscales a source (SW-7172), so a fixture smaller than `edge²` would silently
+/// train a smaller workload than the run claims.
+fn make_dataset(dir: &Path, edge: u32) -> Vec<TrainingItem> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
+    let side = edge.max(96);
+    let fixtures: [(u32, u32, &[[u8; 3]], &str); 2] = [
+        (
+            side,
+            side * 3 / 2,
+            &[[40, 80, 200], [235, 225, 200], [40, 160, 70]],
+            "a blue, cream and green banded swatch",
+        ),
+        (side, side, &[[200, 40, 40]], "a solid red colour swatch"),
+    ];
     let mut items = Vec::new();
-    for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
-        let mut img = image::RgbImage::new(320, 320);
-        for px in img.pixels_mut() {
-            *px = image::Rgb(*color);
-        }
+    for (i, (w, h, bands, caption)) in fixtures.into_iter().enumerate() {
+        let img = image::RgbImage::from_fn(w, h, |_, y| {
+            image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+        });
         let path = dir.join(format!("img{i}.png"));
         img.save(&path).unwrap();
         items.push(TrainingItem::captioned(
             path,
-            format!("a solid colour swatch number {i}"),
+            format!("{caption} number {i}"),
         ));
     }
     items
+}
+
+/// Save preview `n` under the model-proof executor's owned output directory, where the registered
+/// row declares it as an `output_artifacts` entry so the proof artifact carries the rendered
+/// sample for inspection (SW-7172). A manual run outside the executor writes nothing.
+fn save_proof_preview(n: usize, preview: &mlx_gen::Image) {
+    if let Some(dir) = std::env::var_os("MODEL_PROOF_OUTPUT_DIR") {
+        let path = Path::new(&dir).join(format!("preview_{n}.png"));
+        image::save_buffer(
+            path,
+            &preview.pixels,
+            preview.width,
+            preview.height,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+    }
 }
 
 /// A fixed random packed DiT input `(img, txt, sigma, ctx)` for a `grid`×`grid` latent + `txt_len`
@@ -66,7 +98,7 @@ fn probe_forward(
 fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 256);
 
     let mut trainer = mlx_gen_mage::provider_registry()
         .unwrap()
@@ -227,7 +259,8 @@ fn mage_lokr_trains_writes_adapter_and_reloads() {
 fn mage_trainer_emits_preview_samples() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    // Item 0's 512×768 portrait trains — and previews render at — its whole 2:3 canvas (SW-7172).
+    let items = make_dataset(&tmp, 512);
 
     let mut trainer = mlx_gen_mage::provider_registry()
         .unwrap()
@@ -248,8 +281,8 @@ fn mage_trainer_emits_preview_samples() {
         sample_steps: 4,
         sample_guidance_scale: 1.0,
         sample_prompts: vec![
+            "a blue, cream and green banded swatch".to_string(),
             "a solid red colour swatch".to_string(),
-            "a solid blue colour swatch".to_string(),
         ],
         ..Default::default()
     };
@@ -283,6 +316,14 @@ fn mage_trainer_emits_preview_samples() {
                     (image.width * image.height * 3) as usize,
                     "preview is a packed RGB8 buffer"
                 );
+                // Previews render at item 0's canvas: the 2:3 portrait, whole frame (SW-7172).
+                assert!(
+                    image.height > image.width,
+                    "preview renders at item 0's portrait canvas, got {}x{}",
+                    image.width,
+                    image.height
+                );
+                save_proof_preview(samples.len() - 1, &image);
             }
         })
         .expect("training with sampling should succeed");
@@ -315,7 +356,7 @@ fn mage_lora_reload_changes_generated_image() {
 
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 256);
 
     let mut trainer = mlx_gen_mage::provider_registry()
         .unwrap()

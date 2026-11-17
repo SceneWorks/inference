@@ -37,21 +37,36 @@ struct ExpertFile {
     expert: Option<MoeExpert>,
 }
 
-/// Two solid-colour swatch PNGs + captions in `dir`.
-fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+/// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a 2:3 portrait of three
+/// distinct horizontal bands (blue / cream / green), item 1 a solid red square swatch, so every run
+/// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
+/// centre-cropped square) is visible in its latents — and the previews, which render at item 0's
+/// canvas, are themselves portrait. The square side is `edge` (never below the historical 96 px)
+/// and the portrait is that width × 1.5: the canvas never upscales a source (SW-7172), so a fixture
+/// smaller than `edge²` would silently train a smaller workload than the run claims.
+fn make_dataset(dir: &Path, edge: u32) -> Vec<TrainingItem> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
+    let side = edge.max(96);
+    let fixtures: [(u32, u32, &[[u8; 3]], &str); 2] = [
+        (
+            side,
+            side * 3 / 2,
+            &[[40, 80, 200], [235, 225, 200], [40, 160, 70]],
+            "a blue, cream and green banded swatch",
+        ),
+        (side, side, &[[200, 40, 40]], "a solid red colour swatch"),
+    ];
     let mut items = Vec::new();
-    for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
-        let mut img = image::RgbImage::new(128, 128);
-        for px in img.pixels_mut() {
-            *px = image::Rgb(*color);
-        }
+    for (i, (w, h, bands, caption)) in fixtures.into_iter().enumerate() {
+        let img = image::RgbImage::from_fn(w, h, |_, y| {
+            image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+        });
         let path = dir.join(format!("img{i}.png"));
         img.save(&path).unwrap();
         items.push(TrainingItem {
             image_path: path,
-            caption: format!("a solid colour swatch number {i}"),
+            caption: format!("{caption} number {i}"),
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
@@ -59,6 +74,23 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
         });
     }
     items
+}
+
+/// Save preview `n` under the model-proof executor's owned output directory, where the registered
+/// row declares it as an `output_artifacts` entry so the proof artifact carries the rendered
+/// sample for inspection (SW-7172). A manual run outside the executor writes nothing.
+fn save_proof_preview(n: usize, preview: &mlx_gen::Image) {
+    if let Some(dir) = std::env::var_os("MODEL_PROOF_OUTPUT_DIR") {
+        let path = Path::new(&dir).join(format!("preview_{n}.png"));
+        image::save_buffer(
+            path,
+            &preview.pixels,
+            preview.width,
+            preview.height,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+    }
 }
 
 /// Merge a trained adapter file into a fresh weight map, asserting every target applies. `expert ==
@@ -112,7 +144,7 @@ fn run_trainer_e2e_cfg(
 ) {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 256);
 
     let mut trainer = mlx_gen_wan::provider_registry()
         .unwrap()
@@ -371,7 +403,9 @@ fn wan_ti2v_5b_trainer_prodigy_optimizer() {
 fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    // A 512 edge so the saved preview frame is inspectable: item 0's 512×768 portrait trains — and
+    // the preview renders at — its whole 2:3 canvas (SW-7172).
+    let items = make_dataset(&tmp, 512);
     let mut trainer = mlx_gen_wan::provider_registry()
         .unwrap()
         .load_trainer(model_id, &LoadSpec::new(WeightsSource::Dir(snapshot)))
@@ -382,14 +416,14 @@ fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
         alpha: 8.0,
         learning_rate: 1e-4,
         steps: 4, // dual: 2/expert (alternating); dense: 4 on the single expert
-        resolution: 256,
+        resolution: 512,
         save_every: 0,
         seed: 7,
         network_type: NetworkType::Lora,
         sample_every: 4,
         sample_steps: 4,
         sample_guidance_scale: 1.0, // CFG off for previews (ctx_uncond None)
-        sample_prompts: vec!["a solid red colour swatch".to_string()],
+        sample_prompts: vec!["a blue, cream and green banded swatch".to_string()],
         ..Default::default()
     };
     let req = TrainingRequest {
@@ -425,6 +459,14 @@ fn run_sample_smoke(model_id: &str, snapshot: PathBuf) {
                     image.pixels.iter().any(|&b| b != 0),
                     "preview frame is not all-black"
                 );
+                // Previews render at item 0's canvas: the 2:3 portrait, whole frame (SW-7172).
+                assert!(
+                    image.height > image.width,
+                    "preview frame renders at item 0's portrait canvas, got {}x{}",
+                    image.width,
+                    image.height
+                );
+                save_proof_preview(samples.len(), &image);
                 samples.push((step, index, total, prompt));
             }
         })

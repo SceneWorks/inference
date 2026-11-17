@@ -25,6 +25,7 @@ use mlx_gen::{
 };
 
 use mlx_gen::testing::save_png;
+use mlx_gen::train::canvas::training_canvas;
 use mlx_gen_anima::config::Variant;
 use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
 use mlx_gen_anima::training::load_trainer_base;
@@ -68,18 +69,24 @@ fn env_f32(key: &str, default: f32) -> f32 {
 }
 
 /// Write `n` vivid-magenta training images (a distinctive style easy to overfit) + a trigger caption
-/// each, into a fresh dataset dir; return the `TrainingItem`s. Each image is a saturated magenta field
-/// with a small green marker at a per-image offset (so they aren't byte-identical).
-fn tiny_magenta_dataset(n: usize) -> Vec<TrainingItem> {
+/// each, into a fresh dataset dir; return the `TrainingItem`s. Each image is a saturated magenta 2:3
+/// portrait with a small green marker at a per-image offset (so they aren't byte-identical), sized
+/// for a run at bucket edge `edge`: `edge` wide (never below the historical 256 px) × 1.5 tall. The
+/// aspect canvas never upscales a source (SW-7172), so a fixture smaller than `edge²` would silently
+/// train a smaller workload than the run claims; the portrait trains — and the previews render at —
+/// its whole 2:3 canvas ([`item0_canvas`]), never a centre-cropped square.
+fn tiny_magenta_dataset(n: usize, edge: u32) -> Vec<TrainingItem> {
     let dir = out_dir().join("dataset");
     std::fs::create_dir_all(&dir).unwrap();
+    let (w, h) = (edge.max(256), edge.max(256) * 3 / 2);
+    let unit = w / 256; // the historical 256 px marker layout, scaled to the fixture width
     let mut items = Vec::new();
     for i in 0..n {
-        let mut img = image::RgbImage::from_pixel(256, 256, image::Rgb([236u8, 26, 224])); // magenta
-        let ox = 40 + (i as u32 % 3) * 50;
-        let oy = 40 + (i as u32 / 3) * 50;
-        for y in oy..(oy + 32).min(256) {
-            for x in ox..(ox + 32).min(256) {
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([236u8, 26, 224])); // magenta
+        let ox = (40 + (i as u32 % 3) * 50) * unit;
+        let oy = (40 + (i as u32 / 3) * 50) * unit;
+        for y in oy..(oy + 32 * unit).min(h) {
+            for x in ox..(ox + 32 * unit).min(w) {
                 img.put_pixel(x, y, image::Rgb([40, 220, 60]));
             }
         }
@@ -95,6 +102,23 @@ fn tiny_magenta_dataset(n: usize) -> Vec<TrainingItem> {
         });
     }
     items
+}
+
+/// Item 0's training canvas `(width, height)` at bucket edge `edge` — the trainer's own
+/// [`training_canvas`] with the Anima stride (one 8 px VAE cell × the 2×2 patch). The velocity probe
+/// encodes the training image at this shape and the previews render at it.
+fn item0_canvas(edge: u32) -> (u32, u32) {
+    let (w, h) = (edge.max(256), edge.max(256) * 3 / 2);
+    training_canvas((w, h), edge, 16, None).size()
+}
+
+/// Save `img` as `name` under the model-proof executor's owned output directory, where the
+/// registered row declares it as an `output_artifacts` entry so the proof artifact carries the
+/// rendered sample for inspection (SW-7172). A manual run outside the executor writes nothing.
+fn save_proof_png(img: &mlx_gen::media::Image, name: &str) {
+    if let Some(dir) = std::env::var_os("MODEL_PROOF_OUTPUT_DIR") {
+        save_png(img, PathBuf::from(dir).join(name));
+    }
 }
 
 /// Base training config for a hard overfit (full 508-target surface: empty `lora_target_modules`).
@@ -180,8 +204,10 @@ fn velocity_mse(pipeline: &AnimaPipeline, caption: &str, edge: u32, sigma: f32) 
         height: img.height(),
         pixels: img.into_raw(),
     };
-    let nchw = mlx_gen_qwen_image::preprocess_init_image(&core, edge, edge).unwrap();
-    let x0 = pipeline.components().vae.encode(&nchw).unwrap(); // [1,16,1,edge/8,edge/8]
+    // The training image at the canvas it trained on (its whole 2:3 frame), not a squashed square.
+    let (w, h) = item0_canvas(edge);
+    let nchw = mlx_gen_qwen_image::preprocess_init_image(&core, w, h).unwrap();
+    let x0 = pipeline.components().vae.encode(&nchw).unwrap(); // [1,16,1,h/8,w/8]
     let enc = pipeline.encode_prompt(caption).unwrap(); // [1,512,1024] bf16
     let noise =
         random::normal::<f32>(x0.shape(), None, None, Some(&random::key(4242).unwrap())).unwrap();
@@ -336,7 +362,7 @@ fn train_lora_end_to_end() {
     let prompt = "sksanima style, a portrait of a girl";
     let src = WeightsSource::Dir(split_files().unwrap());
 
-    let items = tiny_magenta_dataset(4);
+    let items = tiny_magenta_dataset(4, edge);
     let req = train_request(
         items,
         overfit_config(NetworkType::Lora),
@@ -449,7 +475,7 @@ fn train_resume_matches_uninterrupted() {
     let spec = LoadSpec::new(WeightsSource::Dir(split_files().unwrap()));
 
     // (1) Uninterrupted run — drops a step-K resume snapshot in output_dir + the final adapter.
-    let req_u = train_request(tiny_magenta_dataset(4), make_cfg(false), file_name);
+    let req_u = train_request(tiny_magenta_dataset(4, edge), make_cfg(false), file_name);
     let mut trainer_u = load_trainer_base(&spec).expect("load trainer");
     let mut u_min = u32::MAX;
     let out_u = {
@@ -472,7 +498,7 @@ fn train_resume_matches_uninterrupted() {
     std::fs::copy(&out_u.adapter_path, &uninterrupted_path).expect("copy uninterrupted adapter");
 
     // (2) Resume run — a fresh trainer restores the step-K snapshot and continues K+1..steps.
-    let req_r = train_request(tiny_magenta_dataset(4), make_cfg(true), file_name);
+    let req_r = train_request(tiny_magenta_dataset(4, edge), make_cfg(true), file_name);
     let mut trainer_r = load_trainer_base(&spec).expect("reload trainer");
     let (mut r_min, mut r_max) = (u32::MAX, 0u32);
     let out_r = {
@@ -527,7 +553,7 @@ fn train_lokr_end_to_end() {
     let prompt = "sksanima style, a portrait of a girl";
     let src = WeightsSource::Dir(split_files().unwrap());
 
-    let items = tiny_magenta_dataset(4);
+    let items = tiny_magenta_dataset(4, edge);
     let mut cfg = overfit_config(NetworkType::Lokr);
     cfg.decompose_factor = -1; // auto/balanced Kronecker split
     let req = train_request(items, cfg, "anima_sc10522_lokr.safetensors");
@@ -657,7 +683,7 @@ fn train_emits_in_training_previews() {
     let n_prompts = cfg.sample_prompts.len() as u32;
     let prompt0 = cfg.sample_prompts[0].clone();
     let req = train_request(
-        tiny_magenta_dataset(4),
+        tiny_magenta_dataset(4, edge),
         cfg,
         "anima_sc10641_preview.safetensors",
     );
@@ -709,14 +735,17 @@ fn train_emits_in_training_previews() {
         }
     }
 
-    // (2) NON-DEGENERATE — right size + real pixel variance.
+    // (2) NON-DEGENERATE — right size (item 0's whole 2:3 portrait canvas, SW-7172) + real pixel
+    // variance.
+    let (preview_w, preview_h) = item0_canvas(edge);
+    assert!(preview_h > preview_w, "item 0's canvas is a portrait");
     for (step, index, _t, img) in &samples {
         assert_eq!(
             (img.width, img.height),
-            (edge, edge),
+            (preview_w, preview_h),
             "preview step {step}/{index}: wrong size"
         );
-        assert_eq!(img.pixels.len(), (edge * edge * 3) as usize);
+        assert_eq!(img.pixels.len(), (preview_w * preview_h * 3) as usize);
         let (lo, hi) = img
             .pixels
             .iter()
@@ -742,6 +771,8 @@ fn train_emits_in_training_previews() {
     let (mf, ml) = (magenta_score(first), magenta_score(last));
     save_png(first, out_dir().join("preview_first.png"));
     save_png(last, out_dir().join("preview_last.png"));
+    save_proof_png(first, "preview_first.png");
+    save_proof_png(last, "preview_last.png");
 
     let base =
         AnimaPipeline::from_source(&WeightsSource::Dir(split_files().unwrap()), Variant::Base)
@@ -749,6 +780,7 @@ fn train_emits_in_training_previews() {
     let img_base = generate(&base, &prompt0, 1234, cfg_preview_steps());
     let mb = magenta_score(&img_base);
     save_png(&img_base, out_dir().join("preview_base.png"));
+    save_proof_png(&img_base, "preview_base.png");
 
     eprintln!(
         "[sc-10641] {} previews across {} cadences; prompt0 magenta: base {mb:.1}, first(step {first_step}) {mf:.1} → last(step {last_step}) {ml:.1}",

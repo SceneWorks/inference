@@ -2257,22 +2257,29 @@ mod real_weight_repro {
         let tmp_guard = tempfile::tempdir().unwrap();
         let tmp = tmp_guard.path().to_path_buf();
 
-        // --- tiny synthetic dataset: 2 solid-color 256² PNGs with captions ---
-        let mk_png = |path: &std::path::Path, rgb: [u8; 3]| {
-            let mut img = image::RgbImage::new(256, 256);
-            for px in img.pixels_mut() {
-                *px = image::Rgb(rgb);
-            }
-            img.save(path).unwrap();
+        // --- tiny synthetic dataset: a 256×384 (2:3) portrait of three distinct horizontal bands
+        // (blue / cream / green) and a solid crimson 256² square, with captions. Both are at least
+        // the run's 256² edge area — the aspect canvas never upscales a source (SW-7172) — so the
+        // portrait trains its whole non-square canvas, never a centre-cropped square. ---
+        let mk_png = |path: &std::path::Path, (w, h): (u32, u32), bands: &[[u8; 3]]| {
+            image::RgbImage::from_fn(w, h, |_, y| {
+                image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+            })
+            .save(path)
+            .unwrap();
         };
         let img_a = tmp.join("a.png");
         let img_b = tmp.join("b.png");
-        mk_png(&img_a, [200, 40, 40]);
-        mk_png(&img_b, [40, 60, 200]);
+        mk_png(
+            &img_a,
+            (256, 384),
+            &[[40, 80, 200], [235, 225, 200], [40, 160, 70]],
+        );
+        mk_png(&img_b, (256, 256), &[[200, 40, 40]]);
         let items = vec![
             TrainingItem {
                 image_path: img_a.clone(),
-                caption: "sks a solid crimson swatch".into(),
+                caption: "sks a blue, cream and green banded swatch".into(),
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
@@ -2280,7 +2287,7 @@ mod real_weight_repro {
             },
             TrainingItem {
                 image_path: img_b.clone(),
-                caption: "sks a solid cobalt swatch".into(),
+                caption: "sks a solid crimson swatch".into(),
                 control_image_path: None,
                 model_options: Default::default(),
                 reference_image_paths: Vec::new(),
@@ -2369,10 +2376,11 @@ mod real_weight_repro {
             )]);
         let model =
             crate::model::load_medium(&spec).expect("load sd3_5_medium WITH the trained adapter");
+        // Rendered at the trained portrait's 2:3 aspect so the inspected sample is non-square.
         let gen_req = GenerationRequest {
-            prompt: "sks a solid crimson swatch".into(),
+            prompt: "sks a blue, cream and green banded swatch".into(),
             width: 512,
-            height: 512,
+            height: 768,
             steps: Some(8),
             seed: Some(1),
             count: 1,
@@ -2385,7 +2393,7 @@ mod real_weight_repro {
             GenerationOutput::Images(mut v) => v.remove(0),
             _ => panic!("expected an image"),
         };
-        assert_eq!((img.width, img.height), (512, 512));
+        assert_eq!((img.width, img.height), (512, 768));
         let n = img.pixels.len() as f64;
         let mean = img.pixels.iter().map(|&b| b as f64).sum::<f64>() / n;
         let var = img
@@ -2401,6 +2409,11 @@ mod real_weight_repro {
             .save(&png)
             .unwrap();
         eprintln!("[sc-7885 medium smoke] wrote {}", png.display());
+        // The model-proof executor's owned output directory carries the render (a declared
+        // `output_artifacts` entry) so the proof artifact holds it for inspection (SW-7172).
+        if let Some(dir) = std::env::var_os("MODEL_PROOF_OUTPUT_DIR") {
+            std::fs::copy(&png, std::path::Path::new(&dir).join("render.png")).unwrap();
+        }
         assert!(
             mean > 5.0 && mean < 250.0,
             "render mean luminance sane (coherent)"
