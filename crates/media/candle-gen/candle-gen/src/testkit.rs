@@ -1040,6 +1040,10 @@ mod vram_probe {
                     "nvidia-smi pmon returned physical GPU {gpu}, expected {expected_gpu}; refusing cross-device evidence"
                 ));
             }
+            // An empty card prints one dash row (`1  -  -  -  -  -`): no process, nothing to record.
+            if fields[1] == "-" && fields[2] == "-" {
+                continue;
+            }
             let pid = fields[1]
                 .parse::<u32>()
                 .map_err(|_| format!("malformed PID in nvidia-smi pmon row: {line}"))?;
@@ -1058,8 +1062,11 @@ mod vram_probe {
         Ok(pids)
     }
 
-    /// Window samples of the default baseline proof [`VramProbe::assert_idle`] uses.
+    /// Window samples of the default baseline proof [`VramProbe::start`] and
+    /// [`VramProbe::assert_idle`] use: (count, max drift MiB, interval ms).
     const DEFAULT_STABLE_WINDOW: (usize, u64, u64) = (5, 64, 200);
+    /// How long [`VramProbe::start`] waits for a co-tenant to hold still before it refuses.
+    const STABLE_BASELINE_WAIT: Duration = Duration::from_secs(600);
 
     fn validated_stable_baseline(samples: &[u64], config: StableIdleConfig) -> Result<u64, String> {
         if config.sample_count < 2 || samples.len() != config.sample_count {
@@ -1096,11 +1103,42 @@ mod vram_probe {
         /// A failed query is fatal: treating it as a zero baseline would turn the absence of a
         /// measurement into a plausible low peak that could understate a manifest requirement.
         pub fn start(gpu: usize) -> Self {
-            let baseline = used_mib(gpu).unwrap_or_else(|| {
-                panic!(
-                    "cannot read VRAM for physical GPU {gpu} with nvidia-smi; refusing to record an untrustworthy peak"
-                )
-            });
+            // The baseline is the lowest sample of a STABLE window, retried (and logged at most once a
+            // minute) while a co-tenant is changing the card, so every probe -- including callers that
+            // only check `assert_trustworthy` -- subtracts a baseline that held still.
+            let (count, drift, interval) = DEFAULT_STABLE_WINDOW;
+            let config = StableIdleConfig::new(0.0, count, drift, interval);
+            let started = std::time::Instant::now();
+            let mut logged: Option<std::time::Instant> = None;
+            let baseline = loop {
+                let mut samples = Vec::with_capacity(count);
+                for index in 0..count {
+                    if index > 0 {
+                        std::thread::sleep(Duration::from_millis(interval));
+                    }
+                    samples.push(used_mib(gpu).unwrap_or_else(|| {
+                        panic!(
+                            "cannot read VRAM for physical GPU {gpu} with nvidia-smi; refusing to record an untrustworthy peak"
+                        )
+                    }));
+                }
+                match validated_stable_baseline(&samples, config) {
+                    Ok(baseline) => break baseline,
+                    Err(reason) if started.elapsed() < STABLE_BASELINE_WAIT => {
+                        if logged.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                            logged = Some(std::time::Instant::now());
+                            eprintln!(
+                                "[[CUDA_BASELINE_WAIT]] gpu={gpu} waited={}s reason={reason}",
+                                started.elapsed().as_secs()
+                            );
+                        }
+                    }
+                    Err(reason) => panic!(
+                        "no stable baseline on physical GPU {gpu} within {}s: {reason}",
+                        STABLE_BASELINE_WAIT.as_secs()
+                    ),
+                }
+            };
             Self {
                 gpu,
                 baseline_mib: baseline,
@@ -1292,14 +1330,19 @@ mod vram_probe {
             assert!(validated_stable_baseline(&[1_552; 3], config)
                 .unwrap_err()
                 .contains("exactly 4 samples"));
-            let (samples, drift, _) = DEFAULT_STABLE_WINDOW;
-            assert!(samples >= 2 && drift == 64);
         }
 
         #[test]
         fn pmon_process_evidence_lists_compute_and_rejects_wrong_gpu_and_unknown_rows() {
             let wddm = "# gpu pid type sm mem\n1 3732 C+G - -\n1 6032 G - -\n";
             assert!(pure_compute_pids(wddm, 1).unwrap().is_empty());
+            // An empty headless/TCC card prints one dash row: no process, not malformed.
+            assert!(pure_compute_pids(
+                "# gpu pid type sm mem\n    0      -     -     -     -\n",
+                0
+            )
+            .unwrap()
+            .is_empty());
             assert_eq!(pure_compute_pids("1 420 C 0 0\n", 1).unwrap(), vec![420]);
             assert!(pure_compute_pids("0 420 C 0 0\n", 1)
                 .unwrap_err()

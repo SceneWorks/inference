@@ -14,8 +14,9 @@
 //!
 //! # The five protocol rules, and why each one is not optional
 //!
-//! 1. **An idle card.** [`VramProbe::assert_trustworthy`] panics above a 1 GB baseline: a co-tenant
-//!    process makes the high-water a fact about the box rather than about the model.
+//! 1. **A stable baseline.** The card need not be idle: [`VramProbe::start_rendered`] waits for a
+//!    baseline that holds still (a resident co-tenant is fine), so the high-water above it is the
+//!    model's own. A co-tenant that changes mid-run is the caller's to detect.
 //! 2. **One tier per process.** cudarc's caching allocator never returns pages to the driver, so a
 //!    second tier measured in the same process re-reports the first tier's high-water. There is one
 //!    test per tier and each must be run alone.
