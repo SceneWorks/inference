@@ -17,7 +17,19 @@ fn required(name: &str) -> PathBuf {
     )
 }
 fn prepared(variant: MossImageVariant, base: &Path, shared: &Path, dmd: &Path) -> LoadSpec {
-    let mut spec = LoadSpec::new(WeightsSource::Dir(base.into()));
+    prepared_with_adapters(variant, base, shared, dmd, Vec::new())
+}
+/// [`prepared`] with `adapters` attached BEFORE the file pins are prepared: a prepared spec's pin
+/// set must cover every file source, adapters included, so an adapter cannot be added afterwards.
+fn prepared_with_adapters(
+    variant: MossImageVariant,
+    base: &Path,
+    shared: &Path,
+    dmd: &Path,
+    adapters: Vec<AdapterSpec>,
+) -> LoadSpec {
+    let adapter_paths: Vec<PathBuf> = adapters.iter().map(|a| a.path.clone()).collect();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base.into())).with_adapters(adapters);
     spec.components.insert(
         MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
         WeightsSource::Dir(shared.into()),
@@ -59,6 +71,7 @@ fn prepared(variant: MossImageVariant, base: &Path, shared: &Path, dmd: &Path) -
             paths.insert(dmd.join(name));
         }
     }
+    paths.extend(adapter_paths);
     spec.prepare_with_file_pins(
         paths
             .into_iter()
@@ -332,13 +345,25 @@ fn moss_bounded_acceleration_acceptance() {
     let base = required("MOSS_BASE_SNAPSHOT");
     let shared = required("MOSS_SHARED_SNAPSHOT");
     let input = root.join("input.png");
-    image::RgbImage::from_pixel(
-        resolution as u32,
-        resolution as u32,
-        image::Rgb([80, 140, 210]),
-    )
-    .save(&input)
-    .unwrap();
+    if comparison {
+        // The comparison arms keep their fixed historical square geometry.
+        image::RgbImage::from_pixel(
+            resolution as u32,
+            resolution as u32,
+            image::Rgb([80, 140, 210]),
+        )
+        .save(&input)
+        .unwrap();
+    } else {
+        // A 2:3 portrait of three horizontal bands (blue / cream / green), at least the run's
+        // edge² area: the default path trains it whole on its own aspect canvas (SW-7172), never
+        // a centre-cropped square, and never upscaled.
+        let (w, h) = (resolution as u32, resolution as u32 * 3 / 2);
+        let bands = [[80u8, 140, 210], [235, 225, 200], [40, 160, 70]];
+        image::RgbImage::from_fn(w, h, |_, y| image::Rgb(bands[(y * 3 / h) as usize]))
+            .save(&input)
+            .unwrap();
+    }
     let config = TrainingConfig {
         rank: 2,
         alpha: 2.,
@@ -388,7 +413,7 @@ fn moss_bounded_acceleration_acceptance() {
         assert!(output.final_loss.is_finite());
         (output, spec)
     };
-    let (output, spec) = if comparison {
+    let (output, _spec) = if comparison {
         candle_gen::train::comparison::with_stage(
             &root.join("comparison_metrics.json"),
             "moss",
@@ -424,11 +449,13 @@ fn moss_bounded_acceleration_acceptance() {
     .unwrap()
     .load(
         MossImageVariant::Base.provider_id(),
-        &spec.with_adapters(vec![AdapterSpec::new(
-            output.adapter_path,
-            1.,
-            AdapterKind::Lora,
-        )]),
+        &prepared_with_adapters(
+            MossImageVariant::Base,
+            &base,
+            &shared,
+            &shared,
+            vec![AdapterSpec::new(output.adapter_path, 1., AdapterKind::Lora)],
+        ),
     )
     .unwrap();
     let rendered = images(
