@@ -1231,10 +1231,18 @@ mod tests {
         let staged = estimate(&c, &facts, &edit, &staged_selection).unwrap();
         let warm_plan = warm_estimate(&c, &facts, &edit, &resident_selection).unwrap();
         let warm = warm_weights(&facts, true);
-        assert_eq!(
-            warm_plan.phases[0].device_bytes,
-            staged.phases[0].device_bytes + warm.conditioner + warm.dit + warm.decoder
-        );
+        for (s, w) in staged.phases.iter().zip(&warm_plan.phases) {
+            let others = match s.phase {
+                ImagePhase::VisionTower | ImagePhase::ReferenceEncode => {
+                    warm.conditioner + warm.dit + warm.decoder
+                }
+                ImagePhase::Conditioning => warm.dit + warm.decoder,
+                ImagePhase::Denoise => warm.conditioner + warm.decoder,
+                ImagePhase::Decode => warm.conditioner + warm.dit,
+            };
+            assert_eq!(w.device_bytes, s.device_bytes + others, "{:?}", s.phase);
+        }
+        assert_eq!(warm_plan.phases.len(), 5, "an edit prices all five phases");
     }
 
     /// The contract's stream facts: the trunk plus one entry per block, summing to the DiT.

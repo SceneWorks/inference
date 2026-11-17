@@ -188,10 +188,13 @@ fn keeps_components_warm(req: &GenerationRequest) -> bool {
 const WARM_RESERVE_BYTES: u64 = 2 << 30;
 
 /// Whether a warm set needing `need` device bytes at its peak fits, given the device's `free`
-/// bytes (`None` off CUDA, where nothing is kept warm) and the `held` bytes this generator already
-/// keeps warm (they are part of `need` and already allocated).
-fn warm_set_fits(need: u64, held: u64, free: Option<u64>) -> bool {
+/// bytes (`None` off CUDA, where nothing is kept warm), the `held` bytes this generator already
+/// keeps warm (they are part of `need` and already allocated) and, when the request carries an
+/// admitted context, that context's `admitted` budget (which already credits this generator's
+/// own residency as reclaimable), so a warm set never outgrows what the caller granted.
+fn warm_set_fits(need: u64, held: u64, free: Option<u64>, admitted: Option<u64>) -> bool {
     free.is_some_and(|free| need.saturating_add(WARM_RESERVE_BYTES) <= free.saturating_add(held))
+        && admitted.is_none_or(|budget| need <= budget)
 }
 
 /// The device's free bytes as the CUDA driver reports them after pending work completes; `None`
@@ -529,14 +532,17 @@ impl MiniMaxH3Image {
         .flatten()
         .sum::<u64>();
         let free = device_free_bytes(&self.device);
+        let admitted = crate::memory_strategy::active_context()
+            .map(|context| context.budget.effective_bytes());
         let need = plan.peak_device_bytes();
-        let fits = warm_set_fits(need, held, free);
+        let fits = warm_set_fits(need, held, free, admitted);
         tracing::info!(
             event = "minimax_h3_image_warm_decision",
             keep_warm = fits,
             warm_peak_gb = decimal_gb(need),
             held_warm_gb = decimal_gb(held),
             device_free_gb = free.map(decimal_gb),
+            admitted_budget_gb = admitted.map(decimal_gb),
             reserve_gb = decimal_gb(WARM_RESERVE_BYTES),
             "minimax-h3-image: {}",
             if fits {
@@ -852,7 +858,9 @@ impl Generator for MiniMaxH3Image {
             // A failed render (an out-of-memory load among them) leaves no half-built warm set
             // behind for the next request to inherit; a cancelled one keeps what it loaded.
             *candle_gen::lock_recover(&self.warm) = WarmComponents::default();
-            crate::dit::release_device_memory(&self.device)?;
+            if let Err(release) = crate::dit::release_device_memory(&self.device) {
+                tracing::warn!(%release, "minimax-h3-image: releasing the warm set after a failed render");
+            }
         }
         Ok(result?)
     }
@@ -974,25 +982,30 @@ mod tests {
     }
 
     /// The warm set fits when its peak plus the reserve is within the free memory plus what is
-    /// already held warm; with no CUDA free figure nothing is kept warm.
+    /// already held warm, and within an admitted context's budget; with no CUDA free figure
+    /// nothing is kept warm.
     #[test]
     fn the_warm_set_fits_only_within_free_plus_held_memory() {
         const GB: u64 = 1_000_000_000;
         // q8-sized warm set on an empty 96 GB-class card: fits.
-        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB)));
+        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB), None));
         // The same set already warm: the card reports only what is left, plus what is held.
-        assert!(warm_set_fits(66 * GB, 60 * GB, Some(40 * GB)));
+        assert!(warm_set_fits(66 * GB, 60 * GB, Some(40 * GB), None));
         // bf16's ~126 GB warm set never fits that card, warm or cold.
-        assert!(!warm_set_fits(126 * GB, 0, Some(100 * GB)));
+        assert!(!warm_set_fits(126 * GB, 0, Some(100 * GB), None));
         // The reserve is kept: an exact fit with no slack is refused.
-        assert!(!warm_set_fits(100 * GB, 0, Some(100 * GB)));
+        assert!(!warm_set_fits(100 * GB, 0, Some(100 * GB), None));
         assert!(warm_set_fits(
             100 * GB - WARM_RESERVE_BYTES,
             0,
-            Some(100 * GB)
+            Some(100 * GB),
+            None
         ));
+        // An admitted context's budget bounds the warm set even when the card has room.
+        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB), Some(66 * GB)));
+        assert!(!warm_set_fits(66 * GB, 0, Some(100 * GB), Some(60 * GB)));
         // Off CUDA there is no free figure, so nothing is kept warm.
-        assert!(!warm_set_fits(GB, 0, None));
+        assert!(!warm_set_fits(GB, 0, None, None));
         assert_eq!(device_free_bytes(&Device::Cpu), None);
     }
 
