@@ -58,6 +58,8 @@ pub mod cublaslt;
 pub mod decode_attention;
 pub mod flux3_quant;
 pub mod fused_decode;
+pub mod gated_delta;
+pub mod gdn_prep;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
@@ -88,6 +90,13 @@ pub use decode_attention::{
 pub use fused_decode::{
     check_rms_norm, check_rms_norm_rope, check_swiglu, FusedError, FusedRefusal, RmsNormPlan,
     RopePlan, FUSED_DECODE_SRC, FUSED_ROPE_MAX_HEAD_DIM,
+};
+pub use gated_delta::{
+    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step, GatedDeltaRing,
+    GatedDeltaState, GATED_DELTA_MAX_KEY_DIM, GATED_DELTA_SRC,
+};
+pub use gdn_prep::{
+    gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_qkv, gdn_qkv_serves_key_dim, GDN_PREP_SRC,
 };
 pub use moe_gemv::{
     ggml_kernel, indexed_workspace_bytes, IndexedExperts, IndexedFormat, MoeGemvError,
@@ -131,6 +140,8 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::KITCHEN_INT8_SOURCE,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
+    GATED_DELTA_SRC,
+    GDN_PREP_SRC,
     MOE_GEMV_SRC,
     yue2_stable_conv::YUE2_STABLE_CONV_SRC,
     veda_int8::SOURCE,

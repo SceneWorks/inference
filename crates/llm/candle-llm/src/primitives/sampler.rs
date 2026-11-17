@@ -799,6 +799,30 @@ fn weight_desc_index_asc(a: (usize, f32), b: (usize, f32)) -> Ordering {
 fn nucleus_select(weights: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
     let total: f64 = weights.iter().map(|x| f64::from(x.1)).sum();
     let threshold = f64::from(top_p.max(0.0)) * total;
+    // Fast path, same result: the kept set is a prefix of the (weight desc, index asc) order, so
+    // when the candidates weighing at least `cutoff` already reach the threshold, sorting just
+    // them gives exactly the prefix the full heap would pop — every omitted token weighs less
+    // than every candidate and comes after all of them, and the f64 running sum adds the same
+    // weights in the same order. Shaped weights are relative to the row maximum (1.0), so a
+    // sharp row has a handful of candidates above 1e-3 instead of the whole vocabulary.
+    let max_weight = weights.iter().map(|x| x.1).fold(0.0f32, f32::max);
+    for cutoff in [1e-3f32, 1e-6] {
+        let cutoff = cutoff * max_weight;
+        let mut candidates: Vec<(usize, f32)> =
+            weights.iter().copied().filter(|x| x.1 >= cutoff).collect();
+        if candidates.len() * 4 > weights.len() {
+            break; // Not selective: the heap below is as cheap.
+        }
+        candidates.sort_unstable_by(|a, b| weight_desc_index_asc(*a, *b));
+        let mut cum = 0.0f64;
+        for (n, &(_, w)) in candidates.iter().enumerate() {
+            cum += f64::from(w);
+            if cum >= threshold {
+                candidates.truncate(n + 1);
+                return candidates;
+            }
+        }
+    }
     let mut heap: BinaryHeap<ByWeight> = weights.iter().map(|&(i, w)| ByWeight(i, w)).collect();
     let mut kept = Vec::new();
     let mut cum = 0.0f64;
@@ -1325,6 +1349,58 @@ mod tests {
         for _ in 0..1000 {
             let x = rng.next_f32();
             assert!((0.0..1.0).contains(&x), "{x}");
+        }
+    }
+
+    /// The selective fast path of `nucleus_select` keeps exactly the set (and order) the full heap
+    /// pops: sharp and flat rows, exact ties at the boundary, top-p near 0 and 1, zero weights.
+    #[test]
+    fn nucleus_fast_path_matches_the_heap() {
+        fn heap(weights: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
+            let total: f64 = weights.iter().map(|x| f64::from(x.1)).sum();
+            let threshold = f64::from(top_p.max(0.0)) * total;
+            let mut heap: BinaryHeap<ByWeight> =
+                weights.iter().map(|&(i, w)| ByWeight(i, w)).collect();
+            let (mut kept, mut cum) = (Vec::new(), 0.0f64);
+            while let Some(ByWeight(i, w)) = heap.pop() {
+                kept.push((i, w));
+                cum += f64::from(w);
+                if cum >= threshold {
+                    break;
+                }
+            }
+            kept
+        }
+        let mut rng = SplitMix64::new(11);
+        for case in 0..400 {
+            let n = 1 + (rng.next_u64() % 5000) as usize;
+            let spread = [0.5f32, 4.0, 20.0, 60.0][case % 4];
+            let row: Vec<f32> = (0..n)
+                .map(|_| {
+                    // Coarse grid so exact ties are common.
+                    let x = rng.next_f32();
+                    (x * spread * 8.0).round() / 8.0
+                })
+                .collect();
+            let params = SamplingParams {
+                temperature: [0.2f32, 0.4, 1.0][case % 3],
+                ..SamplingParams::default()
+            };
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<(usize, f32)> = row
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| (i, ((x - max) / params.temperature).exp()))
+                .collect();
+            for top_p in [0.0f32, 0.1, 0.5, 0.9, 0.95, 0.999, 1.0] {
+                let fast = nucleus_select(&weights, top_p);
+                let reference = heap(&weights, top_p);
+                assert_eq!(
+                    fast.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    reference.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    "case {case} n {n} top_p {top_p}"
+                );
+            }
         }
     }
 

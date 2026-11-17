@@ -258,6 +258,16 @@ impl DevicePositions {
         Ok(self.index.narrow(0, 2 + t, 1)?)
     }
 
+    /// The checkpoint-ring slots of the step's first `t` tokens (`[t]` `u32`, contiguous).
+    pub fn ring_writes(&self, t: usize) -> Result<Tensor> {
+        if t == 0 || t > MAX_DEVICE_STEP_TOKENS {
+            return Err(Error::Msg(format!(
+                "DevicePositions: {t} write slots outside 1..={MAX_DEVICE_STEP_TOKENS}"
+            )));
+        }
+        Ok(self.index.narrow(0, 2, t)?)
+    }
+
     /// The RoPE positions of the step's first `n` tokens (`[n]` `f32`).
     pub fn rope_positions(&self, n: usize) -> Result<Tensor> {
         if n > MAX_DEVICE_STEP_TOKENS {

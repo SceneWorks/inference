@@ -27,7 +27,7 @@ check. If this vendor dir ever moves or is dropped, update that consumer patch i
 
 ## Changes vs upstream
 
-There are **three** changes vs upstream:
+There are **four** changes vs upstream:
 
 1. `build.rs` adds three `-gencode` flags to the **statically-linked quant/moe kernel** build
    (`build_lib()` → `libmoe.a`), turning its single-arch SASS object into a true **multi-arch fatbin**
@@ -44,12 +44,19 @@ There are **three** changes vs upstream:
    `__CUDACC_VER < 12.2 && __CUDA_ARCH__ < 750` guard). Not a local invention, just a newer upstream
    state retained on purpose: for every arch this build targets (sm_80+ SASS, compute_80+ PTX) both
    guards compile to the same thing, and downgrading would drop the Turing fix for nothing.
+4. `src/mmvq_gguf.cu` (the multi-column GGUF matvec, search for `mmvq_split_impl`): for **Q8_0 and
+   Q4_K** each weight block is loaded/decoded once and dotted with every activation column
+   (upstream re-decodes it per column), and every MMVQ entry declares `__launch_bounds__` for its
+   real block size (4 warps up to 4 columns, else 2). Each (row, column) accumulator receives the
+   same operations in the same order, so results are **bit-identical**; it only removes redundant
+   decode work and register spills. It is what makes 2..8-row speculative-verify passes cheap
+   (Qwen3.8 27B: a 4-row Q4_K pass went from 2.2x to 1.4x a 1-row pass). Upstreamable.
 
 The licence texts are not a code change: `LICENSE-MIT` and `LICENSE-APACHE` are upstream's
 repository-root files at `1e6aa85e`, copied unmodified, because the crate is `MIT OR Apache-2.0` and
 upstream ships them only at the repository root.
 
-Everything else — every other `.cu`/`.cuh` source, `lib.rs`, `ffi.rs`, `Cargo.toml` — is byte-for-byte
+Everything else — every other `.cu`/`.cuh` source (and the rest of `mmvq_gguf.cu`), `lib.rs`, `ffi.rs`, `Cargo.toml` — is byte-for-byte
 upstream, so candle-core links an otherwise-identical Rust/symbol surface (a fatter `libmoe.a` + the new
 `cast_i32_*` PTX symbols). Diff against the upstream rev to confirm these are the sole deltas.
 
@@ -96,6 +103,9 @@ match only as long as this copy is from the **same** candle rev. **When the cand
 3. Re-apply the `src/cast.cu` `int32_t` cast block (search for `sc-9601`) unless upstream has added it.
 4. Keep the `src/compatibility.cuh` `__CUDA_ARCH__ < 800` fallback guard (upstream #3558) unless the
    new rev already includes it.
+4a. Re-apply the `src/mmvq_gguf.cu` split-decode entries and `__launch_bounds__` (delta 4) unless
+   upstream has an equivalent, and re-run candle-llm's Qwen3.5 decode bench to confirm unchanged
+   text hashes.
 5. Re-run the CUDA gate (`pwsh scripts/check-cuda.ps1`) — `cuda_quant_smoke` must pass on Blackwell.
 6. SceneWorks patches candle-kernels to this dir at its pinned inference rev; once the bump lands
    there (`node scripts/bump-inference.mjs`), its `candle_kernels_patch_guard` test re-verifies the

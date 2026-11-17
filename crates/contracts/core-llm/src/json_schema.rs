@@ -99,7 +99,7 @@ impl JsonSchema {
 
 /// The live position inside a [`JsonSchema`]'s program. `Copy`, so masking a large vocabulary
 /// copies registers, not heap state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SchemaState {
     /// Index of the current segment (`segs.len()` = complete).
     seg: u32,

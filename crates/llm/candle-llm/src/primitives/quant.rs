@@ -362,6 +362,12 @@ impl QuantizedLinear {
     /// cast back to `x`'s dtype so it composes with a bf16 decoder.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = match &self.inner {
+            QuantizedWeight::Matmul(inner) if native_mmvq(inner, x) => {
+                // CUDA MMVQ quantizes a bf16/f16 activation and writes a bf16/f16 result with the
+                // same arithmetic as the f32 round trip below (exact widening in, one RN
+                // narrowing out), without the two cast kernels around every decode matvec.
+                __model_proof_output!(inner.forward(x))?
+            }
             QuantizedWeight::Matmul(inner) => {
                 __model_proof_output!(inner.forward(&x.to_dtype(DType::F32)?))?
                     .to_dtype(x.dtype())?
@@ -378,6 +384,38 @@ impl QuantizedLinear {
             None => Ok(y),
         }
     }
+}
+
+/// Whether `x` can go to Candle's CUDA MMVQ kernels in its own dtype: a contiguous bf16/f16
+/// activation of at most 8 rows (the decode and speculative-verify shapes) against a GGML weight
+/// type those kernels serve. Larger batches keep the f32 path (the MMQ/dequantize fallbacks).
+fn native_mmvq(inner: &QMatMul, x: &Tensor) -> bool {
+    use candle_core::quantized::GgmlDType as G;
+    let QMatMul::QTensor(w) = inner else {
+        return false;
+    };
+    let rows = match x.dims() {
+        [m, _] => *m,
+        [b, m, _] => b * m,
+        _ => return false,
+    };
+    x.device().is_cuda()
+        && matches!(x.dtype(), DType::BF16 | DType::F16)
+        && x.is_contiguous()
+        && (1..=8).contains(&rows)
+        && matches!(
+            w.dtype(),
+            G::Q4_0
+                | G::Q4_1
+                | G::Q5_0
+                | G::Q5_1
+                | G::Q8_0
+                | G::Q2K
+                | G::Q3K
+                | G::Q4K
+                | G::Q5K
+                | G::Q6K
+        )
 }
 
 #[cfg(test)]
