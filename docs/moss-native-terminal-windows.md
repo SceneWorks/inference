@@ -41,11 +41,15 @@ The control object's exact fields are:
   "external_owners_reconciled": true,
   "deadline_utc": "<fresh UTC offset timestamp within six hours>",
   "timeout_seconds": 1800,
-  "required_free_mib": "<positive integer MiB the native and product runs need free on GPU0>"
+  "required_free_mib": 36864
 }
 ```
 
-`required_free_mib` is a positive integer. Owned children keep exact PID, name,
+`required_free_mib` is optional; when present it must be a positive integer. It
+defaults to 36864 MiB: MOSS-Image's two shipped weight files (25,959 MiB per the
+SceneWorks manifest `estimatedSizeBytes`), plus 25% for activations and the CUDA
+context, plus the 2,048 MiB free reserve the other CUDA claims keep, rounded up to
+36 GiB. That figure is derived, not measured; pass a larger value if a run needs it. Owned children keep exact PID, name,
 creation-time and handle identity; any other GPU0 process is a recorded co-tenant.
 The campaign lease file is created exclusively under the existing
 `E:\sceneworks-evaluation\moss\device-locks` authority. Stale or conflicting locks

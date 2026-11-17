@@ -18,6 +18,12 @@ $script:StableMaxUtilizationPercent=30
 $script:StableMaxUtilizationSpread=15
 $script:AdmissionSamples=5
 $script:AdmissionSampleMilliseconds=500
+# Default free memory when the control omits required_free_mib (optional since the shared-card rule).
+# MOSS-Image's two shipped weight files (SceneWorks config/manifests/builtin.models.jsonc
+# estimatedSizeBytes 17,055,137,947 + 10,164,749,652 = 25,959 MiB), +25 % for activations and the
+# CUDA context, + the 2,048 MiB free reserve the other CUDA claims keep, rounded up to 36 GiB. Derived,
+# not measured; a dispatch that knows better passes required_free_mib.
+$script:DefaultRequiredFreeMib=36864
 $script:AdmissionPollMilliseconds=5000
 $script:WaitNoticeSeconds=60
 $script:ownedReleaseConfirmed=$false
@@ -1048,7 +1054,10 @@ $script:ownedReleaseConfirmed=$false
 try {
     Require ($env:GITHUB_REF -ceq 'refs/heads/main') 'Terminal requires final inference main, not a feature/story ref'
     $c = $env:MOSS_NATIVE_CONTROL | ConvertFrom-Json
-    Exact-Fields $c @('campaign','inference_revision','snapshot_base','snapshot_shared','snapshot_dmd','gpu_uuid','physical_gpu_index','deadline_utc','timeout_seconds','owner','required_free_mib','external_owners_reconciled')
+    $fields=@('campaign','inference_revision','snapshot_base','snapshot_shared','snapshot_dmd','gpu_uuid','physical_gpu_index','deadline_utc','timeout_seconds','owner','external_owners_reconciled')
+    if ($c.PSObject.Properties.Name -ccontains 'required_free_mib') { $fields+='required_free_mib' }
+    else { $c | Add-Member -NotePropertyName required_free_mib -NotePropertyValue $script:DefaultRequiredFreeMib }
+    Exact-Fields $c $fields
     Require ($c.campaign -cmatch '^sc-26325-native-[a-z0-9-]{1,48}$') 'Invalid fresh campaign'
     Require ($c.inference_revision -cmatch '^[0-9a-f]{40}$') 'Exact pinned inference SHA required'
     $status.inference=$c.inference_revision
