@@ -107,6 +107,7 @@ class PrecisionControlTests(unittest.TestCase):
             proof_spec.loader.exec_module(proof)
 
             census = types.SimpleNamespace(cuda_physical_census=lambda **_: (raw, []),
+                                           admitted_cuda_census=lambda *_, **__: (raw, []),
                                            metal_census=Mock(), physical_busy_message=Mock(),
                                            same_selected_cuda_device=Mock(),
                                            retain_cuda_physical_evidence=proof.retain_cuda_physical_evidence,
@@ -119,9 +120,13 @@ class PrecisionControlTests(unittest.TestCase):
                                           "yue2_cuda_idle_context": idle}), \
                  patch.dict(os.environ, {"COMPUTERNAME": "unit-host", "YUE2_IDLE_CONTEXT_RUN_ID": ""}), \
                  patch.object(control, "remaining_app_budget", return_value=3600), \
+                 patch.object(control, "shared_gpu1_lock") as lock, \
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)), \
                  patch.object(sys, "argv", argv), redirect_stdout(stdout):
                 self.assertEqual(control.main(), 0)
+            # A standalone preflight holds the host-global UUID lock only for its census.
+            lock.assert_called_once()
+            lock.return_value.release.assert_called_once_with()
 
             receipt = evidence / "preflight-initial.json"
             stored = json.loads(receipt.read_text(encoding="utf-8"))
@@ -640,6 +645,7 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
             census = types.SimpleNamespace(cuda_physical_census=lambda **_: ("typed pmon rows", ["123 C worker"]),
+                                           admitted_cuda_census=lambda *_, **__: ("typed pmon rows", ["123 C worker"]),
                                            metal_census=lambda: ("", []),
                                            physical_busy_message=lambda raw, busy, context: f"{context}: {busy}",
                                            same_selected_cuda_device=Mock(),
@@ -647,6 +653,7 @@ class PrecisionControlTests(unittest.TestCase):
                                            retain_reviewed_baseline=lambda *_: [])
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
                  patch.object(control, "remaining_app_budget", return_value=3600), \
+                 patch.object(control, "shared_gpu1_lock"), \
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
                 with self.assertRaisesRegex(ValueError, "competing physical-device"):
                     control.preflight("cuda", evidence, "before-test")
@@ -662,6 +669,7 @@ class PrecisionControlTests(unittest.TestCase):
         raw = json.dumps({"commandExit": 0, "refusal": "adapterDedicated rose over reviewed baseline"})
         busy = ["0 38212 C+G - - ChatGPT.exe"]
         census = types.SimpleNamespace(cuda_physical_census=lambda **_: (raw, busy),
+                    admitted_cuda_census=lambda *_, **__: (raw, busy),
                     metal_census=Mock(), physical_busy_message=proof.physical_busy_message,
                     same_selected_cuda_device=Mock(),
                     retain_cuda_physical_evidence=Mock(), retain_reviewed_baseline=Mock())
@@ -669,6 +677,7 @@ class PrecisionControlTests(unittest.TestCase):
             evidence = Path(directory) / "evidence"
             with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
                  patch.object(control, "remaining_app_budget", return_value=3600), \
+                 patch.object(control, "shared_gpu1_lock"), \
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
                 with self.assertRaisesRegex(ValueError, "adapterDedicated rose over reviewed baseline"):
                     control.preflight("cuda", evidence, "before-test")
@@ -735,11 +744,15 @@ class PrecisionControlTests(unittest.TestCase):
             cases = root / "cases"
             control.prepare_cases(MODULE_PATH.parent / "yue2-app-precision-cases", cases, "cuda")
             labels = []
-            def preflight(_backend, _evidence, label):
+            held = []
+            def preflight(_backend, _evidence, label, held_lock=None):
                 labels.append(label)
+                held.append(held_lock)
                 if label == "after-cases":
                     raise ValueError("post-case physical owner changed")
             with patch.object(control, "preflight", side_effect=preflight), \
+                 patch.object(control, "remaining_app_budget", return_value=3600), \
+                 patch.object(control, "shared_gpu1_lock") as lock, \
                  patch.object(control, "verified_runtime_policy", return_value=(M4_SHA, M4_POLICY)), \
                  patch.object(control, "run_shared_command", return_value=0), \
                  patch.object(control.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)), \
@@ -752,6 +765,10 @@ class PrecisionControlTests(unittest.TestCase):
                 collect.assert_not_called()
             self.assertEqual(len([label for label in labels if label.startswith("before-")]), 8)
             self.assertEqual(labels[-1], "after-cases")
+            # One UUID lock spans every case admission and the release census, then is released.
+            lock.assert_called_once()
+            self.assertEqual(set(map(id, held)), {id(lock.return_value)})
+            lock.return_value.release.assert_called_once_with()
             self.assertTrue((root / "evidence" / "cases-manifest.json").is_file())
 
     def test_listening_wav_inventory_is_run_owned_and_stream_hashed(self):

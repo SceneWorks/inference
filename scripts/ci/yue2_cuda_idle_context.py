@@ -17,7 +17,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
+import time
+
+import model_proof_cuda_primitives as primitives
 
 RUN_ID = "37145909196"
 BASELINE_ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
@@ -28,7 +32,8 @@ WINDOW = timedelta(hours=12)
 # The owner approved these limits for the process-free GPU0 route. NVML memory
 # utilization measures traffic; memory.used is separately bounded by capacity.
 EMPTY_GPU0_PERCENT_LIMIT = 5
-SHARED_GPU1_PERCENT_LIMIT = 50
+# Default (shared-host/shared-gpu1) admission on GPU1: this much free memory plus the
+# quiet-card window of veda_cuda_guard.stable_window. Foreign actors never refuse.
 SHARED_GPU1_MIN_FREE_MIB = 16 * 1024
 SHARED_GPU1_UUID = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
 SHARED_GPU1_PCI = "00000000:C1:00.0"
@@ -37,6 +42,33 @@ SHARED_GPU1_PCI = "00000000:C1:00.0"
 def require(ok: bool, why: str) -> None:
     if not ok:
         raise RuntimeError(why)
+
+
+class SharedGpu1NotAdmissible(RuntimeError):
+    """Valid selected-card evidence that is not admissible now (free memory or quiet window)."""
+
+
+def cuda_guard():
+    """The hash-pinned vendored guard: its stable_window holds the shared quiet-card thresholds."""
+    return primitives.component("veda_cuda_guard.py", primitives.GUARD_SHA)
+
+
+def shared_gpu1_refusal(window: list[dict]) -> str | None:
+    """Default GPU1 admission over one chronological sampling window.
+
+    Each sample with a free counter needs SHARED_GPU1_MIN_FREE_MIB free; the window must
+    be quiet and stable (veda_cuda_guard.stable_window). Returns the refusal reason or None.
+    """
+    admit = lambda device, _rows: (device.get("free_mib") is None or
+                                   device["free_mib"] >= SHARED_GPU1_MIN_FREE_MIB)
+    check, state = cuda_guard().stable_window(admit, samples=len(window))
+    for device in window:
+        if not check(device, []):
+            reason = state["reason"]
+            if device.get("free_mib") is not None and device["free_mib"] < SHARED_GPU1_MIN_FREE_MIB:
+                reason = f"{device['free_mib']} MiB free < {SHARED_GPU1_MIN_FREE_MIB} MiB required"
+            return reason
+    return None
 
 
 def read_json(directory: Path, name: str) -> dict:
@@ -639,18 +671,15 @@ def _shared_gpu1_summary(directory: Path, *, admission: bool) -> dict:
     luid = f"luid_0x{int.from_bytes(raw_luid[4:], 'little'):08x}_0x{int.from_bytes(raw_luid[:4], 'little'):08x}"
     selected = []
     actors = []
+    window = []
     for index in range(3):
         gpu = _gpu_row(directory, f"gpu-sample-{index}", has_free=True,
                        utilization_percent_limit=100, index=1, with_util=True)
         require(gpu["uuid"] == SHARED_GPU1_UUID and
                 gpu["pci"] == SHARED_GPU1_PCI.lower().lstrip("0"),
                 "selected physical GPU1 UUID/PCI changed")
-        if admission:
-            require(gpu["usedMiB"] * 100 <= gpu["totalMiB"] * SHARED_GPU1_PERCENT_LIMIT and
-                    gpu["freeMiB"] >= SHARED_GPU1_MIN_FREE_MIB and
-                    gpu["gpuPercent"] <= SHARED_GPU1_PERCENT_LIMIT and
-                    gpu["memoryPercent"] <= SHARED_GPU1_PERCENT_LIMIT,
-                    "selected GPU1 baseline exceeds approved occupancy or 16 GiB free floor")
+        window.append({"used_mib": gpu["usedMiB"], "free_mib": gpu["freeMiB"],
+                       "total_mib": gpu["totalMiB"], "utilization_percent": gpu["gpuPercent"]})
         mode = _empty_smi(directory, f"driver-mode-{index}")
         rows = [next(csv.reader([line], skipinitialspace=True)) for line in mode["output"]]
         rows = [row for row in rows if row and row[0].strip() == "1"]
@@ -710,9 +739,6 @@ def _shared_gpu1_summary(directory: Path, *, admission: bool) -> dict:
                     f"selected GPU1 {key} duplicate counter path")
             if key.startswith("adapter"):
                 require(len(samples) == 1, f"selected GPU1 {key} adapter missing")
-            if key == "engine" and admission:
-                require(all(sample["cookedValue"] <= SHARED_GPU1_PERCENT_LIMIT for sample in samples),
-                        "selected GPU1 engine exceeds approved shared baseline")
         selected.append(gpu)
     for name in ("gpu-before-cuda-properties", "gpu-after-cuda-properties"):
         sample = _empty_smi(directory, name)
@@ -722,17 +748,77 @@ def _shared_gpu1_summary(directory: Path, *, admission: bool) -> dict:
                 rows[0][2].strip().lower().lstrip("0") == SHARED_GPU1_PCI.lower().lstrip("0") and
                 rows[0][3].strip().isdigit() and rows[0][4].strip().isdigit() and
                 int(rows[0][4]) <= 100, f"{name} selected GPU1 changed")
-        if admission:
-            require(int(rows[0][3]) * 100 <= selected[0]["totalMiB"] * SHARED_GPU1_PERCENT_LIMIT and
-                    int(rows[0][3]) + SHARED_GPU1_MIN_FREE_MIB <= selected[0]["totalMiB"] and
-                    int(rows[0][4]) <= SHARED_GPU1_PERCENT_LIMIT,
-                    f"{name} selected GPU1 baseline exceeds admission")
+        require(int(rows[0][3]) <= selected[0]["totalMiB"], f"{name} selected GPU1 invalid memory")
+        window.append({"used_mib": int(rows[0][3]), "free_mib": None,
+                       "total_mib": selected[0]["totalMiB"], "utilization_percent": int(rows[0][4])})
     actors.append(_shared_gpu1_pmon(_empty_smi(directory, "pmon-0-final")["output"],
                                     "pmon-0-final"))
+    if admission:
+        # Foreign actors, resident models and Windows engine counters are evidence only.
+        refusal = shared_gpu1_refusal(window)
+        if refusal is not None:
+            raise SharedGpu1NotAdmissible(f"selected GPU1 not admissible: {refusal}")
     return {"physicalMode": "shared-gpu1", "admission": admission, "uuid": SHARED_GPU1_UUID,
             "pci": SHARED_GPU1_PCI, "luid": luid, "cudaOrdinal": 0, "physicalIndex": 1,
-            "minFreeMiB": SHARED_GPU1_MIN_FREE_MIB, "baselineMaxPercent": SHARED_GPU1_PERCENT_LIMIT,
+            "minFreeMiB": SHARED_GPU1_MIN_FREE_MIB,
+            "admissionRule": "free memory floor plus quiet stable window; foreign actors recorded only",
+            "windowUsedMiB": [sample["used_mib"] for sample in window],
+            "baselineUsedMiB": window[-1]["used_mib"],
             "gpu": selected, "observedActors": actors}
+
+
+class SharedGpu1Lock:
+    """Host-global PUBLIC/SceneWorks/gpu-locks/<GPU1 UUID>.lock: the CI-to-CI mutex.
+
+    Same file and byte lock as veda_cuda_guard.claim_device and the model-proof claims.
+    """
+
+    def __init__(self, directory: Path | None = None, locker=None, sleep=time.sleep,
+                 poll_seconds: float = 5.0):
+        self.directory = directory
+        self.locker = locker
+        self.sleep = sleep
+        self.poll_seconds = poll_seconds
+        self.handle = None
+
+    def acquire(self, deadline: float, notice: dict) -> None:
+        if self.handle is not None:
+            return
+        if self.locker is None:
+            import msvcrt  # type: ignore[import-not-found]
+            self.locker = msvcrt
+        directory = self.directory or Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        while True:
+            handle = (directory / f"{SHARED_GPU1_UUID}.lock").open("a+b")
+            try:
+                if handle.seek(0, 2) == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                self.locker.locking(handle.fileno(), self.locker.LK_NBLCK, 1)
+                self.handle = handle
+                return
+            except OSError:
+                handle.close()
+            except BaseException:
+                handle.close()
+                raise
+            require(time.monotonic() < deadline,
+                    f"{SHARED_GPU1_UUID}: UUID lock still held by another CI job at the admission deadline")
+            primitives.wait_notice(notice, f"{SHARED_GPU1_UUID}: UUID lock held by another CI job")
+            self.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
+
+    def release(self) -> None:
+        if self.handle is not None:
+            handle, self.handle = self.handle, None
+            primitives.unlock(handle, self.locker)
+
+    def pause(self, seconds: float, deadline: float, notice: dict) -> None:
+        """Let other CI jobs that fit use the card while this one waits, then retake the lock."""
+        self.release()
+        self.sleep(seconds)
+        self.acquire(deadline, notice)
 
 
 def census_shared_gpu1(*, admission: bool) -> tuple[str, bool]:
@@ -757,6 +843,8 @@ def census_shared_gpu1(*, admission: bool) -> tuple[str, bool]:
             return json.dumps(raw, sort_keys=True), True
         except Exception as error:
             raw["refusal"] = str(error)
+            if isinstance(error, SharedGpu1NotAdmissible):
+                raw["retryableAdmission"] = True
             return json.dumps(raw, sort_keys=True), False
 
 

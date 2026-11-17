@@ -25,6 +25,12 @@ REFERENCE_SHA256 = "c4073edb3c7abfbf5d50a9c5bfa67c73b9b9a8ba20115570ddb616d00d5b
 CUDA_CHILD_TIMEOUT_SECONDS = 180 * 60  # Operational cap, not a measured runtime.
 CUDA_POSTFLIGHT_SECONDS = 600
 CUDA_JOB_TIMEOUT_SECONDS = 240 * 60
+# Re-census interval while the selected card is valid but not admissible (free memory or
+# quiet window). The refusal reason is logged at most once a minute.
+CUDA_ADMISSION_POLL_SECONDS = 15
+# A pre/post-child baseline move larger than the admission window's memory.used spread
+# (veda_cuda_guard.STABLE_MAX_USED_SPREAD_MIB) marks that child's measurement contaminated.
+MEASUREMENT_BASELINE_TOLERANCE_MIB = 256
 TEST_NAME = "explicit_stage_precision_real_weights"
 CUDA_SMOKES = (
     ("quant", "yue2_stable_conv::cuda_tests::bf16_conv_and_transpose_match_same_input_prefix_across_lengths"),
@@ -267,9 +273,10 @@ def cuda_physical_census(*, admission: bool = True) -> tuple[str, list[str]]:
     """Require complete selected-GPU seven-family evidence before model work.
 
     A reviewed C+G receipt selects one signed process; an actually process-free
-    GPU0 requires a fresh unfiltered 29-file probe. The owner-approved shared
-    GPU1 route keeps foreign actors and allocations in raw evidence, admits
-    only the selected card before a child, and checks owned release afterward.
+    GPU0 requires a fresh unfiltered 29-file probe. The default shared GPU1
+    route keeps foreign actors and allocations in raw evidence, admits the
+    selected card on free memory plus a quiet stable window (never on foreign
+    presence) before a child, and checks owned release afterward.
     """
     raw, busy = cuda_census(admission=admission)
     if busy:
@@ -293,6 +300,93 @@ def cuda_physical_census(*, admission: bool = True) -> tuple[str, list[str]]:
     except (ValueError, TypeError, RuntimeError):
         return raw, ["complete selected-device seven-family physical proof absent"]
     return raw, []
+
+
+def retryable_admission(raw: str) -> str | None:
+    """The refusal of a valid selected card that only lacks free memory or a quiet window."""
+    try:
+        probe = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(probe, dict) and probe.get("retryableAdmission") is True:
+        return str(probe.get("refusal"))
+    return None
+
+
+def admitted_cuda_census(deadline: float, lock=None, *, sleep=time.sleep) -> tuple[str, list[str]]:
+    """Admission census that waits while the card is valid but not yet admissible.
+
+    Foreign actors never refuse. Identity/evidence failures return at once; a free-memory
+    or quiet-window refusal is retried until `deadline`, logging the reason once a minute.
+    With `lock`, the UUID lock is released while waiting so other CI jobs that fit can run.
+    """
+    from model_proof_cuda_primitives import wait_notice  # type: ignore[import-not-found]
+    notice: dict = {}
+    while True:
+        raw, busy = cuda_physical_census()
+        reason = retryable_admission(raw) if busy else None
+        if reason is None or time.monotonic() >= deadline:
+            return raw, busy
+        wait_notice(notice, f"{reason}; foreign GPU1 actors are recorded, never a refusal")
+        pause = min(CUDA_ADMISSION_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+        if lock is not None:
+            lock.pause(pause, deadline, notice)
+        else:
+            sleep(pause)
+
+
+def census_used_mib(raw: str) -> int | None:
+    try:
+        value = json.loads(raw).get("validatedDevice", {}).get("baselineUsedMiB")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return value if type(value) is int else None
+
+
+def foreign_compute_pids(raw: str, owned: set[int]) -> set[int] | None:
+    try:
+        actors = json.loads(raw).get("validatedDevice", {}).get("observedActors")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(actors, list):
+        return None
+    return {actor["pid"] for epoch in actors for actor in epoch
+            if actor.get("type") in ("C", "C+G") and actor.get("pid") not in owned}
+
+
+def selected_used_mib(sample: dict) -> int | None:
+    fields = [value.strip() for value in sample.get("raw", "").split(",")]
+    if len(fields) >= 4 and fields[1] == str(sample.get("physical_gpu_index")) and fields[2].isdigit():
+        return int(fields[2])
+    return None
+
+
+def child_memory_measurement(pre_raw: str, post_raw: str | None, samples: list[dict],
+                             owned: set[int]) -> dict:
+    """Peak minus the stable baseline admitted under the lock, for one owned child.
+
+    A co-tenant change seen by the post-child census (baseline moved, or a different set of
+    foreign compute actors) contaminates this measurement; it never refuses the run.
+    """
+    baseline = census_used_mib(pre_raw)
+    used = [value for value in map(selected_used_mib, samples) if value is not None]
+    peak = max(used, default=None)
+    contamination = []
+    after = census_used_mib(post_raw) if post_raw else None
+    if baseline is None or after is None:
+        contamination.append("stable baseline unavailable before or after the child")
+    elif abs(after - baseline) > MEASUREMENT_BASELINE_TOLERANCE_MIB:
+        contamination.append(f"baseline moved {after - baseline:+d} MiB across the child")
+    before_actors = foreign_compute_pids(pre_raw, owned)
+    after_actors = foreign_compute_pids(post_raw, owned) if post_raw else None
+    if before_actors is None or after_actors is None:
+        contamination.append("foreign compute actor inventory unavailable")
+    elif before_actors != after_actors:
+        contamination.append(f"foreign compute actors changed: {sorted(before_actors)} -> {sorted(after_actors)}")
+    return {"baseline_used_mib": baseline, "post_baseline_used_mib": after, "peak_used_mib": peak,
+            "peak_minus_baseline_mib": (peak - baseline if peak is not None and baseline is not None
+                                        else None),
+            "contaminated": bool(contamination), "contamination": contamination}
 
 
 def retain_cuda_physical_evidence(evidence: Path, label: str, raw: str) -> list[dict]:
@@ -817,6 +911,15 @@ def validate_receipt(receipt: Path, backend: str, work_dir: Path | None = None) 
 
 
 def execute(args: argparse.Namespace) -> None:
+    locks: list = []
+    try:
+        _execute(args, locks)
+    finally:
+        for lock in locks:
+            lock.release()
+
+
+def _execute(args: argparse.Namespace, locks: list) -> None:
     evidence = args.evidence
     evidence.mkdir(parents=True, exist_ok=True)
     reference = args.reference / "vae_real_reference.safetensors"
@@ -844,7 +947,7 @@ def execute(args: argparse.Namespace) -> None:
     else:
         require(os.environ.get("CUDA_VISIBLE_DEVICES") == "1",
                 "CUDA proof must bind logical CUDA0 to the owner's physical GPU1")
-        from yue2_cuda_idle_context import check_shared_gpu1_dispatch, require_remaining_window  # type: ignore[import-not-found]
+        from yue2_cuda_idle_context import SharedGpu1Lock, check_shared_gpu1_dispatch  # type: ignore[import-not-found]
         job_start = os.environ.get("YUE2_PRECISION_JOB_STARTED_UTC_NS", "")
         require(job_start.isdigit() and int(job_start) <= time.time_ns() and
                 time.time_ns() + (CUDA_CHILD_TIMEOUT_SECONDS + CUDA_POSTFLIGHT_SECONDS) * 1_000_000_000 <=
@@ -852,8 +955,16 @@ def execute(args: argparse.Namespace) -> None:
                 "bounded CUDA child cannot finish before workflow upload tail")
         baseline = None
         check_shared_gpu1_dispatch()
+        # Wait for admission only as long as the full child budget and postflight still fit.
+        admission_deadline = time.monotonic() + (
+            int(job_start) + CUDA_JOB_TIMEOUT_SECONDS * 1_000_000_000 - time.time_ns()
+        ) / 1_000_000_000 - CUDA_CHILD_TIMEOUT_SECONDS - CUDA_POSTFLIGHT_SECONDS
+        gpu_lock = SharedGpu1Lock()
+        locks.append(gpu_lock)
+        gpu_lock.acquire(admission_deadline, {})
+    before_raw, before_busy = (admitted_cuda_census(admission_deadline, gpu_lock)
+                               if args.backend == "cuda" else metal_census())
     total_deadline = time.monotonic() + CUDA_CHILD_TIMEOUT_SECONDS if args.backend == "cuda" else None
-    before_raw, before_busy = cuda_physical_census() if args.backend == "cuda" else metal_census()
     (evidence / "census-before.txt").write_text(before_raw, encoding="utf-8")
     require(not before_busy, physical_busy_message(before_raw, before_busy, "foreign/lingering accelerator executables before test"))
     before_files = retain_cuda_physical_evidence(evidence, "before", before_raw) if args.backend == "cuda" else None
@@ -881,7 +992,7 @@ def execute(args: argparse.Namespace) -> None:
             if args.backend == "cuda":
                 # The preceding child's tree and watchdog have released; the
                 # fresh physical census is the last action before Popen.
-                handoff_raw, handoff_busy = cuda_physical_census()
+                handoff_raw, handoff_busy = admitted_cuda_census(total_deadline)
                 (evidence / f"census-pre-{label}.txt").write_text(handoff_raw, encoding="utf-8")
                 require(same_selected_cuda_device(before_raw, handoff_raw),
                         "selected GPU1 adapter/LUID changed before owned child")
@@ -898,6 +1009,7 @@ def execute(args: argparse.Namespace) -> None:
         samples.extend(stage_samples)
         faults.extend(stage_faults)
         if args.backend == "cuda":
+            release_raw = None
             try:
                 release_raw, release_busy = cuda_physical_census(admission=False)
                 (evidence / f"census-post-{label}.txt").write_text(release_raw, encoding="utf-8")
@@ -912,6 +1024,9 @@ def execute(args: argparse.Namespace) -> None:
             except Exception as error:
                 result["post_census_error"] = str(error)
                 result["post_census_busy"] = []
+            owned_pids = {result["pid"], *(row["pid"] for row in result.get("owned_descendants", []))}
+            result["memory_measurement"] = child_memory_measurement(
+                handoff_raw, release_raw, stage_samples, owned_pids)
         # A failed or ambiguous smoke never advances to the next child.
         if not child_stage_succeeded(result):
             break
@@ -953,6 +1068,10 @@ def execute(args: argparse.Namespace) -> None:
                     peak = max(peak or 0, int(fields[2]))
     else:
         peak = max((sample["phys_footprint_bytes"] for sample in samples), default=None)
+    measurements = [{"label": row["label"], **row["memory_measurement"]}
+                    for row in child_results if "memory_measurement" in row]
+    deltas = [row["peak_minus_baseline_mib"] for row in measurements
+              if row["peak_minus_baseline_mib"] is not None]
     receipt = evidence / "precision-receipt.json"
     receipt_schema_error = None
     if receipt.is_file():
@@ -976,6 +1095,10 @@ def execute(args: argparse.Namespace) -> None:
               "external_peak_unit": "MiB selected physical device used" if args.backend == "cuda" else "bytes owned phys_footprint",
               "external_peak_scope": "selected-device-global-capacity" if args.backend == "cuda" else "owned-process",
               "owned_cuda_peak_unavailable": args.backend == "cuda",
+              "memory_measurements": measurements if args.backend == "cuda" else None,
+              "external_peak_minus_baseline_mib": max(deltas, default=None) if args.backend == "cuda" else None,
+              "external_peak_minus_baseline_contaminated": (any(row["contaminated"] for row in measurements)
+                                                           if args.backend == "cuda" else None),
               "sampler_faults": faults, "owned_test_pid": last_child["pid"] if last_child else None,
               "owned_test_released": bool(last_child and last_child["released"]),
               "owned_test_timed_out": timed_out, "owned_test_wait_error": wait_error,

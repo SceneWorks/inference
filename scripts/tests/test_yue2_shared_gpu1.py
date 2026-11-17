@@ -1,5 +1,6 @@
 """CPU-only selected-card tests for the owner's physical GPU1 shared window."""
 import copy
+import io
 import json
 from pathlib import Path
 import sys
@@ -45,6 +46,39 @@ def make_shared_probe(root: Path) -> None:
         path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def set_window(root: Path, used: list[int], util: list[int], free: list[int] | None = None) -> None:
+    """Rewrite the five chronological selected-card samples: three gpu-samples, then before/after."""
+    free = free or [97439 - value for value in used[:3]]
+    for index in range(3):
+        path = root / f"gpu-sample-{index}.json"
+        row = json.loads(path.read_text(encoding="utf-8"))
+        fields = [field.strip() for field in row["output"][0].split(",")]
+        fields[6], fields[7], fields[8] = str(used[index]), str(free[index]), str(util[index])
+        row["output"][0] = ", ".join(fields)
+        path.write_text(json.dumps(row), encoding="utf-8")
+    for index, name in ((3, "gpu-before-cuda-properties"), (4, "gpu-after-cuda-properties")):
+        path = root / f"{name}.json"
+        row = json.loads(path.read_text(encoding="utf-8"))
+        fields = [field.strip() for field in row["output"][0].split(",")]
+        fields[3], fields[4] = str(used[index]), str(util[index])
+        row["output"][0] = ", ".join(fields)
+        path.write_text(json.dumps(row), encoding="utf-8")
+
+
+class FakeLock:
+    def __init__(self, *args, **kwargs):
+        self.pauses = []
+
+    def acquire(self, deadline, notice):
+        pass
+
+    def release(self):
+        pass
+
+    def pause(self, seconds, deadline, notice):
+        self.pauses.append(seconds)
+
+
 class SharedGpu1Tests(unittest.TestCase):
     def verify(self, root: Path, *, admission: bool = True) -> dict:
         with patch.dict("os.environ", {"EXPECTED_ENGINE_SHA": SHA, "GITHUB_SHA": SHA,
@@ -71,7 +105,8 @@ class SharedGpu1Tests(unittest.TestCase):
             self.assertEqual((result["physicalIndex"], result["cudaOrdinal"], result["luid"]),
                              (1, 0, LUID))
             self.assertEqual(result["observedActors"][0], [{"pid": 888, "type": "C+G"}])
-            # A coexisting actor may change residency/activity during our child.
+            # A coexisting actor may change residency/activity during our child; only
+            # admission judges the quiet window, never the post-child release census.
             for index in range(3):
                 path = root / f"gpu-sample-{index}.json"
                 row = json.loads(path.read_text(encoding="utf-8"))
@@ -79,8 +114,151 @@ class SharedGpu1Tests(unittest.TestCase):
                                                               ", 70000, 27000, 80, 65")
                 path.write_text(json.dumps(row), encoding="utf-8")
             self.verify(root, admission=False)
-            with self.assertRaisesRegex(RuntimeError, "approved occupancy"):
+            with self.assertRaisesRegex(idle.SharedGpu1NotAdmissible, r"utilization 80% \(> 30%\)"):
                 self.verify(root, admission=True)
+
+    def test_busy_but_stable_foreign_compute_process_is_admitted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_shared_probe(root)
+            # A foreign compute process holds 70 GiB and runs at a steady 20%: present, not refused.
+            set_window(root, [70000, 70040, 70020, 70060, 70050], [20, 22, 21, 20, 23])
+            for name in ("pmon-1-0", "pmon-1-1", "pmon-1-2", "pmon-0-final"):
+                path = root / f"{name}.json"
+                row = json.loads(path.read_text(encoding="utf-8"))
+                row["output"].append("    1       4000     C     20      9      -      -      -      -  70000      0    owner-llm")
+                path.write_text(json.dumps(row), encoding="utf-8")
+            for index in range(3):
+                path = root / f"windows-counters-{index}.json"
+                value = json.loads(path.read_text(encoding="utf-8"))
+                for row in value["counters"]:
+                    if row["counter"] == r"\GPU Engine(*)\Utilization Percentage":
+                        row["samples"][0]["cookedValue"] = 90  # Windows engine counter is evidence only.
+                path.write_text(json.dumps(value), encoding="utf-8")
+            result = self.verify(root)
+            self.assertIn({"pid": 4000, "type": "C"}, result["observedActors"][0])
+            self.assertEqual(result["windowUsedMiB"], [70000, 70040, 70020, 70060, 70050])
+            self.assertEqual(result["baselineUsedMiB"], 70050)
+
+    def test_growth_instability_and_insufficient_free_refuse_with_reason(self):
+        cases = (
+            ("growth", [553, 590, 625, 660, 700], [25] * 5, None, r"memory\.used grew 147 MiB \(> 128\)"),
+            ("spread", [553, 900, 553, 553, 553], [25] * 5, None, r"memory\.used moved 347 MiB \(> 256\)"),
+            ("busy", [553] * 5, [25, 25, 31, 25, 25], None, r"utilization 31% \(> 30%\)"),
+            ("jitter", [553] * 5, [5, 25, 5, 5, 5], None, r"utilization moved 20 points \(> 15\)"),
+            ("free", [553] * 5, [25] * 5, [96886, 16000, 96886], r"16000 MiB free < 16384 MiB required"),
+        )
+        for name, used, util, free, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                make_shared_probe(root)
+                set_window(root, used, util, free)
+                self.verify(root, admission=False)
+                with self.assertRaisesRegex(idle.SharedGpu1NotAdmissible, reason):
+                    self.verify(root)
+
+    def test_not_admissible_census_is_retryable_but_identity_refusal_is_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_shared_probe(root)
+            set_window(root, [553, 900, 553, 553, 553], [25] * 5)
+            def probe(command, **kwargs):
+                output = Path(command[command.index("-OutputDirectory") + 1])
+                for file in root.iterdir():
+                    (output / file.name).write_bytes(file.read_bytes())
+                return type("Completed", (), {"returncode": 0, "stderr": ""})()
+            with patch.object(idle, "check_shared_gpu1_dispatch"), \
+                 patch.dict("os.environ", {"EXPECTED_ENGINE_SHA": SHA, "GITHUB_SHA": SHA,
+                                           "RUNNER_NAME": "cuda-windows"}), \
+                 patch.object(idle.subprocess, "run", side_effect=probe):
+                raw, verified = idle.census_shared_gpu1(admission=True)
+                self.assertFalse(verified)
+                self.assertEqual(proof.retryable_admission(raw),
+                                 "selected GPU1 not admissible: memory.used moved 347 MiB (> 256)")
+                (root / "gpu-sample-1.json").write_text(
+                    (root / "gpu-sample-1.json").read_text(encoding="utf-8").replace(
+                        idle.SHARED_GPU1_UUID, "GPU-other"), encoding="utf-8")
+                raw, verified = idle.census_shared_gpu1(admission=True)
+                self.assertFalse(verified)
+                self.assertIsNone(proof.retryable_admission(raw))
+
+    def test_admission_waits_with_logged_reason_and_releases_the_lock(self):
+        unstable = json.dumps({"retryableAdmission": True,
+                               "refusal": "selected GPU1 not admissible: memory.used grew 300 MiB (> 128)"})
+        census = [(unstable, ["physical GPU1 shared-device proof refused"])] * 2 + [("admitted", [])]
+        lock = FakeLock()
+        stderr = io.StringIO()
+        with patch.object(proof, "cuda_physical_census", side_effect=census) as physical, \
+             patch("sys.stderr", stderr):
+            self.assertEqual(proof.admitted_cuda_census(time.monotonic() + 600, lock), ("admitted", []))
+        self.assertEqual(physical.call_count, 3)
+        self.assertEqual(lock.pauses, [proof.CUDA_ADMISSION_POLL_SECONDS] * 2)
+        # One notice per minute, naming the failed condition and that foreign actors never refuse.
+        self.assertEqual(stderr.getvalue().count("CUDA admission waiting:"), 1)
+        self.assertIn("memory.used grew 300 MiB (> 128)", stderr.getvalue())
+        self.assertIn("never a refusal", stderr.getvalue())
+        # Identity/evidence refusals are returned at once; an expired deadline stops the wait.
+        refused = json.dumps({"refusal": "selected physical GPU1 UUID/PCI changed"})
+        with patch.object(proof, "cuda_physical_census", return_value=(refused, ["refused"])) as physical:
+            self.assertEqual(proof.admitted_cuda_census(time.monotonic() + 600, lock)[1], ["refused"])
+            physical.assert_called_once_with()
+        with patch.object(proof, "cuda_physical_census", return_value=(unstable, ["refused"])) as physical:
+            self.assertEqual(proof.admitted_cuda_census(time.monotonic() - 1, lock)[1], ["refused"])
+            physical.assert_called_once_with()
+
+    def test_host_global_uuid_lock_waits_with_notice_then_holds_and_releases(self):
+        class Locker:
+            LK_NBLCK, LK_UNLCK = 2, 0
+            def __init__(self):
+                self.calls = []
+                self.refusals = 2
+            def locking(self, fd, mode, size):
+                self.calls.append(mode)
+                if mode == self.LK_NBLCK and self.refusals:
+                    self.refusals -= 1
+                    raise OSError("locked")
+        with tempfile.TemporaryDirectory() as directory:
+            locker = Locker()
+            sleeps = []
+            lock = idle.SharedGpu1Lock(Path(directory), locker, sleep=sleeps.append)
+            stderr = io.StringIO()
+            with patch("sys.stderr", stderr):
+                lock.acquire(time.monotonic() + 600, {})
+            self.assertEqual((Path(directory) / f"{idle.SHARED_GPU1_UUID}.lock").read_bytes(), b"0")
+            self.assertEqual(locker.calls, [2, 2, 2])
+            self.assertEqual(len(sleeps), 2)
+            self.assertIn("UUID lock held by another CI job", stderr.getvalue())
+            lock.pause(3, time.monotonic() + 600, {})
+            self.assertEqual(locker.calls[3:], [0, 2])
+            lock.release()
+            lock.release()
+            self.assertEqual(locker.calls[-1], 0)
+            locker.refusals = 1
+            with self.assertRaisesRegex(RuntimeError, "UUID lock still held"):
+                lock.acquire(time.monotonic() - 1, {})
+
+    def test_child_memory_is_peak_minus_locked_baseline_and_cotenant_change_contaminates(self):
+        def census(used, actors):
+            return json.dumps({"validatedDevice": {"baselineUsedMiB": used,
+                               "observedActors": [actors] * 4}})
+        samples = [{"raw": f"t, 1, {value}, 1000", "physical_gpu_index": 1}
+                   for value in (70100, 82000, 75000)]
+        foreign = [{"pid": 4000, "type": "C"}, {"pid": 888, "type": "C+G"}]
+        own = [{"pid": 9001, "type": "C"}]
+        clean = proof.child_memory_measurement(census(70000, foreign), census(70100, foreign + own),
+                                               samples, {9001})
+        self.assertEqual((clean["baseline_used_mib"], clean["peak_used_mib"],
+                          clean["peak_minus_baseline_mib"], clean["contaminated"]),
+                         (70000, 82000, 12000, False))
+        moved = proof.child_memory_measurement(census(70000, foreign), census(74000, foreign), samples, set())
+        self.assertTrue(moved["contaminated"])
+        self.assertIn("baseline moved +4000 MiB", moved["contamination"][0])
+        changed = proof.child_memory_measurement(census(70000, foreign), census(70000, foreign[1:]),
+                                                 samples, set())
+        self.assertEqual(changed["contamination"], ["foreign compute actors changed: [888, 4000] -> [888]"])
+        missing = proof.child_memory_measurement(census(70000, foreign), None, samples, set())
+        self.assertTrue(missing["contaminated"])
+        self.assertEqual(missing["peak_minus_baseline_mib"], 12000)
 
     def test_selected_identity_capacity_and_telemetry_mutations_refuse(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -102,8 +280,6 @@ class SharedGpu1Tests(unittest.TestCase):
                 ("windows-counters-1", lambda row: row["counters"][0].pop("samples")),
                 ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
                     "status", "unavailable")),
-                ("windows-counters-1", lambda row: row["counters"][0]["samples"][0].__setitem__(
-                    "cookedValue", 51)),
             )
             for name, mutate in mutations:
                 with self.subTest(name=name, mutate=mutate):
@@ -147,7 +323,6 @@ class SharedGpu1Tests(unittest.TestCase):
                     "path", row["samples"][-1]["path"].replace("#1", "_other#1")),
                 lambda row: row["samples"][-1].pop("path"),
                 lambda row: row["samples"][-1].__setitem__("status", "unavailable"),
-                lambda row: row["samples"][-1].__setitem__("cookedValue", 51),
             ):
                 with self.subTest(mutate=mutate):
                     value = json.loads(original)
@@ -215,6 +390,7 @@ class SharedGpu1Tests(unittest.TestCase):
                  patch.object(proof, "verify_revisions"), \
                  patch.object(proof.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
                  patch.object(idle, "check_shared_gpu1_dispatch", side_effect=selected_preflight) as selected, \
+                 patch.object(idle, "SharedGpu1Lock", FakeLock), \
                  patch.object(proof, "cuda_physical_census",
                               side_effect=RuntimeError("selected GPU1 census reached")) as census, \
                  patch.object(proof.subprocess, "Popen") as launched:
