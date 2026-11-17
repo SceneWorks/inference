@@ -23,7 +23,7 @@
 //! - **Latents** by the Qwen-Image VAE encode: `preprocess_init_image` (resize + `[−1,1]` NCHW) →
 //!   [`QwenVae::encode`](crate::vae::QwenVae) (per-channel-normalized 16-ch latent) → drop the singleton
 //!   temporal axis → `[1, 16, h/8, w/8]` at the item's aspect-keeping canvas (about `edge²` pixels,
-//!   never upscaled, sides multiples of [`CANVAS_STRIDE`] — never a centre square), exactly the
+//!   never upscaled, sides multiples of `CANVAS_STRIDE` — never a centre square), exactly the
 //!   latent the DiT predicts in.
 //! - **Caption features** are the Qwen3-VL-4B condition encoder's stacked 12 select-layers
 //!   `[1, n_tok, 12, 2560]` (the DiT's `text_fusion` aggregator consumes them). Single-conditional (no

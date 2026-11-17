@@ -516,7 +516,7 @@ impl AnimaTrainer {
             let mask =
                 PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
             // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge (about
-            // `edge²` pixels, never upscaled, sides multiples of [`CANVAS_STRIDE`] — never
+            // `edge²` pixels, never upscaled, sides multiples of `CANVAS_STRIDE` — never
             // centre-cropped to a square). Every micro-step trains one cached entry, so entries of
             // different shapes never share a batch; the DiT prepares one RoPE table per distinct
             // latent shape (`prepare_training`, priced by `training_geometry_bytes`).

@@ -27,7 +27,7 @@
 //!    before the DiT loads.
 //!  - **Latents from a neural VAE encode.** Each image is decoded whole and resized onto its
 //!    aspect-keeping canvas per bucket edge (about `edge²` pixels, never upscaled, sides multiples of
-//!    [`CANVAS_STRIDE`] — never centre-cropped to a square), then `Flux2Vae`-encoded to the packed DiT
+//!    `CANVAS_STRIDE` — never centre-cropped to a square), then `Flux2Vae`-encoded to the packed DiT
 //!    latent `[1, S, 128]` ([`crate::vae::encode`], posterior mean, an `(H/16) × (W/16)` grid) and
 //!    cached with that grid.
 //!  - **Targets:** the fused dual-stream attention projections [`LENS_ATTN_TARGETS`]

@@ -9,7 +9,7 @@
 //!
 //!  1. **Cache** — for each captioned image: decode it whole and resize it onto its aspect-keeping
 //!     canvas at each bucket edge ([`decode_rgb`] + [`canvas_image_tensor`]: about `edge²` pixels,
-//!     never upscaled, sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square),
+//!     never upscaled, sides multiples of `CANVAS_STRIDE` — never centre-cropped to a square),
 //!     encode the **deterministic latent mean** (`VaeMomentsEncoder::encode_mean` → `mean × 0.13025`, the user's `.mean` decision — candle's
 //!     stock VAE hides the mean, hence the vendored encoder), and encode the caption through the dual
 //!     CLIP into `[1, 77, 2048]`. The CLIP + VAE encoders are dropped after caching.

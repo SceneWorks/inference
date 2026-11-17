@@ -4,8 +4,8 @@
 //!
 //! Each captioned image is decoded whole and resized onto its aspect-keeping canvas at every bucket
 //! edge ([`training_canvas`]: about `edge²` pixels, never upscaled, sides multiples of
-//! [`CANVAS_STRIDE`], scaled down at its aspect where the long side would pass the positional cap
-//! [`canvas_max_side`]) — never centre-cropped to a square; the MMDiT crops its learned positional
+//! `CANVAS_STRIDE`, scaled down at its aspect where the long side would pass the positional cap
+//! `canvas_max_side`) — never centre-cropped to a square; the MMDiT crops its learned positional
 //! table to each latent's own `(h, w)` patch grid.
 
 use std::collections::HashMap;

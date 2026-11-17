@@ -14,7 +14,7 @@
 //!
 //!  1. **Cache** — for each captioned image: decode it whole and resize it onto its aspect-keeping
 //!     canvas at each bucket edge ([`decode_rgb`] + [`canvas_image_tensor`]: about `edge²` pixels,
-//!     never upscaled, sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square), encode the **deterministic latent mean** through the Qwen-Image
+//!     never upscaled, sides multiples of `CANVAS_STRIDE` — never centre-cropped to a square), encode the **deterministic latent mean** through the Qwen-Image
 //!     [`QwenVaeEncoder`] (the `(mean − latents_mean)/latents_std` the DiT consumes — `encode` already
 //!     skips the `DiagonalGaussian` draw), and encode the caption through the Qwen3-VL-4B text encoder
 //!     with the *exact* tokenizer + select-layer stack inference uses → `(L, num_text_layers,

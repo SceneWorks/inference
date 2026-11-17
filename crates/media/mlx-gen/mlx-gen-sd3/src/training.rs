@@ -25,7 +25,7 @@
 //!   is the top SD3-vs-Krea/z-image delta (those pass `t` raw); pinned by a test.
 //! - **Latents** by the SD3.5 16-ch VAE encode of each image's aspect-keeping training canvas
 //!   ([`canvas_source`]: the whole frame at about `edge²` pixels, never upscaled, sides multiples of
-//!   [`CANVAS_STRIDE`], scaled down at its aspect past the positional cap [`canvas_max_side`] — never
+//!   `CANVAS_STRIDE`, scaled down at its aspect past the positional cap `canvas_max_side` — never
 //!   centre-cropped to a square): `preprocess_init_image` (resize + `[−1,1]` NCHW) →
 //!   [`Vae::encode`](mlx_gen_z_image::vae::Vae) → `[1, 16, h/8, w/8]` (NO temporal axis, NO
 //!   pack/transpose — the SD3 latent stays plain NCHW, unlike z-image's packed DiT input).
@@ -897,7 +897,7 @@ fn resolve_target_paths(transformer: &Sd3Transformer, cfg: &TrainingConfig) -> V
 }
 
 /// Encode a whole image on its training canvas at bucket `edge` ([`canvas_source`]: its own aspect
-/// at about `edge²` pixels on the [`CANVAS_STRIDE`] grid, long side within `max_side`) into an SD3.5
+/// at about `edge²` pixels on the `CANVAS_STRIDE` grid, long side within `max_side`) into an SD3.5
 /// training latent `[1, 16, h/8, w/8]` — the 16-ch VAE encode the MMDiT predicts in:
 /// `preprocess_init_image` (resize + `[−1,1]` NCHW) → [`Vae::encode`] (16-ch latent in the
 /// scaled/shifted latent space). Unlike z-image's packed DiT input, the SD3 latent stays plain NCHW —

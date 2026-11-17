@@ -4,7 +4,7 @@
 //! plus size embedding.
 //!
 //! Each captioned image is decoded whole and resized onto its aspect-keeping canvas at every bucket
-//! edge (about `edge²` pixels, never upscaled, sides multiples of [`CANVAS_STRIDE`] — never
+//! edge (about `edge²` pixels, never upscaled, sides multiples of `CANVAS_STRIDE` — never
 //! centre-cropped to a square); its `time_ids` name that canvas, exactly as inference names the
 //! render size.
 

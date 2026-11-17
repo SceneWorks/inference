@@ -430,7 +430,7 @@ impl AnimaTrainer {
         on_progress(TrainingProgress::Preparing);
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
         // off). Each edge is an area budget: every item trains on its aspect-keeping canvas at
-        // about `edge²` pixels (never upscaled, sides multiples of [`CANVAS_STRIDE`] — never
+        // about `edge²` pixels (never upscaled, sides multiples of `CANVAS_STRIDE` — never
         // centre-cropped to a square). The memory pre-flight prices the largest edge's square
         // (every canvas is at most that area — the worst case, epic 2123 E7); previews render at
         // item 0's canvas at that edge.

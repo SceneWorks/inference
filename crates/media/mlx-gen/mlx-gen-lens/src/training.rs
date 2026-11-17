@@ -845,7 +845,7 @@ fn resolve_target_paths(transformer: &LensTransformer, cfg: &TrainingConfig) -> 
 }
 
 /// Encode a whole image on its training canvas at bucket `edge` ([`canvas_source`]: its own aspect at
-/// about `edge²` pixels on the [`CANVAS_STRIDE`] grid, never upscaled, never centre-cropped to a
+/// about `edge²` pixels on the `CANVAS_STRIDE` grid, never upscaled, never centre-cropped to a
 /// square) into a Lens training latent `[1, latent_h·latent_w, 128]`, returned with its
 /// `(latent_h, latent_w)` grid — the inverse of the Lens `_decode`. The Lens latent space *is* the
 /// Flux.2 one, so this is the Flux.2

@@ -754,7 +754,7 @@ fn cache_samples(
     let vae = MageVae::load_full(&dirs.vae, device)?;
     // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off);
     // each (item, bucket) packs its own latent grid: the item's aspect-keeping canvas at about
-    // `edge²` pixels (never upscaled, sides multiples of [`CANVAS_STRIDE`], never centre-cropped to
+    // `edge²` pixels (never upscaled, sides multiples of `CANVAS_STRIDE`, never centre-cropped to
     // a square).
     let edges = bucket_edges(&req.config);
     let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);

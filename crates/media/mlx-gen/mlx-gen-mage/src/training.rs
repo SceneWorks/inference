@@ -657,7 +657,7 @@ impl MageFlowTrainer {
 
         // Training resolutions → one edge per resolution bucket (sc-2127; just `[resolution]` when
         // buckets are off). Each edge is an area budget: every item trains on its aspect-keeping
-        // canvas at about `edge²` pixels (never upscaled, sides multiples of [`CANVAS_STRIDE`] —
+        // canvas at about `edge²` pixels (never upscaled, sides multiples of `CANVAS_STRIDE` —
         // never centre-cropped to a square). `patch_size == 1`, so each sample's token count is
         // exactly its latent grid. The memory preflight prices the largest edge's square (every
         // canvas is at most that area); previews render at item 0's canvas at that edge.

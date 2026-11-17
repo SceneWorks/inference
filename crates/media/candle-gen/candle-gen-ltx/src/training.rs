@@ -3199,7 +3199,7 @@ fn ltx23_subject_mask_weight(
 
 /// One item's item-major LTX-2.3 cache entries (sc-2127 × sc-24828): the whole decoded `rgb`
 /// resized onto its aspect-keeping training canvas at each bucket edge (about `edge²` pixels, never
-/// upscaled, sides multiples of [`CANVAS_STRIDE`], long side within [`CANVAS_MAX_SIDE`] — never
+/// upscaled, sides multiples of `CANVAS_STRIDE`, long side within `CANVAS_MAX_SIDE` — never
 /// centre-cropped to a square) and encoded by `encode` (`[1, 3, 1, h_px, w_px]` still →
 /// `[1, C, F, h, w]` latent), flattened to tokens, paired with the caption `context`, the RoPE
 /// positions of the latent's OWN `(h, w)` grid (from `positions`) and the subject-mask weight on

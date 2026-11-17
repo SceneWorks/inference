@@ -16,7 +16,7 @@
 //!   `x ← x + v·(σ_{i+1} − σ_i)`, so there is no sign flip.
 //! - **Latents** are the RGBA autoencoder's posterior **mode** of the whole image resized onto its
 //!   aspect-keeping training canvas (about `edge²` pixels, never upscaled, sides multiples of
-//!   [`CANVAS_STRIDE`] — never centre-cropped to a square; an RGB image is the opaque RGBA case: a
+//!   `CANVAS_STRIDE` — never centre-cropped to a square; an RGB image is the opaque RGBA case: a
 //!   constant `+1` alpha plane), normalised `(z − mean)/std` and packed unpatched to
 //!   `[1, (h/16)·(w/16), z_dim]`.
 //! - **Caption features** are the Qwen3-VL language tower's T2I conditioning
@@ -1550,7 +1550,7 @@ fn edit_target_size(item: &TrainingItem, edge: u32) -> Result<(u32, u32)> {
 /// resized onto. Both kinds keep the target's **aspect ratio** within about `edge²` pixels:
 ///
 /// * a captioned (text-to-image) item trains on its aspect-preserving canvas
-///   ([`training_canvas`] at [`CANVAS_STRIDE`] / [`CANVAS_MAX_SIDE`]: never upscaled past the
+///   ([`training_canvas`] at `CANVAS_STRIDE` / `CANVAS_MAX_SIDE`: never upscaled past the
 ///   source, the whole frame unless it is more elongated than 4:1 — [`canvas_crop`]). The DiT takes
 ///   `h ≠ w` and renders non-square, so a centre square would only discard frame and upscale.
 /// * an edit pair's target is the render path's own fit, [`calculate_dimensions`]`(edge², w/h)` on

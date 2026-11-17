@@ -19,7 +19,7 @@ pub const STREAM_VERSION: &str = "moss-stateless-draw-v1";
 pub const STATE_VERSION: &str = "moss-complete-state-v2";
 /// Assignment policy of the default (no `aspect_ratio_buckets`) path: each item at each square
 /// bucket edge trains on the shared aspect-preserving canvas
-/// ([`gen_core_train::canvas::training_canvas`]) at stride [`CANVAS_STRIDE`], and micro-batches
+/// ([`gen_core_train::canvas::training_canvas`]) at stride `CANVAS_STRIDE`, and micro-batches
 /// larger than one are homogeneous in canvas size. It replaced `legacy-square-bucket-v1` (centre
 /// square at `edge²`), so a resume state written under the square policy is refused by the plan
 /// identity rather than resumed on different geometry.

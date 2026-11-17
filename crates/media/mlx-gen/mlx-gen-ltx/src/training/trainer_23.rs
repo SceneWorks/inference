@@ -91,8 +91,8 @@ impl LtxTrainer {
                     total,
                 });
                 // Decoded once, whole; cut + resized onto its aspect-keeping canvas per bucket edge
-                // (about `edge²` px, never upscaled, sides multiples of [`CANVAS_STRIDE`], long
-                // side within [`CANVAS_MAX_SIDE`] — never centre-cropped to a square). Each step
+                // (about `edge²` px, never upscaled, sides multiples of `CANVAS_STRIDE`, long
+                // side within `CANVAS_MAX_SIDE` — never centre-cropped to a square). Each step
                 // trains ONE cached entry, so entries of different shapes never share a batch.
                 let img = decode_image(&item.image_path)?;
                 // sc-24828: the item's mask is read and checked once, resampled per bucket below.

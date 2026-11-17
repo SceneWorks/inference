@@ -64,19 +64,32 @@ fn snapshot() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Two solid-colour swatch PNGs + captions in `dir`: a square and a 2:3 portrait, so every run
-/// trains a non-square aspect-preserving canvas (the portrait at edge 64 is 48×64, never a
-/// centre-cropped square).
-fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+/// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a solid red square swatch,
+/// item 1 a 2:3 portrait of three distinct horizontal bands (blue / cream / green), so every run
+/// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
+/// centre-cropped square) is visible in its latents and samples. The square side is `edge` (never
+/// below the historical 96 px) and the portrait is that width × 1.5: the canvas never upscales a
+/// source (SW-7172), so a fixture smaller than `edge²` would silently train a smaller workload than
+/// the run claims. At edge 64 that is the historical 96² square plus a 96×144 portrait (canvas
+/// 48×64); at 1024 a 1024² square (canvas 1024², exactly as before) plus a 1024×1536 portrait
+/// (canvas 832×1248).
+fn make_dataset(dir: &Path, edge: u32) -> Vec<TrainingItem> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
+    let side = edge.max(96);
+    let fixtures: [(u32, u32, &[[u8; 3]]); 2] = [
+        (side, side, &[[200, 40, 40]]),
+        (
+            side,
+            side * 3 / 2,
+            &[[40, 80, 200], [235, 225, 200], [40, 160, 70]],
+        ),
+    ];
     let mut items = Vec::new();
-    for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
-        let (w, h) = if i == 0 { (96, 96) } else { (96, 144) };
-        let mut img = image::RgbImage::new(w, h);
-        for px in img.pixels_mut() {
-            *px = image::Rgb(*color);
-        }
+    for (i, (w, h, bands)) in fixtures.into_iter().enumerate() {
+        let img = image::RgbImage::from_fn(w, h, |_, y| {
+            image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+        });
         let path = dir.join(format!("img{i}.png"));
         img.save(&path).unwrap();
         items.push(TrainingItem {
@@ -124,7 +137,8 @@ fn run(
     steps: u32,
     grad_ckpt: bool,
 ) -> RunOut {
-    let items = make_dataset(tmp);
+    let config = config(network_type, steps, grad_ckpt);
+    let items = make_dataset(tmp, config.resolution);
     let mut trainer = candle_gen_krea::provider_registry()
         .unwrap()
         .load_trainer(
@@ -137,7 +151,7 @@ fn run(
 
     let req = TrainingRequest {
         items,
-        config: config(network_type, steps, grad_ckpt),
+        config,
         output_dir: tmp.join("out"),
         file_name: file_name.to_string(),
         trigger_words: vec![],
@@ -233,11 +247,13 @@ fn krea_bounded_acceleration_profile() {
             .map(PathBuf::from)
             .expect("existing model-proof executor must bind its owned generated output directory")
             .join("krea_bounded_acceleration");
-        let items = make_dataset(&tmp.join("data"));
         let mut cfg = config(NetworkType::Lora, expected_updates, false);
         cfg.rank = 16;
         cfg.alpha = 16.;
         cfg.resolution = 1024;
+        // A 1024² square + a 1024×1536 portrait: both at least the run's 1024² area, so the
+        // square trains its historical 1024² canvas and the portrait its whole 2:3 frame.
+        let items = make_dataset(&tmp.join("data"), cfg.resolution);
         cfg.gradient_accumulation = 1;
         // Preserve the established production preview policy; the one acceptance
         // sample below is generated after save/reload/apply, outside step timing.
@@ -587,7 +603,9 @@ fn krea_preview_full_resolution_no_oom() {
         return;
     }
     let tmp = artifact_root().join("krea_preview_1024");
-    let items = make_dataset(&tmp);
+    // Sources at the run's 1024 edge: previews render at item 0's canvas, which stays the 1024²
+    // production shape only if the square swatch is at least 1024² (the canvas never upscales).
+    let items = make_dataset(&tmp, 1024);
     let mut trainer = candle_gen_krea::provider_registry()
         .unwrap()
         .load_trainer(
@@ -648,7 +666,7 @@ fn krea_trainer_emits_preview_samples() {
         return;
     }
     let tmp = artifact_root().join("krea_trainer_e2e_samples");
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 64);
     let mut trainer = candle_gen_krea::provider_registry()
         .unwrap()
         .load_trainer(
@@ -986,14 +1004,27 @@ fn krea_control_bounded_acceleration_acceptance() {
     let snapshot = PathBuf::from(
         std::env::var_os("KREA_CONTROL_BASE_DIR").expect("pinned native Turbo snapshot"),
     );
+    // One 2:3 portrait pair (64×96, above the run's 64² area), so the bounded run trains a
+    // non-square aspect canvas (48×64) on target AND control. The single item is kept: the
+    // `active-item-conditioning-hit` cohort requires consecutive micro-steps on one item. The
+    // target is a centred cream figure on the blue tile, so a sample shows the whole frame trained.
+    let (w, h) = (64u32, 96u32);
     let input = root.join("input.png");
-    image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
-        .save(&input)
-        .unwrap();
+    image::RgbImage::from_fn(w, h, |x, y| {
+        let (dx, dy) = (x.abs_diff(w / 2), y.abs_diff(h / 2));
+        if dx <= w / 6 && dy <= h / 3 {
+            image::Rgb([235, 225, 200])
+        } else {
+            image::Rgb([80, 140, 210])
+        }
+    })
+    .save(&input)
+    .unwrap();
     let control = root.join("control.png");
-    // Nonconstant, aligned control pixels are encoded by the production VAE.
-    image::RgbImage::from_fn(64, 64, |x, y| {
-        image::Rgb([(x * 4) as u8, (y * 4) as u8, 80])
+    // Nonconstant, aligned control pixels (the target's own portrait shape) are encoded by the
+    // production VAE.
+    image::RgbImage::from_fn(w, h, |x, y| {
+        image::Rgb([(x * 255 / (w - 1)) as u8, (y * 255 / (h - 1)) as u8, 80])
     })
     .save(&control)
     .unwrap();

@@ -141,6 +141,23 @@ fn wan_ti2v_5b_lora_real_cuda() {
 }
 
 #[cfg(feature = "model-inference-proof")]
+/// A 2:3 portrait fixture (`width × 1.5·width`): a cream, figure-like centred block on `ground`, so a
+/// sample or latent from a run trained on it shows whether the whole non-square frame was used (the
+/// aspect canvas, SW-7172) rather than a centre-cropped square.
+fn write_portrait(path: &std::path::Path, width: u32, ground: [u8; 3]) {
+    let height = width * 3 / 2;
+    image::RgbImage::from_fn(width, height, |x, y| {
+        if x.abs_diff(width / 2) <= width / 6 && y.abs_diff(height / 2) <= height / 3 {
+            image::Rgb([235, 225, 200])
+        } else {
+            image::Rgb(ground)
+        }
+    })
+    .save(path)
+    .unwrap();
+}
+
+#[cfg(feature = "model-inference-proof")]
 fn bounded_output_root() -> PathBuf {
     let root = PathBuf::from(
         std::env::var_os("MODEL_PROOF_OUTPUT_DIR")
@@ -179,10 +196,14 @@ fn bounded_run(id: &str, env: &str) {
             || {
                 let snapshot =
                     PathBuf::from(std::env::var(env).expect("existing installed model snapshot"));
+                // Sources at least the run's 512² area (the canvas never upscales): the square
+                // trains its historical 512² canvas, the 512×768 portrait its whole 2:3 frame.
                 let input = root.join("comparison_input.png");
-                image::RgbImage::from_pixel(64, 64, image::Rgb([120, 90, 220]))
+                image::RgbImage::from_pixel(512, 512, image::Rgb([120, 90, 220]))
                     .save(&input)
                     .unwrap();
+                let portrait = root.join("comparison_portrait.png");
+                write_portrait(&portrait, 512, [120, 90, 220]);
                 let mut trainer = candle_gen_wan::provider_registry()
                     .unwrap()
                     .load_trainer(id, &LoadSpec::new(WeightsSource::Dir(snapshot)))
@@ -190,7 +211,13 @@ fn bounded_run(id: &str, env: &str) {
                 let output = trainer
                     .train(
                         &TrainingRequest {
-                            items: vec![TrainingItem::captioned(input, "a violet tile".into())],
+                            items: vec![
+                                TrainingItem::captioned(input, "a violet tile".into()),
+                                TrainingItem::captioned(
+                                    portrait,
+                                    "a cream figure on a violet tile".into(),
+                                ),
+                            ],
                             config: TrainingConfig {
                                 network_type: NetworkType::Lora,
                                 rank: 2,
@@ -238,6 +265,10 @@ fn bounded_run(id: &str, env: &str) {
     image::RgbImage::from_pixel(64, 64, image::Rgb([120, 90, 220]))
         .save(&input)
         .unwrap();
+    // A 64×96 portrait (above the run's 64² area) so the bounded run also trains a non-square
+    // aspect canvas over its whole frame.
+    let portrait = temp.as_path().join("portrait.png");
+    write_portrait(&portrait, 64, [120, 90, 220]);
     let mut trainer = candle_gen_wan::provider_registry()
         .unwrap()
         .load_trainer(id, &LoadSpec::new(WeightsSource::Dir(snapshot.clone())))
@@ -253,7 +284,13 @@ fn bounded_run(id: &str, env: &str) {
             trainer
                 .train(
                     &TrainingRequest {
-                        items: vec![TrainingItem::captioned(input, "a violet tile".into())],
+                        items: vec![
+                            TrainingItem::captioned(input, "a violet tile".into()),
+                            TrainingItem::captioned(
+                                portrait,
+                                "a cream figure on a violet tile".into(),
+                            ),
+                        ],
                         config: TrainingConfig {
                             network_type: NetworkType::Lora,
                             rank: 2,

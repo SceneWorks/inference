@@ -453,7 +453,7 @@ impl ZImageTurboTrainer {
 
     /// The caching pass: per item, its caption embedding once and one clean latent per bucket
     /// edge, each the whole image resized onto its aspect-keeping canvas at that edge (about
-    /// `edge²` pixels, never upscaled, sides multiples of [`CANVAS_STRIDE`] — never centre-cropped
+    /// `edge²` pixels, never upscaled, sides multiples of `CANVAS_STRIDE` — never centre-cropped
     /// to a square). Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean
     /// latent, caption embeds, and (subject-masked loss, sc-24828) that bucket's latent loss-weight
     /// map — `None` when the technique is off. Also returns the preview canvas: item 0's canvas at

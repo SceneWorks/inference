@@ -26,7 +26,7 @@
 //!
 //! **Aspect-preserving canvas.** Each captioned image is decoded whole and resized onto its own
 //! training canvas at every bucket edge ([`canvas_source`]: about `edge²` pixels, never upscaled,
-//! sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square). The memory guard still
+//! sides multiples of `CANVAS_STRIDE` — never centre-cropped to a square). The memory guard still
 //! prices the square `edge²` (every canvas is within it); each step trains ONE cached entry, so
 //! entries of different shapes never share a batch; previews render at item 0's canvas at the
 //! largest edge.

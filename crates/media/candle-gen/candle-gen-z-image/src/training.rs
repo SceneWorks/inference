@@ -13,7 +13,7 @@
 //!
 //!  1. **Cache** — for each captioned image: decode it whole and resize it onto its aspect-keeping
 //!     canvas at each bucket edge ([`decode_rgb`] + [`canvas_image_tensor`]: about `edge²` pixels,
-//!     never upscaled, sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square),
+//!     never upscaled, sides multiples of `CANVAS_STRIDE` — never centre-cropped to a square),
 //!     encode the **deterministic latent mean** (the stock z_image
 //!     [`Encoder`](VaeEncoder) → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
 //!     reproducible), and encode the caption through the Qwen3 text encoder with the *exact* gen-core
