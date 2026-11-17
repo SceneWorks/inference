@@ -15,12 +15,11 @@
 
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::gen_core::h3_image::sampler_sigmas;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::train::trainer_loop::build_adapter;
 use mlx_gen::{CancelFlag, TrainingConfig};
 
-use gen_core_train::h3_image::training_step;
+use gen_core_train::h3_image::distilled_step;
 
 use super::block_trainables;
 use super::step::{
@@ -427,7 +426,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     let context = normal(&[1, 16, 5120], 1, 1.0)
         .as_dtype(Dtype::Float32)
         .unwrap();
-    let step = training_step(sampler_sigmas()[2]);
+    let step = distilled_step(2);
     let x0 = normal(&[1, rows, 96], 2, 1.0);
     let noise = normal(&[1, rows, 96], 3, 1.0);
     let (packed, target) = noised_rows(&x0, &noise, step).unwrap();

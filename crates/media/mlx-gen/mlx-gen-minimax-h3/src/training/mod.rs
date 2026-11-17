@@ -65,7 +65,7 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, decode_image};
 use mlx_gen::train::lora::{
     build_lokr_targets, build_lora_targets, factorization, LoraParams, TrainAdapter,
 };
@@ -367,7 +367,7 @@ impl MiniMaxH3ImageTrainer {
                 .map(|p| image_dimensions(p))
                 .collect::<Result<Vec<_>>>()?;
             items.push(TrainingItemShape {
-                canvas: training_canvas(item.is_edit_pair(), dims, plan.edge),
+                canvas: training_canvas(dims, plan.edge),
                 caption_tokens: t2i_prompt_ids(tok.ids(&item.caption)?)?.len() as u32,
                 references,
             });
@@ -507,15 +507,13 @@ impl MiniMaxH3ImageTrainer {
                 }
                 latents
             };
+            // The whole target, captioned or edit: resized (never cropped, never upscaled past its
+            // own area) onto its aspect-keeping canvas at each bucket edge. Every micro-step
+            // trains one cached entry, so entries of different shapes never share a batch.
             let target = decode_image(&item.image_path)?;
             for &edge in &plan.edges {
-                let (w, h) =
-                    training_canvas(item.is_edit_pair(), (target.width, target.height), edge);
-                let image = if item.is_edit_pair() {
-                    resize_to_request(target.clone(), w, h)?
-                } else {
-                    resize_to_request(center_crop_square(&target), w, h)?
-                };
+                let (w, h) = training_canvas((target.width, target.height), edge);
+                let image = resize_to_request(target.clone(), w, h)?;
                 let posterior = encoder.encode(&reference_vae_pixels(&image)?)?;
                 // The posterior mode: the sample at zero noise, normalized like a reference.
                 let zero = Array::zeros::<f32>(posterior.mean().shape())?;
@@ -805,17 +803,18 @@ impl PreviewSetup {
         if plan.sample_prompts.is_empty() {
             return Ok(None);
         }
+        // Item 0's own training canvas in both modes — the shape the preflight prices a preview
+        // at — and, for an edit, its references.
         let first = &plan.req.items[0];
-        let (size, references) = if plan.edit {
-            let dims = image_dimensions(&first.image_path)?;
-            let refs = first
+        let size = training_canvas(image_dimensions(&first.image_path)?, plan.edge);
+        let references = if plan.edit {
+            first
                 .reference_image_paths
                 .iter()
                 .map(|p| decode_image(p))
-                .collect::<Result<Vec<_>>>()?;
-            (training_canvas(true, dims, plan.edge), refs)
+                .collect::<Result<Vec<_>>>()?
         } else {
-            ((plan.edge, plan.edge), Vec::new())
+            Vec::new()
         };
         Ok(Some(Self {
             spec: trainer.spec.clone(),

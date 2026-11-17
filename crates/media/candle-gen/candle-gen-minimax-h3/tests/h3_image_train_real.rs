@@ -252,7 +252,11 @@ fn h3_image_train_t2i_saves_reproduces_and_resumes_q4_cuda() {
     let items: Vec<TrainingItem> = (0..2u32)
         .map(|i| {
             let path = data.path().join(format!("item{i}.png"));
-            draw(&path, 2048, 2048, i);
+            // Item 1 is a 1365x2048 portrait: trained whole at its own aspect and area (a
+            // 1344x2048 canvas), never centre-cropped or upscaled. Item 0 stays square, so the
+            // preview (item 0's canvas) is the 2048² render reproduced below.
+            let (w, h) = if i == 1 { (1365, 2048) } else { (2048, 2048) };
+            draw(&path, w, h, i);
             TrainingItem::captioned(
                 path,
                 format!("a red disc on a gradient, sks style, variant {i}"),

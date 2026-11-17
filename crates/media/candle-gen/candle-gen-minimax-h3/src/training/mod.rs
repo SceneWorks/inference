@@ -80,7 +80,7 @@ use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
-use candle_gen::train::dataset::{bucket_edges, decode_square};
+use candle_gen::train::dataset::bucket_edges;
 use candle_gen::train::flow_match::{
     self, apply_update, create_output_dir, effective_weight_decay, item_major_schedule,
     request_fingerprint, sample_seed, save_adapter, validate_flow_match_request,
@@ -491,17 +491,18 @@ impl PreviewSetup {
         if plan.sample_prompts.is_empty() {
             return Ok(None);
         }
+        // Item 0's own training canvas in both modes — the shape the preflight prices a preview
+        // at — and, for an edit, its references.
         let first = &plan.req.items[0];
-        let (size, references) = if plan.edit {
-            let dims = image_dimensions(&first.image_path)?;
-            let refs = first
+        let size = training_canvas(image_dimensions(&first.image_path)?, plan.edge);
+        let references = if plan.edit {
+            first
                 .reference_image_paths
                 .iter()
                 .map(|p| decode_image(p))
-                .collect::<Result<Vec<_>>>()?;
-            (training_canvas(true, dims, plan.edge), refs)
+                .collect::<Result<Vec<_>>>()?
         } else {
-            ((plan.edge, plan.edge), Vec::new())
+            Vec::new()
         };
         Ok(Some(Self {
             spec: trainer.spec.clone(),
@@ -594,7 +595,7 @@ impl MiniMaxH3ImageTrainer {
                 .map(|p| image_dimensions(p))
                 .collect::<Result<Vec<_>>>()?;
             items.push(TrainingItemShape {
-                canvas: training_canvas(item.is_edit_pair(), dims, plan.edge),
+                canvas: training_canvas(dims, plan.edge),
                 caption_tokens: tokens(&item.caption)?,
                 references,
             });
@@ -716,19 +717,12 @@ impl MiniMaxH3ImageTrainer {
                 current: count + index as u32 + 1,
                 total,
             });
-            let target = if item.is_edit_pair() {
-                decode_image(&item.image_path)?
-            } else {
-                let square = decode_square(&item.image_path)?;
-                Image {
-                    width: square.width(),
-                    height: square.height(),
-                    pixels: square.into_raw(),
-                }
-            };
+            // The whole target, captioned or edit: resized (never cropped, never upscaled past its
+            // own area) onto its aspect-keeping canvas at each bucket edge. Every micro-step
+            // trains one cached entry, so entries of different shapes never share a batch.
+            let target = decode_image(&item.image_path)?;
             for &edge in &plan.edges {
-                let canvas =
-                    training_canvas(item.is_edit_pair(), (target.width, target.height), edge);
+                let canvas = training_canvas((target.width, target.height), edge);
                 let image = resize_reference(&target, canvas)?;
                 let posterior = encoder.encode(&reference_vae_pixels(&image, device)?)?;
                 // The posterior mode: the sample at zero noise, normalized like a reference.

@@ -12,7 +12,8 @@
 //!   distilled H3-Image run computes once per request and therefore cannot train;
 //! * the **flow-matching training contract** — [`training_step`] and [`training_mix`], the noise
 //!   level, head and regression target one micro-step trains on;
-//! * the **training canvas** — [`training_canvas`];
+//! * the **training canvas** — [`training_canvas`]: every target keeps its aspect at about the
+//!   bucket edge's area, never upscaled past its own;
 //! * the **training-step memory envelope** — [`train_step_bytes`], the structural count both
 //!   backends price their train phase with.
 //!
@@ -27,7 +28,13 @@
 //! released sampler steps on — through that step's own head and its own AdaLN timestep
 //! `t = 1 − σ`, exactly the forward the render runs at that step. The configured
 //! `timestep_type` / `timestep_bias` distribution is honored by drawing a continuous noise level
-//! from it and training at the nearest published level ([`training_step`]).
+//! from it and training the head whose equal-width slice of `t` the draw falls in
+//! ([`training_step`]): head `i` owns `t ∈ ((5 − i)/6, (6 − i)/6]`, so a uniform draw trains every
+//! head exactly as often as the six-step render runs it, and a biased draw still favours the noisy
+//! (`t → 1`, head 0) or clean (`t → 0`, head 5) end — but never starves a head the way snapping to
+//! the *nearest* published σ did (σ is 1.0, 0.9675, 0.8875, … so a sigmoid draw reached heads 0
+//! and 1 on well under 1 % of the steps, while the shared blocks the LoRA changes still feed them
+//! at every render).
 
 use gen_core::h3_image::{sampler_sigmas, FIXED_STEPS, MAX_REFERENCES, SIZE_STRIDE};
 use gen_core::license::components::MINIMAX_H3_IMAGE;
@@ -43,8 +50,8 @@ pub const TRAINER_ID: &str = "minimax_h3_image";
 /// The descriptor family (the generator's own).
 pub const FAMILY: &str = "minimax_h3_image";
 
-/// The default square training edge: H3-Image's native 4 MP generation canvas
-/// ([`gen_core::h3_image::MIN_GENERATION_AREA_DEFAULT`] is `2048²`).
+/// The default training edge (a canvas of about `edge²` pixels): H3-Image's native 4 MP
+/// generation canvas ([`gen_core::h3_image::MIN_GENERATION_AREA_DEFAULT`] is `2048²`).
 pub const DEFAULT_TRAINING_RESOLUTION: u32 = 2048;
 
 /// Every training canvas edge is a multiple of this: one VAE cell (16 px) times the DiT's 2×2
@@ -325,25 +332,31 @@ pub struct TrainingStep {
     pub timestep: f32,
 }
 
-/// The distilled step nearest the drawn noise level `t ∈ [0, 1]` — the configured timestep
-/// distribution, quantized onto the six published levels the heads were distilled at. Ties go to
-/// the noisier step. Pure, so a resumed run draws the same steps as an uninterrupted one.
+/// The distilled step a drawn noise level `t ∈ [0, 1]` trains: the configured timestep
+/// distribution, mapped onto the six heads by **equal quantile slices of `t`** —
+/// `index = min(⌊(1 − t)·6⌋, 5)`, so `t → 1` (noisiest) trains head 0 and `t → 0` head 5. A
+/// uniform draw trains each head exactly 1/6 of the time (the render runs each once); a biased draw
+/// shifts that mass toward one end without ever starving a head. (Snapping to the *nearest*
+/// published σ — the grid is 1.0, 0.9675, 0.8875, 0.75, … — left heads 0 and 1 almost untrained
+/// under a sigmoid draw, while the adapted shared blocks still feed them at every render.) A
+/// non-finite draw trains head 0. Pure, so a resumed run draws the same steps as an uninterrupted
+/// one.
 pub fn training_step(t: f32) -> TrainingStep {
-    let sigmas = sampler_sigmas();
     let steps = FIXED_STEPS as usize;
     let t = if t.is_finite() {
-        t.clamp(0.0, 1.0)
+        f64::from(t.clamp(0.0, 1.0))
     } else {
         1.0
     };
-    let index = (0..steps)
-        .min_by(|&a, &b| {
-            (sigmas[a] - t)
-                .abs()
-                .total_cmp(&(sigmas[b] - t).abs())
-                .then(a.cmp(&b))
-        })
-        .unwrap_or(0);
+    let index = (((1.0 - t) * steps as f64).floor() as usize).min(steps - 1);
+    distilled_step(index)
+}
+
+/// Distilled step `index` (`0..6`, clamped): its head, its published noise level `σ` and its
+/// AdaLN timestep `t = 1 − σ`.
+pub fn distilled_step(index: usize) -> TrainingStep {
+    let sigmas = sampler_sigmas();
+    let index = index.min(FIXED_STEPS as usize - 1);
     let sigma = sigmas[index];
     TrainingStep {
         index,
@@ -359,23 +372,34 @@ pub fn training_mix(sigma: f32) -> (f32, f32) {
     (1.0 - sigma, sigma)
 }
 
-/// The square-or-aspect training canvas of one target at `edge`: a captioned item trains on its
-/// centre square at `edge²`; an edit target keeps its aspect at about `edge²` pixels, so it stays
-/// aligned with its references. Both sides floor to [`TRAINING_CANVAS_STRIDE`] (at least one
-/// stride).
-pub fn training_canvas(edit: bool, (width, height): (u32, u32), edge: u32) -> (u32, u32) {
-    let snap = |v: f64| {
-        let s = f64::from(TRAINING_CANVAS_STRIDE);
-        ((v / s).floor() * s).max(s) as u32
-    };
-    if !edit || width == 0 || height == 0 {
+/// The training canvas `(width, height)` of one target whose source is `width × height`, at bucket
+/// edge `edge` — one rule for captioned items and edit targets alike: the target keeps its own
+/// aspect at about `edge²` pixels, and is never upscaled past its source (a source smaller than
+/// `edge²` trains at its own area). Both sides floor to [`TRAINING_CANVAS_STRIDE`] (at least one
+/// stride), so the canvas never exceeds the source's area nor `edge²`.
+///
+/// The whole image is trained, resized (never cropped) onto the canvas — the aspect drift the
+/// stride floor introduces is under one stride per side. An edit's references are conditioned at
+/// their own sizes by the render's conditioning phase, independently of the target's canvas, and
+/// the target keeps its aspect either way, so capping its area keeps references and target
+/// aligned exactly as before. A degenerate (zero) side falls back to the square `edge` canvas.
+pub fn training_canvas((width, height): (u32, u32), edge: u32) -> (u32, u32) {
+    let stride = f64::from(TRAINING_CANVAS_STRIDE);
+    // The epsilon keeps a side that lands on a stride multiple through a square root from flooring
+    // a whole stride down on rounding error.
+    let snap = |v: f64| ((v / stride + 1e-9).floor() * stride).max(stride) as u32;
+    if width == 0 || height == 0 {
         let e = snap(f64::from(edge));
         return (e, e);
     }
+    let (w, h) = (f64::from(width), f64::from(height));
     let area = f64::from(edge) * f64::from(edge);
-    let aspect = f64::from(width) / f64::from(height);
-    let h = (area / aspect).sqrt();
-    (snap(h * aspect), snap(h))
+    if w * h <= area {
+        // Never upscale: a source at or below the edge's area trains at its own size.
+        return (snap(w), snap(h));
+    }
+    let scale = (area / (w * h)).sqrt();
+    (snap(w * scale), snap(h * scale))
 }
 
 // ── the training-step memory envelope ───────────────────────────────────────────────────────────
@@ -662,7 +686,7 @@ mod tests {
         let sigmas = sampler_sigmas();
         let (x0, eps) = (0.37f32, -1.21f32);
         for i in 0..FIXED_STEPS as usize {
-            let step = training_step(sigmas[i]);
+            let step = distilled_step(i);
             assert_eq!(step.index, i);
             assert_eq!(step.sigma, sigmas[i]);
             assert_eq!(step.timestep, 1.0 - sigmas[i]);
@@ -678,28 +702,77 @@ mod tests {
         }
     }
 
+    /// Equal quantile slices of `t`, noisiest first: head `i` owns `((5 − i)/6, (6 − i)/6]`.
     #[test]
-    fn a_drawn_level_trains_at_the_nearest_published_step() {
+    fn a_drawn_level_trains_the_head_whose_slice_of_t_it_falls_in() {
         assert_eq!(training_step(1.0).index, 0);
+        assert_eq!(training_step(0.999).index, 0);
         assert_eq!(training_step(0.0).index, 5);
-        assert_eq!(training_step(0.76).index, 3);
-        assert_eq!(training_step(0.4).index, 4);
+        assert_eq!(training_step(0.001).index, 5);
+        assert_eq!(training_step(0.5).index, 3);
         assert_eq!(training_step(f32::NAN).index, 0);
-        // The midpoint between two levels goes to the noisier one.
-        let s = sampler_sigmas();
-        assert_eq!(training_step((s[3] + s[4]) / 2.0).index, 3);
+        assert_eq!(training_step(f32::INFINITY).index, 0);
+        assert_eq!(training_step(-0.5).index, 5);
+        assert_eq!(training_step(1.5).index, 0);
+        for k in 1..FIXED_STEPS as usize {
+            // Boundary `t = (6 − k)/6`: just above trains head k − 1, just below head k.
+            let b = (FIXED_STEPS as usize - k) as f32 / FIXED_STEPS as f32;
+            assert_eq!(training_step(b + 1e-4).index, k - 1, "above boundary {k}");
+            assert_eq!(training_step(b - 1e-4).index, k, "below boundary {k}");
+        }
+        // The step carries the head's own published σ and timestep.
+        let st = training_step(0.95);
+        assert_eq!(st, distilled_step(0));
+        assert_eq!(st.sigma, sampler_sigmas()[0]);
+        assert_eq!(distilled_step(99), distilled_step(5));
+    }
+
+    /// A uniform draw trains every head exactly as often as the six-step render runs it.
+    #[test]
+    fn a_uniform_draw_trains_every_head_equally() {
+        let n = 6000u32;
+        let mut counts = [0u32; FIXED_STEPS as usize];
+        for i in 0..n {
+            // Cell midpoints of a uniform grid over (0, 1).
+            counts[training_step((i as f32 + 0.5) / n as f32).index] += 1;
+        }
+        assert_eq!(counts, [n / 6; FIXED_STEPS as usize]);
     }
 
     #[test]
-    fn the_training_canvas_is_square_for_captions_and_keeps_an_edits_aspect() {
-        assert_eq!(training_canvas(false, (3000, 2000), 2048), (2048, 2048));
-        assert_eq!(training_canvas(false, (3000, 2000), 1000), (992, 992));
-        let (w, h) = training_canvas(true, (3000, 2000), 2048);
+    fn the_training_canvas_keeps_the_aspect_at_the_edge_area_and_never_upscales() {
+        // Larger than edge²: scaled down at its aspect, stride-floored, area within edge².
+        let (w, h) = training_canvas((3000, 2000), 2048);
         assert_eq!((w % 32, h % 32), (0, 0));
         assert!((f64::from(w) / f64::from(h) - 1.5).abs() < 0.05);
         assert!(u64::from(w) * u64::from(h) <= 2048 * 2048);
-        let (w, h) = training_canvas(true, (10, 4000), 16);
-        assert_eq!((w, h % 32), (32, 0));
+        // A square source at edge²: the square canvas; a larger square scales down.
+        assert_eq!(training_canvas((2048, 2048), 2048), (2048, 2048));
+        assert_eq!(training_canvas((4096, 4096), 1000), (992, 992));
+        // A 1365×2048 portrait at 2048: never upscaled, kept whole at its own area (width floored
+        // to the stride) — not centre-cropped to a square and upscaled to 2048².
+        assert_eq!(training_canvas((1365, 2048), 2048), (1344, 2048));
+        // The same portrait at a smaller edge: scaled down, height stays the long side.
+        let (w, h) = training_canvas((1365, 2048), 1024);
+        assert!(h > w && u64::from(w) * u64::from(h) <= 1024 * 1024);
+        assert!((f64::from(w) / f64::from(h) - 1365.0 / 2048.0).abs() < 0.03);
+        // Landscape keeps width as the long side: the pair is (width, height).
+        assert_eq!(training_canvas((2048, 1365), 2048), (2048, 1344));
+        // A tiny source keeps one stride; a degenerate one falls back to the square edge.
+        assert_eq!(training_canvas((10, 4000), 16), (32, 320));
+        assert_eq!(training_canvas((10, 20), 2048), (32, 32));
+        assert_eq!(training_canvas((0, 20), 1000), (992, 992));
+        // Never larger than the source's area (once it holds a stride on each side).
+        for (sw, sh) in [
+            (1365, 2048),
+            (640, 480),
+            (5000, 300),
+            (1024, 1024),
+            (3000, 2000),
+        ] {
+            let (w, h) = training_canvas((sw, sh), 2048);
+            assert!(u64::from(w) * u64::from(h) <= u64::from(sw) * u64::from(sh));
+        }
     }
 
     #[test]

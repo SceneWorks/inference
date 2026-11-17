@@ -126,15 +126,44 @@ fn adapter_elements_count_what_the_install_trains() {
 #[test]
 fn every_training_step_is_a_render_step() {
     let schedule = gen_core_h3::h3_schedule::SigmaSchedule::h3_image_distilled().unwrap();
-    let sigmas = candle_gen::gen_core::h3_image::sampler_sigmas();
     for (i, &t) in schedule.timesteps().iter().enumerate() {
-        let st = training_step(sigmas[i]);
+        let st = gen_core_train::h3_image::distilled_step(i);
         assert_eq!(st.index, i);
         assert!(
             (st.timestep - t).abs() < 1e-6,
             "step {i}: {} vs {t}",
             st.timestep
         );
+    }
+}
+
+/// The trainer's own timestep draw (`flow_match::sample_unit_timestep` at the per-step seed, the
+/// exact path `micro_step` takes) trains every one of the six heads on a real share of the steps
+/// under each distribution at the balanced bias — the six-step render runs each head once, and the
+/// LoRA in the shared blocks changes all of them. Nearest-σ quantization gave heads 0 and 1 about
+/// 0.002 % and 0.5 % of a sigmoid run. Floors: `linear` is the render's own 1/6 per head;
+/// `sigmoid` puts `P(z > ln 5) ≈ 5.4 %` on each end head; `weighted` (the mean of a uniform and a
+/// sigmoid draw) concentrates on mid noise by design, leaving its end heads ≈ 2.6 % each.
+#[test]
+fn every_head_is_trained_under_every_timestep_distribution() {
+    let steps = 20_000u32;
+    for (kind, floor) in [("sigmoid", 0.045), ("linear", 0.155), ("weighted", 0.02)] {
+        let mut counts = [0u32; 6];
+        for step in 1..=steps {
+            let t = flow_match::sample_unit_timestep(
+                kind,
+                "balanced",
+                flow_match::timestep_seed(42, step),
+            );
+            counts[training_step(t).index] += 1;
+        }
+        for (head, &n) in counts.iter().enumerate() {
+            let share = f64::from(n) / f64::from(steps);
+            assert!(
+                share > floor,
+                "{kind}: head {head} trained {share:.4} of steps, floor {floor} ({counts:?})"
+            );
+        }
     }
 }
 
