@@ -470,9 +470,7 @@ impl GatedDeltaNet {
                 cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
             };
             let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-            return Ok(self
-                .out_proj
-                .forward(&out.reshape((b, s, self.value_dim))?)?);
+            return self.out_proj.forward(&out.reshape((b, s, self.value_dim))?);
         }
         let qc = conv_out
             .narrow(2, 0, self.key_dim)?
@@ -553,8 +551,7 @@ impl GatedDeltaNet {
             1e-6,
             q_scale,
         )?;
-        let (g, beta) =
-            candle_quant_kernels::gdn_gates(a_in, b_in, &self.a_log, &self.dt_bias)?;
+        let (g, beta) = candle_quant_kernels::gdn_gates(a_in, b_in, &self.a_log, &self.dt_bias)?;
         Ok(Some((q, k, v, g, beta)))
     }
 }

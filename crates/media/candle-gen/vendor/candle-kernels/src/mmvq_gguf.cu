@@ -715,6 +715,14 @@ static __device__ void mmvq_core_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Extern-C kernel entry points
+//
+// Macro expands `MMVQ_PLAIN_ENTRY(tag, block_q_t, qk, qi, vdr, vec_dot,
+// dst_tag, dst_c_type, ncols)` into one `__global__` function for batch
+// size `ncols`. The Rust launcher switches on batch size 1..=8.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Multi-column MMVQ with the weight decoded once per block.
 //
 // mmvq_core_impl calls vec_dot once per (column, row), so every activation column re-loads and
@@ -867,14 +875,6 @@ static __device__ void mmvq_split_impl(
     }
   }
 }
-
-// ---------------------------------------------------------------------------
-// Extern-C kernel entry points
-//
-// Macro expands `MMVQ_PLAIN_ENTRY(tag, block_q_t, qk, qi, vdr, vec_dot,
-// dst_tag, dst_c_type, ncols)` into one `__global__` function for batch
-// size `ncols`. The Rust launcher switches on batch size 1..=8.
-// ---------------------------------------------------------------------------
 
 #define MMVQ_PLAIN_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
                           dst_tag, dst_c_type, ncols)                          \

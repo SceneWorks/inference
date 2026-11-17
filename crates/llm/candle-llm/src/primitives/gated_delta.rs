@@ -344,7 +344,7 @@ thread_local! {
 }
 
 /// Run `f` with the GDN input preparation on its op chains (this thread only).
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) fn with_unfused_prep<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {
@@ -380,7 +380,8 @@ fn fused_step_serves(q: &Tensor, ssm: &Tensor, g: &Tensor) -> bool {
         && q.dtype() == DType::F32
         && g.dtype() == DType::F32
         && ssm.dtype() == DType::F32
-        && q.dim(3).is_ok_and(candle_quant_kernels::gated_delta_serves_key_dim)
+        && q.dim(3)
+            .is_ok_and(candle_quant_kernels::gated_delta_serves_key_dim)
         && candle_quant_kernels::gated_delta_available(q.device()).is_ok()
 }
 
@@ -711,8 +712,7 @@ pub fn causal_depthwise_conv_traced(
 ) -> Result<(Tensor, ConvTrace)> {
     let (_b, s, c) = x.dims3()?;
     let kk = weight.dim(1)?; // kernel size K (weight is [C, K])
-    if fused_prep_serves(x) && weight.dtype() == DType::BF16 && conv_state.dtype() == DType::BF16
-    {
+    if fused_prep_serves(x) && weight.dtype() == DType::BF16 && conv_state.dtype() == DType::BF16 {
         // One kernel for the concat, the K-tap conv and the SiLU, bit-identical to the chain below.
         let (cat, out) = candle_quant_kernels::gdn_conv_silu(conv_state, x, weight)?;
         return Ok((
@@ -1200,8 +1200,12 @@ impl DeltaNetCache {
                     let run = (|| -> Result<(Tensor, (Tensor, Tensor))> {
                         for ti in first_write..t {
                             match positions {
-                                Some(p) => ring.write_conv_at(&p.ring_write(ti)?, &conv.tail_after(ti)?)?,
-                                None => ring.write_conv(offset + ti as i32 + 1, &conv.tail_after(ti)?)?,
+                                Some(p) => {
+                                    ring.write_conv_at(&p.ring_write(ti)?, &conv.tail_after(ti)?)?
+                                }
+                                None => {
+                                    ring.write_conv(offset + ti as i32 + 1, &conv.tail_after(ti)?)?
+                                }
                             }
                         }
                         let write = match positions {
@@ -2251,13 +2255,36 @@ mod tests {
                     })
                     .collect()
             };
-            let q = Tensor::from_vec(sample(total * hk * dk, 0.1, 0.0), (b, total, hk, dk), &device).unwrap();
-            let k = Tensor::from_vec(sample(total * hk * dk, 0.1, 0.0), (b, total, hk, dk), &device).unwrap();
-            let v = Tensor::from_vec(sample(total * hv * dv, 1.0, 0.0), (b, total, hv, dv), &device).unwrap();
-            let g = Tensor::from_vec(sample(total * hv, 0.04, 0.95), (b, total, hv), &device).unwrap();
-            let beta = Tensor::from_vec(sample(total * hv, 0.4, 0.5), (b, total, hv), &device).unwrap();
-            let x = Tensor::from_vec(sample(total * conv_dim, 1.0, 0.0), (b, total, conv_dim), &device).unwrap();
-            let weight = Tensor::from_vec(sample(conv_dim * RK, 0.5, 0.0), (conv_dim, RK), &device).unwrap();
+            let q = Tensor::from_vec(
+                sample(total * hk * dk, 0.1, 0.0),
+                (b, total, hk, dk),
+                &device,
+            )
+            .unwrap();
+            let k = Tensor::from_vec(
+                sample(total * hk * dk, 0.1, 0.0),
+                (b, total, hk, dk),
+                &device,
+            )
+            .unwrap();
+            let v = Tensor::from_vec(
+                sample(total * hv * dv, 1.0, 0.0),
+                (b, total, hv, dv),
+                &device,
+            )
+            .unwrap();
+            let g =
+                Tensor::from_vec(sample(total * hv, 0.04, 0.95), (b, total, hv), &device).unwrap();
+            let beta =
+                Tensor::from_vec(sample(total * hv, 0.4, 0.5), (b, total, hv), &device).unwrap();
+            let x = Tensor::from_vec(
+                sample(total * conv_dim, 1.0, 0.0),
+                (b, total, conv_dim),
+                &device,
+            )
+            .unwrap();
+            let weight =
+                Tensor::from_vec(sample(conv_dim * RK, 0.5, 0.0), (conv_dim, RK), &device).unwrap();
             let spec = RingSpec {
                 slots: 6,
                 conv_dims: (b, RK - 1, conv_dim),
@@ -2287,9 +2314,12 @@ mod tests {
                         Some(c) => c.clone(),
                         None => Tensor::zeros((b, RK - 1, conv_dim), DType::F32, &device).unwrap(),
                     };
-                    let (_out, trace) =
-                        causal_depthwise_conv_traced(&narrow_t(&x, start, len), &weight, &conv_state)
-                            .unwrap();
+                    let (_out, trace) = causal_depthwise_conv_traced(
+                        &narrow_t(&x, start, len),
+                        &weight,
+                        &conv_state,
+                    )
+                    .unwrap();
                     let y = cache
                         .advance(
                             &trace,

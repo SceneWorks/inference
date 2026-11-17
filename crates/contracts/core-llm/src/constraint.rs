@@ -853,10 +853,8 @@ mod tests {
         let t = table(&pieces);
         let eos = (pieces.len() - 1) as u32 - 1; // "" is the stop token
         let mut doc: Vec<u32> = vec![0, 4, 5, 4, 7, 2];
-        // A deep array of numbers and strings: many distinct depth states (> the cache bound).
-        for depth in 0..40u32 {
-            doc.extend([if depth % 2 == 0 { 2 } else { 2 }]);
-        }
+        // 40 nested arrays: more distinct depth states than the cache holds.
+        doc.extend([2; 40]);
         for _ in 0..40 {
             doc.extend([3]);
         }

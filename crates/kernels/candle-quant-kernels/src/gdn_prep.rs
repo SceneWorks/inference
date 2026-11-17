@@ -43,7 +43,10 @@ pub fn gdn_prep_available(device: &Device) -> Result<(), String> {
 
 fn require_bf16(name: &str, x: &Tensor) -> candle_core::Result<()> {
     if x.dtype() != DType::BF16 {
-        return Err(msg(format!("gdn_prep: {name} must be BF16, got {:?}", x.dtype())));
+        return Err(msg(format!(
+            "gdn_prep: {name} must be BF16, got {:?}",
+            x.dtype()
+        )));
     }
     Ok(())
 }
@@ -56,7 +59,7 @@ pub fn gdn_conv_silu(
     x: &Tensor,
     weight: &Tensor,
 ) -> candle_core::Result<(Tensor, Tensor)> {
-    let (b, s, c) = x.dims3()?;
+    let (b, _, c) = x.dims3()?;
     let (wc, k) = weight.dims2()?;
     if state.dims() != [b, k.saturating_sub(1), c] || wc != c || k == 0 {
         return Err(msg(format!(
@@ -71,7 +74,7 @@ pub fn gdn_conv_silu(
     }
     match x.device() {
         #[cfg(feature = "cuda")]
-        Device::Cuda(_) => cuda_impl::conv_silu(state, x, weight, (b, s, c, k)),
+        Device::Cuda(_) => cuda_impl::conv_silu(state, x, weight, k),
         other => Err(msg(format!("gdn_conv_silu: no kernel for {other:?}"))),
     }
 }
@@ -204,8 +207,9 @@ mod cuda_impl {
         state: &Tensor,
         x: &Tensor,
         weight: &Tensor,
-        (b, s, c, k): (usize, usize, usize, usize),
+        k: usize,
     ) -> candle_core::Result<(Tensor, Tensor)> {
+        let (b, s, c) = x.dims3()?;
         let dev = device(x)?;
         let (state, x, weight) = (state.contiguous()?, x.contiguous()?, weight.contiguous()?);
         let stream = dev.cuda_stream();

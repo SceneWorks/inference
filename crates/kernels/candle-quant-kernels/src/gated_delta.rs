@@ -173,7 +173,10 @@ mod cuda_impl {
     }
 
     /// The device address of `x`'s first element (`F32` or `U32`).
-    fn address(x: &Tensor, stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>) -> candle_core::Result<u64> {
+    fn address(
+        x: &Tensor,
+        stream: &std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaStream>,
+    ) -> candle_core::Result<u64> {
         let (storage, layout) = x.storage_and_layout();
         let Storage::Cuda(c) = &*storage else {
             return Err(msg("gated_delta_step: expected a CUDA tensor".into()));

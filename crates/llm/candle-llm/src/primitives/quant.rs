@@ -405,7 +405,16 @@ fn native_mmvq(inner: &QMatMul, x: &Tensor) -> bool {
         && (1..=8).contains(&rows)
         && matches!(
             w.dtype(),
-            G::Q4_0 | G::Q4_1 | G::Q5_0 | G::Q5_1 | G::Q8_0 | G::Q2K | G::Q3K | G::Q4K | G::Q5K | G::Q6K
+            G::Q4_0
+                | G::Q4_1
+                | G::Q5_0
+                | G::Q5_1
+                | G::Q8_0
+                | G::Q2K
+                | G::Q3K
+                | G::Q4K
+                | G::Q5K
+                | G::Q6K
         )
 }
 

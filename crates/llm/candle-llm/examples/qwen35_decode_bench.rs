@@ -91,8 +91,16 @@ fn run(
             }
         })
         .expect("generate");
-    let decode = out.timings.as_ref().map(|t| t.decode.as_secs_f64()).unwrap_or(0.0);
-    let prefill = out.timings.as_ref().map(|t| t.prefill.as_secs_f64()).unwrap_or(0.0);
+    let decode = out
+        .timings
+        .as_ref()
+        .map(|t| t.decode.as_secs_f64())
+        .unwrap_or(0.0);
+    let prefill = out
+        .timings
+        .as_ref()
+        .map(|t| t.prefill.as_secs_f64())
+        .unwrap_or(0.0);
     let r = out.decode.as_ref();
     // FNV-1a of the decoded text: equal hashes = identical token stream (for parity checks).
     let mut h: u64 = 0xcbf29ce484222325;

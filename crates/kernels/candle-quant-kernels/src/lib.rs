@@ -92,8 +92,8 @@ pub use fused_decode::{
     RopePlan, FUSED_DECODE_SRC, FUSED_ROPE_MAX_HEAD_DIM,
 };
 pub use gated_delta::{
-    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step, GatedDeltaRing, GatedDeltaState, GATED_DELTA_MAX_KEY_DIM,
-    GATED_DELTA_SRC,
+    gated_delta_available, gated_delta_serves_key_dim, gated_delta_step, GatedDeltaRing,
+    GatedDeltaState, GATED_DELTA_MAX_KEY_DIM, GATED_DELTA_SRC,
 };
 pub use gdn_prep::{
     gdn_conv_silu, gdn_gates, gdn_prep_available, gdn_qkv, gdn_qkv_serves_key_dim, GDN_PREP_SRC,
@@ -140,6 +140,8 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     cublaslt::KITCHEN_INT8_SOURCE,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
+    GATED_DELTA_SRC,
+    GDN_PREP_SRC,
     MOE_GEMV_SRC,
     yue2_stable_conv::YUE2_STABLE_CONV_SRC,
     veda_int8::SOURCE,
