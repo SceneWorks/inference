@@ -117,6 +117,7 @@ impl AdaptableHost for Leaves {
 /// Mutations: skip the re-attach ⇒ the stack-length and forward asserts fail; ignore the block
 /// filter ⇒ block 1's stack assert fails.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_frozen_adapter_is_reattached_after_each_trainable_install() {
     use mlx_gen::adapters::{AdaptableLinear, Adapter};
     use mlx_rs::ops::{add, matmul, subtract};
@@ -155,12 +156,12 @@ fn the_frozen_adapter_is_reattached_after_each_trainable_install() {
     }
     let x = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0], &[2, 2]);
     let residual = |adapter: &Adapter| match adapter {
-        Adapter::Lora { a, b, .. } => matmul(&matmul(&x, a).unwrap(), b).unwrap(),
+        Adapter::Lora { a, b, .. } => matmul(matmul(&x, a).unwrap(), b).unwrap(),
         _ => unreachable!(),
     };
     let want = add(
-        &add(&matmul(&x, weight.t()).unwrap(), &residual(&trainable)).unwrap(),
-        &residual(&frozen),
+        add(matmul(&x, weight.t()).unwrap(), residual(&trainable)).unwrap(),
+        residual(&frozen),
     )
     .unwrap();
     let got = host.adaptable_mut(&q0).unwrap().forward(&x).unwrap();
@@ -182,4 +183,6 @@ fn the_frozen_adapter_is_reattached_after_each_trainable_install() {
     for q in [q0, q1] {
         assert_eq!(host.adaptable_mut(&q).unwrap().adapters().len(), 2);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::the_frozen_adapter_is_reattached_after_each_trainable_install");
 }

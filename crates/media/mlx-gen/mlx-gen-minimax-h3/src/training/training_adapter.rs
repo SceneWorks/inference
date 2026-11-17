@@ -22,8 +22,8 @@
 //!
 //! The trainable install ([`TrainAdapter::install_as`](mlx_gen::train::lora::TrainAdapter::install_as))
 //! **replaces** a target leaf's residual stack with the trainable factor. So the frozen residuals
-//! of every *trainable target* leaf are captured once here ([`FrozenResiduals`]) and appended back
-//! after each trainable install ([`FrozenResiduals::reattach`]) — the resident traced `loss_fn`,
+//! of every *trainable target* leaf are captured once here (`FrozenResiduals`) and appended back
+//! after each trainable install (`FrozenResiduals::reattach`) — the resident traced `loss_fn`,
 //! the streamed forward's concrete install and each block's `vjp` closure alike. A leaf the user
 //! does not train keeps the residual its load (or window rebuild) gave it.
 //!

@@ -3,9 +3,10 @@
 //! a Fizgig-shaped kohya file names, carried by every block residency the trainer has, frozen
 //! beside the trainable factors, and never written into the saved adapter.
 //!
-//! Each test builds complete synthetic DiTs, so — like the crate's other synthetic-DiT checks — it
-//! is ignored by ordinary CI and dispatched only by the manual H3 native suite
-//! (`cargo test -p candle-gen-minimax-h3 --lib training::training_adapter_tests -- --ignored`).
+//! Each test builds complete synthetic DiTs and runs their learned projections, so it is a model
+//! proof: ignored by ordinary CI, registered in `scripts/ci/model-inference-proofs.json` and run
+//! only by the explicit model-proof workflow (`--features model-inference-proof`, which observes
+//! the learned output's device and prints the late BODY marker).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -168,7 +169,7 @@ fn segs(block: usize, leaf: &str) -> Vec<String> {
 fn leaf_forward(dit: &mut MiniMaxH3Dit, block: usize, leaf: &str, x: &Tensor) -> Tensor {
     let segs = segs(block, leaf);
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-    dit.adaptable_mut(&segs).unwrap().forward(x).unwrap()
+    __model_proof_output!(dit.adaptable_mut(&segs).unwrap().forward(x)).unwrap()
 }
 
 fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
@@ -190,7 +191,7 @@ fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
 /// Mutations: skip the install ⇒ every delta assert fails; strength 2 ⇒ the delta assert fails;
 /// a window copy dropping its residuals ⇒ the residency asserts fail.
 #[test]
-#[ignore = "constructs complete synthetic DiTs to install adapters; dispatched only by the manual H3 native suite"]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_adapter_adds_its_mapped_delta_in_every_residency() {
     let tmp = tempfile::tempdir().unwrap();
     let (file, factors) = write_adapter(tmp.path(), &[0, 1]);
@@ -218,8 +219,8 @@ fn the_adapter_adds_its_mapped_delta_in_every_residency() {
         let path = ["token_refiner", "refiner_blocks", "0", "attn", "to_q"];
         assert_eq!(
             max_abs(
-                &adapted.adaptable_mut(&path).unwrap().forward(&x).unwrap(),
-                &bare.adaptable_mut(&path).unwrap().forward(&x).unwrap()
+                &__model_proof_output!(adapted.adaptable_mut(&path).unwrap().forward(&x)).unwrap(),
+                &__model_proof_output!(bare.adaptable_mut(&path).unwrap().forward(&x)).unwrap()
             ),
             0.0
         );
@@ -238,7 +239,10 @@ fn the_adapter_adds_its_mapped_delta_in_every_residency() {
         let mut window = adapted.window_block(block).unwrap().into_owned();
         let lin = window.adaptable_mut(&["attn", "to_q"]).unwrap();
         assert!(lin.is_adapted(), "the window copy carries the residual");
-        assert_eq!(max_abs(&lin.forward(&x).unwrap(), want), 0.0);
+        assert_eq!(
+            max_abs(&__model_proof_output!(lin.forward(&x)).unwrap(), want),
+            0.0
+        );
     }
     adapted.promote_streamed_blocks().unwrap();
     for (block, want) in want.iter().enumerate() {
@@ -247,6 +251,9 @@ fn the_adapter_adds_its_mapped_delta_in_every_residency() {
             0.0
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::the_adapter_adds_its_mapped_delta_in_every_residency");
 }
 
 /// The training adapter is frozen and never saved: the trainable factors install beside it on
@@ -256,7 +263,7 @@ fn the_adapter_adds_its_mapped_delta_in_every_residency() {
 /// assert fails; skip the adapter on the trained leaf ⇒ the gradient assert fails; save the
 /// adapter's tensors ⇒ the key assert fails.
 #[test]
-#[ignore = "constructs complete synthetic DiTs to install adapters; dispatched only by the manual H3 native suite"]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn training_runs_through_the_adapter_and_saves_only_the_trainable_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let (file, _) = write_adapter(tmp.path(), &[0, 1]);
@@ -327,12 +334,15 @@ fn training_runs_through_the_adapter_and_saves_only_the_trainable_keys() {
             "{key}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::training_runs_through_the_adapter_and_saves_only_the_trainable_keys");
 }
 
 /// A file that does not fit the DiT is a named refusal, never a partial install: a block the DiT
 /// does not have, a key that names no H3 module, and a missing file.
 #[test]
-#[ignore = "constructs complete synthetic DiTs to install adapters; dispatched only by the manual H3 native suite"]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_bad_training_adapter_is_a_named_error() {
     let tmp = tempfile::tempdir().unwrap();
     let (stray, _) = write_adapter(tmp.path(), &[0, 7]);
@@ -361,8 +371,21 @@ fn a_bad_training_adapter_is_a_named_error() {
     assert!(err.contains("not_a_module"), "{err}");
 
     let missing = tmp.path().join("missing.safetensors");
-    let err = install_training_adapter(&mut dit(), &missing, 1.0)
+    let mut refused = dit();
+    let err = install_training_adapter(&mut refused, &missing, 1.0)
         .unwrap_err()
         .to_string();
     assert!(err.contains("missing.safetensors"), "{err}");
+    // A refused install leaves the DiT bare: its projections compute exactly the fresh base.
+    let x = seeded(&[3, HIDDEN], 17);
+    assert_eq!(
+        max_abs(
+            &leaf_forward(&mut refused, 0, "attn.to_q", &x),
+            &leaf_forward(&mut dit(), 0, "attn.to_q", &x)
+        ),
+        0.0
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::a_bad_training_adapter_is_a_named_error");
 }
