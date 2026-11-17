@@ -8,6 +8,11 @@
 //! step), saves the LoRA, then renders two six-step samples through the registered generator with
 //! the saved adapter. Everything is written under `H3_BENCH_OUT`; nothing else is written.
 //!
+//! With `H3_BENCH_TRAINING_ADAPTER` the run trains against a frozen de-distill training adapter
+//! (`TrainingConfig::training_adapter`, e.g. `ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter`'s
+//! `fizgig_minimax_h3_image_training_adapter.safetensors`): applied to the DiT for every training
+//! forward/backward, absent from the samples (they load the saved LoRA alone) and never saved.
+//!
 //! ```text
 //! CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 //! H3_BENCH_SNAPSHOT=<MiniMax-H3-Image snapshot> \
@@ -27,6 +32,8 @@
 //! | `H3_BENCH_STEPS` | optimizer steps (10) |
 //! | `H3_BENCH_RESOLUTION` | training edge (2048) |
 //! | `H3_BENCH_TIMESTEP_TYPE` / `H3_BENCH_TIMESTEP_BIAS` | (`sigmoid` / `balanced`) |
+//! | `H3_BENCH_TRAINING_ADAPTER` | a frozen training adapter `.safetensors` applied while training (none) |
+//! | `H3_BENCH_TRAINING_ADAPTER_STRENGTH` | the strength it is applied at (1.0, the production value) |
 //! | `H3_BENCH_BUDGET_GB` | override the device training budget (GB) — e.g. 40 forces the streamed residency for an A/B |
 //! | `H3_BENCH_SPANS` | `1`: record synchronized profile spans (needs `model-inference-proof`; perturbs step times) |
 //! | `H3_BENCH_SAMPLE_PROMPTS` | `|`-separated sample prompts (the first two captions) |
@@ -148,18 +155,34 @@ fn main() {
         train_dtype: "bf16".into(),
         timestep_type: env("H3_BENCH_TIMESTEP_TYPE").unwrap_or_else(|| "sigmoid".into()),
         timestep_bias: env("H3_BENCH_TIMESTEP_BIAS").unwrap_or_else(|| "balanced".into()),
+        training_adapter: env("H3_BENCH_TRAINING_ADAPTER").map(PathBuf::from),
         ..gen_core_train::h3_image::default_training_config()
     };
+    let adapter_strength: f32 = parsed(
+        "H3_BENCH_TRAINING_ADAPTER_STRENGTH",
+        candle_gen_minimax_h3::training::training_adapter::TRAINING_ADAPTER_STRENGTH,
+    );
+    if let Some(adapter) = &cfg.training_adapter {
+        assert!(
+            adapter.is_file(),
+            "H3_BENCH_TRAINING_ADAPTER={} is not a file",
+            adapter.display()
+        );
+    }
     assert!(cfg.gradient_checkpointing);
     eprintln!(
         "[h3-bench] {} items from {}, {steps} steps at {resolution}, rank {} lr {} {}/{} \
-         timesteps, out {}",
+         timesteps, training adapter {}, out {}",
         items.len(),
         data.display(),
         cfg.rank,
         cfg.learning_rate,
         cfg.timestep_type,
         cfg.timestep_bias,
+        cfg.training_adapter.as_ref().map_or_else(
+            || "none".to_owned(),
+            |p| format!("{} at {adapter_strength}", p.display())
+        ),
         out.display()
     );
     let req = TrainingRequest {
@@ -177,6 +200,7 @@ fn main() {
         let gb: f64 = gb.parse().expect("H3_BENCH_BUDGET_GB is a number");
         trainer.set_memory_budget_override(Some((gb * 1e9) as u64));
     }
+    trainer.set_training_adapter_strength(adapter_strength);
     trainer.validate(&req).expect("the request validates");
     let spans = env("H3_BENCH_SPANS").as_deref() == Some("1");
     let mut step_seconds: Vec<f64> = Vec::new();
@@ -291,6 +315,8 @@ fn main() {
     let report = serde_json::json!({
         "steps": output.steps,
         "resolution": resolution,
+        "training_adapter": cfg.training_adapter,
+        "training_adapter_strength": cfg.training_adapter.as_ref().map(|_| adapter_strength),
         "final_loss": output.final_loss,
         "step_seconds": step_seconds,
         "steady_mean_seconds_from_step_3": mean,
