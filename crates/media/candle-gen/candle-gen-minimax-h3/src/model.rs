@@ -629,6 +629,12 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// One warm component and the device bytes the request that kept it priced it at.
+struct Held<T> {
+    item: T,
+    bytes: u64,
+}
+
 /// The components a resident request keeps on the device between requests (see the module docs).
 ///
 /// Every slot is filled only by a resident request whose warm estimate fits, and emptied before
@@ -636,21 +642,21 @@ pub fn descriptor() -> ModelDescriptor {
 #[derive(Default)]
 struct VideoWarm {
     /// The f32 Qwen3-VL vision tower (fl2va / ref2va).
-    vision: Option<candle_gen_boogu::vision::VisionTower>,
+    vision: Option<Held<candle_gen_boogu::vision::VisionTower>>,
     /// The layer-50 conditioner.
-    conditioner: Option<MiniMaxH3TextEncoder>,
+    conditioner: Option<Held<MiniMaxH3TextEncoder>>,
     /// The video VAE: both halves once a request encoded keyframes or references, else the decode
     /// half.
-    video_vae: Option<MiniMaxH3VideoVae>,
+    video_vae: Option<Held<MiniMaxH3VideoVae>>,
     /// The reference-soundtrack encoder (ref2va).
-    audio_encoder: Option<crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder>,
+    audio_encoder: Option<Held<crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder>>,
     /// The DiT after the AdaLN precompute-and-evict, keyed on the task whose partition it is and,
     /// through [`PreparedJointDit::serves`], on the schedule its modulation was projected for.
-    dit: Option<(MiniMaxH3Task, PreparedJointDit)>,
+    dit: Option<Held<(MiniMaxH3Task, PreparedJointDit)>>,
     /// The audio VAE's decode half.
-    audio_vae: Option<crate::audio_vae::MiniMaxH3AudioVae>,
-    /// The per-component warm weights of the request that last kept this set, which
-    /// [`Generator::retained_weight_bytes`] credits the held slots at.
+    audio_vae: Option<Held<crate::audio_vae::MiniMaxH3AudioVae>>,
+    /// The per-component warm weights of the current resident request, recorded beside each slot
+    /// it fills.
     priced: Option<crate::memory_strategy::VideoWarmWeights>,
 }
 
@@ -664,15 +670,29 @@ impl VideoWarm {
             && self.audio_vae.is_none()
     }
 
-    /// The bytes held now, by the request's per-component warm weights. A held VAE is credited at
-    /// its decode half and a held soundtrack encoder not at all, so the credit never exceeds what
-    /// is resident.
-    fn held_bytes(&self, weights: &crate::memory_strategy::VideoWarmWeights) -> u64 {
+    /// `item`, held at the bytes the current request priced it at. A VAE is recorded at its
+    /// decode half and the soundtrack encoder at nothing, so the record never exceeds what is
+    /// resident.
+    fn hold<T>(
+        &self,
+        item: T,
+        bytes: impl Fn(&crate::memory_strategy::VideoWarmWeights) -> u64,
+    ) -> Option<Held<T>> {
+        Some(Held {
+            item,
+            bytes: self.priced.as_ref().map_or(0, bytes),
+        })
+    }
+
+    /// The bytes held now, as each slot recorded them when it was filled.
+    fn held_bytes(&self) -> u64 {
         [
-            self.conditioner.as_ref().map(|_| weights.conditioner),
-            self.dit.as_ref().map(|_| weights.dit),
-            self.video_vae.as_ref().map(|_| weights.video_vae_decode),
-            self.audio_vae.as_ref().map(|_| weights.audio_decoder),
+            self.vision.as_ref().map(|h| h.bytes),
+            self.conditioner.as_ref().map(|h| h.bytes),
+            self.video_vae.as_ref().map(|h| h.bytes),
+            self.audio_encoder.as_ref().map(|h| h.bytes),
+            self.dit.as_ref().map(|h| h.bytes),
+            self.audio_vae.as_ref().map(|h| h.bytes),
         ]
         .into_iter()
         .flatten()
@@ -1153,11 +1173,11 @@ impl MiniMaxH3 {
             return with_conditioner(&self.tiers.text_encoder_dir, &self.device, encode);
         }
         let te = match warm.conditioner.take() {
-            Some(te) => te,
+            Some(held) => held.item,
             None => load_conditioner(&self.tiers.text_encoder_dir, &self.device)?,
         };
         let result = encode(&te);
-        warm.conditioner = Some(te);
+        warm.conditioner = warm.hold(te, |w| w.conditioner);
         result
     }
 
@@ -1170,12 +1190,12 @@ impl MiniMaxH3 {
         run: impl FnOnce(&candle_gen_boogu::vision::VisionTower) -> Result<T>,
     ) -> Result<T> {
         let vision = match warm.vision.take() {
-            Some(vision) => vision,
+            Some(held) => held.item,
             None => load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?,
         };
         let result = run(&vision);
         if keep {
-            warm.vision = Some(vision);
+            warm.vision = warm.hold(vision, |w| w.vision);
         } else {
             drop(vision);
         }
@@ -1213,9 +1233,11 @@ impl MiniMaxH3 {
         let phase = PhaseLog::start("text_encoder");
         let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts, &self.device)?;
         let context = self.with_warm_conditioner(warm, keep, |te| {
-            conditioner_forward(te, &ids, &mask, Some(&grounded), on_progress)
+            let context = conditioner_forward(te, &ids, &mask, Some(&grounded), on_progress);
+            // Before the staged scope's device release, as the inline pass dropped it.
+            drop(grounded);
+            context
         })?;
-        drop(grounded);
         phase.done();
 
         // The tags describe the presentation row for row; a mismatch would mis-tag every row after
@@ -1230,16 +1252,20 @@ impl MiniMaxH3 {
         Ok((context, tags))
     }
 
-    /// [`Self::render`], clearing the warm set after a failed render: an out-of-memory load among
-    /// the failures leaves no half-built warm set behind for the next request to inherit. A
-    /// cancelled render keeps what it loaded.
+    /// [`Self::render`], clearing the warm set after a render that failed once it reached the
+    /// device: an out-of-memory load among the failures leaves no half-built warm set behind for
+    /// the next request to inherit. A request refused before the warm decision (validation,
+    /// geometry, steps) leaves the set alone, and a cancelled render keeps what it loaded.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let result = self.render(req, on_progress);
-        if matches!(&result, Err(error) if !matches!(error, CandleError::Canceled)) {
+        let reached_device = std::cell::Cell::new(false);
+        let result = self.render(req, &reached_device, on_progress);
+        if reached_device.get()
+            && matches!(&result, Err(error) if !matches!(error, CandleError::Canceled))
+        {
             *candle_gen::lock_recover(&self.warm) = VideoWarm::default();
             if let Err(release) = crate::dit::release_device_memory(&self.device) {
                 tracing::warn!(%release, "minimax-h3: releasing the warm set after a failed render");
@@ -1267,6 +1293,18 @@ impl MiniMaxH3 {
             tracing::info!("minimax-h3: released the warm components for a staged request");
         }
         if keep {
+            // Components this request does not use are not part of its warm estimate, so they are
+            // released rather than held unpriced: the vision tower without keyframes or references,
+            // the soundtrack encoder outside ref2va.
+            let encodes = !req.conditioning.is_empty();
+            let unused_vision = (!encodes).then(|| warm.vision.take()).flatten();
+            let unused_encoder = (task != MiniMaxH3Task::Ref2va)
+                .then(|| warm.audio_encoder.take())
+                .flatten();
+            if unused_vision.is_some() || unused_encoder.is_some() {
+                drop((unused_vision, unused_encoder));
+                crate::dit::release_device_memory(&self.device)?;
+            }
             tracing::info!(
                 vision_warm = warm.vision.is_some(),
                 conditioner_warm = warm.conditioner.is_some(),
@@ -1306,11 +1344,8 @@ impl MiniMaxH3 {
                 return false;
             }
         };
-        let decision = crate::warm::WarmDecision::decide(
-            estimate.warm_peak,
-            warm.held_bytes(&estimate.weights),
-            &self.device,
-        );
+        let decision =
+            crate::warm::WarmDecision::decide(estimate.warm_peak, warm.held_bytes(), &self.device);
         warm.priced = decision.keep_warm.then_some(estimate.weights);
         tracing::info!(
             task = ?task,
@@ -1333,7 +1368,7 @@ impl MiniMaxH3 {
         task: MiniMaxH3Task,
         schedule: &crate::dit::adaln::TimestepSchedule,
     ) -> Result<Option<PreparedJointDit>> {
-        match warm.dit.take() {
+        match warm.dit.take().map(|held| held.item) {
             Some((warm_task, prepared)) if warm_task == task && prepared.serves(schedule) => {
                 Ok(Some(prepared))
             }
@@ -1349,7 +1384,7 @@ impl MiniMaxH3 {
     /// The warm video VAE if it carries the encode half, else `None` — after dropping a warm
     /// decode-only VAE and synchronizing, so the full load has its memory back.
     fn take_warm_encoding_vae(&self, warm: &mut VideoWarm) -> Result<Option<MiniMaxH3VideoVae>> {
-        match warm.video_vae.take() {
+        match warm.video_vae.take().map(|held| held.item) {
             Some(vae) if vae.can_encode() => Ok(Some(vae)),
             Some(decode_only) => {
                 drop(decode_only);
@@ -1363,6 +1398,7 @@ impl MiniMaxH3 {
     fn render(
         &self,
         req: &GenerationRequest,
+        reached_device: &std::cell::Cell<bool>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let _stream_request =
@@ -1412,6 +1448,7 @@ impl MiniMaxH3 {
         // A resident request whose warm set fits keeps (and reuses) its components; any other
         // request releases them first, so its staged phases have the device to themselves.
         let mut warm = candle_gen::lock_recover(&self.warm);
+        reached_device.set(true);
         let keep = self.decide_warm(req, task, schedule.num_evals(), &mut warm)?;
         if let Some(refs) = &references {
             return self.generate_ref2va(
@@ -1476,7 +1513,7 @@ impl MiniMaxH3 {
                 &self.device,
             );
             if keep {
-                warm.video_vae = Some(vae);
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
             } else {
                 drop(vae);
             }
@@ -1570,7 +1607,9 @@ impl MiniMaxH3 {
         }
 
         if keep {
-            warm.dit = model.into_prepared().map(|prepared| (task, prepared));
+            warm.dit = model
+                .into_prepared()
+                .and_then(|prepared| warm.hold((task, prepared), |w| w.dit));
         } else {
             drop(model);
         }
@@ -1587,12 +1626,12 @@ impl MiniMaxH3 {
         let frames = {
             // A warm VAE carrying both halves decodes exactly as the decode half alone does.
             let vae = match warm.video_vae.take() {
-                Some(vae) => vae,
+                Some(held) => held.item,
                 None => MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?,
             };
             let video = vae.decode(&rendered.video);
             if keep {
-                warm.video_vae = Some(vae);
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
             } else {
                 drop(vae);
             }
@@ -1603,7 +1642,7 @@ impl MiniMaxH3 {
         let phase = PhaseLog::start("audio_vae_decode");
         let audio = {
             let vae = match warm.audio_vae.take() {
-                Some(vae) => vae,
+                Some(held) => held.item,
                 None => {
                     let (cfg, w) = self.load_audio_vae()?;
                     let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
@@ -1618,7 +1657,7 @@ impl MiniMaxH3 {
             };
             let track = vae.decode_audio_track(&rendered.audio);
             if keep {
-                warm.audio_vae = Some(vae);
+                warm.audio_vae = warm.hold(vae, |w| w.audio_decoder);
             } else {
                 drop(vae);
             }
@@ -1775,7 +1814,7 @@ impl MiniMaxH3 {
                 None => MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?,
             };
             let audio_enc = match warm.audio_encoder.take() {
-                Some(encoder) => encoder,
+                Some(held) => held.item,
                 None => self.load_audio_encoder()?,
             };
             for (i, r) in normalized.iter().enumerate() {
@@ -1871,8 +1910,8 @@ impl MiniMaxH3 {
                 });
             }
             if keep {
-                warm.video_vae = Some(vae);
-                warm.audio_encoder = Some(audio_enc);
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
+                warm.audio_encoder = warm.hold(audio_enc, |_| 0);
             } else {
                 drop(vae);
                 drop(audio_enc);
@@ -1978,7 +2017,9 @@ impl MiniMaxH3 {
         }
 
         if keep {
-            warm.dit = model.into_prepared().map(|prepared| (task, prepared));
+            warm.dit = model
+                .into_prepared()
+                .and_then(|prepared| warm.hold((task, prepared), |w| w.dit));
         } else {
             drop(model);
         }
@@ -1995,12 +2036,12 @@ impl MiniMaxH3 {
         let frames = {
             // A warm VAE carrying both halves decodes exactly as the decode half alone does.
             let vae = match warm.video_vae.take() {
-                Some(vae) => vae,
+                Some(held) => held.item,
                 None => MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?,
             };
             let video = vae.decode(&rendered.video);
             if keep {
-                warm.video_vae = Some(vae);
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
             } else {
                 drop(vae);
             }
@@ -2011,7 +2052,7 @@ impl MiniMaxH3 {
         let phase = PhaseLog::start("audio_vae_decode");
         let audio = {
             let vae = match warm.audio_vae.take() {
-                Some(vae) => vae,
+                Some(held) => held.item,
                 None => {
                     let (cfg, w) = self.load_audio_vae()?;
                     let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
@@ -2026,7 +2067,7 @@ impl MiniMaxH3 {
             };
             let track = vae.decode_audio_track(&rendered.audio);
             if keep {
-                warm.audio_vae = Some(vae);
+                warm.audio_vae = warm.hold(vae, |w| w.audio_decoder);
             } else {
                 drop(vae);
             }
@@ -2153,7 +2194,7 @@ impl MiniMaxH3 {
         let phase = PhaseLog::start("text_encoder");
         let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
         let context = self.with_warm_conditioner(warm, keep, |te| {
-            candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
                 te.forward_with_references(
                     &ids,
                     &mask,
@@ -2161,9 +2202,11 @@ impl MiniMaxH3 {
                     &grounded.deepstack,
                     &grounded.grids,
                 )
-            })
+            });
+            // Before the staged scope's device release, as the inline pass dropped it.
+            drop(grounded);
+            context
         })?;
-        drop(grounded);
         phase.done();
         if context.dims()[1] != tags.len() {
             return Err(CandleError::Msg(format!(
@@ -2434,14 +2477,15 @@ fn capture_h3_execution<G: Generator + ?Sized>(
 
 impl Generator for MiniMaxH3 {
     /// The warm set a resident request left on the device, credited per held component at the
-    /// weights that request priced it at (a held VAE at its decode half). `None` when nothing is
-    /// held.
+    /// bytes the request that kept it priced it at (a held VAE at its decode half). `None` when
+    /// nothing is held, or while a render holds the set (no credit is the safe answer).
     fn retained_weight_bytes(&self) -> Option<u64> {
-        let warm = candle_gen::lock_recover(&self.warm);
-        let held = warm
-            .priced
-            .as_ref()
-            .map_or(0, |weights| warm.held_bytes(weights));
+        let warm = match self.warm.try_lock() {
+            Ok(warm) => warm,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let held = warm.held_bytes();
         (held > 0).then_some(held)
     }
 
@@ -3802,8 +3846,10 @@ mod tests {
     }
 
     /// A resident request on a device with no CUDA free-memory figure — or on a source whose
-    /// headers cannot price a warm set — keeps nothing warm and stages; a staged request never
-    /// does. Every warm slot starts empty, and the held credit counts only what is held.
+    /// headers cannot price a warm set — keeps nothing warm and stages, and so does a staged
+    /// request. (Off CUDA both answers are `false` whatever the request; the staged/streamed
+    /// predicate itself is pinned by `crate::warm`'s tests.) Every warm slot starts empty, and
+    /// nothing held is nothing credited.
     #[test]
     fn a_request_that_cannot_price_or_fit_its_warm_set_stages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3825,17 +3871,10 @@ mod tests {
             .unwrap());
         assert!(warm.is_empty());
 
-        let weights = crate::memory_strategy::VideoWarmWeights {
-            conditioner: 30,
-            dit: 20,
-            video_vae_decode: 5,
-            encoders: 6,
-            audio_decoder: 1,
-            encodes: true,
-        };
+        assert_eq!(warm.held_bytes(), 0);
         assert_eq!(
-            warm.held_bytes(&weights),
-            0,
+            model.retained_weight_bytes(),
+            None,
             "nothing held, nothing credited"
         );
     }

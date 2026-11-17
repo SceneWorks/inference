@@ -415,7 +415,11 @@ fn mul(a: u64, b: u64) -> gen_core::Result<u64> {
 }
 
 /// Bytes of the tensors under `path` that `keep` selects, floats at `width` bytes.
-fn header_bytes(path: &Path, width: u64, keep: impl Fn(&str) -> bool) -> gen_core::Result<u64> {
+pub(crate) fn header_bytes(
+    path: &Path,
+    width: u64,
+    keep: impl Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     weightsmeta::safetensors_path_tensor_headers(path)?
         .iter()
         .filter(|h| keep(&h.name))
