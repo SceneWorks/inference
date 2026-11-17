@@ -990,6 +990,8 @@ struct Trained {
     predicted_train_bytes: u64,
     predicted_peak_bytes: u64,
     remaining_steps_peak: u64,
+    /// The preview samples the run rendered (`sample_every` / `sample_prompts`), in order.
+    previews: Vec<Image>,
 }
 
 /// Run `req` on a fresh trainer through the registry, recording the caching-phase and the
@@ -1054,6 +1056,7 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
     // transient, so an under-prediction splits into "resident" vs "working set".
     let mut resident_after_first_step: Option<u64> = None;
     let mut samples: Vec<Value> = Vec::new();
+    let mut previews: Vec<Image> = Vec::new();
     let output = trainer
         .train(req, &mut |p| {
             let memory = || {
@@ -1100,6 +1103,15 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
                         // Reset only AFTER sampling the completed first step's high-water mark.
                         guard.begin();
                     }
+                }
+                TrainingProgress::Sample { step, image, .. } => {
+                    eprintln!(
+                        "step {step}: preview {}x{} ({:.0}s)",
+                        image.width,
+                        image.height,
+                        started.elapsed().as_secs_f64()
+                    );
+                    previews.push(image);
                 }
                 TrainingProgress::Preparing
                 | TrainingProgress::LoadingModel
@@ -1219,6 +1231,7 @@ fn train(req: &TrainingRequest, guard: &Footprint, canonical: &Path, log_every: 
         predicted_train_bytes,
         predicted_peak_bytes,
         remaining_steps_peak: remaining_steps.0,
+        previews,
     }
 }
 
@@ -1497,6 +1510,103 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
         }
         other => panic!("unregistered model-proof module: {other}"),
     }
+}
+
+/// SW-7172 — a bounded T2I **LoRA** run on a NON-SQUARE dataset: item 0 is a 512×768 (2:3)
+/// portrait of three horizontal bands (blue / cream / green), item 1 a [`ring_image`] square, both
+/// at least the run's [`TRAIN_EDGE`]² area (the aspect canvas never upscales a source). Four steps
+/// train each item on its own aspect canvas — the portrait whole, never a centre-cropped square —
+/// and the one preview at the last step renders at item 0's canvas, so it must be a portrait and a
+/// picture. The preview is written under the model-proof executor's owned output directory (a
+/// declared `output_artifacts` entry) for inspection; the evidence JSON lands before the asserts.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn t2i_lora_trains_a_portrait_and_previews_at_its_canvas() {
+    // Registered only as the integration case (the library's `q4_real_weights_support` copy of
+    // this file has no model-proof binding for it).
+    assert_eq!(module_path!(), "integration::lora_real_weights");
+    let out = out_dir().join("t2i_portrait");
+    std::fs::create_dir_all(&out).unwrap();
+    let guard = Footprint::start(&out);
+    let adapters = out.join("adapters");
+    std::fs::create_dir_all(&adapters).unwrap();
+    let data = out.join("dataset");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let (w, h) = (TRAIN_EDGE, TRAIN_EDGE * 3 / 2);
+    let bands = [[40u8, 80, 200], [235, 225, 200], [40, 160, 70]];
+    let portrait = data.join("portrait.png");
+    image::RgbImage::from_fn(w, h, |_, y| {
+        image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+    })
+    .save(&portrait)
+    .unwrap();
+    let square = data.join("square.png");
+    ring_image(0, TRAIN_EDGE).save(&square).unwrap();
+    const PROMPT: &str = "zxq style, a blue, cream and green banded swatch";
+    let items = vec![
+        TrainingItem::captioned(portrait, PROMPT.into()),
+        TrainingItem::captioned(
+            square,
+            "zxq style, a lighthouse drawn as concentric teal and orange rings on yellow".into(),
+        ),
+    ];
+    let steps = 4;
+    let file_name = "qwen21_t2i_portrait_lora.safetensors";
+    let req = TrainingRequest {
+        items,
+        config: TrainingConfig {
+            rank: 16,
+            alpha: 16.0,
+            learning_rate: TRAIN_LR,
+            steps,
+            gradient_checkpointing: true,
+            resolution: TRAIN_EDGE,
+            save_every: 0,
+            seed: 42,
+            optimizer: "adamw".into(),
+            network_type: NetworkType::Lora,
+            sample_every: steps,
+            sample_steps: RENDER_STEPS,
+            sample_prompts: vec![PROMPT.into()],
+            ..Default::default()
+        },
+        output_dir: adapters.clone(),
+        file_name: file_name.into(),
+        trigger_words: Vec::new(),
+        cancel: Default::default(),
+    };
+    let trained = train(&req, &guard, &adapters.join(file_name), 1);
+    let sizes: Vec<(u32, u32)> = trained
+        .previews
+        .iter()
+        .map(|p| (p.width, p.height))
+        .collect();
+    for (i, preview) in trained.previews.iter().enumerate() {
+        save_png(preview, out.join(format!("preview_{i}.png")));
+        if let Some(dir) = std::env::var_os("MODEL_PROOF_OUTPUT_DIR") {
+            save_png(preview, PathBuf::from(dir).join(format!("preview_{i}.png")));
+        }
+    }
+    write_json(
+        &out_dir(),
+        "t2i_portrait",
+        &json!({"training": trained.facts, "previewSizes": sizes}),
+    );
+
+    assert_trained("t2i portrait", &trained, steps, false);
+    assert_eq!(sizes.len(), 1, "one preview at the step-{steps} cadence");
+    let preview = &trained.previews[0];
+    assert!(
+        preview.height > preview.width,
+        "the preview renders at item 0's portrait canvas, got {}x{}",
+        preview.width,
+        preview.height
+    );
+    assert_sane("t2i portrait preview", preview);
+    crate::model_inference_device::record_model_inference_device();
+    println!("
+MODEL_INFERENCE_BODY_COMPLETED lora_real_weights::t2i_lora_trains_a_portrait_and_previews_at_its_canvas");
 }
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────

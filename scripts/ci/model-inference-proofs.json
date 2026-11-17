@@ -210123,6 +210123,155 @@
     "package": "mlx-gen-qwen-image-2-1",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "lora_real_weights::t2i_lora_trains_a_portrait_and_previews_at_its_canvas",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "bounded SW-7172 canvas proof: 4-step 512-edge T2I LoRA over the dense bf16 base on a 512x768 three-band portrait (item 0) and a 512x512 ring square; one in-training preview at item 0 canvas",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": null,
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs",
+    "input_contract": {
+      "case_generated_inputs": true,
+      "fixture_kind": "external",
+      "requirements": [
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/config.rs::read_json::std::fs::read@3295"
+          ],
+          "required_grade": "reader-binding",
+          "role": "artifact-input",
+          "scope": "case",
+          "slot": "actual-component-config"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "mlx-gen::Weights::from_paths"
+          ],
+          "required_grade": "reader-binding",
+          "role": "model-weights",
+          "scope": "case",
+          "slot": "actual-model-components"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "required_grade": "reader-binding",
+          "role": "tokenizer",
+          "scope": "case",
+          "slot": "actual-model-tokenizer"
+        },
+        {
+          "case_generated_write_read": {
+            "case_source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs",
+            "case_source_sha256": "3de913f3ebee5d75bda6792e2a9087002b9d258d70893aac05bd608c1c8cb871",
+            "writer": "lora_real_weights::t2i_lora_trains_a_portrait_and_previews_at_its_canvas: image::RgbImage::from_fn(512, 768, three horizontal bands [40,80,200]/[235,225,200]/[40,160,70]).save(dataset/portrait.png) and ring_image(0, TRAIN_EDGE).save(dataset/square.png) -> TrainingItem::captioned(path) -> train(&req) -> provider_registry().load_trainer(TRAINER_ID).train -> decode_image/image::open(SAME written PNG paths) -> VAE target encoding"
+          },
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/src/train/dataset.rs::decode_image/image::open"
+          ],
+          "required_grade": "reader-binding",
+          "role": "reference",
+          "scope": "case",
+          "slot": "actual-written-training-target-images"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_saved_sigma_schedule::std::fs::read@13192"
+          ],
+          "required_grade": "reader-binding",
+          "role": "artifact-input",
+          "scope": "case",
+          "slot": "optional-451ae51378c5e33b",
+          "when": "external-present"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@5424"
+          ],
+          "required_grade": "reader-binding",
+          "role": "artifact-input",
+          "scope": "case",
+          "slot": "optional-5c7bc2a94718d3e4",
+          "when": "external-present"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@5935"
+          ],
+          "required_grade": "reader-binding",
+          "role": "artifact-input",
+          "scope": "case",
+          "slot": "optional-ae1863f75570f6ba",
+          "when": "external-present"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/src/quant.rs::packed_quant_bits_at::std::fs::read@3186"
+          ],
+          "required_grade": "reader-binding",
+          "role": "artifact-input",
+          "scope": "case",
+          "slot": "optional-f1e764f29790c4d3",
+          "when": "external-present"
+        },
+        {
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "readers": [
+            "crates/media/mlx-gen/src/quant.rs::packed_quant_group_size_at::std::fs::read@8611"
+          ],
+          "required_grade": "reader-binding",
+          "role": "artifact-input",
+          "scope": "case",
+          "slot": "optional-835f6659d6fbd898",
+          "when": "external-present"
+        }
+      ],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::lora_real_weights::t2i_lora_trains_a_portrait_and_previews_at_its_canvas@3de913f3ebee5d75bda6792e2a9087002b9d258d70893aac05bd608c1c8cb871"
+    },
+    "output_artifacts": [
+      "preview_0.png"
+    ]
+  },
+  {
+    "package": "mlx-gen-qwen-image-2-1",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "lora_real_weights::third_party_lora_applies_strictly_and_moves_every_tier",
     "execution_role": "direct",
     "backend": "mlx",
