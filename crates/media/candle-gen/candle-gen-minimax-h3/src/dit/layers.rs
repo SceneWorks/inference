@@ -601,6 +601,25 @@ impl DitAttention {
         veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
+        self.forward_pag(x, rope, veda, cancel, None)
+    }
+
+    /// [`Self::forward_veda`] with optional Perturbed-Attention Guidance (PAG, SW-7175).
+    ///
+    /// When `pag_prefix_len` is `Some(prefix_len)`:
+    /// - Leading conditioning rows `0..prefix_len` (Qwen3-VL text/vision tokens and any `1..=16`
+    ///   `<Picture N>` reference latent rows) attend normally against the full `[K_prefix, K_gen]`
+    ///   and `[V_prefix, V_gen]` sequence via `sdpa_planned` (FlashAttention-2 or budgeted SDPA).
+    /// - Trailing target-image rows `prefix_len..seq` bypass spatial self-attention (identity
+    ///   self-attention perturbation) and receive `V_generated` directly before `to_out`.
+    pub(crate) fn forward_pag(
+        &self,
+        x: &Tensor,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+        cancel: Option<&CancelFlag>,
+        pag_prefix_len: Option<usize>,
+    ) -> Result<Tensor> {
         let s = x.dims();
         if s.len() != 3 {
             return Err(CandleError::Msg(format!(
@@ -609,6 +628,90 @@ impl DitAttention {
         }
         let (b, seq) = (s[0], s[1]);
         let (h, d) = (self.heads, self.head_dim);
+
+        if let Some(prefix_len) = pag_prefix_len {
+            if prefix_len > seq {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 dit attention: pag_prefix_len {prefix_len} out of range 0..={seq}"
+                )));
+            }
+            if prefix_len == 0 {
+                let v_flat = self.to_v.forward(x)?;
+                return self.to_out.forward(&v_flat);
+            }
+            if prefix_len < seq {
+                let x_prefix = x.narrow(1, 0, prefix_len)?.contiguous()?;
+                let prefix_tables;
+                let prefix_rope = match rope {
+                    Some((rope, tables)) => {
+                        prefix_tables = MmRopeTables {
+                            cos: tables.cos.narrow(0, 0, prefix_len)?.contiguous()?,
+                            sin: tables.sin.narrow(0, 0, prefix_len)?.contiguous()?,
+                        };
+                        Some((rope, &prefix_tables))
+                    }
+                    None => None,
+                };
+                let (q_prefix, k, v_flat) = if rope.is_some()
+                    && x.device().is_cuda()
+                    && crate::block_stream::current().is_some()
+                {
+                    let budget = crate::nn::attention_budget();
+                    let projected = self.to_q.forward(&x_prefix)?;
+                    let q_input = projected.reshape((b, prefix_len, h, d))?;
+                    drop(projected);
+                    let (q_prefix, _) = precondition_projected_qk(
+                        q_input,
+                        &self.norm_q,
+                        self.qk_norm_eps,
+                        prefix_rope,
+                        budget,
+                        cancel,
+                    )?;
+                    let projected = self.to_k.forward(x)?;
+                    let k_input = projected.reshape((b, seq, h, d))?;
+                    drop(projected);
+                    let (k, _) = precondition_projected_qk(
+                        k_input,
+                        &self.norm_k,
+                        self.qk_norm_eps,
+                        rope,
+                        budget,
+                        cancel,
+                    )?;
+                    let v_flat = self.to_v.forward(x)?;
+                    (q_prefix, k, v_flat)
+                } else {
+                    let q_prefix = self
+                        .to_q
+                        .forward(&x_prefix)?
+                        .reshape((b, prefix_len, h, d))?;
+                    let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
+                    let v_flat = self.to_v.forward(x)?;
+                    let q_prefix = rms_weighted(&q_prefix, &self.norm_q, self.qk_norm_eps)?;
+                    let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
+                    let (q_prefix, k) = match (prefix_rope, rope) {
+                        (Some((rp, tp)), Some((rk, tk))) => {
+                            (rp.apply(&q_prefix, tp)?, rk.apply(&k, tk)?)
+                        }
+                        _ => (q_prefix, k),
+                    };
+                    (q_prefix, k, v_flat)
+                };
+                let v = v_flat.reshape((b, seq, h, d))?;
+                let qh_prefix = q_prefix.transpose(1, 2)?;
+                let kh = k.transpose(1, 2)?;
+                let vh = v.transpose(1, 2)?;
+                let scale = 1.0 / (d as f64).sqrt();
+                let out_prefix = sdpa_planned(&qh_prefix, &kh, &vh, scale, cancel)?
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, prefix_len, h * d))?;
+                let v_gen = v_flat.narrow(1, prefix_len, seq - prefix_len)?;
+                let out = Tensor::cat(&[&out_prefix, &v_gen], 1)?;
+                return self.to_out.forward(&out);
+            }
+        }
 
         // The published checkpoint ships `to_q`/`to_k`/`to_v` already split, so this applies NO
         // fused-QKV transform. See `crate::dit::qkv` for which transform produced them and why

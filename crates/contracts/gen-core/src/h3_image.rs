@@ -36,6 +36,39 @@ pub const MAX_PROMPT_TOKENS: usize = 4096;
 pub const FIXED_STEPS: u32 = 6;
 /// The only guidance value (no classifier-free guidance).
 pub const FIXED_GUIDANCE: f32 = 1.0;
+/// Addressable single-stream DiT blocks (`transformer_blocks.0..=49`) in `MiniMax-H3-Image`.
+pub const NUM_DIT_BLOCKS: u32 = 50;
+/// Human/UI-facing block domain name for [`minimax_h3_image_pag_capability`].
+pub const PAG_BLOCK_DOMAIN: &str = "dit_blocks";
+/// Curated mid-stack DiT block perturbed by default when [`crate::PagConfig::layers`] is omitted.
+pub const PAG_DEFAULT_LAYER: u32 = 25;
+/// Default normalized PAG window start (`0.0`, active from step `0`).
+pub const PAG_DEFAULT_START: f32 = 0.0;
+/// Default normalized PAG window stop (`0.66`): on the fixed 6-step PDD schedule (`FIXED_STEPS = 6`),
+/// steps `0, 1, 2, 3` (`progress = 0.0, 0.1667, 0.3333, 0.50 < 0.66`, `active_steps(6) == 4`) run
+/// PAG while late high-frequency PDD heads `4` and `5` (`progress >= 0.6667`) stay unperturbed on-manifold.
+pub const PAG_DEFAULT_STOP: f32 = 0.66;
+/// Gentle recommended PAG scale curated for MiniMax-H3-Image's guidance-distilled 6-step PDD schedule.
+pub const PAG_RECOMMENDED_SCALE: f32 = 1.2;
+
+/// Shared Perturbed-Attention Guidance (PAG) capability descriptor for `minimax_h3_image` across
+/// MLX and Candle (SW-7175).
+///
+/// Advertises the 50 single-stream `dit_blocks` (`0..50`) with curated default block `[25]`, gentle
+/// `recommended_scale = 1.2`, and default window `[0.0, 0.66)` (`4` active steps out of `6`,
+/// leaving late PDD heads `4` and `5` unperturbed) without relaxing H3-Image's
+/// `supports_guidance = false` / `supports_negative_prompt = false` contract.
+pub fn minimax_h3_image_pag_capability() -> crate::PagCapability {
+    crate::PagCapability {
+        num_blocks: NUM_DIT_BLOCKS,
+        block_domain: std::borrow::Cow::Borrowed(PAG_BLOCK_DOMAIN),
+        default_layers: vec![PAG_DEFAULT_LAYER],
+        default_start: PAG_DEFAULT_START,
+        default_stop: PAG_DEFAULT_STOP,
+        recommended_scale: PAG_RECOMMENDED_SCALE,
+        max_scale: crate::DEFAULT_PAG_MAX_SCALE,
+    }
+}
 
 /// The 6-step schedule from `pdd_config.json` (7 boundaries, `1.0` down to `0.0`). The scheduler
 /// uses velocity euler updates and does NOT shift these sigmas.
@@ -1903,5 +1936,138 @@ mod tests {
         // 100 px -> 6 latent cells -> 6; 90 px -> 5 -> 4.
         assert_eq!(reference_latent_grid(90, 100, (2, 2)), (6, 4));
         assert_eq!(REFERENCE_NOISE_AUG, 0.999);
+    }
+
+    #[test]
+    fn minimax_h3_image_pag_capability_curates_50_block_6_step_schedule_without_cfg() {
+        let cap = minimax_h3_image_pag_capability();
+        cap.validate_definition().unwrap();
+        assert_eq!(cap.num_blocks, 50);
+        assert_eq!(cap.block_domain, "dit_blocks");
+        assert_eq!(cap.default_layers, vec![25]);
+        assert_eq!(cap.default_start, 0.0);
+        assert_eq!(cap.default_stop, 0.66);
+        assert_eq!(cap.recommended_scale, 1.2);
+        assert_eq!(cap.max_scale, crate::DEFAULT_PAG_MAX_SCALE);
+
+        let caps = crate::Capabilities {
+            supports_guidance: false,
+            supports_negative_prompt: false,
+            min_size: 1,
+            max_size: 16_384,
+            max_count: 1,
+            supported_steps: crate::StepSupport::Exact(vec![FIXED_STEPS]),
+            pag: Some(cap.clone()),
+            ..Default::default()
+        };
+
+        // PAG resolves cleanly while supports_guidance=false and supports_negative_prompt=false stay enforced.
+        let active_req = crate::GenerationRequest {
+            width: 2048,
+            height: 2048,
+            pag: Some(crate::PagConfig {
+                scale: cap.recommended_scale,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        caps.validate_request("minimax_h3_image", &active_req)
+            .unwrap();
+        let resolved = caps
+            .resolve_pag("minimax_h3_image", &active_req)
+            .unwrap()
+            .expect("active PAG");
+        assert_eq!(resolved.layers, vec![25]);
+        assert_eq!(resolved.active_steps(FIXED_STEPS), 4);
+        for step in 0..4 {
+            assert!(
+                resolved.perturbs_block(25, step, FIXED_STEPS as usize),
+                "step {step} should perturb block 25"
+            );
+            assert!(
+                !resolved.perturbs_block(24, step, FIXED_STEPS as usize),
+                "step {step} must not perturb non-selected block 24"
+            );
+        }
+        for step in 4..6 {
+            assert_eq!(
+                resolved.step_scale(step, FIXED_STEPS as usize),
+                0.0,
+                "late PDD step {step} must stay unperturbed on-manifold"
+            );
+            assert!(!resolved.perturbs_block(25, step, FIXED_STEPS as usize));
+        }
+        let report = resolved.execution_report(FIXED_STEPS);
+        report.validate_with_capability(&cap).unwrap();
+        assert_eq!(
+            report,
+            crate::PagExecutionReport {
+                layers: vec![25],
+                active_steps: 4,
+                total_steps: FIXED_STEPS,
+                scale: 1.2,
+                adaptive_scale: 0.0,
+                start: 0.0,
+                stop: 0.66,
+            }
+        );
+
+        // Zero scale is a strict no-op (resolves to None) while still rejecting out-of-range block 50.
+        let zero_ok = crate::GenerationRequest {
+            width: 2048,
+            height: 2048,
+            pag: Some(crate::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![0, 49]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        caps.validate_request("minimax_h3_image", &zero_ok).unwrap();
+        assert_eq!(
+            caps.resolve_pag("minimax_h3_image", &zero_ok).unwrap(),
+            None
+        );
+
+        for bad_layer in [50_u32, 99] {
+            for scale in [0.0_f32, 1.2] {
+                let bad_req = crate::GenerationRequest {
+                    width: 2048,
+                    height: 2048,
+                    pag: Some(crate::PagConfig {
+                        scale,
+                        layers: Some(vec![bad_layer]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    caps.validate_request("minimax_h3_image", &bad_req),
+                    Err(Error::Msg(_))
+                ));
+            }
+        }
+
+        // Guidance != 1.0 and negative_prompt remain refused even when PAG is active.
+        assert!(matches!(
+            caps.validate_request(
+                "minimax_h3_image",
+                &crate::GenerationRequest {
+                    guidance: Some(4.0),
+                    ..active_req.clone()
+                },
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            caps.validate_request(
+                "minimax_h3_image",
+                &crate::GenerationRequest {
+                    negative_prompt: Some("blurry".into()),
+                    ..active_req
+                },
+            ),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

@@ -207,7 +207,8 @@ pub use image_model::{
     image_descriptor, MiniMaxH3Image, IMAGE_DIT_PARTITION, IMAGE_MODEL_ID, IMAGE_REGISTRATION,
 };
 pub use image_pipeline::{
-    reference_condition_rows, reference_vae_pixels, resize_reference, ImageLayout, ImageVelocity,
+    denoise_image, denoise_image_with_pag, reference_condition_rows, reference_vae_pixels,
+    resize_reference, ImageLayout, ImageVelocity,
 };
 pub use image_vae::{
     bounded_decode_parameters as image_bounded_decode_parameters, MiniMaxH3ImageVae,
