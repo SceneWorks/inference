@@ -7,8 +7,8 @@
 //!
 //! # Phases
 //!
-//! The render is staged exactly as H3's is, for the same reason — the layer-50 Qwen3-VL-32B
-//! conditioner (~58 GB at the tap) and the 66 GB DiT cannot be resident together on any card:
+//! A staged render runs exactly as H3's does — at bf16 the layer-50 Qwen3-VL-32B conditioner
+//! (~58 GB at the tap) and the 66 GB DiT cannot be resident together on a 96 GB card:
 //!
 //! 1. **conditioning** — tokenize the prompt verbatim (no chat template, no special tokens,
 //!    truncated to 4096 tokens), run H3's text-only conditioner pass over the byte-identical
@@ -19,6 +19,17 @@
 //!    drop it and synchronize;
 //! 3. **decode** — map `vae_diffusers/`'s decode half ([`MiniMaxH3ImageVae`]), decode with its
 //!    shipped 256 / 64 tiling, and resize back from the generation canvas to the requested size.
+//!
+//! A request whose admitted selection stages or streams (`GenerationMemory::stage_residency` /
+//! `stream_transformer_blocks`) always runs those phases. A **resident** request (no request
+//! memory, or one that neither stages nor streams) keeps the three components warm instead when
+//! they fit together on the device: the conditioner, the DiT after its AdaLN precompute-and-evict,
+//! and the VAE decode half stay in [`MiniMaxH3Image`] between requests, so the next render reuses
+//! them rather than re-reading them from disk. "Fit" is the header-derived
+//! `admission::warm_estimate` (every phase plus the other components' warm weights) plus a 2 GiB
+//! reserve against the device's free memory plus what is already held warm. A resident request
+//! whose warm set does not fit (bf16 on a 96 GB card: ~126 GB) releases any warm components and
+//! runs staged, exactly as before — which is why rung 0 is admitted at the staged price.
 //!
 //! # Streamed route (rung 4, SW-7095)
 //!
@@ -39,19 +50,21 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::h3_image as contract;
 use candle_gen::gen_core::{
     Capabilities, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape,
-    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, Quant,
-    SizeFloor, StepSupport, WeightsSource,
+    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 use gen_core_h3::h3_schedule::SigmaSchedule;
 
-use crate::dit::{ImageDit, MiniMaxH3Dit};
+use crate::dit::{ImageDit, MiniMaxH3Dit, PreparedImageDit};
 use crate::image_pipeline::{
     decoded_to_image, denoise_image, initial_image_rows, latent_grid, reference_condition_rows,
     reference_noise, reference_vae_pixels, resize_reference, unpack_image_rows, ImageLayout,
 };
 use crate::image_vae::{MiniMaxH3ImageVae, MiniMaxH3ImageVaeEncoder, IMAGE_VAE_COMPONENT};
-use crate::model::{require_component_shards, resolve_seed, run_conditioner, PhaseLog};
+use crate::model::{
+    conditioner_forward, require_component_shards, resolve_seed, run_conditioner, PhaseLog,
+};
 use crate::text_encoder::MiniMaxH3Tokenizer;
 
 /// Caption context, per-row modality tags, and ordered reference latents.
@@ -125,7 +138,7 @@ pub fn image_descriptor() -> ModelDescriptor {
             // Pre-quantized MLX-affine tiers (SW-7093), the artifacts the MLX lane reads: staged as
             // the DiT component; `spec.quantize` asserts which tier was staged.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            // The generator always stages its three components (see the module docs).
+            // A staged request maps and releases its three components in turn (see the module docs).
             supports_sequential_offload: true,
             max_count: 1,
             // PDD-distilled: one output head per step, so six is the only legal count.
@@ -145,8 +158,69 @@ pub fn image_descriptor() -> ModelDescriptor {
     }
 }
 
-/// The loaded `minimax_h3_image` provider — **paths only**; every phase maps and releases its
-/// own component.
+/// The components a resident request keeps on the device between requests.
+#[derive(Default)]
+struct WarmComponents {
+    /// The layer-50 conditioner.
+    conditioner: Option<crate::text_encoder::MiniMaxH3TextEncoder>,
+    /// The DiT after the AdaLN precompute-and-evict, keyed on the timesteps and reference presence
+    /// its modulation was projected for.
+    dit: Option<crate::dit::PreparedImageDit>,
+    /// The image VAE's decode half.
+    decoder: Option<MiniMaxH3ImageVae>,
+}
+
+impl WarmComponents {
+    fn is_empty(&self) -> bool {
+        self.conditioner.is_none() && self.dit.is_none() && self.decoder.is_none()
+    }
+}
+
+/// Whether a request may keep its components warm: one whose request memory neither stages nor
+/// streams, or one with no request memory (a resident admission carries none) on a generator not
+/// loaded with [`OffloadPolicy::Sequential`]. Without request memory the load-time policy stands,
+/// and a sequential load asked for each component to be dropped after its phase.
+fn keeps_components_warm(req: &GenerationRequest, load_policy: OffloadPolicy) -> bool {
+    match req.memory {
+        Some(memory) => !memory.stage_residency && !memory.stream_transformer_blocks,
+        None => load_policy != OffloadPolicy::Sequential,
+    }
+}
+
+/// Device memory a warm request leaves free above its estimate — the same 2 GiB allocator slack
+/// the worker's admission keeps.
+const WARM_RESERVE_BYTES: u64 = 2 << 30;
+
+/// Whether a warm set needing `need` device bytes at its peak fits, given the device's `free`
+/// bytes (`None` off CUDA, where nothing is kept warm), the `held` bytes this generator already
+/// keeps warm (they are part of `need` and already allocated) and, when the request carries an
+/// admitted context, that context's `admitted` budget (which already credits this generator's
+/// own residency as reclaimable), so a warm set never outgrows what the caller granted.
+fn warm_set_fits(need: u64, held: u64, free: Option<u64>, admitted: Option<u64>) -> bool {
+    free.is_some_and(|free| need.saturating_add(WARM_RESERVE_BYTES) <= free.saturating_add(held))
+        && admitted.is_none_or(|budget| need <= budget)
+}
+
+/// The device's free bytes as the CUDA driver reports them after pending work completes; `None`
+/// on any other device.
+fn device_free_bytes(device: &Device) -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    if let Ok(cuda) = device.as_cuda_device() {
+        device.synchronize().ok()?;
+        return cuda
+            .cuda_stream()
+            .context()
+            .mem_get_info()
+            .ok()
+            .map(|(free, _total)| free as u64);
+    }
+    let _ = device;
+    None
+}
+
+/// The loaded `minimax_h3_image` provider. A staged or streamed request maps and releases each
+/// component in its own phase; a resident request keeps them warm in its `warm` field (see the
+/// module docs).
 pub struct MiniMaxH3Image {
     descriptor: ModelDescriptor,
     root: PathBuf,
@@ -161,6 +235,8 @@ pub struct MiniMaxH3Image {
     load_shape: LoadShape,
     /// The header-only facts admission prices each request's phases from (SW-7095).
     memory_facts: Option<crate::image_memory_strategy::admission::ImageMemoryFacts>,
+    /// The components a resident request left on the device for the next one.
+    warm: std::sync::Mutex<WarmComponents>,
 }
 
 impl MiniMaxH3Image {
@@ -224,6 +300,7 @@ impl MiniMaxH3Image {
             spec: spec.clone(),
             load_shape: spec.load_shape,
             memory_facts: crate::image_memory_strategy::facts_for(spec),
+            warm: std::sync::Mutex::new(WarmComponents::default()),
         })
     }
 
@@ -256,6 +333,7 @@ impl MiniMaxH3Image {
     /// Returns the context, its per-row tags and the reference latents `[1, 24, h, w]`.
     fn encode_edit(
         &self,
+        conditioner: Option<&crate::text_encoder::MiniMaxH3TextEncoder>,
         prompt: &str,
         references: &[&candle_gen::gen_core::Image],
         seed: u64,
@@ -277,14 +355,17 @@ impl MiniMaxH3Image {
         let phase = PhaseLog::start("text_encoder");
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask, tags) = tok.encode_image_edit(prompt, &grounded.counts, &self.device)?;
-        let context = run_conditioner(
-            &self.text_encoder_dir,
-            &ids,
-            &mask,
-            Some(&grounded),
-            &self.device,
-            on_progress,
-        )?;
+        let context = match conditioner {
+            Some(te) => conditioner_forward(te, &ids, &mask, Some(&grounded), on_progress)?,
+            None => run_conditioner(
+                &self.text_encoder_dir,
+                &ids,
+                &mask,
+                Some(&grounded),
+                &self.device,
+                on_progress,
+            )?,
+        };
         drop((ids, mask, grounded));
         phase.done();
         if context.dims()[1] != tags.len() {
@@ -323,25 +404,41 @@ impl MiniMaxH3Image {
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<ImageConditioning> {
+        self.encode_conditioning_with(None, prompt, references, seed, on_progress)
+    }
+
+    /// [`Self::encode_conditioning`] through `conditioner` when one is already loaded (a resident
+    /// request's warm encoder), else through a conditioner mapped and released for this call.
+    fn encode_conditioning_with(
+        &self,
+        conditioner: Option<&crate::text_encoder::MiniMaxH3TextEncoder>,
+        prompt: &str,
+        references: &[&candle_gen::gen_core::Image],
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<ImageConditioning> {
         Ok(if references.is_empty() {
             let phase = PhaseLog::start("text_encoder");
             let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
             let (ids, mask) =
                 tok.encode_prompt_truncated(prompt, contract::MAX_PROMPT_TOKENS, &self.device)?;
-            let context = run_conditioner(
-                &self.text_encoder_dir,
-                &ids,
-                &mask,
-                None,
-                &self.device,
-                on_progress,
-            )?;
+            let context = match conditioner {
+                Some(te) => conditioner_forward(te, &ids, &mask, None, on_progress)?,
+                None => run_conditioner(
+                    &self.text_encoder_dir,
+                    &ids,
+                    &mask,
+                    None,
+                    &self.device,
+                    on_progress,
+                )?,
+            };
             drop((ids, mask));
             phase.done();
             let n = context.dims()[1];
             (context, vec![contract::TEXT_TAG as u32; n], Vec::new())
         } else {
-            self.encode_edit(prompt, references, seed, on_progress)?
+            self.encode_edit(conditioner, prompt, references, seed, on_progress)?
         })
     }
 
@@ -396,6 +493,71 @@ impl MiniMaxH3Image {
         &self.device
     }
 
+    /// Whether this request's warm set fits the device now (see the module docs), logging the
+    /// figures the decision used. `false` when the sources' headers could not be read.
+    fn warm_set_fits_now(&self, req: &GenerationRequest, warm: &WarmComponents) -> bool {
+        use crate::image_memory_strategy::admission::{
+            decimal_gb, ladder, warm_estimate, warm_weights, ImageRequestShape,
+        };
+        let Some(facts) = self.memory_facts.as_ref() else {
+            return false;
+        };
+        let tier = candle_gen::gen_core::MemoryNumericTier {
+            precision: self.spec.precision,
+            quant: self.spec.quantize,
+            component_precision_floors: &[],
+        };
+        let plan = ImageRequestShape::from_request(req).and_then(|shape| {
+            let selection = ladder(&self.contract, tier)
+                .into_iter()
+                .find(|s| s.strategy == candle_gen::gen_core::MemoryStrategy::Resident)
+                .ok_or_else(|| {
+                    candle_gen::gen_core::Error::Unsupported(format!(
+                        "{IMAGE_MODEL_ID}: the contract offers no resident rung"
+                    ))
+                })?;
+            let plan = warm_estimate(&self.contract, facts, &shape, &selection)?;
+            Ok((plan, !shape.references.is_empty()))
+        });
+        let (plan, has_references) = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::info!(%error, "minimax-h3-image: no warm estimate; staging this request");
+                return false;
+            }
+        };
+        let weights = warm_weights(facts, has_references);
+        let held = [
+            warm.conditioner.as_ref().map(|_| weights.conditioner),
+            warm.dit.as_ref().map(|_| weights.dit),
+            warm.decoder.as_ref().map(|_| weights.decoder),
+        ]
+        .into_iter()
+        .flatten()
+        .sum::<u64>();
+        let free = device_free_bytes(&self.device);
+        let admitted = crate::memory_strategy::active_context()
+            .map(|context| context.budget.effective_bytes());
+        let need = plan.peak_device_bytes();
+        let fits = warm_set_fits(need, held, free, admitted);
+        tracing::info!(
+            event = "minimax_h3_image_warm_decision",
+            keep_warm = fits,
+            warm_peak_gb = decimal_gb(need),
+            held_warm_gb = decimal_gb(held),
+            device_free_gb = free.map(decimal_gb),
+            admitted_budget_gb = admitted.map(decimal_gb),
+            reserve_gb = decimal_gb(WARM_RESERVE_BYTES),
+            "minimax-h3-image: {}",
+            if fits {
+                "the warm set fits; keeping the text encoder, DiT and VAE decoder resident"
+            } else {
+                "the warm set does not fit; staging this request"
+            }
+        );
+        fits
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -441,40 +603,93 @@ impl MiniMaxH3Image {
         let references = contract::edit_reference_images(&req.conditioning)
             .map_err(|r| CandleError::Msg(r.to_string()))?;
 
+        // Resident requests whose warm set fits reuse (and leave behind) the warm components; any
+        // other request releases them first, so its staged phases have the device to themselves.
+        let mut warm = candle_gen::lock_recover(&self.warm);
+        let resident = keeps_components_warm(req, self.spec.offload_policy)
+            && crate::block_stream::current().is_none()
+            && self.warm_set_fits_now(req, &warm);
+        if !resident && !warm.is_empty() {
+            *warm = WarmComponents::default();
+            crate::dit::release_device_memory(&self.device)?;
+            tracing::info!("minimax-h3-image: released the warm components for a staged request");
+        }
+        if resident {
+            tracing::info!(
+                conditioner_warm = warm.conditioner.is_some(),
+                dit_warm = warm.dit.is_some(),
+                decoder_warm = warm.decoder.is_some(),
+                "minimax-h3-image: resident request; reusing warm components"
+            );
+        }
+
         // --- 1. conditioning ---------------------------------------------------------------
-        let (context, text_tags, reference_latents) =
-            self.encode_conditioning(&req.prompt, &references, seed, on_progress)?;
+        if resident && warm.conditioner.is_none() {
+            let phase = PhaseLog::start("text_encoder_load");
+            warm.conditioner = Some(crate::model::load_conditioner(
+                &self.text_encoder_dir,
+                &self.device,
+            )?);
+            phase.done();
+        }
+        let (context, text_tags, reference_latents) = self.encode_conditioning_with(
+            warm.conditioner.as_ref(),
+            &req.prompt,
+            &references,
+            seed,
+            on_progress,
+        )?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
 
         // --- 2. denoise --------------------------------------------------------------------
-        let phase = PhaseLog::start("dit_load");
-        // Streamed (rung 4): the stack is built on the host in runtime format and only the root
-        // modules (projections, refiner, the six heads) move to the device; each block is copied
-        // in for its window. The adapters are installed on the host copy first, so every window
-        // carries its block's factors.
-        let policy = crate::block_stream::current();
-        let load_device = if policy.is_some() {
-            &Device::Cpu
-        } else {
-            &self.device
-        };
-        let mut dit = self.load_dit(load_device, DType::BF16)?;
-        if !self.spec.adapters.is_empty() {
-            // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
-            // render here rather than producing an image the LoRA barely touched. The image
-            // entry's absent-alpha fallback is `alpha = rank` (the diffusers/PEFT convention).
-            crate::adapters::apply_minimax_h3_image_adapters(&mut dit, &self.spec.adapters)?;
-        }
-        if let Some(policy) = policy {
-            if policy.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
+        let has_references = !reference_latents.is_empty();
+        let timesteps = schedule.timesteps();
+        let warm_dit = warm
+            .dit
+            .take()
+            .filter(|prepared| prepared.serves(timesteps, has_references));
+        // A warm DiT prepared for the other reference presence was dropped by the filter above;
+        // synchronize so its memory is reusable before the reload.
+        crate::dit::release_device_memory(&self.device)?;
+        let prepared = match warm_dit {
+            Some(prepared) => prepared,
+            None => {
+                let phase = PhaseLog::start("dit_load");
+                // Streamed (rung 4): the stack is built on the host in runtime format and only the
+                // root modules (projections, refiner, the six heads) move to the device; each block
+                // is copied in for its window. The adapters are installed on the host copy first,
+                // so every window carries its block's factors.
+                let policy = crate::block_stream::current();
+                let load_device = if policy.is_some() {
+                    &Device::Cpu
+                } else {
+                    &self.device
+                };
+                let mut dit = self.load_dit(load_device, DType::BF16)?;
+                if !self.spec.adapters.is_empty() {
+                    // Strict, like H3 video: an unmatched target or a file that matched nothing
+                    // fails the render here rather than producing an image the LoRA barely
+                    // touched. The image entry's absent-alpha fallback is `alpha = rank` (the
+                    // diffusers/PEFT convention).
+                    crate::adapters::apply_minimax_h3_image_adapters(
+                        &mut dit,
+                        &self.spec.adapters,
+                    )?;
+                }
+                if let Some(policy) = policy {
+                    if policy.cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    dit.prepare_streamed(&self.device, policy.window)?;
+                }
+                let prepared = PreparedImageDit::prepare(dit, timesteps, has_references)?;
+                phase.done();
+                prepared
             }
-            dit.prepare_streamed(&self.device, policy.window)?;
-        }
-        phase.done();
-        let patch = dit.config().patch_size;
+        };
+        let patch = prepared.dit().config().patch_size;
         let layout = if reference_latents.is_empty() {
             ImageLayout::text_to_image(context.dims()[1], latent_h, latent_w, patch)?
         } else {
@@ -493,7 +708,7 @@ impl MiniMaxH3Image {
             image = layout.num_image_rows(),
             "minimax-h3-image: packed DiT sequence"
         );
-        let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps())?;
+        let mut model = ImageDit::from_prepared(prepared, &layout, &context)?;
         model.set_cancel(&req.cancel);
         drop(context);
         let noise = initial_image_rows(latent_h, latent_w, patch, seed, &self.device)?;
@@ -530,7 +745,11 @@ impl MiniMaxH3Image {
             },
         )?;
         phase.done();
-        drop(model);
+        if resident {
+            warm.dit = Some(model.into_prepared());
+        } else {
+            drop(model);
+        }
         drop(initial);
         crate::dit::release_device_memory(&self.device)?;
 
@@ -542,9 +761,23 @@ impl MiniMaxH3Image {
         let phase = PhaseLog::start("image_vae_decode");
         let latents = unpack_image_rows(&rows, &layout)?;
         drop(rows);
-        let vae = MiniMaxH3ImageVae::load(&self.root, &self.device, DType::F32)?;
+        let staged_vae;
+        let vae = if resident {
+            if warm.decoder.is_none() {
+                warm.decoder = Some(MiniMaxH3ImageVae::load(
+                    &self.root,
+                    &self.device,
+                    DType::F32,
+                )?);
+            }
+            warm.decoder
+                .as_ref()
+                .expect("the warm decoder was just loaded")
+        } else {
+            staged_vae = MiniMaxH3ImageVae::load(&self.root, &self.device, DType::F32)?;
+            &staged_vae
+        };
         let decoded = vae.decode(&latents)?;
-        drop(vae);
         drop(latents);
         crate::dit::release_device_memory(&self.device)?;
         let image = decoded_to_image(&decoded, width, height)?;
@@ -624,7 +857,16 @@ impl Generator for MiniMaxH3Image {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<GenerationOutput> {
-        Ok(self.generate_impl(req, on_progress)?)
+        let result = self.generate_impl(req, on_progress);
+        if matches!(&result, Err(error) if !matches!(error, CandleError::Canceled)) {
+            // A failed render (an out-of-memory load among them) leaves no half-built warm set
+            // behind for the next request to inherit; a cancelled one keeps what it loaded.
+            *candle_gen::lock_recover(&self.warm) = WarmComponents::default();
+            if let Err(release) = crate::dit::release_device_memory(&self.device) {
+                tracing::warn!(%release, "minimax-h3-image: releasing the warm set after a failed render");
+            }
+        }
+        Ok(result?)
     }
 }
 
@@ -716,6 +958,85 @@ mod tests {
             height,
             ..Default::default()
         }
+    }
+
+    /// Only a request that neither stages nor streams may keep the components warm; a resident
+    /// admission carries no request memory at all.
+    #[test]
+    fn only_a_resident_request_keeps_components_warm() {
+        use candle_gen::gen_core::GenerationMemory;
+        let resident = OffloadPolicy::Resident;
+        let mut req = request(2048, 2048);
+        assert!(
+            keeps_components_warm(&req, resident),
+            "no request memory is a resident request"
+        );
+        req.memory = Some(GenerationMemory::default());
+        assert!(keeps_components_warm(&req, resident));
+        req.memory = Some(GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        });
+        assert!(
+            !keeps_components_warm(&req, resident),
+            "a staged request stages"
+        );
+        req.memory = Some(GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            ..Default::default()
+        });
+        assert!(
+            !keeps_components_warm(&req, resident),
+            "a streamed request streams"
+        );
+    }
+
+    /// A generator loaded with `OffloadPolicy::Sequential` keeps nothing warm for a request with
+    /// no request memory: the load asked for each component to be dropped after its phase. A
+    /// request's own memory policy still decides when it carries one.
+    #[test]
+    fn a_sequential_load_keeps_nothing_warm_without_request_memory() {
+        use candle_gen::gen_core::GenerationMemory;
+        let sequential = OffloadPolicy::Sequential;
+        let mut req = request(2048, 2048);
+        assert!(
+            !keeps_components_warm(&req, sequential),
+            "a sequential load stages a request with no request memory"
+        );
+        req.memory = Some(GenerationMemory::default());
+        assert!(
+            keeps_components_warm(&req, sequential),
+            "an explicit resident request memory overrides the load default"
+        );
+    }
+
+    /// The warm set fits when its peak plus the reserve is within the free memory plus what is
+    /// already held warm, and within an admitted context's budget; with no CUDA free figure
+    /// nothing is kept warm.
+    #[test]
+    fn the_warm_set_fits_only_within_free_plus_held_memory() {
+        const GB: u64 = 1_000_000_000;
+        // q8-sized warm set on an empty 96 GB-class card: fits.
+        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB), None));
+        // The same set already warm: the card reports only what is left, plus what is held.
+        assert!(warm_set_fits(66 * GB, 60 * GB, Some(40 * GB), None));
+        // bf16's ~126 GB warm set never fits that card, warm or cold.
+        assert!(!warm_set_fits(126 * GB, 0, Some(100 * GB), None));
+        // The reserve is kept: an exact fit with no slack is refused.
+        assert!(!warm_set_fits(100 * GB, 0, Some(100 * GB), None));
+        assert!(warm_set_fits(
+            100 * GB - WARM_RESERVE_BYTES,
+            0,
+            Some(100 * GB),
+            None
+        ));
+        // An admitted context's budget bounds the warm set even when the card has room.
+        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB), Some(66 * GB)));
+        assert!(!warm_set_fits(66 * GB, 0, Some(100 * GB), Some(60 * GB)));
+        // Off CUDA there is no free figure, so nothing is kept warm.
+        assert!(!warm_set_fits(GB, 0, None, None));
+        assert_eq!(device_free_bytes(&Device::Cpu), None);
     }
 
     /// The descriptor is its own image family — not H3 video's id, modality or flags.
@@ -1003,6 +1324,7 @@ mod tests {
             contract: crate::image_memory_strategy::weights_free_contract(&spec).unwrap(),
             spec,
             load_shape: LoadShape::DeferredMaterialization,
+            warm: Default::default(),
             memory_facts: None,
         };
         (tmp, model)
@@ -1122,6 +1444,7 @@ mod tests {
             spec,
             load_shape: LoadShape::EagerMaterialization,
             memory_facts: None,
+            warm: Default::default(),
         };
         assert_eq!(image.dit_config().unwrap().patch_size, [1, 2, 2]);
         // The root has no `transformer_diffusers/`: reading it there is what failed every edit.

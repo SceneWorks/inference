@@ -1393,25 +1393,32 @@ pub struct ImageDit {
     text_indices: Vec<u32>,
     image_indices: Vec<u32>,
     released_bytes: usize,
+    timesteps: Vec<f32>,
+    has_references: bool,
     forwards: usize,
     cancel: Option<CancelFlag>,
 }
 
-impl ImageDit {
-    /// Build the velocity model for one request.
-    ///
-    /// * `context` — `[1, num_text_tokens, text_dim]`, the conditioner's layer-50 hidden state;
-    /// * `timesteps` — the schedule's `t = 1 − σ` per step
-    ///   ([`gen_core_h3::h3_schedule::SigmaSchedule::timesteps`]); step `i` is evaluated at
-    ///   `timesteps[i]` through head `i`, so there must be no more steps than heads.
-    ///
-    /// Consumes the model because the eviction mutates it irreversibly.
-    pub fn new(
-        mut dit: MiniMaxH3Dit,
-        layout: &crate::image_pipeline::ImageLayout,
-        context: &Tensor,
-        timesteps: &[f32],
-    ) -> Result<Self> {
+/// The request-independent half of an [`ImageDit`]: the DiT after the AdaLN precompute-and-evict,
+/// with the whole schedule's modulation. The modulation depends only on the fixed timesteps and on
+/// whether reference rows are present, so a resident generator keeps one of these warm between
+/// requests ([`ImageDit::from_prepared`], [`ImageDit::into_prepared`]) instead of re-reading the
+/// DiT and re-projecting the 26 GB `adaln_proj` stack every render.
+pub struct PreparedImageDit {
+    dit: MiniMaxH3Dit,
+    cache: AdaLnCache,
+    norm_out: NormOutModulation,
+    temb: Tensor,
+    released_bytes: usize,
+    timesteps: Vec<f32>,
+    has_references: bool,
+}
+
+impl PreparedImageDit {
+    /// Precompute the modulation of `timesteps` (plus the reference rows' constant `0.999` when
+    /// `has_references`) and evict `adaln_proj`. Consumes the model because the eviction mutates
+    /// it irreversibly.
+    pub fn prepare(mut dit: MiniMaxH3Dit, timesteps: &[f32], has_references: bool) -> Result<Self> {
         // SW-7095, rung 4: the streamed precompute observes the active request's cancel flag.
         let cancel = if dit.stream_window.is_some() {
             crate::block_stream::current()
@@ -1429,12 +1436,77 @@ impl ImageDit {
             norm_out,
             temb,
             released_bytes,
-        } = image_modulation(
-            &mut dit,
+        } = image_modulation(&mut dit, timesteps, has_references, &cancel)?;
+        Ok(Self {
+            dit,
+            cache,
+            norm_out,
+            temb,
+            released_bytes,
+            timesteps: timesteps.to_vec(),
+            has_references,
+        })
+    }
+
+    /// The evicted DiT.
+    pub fn dit(&self) -> &MiniMaxH3Dit {
+        &self.dit
+    }
+
+    /// Whether this modulation serves a request with `timesteps` and (or without) references —
+    /// the only request inputs it was projected from.
+    pub fn serves(&self, timesteps: &[f32], has_references: bool) -> bool {
+        self.has_references == has_references && self.timesteps.as_slice() == timesteps
+    }
+}
+
+impl ImageDit {
+    /// Build the velocity model for one request.
+    ///
+    /// * `context` — `[1, num_text_tokens, text_dim]`, the conditioner's layer-50 hidden state;
+    /// * `timesteps` — the schedule's `t = 1 − σ` per step
+    ///   ([`gen_core_h3::h3_schedule::SigmaSchedule::timesteps`]); step `i` is evaluated at
+    ///   `timesteps[i]` through head `i`, so there must be no more steps than heads.
+    ///
+    /// Consumes the model because the eviction mutates it irreversibly.
+    pub fn new(
+        dit: MiniMaxH3Dit,
+        layout: &crate::image_pipeline::ImageLayout,
+        context: &Tensor,
+        timesteps: &[f32],
+    ) -> Result<Self> {
+        let prepared = PreparedImageDit::prepare(dit, timesteps, layout.num_reference_rows() > 0)?;
+        Self::from_prepared(prepared, layout, context)
+    }
+
+    /// Build the velocity model for one request from an already-prepared DiT, which must have
+    /// been prepared for this layout's reference presence.
+    pub fn from_prepared(
+        prepared: PreparedImageDit,
+        layout: &crate::image_pipeline::ImageLayout,
+        context: &Tensor,
+    ) -> Result<Self> {
+        let PreparedImageDit {
+            dit,
+            cache,
+            norm_out,
+            temb,
+            released_bytes,
             timesteps,
-            layout.num_reference_rows() > 0,
-            &cancel,
-        )?;
+            has_references,
+        } = prepared;
+        if has_references != (layout.num_reference_rows() > 0) {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3-image dit: the modulation was prepared {} reference rows but the \
+                 layout {} them",
+                if has_references { "with" } else { "without" },
+                if layout.num_reference_rows() > 0 {
+                    "has"
+                } else {
+                    "has none of"
+                },
+            )));
+        }
         let text_rows = dit.embed_context(context)?;
         if text_rows.dims()[1] != layout.num_text_tokens() {
             return Err(CandleError::Msg(format!(
@@ -1458,9 +1530,25 @@ impl ImageDit {
             text_indices: layout.text_indices().to_vec(),
             image_indices: layout.image_indices().to_vec(),
             released_bytes,
+            timesteps,
+            has_references,
             forwards: 0,
             cancel: None,
         })
+    }
+
+    /// Release this request's rows, tables and cancel flag and return the prepared DiT for the
+    /// next request.
+    pub fn into_prepared(self) -> PreparedImageDit {
+        PreparedImageDit {
+            dit: self.dit,
+            cache: self.cache,
+            norm_out: self.norm_out,
+            temb: self.temb,
+            released_bytes: self.released_bytes,
+            timesteps: self.timesteps,
+            has_references: self.has_references,
+        }
     }
 
     /// Attach the request's cancel flag, observed between layers as on [`JointDit`].

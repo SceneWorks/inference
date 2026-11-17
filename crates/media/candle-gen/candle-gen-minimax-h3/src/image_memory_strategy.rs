@@ -2,7 +2,7 @@
 //!
 //! | rung | strategy | status |
 //! |---|---|---|
-//! | 0 | [`MemoryStrategy::Resident`] | **implemented** as the baseline — the render never exceeds it: the generator always stages (as H3's does), so a resident admission over-provisions rather than under-provisions |
+//! | 0 | [`MemoryStrategy::Resident`] | **implemented** — admitted at the staged price: the generator keeps the conditioner, the evicted DiT and the VAE decoder warm between requests only when `admission::warm_estimate` fits the device's free memory, and otherwise stages exactly as rung 1 (`crate::image_model`) |
 //! | 1 | [`MemoryStrategy::StagedResidency`] | **implemented** — `crate::image_model` runs the vision tower (edit), the conditioner, then the reference VAE encode (edit), dropping and synchronizing each; maps the DiT, evicts `adaln_proj` after the precompute, denoises, drops it, then maps the VAE |
 //! | 2 | [`MemoryStrategy::BoundedDecode`] | **implemented** — the 2-D VAE's shipped 256 / 64 tiled decode ([`crate::image_vae::bounded_decode_parameters`]) |
 //! | 3 | [`MemoryStrategy::BoundedAttention`] | **implemented** — H3's attention runs FlashAttention by default with a query-chunked materializing fallback; the selected chunk bounds that fallback (and the text encoder's masked attention and FFN chunks) through the request scope's active context ([`crate::nn::attention_budget`]) |
