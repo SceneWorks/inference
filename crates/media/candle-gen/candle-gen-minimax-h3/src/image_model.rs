@@ -168,11 +168,25 @@ struct WarmComponents {
     dit: Option<crate::dit::PreparedImageDit>,
     /// The image VAE's decode half.
     decoder: Option<MiniMaxH3ImageVae>,
+    /// The per-component warm weights of the resident request that last kept this set.
+    priced: Option<crate::image_memory_strategy::admission::WarmWeights>,
 }
 
 impl WarmComponents {
     fn is_empty(&self) -> bool {
         self.conditioner.is_none() && self.dit.is_none() && self.decoder.is_none()
+    }
+
+    /// The held components' bytes at `weights`.
+    fn held_bytes(&self, weights: &crate::image_memory_strategy::admission::WarmWeights) -> u64 {
+        [
+            self.conditioner.as_ref().map(|_| weights.conditioner),
+            self.dit.as_ref().map(|_| weights.dit),
+            self.decoder.as_ref().map(|_| weights.decoder),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0u64, u64::saturating_add)
     }
 }
 
@@ -453,7 +467,7 @@ impl MiniMaxH3Image {
 
     /// Whether this request's warm set fits the device now (see the module docs), logging the
     /// figures the decision used. `false` when the sources' headers could not be read.
-    fn warm_set_fits_now(&self, req: &GenerationRequest, warm: &WarmComponents) -> bool {
+    fn warm_set_fits_now(&self, req: &GenerationRequest, warm: &mut WarmComponents) -> bool {
         use crate::image_memory_strategy::admission::{
             ladder, warm_estimate, warm_weights, ImageRequestShape,
         };
@@ -485,16 +499,10 @@ impl MiniMaxH3Image {
             }
         };
         let weights = warm_weights(facts, has_references);
-        let held = [
-            warm.conditioner.as_ref().map(|_| weights.conditioner),
-            warm.dit.as_ref().map(|_| weights.dit),
-            warm.decoder.as_ref().map(|_| weights.decoder),
-        ]
-        .into_iter()
-        .flatten()
-        .sum::<u64>();
+        let held = warm.held_bytes(&weights);
         let decision =
             crate::warm::WarmDecision::decide(plan.peak_device_bytes(), held, &self.device);
+        warm.priced = decision.keep_warm.then_some(weights);
         decision.log(
             "minimax_h3_image_warm_decision",
             "minimax-h3-image",
@@ -553,7 +561,7 @@ impl MiniMaxH3Image {
         let mut warm = candle_gen::lock_recover(&self.warm);
         let resident = crate::warm::keeps_components_warm(req)
             && crate::block_stream::current().is_none()
-            && self.warm_set_fits_now(req, &warm);
+            && self.warm_set_fits_now(req, &mut warm);
         if !resident && !warm.is_empty() {
             *warm = WarmComponents::default();
             crate::dit::release_device_memory(&self.device)?;
@@ -762,6 +770,22 @@ pub fn image_dit_config_at(dit_dir: &Path) -> Result<crate::dit::MiniMaxH3DitCon
 impl Generator for MiniMaxH3Image {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    /// The warm set a resident request left on the device, at the weights that request priced it
+    /// at. `None` when nothing is held, or while a render holds the set (no credit is the safe
+    /// answer).
+    fn retained_weight_bytes(&self) -> Option<u64> {
+        let warm = match self.warm.try_lock() {
+            Ok(warm) => warm,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let held = warm
+            .priced
+            .as_ref()
+            .map_or(0, |weights| warm.held_bytes(weights));
+        (held > 0).then_some(held)
     }
 
     fn validate(&self, req: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
@@ -1120,6 +1144,13 @@ mod tests {
     }
 
     /// Small real tensor/tokenizer fixture: exercise the production batch and loader on CPU.
+    /// A provider that holds nothing warm grants no reclaimable credit.
+    #[test]
+    fn an_empty_warm_set_retains_nothing() {
+        let (_tmp, model) = caption_fixture();
+        assert_eq!(model.retained_weight_bytes(), None);
+    }
+
     fn caption_fixture() -> (tempfile::TempDir, MiniMaxH3Image) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
