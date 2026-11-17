@@ -372,13 +372,36 @@ class MultiCudaSupervisorTests(unittest.TestCase):
         probe = DeviceProbe(primary, timeline, 0)
         del probe.policy  # legacy injected probes need no multi-device identity protocol
         result = self.run_fake(timeline, [probe], [primary])
-        names = [field.name for field in dataclasses.fields(safety.RunResult)]
+        names = [field.name for field in dataclasses.fields(safety.RunResult) if not field.kw_only]
         self.assertEqual(names, ["pid", "returncode", "peak_host_bytes", "peak_gpu_bytes", "host_free_at_launch",
                                  "gpu_free_at_launch", "elapsed_seconds", "samples", "admission"])
+        # The two peak sources are keyword-only, so every positional constructor stays legacy.
+        peaks = ["sampled_peak_host_bytes", "lifetime_peak_host_bytes"]
+        self.assertEqual([field.name for field in dataclasses.fields(safety.RunResult) if field.kw_only], peaks)
         self.assertIs(type(result), safety.RunResult)
-        self.assertEqual(list(dataclasses.asdict(result)), names)
+        self.assertEqual(list(dataclasses.asdict(result)), names + peaks)
         self.assertFalse(hasattr(result, "cuda_devices"))
-        self.assertEqual(dataclasses.asdict(safety.RunResult(*(getattr(result, name) for name in names))), dataclasses.asdict(result))
+        self.assertEqual(dataclasses.asdict(safety.RunResult(*(getattr(result, name) for name in names),
+                                                             **{name: getattr(result, name) for name in peaks})),
+                         dataclasses.asdict(result))
+        # An injected probe without a lifetime ledger records null and keeps the sampled peak.
+        self.assertIsNone(result.lifetime_peak_host_bytes)
+        self.assertEqual(result.peak_host_bytes, result.sampled_peak_host_bytes)
+
+    def test_arm_peak_is_the_larger_of_sampled_and_lifetime_peak(self):
+        primary = self.policies[0]
+        timeline = Timeline(root_exit=2, empty=2)
+        probe = DeviceProbe(primary, timeline, 0)
+        del probe.policy
+        probe.lifetime_peak_bytes = lambda: 10**12
+        exits = []
+        probe.record_exit_lifetime_peak = exits.append
+        result = self.run_fake(timeline, [probe], [primary])
+        self.assertEqual(result.lifetime_peak_host_bytes, 10**12)
+        self.assertEqual(result.peak_host_bytes, 10**12)
+        self.assertLess(result.sampled_peak_host_bytes, 10**12)
+        self.assertTrue(exits and set(exits) == {result.pid})
+        self.assertEqual(dataclasses.asdict(result)["lifetime_peak_host_bytes"], 10**12)
 
     def test_windows_global_upper_bound_enforces_cap_without_faking_owned_peak(self):
         data = json.loads(self.policies[0].canonical_bytes)

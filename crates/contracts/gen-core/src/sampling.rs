@@ -53,7 +53,10 @@ pub use solvers::{
     sampler_by_name, Ddim, Dpmpp2m, Dpmpp2mSde, DpmppSde, ErSde, EulerAncestral, Heun, Lcm, Solver,
     UniPc,
 };
-pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler};
+pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler, SolverRunState};
+
+#[cfg(test)]
+mod split_tests;
 
 /// Resolve a flow schedule with an optional multiplicative time-shift override.
 /// An absent override preserves the provider's native schedule byte for byte. With the native

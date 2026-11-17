@@ -1,0 +1,43 @@
+// Generated only in the two isolated manual comparison checkouts.
+use @ENGINE@::gen_core::{Image, Progress};
+use std::{env, fs, path::PathBuf};
+
+fn source_image() -> Result<Image, Box<dyn std::error::Error>> {
+    let path = PathBuf::from(env::var_os("PAIR_SOURCE").ok_or("source image")?);
+    if env::var("PAIR_CASE")?.starts_with("control-") {
+        let pixels = fs::read(path)?;
+        if pixels.len() != 256 * 256 * 3 { return Err("wrong control fixture geometry".into()); }
+        Ok(Image { width: 256, height: 256, pixels })
+    } else {
+        let rgb = image::open(path)?.to_rgb8();
+        let (width, height) = rgb.dimensions();
+        Ok(Image { width, height, pixels: rgb.into_raw() })
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let case = env::var("PAIR_CASE")?;
+    let root = PathBuf::from(env::var_os("PAIR_SNAPSHOT").ok_or("snapshot")?);
+    let assets = PathBuf::from(env::var_os("PAIR_ASSETS").ok_or("assets")?);
+    let dir = PathBuf::from(env::var_os("PAIR_OUT").ok_or("output")?);
+    let source = source_image()?;
+    let mut events = Vec::new();
+    let mut steps = Vec::new();
+    let mut progress = |event: Progress| {
+        events.push(format!("{event:?}"));
+        if let Progress::Step { current, total } = event { steps.push([current, total]); }
+    };
+    @SETUP@
+    @GENERATE@
+    let image_side = if case == "pulid-pid" { 1024 } else { 256 };
+    if (output.width, output.height) != (image_side, image_side)
+        || output.pixels.len() != image_side as usize * image_side as usize * 3 {
+        return Err("wrong render count or geometry".into());
+    }
+    fs::write(dir.join("output.rgb"), &output.pixels)?;
+    fs::write(dir.join("progress.json"), serde_json::to_vec(&steps)?)?;
+    fs::write(dir.join("events.json"), serde_json::to_vec(&events)?)?;
+    @CUDA_PROOF@
+    println!("FLUX1_CONDITIONAL_COMPLETE {case}");
+    Ok(())
+}

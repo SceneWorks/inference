@@ -23,7 +23,7 @@ use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
 use mlx_gen_flux::model::load_flux1;
 use mlx_gen_pulid::eva_clip::{EvaConfig, EvaVisionTransformer};
-use mlx_gen_pulid::pulid_flux::PulidFlux;
+use mlx_gen_pulid::pulid_flux::{compile_constructed_plan, PulidFlux};
 
 fn golden(name: &str) -> Weights {
     let path = format!("{}/../tools/golden/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -105,10 +105,6 @@ fn pulid_flux_quant_holds_identity() {
     // ~12 GB Q8, ~6.5 GB Q4. The PuLID conditioning (EVA/IDFormer/CA, f32) is ~3.5 GB and stays
     // resident in all cases. Completion of each render confirms the quantized stack fits.
     for quant in [Quant::Q8, Quant::Q4] {
-        let spec = LoadSpec::new(WeightsSource::Dir(flux_snapshot())).with_quant(quant);
-        let flux = load_flux1(FluxVariant::Dev, &spec).unwrap();
-        let model = PulidFlux::new(flux, build_eva(), pulid_weights(), load_face()).unwrap();
-
         let req = GenerationRequest {
             prompt: "a portrait photo of a person, headshot, looking at the camera".into(),
             width: size,
@@ -122,8 +118,18 @@ fn pulid_flux_quant_holds_identity() {
             }],
             ..Default::default()
         };
+        // A constructor-built PuLID has no load spec: compile before any weight loads.
+        let plan = compile_constructed_plan(&req).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(flux_snapshot())).with_quant(quant);
+        let flux = load_flux1(FluxVariant::Dev, &spec).unwrap();
+        let model = PulidFlux::new(flux, build_eva(), pulid_weights(), load_face()).unwrap();
         let t = Instant::now();
-        let out = match model.generate(&req, &mut |_| {}).unwrap() {
+        let out = match model
+            .generate_planned(&req, &plan, None, &mut |_| {})
+            .unwrap()
+            .output
+            .expect("PuLID render produced no image")
+        {
             GenerationOutput::Images(mut v) => v.remove(0),
             other => panic!("expected image, got {other:?}"),
         };

@@ -30,6 +30,10 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// Explicit process-local backend poison. This is not inferred from an MLX exception string.
+    #[error("process poisoned: {0}")]
+    ProcessPoisoned(String),
+
     /// The request asked for something this engine/backend cannot do (a capability gap the descriptor
     /// doesn't advertise). Typed — like [`Error::Canceled`] — so it bridges to
     /// [`gen_core::Error::Unsupported`] 1:1 in both directions; candle gating and the worker match on
@@ -101,6 +105,7 @@ impl From<Error> for gen_core::Error {
             Error::MissingTensor(s) => gen_core::Error::MissingTensor(s),
             Error::Io(io) => gen_core::Error::Io(io),
             Error::Canceled => gen_core::Error::Canceled,
+            Error::ProcessPoisoned(s) => gen_core::Error::ProcessPoisoned(s),
             Error::Unsupported(s) => gen_core::Error::Unsupported(s),
             Error::GeometryRefused {
                 reason,
@@ -147,6 +152,7 @@ impl From<gen_core::Error> for Error {
                 alternative,
             },
             gen_core::Error::Canceled => Error::Canceled,
+            gen_core::Error::ProcessPoisoned(s) => Error::ProcessPoisoned(s),
             gen_core::Error::Msg(s) => Error::Msg(s),
         }
     }
@@ -158,6 +164,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_poisoned_round_trips_without_classifying_backend_strings() {
+        let up: gen_core::Error = Error::ProcessPoisoned("device context lost".into()).into();
+        assert!(
+            matches!(up, gen_core::Error::ProcessPoisoned(ref s) if s == "device context lost")
+        );
+        let down: Error = up.into();
+        assert!(matches!(down, Error::ProcessPoisoned(ref s) if s == "device context lost"));
+        let ordinary: gen_core::Error = Error::Msg("process poisoned: fake".into()).into();
+        assert!(matches!(ordinary, gen_core::Error::Msg(_)));
+    }
 
     #[test]
     fn canceled_round_trips_1to1_both_directions() {

@@ -1082,6 +1082,18 @@ fn graph_load_refusal(
 pub const CANDLE_MTP_HEAD_FALLBACK: &str = core_llm::COMPANION_MTP_FAMILY_REFUSAL;
 
 impl LoadRecord {
+    /// The numeric policy a completed report binds: the resident weight format the census
+    /// observed and the device, whenever a census exists — a dense load (`requested = None`)
+    /// observes it too. `requested_quantization` is `null` for a load that requested none.
+    pub(crate) fn numeric_policy(&self, device: String) -> Option<serde_json::Value> {
+        self.census.as_ref()?;
+        Some(serde_json::json!({
+            "requested_quantization": self.requested.map(|requested| format!("{requested:?}")),
+            "resident_projections": format!("{:?}", self.report().projections),
+            "device": device,
+        }))
+    }
+
     /// The backend-neutral report a product renders (sc-24139): the requested format, the
     /// projection kinds actually resident (only the kinds present) and the CUDA-graph switch the
     /// load settled ([`cuda_graphs`](Self::cuda_graphs)).
@@ -2954,3 +2966,37 @@ impl LlamaProvider {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod numeric_policy_tests {
+    use super::*;
+
+    /// A dense load with a census binds its resident format and device; only a provider without a
+    /// census (assembled from parts, or an uncensused architecture) leaves the policy unobserved.
+    #[test]
+    fn census_alone_gates_the_numeric_policy() {
+        let mut census = WeightCensus::default();
+        census.projections.dense.count = 2;
+        census.projections.dense.params = 8;
+        let dense = LoadRecord {
+            census: Some(census),
+            ..Default::default()
+        };
+        let policy = dense.numeric_policy("Cpu".into()).unwrap();
+        assert_eq!(policy["requested_quantization"], serde_json::Value::Null);
+        assert_eq!(policy["device"], "Cpu");
+        assert!(policy["resident_projections"]
+            .as_str()
+            .unwrap()
+            .contains("dense"));
+        let quantized = LoadRecord {
+            requested: Some(Quantize::Q4),
+            ..dense.clone()
+        };
+        assert_eq!(
+            quantized.numeric_policy("Cpu".into()).unwrap()["requested_quantization"],
+            "Q4"
+        );
+        assert!(LoadRecord::default().numeric_policy("Cpu".into()).is_none());
+    }
+}

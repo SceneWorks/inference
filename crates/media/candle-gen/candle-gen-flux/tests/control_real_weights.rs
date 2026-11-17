@@ -27,7 +27,10 @@ use std::sync::Arc;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::Progress;
 use candle_gen::testkit::{env_path, max_abs_diff_u8, read_ppm, write_ppm};
-use candle_gen_flux::{Flux1ControlPaths, Flux1ControlRequest, Flux1DevControl};
+use candle_gen_flux::{
+    compile_control_plan, control_load_spec, Flux1ControlPaths, Flux1ControlRequest,
+    Flux1DevControl,
+};
 
 /// Real-weight: render the control hint at `control_scale = 0.7` (the steer), assert a coherent finite
 /// 1024² image distinct across seeds, and exercise the cancel contract (pre + mid-denoise). The
@@ -51,21 +54,6 @@ fn real_weight_control() {
         control_image.width, control_image.height
     );
 
-    let t0 = std::time::Instant::now();
-    let model = Flux1DevControl::load(&paths).expect("load Flux1DevControl");
-    println!(
-        "loaded in {:?} — {} residuals, interval {}",
-        t0.elapsed(),
-        model.num_residuals(),
-        model.residual_interval()
-    );
-    assert_eq!(
-        model.num_residuals(),
-        6,
-        "Shakker Union-Pro-2.0 ships 6 control double blocks"
-    );
-    assert_eq!(model.residual_interval(), 4, "ceil(19/6) = 4");
-
     let prompt = "a cinematic portrait photo of a person, soft natural light, photorealistic";
     let base = Flux1ControlRequest {
         prompt: prompt.into(),
@@ -88,16 +76,53 @@ fn real_weight_control() {
     };
     let mut noop = |_p: Progress| {};
 
+    // Compile every trajectory before any weight loads; the load binds the same spec.
+    let spec = control_load_spec(&paths);
+    let base_plan =
+        compile_control_plan(&paths, &spec, &base, &control_image).expect("compile base plan");
+    let other = Flux1ControlRequest {
+        seed: 999,
+        ..base.clone()
+    };
+    let other_plan =
+        compile_control_plan(&paths, &spec, &other, &control_image).expect("compile seed-999 plan");
+    // The accepted-kind gate: an unmodelled kind is rejected loudly before load (input-agnostic
+    // union — pose/canny/depth only).
+    let bad = Flux1ControlRequest {
+        control_kind: "scribble".into(),
+        ..base.clone()
+    };
+    assert!(
+        compile_control_plan(&paths, &spec, &bad, &control_image).is_err(),
+        "an unsupported control kind must be rejected"
+    );
+
+    let t0 = std::time::Instant::now();
+    let model = Flux1DevControl::load_with_memory_spec(&paths, base.memory, &spec)
+        .expect("load Flux1DevControl");
+    println!(
+        "loaded in {:?} — {} residuals, interval {}",
+        t0.elapsed(),
+        model.num_residuals(),
+        model.residual_interval()
+    );
+    assert_eq!(
+        model.num_residuals(),
+        6,
+        "Shakker Union-Pro-2.0 ships 6 control double blocks"
+    );
+    assert_eq!(model.residual_interval(), 4, "ceil(19/6) = 4");
+
     // Steered render (control_scale = 0.7).
     let t = std::time::Instant::now();
     let steered = model
-        .generate(&base, &control_image, &mut noop)
+        .generate_with_injector_planned(&base, &control_image, None, &base_plan, &mut noop)
         .expect("generate (steered)");
     println!("[steer] {:?}", t.elapsed());
     write_ppm(&out_dir.join(format!("flux1_control_{kind}.ppm")), &steered);
     if let Some(adapter) = std::env::var_os("FLUX1_CTRL_LORA") {
         drop(model);
-        let adapted = Flux1DevControl::load(&Flux1ControlPaths {
+        let adapted_paths = Flux1ControlPaths {
             flux_base: env_path("FLUX1_CTRL_BASE"),
             control: env_path("FLUX1_CTRL_OVERLAY"),
             adapters: vec![candle_gen::gen_core::AdapterSpec::new(
@@ -105,10 +130,16 @@ fn real_weight_control() {
                 1.0,
                 candle_gen::gen_core::AdapterKind::Lora,
             )],
-        })
-        .expect("load adapter-conditioned FLUX.1 control");
+        };
+        let adapted_spec = control_load_spec(&adapted_paths);
+        let adapted_plan =
+            compile_control_plan(&adapted_paths, &adapted_spec, &base, &control_image)
+                .expect("compile adapter-conditioned plan");
+        let adapted =
+            Flux1DevControl::load_with_memory_spec(&adapted_paths, base.memory, &adapted_spec)
+                .expect("load adapter-conditioned FLUX.1 control");
         let with_adapter = adapted
-            .generate(&base, &control_image, &mut noop)
+            .generate_with_injector_planned(&base, &control_image, None, &adapted_plan, &mut noop)
             .expect("generate (control + LoRA)");
         assert_eq!(
             (with_adapter.width, with_adapter.height),
@@ -138,7 +169,7 @@ fn real_weight_control() {
     // VAE posterior MEAN (no device RNG), so nothing in the pipeline samples outside the CPU-seeded
     // `StdRng` (the sc-3673 contract). Pre-fix, the sampled control latent made this per-launch at best.
     let again = model
-        .generate(&base, &control_image, &mut noop)
+        .generate_with_injector_planned(&base, &control_image, None, &base_plan, &mut noop)
         .expect("generate (repeat seed 12345)");
     let d_same = max_abs_diff_u8(&steered.pixels, &again.pixels);
     println!("max|Δ| same seed = {d_same} (must be 0)");
@@ -148,27 +179,12 @@ fn real_weight_control() {
     );
 
     // A second seed yields a different (real) render — confirms it is not a constant output.
-    let other = Flux1ControlRequest {
-        seed: 999,
-        ..base.clone()
-    };
     let steered2 = model
-        .generate(&other, &control_image, &mut noop)
+        .generate_with_injector_planned(&other, &control_image, None, &other_plan, &mut noop)
         .expect("generate (seed 999)");
     let d = max_abs_diff_u8(&steered.pixels, &steered2.pixels);
     println!("max|Δ| across seeds = {d} (must be > 0)");
     assert!(d > 0, "two seeds must produce different images");
-
-    // The accepted-kind gate: an unmodelled kind is rejected loudly (input-agnostic union — pose/canny/
-    // depth only).
-    let bad = Flux1ControlRequest {
-        control_kind: "scribble".into(),
-        ..base.clone()
-    };
-    assert!(
-        model.generate(&bad, &control_image, &mut noop).is_err(),
-        "an unsupported control kind must be rejected"
-    );
 
     // Cancel contract: pre-cancel returns Canceled.
     let cancelled = Flux1ControlRequest {
@@ -181,7 +197,13 @@ fn real_weight_control() {
     };
     assert!(
         matches!(
-            model.generate(&cancelled, &control_image, &mut noop),
+            model.generate_with_injector_planned(
+                &cancelled,
+                &control_image,
+                None,
+                &base_plan,
+                &mut noop
+            ),
             Err(candle_gen::CandleError::Canceled)
         ),
         "pre-cancel must return Canceled"
@@ -205,7 +227,13 @@ fn real_weight_control() {
     };
     assert!(
         matches!(
-            model.generate(&mid_req, &control_image, &mut cancel_at_3),
+            model.generate_with_injector_planned(
+                &mid_req,
+                &control_image,
+                None,
+                &base_plan,
+                &mut cancel_at_3
+            ),
             Err(candle_gen::CandleError::Canceled)
         ),
         "mid-cancel must return Canceled"

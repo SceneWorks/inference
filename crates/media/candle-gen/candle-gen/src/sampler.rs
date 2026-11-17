@@ -201,15 +201,56 @@ pub fn run_curated_sampler(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let span = 0..sigmas.len().saturating_sub(1);
+    run_curated_sampler_spans(
+        sampler_name,
+        ms,
+        sigmas,
+        std::slice::from_ref(&span),
+        None,
+        false,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_curated_sampler_spans(
+    sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    // The provider entered phase 0 before preparing its device tensors. The driver still closes it.
+    first_phase_active: bool,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
-    use gen_core::sampling::denoise as gc_denoise;
+    use gen_core::sampling::{denoise as gc_denoise, SolverRunState};
 
     let ops = CandleLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
     let solver = resolved_solver(sampler_name);
     let sampler = solver.boxed::<CandleLatentOps>();
+    let mut state = SolverRunState::new(sampler.solver(), sigmas);
+    if let Some(run) = phase_scope {
+        // A planned render iterates its plan's seeds, not `for_each_image_seed`, so its
+        // per-image initial-noise draw is recorded here, before this output's runtime and
+        // schedule, as `for_each_image_seed` does: output index = seed - plan base seed.
+        let index = seed.wrapping_sub(run.plan().base_seed()) as usize;
+        crate::execution::draw("image_initial_noise", seed, index);
+    }
     crate::execution::runtime(latents.device(), latents.dtype());
     crate::execution::schedule(solver.name(), sigmas, &format!("{:?}", ms.prediction()));
 
@@ -235,9 +276,35 @@ pub fn run_curated_sampler(
         })
     };
 
-    sampler
-        .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
-        .map_err(CandleError::from)
+    let mut out = latents;
+    for (phase, span) in spans.iter().enumerate() {
+        if let Some(run) = phase_scope {
+            if phase != 0 || !first_phase_active {
+                run.begin_denoise_phase(phase).map_err(CandleError::from)?;
+            }
+        }
+        out = sampler
+            .sample_span(
+                &ops,
+                ms,
+                &mut denoise_fn,
+                out,
+                sigmas,
+                seed,
+                span.clone(),
+                &mut state,
+            )
+            .map_err(CandleError::from)?;
+        if let Some(run) = phase_scope {
+            run.end_denoise_phase(phase).map_err(CandleError::from)?;
+        }
+    }
+    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(CandleError::from(gen_core::Error::Unsupported(
+            "sampler spans do not cover the executed schedule".into(),
+        )));
+    }
+    Ok(out)
 }
 
 /// Drive a curated solver over a flow-match (rectified-flow) sigma schedule — the thin
@@ -270,6 +337,39 @@ pub fn run_flow_sampler(
         sampler_name,
         &ms,
         sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler_spans(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    first_phase_active: bool,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    crate::execution::policy("flow_timestep_convention", format!("{conv:?}").into());
+    let ms = gen_core::sampling::FlowModelSampling::new(conv);
+    run_curated_sampler_spans(
+        sampler_name,
+        &ms,
+        sigmas,
+        spans,
+        phase_scope,
+        first_phase_active,
         latents,
         seed,
         cancel,
@@ -765,6 +865,98 @@ mod tests {
     fn t(v: &[f32]) -> Tensor {
         Tensor::from_vec(v.to_vec(), v.len(), &Device::Cpu).unwrap()
     }
+
+    /// The planned (spans) path iterates the plan's seeds rather than `for_each_image_seed`, so it
+    /// must record each image's initial-noise draw itself; without it a planned render's report is
+    /// Unavailable. Tiny CPU latent and a zero-velocity stand-in predictor: no model weights.
+    #[test]
+    fn planned_spans_path_records_each_image_draw() {
+        use gen_core::generator::{ExecutionIdentity, ExecutionRandomness};
+        let descriptor = gen_core::ModelDescriptor {
+            id: "spans_probe",
+            family: "probe",
+            backend: "candle",
+            modality: gen_core::Modality::Image,
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            capabilities: gen_core::Capabilities {
+                max_count: 2,
+                ..Default::default()
+            },
+        };
+        let req = gen_core::GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 2,
+            seed: Some(40),
+            ..Default::default()
+        };
+        let plan = gen_core::RenderPlan::base_image(
+            &descriptor,
+            &req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 0.0,
+                sigmas: vec![1.0, 0.5, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+        let completed = crate::execution::capture_direct(&descriptor, &req.cancel, || {
+            crate::execution::rng_scheme("fixture-metadata-v1");
+            let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+            run.encode(|| Ok::<_, gen_core::Error>(()))?;
+            let images = run.images_with_denoise_phases(
+                &mut |_| {},
+                |_seed| Ok::<_, gen_core::Error>(t(&[0.25, -0.5])),
+                |seed, latent, progress| {
+                    run.begin_denoise_phase(0)?;
+                    run_flow_sampler_spans(
+                        Some("euler"),
+                        TimestepConvention::Sigma,
+                        plan.denoise_sigmas(),
+                        &plan.denoise_spans(),
+                        Some(&run),
+                        true,
+                        latent,
+                        seed,
+                        &req.cancel,
+                        progress,
+                        None,
+                        |x, _| x.zeros_like().map_err(Into::into),
+                    )
+                    .map_err(gen_core::Error::from)
+                },
+                |_, _, _| {
+                    Ok(gen_core::Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    })
+                },
+            )?;
+            Ok(gen_core::GenerationOutput::Images(images))
+        })
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = completed.execution else {
+            panic!("unresolved: {:?}", completed.execution)
+        };
+        let ExecutionRandomness::Draws { draws, .. } = identity.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(
+            draws
+                .iter()
+                .map(|draw| (draw.seed, draw.output_index))
+                .collect::<Vec<_>>(),
+            [(Some(40), 0), (Some(41), 1)]
+        );
+    }
     fn vec1(x: &Tensor) -> Vec<f32> {
         x.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
@@ -868,10 +1060,139 @@ mod tests {
 
     // --- Curated-sampler driver (epic 7114 P4, sc-7123): the per-engine adoption seam ---------------
 
-    use super::{run_curated_sampler, run_flow_sampler};
+    use super::{run_curated_sampler, run_flow_sampler, run_flow_sampler_spans};
     use candle_core::DType;
     use gen_core::sampling::{AlphaSchedule, DiscreteModelSampling, EdmModelSampling, Scheduler};
     use gen_core::{CancelFlag, Progress};
+
+    #[test]
+    fn preopened_first_span_covers_preparation_and_closes_before_next_span() {
+        use gen_core::render::{PackedImagePass, RenderPhaseIdentity};
+        use gen_core::{
+            Capabilities, GenerationRequest, MemoryGeometry, MemoryPhase, MemoryRequestScope,
+            MemoryRunOutcome, Modality, ModelDescriptor, RenderPlan, RenderRun,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Scope(Rc<RefCell<Vec<String>>>);
+        impl MemoryRequestScope for Scope {
+            fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.0.borrow_mut().push(format!("enter {phase:?}"));
+                Ok(())
+            }
+            fn enter_render_phase(
+                &mut self,
+                phase: MemoryPhase,
+                id: &RenderPhaseIdentity,
+            ) -> gen_core::Result<()> {
+                self.0
+                    .borrow_mut()
+                    .push(format!("enter {phase:?} {}", id.phase));
+                Ok(())
+            }
+            fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.0.borrow_mut().push(format!("leave {phase:?}"));
+                Ok(())
+            }
+            fn configure_decode(
+                &mut self,
+                _: u32,
+                _: u32,
+                _: MemoryGeometry,
+            ) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+        }
+
+        let descriptor = ModelDescriptor {
+            id: "phase_scope_fixture",
+            backend: "candle",
+            family: "test",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        let req = GenerationRequest::default();
+        let plan = RenderPlan::base_image(
+            &descriptor,
+            &req,
+            PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 3.5,
+                sigmas: vec![1.0, 0.5, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap()
+        .with_inert_split_at(1)
+        .unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut scope = Scope(Rc::clone(&events));
+        let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+        run.images_with_denoise_phases(
+            &mut |_| {},
+            |_| Ok::<_, CandleError>(t(&[0.2, -0.5])),
+            |seed, latents, progress| {
+                run.begin_denoise_phase(0).map_err(CandleError::from)?;
+                events.borrow_mut().push("prepare".into());
+                run_flow_sampler_spans(
+                    Some("euler"),
+                    TimestepConvention::Sigma,
+                    plan.denoise_sigmas(),
+                    &plan.denoise_spans(),
+                    Some(&run),
+                    true,
+                    latents,
+                    seed,
+                    &req.cancel,
+                    progress,
+                    None,
+                    |x, _| {
+                        events.borrow_mut().push("predict".into());
+                        Ok(x.affine(0.25, 0.1)?)
+                    },
+                )
+            },
+            |_, latents, _| Ok::<_, CandleError>(latents),
+        )
+        .unwrap();
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "enter Conditioning 0",
+                "leave Conditioning",
+                "enter Denoise 0",
+                "prepare",
+                "predict",
+                "leave Denoise",
+                "enter Denoise 1",
+                "predict",
+                "leave Denoise",
+                "enter Decode 0",
+                "leave Decode",
+            ]
+        );
+    }
 
     /// N1 keystone: `run_flow_sampler` with the default `euler` over a FLOW schedule reproduces the
     /// legacy inline flow-match loop `img += v·(σ_{i+1} − σ_i)` within tolerance (the `to_d` round-trip
@@ -910,6 +1231,73 @@ mod tests {
             max_abs_diff_slices(&vec1(&out), &vec1(&legacy)) < 1e-4,
             "driver euler diverged from inline flow loop"
         );
+    }
+
+    #[test]
+    fn flow_driver_inert_spans_preserve_every_solver_output_and_progress() {
+        let sigmas = [0.96, 0.77, 0.59, 0.34, 0.17, 0.0];
+        let initial = t(&[0.2, -0.5, 1.0, 0.3]);
+        for solver in gen_core::sampling::Solver::ALL {
+            let cancel = CancelFlag::new();
+            let mut reference_progress = Vec::new();
+            let mut reference_predict = Vec::new();
+            let reference = run_flow_sampler(
+                Some(solver.name()),
+                TimestepConvention::Sigma,
+                &sigmas,
+                initial.clone(),
+                104729,
+                &cancel,
+                &mut |event| {
+                    if let Progress::Step { current, total } = event {
+                        reference_progress.push((current, total));
+                    }
+                },
+                None,
+                |x, timestep| {
+                    reference_predict.push((timestep.to_bits(), vec1(x)));
+                    Ok(x.affine(0.25, 0.1)?)
+                },
+            )
+            .unwrap();
+            let mut split_progress = Vec::new();
+            let mut split_predict = Vec::new();
+            let split = run_flow_sampler_spans(
+                Some(solver.name()),
+                TimestepConvention::Sigma,
+                &sigmas,
+                &[0..2, 2..4, 4..5],
+                None,
+                false,
+                initial.clone(),
+                104729,
+                &cancel,
+                &mut |event| {
+                    if let Progress::Step { current, total } = event {
+                        split_progress.push((current, total));
+                    }
+                },
+                None,
+                |x, timestep| {
+                    split_predict.push((timestep.to_bits(), vec1(x)));
+                    Ok(x.affine(0.25, 0.1)?)
+                },
+            )
+            .unwrap();
+            assert_eq!(vec1(&split), vec1(&reference), "{} output", solver.name());
+            assert_eq!(
+                split_progress,
+                reference_progress,
+                "{} progress",
+                solver.name()
+            );
+            assert_eq!(
+                split_predict,
+                reference_predict,
+                "{} callbacks",
+                solver.name()
+            );
+        }
     }
 
     /// Keystone: `run_curated_sampler` over a `DiscreteModelSampling` (ε prediction) with `euler`

@@ -1,0 +1,30 @@
+{
+  "runner": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "rw-llm"
+  ],
+  "asset_setup": "none",
+  "backend": "mlx",
+  "request": {
+    "runner": "nax",
+    "selection": "mlx-gen-flux/mlx_gen_flux/transformer::tests::scale_zero_noop_mixed_stack_and_strict",
+    "policy": {
+      "schemaVersion": 1,
+      "deadlineSeconds": 1200,
+      "pollMillis": 1000,
+      "termGraceMillis": 5000,
+      "hostFreeReserveBytes": 8589934592,
+      "childFootprintCapBytes": 25769803776,
+      "stdoutCapBytes": 16777216,
+      "stderrCapBytes": 16777216,
+      "eventCapBytes": 16777216,
+      "backend": "darwin-mlx"
+    }
+  },
+  "selected": 1,
+  "bindings": [
+    "mlx-gen-flux/mlx_gen_flux/transformer::tests::scale_zero_noop_mixed_stack_and_strict"
+  ]
+}

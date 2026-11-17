@@ -202,6 +202,15 @@ pub trait MemoryRequestScope {
         ))
     }
     fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()>;
+    /// Enter a runner stage at its actual packed-stream geometry under this scope's
+    /// admitted selection. Legacy callers and providers retain the plain phase hook.
+    fn enter_render_phase(
+        &mut self,
+        phase: MemoryPhase,
+        _identity: &crate::render::RenderPhaseIdentity,
+    ) -> Result<()> {
+        self.enter_phase(phase)
+    }
     fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn configure_decode(
         &mut self,

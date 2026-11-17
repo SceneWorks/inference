@@ -21,6 +21,10 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: pulid_flux::MODEL_ID,
+            compile: pulid_flux::compile_plan,
+        })
         .register_generator(pulid_flux::REGISTRATION)
         .register_memory_strategy(pulid_flux::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {

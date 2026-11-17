@@ -8,6 +8,7 @@ use super::*;
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     pub(super) generators: Vec<ModelRegistration>,
+    pub(super) render_plans: Vec<crate::RenderPlanRegistration>,
     pub(super) checkpoint_adapters: Vec<CheckpointAdapterRegistration>,
     pub(super) checkpoint_codecs: Vec<CheckpointCodecRegistration>,
     pub(super) encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
@@ -479,6 +480,11 @@ impl ProviderRegistryBuilder {
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
     builder_registration_method!(
+        register_render_plan,
+        render_plans,
+        crate::RenderPlanRegistration
+    );
+    builder_registration_method!(
         register_checkpoint_adapter,
         checkpoint_adapters,
         CheckpointAdapterRegistration
@@ -612,6 +618,20 @@ impl ProviderRegistryBuilder {
             }};
         }
         ensure_unique!(generators, "generator");
+        let mut plan_ids = std::collections::BTreeSet::new();
+        for planner in &self.render_plans {
+            if !plan_ids.insert(planner.provider_id)
+                || !self
+                    .generators
+                    .iter()
+                    .any(|provider| (provider.descriptor)().id == planner.provider_id)
+            {
+                return Err(Error::Msg(format!(
+                    "duplicate or unbound render-plan registration for {}",
+                    planner.provider_id
+                )));
+            }
+        }
         {
             let mut route_ids = std::collections::BTreeSet::new();
             for registration in &self.encoder_contract_routes {
@@ -834,6 +854,7 @@ impl ProviderRegistryBuilder {
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
+            render_plans: self.render_plans.into_boxed_slice(),
             checkpoint_adapters: self.checkpoint_adapters.into_boxed_slice(),
             checkpoint_codecs,
             imported_models: imported_models.into_boxed_slice(),

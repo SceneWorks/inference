@@ -3143,6 +3143,20 @@ impl<'a> TextPipeline<'a> {
     }
 }
 
+/// The numeric policy a completed report binds: the resident projection format the loaded
+/// decoder holds and the device. Recorded for every load — a dense load (`requested = None`)
+/// observes its resident format too; `requested_quantization` is then `null`.
+fn numeric_policy(
+    requested: Option<Quantize>,
+    resident_projection_quantized: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "requested_quantization": requested.map(|requested| format!("{requested:?}")),
+        "resident_projection_quantized": resident_projection_quantized,
+        "device": "metal",
+    })
+}
+
 impl TextLlm for LlamaProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
@@ -3181,13 +3195,10 @@ impl TextLlm for LlamaProvider {
         events: &mut dyn FnMut(core_llm::StreamEvent),
     ) -> core_llm::Result<core_llm::CompletedTextLlm> {
         let scope = core_llm::token_execution::TokenExecutionScope::new();
-        if let Some(requested) = self.load_report.requested {
-            scope.observe_numeric_policy(serde_json::json!({
-                "requested_quantization": format!("{requested:?}"),
-                "resident_projection_quantized": self.is_quantized(),
-                "device": "metal",
-            }));
-        }
+        scope.observe_numeric_policy(numeric_policy(
+            self.load_report.requested,
+            self.is_quantized(),
+        ));
         let output = self.generate(request, &mut |event| {
             core_llm::token_execution::without_observations(|| events(event))
         })?;
@@ -6130,3 +6141,22 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod numeric_policy_tests {
+    use super::*;
+
+    /// A dense load (no requested quantization) still binds its resident format and device; the
+    /// quantized policy value is unchanged from the requested-only form.
+    #[test]
+    fn dense_and_quantized_loads_both_observe_resident_numeric_policy() {
+        let dense = numeric_policy(None, false);
+        assert_eq!(dense["requested_quantization"], serde_json::Value::Null);
+        assert_eq!(dense["resident_projection_quantized"], false);
+        assert_eq!(dense["device"], "metal");
+        let quantized = numeric_policy(Some(Quantize::Q4), true);
+        assert_eq!(quantized["requested_quantization"], "Q4");
+        assert_eq!(quantized["resident_projection_quantized"], true);
+        assert_ne!(dense, quantized);
+    }
+}

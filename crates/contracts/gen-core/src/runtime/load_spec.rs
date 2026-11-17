@@ -175,7 +175,7 @@ pub struct LoadSpec {
 /// *latent space*, not a model, so a provider in an eligible space points at the converted
 /// per-latent-space checkpoint plus the shared Gemma-2-2b caption encoder. Backend-neutral (just
 /// paths); the tensor load lives in `mlx-gen-pid`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PidWeights {
     /// The converted PiD student checkpoint — a single `.safetensors`
     /// ([`WeightsSource::File`]; `tools/convert_pid.py` output for this latent space).

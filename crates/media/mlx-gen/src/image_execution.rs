@@ -180,6 +180,24 @@ pub fn complete_image_report_attempt(
     CompletedGeneration::new(generation, execution, descriptor)
 }
 
+/// The admitted-runner entry: one attempt around a provider's planned body, so observations
+/// made inside the scope's Conditioning/Denoise/Decode phases bind to this output. Load-time
+/// selections are observed first; the consumer's progress callback stays outside the attempt.
+pub fn complete_planned_image_report<G: crate::gen_core::Generator + ?Sized>(
+    generator: &G,
+    request: &crate::gen_core::GenerationRequest,
+    plan: &crate::gen_core::RenderPlan,
+    scope: Option<&mut dyn crate::gen_core::MemoryRequestScope>,
+    on_progress: &mut dyn FnMut(crate::gen_core::Progress),
+    loaded_policy: impl FnOnce(),
+) -> crate::gen_core::Result<CompletedGeneration> {
+    complete_image_report_attempt(generator.descriptor(), &request.cancel, || {
+        loaded_policy();
+        let mut progress = |event| without_capture(|| on_progress(event));
+        generator.generate_planned(request, plan, scope, &mut progress)
+    })
+}
+
 fn selected_stream_device() -> Option<&'static str> {
     match mlx_rs::Stream::task_local_or_default()
         .get_device()
@@ -563,6 +581,130 @@ mod tests {
         policy("decode", json!("untiled"));
         sampled_native("euler", "Sigma", mlx_rs::Dtype::Float32, &[1.0, 0.0], seed);
     }
+    struct Planned;
+    impl crate::gen_core::Generator for Planned {
+        fn descriptor(&self) -> &ModelDescriptor {
+            static DESCRIPTOR: std::sync::LazyLock<ModelDescriptor> =
+                std::sync::LazyLock::new(descriptor);
+            &DESCRIPTOR
+        }
+        fn validate(&self, _: &crate::gen_core::GenerationRequest) -> crate::gen_core::Result<()> {
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _: &crate::gen_core::GenerationRequest,
+            _: &mut dyn FnMut(crate::gen_core::Progress),
+        ) -> crate::gen_core::Result<GenerationOutput> {
+            unreachable!("the planned entry owns execution")
+        }
+        fn generate_planned(
+            &self,
+            request: &crate::gen_core::GenerationRequest,
+            plan: &crate::gen_core::RenderPlan,
+            scope: Option<&mut dyn crate::gen_core::MemoryRequestScope>,
+            progress: &mut dyn FnMut(crate::gen_core::Progress),
+        ) -> crate::gen_core::Result<crate::gen_core::GenerationReport> {
+            // Metadata only: observations made inside each admitted phase.
+            let run = crate::gen_core::RenderRun::new(plan, &request.cancel, scope);
+            run.encode(|| {
+                policy("probe.conditioning", json!("inside"));
+                Ok::<_, crate::gen_core::Error>(())
+            })?;
+            let mut images = run.images(
+                progress,
+                |_| Ok::<_, crate::gen_core::Error>(()),
+                |seed, (), progress| {
+                    observe(seed);
+                    progress(crate::gen_core::Progress::Step {
+                        current: 1,
+                        total: 1,
+                    });
+                    Ok(())
+                },
+                |_, (), _| {
+                    policy("probe.decode", json!("inside"));
+                    Ok(output())
+                },
+            )?;
+            Ok(crate::gen_core::GenerationReport::from_output(
+                images.remove(0),
+            ))
+        }
+        fn generate_planned_with_execution_report(
+            &self,
+            request: &crate::gen_core::GenerationRequest,
+            plan: &crate::gen_core::RenderPlan,
+            scope: Option<&mut dyn crate::gen_core::MemoryRequestScope>,
+            progress: &mut dyn FnMut(crate::gen_core::Progress),
+        ) -> crate::gen_core::Result<CompletedGeneration> {
+            complete_planned_image_report(self, request, plan, scope, progress, || {
+                policy("probe.loaded", json!("at_load"));
+            })
+        }
+    }
+
+    fn planned_request() -> (
+        crate::gen_core::GenerationRequest,
+        crate::gen_core::RenderPlan,
+    ) {
+        let request = crate::gen_core::GenerationRequest {
+            width: 512,
+            height: 512,
+            seed: Some(9),
+            ..Default::default()
+        };
+        let plan = crate::gen_core::RenderPlan::base_image(
+            &descriptor(),
+            &request,
+            crate::gen_core::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 0.0,
+                sigmas: vec![1.0, 0.0],
+                executed_steps: 1,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+        (request, plan)
+    }
+
+    #[test]
+    fn admitted_planned_entry_reports_the_whole_attempt() {
+        use crate::gen_core::Generator;
+        let (request, plan) = planned_request();
+        let completed = Planned
+            .generate_planned_with_execution_report(&request, &plan, None, &mut |_| {
+                policy("consumer.callback", json!("outside"));
+                observe(77);
+            })
+            .unwrap();
+        let report = completed.execution.resolved().unwrap();
+        let ExecutionFact::Resolved { value } = &report.quality_policy else {
+            panic!("quality policy")
+        };
+        for inside in ["probe.loaded", "probe.conditioning", "probe.decode"] {
+            assert!(value.get(inside).is_some(), "{inside}: {value}");
+        }
+        assert!(value.get("consumer.callback").is_none(), "{value}");
+        let ExecutionRandomness::Draws { draws, .. } = &report.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(9));
+
+        let (request, plan) = planned_request();
+        let signal = request.cancel.clone();
+        assert!(matches!(
+            Planned.generate_planned_with_execution_report(&request, &plan, None, &mut |_| {
+                signal.cancel()
+            }),
+            Err(crate::gen_core::Error::Canceled)
+        ));
+    }
+
     #[test]
     fn completed_attempt_owns_actual_seeds_and_schedule() {
         let completed = complete_image_attempt(&descriptor(), &CancelFlag::new(), || {

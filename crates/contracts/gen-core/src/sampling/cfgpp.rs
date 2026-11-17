@@ -21,9 +21,10 @@
 //! paper-validated CFG++ form and are gated off ([`base_supports_cfgpp`]).
 
 use super::solvers::{SolverEvaluation, SolverObservation};
-use super::unified::{is_terminal, to_d};
+use super::unified::{is_terminal, to_d, SolverRunState};
 use super::{LatentOps, Solver};
 use crate::Result;
+use std::ops::Range;
 
 /// A `denoise(x, σ) -> (guided_x0, uncond_x0)` callback the CFG++ samplers drive. Unlike the standard
 /// [`super::DenoiseFn`] (one `x0`), it surfaces the unconditional estimate the engine would otherwise
@@ -39,6 +40,8 @@ pub type CfgPpDenoiseFn<'a, L> = dyn FnMut(
 /// dependency), so the signature drops `seed`/`ms`; a future ancestral CFG++ variant would reintroduce
 /// them on its own trait or via an extension.
 pub trait CfgPpSampler<L: LatentOps> {
+    fn base_solver(&self) -> Solver;
+
     /// Integrate `x` from `sigmas[0]` down to `sigmas[last]` (trailing `0.0`), renoising each step
     /// from the unconditional estimate while landing on the guided one.
     fn sample(
@@ -47,6 +50,26 @@ pub trait CfgPpSampler<L: LatentOps> {
         denoise: &mut CfgPpDenoiseFn<'_, L>,
         x: L::Latent,
         sigmas: &[f32],
+    ) -> Result<L::Latent> {
+        let mut state = SolverRunState::new_cfg_pp(self.base_solver(), sigmas);
+        self.sample_span(
+            ops,
+            denoise,
+            x,
+            sigmas,
+            0..sigmas.len().saturating_sub(1),
+            &mut state,
+        )
+    }
+
+    fn sample_span(
+        &self,
+        ops: &L,
+        denoise: &mut CfgPpDenoiseFn<'_, L>,
+        x: L::Latent,
+        sigmas: &[f32],
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent>;
 }
 
@@ -73,14 +96,21 @@ fn lambda(sigma: f32) -> f64 {
 pub struct EulerCfgPp;
 
 impl<L: LatentOps> CfgPpSampler<L> for EulerCfgPp {
-    fn sample(
+    fn base_solver(&self) -> Solver {
+        Solver::Euler
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         denoise: &mut CfgPpDenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_cfg_pp_span(Solver::Euler, sigmas, &span)?;
+        for i in span.clone() {
             let sigma = sigmas[i];
             ops.observe_solver(
                 SolverObservation::callback(
@@ -118,6 +148,7 @@ impl<L: LatentOps> CfgPpSampler<L> for EulerCfgPp {
                     .cfg_pp(),
             );
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -139,15 +170,22 @@ impl<L: LatentOps> CfgPpSampler<L> for EulerCfgPp {
 pub struct Dpmpp2mCfgPp;
 
 impl<L: LatentOps> CfgPpSampler<L> for Dpmpp2mCfgPp {
-    fn sample(
+    fn base_solver(&self) -> Solver {
+        Solver::Dpmpp2m
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         denoise: &mut CfgPpDenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        let mut old_uncond: Option<L::Latent> = None;
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_cfg_pp_span(Solver::Dpmpp2m, sigmas, &span)?;
+        let mut old_uncond = state.previous_denoised.take();
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(
@@ -214,6 +252,8 @@ impl<L: LatentOps> CfgPpSampler<L> for Dpmpp2mCfgPp {
                     .cfg_pp(),
             );
         }
+        state.previous_denoised = old_uncond;
+        state.next_step = span.end;
         Ok(x)
     }
 }

@@ -10,9 +10,10 @@
 //! where each reduces to plain Euler at first order, so a constant-velocity field integrates EXACTLY
 //! (the per-solver coherence test).
 
-use super::unified::{is_terminal, to_d, DenoiseFn, Euler, Sampler};
+use super::unified::{is_terminal, to_d, DenoiseFn, Euler, Sampler, SolverRunState};
 use super::LatentOps;
 use crate::Result;
+use std::ops::Range;
 
 // =================================================================================================
 // Scalar helpers (host f64) — the VE-sigma `λ = −ln σ` time and the ancestral noise split.
@@ -62,7 +63,11 @@ impl Default for EulerAncestral {
 }
 
 impl<L: LatentOps> Sampler<L> for EulerAncestral {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::EulerAncestral
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -70,8 +75,18 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
         mut x: L::Latent,
         sigmas: &[f32],
         seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(
+            Solver::EulerAncestral,
+            _ms,
+            sigmas,
+            seed,
+            [self.eta.to_bits(), 0, 0],
+            &span,
+        )?;
+        for i in span.clone() {
             let sigma = sigmas[i];
             ops.observe_solver(SolverObservation::callback(
                 Solver::EulerAncestral,
@@ -112,6 +127,7 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
                 su > 0.0,
             ));
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -126,7 +142,11 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
 pub struct Heun;
 
 impl<L: LatentOps> Sampler<L> for Heun {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::Heun
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -134,8 +154,11 @@ impl<L: LatentOps> Sampler<L> for Heun {
         mut x: L::Latent,
         sigmas: &[f32],
         _seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(Solver::Heun, _ms, sigmas, _seed, [0; 3], &span)?;
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(SolverObservation::callback(
@@ -192,6 +215,7 @@ impl<L: LatentOps> Sampler<L> for Heun {
                 false,
             ));
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -207,7 +231,11 @@ impl<L: LatentOps> Sampler<L> for Heun {
 pub struct Dpmpp2m;
 
 impl<L: LatentOps> Sampler<L> for Dpmpp2m {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::Dpmpp2m
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -215,9 +243,12 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
         mut x: L::Latent,
         sigmas: &[f32],
         _seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        let mut old_x0: Option<L::Latent> = None;
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(Solver::Dpmpp2m, _ms, sigmas, _seed, [0; 3], &span)?;
+        let mut old_x0 = state.previous_denoised.take();
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(
@@ -291,6 +322,8 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
                     .history(old_x0.as_ref(), None, None),
             );
         }
+        state.previous_denoised = old_x0;
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -314,7 +347,11 @@ impl Default for DpmppSde {
 }
 
 impl<L: LatentOps> Sampler<L> for DpmppSde {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::DpmppSde
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -322,9 +359,19 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
         mut x: L::Latent,
         sigmas: &[f32],
         seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
+        state.check_span(
+            Solver::DpmppSde,
+            _ms,
+            sigmas,
+            seed,
+            [self.eta.to_bits(), 0, 0],
+            &span,
+        )?;
         const R: f64 = 0.5;
-        for i in 0..sigmas.len().saturating_sub(1) {
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(SolverObservation::callback(
@@ -413,6 +460,7 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
                 su1 > 0.0 || su2 > 0.0,
             ));
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -429,7 +477,11 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
 pub struct UniPc;
 
 impl<L: LatentOps> Sampler<L> for UniPc {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::UniPc
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -437,10 +489,13 @@ impl<L: LatentOps> Sampler<L> for UniPc {
         mut x: L::Latent,
         sigmas: &[f32],
         _seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        let mut prev_x0: Option<L::Latent> = None; // x0_{i-1}
-        let mut last_sample: Option<L::Latent> = None; // corrected x_{i-1}
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(Solver::UniPc, _ms, sigmas, _seed, [0; 3], &span)?;
+        let mut prev_x0 = state.previous_denoised.take(); // x0_{i-1}
+        let mut last_sample = state.previous_sample.take(); // corrected x_{i-1}
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(
@@ -501,6 +556,9 @@ impl<L: LatentOps> Sampler<L> for UniPc {
                     .history(prev_x0.as_ref(), None, last_sample.as_ref()),
             );
         }
+        state.previous_denoised = prev_x0;
+        state.previous_sample = last_sample;
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -517,7 +575,11 @@ impl<L: LatentOps> Sampler<L> for UniPc {
 pub struct Lcm;
 
 impl<L: LatentOps> Sampler<L> for Lcm {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::Lcm
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         ms: &dyn super::ModelSampling,
@@ -525,8 +587,11 @@ impl<L: LatentOps> Sampler<L> for Lcm {
         mut x: L::Latent,
         sigmas: &[f32],
         seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(Solver::Lcm, ms, sigmas, seed, [0; 3], &span)?;
+        for i in span.clone() {
             ops.observe_solver(SolverObservation::callback(
                 Solver::Lcm,
                 i,
@@ -557,6 +622,7 @@ impl<L: LatentOps> Sampler<L> for Lcm {
                 s_next > 0.0,
             ));
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -571,7 +637,11 @@ impl<L: LatentOps> Sampler<L> for Lcm {
 pub struct Ddim;
 
 impl<L: LatentOps> Sampler<L> for Ddim {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::Ddim
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -579,8 +649,11 @@ impl<L: LatentOps> Sampler<L> for Ddim {
         mut x: L::Latent,
         sigmas: &[f32],
         _seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(Solver::Ddim, _ms, sigmas, _seed, [0; 3], &span)?;
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(SolverObservation::callback(
@@ -617,6 +690,7 @@ impl<L: LatentOps> Sampler<L> for Ddim {
                 false,
             ));
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -658,7 +732,11 @@ impl Default for ErSde {
 }
 
 impl<L: LatentOps> Sampler<L> for ErSde {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::ErSde
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -666,15 +744,27 @@ impl<L: LatentOps> Sampler<L> for ErSde {
         mut x: L::Latent,
         sigmas: &[f32],
         seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
+        state.check_span(
+            Solver::ErSde,
+            _ms,
+            sigmas,
+            seed,
+            [self.s_noise.to_bits(), u32::from(self.max_stage), 0],
+            &span,
+        )?;
         const NUM_INTEGRATION_POINTS: usize = 200;
         let max_stage = self.max_stage.max(1) as usize;
-        let mut old_denoised: Option<L::Latent> = None;
-        let mut old_denoised_d: Option<L::Latent> = None;
-        for i in 0..sigmas.len().saturating_sub(1) {
+        let mut old_denoised = state.previous_denoised.take();
+        let mut old_denoised_d = state.previous_derivative.take();
+        let mut history_steps = state.history_steps;
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
-            let stage_used = max_stage.min(i + 1);
+            let stage_used = max_stage.min(history_steps + 1);
+            history_steps += 1;
             ops.observe_solver(
                 SolverObservation::callback(
                     Solver::ErSde,
@@ -796,6 +886,10 @@ impl<L: LatentOps> Sampler<L> for ErSde {
                     .stage(stage_used as u8),
             );
         }
+        state.previous_denoised = old_denoised;
+        state.previous_derivative = old_denoised_d;
+        state.history_steps = history_steps;
+        state.next_step = span.end;
         Ok(x)
     }
 }
@@ -828,7 +922,11 @@ impl Default for Dpmpp2mSde {
 }
 
 impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
-    fn sample(
+    fn solver(&self) -> Solver {
+        Solver::Dpmpp2mSde
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -836,11 +934,21 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
         mut x: L::Latent,
         sigmas: &[f32],
         seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
+        state.check_span(
+            Solver::Dpmpp2mSde,
+            _ms,
+            sigmas,
+            seed,
+            [self.eta.to_bits(), self.s_noise.to_bits(), 0],
+            &span,
+        )?;
         let eta = self.eta as f64;
-        let mut old_denoised: Option<L::Latent> = None;
-        let mut h_last: Option<f64> = None;
-        for i in 0..sigmas.len().saturating_sub(1) {
+        let mut old_denoised = state.previous_denoised.take();
+        let mut h_last = state.previous_interval.take();
+        for i in span.clone() {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             ops.observe_solver(
@@ -932,6 +1040,9 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
                 .scalar_history(h_last.is_some()),
             );
         }
+        state.previous_denoised = old_denoised;
+        state.previous_interval = h_last;
+        state.next_step = span.end;
         Ok(x)
     }
 }

@@ -117,6 +117,25 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             ));
         }
     }
+    if let crate::SizeFloor::RangeCheckedOnGridArea {
+        multiple,
+        max_cells,
+    } = caps.size_floor
+    {
+        if max_cells == 0 {
+            errs.push(format!(
+                "{ctx}: explicit grid area cap is 0 — no size can pass"
+            ));
+        } else if multiple != 0 {
+            let min_grid = u64::from(caps.min_size.div_ceil(multiple));
+            if min_grid * min_grid > u64::from(max_cells) {
+                errs.push(format!(
+                    "{ctx}: explicit grid area cap {max_cells} cannot admit min_size {}",
+                    caps.min_size
+                ));
+            }
+        }
+    }
     // The advertised step surface must be satisfiable (sc-19559). Each of these declares a
     // constraint that refuses EVERY step count, which the shared floor would then enforce on every
     // request — the descriptor mistake is silent otherwise, because `Unconstrained` (the common

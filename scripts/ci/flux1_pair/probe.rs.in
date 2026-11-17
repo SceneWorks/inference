@@ -1,0 +1,37 @@
+// Copied only into the two isolated manual proof checkouts.
+use @ENGINE@::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
+use std::{env, fs, path::PathBuf};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = env::var("PAIR_MODEL")?;
+    let root = PathBuf::from(env::var_os("PAIR_SNAPSHOT").ok_or("snapshot")?);
+    let dir = PathBuf::from(env::var_os("PAIR_OUT").ok_or("output")?);
+    let spec = LoadSpec::new(WeightsSource::Dir(root));
+    @TIER_SPEC@
+    let registry = @PROVIDER@::provider_registry()?;
+    let request = GenerationRequest {
+        prompt: "red kite".to_owned(),
+        width: 256,
+        height: 256,
+        count: 1,
+        seed: Some(104729),
+        steps: Some(3),
+        guidance: (model == "flux1_dev").then_some(3.5),
+        sampler: Some("euler".into()),
+        ..Default::default()
+    };
+    let mut steps = Vec::new();
+    let mut progress = |event| { if let Progress::Step { current, total } = event {
+        steps.push([current, total]);
+    }};
+    @GENERATE@
+    let GenerationOutput::Images(images) = output else { return Err("expected images".into()); };
+    if images.len() != 1 || (images[0].width, images[0].height) != (256, 256) {
+        return Err("wrong render count or geometry".into());
+    }
+    fs::write(dir.join("output.rgb"), &images[0].pixels)?;
+    fs::write(dir.join("progress.json"), serde_json::to_vec(&steps)?)?;
+    @CUDA_PROOF@
+    println!("FLUX1_PAIR_COMPLETE {model}");
+    Ok(())
+}

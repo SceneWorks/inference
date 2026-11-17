@@ -4,7 +4,7 @@ use super::*;
 
 /// A single adapter to stack at load time. Multiples + mixed LoRA/LoKr are supported by
 /// construction — see the provider `adapters` modules. Carried by [`LoadSpec::adapters`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct AdapterSpec {
     pub path: PathBuf,
     pub scale: f32,
@@ -71,7 +71,7 @@ impl AdapterSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum AdapterKind {
     Lora,
     Lokr,
@@ -81,7 +81,7 @@ pub enum AdapterKind {
 /// merges onto. The A14B splits denoising at a noise `boundary` between a **high**-noise expert
 /// (early, noisy steps) and a **low**-noise expert (late steps); a trained Wan MoE LoRA ships as a
 /// high/low pair (e.g. `*_wan22_high` + `*_wan22_low`). See [`AdapterSpec::moe_expert`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum MoeExpert {
     High,
     Low,

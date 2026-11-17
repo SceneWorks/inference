@@ -14,6 +14,10 @@ pub struct MlxResidencyRuntime;
 impl gen_core::ResidencyRuntime for MlxResidencyRuntime {
     type Error = Error;
 
+    fn is_process_poisoned(error: &Self::Error) -> bool {
+        matches!(error, Error::ProcessPoisoned(_))
+    }
+
     fn after_component_drop() {
         drain_allocator_cache();
     }

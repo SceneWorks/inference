@@ -163,9 +163,9 @@ pub mod sampler;
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, menu_with_aliases, resolve_flow_schedule,
     resolve_flow_schedule_with_shift, resolve_schedule, run_av_curated_sampler,
-    run_curated_sampler, run_flow_sampler, run_scm_sampler, run_scm_sampler_from, AvLatents,
-    CandleAvLatentOps, CandleLatentOps, ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP,
-    SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
+    run_curated_sampler, run_flow_sampler, run_flow_sampler_spans, run_scm_sampler,
+    run_scm_sampler_from, AvLatents, CandleAvLatentOps, CandleLatentOps, ScmScheduler,
+    SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
 };
 
 // Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,
@@ -296,6 +296,10 @@ pub enum CandleError {
     #[error("cancelled")]
     Canceled,
 
+    /// Explicit process-local backend poison. Ordinary Candle failures remain backend errors.
+    #[error("process poisoned: {0}")]
+    ProcessPoisoned(String),
+
     /// A measured pre-render refusal. Keep every decision-surface field typed across the Candle seam
     /// so worker/API telemetry can distinguish it from an opaque backend failure.
     #[error(
@@ -319,6 +323,7 @@ impl From<CandleError> for gen_core::Error {
             CandleError::Unsupported(s) => gen_core::Error::Unsupported(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
+            CandleError::ProcessPoisoned(s) => gen_core::Error::ProcessPoisoned(s),
             CandleError::GeometryRefused {
                 reason,
                 requested_width,
@@ -345,6 +350,7 @@ impl From<gen_core::Error> for CandleError {
     fn from(e: gen_core::Error) -> Self {
         match e {
             gen_core::Error::Canceled => CandleError::Canceled,
+            gen_core::Error::ProcessPoisoned(s) => CandleError::ProcessPoisoned(s),
             gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
             gen_core::Error::Unsupported(s) => CandleError::Unsupported(s),
             gen_core::Error::GeometryRefused {
@@ -418,6 +424,21 @@ pub fn default_dtype() -> candle_core::DType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_poisoned_round_trips_without_classifying_backend_strings() {
+        let neutral: gen_core::Error =
+            CandleError::ProcessPoisoned("device context lost".into()).into();
+        assert!(
+            matches!(neutral, gen_core::Error::ProcessPoisoned(ref s) if s == "device context lost")
+        );
+        let candle: CandleError = neutral.into();
+        assert!(
+            matches!(candle, CandleError::ProcessPoisoned(ref s) if s == "device context lost")
+        );
+        let ordinary: gen_core::Error = CandleError::Msg("process poisoned: fake".into()).into();
+        assert!(matches!(ordinary, gen_core::Error::Msg(_)));
+    }
 
     #[test]
     fn default_device_constructs() {

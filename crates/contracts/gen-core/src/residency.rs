@@ -19,6 +19,13 @@ pub trait ResidencyRuntime {
     type Error: From<Error>;
 
     fn after_component_drop();
+
+    /// True only for an explicit process-fatal provider error. The driver suppresses its own
+    /// component destructors and backend cleanup before the worker abandons the owner. Providers
+    /// remain responsible for GPU-backed locals that unwind before returning this error.
+    fn is_process_poisoned(_error: &Self::Error) -> bool {
+        false
+    }
 }
 
 type RuntimeResult<R, T> = std::result::Result<T, <R as ResidencyRuntime>::Error>;
@@ -361,7 +368,9 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             match load_warm(streamable) {
                 Ok(pair) => pair,
                 Err(error) => {
-                    R::after_component_drop();
+                    if !R::is_process_poisoned(&error) {
+                        R::after_component_drop();
+                    }
                     return Err(error);
                 }
             }
@@ -369,7 +378,9 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             let text = match (self.loaders.load_text)(streamable, None) {
                 Ok(text) => text,
                 Err(error) => {
-                    R::after_component_drop();
+                    if !R::is_process_poisoned(&error) {
+                        R::after_component_drop();
+                    }
                     return Err(error);
                 }
             };
@@ -378,8 +389,12 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             let heavy = match (self.loaders.load_heavy)(true, streamable, None) {
                 Ok(heavy) => heavy,
                 Err(error) => {
-                    drop(text);
-                    R::after_component_drop();
+                    if R::is_process_poisoned(&error) {
+                        std::mem::forget(text);
+                    } else {
+                        drop(text);
+                        R::after_component_drop();
+                    }
                     return Err(error);
                 }
             };
@@ -494,7 +509,13 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 match crate::with_prompt_encoding(on_progress, || encode(&pair.text, prepared)) {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        let _ = materialize_before_text_drop(None);
+                        if !R::is_process_poisoned(&error) {
+                            if let Err(cleanup) = materialize_before_text_drop(None) {
+                                if R::is_process_poisoned(&cleanup) {
+                                    return Err(cleanup);
+                                }
+                            }
+                        }
                         return Err(error);
                     }
                 };
@@ -674,7 +695,13 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 match crate::with_prompt_encoding(on_progress, || encode(&pair.text, prepared)) {
                     Ok(encoded) => encoded,
                     Err(primary) => {
-                        let _ = materialize_encoded(None);
+                        if !R::is_process_poisoned(&primary) {
+                            if let Err(cleanup) = materialize_encoded(None) {
+                                if R::is_process_poisoned(&cleanup) {
+                                    return Err(cleanup);
+                                }
+                            }
+                        }
                         return Err(primary);
                     }
                 };
@@ -685,7 +712,13 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             let mid = match denoise(&pair.heavy, encoded, on_progress) {
                 Ok(mid) => mid,
                 Err(primary) => {
-                    let _ = materialize_mid(None);
+                    if !R::is_process_poisoned(&primary) {
+                        if let Err(cleanup) = materialize_mid(None) {
+                            if R::is_process_poisoned(&cleanup) {
+                                return Err(cleanup);
+                            }
+                        }
+                    }
                     return Err(primary);
                 }
             };
@@ -698,17 +731,42 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         let text = match (self.loaders.load_text)(streamable, Some(cancel)) {
             Ok(text) => text,
             Err(error) => {
-                R::after_component_drop();
+                if !R::is_process_poisoned(&error) {
+                    R::after_component_drop();
+                }
                 return Err(error);
             }
         };
         let encoded = match crate::with_prompt_encoding(on_progress, || encode(&text, prepared)) {
-            Ok(encoded) => materialize_encoded(Some(&encoded)).map(|()| encoded),
+            Ok(encoded) => match materialize_encoded(Some(&encoded)) {
+                Ok(()) => Ok(encoded),
+                Err(error) => {
+                    if R::is_process_poisoned(&error) {
+                        std::mem::forget(encoded);
+                    }
+                    Err(error)
+                }
+            },
             Err(primary) => {
-                let _ = materialize_encoded(None);
-                Err(primary)
+                if !R::is_process_poisoned(&primary) {
+                    if let Err(cleanup) = materialize_encoded(None) {
+                        if R::is_process_poisoned(&cleanup) {
+                            Err(cleanup)
+                        } else {
+                            Err(primary)
+                        }
+                    } else {
+                        Err(primary)
+                    }
+                } else {
+                    Err(primary)
+                }
             }
         };
+        if encoded.as_ref().err().is_some_and(R::is_process_poisoned) {
+            std::mem::forget(text);
+            return Err(encoded.err().expect("checked poisoned error"));
+        }
         drop(text);
         R::after_component_drop();
         let encoded = encoded?;
@@ -717,24 +775,49 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         let heavy = match (self.loaders.load_heavy)(use_pid, streamable, Some(cancel)) {
             Ok(heavy) => heavy,
             Err(error) => {
-                R::after_component_drop();
+                if R::is_process_poisoned(&error) {
+                    std::mem::forget(encoded);
+                } else {
+                    R::after_component_drop();
+                }
                 return Err(error);
             }
         };
         let denoised =
             check_cancel::<R>(cancel).and_then(|()| denoise(&heavy, encoded, on_progress));
         let mid = match denoised {
-            Ok(mid) => materialize_mid(Some(&mid))
-                .and_then(|()| check_cancel::<R>(cancel))
-                .map(|()| mid),
+            Ok(mid) => match materialize_mid(Some(&mid)) {
+                Ok(()) => check_cancel::<R>(cancel).map(|()| mid),
+                Err(error) => {
+                    if R::is_process_poisoned(&error) {
+                        std::mem::forget(mid);
+                    }
+                    Err(error)
+                }
+            },
             Err(primary) => {
-                let _ = materialize_mid(None);
-                Err(primary)
+                if !R::is_process_poisoned(&primary) {
+                    if let Err(cleanup) = materialize_mid(None) {
+                        if R::is_process_poisoned(&cleanup) {
+                            Err(cleanup)
+                        } else {
+                            Err(primary)
+                        }
+                    } else {
+                        Err(primary)
+                    }
+                } else {
+                    Err(primary)
+                }
             }
         };
         let light_and_mid = match mid {
             Ok(mid) => Ok((heavy.shed_dit(), mid)),
             Err(primary) => {
+                if R::is_process_poisoned(&primary) {
+                    std::mem::forget(heavy);
+                    return Err(primary);
+                }
                 drop(heavy);
                 Err(primary)
             }
@@ -742,6 +825,10 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         R::after_component_drop();
         let (light, mid) = light_and_mid?;
         let result = decode(Heavy::light_view(&light), mid, on_progress);
+        if result.as_ref().err().is_some_and(R::is_process_poisoned) {
+            std::mem::forget(light);
+            return result;
+        }
         drop(light);
         R::after_component_drop();
         drop(warm);
@@ -768,17 +855,42 @@ where
     let text = match load_text() {
         Ok(text) => text,
         Err(error) => {
-            R::after_component_drop();
+            if !R::is_process_poisoned(&error) {
+                R::after_component_drop();
+            }
             return Err(error);
         }
     };
     let encoded = match crate::with_prompt_encoding(on_progress, || encode(&text)) {
-        Ok(encoded) => materialize_before_text_drop(Some(&encoded)).map(|()| encoded),
+        Ok(encoded) => match materialize_before_text_drop(Some(&encoded)) {
+            Ok(()) => Ok(encoded),
+            Err(error) => {
+                if R::is_process_poisoned(&error) {
+                    std::mem::forget(encoded);
+                }
+                Err(error)
+            }
+        },
         Err(error) => {
-            let _ = materialize_before_text_drop(None);
-            Err(error)
+            if !R::is_process_poisoned(&error) {
+                if let Err(cleanup) = materialize_before_text_drop(None) {
+                    if R::is_process_poisoned(&cleanup) {
+                        Err(cleanup)
+                    } else {
+                        Err(error)
+                    }
+                } else {
+                    Err(error)
+                }
+            } else {
+                Err(error)
+            }
         }
     };
+    if encoded.as_ref().err().is_some_and(R::is_process_poisoned) {
+        std::mem::forget(text);
+        return Err(encoded.err().expect("checked poisoned error"));
+    }
     drop(text);
     R::after_component_drop();
     let encoded = encoded?;
@@ -788,11 +900,19 @@ where
     let heavy = match load_heavy() {
         Ok(heavy) => heavy,
         Err(error) => {
-            R::after_component_drop();
+            if R::is_process_poisoned(&error) {
+                std::mem::forget(encoded);
+            } else {
+                R::after_component_drop();
+            }
             return Err(error);
         }
     };
     let result = check_cancel::<R>(cancel).and_then(|()| render(&heavy, encoded, on_progress));
+    if result.as_ref().err().is_some_and(R::is_process_poisoned) {
+        std::mem::forget(heavy);
+        return result;
+    }
     drop(heavy);
     R::after_component_drop();
     result
@@ -822,6 +942,18 @@ mod tests {
         }
     }
 
+    static POISON_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+    struct PoisonRuntime;
+    impl ResidencyRuntime for PoisonRuntime {
+        type Error = Error;
+        fn after_component_drop() {
+            POISON_CLEANUPS.fetch_add(1, Ordering::SeqCst);
+        }
+        fn is_process_poisoned(error: &Self::Error) -> bool {
+            matches!(error, Error::ProcessPoisoned(_))
+        }
+    }
+
     struct Witness {
         name: &'static str,
         log: Arc<Mutex<Vec<&'static str>>>,
@@ -834,6 +966,78 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(self.name);
+        }
+    }
+
+    struct EncodedDrop(Arc<AtomicUsize>);
+    impl Drop for EncodedDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn typed_poison_skips_component_drop_and_cleanup_at_each_two_phase_fault() {
+        for fault in ["encode", "load-heavy", "render"] {
+            POISON_CLEANUPS.store(0, Ordering::SeqCst);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let text_log = Arc::clone(&log);
+            let heavy_log = Arc::clone(&log);
+            let encoded_drops = Arc::new(AtomicUsize::new(0));
+            let encoded_drops_for_encode = Arc::clone(&encoded_drops);
+            let materialize_calls = AtomicUsize::new(0);
+            let result: Result<(), Error> = run_two_phase::<PoisonRuntime, _, _, _, _>(
+                &CancelFlag::new(),
+                &mut |_| {},
+                || {
+                    Ok(Witness {
+                        name: "drop-text",
+                        log: text_log,
+                    })
+                },
+                |_| {
+                    if fault == "encode" {
+                        Err(Error::ProcessPoisoned(fault.into()))
+                    } else {
+                        Ok((fault == "load-heavy").then(|| EncodedDrop(encoded_drops_for_encode)))
+                    }
+                },
+                |_| {
+                    materialize_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                || {
+                    if fault == "load-heavy" {
+                        Err(Error::ProcessPoisoned(fault.into()))
+                    } else {
+                        Ok(Witness {
+                            name: "drop-heavy",
+                            log: heavy_log,
+                        })
+                    }
+                },
+                |_, _, _| Err(Error::ProcessPoisoned(fault.into())),
+            );
+            assert!(matches!(result, Err(Error::ProcessPoisoned(ref detail)) if detail == fault));
+            assert_eq!(
+                materialize_calls.load(Ordering::SeqCst),
+                usize::from(fault != "encode")
+            );
+            assert_eq!(
+                *log.lock().unwrap(),
+                if fault == "encode" {
+                    vec![]
+                } else {
+                    vec!["drop-text"]
+                },
+                "fault={fault}"
+            );
+            assert_eq!(
+                POISON_CLEANUPS.load(Ordering::SeqCst),
+                usize::from(fault != "encode"),
+                "fault={fault}"
+            );
+            assert_eq!(encoded_drops.load(Ordering::SeqCst), 0, "fault={fault}");
         }
     }
 
@@ -888,6 +1092,104 @@ mod tests {
         }
         fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
             light
+        }
+    }
+
+    static THREE_POISON_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+    struct ThreePoisonRuntime;
+    impl ResidencyRuntime for ThreePoisonRuntime {
+        type Error = Error;
+        fn after_component_drop() {
+            THREE_POISON_CLEANUPS.fetch_add(1, Ordering::SeqCst);
+        }
+        fn is_process_poisoned(error: &Self::Error) -> bool {
+            matches!(error, Error::ProcessPoisoned(_))
+        }
+    }
+
+    #[test]
+    fn typed_poison_skips_three_phase_fences_and_owned_component_drops() {
+        for fault in ["encode", "load-heavy", "denoise", "decode"] {
+            THREE_POISON_CLEANUPS.store(0, Ordering::SeqCst);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let text_log = Arc::clone(&log);
+            let heavy_log = Arc::clone(&log);
+            let encoded_drops = Arc::new(AtomicUsize::new(0));
+            let encoded_drops_for_encode = Arc::clone(&encoded_drops);
+            let owner = Residency::<Witness, ThreeWitness, ThreePoisonRuntime>::request_scoped(
+                move |_| {
+                    Ok(Witness {
+                        name: "drop-text",
+                        log: Arc::clone(&text_log),
+                    })
+                },
+                move |_, _| {
+                    if fault == "load-heavy" {
+                        Err(Error::ProcessPoisoned(fault.into()))
+                    } else {
+                        Ok(ThreeWitness {
+                            dit: Witness {
+                                name: "drop-dit",
+                                log: Arc::clone(&heavy_log),
+                            },
+                            ae: Witness {
+                                name: "drop-ae",
+                                log: Arc::clone(&heavy_log),
+                            },
+                        })
+                    }
+                },
+            );
+            let result: Result<(), Error> = owner.run_staged_request_scoped_with_prepare(
+                true,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                None::<fn() -> Result<(), Error>>,
+                |_| Ok(()),
+                |_, ()| {
+                    if fault == "encode" {
+                        Err(Error::ProcessPoisoned(fault.into()))
+                    } else {
+                        Ok((fault == "load-heavy").then(|| EncodedDrop(encoded_drops_for_encode)))
+                    }
+                },
+                |_| {
+                    log.lock().unwrap().push("encoded-fence");
+                    Ok(())
+                },
+                |_, _, _| {
+                    if fault == "denoise" {
+                        Err(Error::ProcessPoisoned(fault.into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    log.lock().unwrap().push("mid-fence");
+                    Ok(())
+                },
+                |_, (), _| Err(Error::ProcessPoisoned(fault.into())),
+            );
+            assert!(matches!(result, Err(Error::ProcessPoisoned(ref detail)) if detail == fault));
+            let expected = match fault {
+                "encode" => vec![],
+                "load-heavy" => vec!["encoded-fence", "drop-text"],
+                "denoise" => vec!["encoded-fence", "drop-text"],
+                _ => vec!["encoded-fence", "drop-text", "mid-fence", "drop-dit"],
+            };
+            assert_eq!(*log.lock().unwrap(), expected, "fault={fault}");
+            assert_eq!(
+                THREE_POISON_CLEANUPS.load(Ordering::SeqCst),
+                match fault {
+                    "encode" => 0,
+                    "load-heavy" | "denoise" => 1,
+                    _ => 2,
+                },
+                "fault={fault}"
+            );
+            assert_eq!(encoded_drops.load(Ordering::SeqCst), 0, "fault={fault}");
         }
     }
     fn prepared_three_owner(

@@ -62,6 +62,18 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX1_SCHNELL_ID,
+            compile: |spec, req| model::compile_base(FluxVariant::Schnell, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX1_DEV_ID,
+            compile: |spec, req| model::compile_base(FluxVariant::Dev, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX1_DEV_CONTROL_ID,
+            compile: model_control::compile_control,
+        })
         .register_generator(model::SCHNELL_REGISTRATION)
         .register_memory_strategy(model::SCHNELL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {

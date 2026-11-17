@@ -23,21 +23,22 @@
 use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::models::flux::sampling::{get_schedule, State};
+use candle_transformers::models::flux::sampling::State;
 use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
-    GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, PidWeights, PreviewSink,
-    Progress,
+    Conditioning, ConditioningKind, GenerationMemory, GenerationRequest, IdentityWeights, Image,
+    LoadSpec, MemoryProviderContract, MemoryRunContext, MemoryRunOutcome, ModelDescriptor,
+    PidWeights, PreviewSink, Progress, RenderLoadBinding, RenderPlan, RenderRun, WeightsSource,
 };
 use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
-use candle_gen_flux::{
-    flow_mu, DitImageInjector, FluxRefBackbone, FluxRefHeavy, Variant, BASE_SHIFT, MAX_SHIFT,
-};
+#[cfg(test)]
+use candle_gen_flux::{flow_mu, BASE_SHIFT, MAX_SHIFT};
+use candle_gen_flux::{DitImageInjector, FluxRefBackbone, FluxRefHeavy, Variant};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::ca::PulidCa;
@@ -165,6 +166,7 @@ pub const DEFAULT_ID_WEIGHT: f32 = 1.0;
 pub const DEFAULT_GUIDANCE: f32 = 4.0;
 
 /// Paths to the PuLID-FLUX checkpoints.
+#[derive(Clone)]
 pub struct PulidFluxPaths {
     /// The FLUX.1-dev backbone snapshot dir — auto-detected (sc-10103): either a dense black-forest-labs
     /// `FLUX.1-dev` snapshot (`flux1-dev.safetensors`, `ae.safetensors`, `text_encoder{,_2}/`,
@@ -274,9 +276,133 @@ pub struct PulidFlux {
     pid: Option<PidEngine>,
     /// Exact request-scoped contract/context selected for the bespoke route. Legacy callers that use
     /// `load`/`load_with_memory` leave these empty; the SceneWorks route uses
-    /// `load_with_memory_context` and must then call `generate_with_memory_context`.
+    /// `load_with_memory_context` and must then call `generate_with_memory_context_planned`.
     memory_contract: Option<MemoryProviderContract>,
     admitted_context: Option<MemoryRunContext>,
+    loaded_spec: LoadSpec,
+}
+
+/// The load contract [`PulidFlux::load`], [`PulidFlux::load_with_memory`] and
+/// [`PulidFlux::load_with_memory_context`] bind, so a caller of those paths-only loaders can compile
+/// [`compile_pulid_plan`] before loading. A later [`PulidFlux::with_pid`] adds its overlay to this
+/// spec; plan a PiD request against the spec with that overlay set.
+pub fn pulid_load_spec(paths: &PulidFluxPaths) -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+        .with_adapters(paths.adapters.clone());
+    spec.identity = Some(IdentityWeights {
+        encoder: Some(WeightsSource::File(paths.pulid_weights.clone())),
+        eva: Some(WeightsSource::File(paths.eva_weights.clone())),
+        face_dir: Some(WeightsSource::Dir(paths.face_dir.clone())),
+    });
+    spec
+}
+
+fn validate_pulid_spec(
+    paths: &PulidFluxPaths,
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<()> {
+    let expected = pulid_load_spec(paths);
+    let slots = |identity: Option<&IdentityWeights>| {
+        identity.map(|identity| {
+            (
+                identity.encoder.clone(),
+                identity.eva.clone(),
+                identity.face_dir.clone(),
+            )
+        })
+    };
+    if spec.weights != expected.weights
+        || slots(spec.identity.as_ref()) != slots(expected.identity.as_ref())
+        || spec.adapters != paths.adapters
+        || spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || !spec.components.is_empty()
+        || spec.text_encoder.is_some()
+        || spec.quantize.is_some()
+        || spec.precision != candle_gen::gen_core::Precision::Bf16
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "PuLID-FLUX load contract differs from resolved paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn plan_descriptor() -> ModelDescriptor {
+    let mut descriptor = candle_gen_flux::descriptor_dev();
+    candle_gen_flux::add_conditioned_native_aliases(&mut descriptor);
+    // PuLID's legacy size gate is the FLUX pack stride, not the base txt2img
+    // descriptor's 256..=2048 range.
+    descriptor.capabilities.min_size = SIZE_MULTIPLE;
+    descriptor.capabilities.max_size = u32::MAX;
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
+        multiple: SIZE_MULTIPLE,
+        max_cells: u32::MAX,
+    };
+    descriptor.id = "pulid_flux";
+    descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
+    descriptor.capabilities.max_count = 1;
+    descriptor
+}
+
+fn typed_pulid_request(
+    req: &PulidFluxRequest,
+    reference: &Image,
+) -> candle_gen::gen_core::Result<GenerationRequest> {
+    let steps = u32::try_from(req.steps).map_err(|_| {
+        candle_gen::gen_core::Error::Unsupported("PuLID step count exceeds u32".into())
+    })?;
+    Ok(GenerationRequest {
+        prompt: req.prompt.clone(),
+        width: req.width,
+        height: req.height,
+        count: 1,
+        steps: Some(steps),
+        seed: Some(req.seed),
+        guidance: Some(req.guidance),
+        sampler: req.sampler.clone(),
+        scheduler: req.scheduler.clone(),
+        scheduler_shift: req.scheduler_shift,
+        conditioning: vec![Conditioning::Reference {
+            image: reference.clone(),
+            strength: Some(req.id_weight),
+        }],
+        use_pid: req.use_pid,
+        preview: req.preview.clone(),
+        cancel: req.cancel.clone(),
+        ..Default::default()
+    })
+}
+
+/// Freeze the face source, identity stack, optional PiD decoder and trajectory before load.
+pub fn compile_pulid_plan(
+    paths: &PulidFluxPaths,
+    spec: &LoadSpec,
+    req: &PulidFluxRequest,
+    reference: &Image,
+) -> candle_gen::gen_core::Result<RenderPlan> {
+    validate_pulid_spec(paths, spec)?;
+    reject_below_floor(req)?;
+    if req.prompt.trim().is_empty() {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "PuLID needs a prompt".into(),
+        ));
+    }
+    if req.use_pid && spec.pid.is_none() {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "PuLID PiD decode needs a loaded overlay".into(),
+        ));
+    }
+    if req.cancel.is_cancelled() {
+        return Err(candle_gen::gen_core::Error::Canceled);
+    }
+    let typed = typed_pulid_request(req, reference)?;
+    let descriptor = plan_descriptor();
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, &typed)?;
+    candle_gen_flux::compile_conditioned_plan(Variant::Dev, &descriptor, spec, &typed)
 }
 
 impl PulidFlux {
@@ -299,7 +425,15 @@ impl PulidFlux {
     /// base backbone may stage text→DiT/VAE, stream its two block stacks, and CPU-decode through the
     /// calibrated bounded-host path.
     pub fn load_with_memory(paths: &PulidFluxPaths, memory: GenerationMemory) -> Result<Self> {
-        Self::load_internal(paths, memory, None, None)
+        Self::load_internal(paths, memory, None, None, &pulid_load_spec(paths))
+    }
+
+    pub fn load_with_memory_spec(
+        paths: &PulidFluxPaths,
+        memory: GenerationMemory,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        Self::load_internal(paths, memory, None, None, spec)
     }
 
     /// Load under an exact shared-ladder admission context. The provider rebuilds and validates the
@@ -316,7 +450,28 @@ impl PulidFlux {
         let memory = contract
             .generation_memory(&context.selection)
             .unwrap_or_default();
-        Self::load_internal(paths, memory, Some(contract), Some(context))
+        Self::load_internal(
+            paths,
+            memory,
+            Some(contract),
+            Some(context),
+            &pulid_load_spec(paths),
+        )
+    }
+
+    pub fn load_with_memory_context_spec(
+        paths: &PulidFluxPaths,
+        context: MemoryRunContext,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract(paths)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_context(paths, &contract, &context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let memory = contract
+            .generation_memory(&context.selection)
+            .unwrap_or_default();
+        Self::load_internal(paths, memory, Some(contract), Some(context), spec)
     }
 
     fn load_internal(
@@ -324,7 +479,9 @@ impl PulidFlux {
         memory: GenerationMemory,
         memory_contract: Option<MemoryProviderContract>,
         admitted_context: Option<MemoryRunContext>,
+        spec: &LoadSpec,
     ) -> Result<Self> {
+        validate_pulid_spec(paths, spec)?;
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
 
@@ -374,6 +531,7 @@ impl PulidFlux {
             pid: None,
             memory_contract,
             admitted_context,
+            loaded_spec: spec.clone(),
         })
     }
 
@@ -383,7 +541,15 @@ impl PulidFlux {
     /// `use_pid` errors loudly. Face likeness may shift under the generative decode — the user's per-gen
     /// call. Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        if self.loaded_spec.pid.as_ref().is_some_and(|expected| {
+            expected.checkpoint != pid.checkpoint || expected.gemma != pid.gemma
+        }) {
+            return Err(CandleError::Unsupported(
+                "PuLID PiD decoder differs from the pre-load plan".into(),
+            ));
+        }
         self.pid = Some(PidEngine::from_spec(pid, "flux", &self.device)?);
+        self.loaded_spec.pid = Some(pid.clone());
         Ok(self)
     }
 
@@ -457,46 +623,48 @@ impl PulidFlux {
         identity_stage(cancel, || self.idformer.forward(&id_cond, &eva_out.hidden))
     }
 
-    /// Reference-image identity T2I: condition the FLUX.1-dev generation on `reference`'s PuLID
-    /// id_embedding at `req.id_weight` (a single distilled forward per step — no true-CFG).
-    /// Bind a completed image to observations from this same PuLID attempt.
+    /// Bind a completed planned image to observations from this same PuLID attempt.
     pub fn generate_with_execution_report(
         &self,
         req: &PulidFluxRequest,
         reference: &Image,
+        plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         complete_pulid_image(&req.cancel, "pulid/pulid_flux/generate", || {
-            self.generate(req, reference, &mut report_progress)
+            self.generate_planned(req, reference, plan, &mut report_progress)
         })
     }
 
-    pub fn generate(
+    /// Reference-image identity T2I from the trajectory [`compile_pulid_plan`] froze before load:
+    /// condition the FLUX.1-dev generation on `reference`'s PuLID id_embedding at `req.id_weight` (a
+    /// single distilled forward per step — no true-CFG).
+    pub fn generate_planned(
         &self,
         req: &PulidFluxRequest,
         reference: &Image,
+        plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         if self.admitted_context.is_some() {
             return Err(CandleError::Msg(
-                "pulid_flux: admitted model requires generate_with_memory_context".into(),
+                "pulid_flux: admitted model requires generate_with_memory_context_planned".into(),
             ));
         }
-        self.generate_inner(req, reference, on_progress)
+        self.check_plan(req, reference, plan)?;
+        let run = RenderRun::new(plan, &req.cancel, None);
+        self.generate_inner(req, reference, plan, &run, on_progress)
     }
 
-    /// Execute one bespoke PuLID request under the exact admission handshake retained at load. The
-    /// route and geometry are revalidated at the last responsible moment and the CUDA device is
-    /// synchronized on both success and failure so request-scoped materializations cannot leak into
-    /// the next job's budget snapshot.
-    /// Bind an admitted PuLID render's output to observations from that same attempt.
+    /// Bind an admitted planned PuLID render's output to observations from that same attempt.
     pub fn generate_with_memory_context_with_execution_report(
         &self,
         context: &MemoryRunContext,
         req: &PulidFluxRequest,
         reference: &Image,
+        plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
@@ -504,15 +672,28 @@ impl PulidFlux {
         complete_pulid_image(
             &req.cancel,
             "pulid/pulid_flux/generate_with_memory_context",
-            || self.generate_with_memory_context(context, req, reference, &mut report_progress),
+            || {
+                self.generate_with_memory_context_planned(
+                    context,
+                    req,
+                    reference,
+                    plan,
+                    &mut report_progress,
+                )
+            },
         )
     }
 
-    pub fn generate_with_memory_context(
+    /// Execute one bespoke PuLID request, planned before load, under the exact admission handshake
+    /// retained at load. The route and geometry are revalidated at the last responsible moment and the
+    /// CUDA device is synchronized on both success and failure so request-scoped materializations
+    /// cannot leak into the next job's budget snapshot.
+    pub fn generate_with_memory_context_planned(
         &self,
         context: &MemoryRunContext,
         req: &PulidFluxRequest,
         reference: &Image,
+        plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let admitted = self.admitted_context.as_ref().ok_or_else(|| {
@@ -534,8 +715,27 @@ impl PulidFlux {
         )?;
         crate::memory_strategy::validate_context_from_loaded(contract, context)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
-        let result = self.generate_inner(req, reference, on_progress);
-        let synchronized = self.device.synchronize().map_err(CandleError::Candle);
+        self.check_plan(req, reference, plan)?;
+        let mut scope = candle_gen_flux::memory_strategy::reference_backbone_request_scope(
+            "pulid_flux",
+            self.device.clone(),
+            contract,
+            context,
+        );
+        let result = {
+            let run = RenderRun::new(plan, &req.cancel, Some(scope.as_mut()));
+            self.generate_inner(req, reference, plan, &run, on_progress)
+        };
+        let outcome = match &result {
+            Ok(_) => MemoryRunOutcome::Complete,
+            Err(CandleError::Canceled) => MemoryRunOutcome::Canceled,
+            Err(error) => MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        let synchronized = scope
+            .finish(outcome)
+            .map_err(|error| CandleError::Msg(error.to_string()));
         match (result, synchronized) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -543,10 +743,29 @@ impl PulidFlux {
         }
     }
 
+    fn check_plan(
+        &self,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+    ) -> Result<()> {
+        if req.use_pid && self.pid.is_none() {
+            return Err(CandleError::Unsupported(
+                "PuLID PiD decode was planned but the decoder was not attached".into(),
+            ));
+        }
+        let typed = typed_pulid_request(req, reference)?;
+        plan.check_request(&plan_descriptor(), &typed)?;
+        plan.check_load(&RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        Ok(())
+    }
+
     fn generate_inner(
         &self,
         req: &PulidFluxRequest,
         reference: &Image,
+        plan: &RenderPlan,
+        run: &RenderRun<'_, '_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         if req.cancel.is_cancelled() {
@@ -556,75 +775,83 @@ impl PulidFlux {
         self.backbone
             .validate_native_vae_request(req.use_pid, &req.cancel)?;
 
-        // Identity conditioning (computed once; constant across the denoise).
-        let id_embedding = self.compute_id_embedding_with_cancel(reference, &req.cancel)?;
-        let pulid_ca = identity_stage(&req.cancel, || {
-            PulidCa::from_weights(
-                &self.pulid,
-                "pulid_ca",
-                id_embedding,
-                req.id_weight as f64,
-                NUM_DOUBLE_BLOCKS,
-                NUM_SINGLE_BLOCKS,
-            )
+        // Identity, text and the PiD caption encode (minting the decoder runs Gemma) are all
+        // conditioning; the queued kernels finish before the phase closes.
+        let (pulid_ca, t5_emb, clip_emb, pid_decoder) = run.encode(|| {
+            let id_embedding = self.compute_id_embedding_with_cancel(reference, &req.cancel)?;
+            let pulid_ca = identity_stage(&req.cancel, || {
+                PulidCa::from_weights(
+                    &self.pulid,
+                    "pulid_ca",
+                    id_embedding,
+                    req.id_weight as f64,
+                    NUM_DOUBLE_BLOCKS,
+                    NUM_SINGLE_BLOCKS,
+                )
+            })?;
+            let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
+                &req.prompt,
+                &req.cancel,
+                on_progress,
+            )?;
+            let pid_decoder = self.pid_decoder_for(req)?;
+            self.device.synchronize()?;
+            Ok::<_, CandleError>((pulid_ca, t5_emb, clip_emb, pid_decoder))
         })?;
-
-        // Text conditioning (T5 seq + CLIP pooled) — tier-agnostic via the backbone (dense or packed
-        // encoders, same token ids either way).
-        let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
-            &req.prompt,
-            &req.cancel,
-            on_progress,
-        )?;
         let heavy = self.backbone.load_heavy(&req.cancel)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
-        let n = LATENT_CHANNELS * lat_h * lat_w;
-        // sc-3673 parity: deterministic, launch-portable CPU-seeded initial noise.
-        let mut rng = StdRng::seed_from_u64(req.seed);
-        let noise = candle_gen::seeded_normal_vec(&mut rng, n);
-        let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-            .to_device(&self.device)?
-            .to_dtype(self.dtype)?;
-
-        let state = State::new(&t5_emb, &clip_emb, &noise)?;
-        // FLUX.1-dev: resolution-dependent time-shifted flow-match schedule + embedded guidance.
-        let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
-        let guidance = req.guidance as f64;
-
-        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
-        // decode below is given. The PuLID CA identity residuals are injected inside the DiT forward
-        // and never join the running latent, so the strip shows the developing image alone.
-        let preview = crate::preview::hook(&req.preview, req.width, req.height);
-        let latents = self.denoise(
-            &state,
-            &timesteps,
-            guidance,
-            &pulid_ca,
-            heavy.as_ref(),
-            req.sampler.as_deref(),
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            req.seed,
-            &preview,
-            &req.cancel,
+        let images = run.images_with_denoise_phases(
             on_progress,
+            |seed| {
+                let n = LATENT_CHANNELS * lat_h * lat_w;
+                let mut rng = StdRng::seed_from_u64(seed);
+                let noise = candle_gen::seeded_normal_vec(&mut rng, n);
+                Ok::<_, CandleError>(
+                    Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+                        .to_device(&self.device)?
+                        .to_dtype(self.dtype)?,
+                )
+            },
+            |seed, noise, on_progress| {
+                run.begin_denoise_phase(0)?;
+                let state = State::new(&t5_emb, &clip_emb, &noise)?;
+                if state.img.dim(1)? != plan.packed_tokens() {
+                    return Err(CandleError::Msg(
+                        "PuLID packed geometry changed after planning".into(),
+                    ));
+                }
+                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                self.denoise(
+                    &state,
+                    plan,
+                    run,
+                    &pulid_ca,
+                    heavy.as_ref(),
+                    seed,
+                    &preview,
+                    &req.cancel,
+                    on_progress,
+                )
+            },
+            |_, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                self.backbone.decode_with_memory(
+                    heavy.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                    pid_decoder.as_ref(),
+                    &req.cancel,
+                )
+            },
         )?;
-        on_progress(Progress::Decoding);
-        // Decode the final latent: native FLUX.1 VAE by default, or the `flux` PiD student (4× SR) when
-        // this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). PiD is a
-        // generative decoder, so face likeness may shift — the user's per-gen call.
-        let pid_decoder = self.pid_decoder_for(req)?;
-        self.backbone.decode_with_memory(
-            heavy.as_ref(),
-            &latents,
-            req.height as usize,
-            req.width as usize,
-            pid_decoder.as_ref(),
-            &req.cancel,
-        )
+        images
+            .into_iter()
+            .next()
+            .ok_or_else(|| CandleError::Msg("PuLID plan produced no image".into()))
     }
 
     /// The flow-match denoise with the PuLID CA injector, routed through the unified curated
@@ -640,39 +867,24 @@ impl PulidFlux {
     fn denoise(
         &self,
         state: &State,
-        timesteps: &[f64],
-        guidance: f64,
+        render_plan: &RenderPlan,
+        run: &RenderRun<'_, '_>,
         injector: &PulidCa,
         heavy: Option<&FluxRefHeavy>,
-        sampler: Option<&str>,
-        scheduler: Option<&str>,
-        scheduler_shift: Option<f32>,
         seed: u64,
         preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let b_sz = state.img.dim(0)?;
-        let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
-        // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); the
-        // default (scheduler unset / native alias) returns it byte-exact, so the legacy flow-match Euler
-        // path is the N1 no-op for `img += pred·(σ_{i+1} − σ_i)`.
-        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
-        // PuLID is always dev, so the shared `flow_mu` is fed `Variant::Dev` (the schnell `mu = 0`
-        // branch is inert here) — the candle-gen-flux twin, deduped in sc-11249 / F-140.
-        let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
-        let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            scheduler,
-            scheduler_shift,
-            mu,
-            steps,
-            &native,
-        )?;
-        candle_gen::run_flow_sampler(
-            sampler,
+        let guidance_t = Tensor::full(render_plan.guidance(), b_sz, &self.device)?;
+        candle_gen::run_flow_sampler_spans(
+            Some(render_plan.sampler()),
             TimestepConvention::Sigma,
-            &sigmas,
+            render_plan.denoise_sigmas(),
+            &render_plan.denoise_spans(),
+            Some(run),
+            true,
             state.img.clone(),
             seed,
             cancel,
@@ -723,7 +935,215 @@ fn validate_request_geometry(
 
 #[cfg(test)]
 mod tests {
+    /// The identity embedding, the text encode and the PiD decoder mint (which runs the Gemma
+    /// caption encode) all happen inside `run.encode`, which synchronizes before Conditioning
+    /// closes; nothing learned runs between Conditioning and the first denoise phase. Pinned
+    /// against the shipped source; nothing executes.
+    #[test]
+    fn pulid_conditioning_work_stays_inside_the_conditioning_phase() {
+        let source = include_str!("pulid_flux.rs");
+        let shipped = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let render = &shipped[shipped
+            .find("let (pulid_ca, t5_emb, clip_emb, pid_decoder) = run.encode(|| {")
+            .unwrap()..];
+        let end = "Ok::<_, CandleError>((pulid_ca, t5_emb, clip_emb, pid_decoder))";
+        let closure = &render[..render.find(end).unwrap()];
+        let identity = closure
+            .find("self.compute_id_embedding_with_cancel(")
+            .unwrap();
+        let text = closure
+            .find("encode_text_with_memory_and_progress(")
+            .unwrap();
+        let pid = closure.find("self.pid_decoder_for(req)?").unwrap();
+        let sync = closure.find("self.device.synchronize()?;").unwrap();
+        assert!(identity < sync && text < sync && pid < sync);
+        let between = &render
+            [render.find(end).unwrap()..render.find("run.images_with_denoise_phases(").unwrap()];
+        assert!(
+            !between.contains("pid_decoder_for("),
+            "PiD mint escaped Conditioning"
+        );
+        assert_eq!(shipped.matches("self.pid_decoder_for(req)").count(), 1);
+    }
+
     use super::*;
+
+    #[derive(Default)]
+    struct PhaseTrace(Vec<(bool, candle_gen::gen_core::MemoryPhase)>);
+
+    impl candle_gen::gen_core::MemoryRequestScope for PhaseTrace {
+        fn configure_request(
+            &mut self,
+            _: &mut GenerationRequest,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn enter_phase(
+            &mut self,
+            _: candle_gen::gen_core::MemoryPhase,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn enter_render_phase(
+            &mut self,
+            phase: candle_gen::gen_core::MemoryPhase,
+            identity: &candle_gen::gen_core::render::RenderPhaseIdentity,
+        ) -> candle_gen::gen_core::Result<()> {
+            assert_eq!((identity.pass, identity.phase), (0, 0));
+            assert_eq!(
+                (
+                    identity.geometry.batch,
+                    identity.geometry.frames,
+                    identity.geometry.reference_count
+                ),
+                (1, 1, 1)
+            );
+            self.0.push((true, phase));
+            Ok(())
+        }
+        fn leave_phase(
+            &mut self,
+            phase: candle_gen::gen_core::MemoryPhase,
+        ) -> candle_gen::gen_core::Result<()> {
+            self.0.push((false, phase));
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: candle_gen::gen_core::MemoryGeometry,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn configure_attention(&mut self, _: u32) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            _: u32,
+            _: u32,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[allow(clippy::drop_non_drop)]
+    fn pulid_plan_binds_face_identity_and_pid_before_weights() {
+        let paths = PulidFluxPaths {
+            flux_base: "/missing/flux-dev".into(),
+            pulid_weights: "/missing/pulid".into(),
+            eva_weights: "/missing/eva".into(),
+            face_dir: "/missing/face".into(),
+            adapters: Vec::new(),
+        };
+        let spec = pulid_load_spec(&paths);
+        let req = PulidFluxRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: 4,
+            seed: 17,
+            ..Default::default()
+        };
+        let mut reference = Image {
+            width: 16,
+            height: 16,
+            pixels: vec![5; 16 * 16 * 3],
+        };
+        let plan = compile_pulid_plan(&paths, &spec, &req, &reference).unwrap();
+        let large = PulidFluxRequest {
+            width: 2304,
+            height: 1024,
+            ..req.clone()
+        };
+        compile_pulid_plan(&paths, &spec, &large, &reference).unwrap();
+        assert_eq!(plan.base_seed(), 17);
+        for name in ["flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.sampler = Some(name.into());
+            assert_eq!(
+                compile_pulid_plan(&paths, &spec, &alias, &reference)
+                    .unwrap()
+                    .sampler(),
+                name
+            );
+        }
+        for name in ["native", "flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.scheduler = Some(name.into());
+            assert_eq!(
+                compile_pulid_plan(&paths, &spec, &alias, &reference)
+                    .unwrap()
+                    .denoise_sigmas(),
+                plan.denoise_sigmas()
+            );
+        }
+        for (sampler, scheduler) in [(Some("unknown"), None), (None, Some("unknown"))] {
+            let mut invalid = req.clone();
+            invalid.sampler = sampler.map(str::to_owned);
+            invalid.scheduler = scheduler.map(str::to_owned);
+            assert!(compile_pulid_plan(&paths, &spec, &invalid, &reference).is_err());
+        }
+        let mut trace = PhaseTrace::default();
+        let run = RenderRun::new(&plan, &req.cancel, Some(&mut trace));
+        run.encode(|| Ok::<_, candle_gen::gen_core::Error>(()))
+            .unwrap();
+        run.images_with_denoise_phases(
+            &mut |_| {},
+            |_| Ok::<_, candle_gen::gen_core::Error>(()),
+            |_, _, _| {
+                run.begin_denoise_phase(0)?;
+                run.end_denoise_phase(0)?;
+                Ok::<_, candle_gen::gen_core::Error>(())
+            },
+            |_, _, _| Ok::<_, candle_gen::gen_core::Error>(()),
+        )
+        .unwrap();
+        drop(run);
+        use candle_gen::gen_core::MemoryPhase;
+        assert_eq!(
+            trace.0,
+            vec![
+                (true, MemoryPhase::Conditioning),
+                (false, MemoryPhase::Conditioning),
+                (true, MemoryPhase::Denoise),
+                (false, MemoryPhase::Denoise),
+                (true, MemoryPhase::Decode),
+                (false, MemoryPhase::Decode),
+            ]
+        );
+        reference.pixels[0] ^= 1;
+        assert!(plan
+            .check_request(
+                &plan_descriptor(),
+                &typed_pulid_request(&req, &reference).unwrap()
+            )
+            .is_err());
+        let mut changed = spec.clone();
+        changed.identity.as_mut().unwrap().eva = Some(WeightsSource::File("/other/eva".into()));
+        assert!(plan
+            .check_load(&RenderLoadBinding::from_spec(&changed))
+            .is_err());
+        let pid_req = PulidFluxRequest {
+            use_pid: true,
+            ..req.clone()
+        };
+        assert!(compile_pulid_plan(&paths, &spec, &pid_req, &reference).is_err());
+        let mut missing_overlay = spec.clone();
+        missing_overlay.identity = None;
+        assert!(compile_pulid_plan(&paths, &missing_overlay, &req, &reference).is_err());
+        let mut invalid = req.clone();
+        invalid.steps = 0;
+        assert!(compile_pulid_plan(&paths, &spec, &invalid, &reference).is_err());
+        invalid.steps = req.steps;
+        invalid.width = 513;
+        assert!(compile_pulid_plan(&paths, &spec, &invalid, &reference).is_err());
+    }
 
     /// `steps == 0` and a non-multiple-of-16 size are fast typed errors (never a decoded pure-noise
     /// "success"); the defaults pass (sc-11182, F-102).

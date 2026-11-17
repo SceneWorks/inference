@@ -78,6 +78,11 @@ mod moss_image_assets;
 pub mod moss_image_edit;
 pub mod numeric;
 pub mod registry;
+pub mod render;
+pub use render::{
+    MultiPassRenderPlan, PlannedPassRequest, ProducedReference, RenderLoadBinding, RenderPlan,
+    RenderPlanRegistration, RenderRun,
+};
 pub mod residency;
 pub mod runtime;
 pub use load_activity::{

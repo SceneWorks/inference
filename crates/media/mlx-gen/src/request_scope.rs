@@ -439,6 +439,15 @@ impl MemoryRequestScope for MlxRequestScopeCore {
         self.ensure_active()
     }
 
+    fn enter_render_phase(
+        &mut self,
+        phase: MemoryPhase,
+        identity: &gen_core::render::RenderPhaseIdentity,
+    ) -> Result<()> {
+        self.validate_geometry(identity.geometry)?;
+        self.enter_phase(phase)
+    }
+
     fn leave_phase(&mut self, _phase: MemoryPhase) -> Result<()> {
         self.ensure_active()
     }

@@ -19,13 +19,14 @@ use mlx_gen::media::Image;
 use mlx_gen::testing::{cosine_f32_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    Conditioning, GenerationOutput, GenerationRequest, Generator, LoadSpec, WeightsSource,
+    gen_core::RenderPlan, Conditioning, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    WeightsSource,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
 use mlx_gen_flux::model::load_flux1;
 use mlx_gen_pulid::eva_clip::{EvaConfig, EvaVisionTransformer};
-use mlx_gen_pulid::pulid_flux::PulidFlux;
+use mlx_gen_pulid::pulid_flux::{compile_constructed_plan, PulidFlux};
 
 fn golden(name: &str) -> Weights {
     let path = format!("{}/../tools/golden/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -102,6 +103,18 @@ fn req_with(
     }
 }
 
+/// Execute a plan compiled before the sub-models loaded (a constructor-built PuLID has no load
+/// spec, so `generate` refuses it).
+fn planned_image(model: &PulidFlux, req: &GenerationRequest, plan: &RenderPlan) -> Image {
+    first_image(
+        model
+            .generate_planned(req, plan, None, &mut |_| {})
+            .unwrap()
+            .output
+            .expect("PuLID render produced no image"),
+    )
+}
+
 fn first_image(out: GenerationOutput) -> Image {
     match out {
         GenerationOutput::Images(mut v) => v.remove(0),
@@ -128,6 +141,18 @@ fn pulid_flux_end_to_end() {
     assert!(!ref_faces.is_empty(), "no face in the reference image");
     let ref_emb = ref_faces[0].embedding.clone();
 
+    // Compile every PuLID trajectory before any backbone or identity weight loads.
+    let id0_req = req_with(&face_img, prompt, 0.0, steps, size);
+    let id1_req = req_with(&face_img, prompt, 1.0, steps, size);
+    // sc-3075: real-CFG (true_cfg>1) + negative prompt engages the dual-forward branch.
+    let mut cfg_req = req_with(&face_img, prompt, 1.0, steps, size);
+    cfg_req.true_cfg = Some(2.0);
+    cfg_req.negative_prompt = Some("low quality, blurry, deformed, disfigured".into());
+    cfg_req.timestep_to_start_cfg = Some(4); // sc-3336: exercise the new core CFG-start knob
+    let id0_plan = compile_constructed_plan(&id0_req).unwrap();
+    let id1_plan = compile_constructed_plan(&id1_req).unwrap();
+    let cfg_plan = compile_constructed_plan(&cfg_req).unwrap();
+
     // FLUX backbone — generate the PLAIN txt2img first (no conditioning; same prompt/seed/size).
     let spec = LoadSpec::new(WeightsSource::Dir(flux_snapshot()));
     let flux = load_flux1(FluxVariant::Dev, &spec).unwrap();
@@ -145,22 +170,14 @@ fn pulid_flux_end_to_end() {
     let model = PulidFlux::new(flux, eva, pulid_weights(), load_face()).unwrap();
 
     // (1) id_weight = 0 ⇒ bit-identical to plain FLUX.
-    let id0 = first_image(
-        model
-            .generate(&req_with(&face_img, prompt, 0.0, steps, size), &mut |_| {})
-            .unwrap(),
-    );
+    let id0 = planned_image(&model, &id0_req, &id0_plan);
     assert_eq!(
         id0.pixels, plain.pixels,
         "id_weight=0 must equal plain FLUX bit-for-bit"
     );
 
     // (2) id_weight = 1 ⇒ output changes.
-    let id1 = first_image(
-        model
-            .generate(&req_with(&face_img, prompt, 1.0, steps, size), &mut |_| {})
-            .unwrap(),
-    );
+    let id1 = planned_image(&model, &id1_req, &id1_plan);
     let changed = id1
         .pixels
         .iter()
@@ -195,14 +212,8 @@ fn pulid_flux_end_to_end() {
         );
     }
 
-    // (4) sc-3075: real-CFG (true_cfg>1) + negative prompt engages the dual-forward branch and
-    // changes the render vs the fake-CFG (true_cfg=1.0) id1 result.
-    let mut cfg_req = req_with(&face_img, prompt, 1.0, steps, size);
-    cfg_req.true_cfg = Some(2.0);
-    cfg_req.negative_prompt = Some("low quality, blurry, deformed, disfigured".into());
-    cfg_req.timestep_to_start_cfg = Some(4); // sc-3336: exercise the new core CFG-start knob
-
-    let cfg = first_image(model.generate(&cfg_req, &mut |_| {}).unwrap());
+    // (4) sc-3075: real-CFG changes the render vs the fake-CFG (true_cfg=1.0) id1 result.
+    let cfg = planned_image(&model, &cfg_req, &cfg_plan);
     let cfg_changed = cfg
         .pixels
         .iter()
