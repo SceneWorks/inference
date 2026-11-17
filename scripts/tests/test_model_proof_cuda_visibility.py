@@ -165,9 +165,7 @@ class ChildCudaVisibility(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(packet(kwargs['env'], selected_uuid)))
                 with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
                         patch.object(guard, 'inventory', return_value=([nvml_device], [])), \
-                        patch.object(guard, 'idle', return_value=True), \
-                        patch.object(guard, 'sample_baseline', return_value=(nvml_device, {'MOCK': True})) as baseline, \
-                        patch.object(guard, 'verify_idle') as post_idle, \
+                        patch.object(guard.time, 'sleep'), \
                         patch.object(resources.subprocess, 'run', side_effect=run):
                     if selected_uuid == APPROVED:
                         with resources.execution_claim('candle-cuda', policy, root, environment, constraints=case()) as receipt:
@@ -175,58 +173,90 @@ class ChildCudaVisibility(unittest.TestCase):
                             self.assertEqual(receipt['physical_index'], 1)
                             self.assertEqual(receipt['child_visibility_binding']['metadata']['devices'][0]['ordinal'], 0)
                         self.assertTrue(receipt['post_execution_verified'])
-                        baseline.assert_called_once()
-                        post_idle.assert_called_once()
+                        self.assertTrue((root / 'model-proof-admission-samples.json').is_file())
+                        self.assertTrue((root / 'model-proof-release-samples.json').is_file())
                     else:
                         with self.assertRaisesRegex(ValueError, 'other than the approved leased device'):
                             with resources.execution_claim('candle-cuda', policy, root, environment, constraints=case()):
                                 self.fail('wrong UUID must never reach model launch')
-                        baseline.assert_not_called()
-                        post_idle.assert_not_called()
+                        self.assertFalse((root / 'model-proof-admission-samples.json').exists())
                 self.assertEqual(locked, [False])
                 self.assertEqual(environment, original)
 
-    def test_rejected_fresh_claim_records_bounded_driver_predicates_without_process_names(self):
+    def _fake_windows(self, locks=None):
+        def locking(_descriptor, operation, _count):
+            if locks is not None:
+                locks.append(operation)
+        return (patch.object(resources, 'os', SimpleNamespace(name='nt', fstat=os.fstat)),
+                patch.dict(sys.modules, {'msvcrt': SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)}))
+
+    def test_default_claim_admits_foreign_compute_unknown_contexts_and_busy_utilization(self):
+        # CI_IMPACT: fake Windows lock and inventory only. The owner's desktop app holds a
+        # compute context and a loaded model on a display GPU; headroom alone decides admission.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 12000,
+                'free_mib': 86304, 'utilization_percent': 85}
+        rows = [[APPROVED, '123', 'private.exe', 'C'], [APPROVED, '124', 'opaque', 'unknown'],
+                [APPROVED, '125', 'dwm.exe', 'C+G']]
+        self.assertFalse(guard.idle(card, rows))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            locks = []
+            os_patch, lock_patch = self._fake_windows(locks)
+            with os_patch, lock_patch, patch.object(guard, 'inventory', return_value=([card], rows)) as inventory, \
+                    patch.object(guard.time, 'sleep'):
+                with resources.execution_claim('candle-cuda', GPU_POLICY, root,
+                                               {'PUBLIC': str(root), 'RUNNER_NAME': 'MOCK runner'}) as receipt:
+                    self.assertEqual(receipt['activity_profile'], resources.SHARED_CUDA_HEADROOM_ACTIVITY)
+                    self.assertEqual(receipt['admission_utilization_percent'], [85] * 5)
+                    self.assertFalse(receipt['isolated_benchmark_claim'])
+            self.assertTrue(receipt['post_execution_verified'])
+            self.assertTrue(receipt['lease_released'])
+            self.assertEqual(locks, [1, 2])
+            self.assertEqual(inventory.call_count, 11)  # first poll + five admission + five release
+            # Only the exact selected card's counters are read; no host process census.
+            self.assertEqual({call.kwargs.get('selected_uuid') for call in inventory.call_args_list}, {APPROVED})
+            self.assertNotIn('private.exe', json.dumps(receipt))
+
+    def test_default_claim_refuses_only_missing_headroom_or_identity_and_never_waits_silently(self):
         # CI_IMPACT: fake Windows lock and inventory only; no GPU, process, model, or Cargo.
-        for card, processes, expected in (
-            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 16385,
-              'free_mib': 81919, 'utilization_percent': 0},
-             [[APPROVED, '123', 'private.exe', 'C']], 'free_memory_above_policy_headroom'),
-            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
-              'free_mib': 97280, 'utilization_percent': 0},
-             [[APPROVED, '123', 'private.exe', 'unknown']], 'selected_process_types_allowed'),
-            ({'uuid': OTHER, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
-              'free_mib': 97280, 'utilization_percent': 0}, [], 'unique_uuid'),
-        ):
-            with self.subTest(predicate=expected), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary).resolve()
-                environment = {'PUBLIC': str(root), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': APPROVED}
-                policy = GPU_POLICY
-                locks = []
-                def locking(_descriptor, operation, _count):
-                    locks.append(operation)
-                fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
-                fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)
-                with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
-                        patch.object(guard, 'inventory', return_value=([card], processes)) as inventory, \
-                        patch.object(guard, 'sample_baseline') as baseline:
-                    with self.assertRaises(resources.CudaClaimRejected) as caught:
-                        with resources.execution_claim('candle-cuda', policy, root, environment):
-                            self.fail('refused claim must never execute a body')
-                inventory.assert_called_once_with(root, 'model-proof-claimed-device')
-                baseline.assert_not_called()
-                self.assertEqual(locks, [1, 2])
-                diagnostic = caught.exception.diagnostic
-                self.assertFalse(diagnostic['predicates'][expected])
-                self.assertEqual(diagnostic['requested_uuid'], APPROVED)
-                self.assertNotIn('private.exe', json.dumps(diagnostic))
-                self.assertLess(len(json.dumps(diagnostic)), 4096)
+        short = {'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 30000,
+                 'free_mib': 68304 - 16384 * 2, 'utilization_percent': 0}
+        policy = SimpleNamespace(**{**vars(GPU_POLICY), 'deadline_seconds': 0.05})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            locks = []
+            os_patch, lock_patch = self._fake_windows(locks)
+            with os_patch, lock_patch, patch.object(guard, 'inventory', return_value=([short], [])), \
+                    patch.object(guard, 'sample_baseline') as baseline, patch('sys.stderr') as stderr:
+                with self.assertRaises(resources.CudaClaimRejected) as caught:
+                    with resources.execution_claim('candle-cuda', policy, root, {'PUBLIC': str(root)}):
+                        self.fail('refused claim must never execute a body')
+            baseline.assert_not_called()
+            self.assertEqual(locks, [1, 2])
+            diagnostic = caught.exception.diagnostic
+            self.assertFalse(diagnostic['predicates']['free_memory_above_policy_headroom'])
+            self.assertIn('deadline expired waiting for headroom', diagnostic['admission_error'])
+            self.assertGreaterEqual(diagnostic['admission_wait']['headroom_shortfalls'], 1)
+            self.assertLess(len(json.dumps(diagnostic)), 4096)
+            printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
+            self.assertIn('CUDA admission waiting: ' + APPROVED + ': 35536 MiB free < 81920 MiB required', printed)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            os_patch, lock_patch = self._fake_windows()
+            other = dict(short, uuid=OTHER, free_mib=97280)
+            with os_patch, lock_patch, patch.object(guard, 'inventory', return_value=([other], [])) as inventory:
+                with self.assertRaises(resources.CudaClaimRejected) as caught:
+                    with resources.execution_claim('candle-cuda', GPU_POLICY, root, {'PUBLIC': str(root)}):
+                        self.fail('missing UUID must never execute a body')
+            inventory.assert_called_once()
+            self.assertFalse(caught.exception.diagnostic['predicates']['unique_uuid'])
 
         many = [[APPROVED, str(i), 'private.exe', 'C'] for i in range(100)]
-        diagnostic = resources.cuda_claim_diagnostic(APPROVED, [card | {'uuid': APPROVED}], many, GPU_POLICY)
+        diagnostic = resources.cuda_claim_diagnostic(APPROVED, [short], many, GPU_POLICY)
         self.assertEqual(diagnostic['selected_process_count'], 100)
         self.assertEqual(len(diagnostic['selected_processes']), 64)
         self.assertTrue(diagnostic['process_list_truncated'])
+        self.assertNotIn('private.exe', json.dumps(diagnostic))
 
     def test_release_refusal_reports_only_existing_bounded_sample_predicates(self):
         # CI_IMPACT: synthetic saved driver rows only; no GPU, model or process execution.
@@ -266,77 +296,52 @@ class ChildCudaVisibility(unittest.TestCase):
         card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
                 'free_mib': 96003, 'utilization_percent': 0}
         rows = [[APPROVED, '123', 'private-process-name', 'C']]
-        baseline = {'uuid': APPROVED, 'reserved_baseline_mib': 1884,
-                    'process_identities': [(APPROVED, '123', 'C')]}
         def refuse(_card, output, _phase, _baseline, **_kwargs):
             (output / 'model-proof-release-samples.json').write_text(json.dumps([
-                {'sample_number': 1, 'devices': [dict(card, utilization_percent=1)], 'processes': rows},
+                {'sample_number': 1, 'devices': [dict(card, total_mib=48000)], 'processes': rows},
             ]), encoding='utf-8')
             raise RuntimeError('physical GPU occupied during model-proof-release')
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
-            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner'}
-            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
-            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
-            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
-                    patch.object(guard, 'inventory', return_value=([card], rows)), \
-                    patch.object(guard, 'sample_baseline', return_value=(card, baseline)), \
+            os_patch, lock_patch = self._fake_windows()
+            with os_patch, lock_patch, patch.object(guard, 'inventory', return_value=([card], rows)), \
                     patch.object(guard, 'verify_idle', side_effect=refuse), patch.object(guard.time, 'sleep'):
                 with self.assertRaises(resources.CudaReleaseRejected) as caught:
-                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, {'PUBLIC': str(output)},
                                                    constraints={'required_cuda_physical_index': 1}) as claim:
                         self.assertFalse(claim['post_execution_verified'])
             self.assertFalse(claim['post_execution_verified'])
-            self.assertEqual(caught.exception.diagnostic['sample_count'], 1)
-            self.assertEqual(caught.exception.diagnostic['settle_attempt_count'], 5)
-            self.assertFalse(caught.exception.diagnostic['samples'][0]['predicates']['selected_gpu_zero_utilization'])
-            self.assertNotIn('private-process-name', json.dumps(caught.exception.diagnostic))
+            self.assertTrue(claim['lease_released'])
+            diagnostic = caught.exception.diagnostic
+            self.assertEqual(diagnostic['sample_count'], 1)
+            self.assertEqual(diagnostic['settle_attempt_count'], 1)
+            self.assertFalse(diagnostic['samples'][0]['post_owned_exit_primary_metadata_valid'])
+            self.assertNotIn('private-process-name', json.dumps(diagnostic))
 
-    def test_transient_selected_gpu_utilization_requires_five_clean_admission_and_release_samples(self):
-        # CI_IMPACT: mocked SMI snapshots prove bounded settle without learned work or device queries.
+    def test_headroom_loss_during_locked_sampling_waits_and_restarts_with_a_logged_reason(self):
+        # CI_IMPACT: mocked SMI snapshots; foreign utilization swings are diagnostic only.
         card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
                 'free_mib': 96003, 'utilization_percent': 0}
-        warm = dict(card, utilization_percent=2)
+        busy = dict(card, utilization_percent=100)
+        short = dict(card, used_mib=60000, free_mib=37887)
         rows = [[APPROVED, '123', 'private-process-name', 'C']]
-        snapshots = [([warm], rows)] + [([card], rows)] * 5 + [([warm], rows)] + [([card], rows)] * 5
+        snapshots = ([([card], rows)] + [([busy], rows)] * 2 + [([short], rows)]
+                     + [([short], rows)] + [([busy], rows)] * 6 + [([card], rows)] * 5)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
-            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner'}
-            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
-            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
-            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
-                    patch.object(guard, 'inventory', side_effect=snapshots) as inventory, patch.object(guard.time, 'sleep'):
-                with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+            os_patch, lock_patch = self._fake_windows()
+            with os_patch, lock_patch, patch.object(guard, 'inventory', side_effect=snapshots) as inventory, \
+                    patch.object(guard.time, 'sleep'), patch.object(resources.time, 'sleep'), patch('sys.stderr') as stderr:
+                with resources.execution_claim('candle-cuda', GPU_POLICY, output, {'PUBLIC': str(output)},
                                                constraints={'required_cuda_physical_index': 1}) as claim:
                     self.assertFalse(claim['post_execution_verified'])
-            self.assertEqual(inventory.call_count, 12)
+            self.assertEqual(inventory.call_count, len(snapshots))
             self.assertTrue(claim['post_execution_verified'])
-            self.assertEqual(claim['physical_index'], 1)
-            self.assertEqual(claim['device_uuid'], APPROVED)
-            self.assertEqual(len(json.loads((output / 'model-proof-admission-samples.json').read_text(encoding='utf-8'))), 5)
-            self.assertEqual(len(json.loads((output / 'model-proof-release-samples.json').read_text(encoding='utf-8'))), 5)
-
-    def test_persistent_selected_gpu_utilization_rejects_after_bounded_retries(self):
-        # CI_IMPACT: one controlled precheck plus five synthetic failed samples; never launches model work.
-        warm = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
-                'free_mib': 96003, 'utilization_percent': 2}
-        rows = [[APPROVED, '123', 'private-process-name', 'C']]
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner'}
-            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
-            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
-            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
-                    patch.object(guard, 'inventory', return_value=([warm], rows)) as inventory, \
-                    patch.object(guard.time, 'sleep'):
-                with self.assertRaises(resources.CudaClaimRejected) as caught:
-                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
-                                                   constraints={'required_cuda_physical_index': 1}):
-                        self.fail('persistent GPU activity must never execute model body')
-            self.assertEqual(inventory.call_count, 6)
-            self.assertEqual(caught.exception.diagnostic['admission_samples']['sample_count'], 1)
-            self.assertEqual(caught.exception.diagnostic['admission_samples']['settle_attempt_count'], 5)
-            self.assertTrue(caught.exception.diagnostic['admission_samples']['samples'][0]['transient_utilization_only'])
+            self.assertEqual(claim['admission_wait']['stable_sample_restarts'], 1)
+            self.assertEqual(claim['admission_wait']['headroom_shortfalls'], 1)
+            self.assertEqual(claim['admission_utilization_percent'], [100] * 5)
+            printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
+            self.assertIn('free memory fell below reserve + child cap', printed)
 
     def test_settle_deadline_expires_without_additional_driver_probe(self):
         # CI_IMPACT: pure deadline control; no driver, CUDA or model work.
@@ -473,10 +478,12 @@ class ChildCudaVisibility(unittest.TestCase):
                         self.assertTrue(receipt['post_execution_verified'])
                         self.assertEqual(inventory.call_count, 11)
                     else:
-                        with self.assertRaisesRegex(ValueError, 'fixed physical-index restriction'):
+                        with self.assertRaises(resources.CudaClaimRejected) as caught:
                             with resources.execution_claim('candle-cuda', policy, output, environment,
                                                            constraints={'required_cuda_physical_index': required_index}):
                                 self.fail('wrong physical index must never reach a model body')
+                        self.assertEqual(caught.exception.diagnostic['admission_error'],
+                                         'invalid selected primary identity/metadata')
                         inventory.assert_called_once()
 
     def test_iris_correctness_profile_admits_two_percent_and_seals_five_samples(self):
@@ -508,7 +515,8 @@ class ChildCudaVisibility(unittest.TestCase):
                         with resources.execution_claim('candle-cuda', policy, output, environment, constraints=case) as receipt:
                             self.assertFalse(receipt['post_execution_verified'])
                             self.assertEqual(receipt['admission_utilization_percent'], [2] * 5)
-                            self.assertEqual(receipt['activity_profile'], resources.IRIS_CUDA_CORRECTNESS_ACTIVITY)
+                            # The declared Iris profile is still authenticated, but admits on headroom.
+                            self.assertEqual(receipt['activity_profile'], resources.SHARED_CUDA_HEADROOM_ACTIVITY)
                             self.assertFalse(receipt['isolated_benchmark_claim'])
                         self.assertTrue(receipt['post_execution_verified'])
                         self.assertEqual(receipt['release_utilization_percent'], [2] * 5)
@@ -555,7 +563,7 @@ class ChildCudaVisibility(unittest.TestCase):
         row = next(row for row in proof.load_registry() if row['package'] == 'candle-gen-iris'
                    and row['fqn'] == 'quant_real_weights::real_tiers_shrink_the_resident_weights')
         configured = proof.configured_case(row, 'source_selected_cuda')
-        self.assertEqual(resources.bound_cuda_activity_profile(configured), resources.IRIS_CUDA_CORRECTNESS_ACTIVITY)
+        self.assertEqual(resources.bound_cuda_activity_profile(configured), resources.SHARED_CUDA_HEADROOM_ACTIVITY)
         for forged in ({**configured, 'source': 'crates/media/candle-gen/candle-gen-iris/tests/other.rs'},
                        {**configured, 'fqn': 'other::proof'},
                        {**configured, 'selected_configuration': {**configured['selected_configuration'],
@@ -581,7 +589,7 @@ class ChildCudaVisibility(unittest.TestCase):
                     inventory.assert_called_once()
         card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
                 'free_mib': 96003, 'utilization_percent': 2}
-        changed = dict(card, utilization_percent=5)
+        changed = dict(card, utilization_percent=5, total_mib=48000)  # card identity/counters changed
         processes = [[APPROVED, '123', 'private', 'G']]
         snapshots = [([card], processes)] * 6 + [([changed], processes)] * 5
         with tempfile.TemporaryDirectory() as temporary:
@@ -598,7 +606,7 @@ class ChildCudaVisibility(unittest.TestCase):
             self.assertFalse(receipt['post_execution_verified'])
             self.assertEqual(receipt['admission_utilization_percent'], [2] * 5)
             self.assertNotIn('release_utilization_percent', receipt)
-            self.assertEqual(caught.exception.diagnostic['activity_profile'], resources.IRIS_CUDA_CORRECTNESS_ACTIVITY)
+            self.assertEqual(caught.exception.diagnostic['activity_profile'], resources.SHARED_CUDA_HEADROOM_ACTIVITY)
             self.assertEqual(caught.exception.diagnostic['samples'][0]['selected_card']['utilization_percent'], 5)
 
 

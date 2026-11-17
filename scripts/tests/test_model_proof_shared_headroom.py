@@ -43,7 +43,7 @@ class SharedHeadroom(unittest.TestCase):
                      'free_mib': 92891, 'utilization_percent': utilization}, **changes)
 
     def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None,
-              original_deadline_monotonic=None):
+              original_deadline_monotonic=None, require_owned_completion=True):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': UUID}
@@ -59,7 +59,8 @@ class SharedHeadroom(unittest.TestCase):
                     patch.object(guard.time, 'sleep', side_effect=clock.sleep if clock else None):
                 with resources.execution_claim('candle-cuda', policy, output, environment,
                                                constraints=self.configured,
-                                               original_deadline_monotonic=original_deadline_monotonic) as receipt:
+                                               original_deadline_monotonic=original_deadline_monotonic,
+                                               require_owned_completion=require_owned_completion) as receipt:
                     self.assertFalse(receipt['post_execution_verified'])
                     if owned_completion:
                         receipt['owned_execution_completion'] = {
@@ -257,6 +258,31 @@ class SharedHeadroom(unittest.TestCase):
                 receipt['owned_execution_completion'][key] = value
             with self.subTest(key=key), self.assertRaises(resources.CudaReleaseRejected):
                 self.claim([valid] * 6, body=pending)
+
+    def test_callers_without_owned_job_record_seal_on_release_metadata_alone(self):
+        # Comparison/allocator drivers reap their own supervised trees before the claim exits.
+        record, _ = self.claim([([self.card()], [])] * 11, owned_completion=False, require_owned_completion=False)
+        self.assertTrue(record['post_execution_verified'])
+        self.assertTrue(record['lease_released'])
+
+    def test_every_single_uuid_cuda_row_requires_the_headroom_release_seal(self):
+        record, _ = self.claim([([self.card()], [])] * 11)
+        body = {'argv': ['cargo', 'test'], 'supervision': {
+            'pid': 1234, 'returncode': 0, 'owned_completion': record['owned_execution_completion'],
+            'admission': {'originalClaimDeadlineMonotonic': record['claim_deadline_monotonic']}}}
+        # A row that declares no profile and pins no device still gets the same seal check.
+        plain = {'backend': 'candle-cuda', 'package': 'any', 'fqn': 'any::case'}
+        resources.validate_shared_release_record(record, [body], plain)
+        for mutation in (lambda r: r.update(activity_profile=resources.STRICT_CUDA_ACTIVITY),
+                         lambda r: r.update(lease_released=False),
+                         lambda r: r.pop('owned_execution_completion')):
+            invalid = copy.deepcopy(record)
+            mutation(invalid)
+            with self.assertRaises(ValueError):
+                resources.validate_shared_release_record(invalid, [body], plain)
+        # Multi-UUID rows carry their own lease record and are not joined here.
+        self.assertIsNone(resources.validate_shared_release_record(
+            {'approved_uuid_roles': [], 'post_execution_verified': True}, [], {**plain, 'required_cuda_ordinals': [0, 1]}))
 
     def test_shared_release_metadata_deadline_and_unlock_failures_never_seal(self):
         valid = ([self.card()], [])

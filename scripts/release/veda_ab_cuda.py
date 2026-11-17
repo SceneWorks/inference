@@ -161,7 +161,9 @@ def main() -> int:
         }
         cells = [expand(c, tokens) for c in parse_cells(os.environ["VEDA_AB_CELLS"])]
         summary["cells"] = cells
-        device, lock, baseline = guard.claim_device(root)
+        # Strict idle on purpose: this A/B's quantity is per-step render time (veda_ab.rs `timings`),
+        # and a co-tenant's GPU work would corrupt the dense-vs-sparse speedup. Not a correctness gate.
+        device, lock, baseline = guard.claim_device(root, strict=True)
         summary["device"] = device
         os.environ["CUDA_VISIBLE_DEVICES"] = device["uuid"]
         summary["status"] = "device_admitted"
