@@ -123,6 +123,19 @@ class MlxTrainingAssets(unittest.TestCase):
             self.assertEqual(resolved["TWIN"], primary / twin.relative())
             self.assertEqual(resolved["PRESENT"], primary / present.relative())
 
+    def test_a_refused_download_is_recorded_and_the_pin_stays_missing(self):
+        gated = assets.Pin("org/gated", "e" * 40, files=("config.json",))
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory).resolve()
+            roots = [(f"MLX_GEN_MODELS_ROOT={primary}", primary)]
+
+            def refused(pin, cache_dir):
+                raise RuntimeError("403 Client Error\nCannot access gated repo")
+
+            resolved, downloads = assets.bind({"GATED": gated}, roots, True, download=refused)
+            self.assertIsNone(resolved["GATED"])
+            self.assertEqual(downloads[0]["error"], "RuntimeError: 403 Client Error")
+
     def test_request_validates_download_missing_and_the_primary_mac_route(self):
         policy = {"backend": "darwin-mlx"}
         value = proofs.request(json.dumps({"selection": "x", "policy": policy, "runner": "nax-primary",

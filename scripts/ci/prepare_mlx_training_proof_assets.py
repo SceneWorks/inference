@@ -282,8 +282,13 @@ def bind(bindings: dict[str, Pin], roots: list[tuple[str, Path]], download_missi
                 continue
             fetched.add((pin.repository, pin.revision))
             print(f"downloading {pin.repository}@{pin.revision} (whole repository) into {target}", flush=True)
-            download(pin, target)
-            downloads.append({"repository": pin.repository, "revision": pin.revision, "cache_dir": str(target)})
+            record = {"repository": pin.repository, "revision": pin.revision, "cache_dir": str(target)}
+            try:
+                download(pin, target)
+            except Exception as error:  # noqa: BLE001 - a refused fetch (e.g. a gated repo) is reported
+                record["error"] = f"{type(error).__name__}: {str(error).splitlines()[0] if str(error) else ''}"
+                print(f"download of {pin.repository}@{pin.revision} failed: {record['error']}", flush=True)
+            downloads.append(record)
         resolved = {name: resolve(pin, roots) for name, pin in bindings.items()}
     return resolved, downloads
 
