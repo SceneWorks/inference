@@ -33,6 +33,14 @@ fn snapshot() -> PathBuf {
         .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
 }
 
+/// The Gemma text-encoder dir: `LTX_GEMMA_DIR`, else the base tier's sibling `gemma/` (the hosted
+/// `SceneWorks/ltx-2.3-mlx` snapshot keeps `gemma/` beside its `q8/` tier, not inside it).
+fn gemma_dir() -> PathBuf {
+    std::env::var_os("LTX_GEMMA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshot().join("gemma"))
+}
+
 /// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a 2:3 portrait of three
 /// distinct horizontal bands (blue / cream / green), item 1 a solid red square swatch, so every run
 /// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
@@ -102,7 +110,7 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
         .load_trainer(
             "ltx_2_3",
             &LoadSpec::new(WeightsSource::Dir(snapshot()))
-                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+                .with_text_encoder(WeightsSource::Dir(gemma_dir())),
         )
         .expect("ltx_2_3 trainer should be registered");
 
@@ -233,7 +241,7 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
         .load_trainer(
             "ltx_2_3",
             &LoadSpec::new(WeightsSource::Dir(snapshot()))
-                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+                .with_text_encoder(WeightsSource::Dir(gemma_dir())),
         )
         .expect("ltx_2_3 trainer should be registered");
 
@@ -311,7 +319,7 @@ fn ltx_trainer_emits_preview_samples() {
         .load_trainer(
             "ltx_2_3",
             &LoadSpec::new(WeightsSource::Dir(snapshot()))
-                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+                .with_text_encoder(WeightsSource::Dir(gemma_dir())),
         )
         .expect("ltx_2_3 trainer should be registered");
 
