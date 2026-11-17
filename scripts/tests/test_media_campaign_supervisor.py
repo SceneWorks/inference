@@ -1340,12 +1340,12 @@ class SupervisorTests(unittest.TestCase):
         path = self.root / 'windows-baseline-policy.json'
         path.write_text(json.dumps(data), encoding='utf-8')
         policy = safety.load_policy(path)
-        card = {'used': 30720}
+        card = {'used': 30720, 'apps': f'456, N/A, {gpu}\n'}
         def output(argv, **_kwargs):
             if '--query-gpu=uuid,memory.free' in argv:
                 return f'{gpu}, {98304 - card["used"]}\n'
             if '--query-compute-apps=pid,used_gpu_memory,gpu_uuid' in argv:
-                return f'123, N/A, {gpu}\n456, N/A, {gpu}\n'
+                return card['apps']
             return f'{gpu}, WDDM, 98304, {card["used"]}, {98304 - card["used"]}\n'
         with patch.object(safety.platform, 'system', return_value='Windows'), \
              patch.object(safety.windows, 'trusted_nvidia_smi', return_value='C:\\Windows\\System32\\nvidia-smi.exe'), \
@@ -1354,6 +1354,7 @@ class SupervisorTests(unittest.TestCase):
             # The baseline is the raw card value: the rounding MiB is charged to the child only.
             self.assertEqual(probe.record_global_used_baseline(), 30720 * 1024**2)
             card['used'] = 30720 + 15360
+            card['apps'] = f'123, N/A, {gpu}\n456, N/A, {gpu}\n'
             owner = type('Owner', (), {'members': lambda self: {123}})()
             free, charged = probe.gpu_free_and_tree_bytes(owner)
             self.assertEqual(charged, 15361 * 1024**2)
@@ -1364,6 +1365,54 @@ class SupervisorTests(unittest.TestCase):
             card['used'] = 30000  # the co-tenant freed memory: never a negative charge
             self.assertEqual(probe.gpu_free_and_tree_bytes(owner)[1], 0)
             self.assertEqual(probe.last_global_used_upper_bound_bytes, 30001 * 1024**2)
+
+    def test_windows_wddm_fallback_stops_deducting_memory_a_tenant_released(self):
+        # CI_IMPACT: mocked SMI only. A tenant holds 30 GiB at admission and then frees it while
+        # the child allocates 50 GiB under a 40 GiB cap. The charge must still exceed the cap.
+        data = json.loads(self.policy.canonical_bytes)
+        gpu = 'GPU-12345678-1234-1234-1234-123456789abc'
+        data.update(backend='windows-cuda', cudaDeviceUuid=gpu,
+                    gpuFreeReserveBytes=1024, childGpuCapBytes=40 * 1024**3)
+        path = self.root / 'windows-release-policy.json'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        policy = safety.load_policy(path)
+        gib = 1024
+        card = {'used': 30 * gib + 512, 'apps': ''}
+        def output(argv, **_kwargs):
+            if '--query-gpu=uuid,memory.free' in argv:
+                return f'{gpu}, {98304 - card["used"]}\n'
+            if '--query-compute-apps=pid,used_gpu_memory,gpu_uuid' in argv:
+                return card['apps']
+            return f'{gpu}, WDDM, 98304, {card["used"]}, {98304 - card["used"]}\n'
+        owner = type('Owner', (), {'members': lambda self: {123}})()
+        cap = policy.child_gpu_cap_bytes
+        with patch.object(safety.platform, 'system', return_value='Windows'), \
+             patch.object(safety.windows, 'trusted_nvidia_smi', return_value='C:\\Windows\\System32\\nvidia-smi.exe'), \
+             patch.object(safety, '_bounded_output', side_effect=output):
+            # 1. An N/A tenant (the WDDM norm) exits: what it freed is unknown, so the
+            #    child is charged the whole card.
+            probe = safety.SystemProbe(policy)
+            card.update(used=30 * gib + 512, apps=f'456, N/A, {gpu}\n')
+            probe.record_global_used_baseline()
+            card.update(used=512 + 50 * gib, apps=f'123, N/A, {gpu}\n')
+            charged = probe.gpu_free_and_tree_bytes(owner)[1]
+            self.assertEqual(charged, (512 + 50 * gib + 1) * 1024**2)
+            self.assertGreater(charged, cap)
+            # 2. A measured tenant shrinks from 30 GiB to 10 GiB without exiting: only the
+            #    10 GiB it still holds (plus the unattributed 512 MiB) stays deducted.
+            probe = safety.SystemProbe(policy)
+            card.update(used=30 * gib + 512, apps=f'456, {30 * gib}, {gpu}\n')
+            probe.record_global_used_baseline()
+            card.update(used=512 + 10 * gib + 50 * gib, apps=f'123, N/A, {gpu}\n456, {10 * gib}, {gpu}\n')
+            charged = probe.gpu_free_and_tree_bytes(owner)[1]
+            self.assertEqual(charged, (50 * gib + 1) * 1024**2)
+            self.assertGreater(charged, cap)
+            # 3. A measured tenant exits: its whole share leaves the deduction.
+            card.update(used=512 + 50 * gib, apps=f'123, N/A, {gpu}\n')
+            self.assertEqual(probe.gpu_free_and_tree_bytes(owner)[1], (50 * gib + 1) * 1024**2)
+            # 4. A tenant that keeps its memory keeps the old growth-only charge.
+            card.update(used=30 * gib + 512 + 15 * gib, apps=f'123, N/A, {gpu}\n456, {30 * gib}, {gpu}\n')
+            self.assertEqual(probe.gpu_free_and_tree_bytes(owner)[1], (15 * gib + 1) * 1024**2)
 
     def test_windows_wddm_unowned_na_does_not_replace_exact_owned_usage(self):
         data = json.loads(self.policy.canonical_bytes)

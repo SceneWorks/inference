@@ -540,6 +540,9 @@ class SystemProbe:
         # the UUID lock). The WDDM global-used fallback charges only growth above it to the child,
         # so a co-tenant's resident memory is never counted against the child cap.
         self.global_used_baseline_bytes: int | None = None
+        # {pid: bytes, or None when the row reads N/A} for the processes on the card at that
+        # baseline. A tenant that later frees memory must stop reducing the child's charge.
+        self.global_used_baseline_tenants: dict[int, int | None] = {}
         self.last_global_used_upper_bound_bytes: int | None = None
         actual = {"Darwin": "darwin-mlx", "Linux": "linux-cpu" if policy.backend == "linux-cpu" else "linux-cuda",
                   "Windows": "windows-cpu" if policy.backend == "windows-cpu" else "windows-cuda"}.get(platform.system(), "unsupported")
@@ -641,10 +644,42 @@ class SystemProbe:
         assert self.policy.cuda_device_uuid
         uuid = self.policy.cuda_device_uuid
         pids = owner.members()
-        usage = _bounded_output([self._smi, "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
-                                 "--format=csv,noheader,nounits"])
         used = 0
         unknown_owned = False
+        tenants: dict[int, int | None] = {}
+        for pid, row_uuid, row_bytes in self._compute_app_rows():
+            if pid in pids:
+                # A multi-device run declares its exact UUID set on the SAME owned tree.
+                # Attribute only this probe's UUID; still reject any undeclared device.
+                allowed = getattr(owner, "cuda_device_uuids", (uuid,))
+                if row_uuid not in allowed:
+                    raise SupervisionError("probe-failure", "child used an unexpected GPU")
+                if row_uuid == uuid:
+                    if row_bytes is None:
+                        unknown_owned = True
+                    else:
+                        used += row_bytes
+            elif row_uuid == uuid:
+                # An exact, unique PID outside the owned Job is not child usage.
+                # WDDM commonly reports its graphics processes with N/A memory.
+                tenants[pid] = row_bytes
+        if unknown_owned:
+            # The raw whole-card value stays the upper bound. The child is charged its growth
+            # above the part of the pre-spawn baseline its tenants still hold, so a tenant that
+            # frees memory cannot hide the child's use from the cap.
+            free, upper = self._windows_global_used_upper_bound()
+            self.last_global_used_upper_bound_bytes = upper
+            used = max(0, upper - self._attributable_baseline_bytes(tenants))
+            self.gpu_usage_basis = "global-used-upper-bound"
+        else:
+            self.gpu_usage_basis = "owned-process-attributed"
+        return free, used
+
+    def _compute_app_rows(self) -> list[tuple[int, str, int | None]]:
+        """Validated (pid, GPU UUID, used bytes or None for N/A) rows from one compute-apps query."""
+        usage = _bounded_output([self._smi, "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
+                                 "--format=csv,noheader,nounits"])
+        rows: list[tuple[int, str, int | None]] = []
         seen: set[tuple[int, str]] = set()
         for number, line in enumerate(usage.splitlines(), 1):
             parts = [item.strip() for item in line.split(",")]
@@ -656,36 +691,41 @@ class SystemProbe:
             if key in seen:
                 raise SupervisionError("probe-failure", f"CUDA process-memory row {number} duplicates PID/UUID {pid}/{parts[2]}")
             seen.add(key)
-            if pid in pids:
-                # A multi-device run declares its exact UUID set on the SAME owned tree.
-                # Attribute only this probe's UUID; still reject any undeclared device.
-                allowed = getattr(owner, "cuda_device_uuids", (uuid,))
-                if parts[2] not in allowed:
-                    raise SupervisionError("probe-failure", "child used an unexpected GPU")
             if parts[1].isdecimal() and len(parts[1]) <= 20:
-                if pid in pids and parts[2] == uuid:
-                    used += int(parts[1]) * 1024**2
+                rows.append((pid, parts[2], int(parts[1]) * 1024**2))
             elif parts[1] in {"N/A", "[N/A]"}:
                 if self.policy.backend != "windows-cuda":
                     raise SupervisionError("probe-failure", f"CUDA process-memory row {number} is unavailable: {line[:160]!r}")
-                if pid in pids:
-                    if parts[2] == uuid:
-                        unknown_owned = True
-                # An exact, unique PID outside the owned Job is not child usage.
-                # WDDM commonly reports its graphics processes with N/A memory.
+                rows.append((pid, parts[2], None))
             else:
                 raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has unknown usage: {line[:160]!r}")
-        if unknown_owned:
-            # The raw whole-card value stays the upper bound; the child is charged only its
-            # growth above the pre-spawn baseline (a co-tenant freeing memory can understate it).
-            free, upper = self._windows_global_used_upper_bound()
-            self.last_global_used_upper_bound_bytes = upper
-            used = (upper if self.global_used_baseline_bytes is None
-                    else max(0, upper - self.global_used_baseline_bytes))
-            self.gpu_usage_basis = "global-used-upper-bound"
-        else:
-            self.gpu_usage_basis = "owned-process-attributed"
-        return free, used
+        return rows
+
+    def _attributable_baseline_bytes(self, tenants: dict[int, int | None]) -> int:
+        """How much of the pre-spawn card baseline still belongs to someone other than the child.
+
+        The baseline only stays deductible while the tenants that made it up still hold their
+        memory. A measured tenant that shrank or exited reduces the deduction by what it freed.
+        A tenant whose usage reads N/A cannot be measured: if it exits, what it freed is
+        unknown, so nothing is deducted and the child is charged the whole card. An N/A tenant
+        that is still present keeps its share of the baseline (no counter can show a release).
+        """
+        baseline = self.global_used_baseline_bytes
+        if baseline is None:
+            return 0
+        released = 0
+        for pid, held in self.global_used_baseline_tenants.items():
+            if pid not in tenants:
+                if held is None:
+                    return 0
+                released += held
+                continue
+            now = tenants[pid]
+            if held is not None and now is None:
+                return 0
+            if held is not None and now is not None:
+                released += max(0, held - now)
+        return max(0, baseline - released)
 
     def record_global_used_baseline(self) -> int | None:
         """Pre-spawn card-wide used bytes for the WDDM fallback; None when the card is not WDDM."""
@@ -697,7 +737,12 @@ class SystemProbe:
         except SupervisionError:
             # A TCC card reports per-process memory, so the fallback (and this baseline) never applies.
             self.global_used_baseline_bytes = None
+            self.global_used_baseline_tenants = {}
             return None
+        uuid = self.policy.cuda_device_uuid
+        # The child does not exist yet: every process on this card is a tenant.
+        self.global_used_baseline_tenants = {
+            pid: held for pid, row_uuid, held in self._compute_app_rows() if row_uuid == uuid}
         self.global_used_baseline_bytes = used
         return used
 
