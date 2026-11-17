@@ -704,7 +704,7 @@ impl VideoWarm {
 ///
 /// A staged or streamed request holds nothing heavy between renders or between the phases of one
 /// render: every phase maps its component, uses it, drops it and synchronizes. A **resident**
-/// request whose warm estimate fits keeps the components it loads in [`Self::warm`] for the next
+/// request whose warm estimate fits keeps the components it loads in its `warm` field for the next
 /// request instead (see the module docs).
 pub struct MiniMaxH3 {
     descriptor: ModelDescriptor,

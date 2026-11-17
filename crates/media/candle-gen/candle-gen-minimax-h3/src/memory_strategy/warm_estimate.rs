@@ -188,10 +188,11 @@ pub fn video_warm_estimate(
     };
 
     // --- denoise ----------------------------------------------------------------------------------
-    let mut dit_peak = native.resident_peak_bytes_windowed(rows, None)?;
-    if let Some(bound) = super::veda_workspace_bound_for_contract(request, contract)? {
-        dit_peak = dit_peak.max(native.denoise_peak_bytes_with_veda(rows, None, &bound)?);
-    }
+    let dit_peak = dit_phase_peak(
+        native,
+        rows,
+        super::veda_workspace_bound_for_contract(request, contract)?.as_ref(),
+    )?;
     // The packed rows' carried hidden state and velocity, f32, over the whole sequence.
     let sampler = mul(mul(rows.packed, dit_hidden)?, f32_bytes * 2)?;
     let overlay = contract.asset_facts.overlay_bytes;
@@ -218,6 +219,26 @@ pub fn video_warm_estimate(
         warm_peak,
         task: rows.task,
     })
+}
+
+/// The resident DiT phase's device peak, as the staged admission prices it: the larger of the
+/// load (the constructor's coexisting original and replacement storage, then the AdaLN
+/// precompute) and the ordinary denoise working set, each with the adapter's install and forward
+/// work, never below the resident weights and modulation tables — then the Veda sparse-attention
+/// bound when the request enables it. The overlay is added once by the caller.
+fn dit_phase_peak(
+    native: &NativeAllocationFacts,
+    rows: NativeRows,
+    veda: Option<&candle_gen::gen_core::veda::workspace::WorkspaceBound>,
+) -> candle_gen::gen_core::Result<u64> {
+    let mut peak = native
+        .precompute_peak_bytes_windowed(rows, None)?
+        .max(native.denoise_peak_bytes_windowed(rows, None)?)
+        .max(native.resident_peak_bytes_windowed(rows, None)?);
+    if let Some(bound) = veda {
+        peak = peak.max(native.denoise_peak_bytes_with_veda(rows, None, bound)?);
+    }
+    Ok(peak)
 }
 
 /// Each phase's device bytes, as the staged render allocates them.
@@ -371,6 +392,44 @@ mod tests {
         assert_eq!(staged, 40 * GB);
         assert_eq!(weights.total(), 64 * GB);
         assert_eq!(warm, 64 * GB + 20 * GB, "the encode working set binds");
+    }
+
+    /// The warm DiT phase is priced from the full load and denoise peaks, not the resident weight
+    /// floor: a w4a8 constructor holds the original and replacement companions together, which
+    /// the floor alone omits. Header-only fixture; no tensor is loaded.
+    #[test]
+    fn the_dit_phase_peak_includes_construction_and_denoise_work() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::write_w4a8_component(
+            &root.path().join("transformer"),
+            &[(32, 512), (64, 256), (16, 1024)],
+        );
+        let contract = super::super::contract_for(&candle_gen::gen_core::LoadSpec::new(
+            candle_gen::gen_core::WeightsSource::Dir(root.path().into()),
+        ))
+        .unwrap();
+        let native = contract
+            .phase_facts
+            .as_ref()
+            .and_then(|facts| facts.native_quant.as_ref())
+            .unwrap();
+        let req = GenerationRequest {
+            width: 1344,
+            height: 768,
+            frames: Some(124),
+            ..Default::default()
+        };
+        let rows = native.request_rows((&req).into(), 50).unwrap();
+        let floor = native.resident_peak_bytes_windowed(rows, None).unwrap();
+        let precompute = native.precompute_peak_bytes_windowed(rows, None).unwrap();
+        let denoise = native.denoise_peak_bytes_windowed(rows, None).unwrap();
+        let peak = dit_phase_peak(native, rows, None).unwrap();
+        assert_eq!(peak, floor.max(precompute).max(denoise));
+        assert!(
+            peak > floor,
+            "construction and denoise work sit above the resident weights and tables \
+             ({peak} vs {floor})"
+        );
     }
 
     /// A source with no native allocation inventory prices no warm set, so it stages.
