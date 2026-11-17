@@ -65,7 +65,7 @@ pub fn binary_gib(bytes: u64) -> f64 {
 pub const PIXELS_PER_TOKEN_SIDE: u32 = contract::VAE_SPATIAL_RATIO * 2;
 
 /// Vision-tower patch edge in pixels (`minimax_h3_vision_config().patch_size`).
-const VISION_PATCH: u32 = 16;
+pub(crate) const VISION_PATCH: u32 = 16;
 
 /// Presentation tokens around each reference's merged vision block: the `Picture i: ` label and
 /// the vision start/end markers. A bound, not a tokenizer count.
@@ -415,7 +415,11 @@ fn mul(a: u64, b: u64) -> gen_core::Result<u64> {
 }
 
 /// Bytes of the tensors under `path` that `keep` selects, floats at `width` bytes.
-fn header_bytes(path: &Path, width: u64, keep: impl Fn(&str) -> bool) -> gen_core::Result<u64> {
+pub(crate) fn header_bytes(
+    path: &Path,
+    width: u64,
+    keep: impl Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     weightsmeta::safetensors_path_tensor_headers(path)?
         .iter()
         .filter(|h| keep(&h.name))
@@ -552,7 +556,7 @@ impl ImageMemoryFacts {
 /// covers scores, scaling and softmax), and the FFN's budget-chunked gate/up/product with the
 /// concatenated chunk outputs. Attention and FFN do not overlap.
 #[allow(clippy::too_many_arguments)]
-fn block_working_bytes(
+pub(crate) fn block_working_bytes(
     rows: u64,
     hidden: u64,
     heads: u64,
@@ -850,7 +854,7 @@ pub(crate) fn tiled_encode_bytes(facts: &ImageMemoryFacts, pixels: u64) -> gen_c
 
 /// `(hidden, heads, head_dim, mlp)` of the Qwen3-VL tower H3 ships
 /// ([`crate::text_encoder::minimax_h3_vision_config`]).
-fn minimax_vision_dims() -> (u64, u64, u64, u64) {
+pub(crate) fn minimax_vision_dims() -> (u64, u64, u64, u64) {
     let c = crate::text_encoder::minimax_h3_vision_config();
     let hidden = c.hidden_size as u64;
     let heads = c.num_heads as u64;

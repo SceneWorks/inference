@@ -168,54 +168,38 @@ struct WarmComponents {
     dit: Option<crate::dit::PreparedImageDit>,
     /// The image VAE's decode half.
     decoder: Option<MiniMaxH3ImageVae>,
+    /// The per-component warm weights of the resident request that last kept this set.
+    priced: Option<crate::image_memory_strategy::admission::WarmWeights>,
 }
 
 impl WarmComponents {
     fn is_empty(&self) -> bool {
         self.conditioner.is_none() && self.dit.is_none() && self.decoder.is_none()
     }
+
+    /// The held components' bytes at `weights`.
+    fn held_bytes(&self, weights: &crate::image_memory_strategy::admission::WarmWeights) -> u64 {
+        [
+            self.conditioner.as_ref().map(|_| weights.conditioner),
+            self.dit.as_ref().map(|_| weights.dit),
+            self.decoder.as_ref().map(|_| weights.decoder),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0u64, u64::saturating_add)
+    }
 }
 
 /// Whether a request may keep its components warm: one whose request memory neither stages nor
-/// streams, or one with no request memory (a resident admission carries none) on a generator not
-/// loaded with [`OffloadPolicy::Sequential`]. Without request memory the load-time policy stands,
-/// and a sequential load asked for each component to be dropped after its phase.
+/// streams ([`crate::warm::keeps_components_warm`]), or one with no request memory (a resident
+/// admission carries none) on a generator not loaded with [`OffloadPolicy::Sequential`]. Without
+/// request memory the load-time policy stands, and a sequential load asked for each component to
+/// be dropped after its phase.
 fn keeps_components_warm(req: &GenerationRequest, load_policy: OffloadPolicy) -> bool {
     match req.memory {
-        Some(memory) => !memory.stage_residency && !memory.stream_transformer_blocks,
+        Some(_) => crate::warm::keeps_components_warm(req),
         None => load_policy != OffloadPolicy::Sequential,
     }
-}
-
-/// Device memory a warm request leaves free above its estimate — the same 2 GiB allocator slack
-/// the worker's admission keeps.
-const WARM_RESERVE_BYTES: u64 = 2 << 30;
-
-/// Whether a warm set needing `need` device bytes at its peak fits, given the device's `free`
-/// bytes (`None` off CUDA, where nothing is kept warm), the `held` bytes this generator already
-/// keeps warm (they are part of `need` and already allocated) and, when the request carries an
-/// admitted context, that context's `admitted` budget (which already credits this generator's
-/// own residency as reclaimable), so a warm set never outgrows what the caller granted.
-fn warm_set_fits(need: u64, held: u64, free: Option<u64>, admitted: Option<u64>) -> bool {
-    free.is_some_and(|free| need.saturating_add(WARM_RESERVE_BYTES) <= free.saturating_add(held))
-        && admitted.is_none_or(|budget| need <= budget)
-}
-
-/// The device's free bytes as the CUDA driver reports them after pending work completes; `None`
-/// on any other device.
-fn device_free_bytes(device: &Device) -> Option<u64> {
-    #[cfg(feature = "cuda")]
-    if let Ok(cuda) = device.as_cuda_device() {
-        device.synchronize().ok()?;
-        return cuda
-            .cuda_stream()
-            .context()
-            .mem_get_info()
-            .ok()
-            .map(|(free, _total)| free as u64);
-    }
-    let _ = device;
-    None
 }
 
 /// The loaded `minimax_h3_image` provider. A staged or streamed request maps and releases each
@@ -495,9 +479,9 @@ impl MiniMaxH3Image {
 
     /// Whether this request's warm set fits the device now (see the module docs), logging the
     /// figures the decision used. `false` when the sources' headers could not be read.
-    fn warm_set_fits_now(&self, req: &GenerationRequest, warm: &WarmComponents) -> bool {
+    fn warm_set_fits_now(&self, req: &GenerationRequest, warm: &mut WarmComponents) -> bool {
         use crate::image_memory_strategy::admission::{
-            decimal_gb, ladder, warm_estimate, warm_weights, ImageRequestShape,
+            ladder, warm_estimate, warm_weights, ImageRequestShape,
         };
         let Some(facts) = self.memory_facts.as_ref() else {
             return false;
@@ -527,35 +511,16 @@ impl MiniMaxH3Image {
             }
         };
         let weights = warm_weights(facts, has_references);
-        let held = [
-            warm.conditioner.as_ref().map(|_| weights.conditioner),
-            warm.dit.as_ref().map(|_| weights.dit),
-            warm.decoder.as_ref().map(|_| weights.decoder),
-        ]
-        .into_iter()
-        .flatten()
-        .sum::<u64>();
-        let free = device_free_bytes(&self.device);
-        let admitted = crate::memory_strategy::active_context()
-            .map(|context| context.budget.effective_bytes());
-        let need = plan.peak_device_bytes();
-        let fits = warm_set_fits(need, held, free, admitted);
-        tracing::info!(
-            event = "minimax_h3_image_warm_decision",
-            keep_warm = fits,
-            warm_peak_gb = decimal_gb(need),
-            held_warm_gb = decimal_gb(held),
-            device_free_gb = free.map(decimal_gb),
-            admitted_budget_gb = admitted.map(decimal_gb),
-            reserve_gb = decimal_gb(WARM_RESERVE_BYTES),
-            "minimax-h3-image: {}",
-            if fits {
-                "the warm set fits; keeping the text encoder, DiT and VAE decoder resident"
-            } else {
-                "the warm set does not fit; staging this request"
-            }
+        let held = warm.held_bytes(&weights);
+        let decision =
+            crate::warm::WarmDecision::decide(plan.peak_device_bytes(), held, &self.device);
+        warm.priced = decision.keep_warm.then_some(weights);
+        decision.log(
+            "minimax_h3_image_warm_decision",
+            "minimax-h3-image",
+            "text encoder, DiT and VAE decoder",
         );
-        fits
+        decision.keep_warm
     }
 
     fn generate_impl(
@@ -608,7 +573,7 @@ impl MiniMaxH3Image {
         let mut warm = candle_gen::lock_recover(&self.warm);
         let resident = keeps_components_warm(req, self.spec.offload_policy)
             && crate::block_stream::current().is_none()
-            && self.warm_set_fits_now(req, &warm);
+            && self.warm_set_fits_now(req, &mut warm);
         if !resident && !warm.is_empty() {
             *warm = WarmComponents::default();
             crate::dit::release_device_memory(&self.device)?;
@@ -819,6 +784,22 @@ impl Generator for MiniMaxH3Image {
         &self.descriptor
     }
 
+    /// The warm set a resident request left on the device, at the weights that request priced it
+    /// at. `None` when nothing is held, or while a render holds the set (no credit is the safe
+    /// answer).
+    fn retained_weight_bytes(&self) -> Option<u64> {
+        let warm = match self.warm.try_lock() {
+            Ok(warm) => warm,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let held = warm
+            .priced
+            .as_ref()
+            .map_or(0, |weights| warm.held_bytes(weights));
+        (held > 0).then_some(held)
+    }
+
     fn validate(&self, req: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
         validate_image_request(&self.descriptor, req)
     }
@@ -960,38 +941,6 @@ mod tests {
         }
     }
 
-    /// Only a request that neither stages nor streams may keep the components warm; a resident
-    /// admission carries no request memory at all.
-    #[test]
-    fn only_a_resident_request_keeps_components_warm() {
-        use candle_gen::gen_core::GenerationMemory;
-        let resident = OffloadPolicy::Resident;
-        let mut req = request(2048, 2048);
-        assert!(
-            keeps_components_warm(&req, resident),
-            "no request memory is a resident request"
-        );
-        req.memory = Some(GenerationMemory::default());
-        assert!(keeps_components_warm(&req, resident));
-        req.memory = Some(GenerationMemory {
-            stage_residency: true,
-            ..Default::default()
-        });
-        assert!(
-            !keeps_components_warm(&req, resident),
-            "a staged request stages"
-        );
-        req.memory = Some(GenerationMemory {
-            stage_residency: true,
-            stream_transformer_blocks: true,
-            ..Default::default()
-        });
-        assert!(
-            !keeps_components_warm(&req, resident),
-            "a streamed request streams"
-        );
-    }
-
     /// A generator loaded with `OffloadPolicy::Sequential` keeps nothing warm for a request with
     /// no request memory: the load asked for each component to be dropped after its phase. A
     /// request's own memory policy still decides when it carries one.
@@ -1009,34 +958,6 @@ mod tests {
             keeps_components_warm(&req, sequential),
             "an explicit resident request memory overrides the load default"
         );
-    }
-
-    /// The warm set fits when its peak plus the reserve is within the free memory plus what is
-    /// already held warm, and within an admitted context's budget; with no CUDA free figure
-    /// nothing is kept warm.
-    #[test]
-    fn the_warm_set_fits_only_within_free_plus_held_memory() {
-        const GB: u64 = 1_000_000_000;
-        // q8-sized warm set on an empty 96 GB-class card: fits.
-        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB), None));
-        // The same set already warm: the card reports only what is left, plus what is held.
-        assert!(warm_set_fits(66 * GB, 60 * GB, Some(40 * GB), None));
-        // bf16's ~126 GB warm set never fits that card, warm or cold.
-        assert!(!warm_set_fits(126 * GB, 0, Some(100 * GB), None));
-        // The reserve is kept: an exact fit with no slack is refused.
-        assert!(!warm_set_fits(100 * GB, 0, Some(100 * GB), None));
-        assert!(warm_set_fits(
-            100 * GB - WARM_RESERVE_BYTES,
-            0,
-            Some(100 * GB),
-            None
-        ));
-        // An admitted context's budget bounds the warm set even when the card has room.
-        assert!(warm_set_fits(66 * GB, 0, Some(100 * GB), Some(66 * GB)));
-        assert!(!warm_set_fits(66 * GB, 0, Some(100 * GB), Some(60 * GB)));
-        // Off CUDA there is no free figure, so nothing is kept warm.
-        assert!(!warm_set_fits(GB, 0, None, None));
-        assert_eq!(device_free_bytes(&Device::Cpu), None);
     }
 
     /// The descriptor is its own image family — not H3 video's id, modality or flags.
@@ -1328,6 +1249,13 @@ mod tests {
             memory_facts: None,
         };
         (tmp, model)
+    }
+
+    /// A provider that holds nothing warm grants no reclaimable credit.
+    #[test]
+    fn an_empty_warm_set_retains_nothing() {
+        let (_tmp, model) = caption_fixture();
+        assert_eq!(model.retained_weight_bytes(), None);
     }
 
     #[test]
