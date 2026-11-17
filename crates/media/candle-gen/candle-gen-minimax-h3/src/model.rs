@@ -694,21 +694,29 @@ pub(crate) fn run_conditioner(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<candle_gen::candle_core::Tensor> {
     with_conditioner(te_dir, device, |te| {
-        candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
-            None => te.forward(ids, mask),
-            Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
-        })
+        conditioner_forward(te, ids, mask, grounded, on_progress)
     })
 }
 
-/// Keep one prepared conditioner alive for a phase containing multiple independent prompts.
-/// The streamed route still keeps its stack on the host and copies only the current layer.
-/// Release the stack before returning, including when a prompt fails or is cancelled.
-pub(crate) fn with_conditioner<T>(
-    te_dir: &Path,
-    device: &Device,
-    encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
-) -> Result<T> {
+/// One conditioner pass over an already-loaded encoder: the prompt (and an edit's grounded vision
+/// rows) through the layer-50 tap. Shared by the staged [`run_conditioner`] and a resident
+/// generator's warm encoder.
+pub(crate) fn conditioner_forward(
+    te: &MiniMaxH3TextEncoder,
+    ids: &candle_gen::candle_core::Tensor,
+    mask: &candle_gen::candle_core::Tensor,
+    grounded: Option<&crate::text_encoder::GroundedVision>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<candle_gen::candle_core::Tensor> {
+    candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
+        None => te.forward(ids, mask),
+        Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
+    })
+}
+
+/// Load the layer-50 conditioner onto `device` — or, inside a streamed request (rung 4), onto the
+/// host with its one-layer device window prepared. The one conditioner load site.
+pub(crate) fn load_conditioner(te_dir: &Path, device: &Device) -> Result<MiniMaxH3TextEncoder> {
     let cfg = MiniMaxH3TeConfig::from_component_dir(te_dir)?;
     let shards = candle_gen::loader::sorted_safetensors(te_dir, "minimax-h3 te")?;
     let prefixes = lm_prefixes(LM_PREFIX, &cfg);
@@ -733,6 +741,18 @@ pub(crate) fn with_conditioner<T>(
         }
         te.prepare_streamed(&cfg, device)?;
     }
+    Ok(te)
+}
+
+/// Keep one prepared conditioner alive for a phase containing multiple independent prompts.
+/// The streamed route still keeps its stack on the host and copies only the current layer.
+/// Release the stack before returning, including when a prompt fails or is cancelled.
+pub(crate) fn with_conditioner<T>(
+    te_dir: &Path,
+    device: &Device,
+    encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
+) -> Result<T> {
+    let te = load_conditioner(te_dir, device)?;
     let result = encode(&te);
     // Candle is eager: no output retains the encoder's weights or a lazy forward graph.
     drop(te);
@@ -3213,10 +3233,16 @@ mod tests {
     /// anchor and the inner `MiniMaxH3Dit::load` lives one call deeper. Exempting it here is only
     /// safe because the pairing below is asserted in both directions — a helper listed here that no
     /// phase actually names as a map would be an uncovered hole, and reds.
+    ///
+    /// `load_conditioner` is the fourth: the one conditioner load site, which `with_conditioner`
+    /// names as its map and releases after the encode. (MiniMax-H3-Image's resident route also
+    /// calls it and deliberately keeps the encoder warm across requests; that caller lives in
+    /// `image_model.rs`, whose warm set is priced by `admission::warm_estimate`.)
     const DELEGATED_HELPERS: &[&str] = &[
         "fn load_audio_encoder(",
         "fn load_audio_vae(",
         "fn load_task_dit(",
+        "fn load_conditioner(",
     ];
 
     /// **The staged phases of every staging function in this file, in source order** — the table
@@ -3262,8 +3288,8 @@ mod tests {
                 "fn with_conditioner<T>(",
                 &[(
                     "the 66.7 GB Qwen3-VL-32B text encoder",
-                    TE_MAPS,
-                    &["drop(w);", "drop(te);"],
+                    &["load_conditioner("],
+                    &["drop(te);"],
                 )],
             ),
             (
@@ -3499,12 +3525,14 @@ mod tests {
             .map(|(signature, _)| body_of(&src, signature))
             .collect();
         for helper in DELEGATED_HELPERS {
-            // `fn load_audio_vae(` -> `self.load_audio_vae(`, the anchor a phase must name.
-            let anchor = format!("self.{}", helper.trim_start_matches("fn "));
+            // `fn load_audio_vae(` -> `self.load_audio_vae(` (a method) or `load_conditioner(` (a
+            // free function), the anchor a phase must name.
+            let call = helper.trim_start_matches("fn ");
+            let anchor = format!("self.{call}");
             let named = staged
                 .iter()
                 .flat_map(|(_, phases)| phases.iter())
-                .any(|(_, maps, _)| maps.contains(&anchor.as_str()));
+                .any(|(_, maps, _)| maps.contains(&anchor.as_str()) || maps.contains(&call));
             assert!(
                 named,
                 "`{helper}` is exempted as a delegated helper but no phase names `{anchor}` as a \

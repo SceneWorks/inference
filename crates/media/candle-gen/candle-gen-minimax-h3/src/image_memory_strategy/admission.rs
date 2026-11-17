@@ -19,7 +19,14 @@
 //!
 //! Successive lifetimes take a **maximum**, never a sum: the generator stages vision tower → text
 //! encoder → VAE encoder → DiT → VAE decoder, releasing and synchronizing each before the next
-//! (rung 1). Host and GPU bytes are separate columns of every phase. [`decimal_gb`] and
+//! (rung 1). Host and GPU bytes are separate columns of every phase.
+//!
+//! A resident request ([`MemoryStrategy::Resident`]) is admitted at that staged price, because the
+//! generator falls back to staging whenever its warm components do not fit. Whether they fit is
+//! [`warm_estimate`]: the same phases, each also carrying the warm weights of the components it
+//! does not itself run ([`warm_weights`]) — the conditioner, the evicted DiT and the VAE decode
+//! half the generator keeps on the device between requests. Its denoise phase prices the DiT load
+//! and AdaLN precompute with the conditioner and decoder still resident. [`decimal_gb`] and
 //! [`binary_gib`] are the only unit conversions, and every rendering names which one it uses.
 
 use std::fmt;
@@ -759,6 +766,72 @@ pub fn estimate(
     })
 }
 
+/// The per-phase estimate of `shape` when the generator keeps its components warm: [`estimate`]
+/// at `selection`, with every phase also carrying the warm weights of the components it does not
+/// itself run. `Err` for a selection that stages or streams, which keeps nothing warm.
+pub fn warm_estimate(
+    contract: &MemoryProviderContract,
+    facts: &ImageMemoryFacts,
+    shape: &ImageRequestShape,
+    selection: &MemorySelection,
+) -> gen_core::Result<ImageMemoryEstimate> {
+    if contract.engages_selection(selection, MemoryStrategy::StagedResidency)
+        || contract.engages_selection(selection, MemoryStrategy::BoundedTransformerResidency)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{IMAGE_MODEL_ID}: {:?} stages its components; nothing is kept warm",
+            selection.strategy
+        )));
+    }
+    let mut plan = estimate(contract, facts, shape, selection)?;
+    let warm = warm_weights(facts, !shape.references.is_empty());
+    for phase in &mut plan.phases {
+        // Everything warm that this phase does not already price as its own weights.
+        let others = match phase.phase {
+            ImagePhase::Conditioning => add_all([warm.dit, warm.decoder])?,
+            ImagePhase::Denoise => add_all([warm.conditioner, warm.decoder])?,
+            ImagePhase::Decode => add_all([warm.conditioner, warm.dit])?,
+            ImagePhase::VisionTower | ImagePhase::ReferenceEncode => {
+                add_all([warm.conditioner, warm.dit, warm.decoder])?
+            }
+        };
+        phase.device_bytes = add_all([phase.device_bytes, others])?;
+    }
+    Ok(plan)
+}
+
+/// The device bytes a resident generator keeps warm between requests, per component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmWeights {
+    /// The layer-50 conditioner's weights.
+    pub conditioner: u64,
+    /// The DiT after the AdaLN precompute-and-evict: its resident weights less the evicted
+    /// `adaln_proj` stack, plus the retained modulation table and the adapter stack.
+    pub dit: u64,
+    /// The image VAE's f32 decode half.
+    pub decoder: u64,
+}
+
+/// See [`WarmWeights`]. `has_references` adds the reference rows' `0.999` timestep to the table.
+pub fn warm_weights(facts: &ImageMemoryFacts, has_references: bool) -> WarmWeights {
+    let timesteps = u64::from(contract::FIXED_STEPS) + u64::from(has_references);
+    WarmWeights {
+        conditioner: facts.te.peak_bytes(None),
+        dit: facts
+            .task
+            .resident_bytes
+            .saturating_sub(facts.task.evicted_bytes)
+            .saturating_add(
+                facts
+                    .task
+                    .table_bytes_per_timestep
+                    .saturating_mul(timesteps),
+            )
+            .saturating_add(facts.adapter_resident),
+        decoder: facts.decoder_bytes,
+    }
+}
+
 /// The image VAE's tiled encode of one `pixels`-pixel image on the device: the f32 encoder, one
 /// overlapped tile's live feature maps (the encoder tiles at the shipped 256 / 64 by default,
 /// [`crate::spatial_tiling::TILING_IS_ON_BY_DEFAULT`]), the f32 pixels in and the posterior (mean
@@ -1113,6 +1186,55 @@ mod tests {
             &selection(&c, MemoryStrategy::BoundedTransformerResidency)
         )
         .is_err());
+    }
+
+    /// The warm estimate prices each phase as the staged phase plus the warm weights of every other
+    /// component. At bf16 the conditioner and the DiT cannot be co-resident on a 96 GB card, while
+    /// the resident rung stays admitted at the staged price (the generator stages when the warm set
+    /// does not fit).
+    #[test]
+    fn the_warm_estimate_prices_the_components_together() {
+        let c = contract(LoadShape::EagerMaterialization);
+        let facts = shipped_scale_facts(0);
+        let shape = ImageRequestShape::text_to_image(2048, 2048);
+        let resident_selection = selection(&c, MemoryStrategy::Resident);
+        let staged_selection = selection(&c, MemoryStrategy::StagedResidency);
+        let staged = estimate(&c, &facts, &shape, &staged_selection).unwrap();
+        let resident = estimate(&c, &facts, &shape, &resident_selection).unwrap();
+        assert_eq!(
+            resident.phases, staged.phases,
+            "rung 0 is admitted at the staged price"
+        );
+        let warm_plan = warm_estimate(&c, &facts, &shape, &resident_selection).unwrap();
+        let warm = warm_weights(&facts, false);
+        assert!(
+            warm.dit < facts.task.resident_bytes,
+            "the warm DiT is the evicted one"
+        );
+        for (s, w) in staged.phases.iter().zip(&warm_plan.phases) {
+            let others = match s.phase {
+                ImagePhase::Conditioning => warm.dit + warm.decoder,
+                ImagePhase::Denoise => warm.conditioner + warm.decoder,
+                ImagePhase::Decode => warm.conditioner + warm.dit,
+                _ => unreachable!("text-to-image has no reference phases"),
+            };
+            assert_eq!(w.device_bytes, s.device_bytes + others, "{:?}", s.phase);
+            assert_eq!(w.host_bytes, s.host_bytes, "{:?}", s.phase);
+        }
+        // bf16: ~126 GB warm against ~66 GB staged — more than a 96 GB card holds.
+        assert!(warm_plan.peak_device_bytes() > 110 * GB, "{warm_plan}");
+        assert!(staged.peak_device_bytes() < 70 * GB, "{staged}");
+        // A staging selection keeps nothing warm.
+        assert!(warm_estimate(&c, &facts, &shape, &staged_selection).is_err());
+        // An edit's reference phases also carry every warm component.
+        let edit = ImageRequestShape::with_reference_count(2048, 2048, 1);
+        let staged = estimate(&c, &facts, &edit, &staged_selection).unwrap();
+        let warm_plan = warm_estimate(&c, &facts, &edit, &resident_selection).unwrap();
+        let warm = warm_weights(&facts, true);
+        assert_eq!(
+            warm_plan.phases[0].device_bytes,
+            staged.phases[0].device_bytes + warm.conditioner + warm.dit + warm.decoder
+        );
     }
 
     /// The contract's stream facts: the trunk plus one entry per block, summing to the DiT.
