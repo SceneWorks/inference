@@ -134,8 +134,15 @@ pub fn checkpointed_backward_with_input_grad(
     //    its (non-detached) `out` goes out of scope at the end of the iteration.
     let mut states: Vec<Vec<Tensor>> = Vec::with_capacity(segments.len() + 1);
     states.push(detach_all(inputs));
+    // The profile spans are inert (a plain call) unless a manual profiling scope is active.
+    let device = inputs
+        .first()
+        .map(|t| t.device().clone())
+        .unwrap_or(candle_core::Device::Cpu);
     for (i, seg) in segments.iter().enumerate() {
-        let out = seg(states.last().unwrap())?;
+        let out = super::profile::span("checkpoint_forward", &device, || {
+            seg(states.last().unwrap())
+        })?;
         if out.is_empty() {
             return Err(CandleError::Msg(format!(
                 "checkpointed_backward: segment {i} returned an empty state"
@@ -172,7 +179,8 @@ pub fn checkpointed_backward_with_input_grad(
             .map(Var::from_tensor)
             .collect::<CandleResult<_>>()?;
         let in_tensors: Vec<Tensor> = in_vars.iter().map(|v| v.as_tensor().clone()).collect();
-        let out = segments[i](&in_tensors)?;
+        let out =
+            super::profile::span("checkpoint_recompute", &device, || segments[i](&in_tensors))?;
         if out.len() != cot.len() {
             return Err(CandleError::Msg(format!(
                 "checkpointed_backward: segment {i} produced {} output(s) on recompute but its \
@@ -192,9 +200,8 @@ pub fn checkpointed_backward_with_input_grad(
                 Some(s) => (s + term)?,
             });
         }
-        let grads = surrogate
-            .expect("out is non-empty (checked in the stash pass)")
-            .backward()?;
+        let surrogate = surrogate.expect("out is non-empty (checked in the stash pass)");
+        let grads = super::profile::span("checkpoint_backward", &device, || surrogate.backward())?;
 
         // The previous boundary's cotangent = grad w.r.t. each input `Var` (absent ⇒ zero). Detach so
         // the recompute graph is free to drop at the end of this iteration.
