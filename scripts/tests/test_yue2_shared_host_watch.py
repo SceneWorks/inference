@@ -62,6 +62,9 @@ def reviewed_gpu1_snapshot():
     return data
 
 
+STRICT = "gpu0-with-reviewed-gpu1"
+
+
 def transition_fixture():
     data = own_snapshot()
     data["checked_at"] = "2026-10-04T20:02:00Z"
@@ -114,7 +117,8 @@ class SharedHostWatchTests(unittest.TestCase):
         foreign_key = ("SceneWorks/SceneWorks", 99)
         foreign["runs"][foreign_key] = {"id": 99, "status": "queued"}
         foreign["jobs"][foreign_key] = []
-        with self.assertRaisesRegex(RuntimeError, "foreign run has no allocated jobs"):
+        # The default route observes the foreign reservation; only the owned transition remains.
+        with self.assertRaises(watch.OwnedInventoryTransition):
             watch.classify(foreign, 7, SHA, "yue2-precision-proof.yml",
                            mode="shared-host", owned_binding=foreign_binding)
 
@@ -199,11 +203,15 @@ class SharedHostWatchTests(unittest.TestCase):
             with patch.object(watch, "bind_owned_job", return_value=binding) as auth, \
                  patch.object(watch, "owned_run", return_value=direct), \
                  patch.object(watch, "snapshot", return_value=stale) as snapshots, \
+                 patch.object(watch.time, "sleep"), \
                  patch.object(watch, "cancel_bound_run") as cancel:
-                with self.assertRaisesRegex(RuntimeError, "foreign run has no allocated jobs"):
+                # The foreign reservation is observed; the stale owned state is retried, bounded,
+                # and only then cancels the owned run.
+                with self.assertRaisesRegex(RuntimeError, "owned aggregate state remained unresolved"):
                     watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "bad",
                                 60, 30, 70, "cuda-windows", 2313, mode="shared-host")
-            self.assertEqual((auth.call_count, snapshots.call_count), (1, 1))
+            self.assertEqual((auth.call_count, snapshots.call_count),
+                             (watch.SHARED_GPU1_INVENTORY_ATTEMPTS, watch.SHARED_GPU1_INVENTORY_ATTEMPTS))
             cancel.assert_called_once()
 
         with tempfile.TemporaryDirectory() as directory:
@@ -379,18 +387,22 @@ class SharedHostWatchTests(unittest.TestCase):
                             70, "cuda-windows", 2313, mode="shared-gpu1")
             self.assertEqual((auth.call_count, snapshots.call_count), (2, 2))
             cancel.assert_not_called()
+        # The default shared-host route retains an incomplete foreign inventory the same way;
+        # the strict refusal remains only on the retired GPU0 route (tested below).
         incomplete = watch.InventorySnapshotError("truncated paginated inventory", "queued", [])
         with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "watch"
             with patch.object(watch, "bind_owned_job", return_value=bound) as auth, \
-                 patch.object(watch, "owned_run", return_value=direct), \
+                 patch.object(watch, "owned_run", side_effect=[direct, {**direct, "status": "completed"}]), \
                  patch.object(watch, "snapshot", side_effect=incomplete) as snapshots, \
+                 patch.object(watch.time, "sleep"), \
                  patch.object(watch, "cancel_bound_run") as cancel:
-                with self.assertRaisesRegex(RuntimeError, "truncated paginated inventory"):
-                    watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
-                                60, 30, 70, "cuda-windows", 2313, mode="shared-host")
-            auth.assert_called_once()
-            snapshots.assert_called_once()
-            cancel.assert_called_once()
+                watch.watch(7, SHA, "yue2-precision-proof.yml", output,
+                            60, 30, 70, "cuda-windows", 2313, mode="shared-host")
+            self.assertEqual(snapshots.call_count, watch.SHARED_GPU1_INVENTORY_ATTEMPTS)
+            self.assertEqual(auth.call_count, 1 + watch.SHARED_GPU1_INVENTORY_ATTEMPTS)
+            cancel.assert_not_called()
+            self.assertTrue((output / "incomplete-foreign-inventory-0001.json").is_file())
 
     def test_shared_gpu1_repeated_capture_count_failures_resume_then_terminal(self):
         # The rejected CUDA37328223930 pages: queued total 1/rows 0 twice,
@@ -571,8 +583,9 @@ class SharedHostWatchTests(unittest.TestCase):
         self.assertEqual(proof["own_job"], 70)
         self.assertEqual(proof["foreign_runs_observed"],
                          [{"repository": key[0], "run_id": 99, "status": "queued", "job_count": 0}])
-        with self.assertRaisesRegex(RuntimeError, "unaccounted busy"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode="shared-host")
+        # The default route records the same foreign work instead of refusing it.
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode="shared-host"),
+                         proof)
         data["runs"][("SceneWorks/inference", 7)]["head_sha"] = "c" * 40
         with self.assertRaisesRegex(RuntimeError, "owned run/source"):
             watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode="shared-gpu1")
@@ -593,6 +606,11 @@ class SharedHostWatchTests(unittest.TestCase):
                            mode="shared-gpu1", own_job_name="cuda_diagnostic")
 
     def test_shared_gpu1_watch_keeps_owned_run_when_foreign_cuda_job_is_active(self):
+        for mode in ("shared-host", "shared-gpu1"):
+            with self.subTest(mode=mode):
+                self._watch_keeps_owned_run_with_foreign_cuda_job(mode)
+
+    def _watch_keeps_owned_run_with_foreign_cuda_job(self, mode):
         with tempfile.TemporaryDirectory() as directory:
             data = own_snapshot()
             data["runners"]["org"][1]["busy"] = True
@@ -613,7 +631,7 @@ class SharedHostWatchTests(unittest.TestCase):
                  patch.object(watch.time, "sleep"), \
                  patch.object(watch, "cancel_bound_run") as cancel:
                 watch.watch(7, SHA, "yue2-precision-proof.yml", Path(directory) / "watch",
-                            60, 30, 70, "cuda-windows", 2313, mode="shared-gpu1")
+                            60, 30, 70, "cuda-windows", 2313, mode=mode)
             cancel.assert_not_called()
 
     def test_unused_app_listeners_may_be_offline_but_owned_runner_must_be_online(self):
@@ -621,9 +639,9 @@ class SharedHostWatchTests(unittest.TestCase):
         for row in data["runners"]["app"]:
             row["status"] = "offline"
         self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml")["own_job"], 70)
+        # A busy foreign listener is another job on the host: recorded, never a refusal.
         data["runners"]["app"][0]["busy"] = True
-        with self.assertRaisesRegex(RuntimeError, "unaccounted busy"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+        self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml")["own_job"], 70)
         data["runners"]["app"][0]["busy"] = False
         data["runners"]["org"][0]["status"] = "offline"
         with self.assertRaisesRegex(RuntimeError, "owned CUDA runner is offline"):
@@ -704,19 +722,24 @@ class SharedHostWatchTests(unittest.TestCase):
             cancel.assert_called_once()
             self.assertEqual(cancel.call_args.args[0],
                              ["gh", "run", "cancel", "7", "-R", "SceneWorks/inference"])
-    def test_only_exact_owned_job_and_four_known_idle_other_runners_pass(self):
+    def test_default_route_records_foreign_work_but_strict_route_refuses_it(self):
         data = own_snapshot()
         self.assertEqual(watch.classify(data, 7, SHA, "yue2-precision-proof.yml")["own_job"], 70)
         foreign = {"id": 8, "status": "queued", "head_sha": "b" * 40}
         data["runs"][("SceneWorks/inference", 8)] = foreign
         data["jobs"][("SceneWorks/inference", 8)] = []
+        data["runners"]["app"][0]["busy"] = True
+        proof = watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+        self.assertEqual(proof["foreign_runs_observed"],
+                         [{"repository": "SceneWorks/inference", "run_id": 8,
+                           "status": "queued", "job_count": 0}])
+        strict = reviewed_gpu1_snapshot()
+        strict["runs"][("SceneWorks/inference", 8)] = foreign
+        strict["jobs"][("SceneWorks/inference", 8)] = []
         with self.assertRaisesRegex(RuntimeError, "foreign run has no allocated jobs"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+            watch.classify(strict, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
         del data["runs"][("SceneWorks/inference", 8)]
         del data["jobs"][("SceneWorks/inference", 8)]
-        data["runners"]["app"][0]["busy"] = True
-        with self.assertRaisesRegex(RuntimeError, "unaccounted busy"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
         data["runners"]["app"][0]["busy"] = False
         data["runners"]["app"].append({"name": "cuda-windows-5", "id": 25,
                                           "status": "online", "busy": False,
@@ -725,22 +748,28 @@ class SharedHostWatchTests(unittest.TestCase):
             watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
 
     def test_source_qualified_allocated_cpu_job_may_coexist_but_unknown_cannot(self):
-        data = own_snapshot()
+        # Strict foreign-job classification survives only on the retired reviewed-GPU1 route.
+        data = reviewed_gpu1_snapshot()
         key = ("SceneWorks/SceneWorks", 9)
         data["runs"][key] = {"id": 9, "status": "in_progress"}
         data["jobs"][key] = [{"id": 90, "status": "in_progress", "labels": ["ubuntu-latest"],
                               "runner_name": "GitHub Actions 2", "runner_id": 100}]
-        watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+        watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
         data["jobs"][key][0]["labels"] = ["cuda", "self-hosted"]
         with self.assertRaisesRegex(RuntimeError, "foreign CUDA or unknown"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
+        # The default route records the same foreign CUDA job.
+        default = own_snapshot()
+        default["runs"][key] = data["runs"][key]
+        default["jobs"][key] = data["jobs"][key]
+        self.assertEqual(watch.classify(default, 7, SHA, "yue2-precision-proof.yml")["own_job"], 70)
         data["jobs"][key][0]["labels"] = ["ubuntu-latest"]
         data["jobs"][key][0]["runner_name"] = "cuda-windows-3"
         with self.assertRaisesRegex(RuntimeError, "foreign CUDA or unknown"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
 
     def test_exact_two_historical_zero_job_exceptions_only(self):
-        data = own_snapshot()
+        data = reviewed_gpu1_snapshot()
         data["legacy_direct"] = {}
         for rid, (sha, attempt, created, updated) in watch.LEGACY_ZERO_JOB.items():
             row = {
@@ -751,25 +780,27 @@ class SharedHostWatchTests(unittest.TestCase):
             data["legacy_direct"][("SceneWorks/inference", rid)] = {
                 **row, "repository": {"full_name": "SceneWorks/inference"}}
             data["jobs"][("SceneWorks/inference", rid)] = []
-        self.assertEqual(set(watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+        self.assertEqual(set(watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
                              ["historical_zero_job_runs"]), set(watch.LEGACY_ZERO_JOB))
         first = next(iter(watch.LEGACY_ZERO_JOB))
         data["runs"][("SceneWorks/inference", first)]["updated_at"] = "changed"
         with self.assertRaisesRegex(RuntimeError, "direct run readback"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
 
     def test_nonterminal_run_with_only_completed_jobs_is_unknown(self):
-        data = own_snapshot()
+        data = reviewed_gpu1_snapshot()
         key = ("SceneWorks/SceneWorks", 9)
         data["runs"][key] = {"id": 9, "status": "in_progress"}
         data["jobs"][key] = [{"id": 90, "status": "completed", "conclusion": "success"}]
         with self.assertRaisesRegex(RuntimeError, "no active assigned"):
-            watch.classify(data, 7, SHA, "yue2-precision-proof.yml")
+            watch.classify(data, 7, SHA, "yue2-precision-proof.yml", mode=STRICT)
 
     def test_watch_cancels_only_authenticated_owned_run_on_foreign_actor(self):
         with tempfile.TemporaryDirectory() as directory:
+            # Only the retired strict route still refuses a foreign actor.
             output = Path(directory) / "new-watch"
-            data = own_snapshot()
+            data = reviewed_gpu1_snapshot()
+            data["checked_at"] = "2026-10-04T20:02:00Z"
             data["runs"][("SceneWorks/SceneWorks", 9)] = {"id": 9, "status": "queued"}
             data["privateToken"] = "must-not-be-retained"
             direct = {**data["runs"][("SceneWorks/inference", 7)],
@@ -780,11 +811,12 @@ class SharedHostWatchTests(unittest.TestCase):
             with patch.object(watch, "bind_owned_job", return_value=bound), \
                  patch.object(watch, "owned_run", return_value=direct), \
                  patch.object(watch, "api", return_value=direct), \
+                 patch.object(gpu1, "source"), \
                  patch.object(watch, "snapshot", return_value=data), \
                  patch.object(watch.subprocess, "run") as cancel:
                 with self.assertRaisesRegex(RuntimeError, "foreign run has no allocated jobs"):
                     watch.watch(7, SHA, "yue2-precision-proof.yml", output, 60, 30,
-                                70, "cuda-windows", 2313)
+                                70, "cuda-windows-2", 2619, mode=STRICT)
             cancel.assert_called_once()
             self.assertEqual(cancel.call_args.args[0],
                              ["gh", "run", "cancel", "7", "-R", "SceneWorks/inference"])

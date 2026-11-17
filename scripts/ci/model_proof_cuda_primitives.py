@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-GUARD_SHA = "2a08c3476534ae04c99ac6473a2d359304c8bff1ff143c046626861e0dab3a06"
+GUARD_SHA = "e4a000279a5da909dd9c074916dfe2bcdcf7751c849b0dad3080778f4b281a36"
 
 def component(name: str, expected: str):
     file = Path(__file__).resolve().parent / "vendor" / name
@@ -43,11 +43,41 @@ def release_all(handles, locker):
         raise first_error
 
 
-def claim_uuids(uuids, guard, out, deadline, public, locker,
+def required_mib(required_free_bytes: int) -> int:
+    if type(required_free_bytes) is not int or required_free_bytes <= 0:
+        raise RuntimeError("positive per-UUID free-memory requirement is required")
+    return -(-required_free_bytes // 1024**2)
+
+
+WAIT_NOTICE_SECONDS = 60
+
+
+def wait_notice(state: dict, reason: str, clock=time.monotonic) -> None:
+    """Print the current refusal reason at most once per WAIT_NOTICE_SECONDS; never a silent wait."""
+    now = clock()
+    if now - state.get("last", float("-inf")) >= WAIT_NOTICE_SECONDS:
+        state["last"] = now
+        print(f"CUDA admission waiting: {reason}", file=sys.stderr, flush=True)
+
+
+def shortfall(guard, device, required: int) -> str:
+    if not guard.counters_valid(device):
+        return f'{device["uuid"]}: invalid memory counters'
+    return f'{device["uuid"]}: {device["free_mib"]} MiB free < {required} MiB required'
+
+
+def claim_uuids(uuids, guard, out, deadline, public, locker, required_free_bytes,
                 required_indices=None, phase_names=None, clock=time.monotonic, sleep=time.sleep):
+    """Lock every UUID, then admit when each keeps its required free memory on a quiet card.
+
+    Foreign contexts never refuse; the PUBLIC UUID lock is the CI-to-CI mutex and is released
+    on every refusal so other CI jobs can use the card while this one waits.
+    """
     expected = sorted(uuids, key=str.casefold)
     if not expected or len({value.casefold() for value in expected}) != len(expected):
         raise RuntimeError("explicit unique CUDA UUID set is required")
+    needed = {identifier.casefold(): required_mib(required_free_bytes[identifier]) for identifier in expected}
+    notice = {}
     if not public.is_absolute():
         raise RuntimeError("PUBLIC must name the host-global absolute lock namespace")
     started = clock()
@@ -64,9 +94,6 @@ def claim_uuids(uuids, guard, out, deadline, public, locker,
             if not re.fullmatch(r"GPU-[A-Za-z0-9-]+", device["uuid"]):
                 raise RuntimeError("unrecognized physical GPU UUID")
             selected.append(device)
-        if not all(guard.idle(device, processes) for device in selected):
-            sleep(min(1, max(0, deadline - clock())))
-            continue
         handles = []
         busy = False
         directory = public / "SceneWorks" / "gpu-locks"
@@ -93,6 +120,16 @@ def claim_uuids(uuids, guard, out, deadline, public, locker,
             raise
         if busy:
             release_all(handles, locker)
+            wait_notice(notice, "a selected UUID lock is held by another CI job", clock)
+            sleep(min(1, max(0, deadline - clock())))
+            continue
+        # Judged after every lock is taken, but on the inventory read just before locking;
+        # sample_headroom below re-reads each card under the lock before admission.
+        short = [shortfall(guard, device, needed[device["uuid"].casefold()]) for device in selected
+                 if not guard.has_headroom(device, needed[device["uuid"].casefold()])]
+        if short:
+            release_all(handles, locker)
+            wait_notice(notice, "; ".join(short), clock)
             sleep(min(1, max(0, deadline - clock())))
             continue
         try:
@@ -100,17 +137,18 @@ def claim_uuids(uuids, guard, out, deadline, public, locker,
             checked = []
             for device in selected:
                 phase = (phase_names or {}).get(device["uuid"], f'claimed-device-{device["index"]}')
-                current, baseline = guard.sample_baseline(device, out, phase)
+                current, baseline = guard.sample_headroom(device, out, phase, needed[device["uuid"].casefold()])
                 checked.append(current)
                 baselines[device["uuid"]] = baseline
             return checked, handles, baselines, clock() - started
-        except RuntimeError:
+        except RuntimeError as error:
             release_all(handles, locker)
+            wait_notice(notice, f"card not stable across samples: {error}", clock)
             sleep(min(1, max(0, deadline - clock())))
         except BaseException:
             release_all(handles, locker)
             raise
-    raise TimeoutError("exact GPU UUID lock/idle wait exhausted the existing execution budget")
+    raise TimeoutError("exact GPU UUID lock/headroom wait exhausted the existing execution budget")
 
 
 def integers(value):

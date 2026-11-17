@@ -4,14 +4,26 @@
 //! The Windows/Linux sibling of `mlx_gen_minimax_h3::model`. The checkpoint is guidance-distilled —
 //! no negative prompt, no guidance scale, one transformer forward per step.
 //!
-//! # Phases, and why nothing is held resident
+//! # Phases, and when components stay warm
 //!
 //! The three heavy components are **66.71 GB** of Qwen3-VL-32B text encoder, **66.28 GB** of DiT
-//! (40.43 GB once the AdaLN projections are evicted) and **10.42 GB** of video VAE. Holding any two
-//! of them at once does not fit a card that exists, so `MiniMaxH3::generate_impl` builds each
-//! phase's component, uses it, drops it and synchronizes the device before the next.
-//! [`load`](MiniMaxH3::load) therefore holds **paths**, not tensors: it validates that every
+//! (40.43 GB once the AdaLN projections are evicted) and **10.42 GB** of video VAE at bf16. A
+//! staged render builds each phase's component, uses it, drops it and synchronizes the device
+//! before the next. [`load`](MiniMaxH3::load) holds **paths**, not tensors: it validates that every
 //! partition the render needs is present and defers the reads.
+//!
+//! A request whose admitted selection stages or streams (`GenerationMemory::stage_residency` /
+//! `stream_transformer_blocks`) always runs those staged phases. A **resident** request (no request
+//! memory, or one that neither stages nor streams) instead keeps every component it loads warm in
+//! the provider between requests — the vision tower and the layer-50 conditioner, the selected
+//! partition's DiT after its AdaLN precompute-and-evict (keyed on the task and the schedule its
+//! modulation was projected for), the video VAE, the reference-soundtrack encoder and the audio
+//! VAE decoder — when they fit together on the device. "Fit" is the header-derived
+//! `memory_strategy::video_warm_estimate` (every warm component plus the largest phase working
+//! set) plus a 2 GiB reserve, against the device's free memory plus what is already held warm and
+//! against the admitted context's budget (`crate::warm`). A resident request whose warm set does
+//! not fit (bf16 on a 96 GB card) releases any warm components and runs staged, exactly as
+//! before — so admission still prices every request at the staged peak.
 //!
 //! # The offload policy is FORCED, and that is what makes the VRAM gate honest
 //!
@@ -144,8 +156,7 @@ use candle_gen::{CandleError, Result};
 
 use crate::audio_config::{AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::denoise::{JointSchedule, AUDIO_SIGMA_SHIFT, MINIMAX_H3_FPS, VIDEO_SIGMA_SHIFT};
-use crate::dit::adaln::AdaLnResidency;
-use crate::dit::model::{JointDit, MiniMaxH3Dit};
+use crate::dit::model::{JointDit, MiniMaxH3Dit, PreparedJointDit};
 use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
     decoded_frames_to_images, fit_audio_to_video, fl2va_layout, initial_latents,
@@ -262,6 +273,8 @@ pub(crate) fn resolve_seed(req: &GenerationRequest) -> u64 {
 ///
 /// See the module docs: the manifest's measured `vramGbByTier` is a sequential-phase peak, so the
 /// number is only truthful if the load cannot be talked out of the staging it was measured under.
+/// A resident request keeps components warm only after checking the device's free memory itself,
+/// so that price stays the admission price.
 pub const OFFLOAD_POLICY: OffloadPolicy = OffloadPolicy::Sequential;
 
 /// The DiT partition a `t2va` / `fl2va` render denoises from.
@@ -616,11 +629,83 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The loaded `minimax_h3` provider — **paths only**.
+/// One warm component and the device bytes the request that kept it priced it at.
+struct Held<T> {
+    item: T,
+    bytes: u64,
+}
+
+/// The components a resident request keeps on the device between requests (see the module docs).
 ///
-/// Nothing heavy is resident between renders, and nothing heavy is resident between *phases* of one
-/// render either. That is the whole memory design, so the struct that carries it holds no tensors to
-/// make the property structural rather than a habit.
+/// Every slot is filled only by a resident request whose warm estimate fits, and emptied before
+/// any staged or streamed request maps anything.
+#[derive(Default)]
+struct VideoWarm {
+    /// The f32 Qwen3-VL vision tower (fl2va / ref2va).
+    vision: Option<Held<candle_gen_boogu::vision::VisionTower>>,
+    /// The layer-50 conditioner.
+    conditioner: Option<Held<MiniMaxH3TextEncoder>>,
+    /// The video VAE: both halves once a request encoded keyframes or references, else the decode
+    /// half.
+    video_vae: Option<Held<MiniMaxH3VideoVae>>,
+    /// The reference-soundtrack encoder (ref2va).
+    audio_encoder: Option<Held<crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder>>,
+    /// The DiT after the AdaLN precompute-and-evict, keyed on the task whose partition it is and,
+    /// through [`PreparedJointDit::serves`], on the schedule its modulation was projected for.
+    dit: Option<Held<(MiniMaxH3Task, PreparedJointDit)>>,
+    /// The audio VAE's decode half.
+    audio_vae: Option<Held<crate::audio_vae::MiniMaxH3AudioVae>>,
+    /// The per-component warm weights of the current resident request, recorded beside each slot
+    /// it fills.
+    priced: Option<crate::memory_strategy::VideoWarmWeights>,
+}
+
+impl VideoWarm {
+    fn is_empty(&self) -> bool {
+        self.vision.is_none()
+            && self.conditioner.is_none()
+            && self.video_vae.is_none()
+            && self.audio_encoder.is_none()
+            && self.dit.is_none()
+            && self.audio_vae.is_none()
+    }
+
+    /// `item`, held at the bytes the current request priced it at. A VAE is recorded at its
+    /// decode half and the soundtrack encoder at nothing, so the record never exceeds what is
+    /// resident.
+    fn hold<T>(
+        &self,
+        item: T,
+        bytes: impl Fn(&crate::memory_strategy::VideoWarmWeights) -> u64,
+    ) -> Option<Held<T>> {
+        Some(Held {
+            item,
+            bytes: self.priced.as_ref().map_or(0, bytes),
+        })
+    }
+
+    /// The bytes held now, as each slot recorded them when it was filled.
+    fn held_bytes(&self) -> u64 {
+        [
+            self.vision.as_ref().map(|h| h.bytes),
+            self.conditioner.as_ref().map(|h| h.bytes),
+            self.video_vae.as_ref().map(|h| h.bytes),
+            self.audio_encoder.as_ref().map(|h| h.bytes),
+            self.dit.as_ref().map(|h| h.bytes),
+            self.audio_vae.as_ref().map(|h| h.bytes),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// The loaded `minimax_h3` provider.
+///
+/// A staged or streamed request holds nothing heavy between renders or between the phases of one
+/// render: every phase maps its component, uses it, drops it and synchronizes. A **resident**
+/// request whose warm estimate fits keeps the components it loads in its `warm` field for the next
+/// request instead (see the module docs).
 pub struct MiniMaxH3 {
     descriptor: ModelDescriptor,
     root: PathBuf,
@@ -649,6 +734,8 @@ pub struct MiniMaxH3 {
     adapters: Vec<AdapterSpec>,
     veda_report: crate::veda::ReportSink,
     veda_component: Option<PathBuf>,
+    /// The components a resident request left on the device for the next one.
+    warm: std::sync::Mutex<VideoWarm>,
 }
 
 #[cfg(feature = "cuda")]
@@ -694,21 +781,29 @@ pub(crate) fn run_conditioner(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<candle_gen::candle_core::Tensor> {
     with_conditioner(te_dir, device, |te| {
-        candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
-            None => te.forward(ids, mask),
-            Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
-        })
+        conditioner_forward(te, ids, mask, grounded, on_progress)
     })
 }
 
-/// Keep one prepared conditioner alive for a phase containing multiple independent prompts.
-/// The streamed route still keeps its stack on the host and copies only the current layer.
-/// Release the stack before returning, including when a prompt fails or is cancelled.
-pub(crate) fn with_conditioner<T>(
-    te_dir: &Path,
-    device: &Device,
-    encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
-) -> Result<T> {
+/// One conditioner pass over an already-loaded encoder: the prompt (and an edit's grounded vision
+/// rows) through the layer-50 tap. Shared by the staged [`run_conditioner`] and a resident
+/// generator's warm encoder.
+pub(crate) fn conditioner_forward(
+    te: &MiniMaxH3TextEncoder,
+    ids: &candle_gen::candle_core::Tensor,
+    mask: &candle_gen::candle_core::Tensor,
+    grounded: Option<&crate::text_encoder::GroundedVision>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<candle_gen::candle_core::Tensor> {
+    candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
+        None => te.forward(ids, mask),
+        Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
+    })
+}
+
+/// Load the layer-50 conditioner onto `device` — or, inside a streamed request (rung 4), onto the
+/// host with its one-layer device window prepared. The one conditioner load site.
+pub(crate) fn load_conditioner(te_dir: &Path, device: &Device) -> Result<MiniMaxH3TextEncoder> {
     let cfg = MiniMaxH3TeConfig::from_component_dir(te_dir)?;
     let shards = candle_gen::loader::sorted_safetensors(te_dir, "minimax-h3 te")?;
     let prefixes = lm_prefixes(LM_PREFIX, &cfg);
@@ -733,6 +828,18 @@ pub(crate) fn with_conditioner<T>(
         }
         te.prepare_streamed(&cfg, device)?;
     }
+    Ok(te)
+}
+
+/// Keep one prepared conditioner alive for a phase containing multiple independent prompts.
+/// The streamed route still keeps its stack on the host and copies only the current layer.
+/// Release the stack before returning, including when a prompt fails or is cancelled.
+pub(crate) fn with_conditioner<T>(
+    te_dir: &Path,
+    device: &Device,
+    encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
+) -> Result<T> {
+    let te = load_conditioner(te_dir, device)?;
     let result = encode(&te);
     // Candle is eager: no output retains the encoder's weights or a lazy forward graph.
     drop(te);
@@ -842,6 +949,7 @@ impl MiniMaxH3 {
                 Some(WeightsSource::File(path)) => Some(path.clone()),
                 _ => None,
             },
+            warm: Default::default(),
         })
     }
 
@@ -1039,21 +1147,60 @@ impl MiniMaxH3 {
     fn encode_prompt(
         &self,
         prompt: &str,
+        warm: &mut VideoWarm,
+        keep: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<candle_gen::candle_core::Tensor> {
         let phase = PhaseLog::start("text_encoder");
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
-        let context = run_conditioner(
-            &self.tiers.text_encoder_dir,
-            &ids,
-            &mask,
-            None,
-            &self.device,
-            on_progress,
-        )?;
+        let context = self.with_warm_conditioner(warm, keep, |te| {
+            conditioner_forward(te, &ids, &mask, None, on_progress)
+        })?;
         phase.done();
         Ok(context)
+    }
+
+    /// Run `encode` through the conditioner: when `keep`, the warm one (loaded on first use and
+    /// kept afterwards), else one mapped and released for this call by [`with_conditioner`].
+    fn with_warm_conditioner<T>(
+        &self,
+        warm: &mut VideoWarm,
+        keep: bool,
+        encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
+    ) -> Result<T> {
+        if !keep {
+            return with_conditioner(&self.tiers.text_encoder_dir, &self.device, encode);
+        }
+        let te = match warm.conditioner.take() {
+            Some(held) => held.item,
+            None => load_conditioner(&self.tiers.text_encoder_dir, &self.device)?,
+        };
+        let result = encode(&te);
+        warm.conditioner = warm.hold(te, |w| w.conditioner);
+        result
+    }
+
+    /// Run the vision tower over `run`'s sources: when `keep`, the warm tower (loaded on first use
+    /// and kept afterwards), else one mapped, dropped and released for this call.
+    fn with_vision_tower<T>(
+        &self,
+        warm: &mut VideoWarm,
+        keep: bool,
+        run: impl FnOnce(&candle_gen_boogu::vision::VisionTower) -> Result<T>,
+    ) -> Result<T> {
+        let vision = match warm.vision.take() {
+            Some(held) => held.item,
+            None => load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?,
+        };
+        let result = run(&vision);
+        if keep {
+            warm.vision = warm.hold(vision, |w| w.vision);
+        } else {
+            drop(vision);
+        }
+        crate::dit::release_device_memory(&self.device)?;
+        result
     }
 
     /// **Phase 1 (fl2va): the vision-grounded presentation.**
@@ -1071,56 +1218,26 @@ impl MiniMaxH3 {
         &self,
         prompt: &str,
         keyframes: &[&Image],
+        warm: &mut VideoWarm,
+        keep: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
-        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
 
         let phase = PhaseLog::start("vision_tower");
-        let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
-        let grounded = crate::text_encoder::run_vision(&vision, keyframes, &self.device)?;
-        drop(vision);
-        crate::dit::release_device_memory(&self.device)?;
+        let grounded = self.with_vision_tower(warm, keep, |vision| {
+            crate::text_encoder::run_vision(vision, keyframes, &self.device)
+        })?;
         phase.done();
 
         let phase = PhaseLog::start("text_encoder");
         let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts, &self.device)?;
-        let shards =
-            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
-        let prefixes = lm_prefixes(LM_PREFIX, &cfg);
-        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let policy = crate::block_stream::current();
-        let load_device = if policy.is_some() {
-            &Device::Cpu
-        } else {
-            &self.device
-        };
-        let w = candle_gen::Weights::from_files_filtered_host_packed(
-            &shards,
-            load_device,
-            TE_STORE_DTYPE,
-            &refs,
-        )?;
-        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
-        drop(w);
-        if let Some(policy) = policy {
-            if policy.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            te.prepare_streamed(&cfg, &self.device)?;
-        }
-        let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-            te.forward_with_images(
-                &ids,
-                &mask,
-                &grounded.embeds,
-                &grounded.deepstack,
-                &grounded.grids,
-            )
+        let context = self.with_warm_conditioner(warm, keep, |te| {
+            let context = conditioner_forward(te, &ids, &mask, Some(&grounded), on_progress);
+            // Before the staged scope's device release, as the inline pass dropped it.
+            drop(grounded);
+            context
         })?;
-        drop(te);
-        drop(grounded);
-        crate::dit::release_device_memory(&self.device)?;
         phase.done();
 
         // The tags describe the presentation row for row; a mismatch would mis-tag every row after
@@ -1135,9 +1252,153 @@ impl MiniMaxH3 {
         Ok((context, tags))
     }
 
+    /// [`Self::render`], clearing the warm set after a render that failed once it reached the
+    /// device: an out-of-memory load among the failures leaves no half-built warm set behind for
+    /// the next request to inherit. A request refused before the warm decision (validation,
+    /// geometry, steps) leaves the set alone, and a cancelled render keeps what it loaded.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let reached_device = std::cell::Cell::new(false);
+        let result = self.render(req, &reached_device, on_progress);
+        if reached_device.get()
+            && matches!(&result, Err(error) if !matches!(error, CandleError::Canceled))
+        {
+            *candle_gen::lock_recover(&self.warm) = VideoWarm::default();
+            if let Err(release) = crate::dit::release_device_memory(&self.device) {
+                tracing::warn!(%release, "minimax-h3: releasing the warm set after a failed render");
+            }
+        }
+        result
+    }
+
+    /// Decide whether this request keeps its components warm, releasing any warm components first
+    /// when it does not (see the module docs). Logs the decision and, for a resident request, what
+    /// it reuses.
+    fn decide_warm(
+        &self,
+        req: &GenerationRequest,
+        task: MiniMaxH3Task,
+        evaluations: usize,
+        warm: &mut VideoWarm,
+    ) -> Result<bool> {
+        let keep = crate::warm::keeps_components_warm(req)
+            && crate::block_stream::current().is_none()
+            && self.warm_set_fits_now(req, task, evaluations, warm);
+        if !keep && !warm.is_empty() {
+            *warm = VideoWarm::default();
+            crate::dit::release_device_memory(&self.device)?;
+            tracing::info!("minimax-h3: released the warm components for a staged request");
+        }
+        if keep {
+            // Components this request does not use are not part of its warm estimate, so they are
+            // released rather than held unpriced: the vision tower without keyframes or references,
+            // the soundtrack encoder outside ref2va.
+            let encodes = !req.conditioning.is_empty();
+            let unused_vision = (!encodes).then(|| warm.vision.take()).flatten();
+            let unused_encoder = (task != MiniMaxH3Task::Ref2va)
+                .then(|| warm.audio_encoder.take())
+                .flatten();
+            if unused_vision.is_some() || unused_encoder.is_some() {
+                drop((unused_vision, unused_encoder));
+                crate::dit::release_device_memory(&self.device)?;
+            }
+            tracing::info!(
+                vision_warm = warm.vision.is_some(),
+                conditioner_warm = warm.conditioner.is_some(),
+                dit_warm = warm.dit.is_some(),
+                video_vae_warm = warm.video_vae.is_some(),
+                audio_encoder_warm = warm.audio_encoder.is_some(),
+                audio_vae_warm = warm.audio_vae.is_some(),
+                "minimax-h3: resident request; reusing warm components"
+            );
+        }
+        Ok(keep)
+    }
+
+    /// Whether this request's warm set fits the device now, logging the figures the decision used.
+    /// `false` when the source's headers cannot price it.
+    fn warm_set_fits_now(
+        &self,
+        req: &GenerationRequest,
+        task: MiniMaxH3Task,
+        evaluations: usize,
+        warm: &mut VideoWarm,
+    ) -> bool {
+        let estimate = self.task_dit_config(task).and_then(|cfg| {
+            crate::memory_strategy::video_warm_estimate(
+                &self.contract,
+                &self.tiers.text_encoder_dir,
+                cfg.hidden_size as u64,
+                req,
+                evaluations,
+            )
+            .map_err(|e| CandleError::Msg(e.to_string()))
+        });
+        let estimate = match estimate {
+            Ok(estimate) => estimate,
+            Err(error) => {
+                tracing::info!(%error, "minimax-h3: no warm estimate; staging this request");
+                return false;
+            }
+        };
+        let decision =
+            crate::warm::WarmDecision::decide(estimate.warm_peak, warm.held_bytes(), &self.device);
+        warm.priced = decision.keep_warm.then_some(estimate.weights);
+        tracing::info!(
+            task = ?task,
+            staged_peak_gb = crate::image_memory_strategy::admission::decimal_gb(estimate.staged_peak),
+            "minimax-h3: staged peak of this request"
+        );
+        decision.log(
+            "minimax_h3_warm_decision",
+            "minimax-h3",
+            "text encoder, vision tower, DiT, video VAE and audio VAE",
+        );
+        decision.keep_warm
+    }
+
+    /// The warm DiT if it serves `task` and `schedule`, else `None` — after dropping a warm DiT of
+    /// the other partition or schedule and synchronizing, so the reload has its memory back.
+    fn take_warm_dit(
+        &self,
+        warm: &mut VideoWarm,
+        task: MiniMaxH3Task,
+        schedule: &crate::dit::adaln::TimestepSchedule,
+    ) -> Result<Option<PreparedJointDit>> {
+        match warm.dit.take().map(|held| held.item) {
+            Some((warm_task, prepared)) if warm_task == task && prepared.serves(schedule) => {
+                Ok(Some(prepared))
+            }
+            Some(stale) => {
+                drop(stale);
+                crate::dit::release_device_memory(&self.device)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The warm video VAE if it carries the encode half, else `None` — after dropping a warm
+    /// decode-only VAE and synchronizing, so the full load has its memory back.
+    fn take_warm_encoding_vae(&self, warm: &mut VideoWarm) -> Result<Option<MiniMaxH3VideoVae>> {
+        match warm.video_vae.take().map(|held| held.item) {
+            Some(vae) if vae.can_encode() => Ok(Some(vae)),
+            Some(decode_only) => {
+                drop(decode_only);
+                crate::dit::release_device_memory(&self.device)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn render(
+        &self,
+        req: &GenerationRequest,
+        reached_device: &std::cell::Cell<bool>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let _stream_request =
@@ -1184,8 +1445,22 @@ impl MiniMaxH3 {
                 "task": format!("{task:?}"), "patch": patch, "guidance": "distilled_no_cfg"
             }),
         );
+        // A resident request whose warm set fits keeps (and reuses) its components; any other
+        // request releases them first, so its staged phases have the device to themselves.
+        let mut warm = candle_gen::lock_recover(&self.warm);
+        reached_device.set(true);
+        let keep = self.decide_warm(req, task, schedule.num_evals(), &mut warm)?;
         if let Some(refs) = &references {
-            return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
+            return self.generate_ref2va(
+                req,
+                refs,
+                task,
+                &geometry,
+                &schedule,
+                seed,
+                (&mut warm, keep),
+                on_progress,
+            );
         }
         let slots = keyframe_slots(&keyframes, geometry.joint.num_frames)?;
         let anchors = slots.anchors();
@@ -1203,12 +1478,12 @@ impl MiniMaxH3 {
         };
 
         let (context, text_tags) = if anchors.is_empty() {
-            let context = self.encode_prompt(&req.prompt, on_progress)?;
+            let context = self.encode_prompt(&req.prompt, &mut warm, keep, on_progress)?;
             let tags = vec![crate::denoise::TEXT_TAG; context.dims()[1]];
             (context, tags)
         } else {
             let refs: Vec<&Image> = fitted.iter().collect();
-            self.encode_prompt_grounded(&req.prompt, &refs, on_progress)?
+            self.encode_prompt_grounded(&req.prompt, &refs, &mut warm, keep, on_progress)?
         };
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -1225,7 +1500,10 @@ impl MiniMaxH3 {
                 .iter()
                 .map(|f| crate::keyframe::keyframe_to_vae_pixels(f, &self.device))
                 .collect::<Result<Vec<_>>>()?;
-            let vae = MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?;
+            let vae = match self.take_warm_encoding_vae(&mut warm)? {
+                Some(vae) => vae,
+                None => MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?,
+            };
             let rows = crate::conditioning::build_condition_rows(
                 &vae,
                 &pixels,
@@ -1233,25 +1511,40 @@ impl MiniMaxH3 {
                 patch,
                 &crate::conditioning::KeyframeNoise::Seeded,
                 &self.device,
-            )?;
-            drop(vae);
+            );
+            if keep {
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
+            } else {
+                drop(vae);
+            }
             crate::dit::release_device_memory(&self.device)?;
             phase.done();
-            rows
+            rows?
         };
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
 
         // --- 2. denoise -----------------------------------------------------------------------
-        // Through the adapter seam, at the partition THIS task selected — so `ref2va` (sc-17157)
-        // gets the staged LoRA folded onto `transformer_ref` exactly as `t2va` / `fl2va` get it on
-        // `transformer`. A bare `MiniMaxH3Dit::load` here would render a reference job with the
-        // adapter silently dropped.
-        let phase = PhaseLog::start("dit_load");
-        let dit = self.load_task_dit(task.partition())?;
-        phase.done();
-        debug_assert_eq!(patch, dit.config().patch_size);
+        // The warm DiT when it serves this task and schedule; else, through the adapter seam, at
+        // the partition THIS task selected — so `ref2va` (sc-17157) gets the staged LoRA folded
+        // onto `transformer_ref` exactly as `t2va` / `fl2va` get it on `transformer`. A bare
+        // `MiniMaxH3Dit::load` here would render a reference job with the adapter silently dropped.
+        let adaln = crate::denoise::adaln_schedule(&schedule)?;
+        let prepared = match self.take_warm_dit(&mut warm, task, &adaln)? {
+            Some(prepared) => prepared,
+            None => {
+                let phase = PhaseLog::start("dit_load");
+                let dit = self.load_task_dit(task.partition())?;
+                // The 26.02 GB lever: project the whole schedule's modulation and release
+                // `adaln_proj`. Every timestep this run evaluates at is enumerated in `adaln`, so
+                // the eviction is safe.
+                let prepared = PreparedJointDit::prepare(dit, adaln)?;
+                phase.done();
+                prepared
+            }
+        };
+        debug_assert_eq!(patch, prepared.dit().config().patch_size);
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.dims()[1], patch, &self.device)?
         } else {
@@ -1261,16 +1554,7 @@ impl MiniMaxH3 {
         let (video_rows, audio_rows) = initial_latents(&geometry, patch, seed, &self.device)?;
         // The anchors LEAD the video row stream; the scheduler then writes only the tail.
         let video_rows = prepend_condition_rows(&layout, condition_rows.as_ref(), &video_rows)?;
-        let adaln = crate::denoise::adaln_schedule(&schedule)?;
-        // The 26.02 GB lever: project the whole schedule's modulation and release `adaln_proj`.
-        // Every timestep this run evaluates at is enumerated in `adaln`, so the eviction is safe.
-        let mut model = JointDit::new(
-            dit,
-            layout.clone(),
-            &context,
-            adaln,
-            AdaLnResidency::PrecomputeAndEvict,
-        )?;
+        let mut model = JointDit::from_prepared(prepared, layout.clone(), &context)?;
         // Per-layer (and, on the budgeted fallback, per-attention-chunk) cancellation: a forward
         // over a long packed sequence is minutes, far too coarse for a step-boundary check alone.
         model.set_cancel(&req.cancel);
@@ -1322,7 +1606,13 @@ impl MiniMaxH3 {
                 }));
         }
 
-        drop(model);
+        if keep {
+            warm.dit = model
+                .into_prepared()
+                .and_then(|prepared| warm.hold((task, prepared), |w| w.dit));
+        } else {
+            drop(model);
+        }
         drop(video_rows);
         drop(audio_rows);
         crate::dit::release_device_memory(&self.device)?;
@@ -1334,27 +1624,45 @@ impl MiniMaxH3 {
         }
         let phase = PhaseLog::start("video_vae_decode");
         let frames = {
-            let vae = MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?;
-            let video = vae.decode(&rendered.video)?;
-            drop(vae);
+            // A warm VAE carrying both halves decodes exactly as the decode half alone does.
+            let vae = match warm.video_vae.take() {
+                Some(held) => held.item,
+                None => MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?,
+            };
+            let video = vae.decode(&rendered.video);
+            if keep {
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
+            } else {
+                drop(vae);
+            }
             crate::dit::release_device_memory(&self.device)?;
-            decoded_frames_to_images(&video)?
+            decoded_frames_to_images(&video?)?
         };
         phase.done();
         let phase = PhaseLog::start("audio_vae_decode");
         let audio = {
-            let (cfg, w) = self.load_audio_vae()?;
-            let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
-                &w,
-                &cfg,
-                &self.device,
-                self.dtype,
-            )?;
-            drop(w);
-            let track = vae.decode_audio_track(&rendered.audio)?;
-            drop(vae);
+            let vae = match warm.audio_vae.take() {
+                Some(held) => held.item,
+                None => {
+                    let (cfg, w) = self.load_audio_vae()?;
+                    let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
+                        &w,
+                        &cfg,
+                        &self.device,
+                        self.dtype,
+                    )?;
+                    drop(w);
+                    vae
+                }
+            };
+            let track = vae.decode_audio_track(&rendered.audio);
+            if keep {
+                warm.audio_vae = warm.hold(vae, |w| w.audio_decoder);
+            } else {
+                drop(vae);
+            }
             crate::dit::release_device_memory(&self.device)?;
-            track
+            track?
         };
         phase.done();
         let audio = finish_audio(audio, &geometry)?;
@@ -1391,6 +1699,7 @@ impl MiniMaxH3 {
         geometry: &RequestGeometry,
         schedule: &JointSchedule,
         seed: u64,
+        (warm, keep): (&mut VideoWarm, bool),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         use crate::conditioning::{
@@ -1487,7 +1796,7 @@ impl MiniMaxH3 {
 
         // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
         let (context, text_tags) =
-            self.encode_prompt_ref2va(&req.prompt, &normalized, on_progress)?;
+            self.encode_prompt_ref2va(&req.prompt, &normalized, warm, keep, on_progress)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -1500,8 +1809,14 @@ impl MiniMaxH3 {
         let mut reference_audio_channels = Vec::new();
         {
             let phase = PhaseLog::start("reference_vae_audio_encode");
-            let vae = MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?;
-            let audio_enc = self.load_audio_encoder()?;
+            let vae = match self.take_warm_encoding_vae(warm)? {
+                Some(vae) => vae,
+                None => MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?,
+            };
+            let audio_enc = match warm.audio_encoder.take() {
+                Some(held) => held.item,
+                None => self.load_audio_encoder()?,
+            };
             for (i, r) in normalized.iter().enumerate() {
                 // Audio FIRST, mirroring the packed row order.
                 let num_audio_latents = if let Some(track) = r.audio() {
@@ -1594,8 +1909,13 @@ impl MiniMaxH3 {
                     num_audio_latents,
                 });
             }
-            drop(vae);
-            drop(audio_enc);
+            if keep {
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
+                warm.audio_encoder = warm.hold(audio_enc, |_| 0);
+            } else {
+                drop(vae);
+                drop(audio_enc);
+            }
             crate::dit::release_device_memory(&self.device)?;
             phase.done();
         }
@@ -1619,10 +1939,18 @@ impl MiniMaxH3 {
         // comment names — a denoise path that maps its own DiT would render a `ref2va` job with the
         // caller's staged LoRA silently dropped, `Ok` and with no error. `tests/turbo_lora.rs`
         // covers the seam; the staging table below tracks this anchor.
-        let phase = PhaseLog::start("dit_load");
-        let dit = self.load_task_dit(task.partition())?;
-        phase.done();
-        debug_assert_eq!(patch, dit.config().patch_size);
+        let adaln = crate::denoise::adaln_schedule(schedule)?;
+        let prepared = match self.take_warm_dit(warm, task, &adaln)? {
+            Some(prepared) => prepared,
+            None => {
+                let phase = PhaseLog::start("dit_load");
+                let dit = self.load_task_dit(task.partition())?;
+                let prepared = PreparedJointDit::prepare(dit, adaln)?;
+                phase.done();
+                prepared
+            }
+        };
+        debug_assert_eq!(patch, prepared.dit().config().patch_size);
         let layout = ref2va_layout_with_audio_channels(
             geometry,
             &text_tags,
@@ -1636,14 +1964,7 @@ impl MiniMaxH3 {
         let video_rows = prepend_condition_rows(&layout, condition_video.as_ref(), &video_rows)?;
         let audio_rows =
             prepend_condition_audio_rows(&layout, condition_audio.as_ref(), &audio_rows)?;
-        let adaln = crate::denoise::adaln_schedule(schedule)?;
-        let mut model = JointDit::new(
-            dit,
-            layout.clone(),
-            &context,
-            adaln,
-            AdaLnResidency::PrecomputeAndEvict,
-        )?;
+        let mut model = JointDit::from_prepared(prepared, layout.clone(), &context)?;
         // Per-layer (and, on the budgeted fallback, per-attention-chunk) cancellation: a forward
         // over a long packed sequence is minutes, far too coarse for a step-boundary check alone.
         model.set_cancel(&req.cancel);
@@ -1695,7 +2016,13 @@ impl MiniMaxH3 {
                 }));
         }
 
-        drop(model);
+        if keep {
+            warm.dit = model
+                .into_prepared()
+                .and_then(|prepared| warm.hold((task, prepared), |w| w.dit));
+        } else {
+            drop(model);
+        }
         drop(video_rows);
         drop(audio_rows);
         crate::dit::release_device_memory(&self.device)?;
@@ -1707,27 +2034,45 @@ impl MiniMaxH3 {
         }
         let phase = PhaseLog::start("video_vae_decode");
         let frames = {
-            let vae = MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?;
-            let video = vae.decode(&rendered.video)?;
-            drop(vae);
+            // A warm VAE carrying both halves decodes exactly as the decode half alone does.
+            let vae = match warm.video_vae.take() {
+                Some(held) => held.item,
+                None => MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?,
+            };
+            let video = vae.decode(&rendered.video);
+            if keep {
+                warm.video_vae = warm.hold(vae, |w| w.video_vae_decode);
+            } else {
+                drop(vae);
+            }
             crate::dit::release_device_memory(&self.device)?;
-            decoded_frames_to_images(&video)?
+            decoded_frames_to_images(&video?)?
         };
         phase.done();
         let phase = PhaseLog::start("audio_vae_decode");
         let audio = {
-            let (cfg, w) = self.load_audio_vae()?;
-            let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
-                &w,
-                &cfg,
-                &self.device,
-                self.dtype,
-            )?;
-            drop(w);
-            let track = vae.decode_audio_track(&rendered.audio)?;
-            drop(vae);
+            let vae = match warm.audio_vae.take() {
+                Some(held) => held.item,
+                None => {
+                    let (cfg, w) = self.load_audio_vae()?;
+                    let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
+                        &w,
+                        &cfg,
+                        &self.device,
+                        self.dtype,
+                    )?;
+                    drop(w);
+                    vae
+                }
+            };
+            let track = vae.decode_audio_track(&rendered.audio);
+            if keep {
+                warm.audio_vae = warm.hold(vae, |w| w.audio_decoder);
+            } else {
+                drop(vae);
+            }
             crate::dit::release_device_memory(&self.device)?;
-            track
+            track?
         };
         phase.done();
         let audio = finish_audio(audio, geometry)?;
@@ -1755,6 +2100,8 @@ impl MiniMaxH3 {
         &self,
         prompt: &str,
         references: &[Ref2VaReference],
+        warm: &mut VideoWarm,
+        keep: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
         use crate::reference::{
@@ -1763,7 +2110,6 @@ impl MiniMaxH3 {
         };
 
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
-        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
 
         // The tower's sources, in **sequence order** — the order the pad runs appear in, which is
         // what `forward_with_references` consumes them in.
@@ -1815,10 +2161,9 @@ impl MiniMaxH3 {
         }
 
         let phase = PhaseLog::start("vision_tower");
-        let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
-        let grounded = crate::text_encoder::run_vision_sources(&vision, &sources, &self.device)?;
-        drop(vision);
-        crate::dit::release_device_memory(&self.device)?;
+        let grounded = self.with_vision_tower(warm, keep, |vision| {
+            crate::text_encoder::run_vision_sources(vision, &sources, &self.device)
+        })?;
         phase.done();
 
         // The presentation, from the tower's per-source counts.
@@ -1848,42 +2193,20 @@ impl MiniMaxH3 {
 
         let phase = PhaseLog::start("text_encoder");
         let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
-        let shards =
-            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
-        let prefixes = lm_prefixes(LM_PREFIX, &cfg);
-        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let policy = crate::block_stream::current();
-        let load_device = if policy.is_some() {
-            &Device::Cpu
-        } else {
-            &self.device
-        };
-        let w = candle_gen::Weights::from_files_filtered_host_packed(
-            &shards,
-            load_device,
-            TE_STORE_DTYPE,
-            &refs,
-        )?;
-        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
-        drop(w);
-        if let Some(policy) = policy {
-            if policy.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            te.prepare_streamed(&cfg, &self.device)?;
-        }
-        let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-            te.forward_with_references(
-                &ids,
-                &mask,
-                &grounded.embeds,
-                &grounded.deepstack,
-                &grounded.grids,
-            )
+        let context = self.with_warm_conditioner(warm, keep, |te| {
+            let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                te.forward_with_references(
+                    &ids,
+                    &mask,
+                    &grounded.embeds,
+                    &grounded.deepstack,
+                    &grounded.grids,
+                )
+            });
+            // Before the staged scope's device release, as the inline pass dropped it.
+            drop(grounded);
+            context
         })?;
-        drop(te);
-        drop(grounded);
-        crate::dit::release_device_memory(&self.device)?;
         phase.done();
         if context.dims()[1] != tags.len() {
             return Err(CandleError::Msg(format!(
@@ -2153,6 +2476,19 @@ fn capture_h3_execution<G: Generator + ?Sized>(
 }
 
 impl Generator for MiniMaxH3 {
+    /// The warm set a resident request left on the device, credited per held component at the
+    /// bytes the request that kept it priced it at (a held VAE at its decode half). `None` when
+    /// nothing is held, or while a render holds the set (no credit is the safe answer).
+    fn retained_weight_bytes(&self) -> Option<u64> {
+        let warm = match self.warm.try_lock() {
+            Ok(warm) => warm,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let held = warm.held_bytes();
+        (held > 0).then_some(held)
+    }
+
     fn veda_execution_report(&self) -> Option<candle_gen::gen_core::VedaExecutionReport> {
         Some(self.veda_report.borrow().clone())
     }
@@ -3168,14 +3504,6 @@ mod tests {
     /// hands the pages back to its own allocator, so without this the next phase maps on top.
     const RELEASE: &str = "crate::dit::release_device_memory(";
 
-    /// The two bindings every text-encoder phase holds: the weight map and the tower built
-    /// from it. The tower is built *before* the map is dropped, necessarily, so a phase is a
-    /// group of maps and a group of releases rather than one pair.
-    const TE_MAPS: &[&str] = &[
-        "Weights::from_files_filtered",
-        "MiniMaxH3TextEncoder::from_weights",
-    ];
-
     /// One staged phase: a name for the message, the source anchors that MAP its component,
     /// and the source anchors that RELEASE it.
     type Phase = (
@@ -3213,10 +3541,16 @@ mod tests {
     /// anchor and the inner `MiniMaxH3Dit::load` lives one call deeper. Exempting it here is only
     /// safe because the pairing below is asserted in both directions — a helper listed here that no
     /// phase actually names as a map would be an uncovered hole, and reds.
+    ///
+    /// `load_conditioner` is the fourth: the one conditioner load site, which `with_conditioner`
+    /// names as its map and releases after the encode. (MiniMax-H3-Image's resident route also
+    /// calls it and deliberately keeps the encoder warm across requests; that caller lives in
+    /// `image_model.rs`, whose warm set is priced by `admission::warm_estimate`.)
     const DELEGATED_HELPERS: &[&str] = &[
         "fn load_audio_encoder(",
         "fn load_audio_vae(",
         "fn load_task_dit(",
+        "fn load_conditioner(",
     ];
 
     /// **The staged phases of every staging function in this file, in source order** — the table
@@ -3230,7 +3564,7 @@ mod tests {
     /// render — the true peak becomes the ~143 GB **sum** of the components instead of their max,
     /// and the worker admits cards against a number 3.5x too small.
     ///
-    /// So the guard walks the staged phases of the **five** staging functions in this file's own
+    /// So the guard walks the staged phases of the **four** staging functions in this file's own
     /// production source. Each phase must map its component, drop it, and release the device —
     /// **before** the next phase maps anything. Deleting any single `drop(...)`, or any single
     /// `crate::dit::release_device_memory(...)`, makes it red on its own; each was mutated
@@ -3241,7 +3575,7 @@ mod tests {
     /// A hardcoded phase table is only as exhaustive as whoever last edited it, so
     /// `every_heavy_map_is_inside_a_staged_phase` reads the same production source for **every**
     /// heavy-component map anchor in [`MAP_ANCHORS`] and asserts each occurrence falls inside a
-    /// tabled function — or inside a helper that is itself a tabled map anchor. A sixth staging
+    /// tabled function — or inside a helper that is itself a tabled map anchor. A fifth staging
     /// function, or a heavy map hidden in a new helper like `load_audio_encoder`, reds there rather
     /// than being silently uncovered.
     ///
@@ -3254,35 +3588,37 @@ mod tests {
     /// without a checkpoint — and that is sc-18660's scope. Nothing in this crate can execute
     /// `generate_impl` without a ~143 GB snapshot, so this is the strongest guard available at this
     /// size: deliberately blunt, in exchange for being exact about the regression that was live.
-    fn staged_phases() -> [(&'static str, &'static [Phase]); 5] {
+    ///
+    /// # The warm path is the deliberate exception
+    ///
+    /// A resident request keeps the components it loads warm between requests instead of dropping
+    /// them — only after `memory_strategy::video_warm_estimate` says they fit the device together
+    /// (see the module docs). Each phase therefore reads `if keep { warm.… = Some(…) } else {
+    /// drop(…) }`: the staged branch still drops and releases exactly as this table pins, and the
+    /// device release still follows every phase on both branches.
+    fn staged_phases() -> [(&'static str, &'static [Phase]); 4] {
         [
-            // Both single-prompt renders and the training caption batch delegate their
-            // conditioner lifetime to this scope; pin the map and release at their owner.
+            // Every staged conditioner pass — t2va, fl2va, ref2va and the training caption batch —
+            // delegates its lifetime to this scope; pin the map and release at their owner.
             (
                 "fn with_conditioner<T>(",
                 &[(
                     "the 66.7 GB Qwen3-VL-32B text encoder",
-                    TE_MAPS,
-                    &["drop(w);", "drop(te);"],
+                    &["load_conditioner("],
+                    &["drop(te);"],
+                )],
+            ),
+            // The fl2va and ref2va presentations both run the tower through this scope.
+            (
+                "fn with_vision_tower<T>(",
+                &[(
+                    "the Qwen3-VL vision tower",
+                    &["load_vision_tower("],
+                    &["drop(vision);"],
                 )],
             ),
             (
-                "fn encode_prompt_grounded(",
-                &[
-                    (
-                        "the Qwen3-VL vision tower",
-                        &["load_vision_tower("],
-                        &["drop(vision);"],
-                    ),
-                    (
-                        "the 66.7 GB Qwen3-VL-32B text encoder",
-                        TE_MAPS,
-                        &["drop(w);", "drop(te);", "drop(grounded);"],
-                    ),
-                ],
-            ),
-            (
-                "fn generate_impl(",
+                "fn render(",
                 &[
                     (
                         "the 10.4 GB video VAE, keyframe encode",
@@ -3293,7 +3629,7 @@ mod tests {
                         // `load_task_dit` is the single seam that maps the partition AND folds any
                         // staged LoRA (sc-18728), so the anchor tracks it rather than the inner
                         // `MiniMaxH3Dit::load` — which is now one call deeper and outside this
-                        // function's body, where a scan of `generate_impl` cannot see it.
+                        // function's body, where a scan of `render` cannot see it.
                         "the 66.3 GB DiT",
                         &["self.load_task_dit("],
                         &["drop(model);"],
@@ -3310,24 +3646,6 @@ mod tests {
                     ),
                 ],
             ),
-            // The `ref2va` presentation (sc-17157). Same two components as `encode_prompt_grounded`
-            // — the tower, then the LM — but a separate function, so a release deleted here would
-            // not be caught by that entry.
-            (
-                "fn encode_prompt_ref2va(",
-                &[
-                    (
-                        "the Qwen3-VL vision tower",
-                        &["load_vision_tower("],
-                        &["drop(vision);"],
-                    ),
-                    (
-                        "the 66.7 GB Qwen3-VL-32B text encoder",
-                        TE_MAPS,
-                        &["drop(w);", "drop(te);", "drop(grounded);"],
-                    ),
-                ],
-            ),
             // The `ref2va` render. **The DiT phase is the one that matters for sc-17157**: it maps
             // ONE 66 GB partition, chosen by `MiniMaxH3Task::partition()`, and drops it before the
             // decode VAEs. The two partitions are byte-identical in size, so a build that mapped
@@ -3341,9 +3659,9 @@ mod tests {
                         &["drop(vae);", "drop(audio_enc);"],
                     ),
                     (
-                        // Same seam as `generate_impl`'s DiT phase: `load_task_dit` maps the
-                        // partition AND folds any staged LoRA, so the inner `MiniMaxH3Dit::load`
-                        // is one call deeper and outside this function's body.
+                        // Same seam as `render`'s DiT phase: `load_task_dit` maps the partition
+                        // AND folds any staged LoRA, so the inner `MiniMaxH3Dit::load` is one call
+                        // deeper and outside this function's body.
                         "the 66.3 GB task DiT",
                         &["self.load_task_dit("],
                         &["drop(model);"],
@@ -3435,45 +3753,35 @@ mod tests {
     /// **Every render arm evicts the AdaLN projections, so the contract's exclusion is honest.**
     ///
     /// `memory_strategy::adaln_component` declares 26.02 GB of DiT weights as
-    /// `PrecomputedThenEvicted` and states that `crate::model` passes
-    /// [`AdaLnResidency::PrecomputeAndEvict`] as a *literal*, so nothing a request carries can
-    /// re-resident them. That was a one-arm claim when sc-18665 wrote it. sc-17157 then added a
-    /// **second** `JointDit::new` call site — `generate_ref2va`, which denoises the reference
-    /// partition — and a doc comment cannot see it. An arm that passed
-    /// [`AdaLnResidency::Resident`] would leave the contract declaring a saving that render does
-    /// not deliver, which is the OOM direction and exactly the half-of-a-pair-moved shape sc-17150
-    /// and sc-19008 both shipped.
+    /// `PrecomputedThenEvicted`. sc-17157 added a **second** render arm (`generate_ref2va`), and a
+    /// doc comment cannot see a third; an arm that kept the projections resident would leave the
+    /// contract declaring a saving that render does not deliver — the OOM direction.
     ///
-    /// So: scan the production source, and require every `JointDit::new(` construction to carry the
-    /// evicting literal. The count is derived, not maintained — a third arm is covered the moment
-    /// it is written.
+    /// Both arms build their velocity model through `JointDit::from_prepared`, whose
+    /// `PreparedJointDit` is either the warm one or `PreparedJointDit::prepare`'s, and `prepare`
+    /// always evicts (`dit::model` has no resident variant of it). So: the production source must
+    /// construct no `JointDit::new(` at all (the only constructor that takes a residency), and
+    /// each arm must prepare its freshly mapped DiT. The counts are derived, not maintained.
     #[test]
     fn every_joint_dit_construction_evicts_the_adaln_projections() {
-        const CONSTRUCTION: &str = "JointDit::new(";
-        const EVICTING: &str = "AdaLnResidency::PrecomputeAndEvict";
-
         let src = production_source();
-        let sites: Vec<usize> = src.match_indices(CONSTRUCTION).map(|(i, _)| i).collect();
-        assert!(
-            sites.len() >= 2,
-            "expected at least the base and ref2va render arms to construct a `{CONSTRUCTION}`, \
-             found {}. If the constructor was renamed this guard stopped watching anything",
-            sites.len()
+        assert_eq!(
+            src.matches("JointDit::new(").count(),
+            0,
+            "a render arm constructs `JointDit::new`, which can keep the AdaLN projections \
+             resident; build it from a `PreparedJointDit` instead"
         );
-        for start in sites {
-            // The residency is the last argument, so the literal lives between the constructor and
-            // the closing paren of that call.
-            let tail = &src[start..];
-            let end = tail
-                .find(")?")
-                .expect("a JointDit::new call is closed and fallible");
-            assert!(
-                tail[..end].contains(EVICTING),
-                "a `{CONSTRUCTION}` at byte {start} does not pass `{EVICTING}`. \
-                 memory_strategy::adaln_component declares the eviction unconditionally, so an arm \
-                 that keeps the projections resident makes the published contract over-declare its \
-                 saving by up to 26.02 GB:\n{}",
-                &tail[..end]
+        for arm in ["fn render(", "fn generate_ref2va("] {
+            let body = body_of(&src, arm);
+            assert_eq!(
+                body.matches("PreparedJointDit::prepare(").count(),
+                1,
+                "{arm} must evict through `PreparedJointDit::prepare` when it maps the DiT"
+            );
+            assert_eq!(
+                body.matches("JointDit::from_prepared(").count(),
+                1,
+                "{arm} must build its velocity model from the prepared (evicted) DiT"
             );
         }
     }
@@ -3499,12 +3807,14 @@ mod tests {
             .map(|(signature, _)| body_of(&src, signature))
             .collect();
         for helper in DELEGATED_HELPERS {
-            // `fn load_audio_vae(` -> `self.load_audio_vae(`, the anchor a phase must name.
-            let anchor = format!("self.{}", helper.trim_start_matches("fn "));
+            // `fn load_audio_vae(` -> `self.load_audio_vae(` (a method) or `load_conditioner(` (a
+            // free function), the anchor a phase must name.
+            let call = helper.trim_start_matches("fn ");
+            let anchor = format!("self.{call}");
             let named = staged
                 .iter()
                 .flat_map(|(_, phases)| phases.iter())
-                .any(|(_, maps, _)| maps.contains(&anchor.as_str()));
+                .any(|(_, maps, _)| maps.contains(&anchor.as_str()) || maps.contains(&call));
             assert!(
                 named,
                 "`{helper}` is exempted as a delegated helper but no phase names `{anchor}` as a \
@@ -3533,6 +3843,40 @@ mod tests {
                 total - inside
             );
         }
+    }
+
+    /// A resident request on a device with no CUDA free-memory figure — or on a source whose
+    /// headers cannot price a warm set — keeps nothing warm and stages, and so does a staged
+    /// request. (Off CUDA both answers are `false` whatever the request; the staged/streamed
+    /// predicate itself is pinned by `crate::warm`'s tests.) Every warm slot starts empty, and
+    /// nothing held is nothing credited.
+    #[test]
+    fn a_request_that_cannot_price_or_fit_its_warm_set_stages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(staged_root(&tmp)))).unwrap();
+        let mut warm = VideoWarm::default();
+        assert!(warm.is_empty());
+        let resident = request(1344, 768);
+        assert!(crate::warm::keeps_components_warm(&resident));
+        assert!(!model
+            .decide_warm(&resident, MiniMaxH3Task::T2va, 50, &mut warm)
+            .unwrap());
+        let mut staged = request(1344, 768);
+        staged.memory = Some(candle_gen::gen_core::GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        });
+        assert!(!model
+            .decide_warm(&staged, MiniMaxH3Task::T2va, 50, &mut warm)
+            .unwrap());
+        assert!(warm.is_empty());
+
+        assert_eq!(warm.held_bytes(), 0);
+        assert_eq!(
+            model.retained_weight_bytes(),
+            None,
+            "nothing held, nothing credited"
+        );
     }
 
     /// **The audio VAE's encode half is pinned to f32 and does NOT follow the provider's dtype.**

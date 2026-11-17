@@ -8,6 +8,28 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Default CUDA admission (same rule and thresholds as scripts/ci/vendor/veda_cuda_guard.py
+# stable_window): under the host-global PUBLIC/SceneWorks/gpu-locks/<UUID>.lock, the card
+# must keep required_free_mib free in every sample of a quiet, stable window. Other
+# processes on the card are recorded, never a refusal by presence.
+$script:StableMaxUsedSpreadMib=256
+$script:StableMaxUsedGrowthMib=128
+$script:StableMaxUtilizationPercent=30
+$script:StableMaxUtilizationSpread=15
+$script:AdmissionSamples=5
+$script:AdmissionSampleMilliseconds=500
+# Default free memory when the control omits required_free_mib (optional since the shared-card rule).
+# MOSS-Image's two shipped weight files (SceneWorks config/manifests/builtin.models.jsonc
+# estimatedSizeBytes 17,055,137,947 + 10,164,749,652 = 25,959 MiB), +25 % for activations and the
+# CUDA context, + the 2,048 MiB free reserve the other CUDA claims keep, rounded up to 36 GiB. Derived,
+# not measured; a dispatch that knows better passes required_free_mib.
+$script:DefaultRequiredFreeMib=36864
+$script:AdmissionPollMilliseconds=5000
+$script:WaitNoticeSeconds=60
+$script:ownedReleaseConfirmed=$false
+$script:uuidLock=$null
+$script:gpuLockDirectory=$null
+$script:lastWaitNotice=$null
 function Require($condition, [string]$message) { if (-not $condition) { throw $message } }
 function Integer($value) { ($value -is [int] -or $value -is [long]) }
 function Exact-Fields($value, [string[]]$expected) {
@@ -41,9 +63,6 @@ function Identity($pidValue) {
 }
 function Same-Identity($a, $b) {
     $a.pid -eq $b.pid -and $a.name -ieq $b.name -and [DateTimeOffset]::Parse($a.created_utc) -eq [DateTimeOffset]::Parse($b.created_utc)
-}
-function Pid-Subset([int[]]$actual, [int[]]$allowed) {
-    foreach ($id in $actual) { Require ($allowed -contains $id) "Foreign GPU0 PID $id; never terminate it" }
 }
 function Check-Pin([string]$root, [string]$expected) {
     Require ($expected -cmatch '^[0-9a-f]{40}$') 'Exact inference SHA required'
@@ -304,43 +323,115 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
     }
     if ($null -ne $failure) { throw $failure }
 }
-function Check-Device([int[]]$allowed=@(),[bool]$quiescing=$false,[hashtable]$owned=@{}) {
+function Check-Device([int[]]$allowed=@(),[hashtable]$owned=@{}) {
     Require ([DateTimeOffset]::UtcNow -lt $script:deadline) 'Fresh lease expired'
-    $gpu=@(Native nvidia-smi @('--query-gpu=index,uuid,name,memory.used,utilization.gpu,driver_version','--format=csv,noheader,nounits') | ConvertFrom-Csv -Header index,uuid,name,memory,utilization,driver | Where-Object { $_.index.Trim() -eq '0' })
+    $gpu=@(Native nvidia-smi @('--query-gpu=index,uuid,name,memory.used,memory.free,utilization.gpu,driver_version','--format=csv,noheader,nounits') | ConvertFrom-Csv -Header index,uuid,name,memory,free,utilization,driver | Where-Object { $_.index.Trim() -eq '0' })
     Require ($gpu.Count -eq 1 -and $gpu[0].uuid.Trim() -ceq $script:control.gpu_uuid) 'Physical GPU0 UUID mapping changed'
     $rows=@(Native nvidia-smi @('--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits') | ConvertFrom-Csv -Header uuid,pid | Where-Object { $_.uuid.Trim() -ceq $script:control.gpu_uuid })
-    $baseline=@()
-    foreach ($b in @($script:control.desktop_baseline)) {
-        Exact-Fields $b @('pid','name','created_utc')
-        Require (Same-Identity $b (Identity $b.pid)) 'Baseline PID disappeared, changed or became inaccessible'
-        $baseline += [int]$b.pid
-    }
     $pids=@(); foreach ($row in $rows) { Require ($row.pid.Trim() -cmatch '^[0-9]+$') 'Unresolved GPU process'; $pids += [int]$row.pid.Trim() }
-    Pid-Subset $pids @($allowed+$baseline+@($owned.Keys))
-    if ($allowed.Count -eq 0 -and $owned.Count -eq 0 -and -not $quiescing) {
-        Require ([double]$gpu[0].memory -le [double]$script:control.baseline_max_memory_mib -and [double]$gpu[0].utilization -le [double]$script:control.baseline_max_utilization_percent) 'GPU0 not within admitted idle baseline'
-    }
-    $owners=@($pids | ForEach-Object {
-        if ($baseline -contains $_) { Identity $_ } else { Owned-Gpu-Identity ([int]$_) $owned }
-    })
-    $gpu[0] | Add-Member -NotePropertyName owned_pids -NotePropertyValue @($pids | Where-Object {$baseline -notcontains $_})
-    $key=($owners | ConvertTo-Json -Compress)
+    # Owned PIDs keep exact identity/handle proof. Any other process on the card (display,
+    # desktop app, loaded model, foreign compute) is a co-tenant: recorded, never a refusal.
+    $mine=@($pids | Where-Object { $owned.ContainsKey($_) -or $allowed -contains $_ })
+    $foreign=@($pids | Where-Object { -not ($owned.ContainsKey($_) -or $allowed -contains $_) })
+    $owners=@($mine | ForEach-Object { Owned-Gpu-Identity ([int]$_) $owned })
+    $gpu[0] | Add-Member -NotePropertyName owned_pids -NotePropertyValue $mine
+    $gpu[0] | Add-Member -NotePropertyName foreign_pids -NotePropertyValue $foreign
+    $key=(@{owners=$owners;foreign_pids=$foreign} | ConvertTo-Json -Depth 4 -Compress)
     if ($script:lastOwners -cne $key) {
-        @{utc=[DateTime]::UtcNow.ToString('o');gpu0=$gpu[0];owners=$owners;baseline=$script:control.desktop_baseline} | ConvertTo-Json -Depth 8 -Compress | Add-Content -LiteralPath (Join-Path $script:evidence 'ownership-observations.jsonl') -Encoding UTF8
+        @{utc=[DateTime]::UtcNow.ToString('o');gpu0=$gpu[0];owners=$owners;foreign_pids=$foreign} | ConvertTo-Json -Depth 8 -Compress | Add-Content -LiteralPath (Join-Path $script:evidence 'ownership-observations.jsonl') -Encoding UTF8
         $script:lastOwners=$key
     }
     $gpu
 }
-function Wait-DeviceIdle([hashtable]$owned=@{}) {
-    $script:deviceIdleConfirmed=$false
-    # NVML utilization is sampled over a window. Wait for the window to decay after an owned
-    # process exits; foreign PIDs and UUID/identity changes still fail immediately on each poll.
+function Wait-OwnedRelease([hashtable]$owned=@{}) {
+    $script:ownedReleaseConfirmed=$false
+    # An exited owned process may keep a stale NVML row briefly. Foreign processes never matter here;
+    # utilization and memory settle are judged by the next admission's quiet window.
     for ($attempt=0; $attempt -lt 60; $attempt++) {
-        $g=@(Check-Device @() $true $owned)
-        if ($g[0].owned_pids.Count -eq 0 -and [double]$g[0].memory -le [double]$script:control.baseline_max_memory_mib -and [double]$g[0].utilization -le [double]$script:control.baseline_max_utilization_percent) { $script:deviceIdleConfirmed=$true; return $g }
+        $g=@(Check-Device @() $owned)
+        if ($g[0].owned_pids.Count -eq 0) { $script:ownedReleaseConfirmed=$true; return $g }
         Start-Sleep -Milliseconds 500
     }
-    throw 'GPU0 did not return to the fresh admitted idle baseline'
+    throw 'Owned GPU0 processes did not release'
+}
+function Wait-Notice([string]$reason) {
+    # Never wait silently: print the current refusal reason at most once per WaitNoticeSeconds.
+    $now=[DateTimeOffset]::UtcNow
+    if ($null -eq $script:lastWaitNotice -or ($now-$script:lastWaitNotice).TotalSeconds -ge $script:WaitNoticeSeconds) {
+        Write-Host "CUDA admission waiting: $reason"
+        $script:lastWaitNotice=$now
+    }
+}
+function Admission-Refusal($samples,[double]$requiredFreeMib) {
+    # Returns the first failed condition, or $null when the window is admissible.
+    # Utilization reported as N/A is not judged. Foreign processes are not an input.
+    $used=@(); $utilization=@()
+    foreach ($sample in @($samples)) {
+        if ($sample.memory.Trim() -notmatch '^[0-9]+$' -or $sample.free.Trim() -notmatch '^[0-9]+$') { return 'invalid memory counters' }
+        if ([double]$sample.free -lt $requiredFreeMib) { return ('{0} MiB free < {1} MiB required' -f $sample.free.Trim(),$requiredFreeMib) }
+        $used+=[double]$sample.memory
+        $value=$sample.utilization.Trim()
+        if ($value -match '^[0-9]+$') { $utilization+=[double]$value } elseif ($value -notmatch 'N/A') { return 'invalid utilization counter' }
+    }
+    $range=$used | Measure-Object -Maximum -Minimum
+    if ($range.Maximum-$range.Minimum -gt $script:StableMaxUsedSpreadMib) { return ('memory.used moved {0} MiB (> {1})' -f ($range.Maximum-$range.Minimum),$script:StableMaxUsedSpreadMib) }
+    if ($utilization.Count -gt 0) {
+        $range=$utilization | Measure-Object -Maximum -Minimum
+        if ($range.Maximum -gt $script:StableMaxUtilizationPercent) { return ('utilization {0}% (> {1}%)' -f $range.Maximum,$script:StableMaxUtilizationPercent) }
+        if ($range.Maximum-$range.Minimum -gt $script:StableMaxUtilizationSpread) { return ('utilization moved {0} points (> {1})' -f ($range.Maximum-$range.Minimum),$script:StableMaxUtilizationSpread) }
+    }
+    if ($used[-1]-$used[0] -gt $script:StableMaxUsedGrowthMib) { return ('memory.used grew {0} MiB (> {1})' -f ($used[-1]-$used[0]),$script:StableMaxUsedGrowthMib) }
+    $null
+}
+function Lock-Uuid {
+    # Host-global CI-to-CI mutex, shared with the Python claims (msvcrt byte 0 of the same file).
+    if ($null -ne $script:uuidLock) { return }
+    $directory=$script:gpuLockDirectory
+    if ([string]::IsNullOrEmpty($directory)) {
+        Require (-not [string]::IsNullOrEmpty($env:PUBLIC)) 'PUBLIC is required for the host-global GPU lock'
+        $directory=Join-Path $env:PUBLIC 'SceneWorks\gpu-locks'
+    }
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    $path=Join-Path $directory ($script:control.gpu_uuid+'.lock')
+    while ($true) {
+        Require ([DateTimeOffset]::UtcNow -lt $script:deadline) 'Fresh lease expired waiting for the host-global UUID lock'
+        $stream=[IO.File]::Open($path,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)
+        try {
+            if ($stream.Length -eq 0) { $stream.Write([byte[]]@(48),0,1) }
+            $stream.Lock(0,1)
+            $script:uuidLock=$stream
+            return
+        } catch {
+            $stream.Dispose()
+            # .NET method failures arrive wrapped; only a held lock (IOException) means wait.
+            if (-not ($_.Exception -is [IO.IOException] -or $_.Exception.InnerException -is [IO.IOException])) { throw }
+        }
+        Wait-Notice ("GPU0 {0}: UUID lock held by another CI job" -f $script:control.gpu_uuid)
+        Start-Sleep -Milliseconds $script:AdmissionPollMilliseconds
+    }
+}
+function Unlock-Uuid {
+    if ($null -eq $script:uuidLock) { return }
+    $stream=$script:uuidLock; $script:uuidLock=$null
+    try { $stream.Unlock(0,1) } finally { $stream.Dispose() }
+}
+function Wait-DeviceAdmissible([bool]$releaseWhileWaiting=$false) {
+    # Admit on free memory plus a quiet, stable window under the UUID lock. Before the first
+    # admission the lock is released while waiting so other CI jobs that fit can run.
+    while ($true) {
+        Lock-Uuid
+        $samples=@()
+        for ($index=0; $index -lt $script:AdmissionSamples; $index++) {
+            if ($index -gt 0) { Start-Sleep -Milliseconds $script:AdmissionSampleMilliseconds }
+            $samples+=@(Check-Device @() @{})[0]
+        }
+        $refusal=Admission-Refusal $samples ([double]$script:control.required_free_mib)
+        if ($null -eq $refusal) { return $samples[-1] }
+        $foreign=@($samples | ForEach-Object { $_.foreign_pids } | Sort-Object -Unique)
+        Wait-Notice ("GPU0 {0}: {1}; other GPU0 PIDs [{2}] are recorded, never a refusal" -f $script:control.gpu_uuid,$refusal,($foreign -join ','))
+        if ($releaseWhileWaiting) { Unlock-Uuid }
+        Start-Sleep -Milliseconds $script:AdmissionPollMilliseconds
+    }
 }
 function Evidence-Files([string]$root) {
     foreach ($directory in @($root,(Join-Path $root 'product-worker'))) {
@@ -500,9 +591,12 @@ function Test-Ownership-Fixture {
     Remove-Variable fixtureLive,fixtureTerminated -Scope Script
 }
 function Test-Device-Exit-Fixture([string]$temp) {
-    # Exercise the actual device callback and drain with deterministic NVML/CIM races.
+    # Exercise the actual device callback, drain and admission with deterministic NVML/CIM races.
     function Reset-DeviceFixture([string]$mode) {
+        Unlock-Uuid
         $script:fixtureGpuMode=$mode; $script:fixtureGpuPoll=0
+        $script:fixtureWindow=$null; $script:fixtureQuery=0; $script:fixtureNotices=@()
+        $script:fixtureUnlockedWaits=@(); $script:fixtureExpireAfter=0
         $script:fixtureGpuProcess=[pscustomobject]@{Id=100;HasExited=$false;StartTime=[DateTime]::Parse('2026-01-01T00:00:00.0000007Z');ExitTime=[DateTime]::UtcNow}
         $script:fixtureGpuProcess | Add-Member -MemberType ScriptMethod -Name Refresh -Value {
             if ($script:fixtureGpuMode -eq 'handle-query-error') { throw 'fixture handle inaccessible' }
@@ -510,31 +604,34 @@ function Test-Device-Exit-Fixture([string]$temp) {
         }
         $script:fixtureGpuRow=[pscustomobject]@{ProcessId=100;Name='owned.exe';CreationDate=[DateTime]::Parse('2026-01-01T00:00:00.0000010Z')}
         $script:fixtureGpuOwned=@{100=[pscustomobject]@{identity=Snapshot-Identity $script:fixtureGpuRow;process=$script:fixtureGpuProcess;handle_created_utc=$script:fixtureGpuProcess.StartTime.ToUniversalTime().ToString('o')}}
-        if ($mode -in @('exited-present','exited-missing','stale-expired','future-exit','drain','stuck-row','stuck-utilization','cim-error')) { $script:fixtureGpuProcess.HasExited=$true }
+        if ($mode -in @('exited-present','exited-missing','stale-expired','future-exit','drain','stuck-row','busy-after-exit','cim-error')) { $script:fixtureGpuProcess.HasExited=$true }
         if ($mode -eq 'stale-expired') { $script:fixtureGpuProcess.ExitTime=[DateTime]::UtcNow.AddSeconds(-31) }
         if ($mode -eq 'future-exit') { $script:fixtureGpuProcess.ExitTime=[DateTime]::UtcNow.AddSeconds(60) }
         if ($mode -eq 'wrong-handle-pid') { $script:fixtureGpuProcess.Id=101 }
         if ($mode -eq 'wrong-handle-time') { $script:fixtureGpuProcess.StartTime=$script:fixtureGpuProcess.StartTime.AddTicks(1) }
-        $script:control=[pscustomobject]@{gpu_uuid='GPU-fixture';desktop_baseline=@([pscustomobject]@{pid=20;name='desktop.exe';created_utc='2026-01-01T00:00:00.0000000Z'});baseline_max_memory_mib=512;baseline_max_utilization_percent=0}
+        $script:control=[pscustomobject]@{gpu_uuid='GPU-fixture';required_free_mib=4096}
         $script:deadline=[DateTimeOffset]::UtcNow.AddMinutes(1)
-        $script:evidence=$temp; $script:lastOwners='unobserved'; $script:deviceIdleConfirmed=$false
+        $script:evidence=$temp; $script:lastOwners='unobserved'; $script:ownedReleaseConfirmed=$false
+        $script:lastWaitNotice=$null; $script:gpuLockDirectory=$temp
     }
     function Native([string]$exe,[string[]]$arguments) {
         if ($script:fixtureGpuMode -eq 'nvml-error') { throw 'fixture NVML inaccessible' }
         if ($arguments[0] -like '--query-gpu=*') {
+            Require ($arguments[0] -ceq '--query-gpu=index,uuid,name,memory.used,memory.free,utilization.gpu,driver_version') 'Fixture GPU query contract changed'
             $uuid='GPU-fixture'; if ($script:fixtureGpuMode -eq 'uuid') { $uuid='GPU-foreign' }
-            $util=0
-            if ($script:fixtureGpuMode -eq 'stuck-utilization' -or ($script:fixtureGpuMode -eq 'drain' -and $script:fixtureGpuPoll -lt 2)) { $util=61 }
-            return "0, $uuid, fixture, 282, $util, fixture-driver"
+            if ($null -ne $script:fixtureWindow) {
+                # One "used, free, utilization" row per query; the last row repeats.
+                $row=$script:fixtureWindow[[Math]::Min($script:fixtureQuery,$script:fixtureWindow.Count-1)]
+                $script:fixtureQuery++
+                return "0, $uuid, fixture, $row, fixture-driver"
+            }
+            $util=0; if ($script:fixtureGpuMode -eq 'busy-after-exit') { $util=61 }
+            return "0, $uuid, fixture, 282, 90000, $util, fixture-driver"
         }
+        # PID 20 is a desktop process and 4000 a foreign compute job: both only co-tenants.
         'GPU-fixture, 20'
-        if ($script:fixtureGpuMode -eq 'stuck-utilization' -or ($script:fixtureGpuMode -eq 'drain' -and $script:fixtureGpuPoll -ge 1)) { return }
+        if ($script:fixtureGpuMode -in @('admit','busy-after-exit') -or ($script:fixtureGpuMode -eq 'drain' -and $script:fixtureGpuPoll -ge 1)) { 'GPU-fixture, 4000'; return }
         if ($script:fixtureGpuMode -eq 'unknown-pid') { 'GPU-fixture, 999' } else { 'GPU-fixture, 100' }
-    }
-    function Identity($pidValue) {
-        Require ($pidValue -eq 20) 'Fixture queried unexpected desktop identity'
-        if ($script:fixtureGpuMode -eq 'baseline') { throw 'fixture desktop inaccessible' }
-        $script:control.desktop_baseline[0]
     }
     function Get-CimInstance($class,[string]$Filter,[string]$ErrorAction) {
         Require ($class -ceq 'Win32_Process' -and $Filter -ceq 'ProcessId=100' -and $ErrorAction -ceq 'Stop') 'Fixture CIM query contract changed'
@@ -547,51 +644,108 @@ function Test-Device-Exit-Fixture([string]$temp) {
         if ($script:fixtureGpuMode -eq 'missing-creation') { $row.CreationDate=$null }
         $row
     }
-    function Start-Sleep([int]$Milliseconds) { $script:fixtureGpuPoll++ }
+    function Start-Sleep([int]$Milliseconds) {
+        $script:fixtureGpuPoll++
+        if ($Milliseconds -eq $script:AdmissionPollMilliseconds) { $script:fixtureUnlockedWaits+=@($null -eq $script:uuidLock) }
+        if ($script:fixtureExpireAfter -gt 0 -and $script:fixtureGpuPoll -ge $script:fixtureExpireAfter) { $script:deadline=[DateTimeOffset]::UtcNow.AddMinutes(-1) }
+    }
+    function Write-Host([string]$Object) { $script:fixtureNotices+=@($Object) }
     try {
         foreach ($mode in @('live','exit-during-refresh','exited-present','exited-missing')) {
             Reset-DeviceFixture $mode
             # Empty live-ID list reproduces a callback entered after the root exits.
-            $g=@(Check-Device @() $false $script:fixtureGpuOwned)
-            Require ($g.Count -eq 1 -and $g[0].owned_pids.Count -eq 1) "Owned exit race rejected: $mode"
+            $g=@(Check-Device @() $script:fixtureGpuOwned)
+            Require ($g.Count -eq 1 -and $g[0].owned_pids.Count -eq 1 -and ($g[0].foreign_pids -join ',') -ceq '20') "Owned exit race rejected: $mode"
         }
         Reset-DeviceFixture 'exit-during-refresh'
         $legacyAccepted=(Same-Identity $script:fixtureGpuOwned[100].identity (Snapshot-Identity $script:fixtureGpuRow)) -and (Owned-Entry-Live $script:fixtureGpuOwned[100])
         Require (-not $legacyAccepted) 'Legacy exit-race fixture did not discriminate'
-        Check-Device @() $false $script:fixtureGpuOwned | Out-Null
+        Check-Device @() $script:fixtureGpuOwned | Out-Null
+        # An unknown process on the card is recorded, never refused and never terminated.
+        Reset-DeviceFixture 'unknown-pid'
+        $g=@(Check-Device @() $script:fixtureGpuOwned)
+        Require (($g[0].foreign_pids -join ',') -ceq '20,999' -and $g[0].owned_pids.Count -eq 0) 'Foreign GPU0 PID was refused or misattributed'
         $failures=@{
             'wrong-pid'='GPU PID identity changed*';'changed-name'='GPU PID identity changed*';'changed-creation'='GPU PID identity changed*'
             'missing-creation'='Unresolved process creation identity';'wrong-handle-pid'='GPU PID retained handle changed*';'wrong-handle-time'='GPU PID retained handle changed*'
             'handle-query-error'='*fixture handle inaccessible*';'cim-error'='fixture CIM inaccessible';'missing-live'='Live GPU PID has no CIM identity*'
             'stale-expired'='Exited GPU PID telemetry did not clear*';'future-exit'='Exited GPU PID telemetry did not clear*'
-            'unknown-pid'='Foreign GPU0 PID*';'unretained-allowed'='Unretained GPU PID*';'uuid'='Physical GPU0 UUID mapping changed'
-            'baseline'='fixture desktop inaccessible';'nvml-error'='fixture NVML inaccessible';'deadline'='Fresh lease expired'
+            'unretained-allowed'='Unretained GPU PID*';'uuid'='Physical GPU0 UUID mapping changed'
+            'nvml-error'='fixture NVML inaccessible';'deadline'='Fresh lease expired'
         }
         foreach ($mode in $failures.Keys) {
             Reset-DeviceFixture $mode
             if ($mode -eq 'unretained-allowed') { $script:fixtureGpuOwned=@{} }
             if ($mode -eq 'deadline') { $script:deadline=[DateTimeOffset]::UtcNow.AddMinutes(-1) }
             $rejected=$false
-            try { Check-Device @(100) $false $script:fixtureGpuOwned | Out-Null } catch { $rejected=$_.Exception.Message -like $failures[$mode] }
+            try { Check-Device @(100) $script:fixtureGpuOwned | Out-Null } catch { $rejected=$_.Exception.Message -like $failures[$mode] }
             Require $rejected "Device guard admitted $mode or failed for the wrong reason"
         }
         # Reuse remains forbidden even when the held process has exited.
         foreach ($mode in @('wrong-pid','changed-name','changed-creation')) {
             Reset-DeviceFixture $mode; $script:fixtureGpuProcess.HasExited=$true
             $rejected=$false
-            try { Check-Device @() $true $script:fixtureGpuOwned | Out-Null } catch { $rejected=$_.Exception.Message -like 'GPU PID identity changed*' }
+            try { Check-Device @() $script:fixtureGpuOwned | Out-Null } catch { $rejected=$_.Exception.Message -like 'GPU PID identity changed*' }
             Require $rejected "Exited handle admitted reused $mode"
         }
+        # Drain waits only for owned rows; a foreign compute job arriving meanwhile is not waited on.
         Reset-DeviceFixture 'drain'
-        Wait-DeviceIdle $script:fixtureGpuOwned | Out-Null
-        Require ($script:deviceIdleConfirmed -and $script:fixtureGpuPoll -eq 2) 'Drain skipped stale NVML rows or sampled utilization'
-        foreach ($mode in @('stuck-row','stuck-utilization')) {
-            Reset-DeviceFixture $mode; $rejected=$false
-            try { Wait-DeviceIdle $script:fixtureGpuOwned | Out-Null } catch { $rejected=$_.Exception.Message -ceq 'GPU0 did not return to the fresh admitted idle baseline' }
-            Require ($rejected -and -not $script:deviceIdleConfirmed -and $script:fixtureGpuPoll -eq 60) "Unbounded or unsafe drain: $mode"
+        Wait-OwnedRelease $script:fixtureGpuOwned | Out-Null
+        Require ($script:ownedReleaseConfirmed -and $script:fixtureGpuPoll -eq 1) 'Drain skipped stale NVML rows or waited on a foreign process'
+        Reset-DeviceFixture 'busy-after-exit'
+        Wait-OwnedRelease $script:fixtureGpuOwned | Out-Null
+        Require ($script:ownedReleaseConfirmed -and $script:fixtureGpuPoll -eq 0) 'Drain waited on foreign utilization'
+        Reset-DeviceFixture 'stuck-row'; $rejected=$false
+        try { Wait-OwnedRelease $script:fixtureGpuOwned | Out-Null } catch { $rejected=$_.Exception.Message -ceq 'Owned GPU0 processes did not release' }
+        Require ($rejected -and -not $script:ownedReleaseConfirmed -and $script:fixtureGpuPoll -eq 60) 'Unbounded or unsafe drain: stuck-row'
+        # A busy-but-stable foreign compute process (70 GiB resident, steady ~20%) is admitted.
+        Reset-DeviceFixture 'admit'
+        $script:fixtureWindow=@('70000, 20000, 20','70040, 19960, 22','70020, 19980, 21','70060, 19940, 20','70050, 19950, 23')
+        $g=Wait-DeviceAdmissible $true
+        Require ($null -ne $script:uuidLock -and $script:fixtureNotices.Count -eq 0 -and $script:fixtureQuery -eq 5 -and ($g.foreign_pids -join ',') -ceq '20,4000') 'Busy-but-stable foreign compute process was refused'
+        Unlock-Uuid
+        Reset-DeviceFixture 'admit'
+        $script:fixtureWindow=@('553, 90000, [N/A]')
+        Wait-DeviceAdmissible $true | Out-Null
+        Require ($script:fixtureNotices.Count -eq 0) 'N/A utilization was judged'
+        # Growth, instability, busy utilization and short free memory wait with a logged reason,
+        # release the UUID lock while waiting, then admit once the card is quiet.
+        $refusals=[ordered]@{
+            'memory.used grew 147 MiB (> 128)'=@('553, 90000, 5','590, 90000, 5','625, 90000, 5','660, 90000, 5','700, 90000, 5')
+            'memory.used moved 347 MiB (> 256)'=@('553, 90000, 5','900, 90000, 5','553, 90000, 5','553, 90000, 5','553, 90000, 5')
+            'utilization 31% (> 30%)'=@('553, 90000, 25','553, 90000, 25','553, 90000, 31','553, 90000, 25','553, 90000, 25')
+            'utilization moved 20 points (> 15)'=@('553, 90000, 5','553, 90000, 25','553, 90000, 5','553, 90000, 5','553, 90000, 5')
+            '1000 MiB free < 4096 MiB required'=@('553, 1000, 5','553, 1000, 5','553, 1000, 5','553, 1000, 5','553, 1000, 5','553, 90000, 5')
         }
+        foreach ($reason in $refusals.Keys) {
+            Reset-DeviceFixture 'admit'
+            $script:fixtureWindow=$refusals[$reason]
+            Wait-DeviceAdmissible $true | Out-Null
+            $expected="CUDA admission waiting: GPU0 GPU-fixture: $reason; other GPU0 PIDs [20,4000] are recorded, never a refusal"
+            Require ($script:fixtureNotices.Count -eq 1 -and $script:fixtureNotices[0] -ceq $expected -and ($script:fixtureUnlockedWaits -join ',') -ceq 'True' -and $null -ne $script:uuidLock) "Admission did not wait with a logged reason: $reason"
+            Unlock-Uuid
+        }
+        # Between owned phases the lock stays held while waiting; the lease deadline bounds the wait.
+        Reset-DeviceFixture 'admit'
+        $script:fixtureWindow=@('553, 1000, 5'); $script:fixtureExpireAfter=12; $rejected=$false
+        try { Wait-DeviceAdmissible $false | Out-Null } catch { $rejected=$_.Exception.Message -ceq 'Fresh lease expired' }
+        Require ($rejected -and $script:fixtureNotices.Count -eq 1 -and @($script:fixtureUnlockedWaits | Where-Object { $_ }).Count -eq 0) 'Held-lock admission wait was unbounded or released the lock'
+        # Another holder of the host-global UUID lock is waited for with a logged reason.
+        Reset-DeviceFixture 'admit'
+        $other=[IO.File]::Open((Join-Path $temp 'GPU-fixture.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)
+        try {
+            $other.Lock(0,1); $script:fixtureExpireAfter=2; $rejected=$false
+            try { Lock-Uuid } catch { $rejected=$_.Exception.Message -ceq 'Fresh lease expired waiting for the host-global UUID lock' }
+            Require ($rejected -and $null -eq $script:uuidLock -and $script:fixtureNotices.Count -eq 1 -and $script:fixtureNotices[0] -ceq 'CUDA admission waiting: GPU0 GPU-fixture: UUID lock held by another CI job') 'Held UUID lock was stolen or waited on silently'
+            $other.Unlock(0,1)
+            $script:deadline=[DateTimeOffset]::UtcNow.AddMinutes(1); $script:fixtureExpireAfter=0
+            Lock-Uuid
+            Require ($null -ne $script:uuidLock) 'Released UUID lock was not acquired'
+        } finally { $other.Dispose() }
     } finally {
-        Remove-Variable fixtureGpuMode,fixtureGpuPoll,fixtureGpuProcess,fixtureGpuRow,fixtureGpuOwned,control,deadline,lastOwners,deviceIdleConfirmed -Scope Script
+        Unlock-Uuid
+        Remove-Variable fixtureGpuMode,fixtureGpuPoll,fixtureGpuProcess,fixtureGpuRow,fixtureGpuOwned,fixtureWindow,fixtureQuery,fixtureNotices,fixtureUnlockedWaits,fixtureExpireAfter,control,deadline,lastOwners -Scope Script
+        $script:ownedReleaseConfirmed=$false; $script:lastWaitNotice=$null; $script:gpuLockDirectory=$null
     }
 }
 if ($SelfTest) {
@@ -646,8 +800,6 @@ if ($SelfTest) {
         $rejected=$false; try { Check-Pin $temp ('b'*40) } catch { $rejected=$true }; Require $rejected 'Pin mismatch accepted'
         Require (Integer ([long]12)) 'JSON Int64 rejected'
         Require (-not (Integer 1.2)) 'Fractional PID accepted'
-        Pid-Subset @(12) @(12,13)
-        $rejected=$false; try { Pid-Subset @(14) @(12,13) } catch {$rejected=$true}; Require $rejected 'Foreign PID accepted'
         Exact-Fields ([pscustomobject]@{a=1;b=2}) @('a','b')
         $rejected=$false; try { Exact-Fields ([pscustomobject]@{a=1;b=2;c=3}) @('a','b') } catch {$rejected=$true}; Require $rejected 'Unknown field accepted'
         $a=[pscustomobject]@{pid=12;name='test';created_utc='2026-01-01T00:00:00Z'}
@@ -898,22 +1050,23 @@ Require (-not [string]::IsNullOrEmpty($script:evidence)) 'Missing artifact root'
 New-Item -ItemType Directory -Force -Path $script:evidence | Out-Null
 $status = @{status='failed'; run=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT; host=$env:COMPUTERNAME; workflow_revision=$env:GITHUB_SHA; controller_path=$PSCommandPath; controller_sha256=(Hash $PSCommandPath); inference=$null; sceneworks=$env:MOSS_SCENEWORKS_REVISION; started_utc=[DateTime]::UtcNow.ToString('o')}
 $leaseHandle=$null; $leasePath=$null; $leaseHash=$null; $persistent=$null; $persistentCreated=$false
-$script:deviceIdleConfirmed=$false
+$script:ownedReleaseConfirmed=$false
 try {
     Require ($env:GITHUB_REF -ceq 'refs/heads/main') 'Terminal requires final inference main, not a feature/story ref'
     $c = $env:MOSS_NATIVE_CONTROL | ConvertFrom-Json
-    Exact-Fields $c @('campaign','inference_revision','snapshot_base','snapshot_shared','snapshot_dmd','gpu_uuid','physical_gpu_index','deadline_utc','timeout_seconds','owner','desktop_baseline','baseline_max_memory_mib','baseline_max_utilization_percent','external_owners_reconciled')
+    $fields=@('campaign','inference_revision','snapshot_base','snapshot_shared','snapshot_dmd','gpu_uuid','physical_gpu_index','deadline_utc','timeout_seconds','owner','external_owners_reconciled')
+    $hasRequiredFree=$c.PSObject.Properties.Name -ccontains 'required_free_mib'
+    if ($hasRequiredFree) { $fields+='required_free_mib' }
+    # Validate the supplied fields first; the default is added only after Exact-Fields passes.
+    Exact-Fields $c $fields
+    if (-not $hasRequiredFree) { $c | Add-Member -NotePropertyName required_free_mib -NotePropertyValue $script:DefaultRequiredFreeMib }
     Require ($c.campaign -cmatch '^sc-26325-native-[a-z0-9-]{1,48}$') 'Invalid fresh campaign'
     Require ($c.inference_revision -cmatch '^[0-9a-f]{40}$') 'Exact pinned inference SHA required'
     $status.inference=$c.inference_revision
     Require ($env:MOSS_SCENEWORKS_REVISION -cmatch '^[0-9a-f]{40}$') 'Exact SceneWorks revision required'
     Require ((Integer $c.physical_gpu_index) -and $c.physical_gpu_index -eq 0 -and $c.gpu_uuid -cmatch '^GPU-[0-9a-fA-F-]{16,64}$') 'Explicit physical GPU0 UUID required'
     Require (-not [string]::IsNullOrWhiteSpace($c.owner) -and $c.external_owners_reconciled -is [bool] -and $c.external_owners_reconciled -eq $true) 'Fresh cross-repository/external-owner reconciliation required'
-    Require ($c.desktop_baseline -is [System.Array]) 'Explicit baseline identity array required'
-    foreach ($number in @($c.baseline_max_memory_mib,$c.baseline_max_utilization_percent)) {
-        Require ($number -is [ValueType] -and (-not [double]::IsNaN([double]$number)) -and (-not [double]::IsInfinity([double]$number)) -and [double]$number -ge 0) 'Finite nonnegative baseline limits required'
-    }
-    Require ([double]$c.baseline_max_utilization_percent -le 100) 'Invalid utilization baseline'
+    Require ((Integer $c.required_free_mib) -and $c.required_free_mib -gt 0) 'Positive integer required_free_mib required'
     Require ((Integer $c.timeout_seconds) -and $c.timeout_seconds -ge 1 -and $c.timeout_seconds -le 7200) 'Invalid child timeout'
     Require ($c.deadline_utc -match '(Z|[+-][0-9]{2}:[0-9]{2})$') 'Explicit UTC offset required'
     $script:deadline=[DateTimeOffset]::Parse($c.deadline_utc)
@@ -998,7 +1151,10 @@ try {
     $status.assets=$assets
     $script:control=$c
     $script:lastOwners='unobserved'
-    $status.before=@(Wait-DeviceIdle)
+    # Free memory plus a quiet window under the host-global UUID lock; the lock is released
+    # while waiting before this first admission, then held through the final release check.
+    $status.admission_policy='required_free_mib free in every sample of a quiet stable window under the host-global UUID lock; other GPU0 processes recorded, never refused'
+    $status.before=@(Wait-DeviceAdmissible $true)
     $locks=Join-Path $base 'device-locks'; if (-not (Test-Path -LiteralPath $locks)) { New-Item -ItemType Directory -Path $locks | Out-Null }; Plain-Path $locks
     $leasePath=Join-Path $locks ($c.gpu_uuid+'.lock')
     $leaseHandle=[IO.File]::Open($leasePath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
@@ -1013,28 +1169,29 @@ try {
     $env:MOSS_NATIVE_TERMINAL_ADMITTED='sc-26325-physical-gpu0'; $env:MOSS_PHYSICAL_GPU_INDEX='0'; $env:MOSS_EXPECTED_CUDA_UUID=$c.gpu_uuid
     $env:CUDA_DEVICE_ORDER='PCI_BUS_ID'; $env:CUDA_VISIBLE_DEVICES=$c.gpu_uuid; $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'
     $env:MOSS_NATIVE_SKIP_PNG='1'; $env:SCENEWORKS_GPU_ID='0'
-    Check-Device @() | Out-Null
-    $script:deviceIdleConfirmed=$false
+    Check-Device | Out-Null
+    $script:ownedReleaseConfirmed=$false
     Owned-Run $exe @('real_weights::native_complete_surface_campaign','--ignored','--exact','--nocapture','--test-threads','1') 'native' $c.timeout_seconds {
         param($ids,$owned)
         Require ((Hash $script:leasePath) -ceq $script:leaseHash) 'Held UUID lease changed'
-        Check-Device $ids $false $owned | Out-Null
-    } {param($owned) Wait-DeviceIdle $owned | Out-Null}
+        Check-Device $ids $owned | Out-Null
+    } {param($owned) Wait-OwnedRelease $owned | Out-Null}
     $status.native_exit_code=0
     Validate-Backend $script:evidence $protocol
-    Wait-DeviceIdle|Out-Null
+    Wait-DeviceAdmissible $false | Out-Null
     Push-Location $product
     try {
-        $script:deviceIdleConfirmed=$false
+        $script:ownedReleaseConfirmed=$false
         Owned-Run $productExe @('--exact','image_jobs::moss_consumer_tests::moss_real_native_product_worker_campaign','--ignored','--nocapture','--test-threads=1') 'product-native' $c.timeout_seconds {
             param($ids,$owned)
             Require ((Hash $script:leasePath) -ceq $script:leaseHash) 'Held UUID lease changed'
-            Check-Device $ids $false $owned|Out-Null
-        } {param($owned) Wait-DeviceIdle $owned | Out-Null}
+            Check-Device $ids $owned|Out-Null
+        } {param($owned) Wait-OwnedRelease $owned | Out-Null}
     } finally { Pop-Location }
     $status.product_exit_code=0
     Validate-Product (Join-Path $script:evidence 'product-worker') $protocol
-    $status.after=@(Wait-DeviceIdle)
+    # The product run's drain already confirmed owned release with its real owned map; record the card.
+    $status.after=@(Check-Device)
     $status.status='passed'
 } catch {
     $status.error=$_.Exception.Message
@@ -1047,9 +1204,10 @@ try {
     if ($null -ne $leaseHandle) {
         try {
             $leaseHandle.Dispose()
-            if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath) -and (Hash $leasePath) -ceq $leaseHash) { Remove-Item -LiteralPath $leasePath } else { $status.lock_retained='device idle unconfirmed or identity changed; coordinator reconciliation required' }
+            if ($script:ownedReleaseConfirmed -and (Test-Path -LiteralPath $leasePath) -and (Hash $leasePath) -ceq $leaseHash) { Remove-Item -LiteralPath $leasePath } else { $status.lock_retained='owned GPU0 release unconfirmed or identity changed; coordinator reconciliation required' }
         } catch { $status.lock_cleanup_error=$_.Exception.Message } finally { $leaseHandle.Dispose() }
     }
+    try { Unlock-Uuid } catch { $status.uuid_lock_release_error=$_.Exception.Message }
     $status.finished_utc=[DateTime]::UtcNow.ToString('o')
     $status | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $script:evidence 'transport.json') -Encoding UTF8
     $files=@(Evidence-Files $script:evidence | ForEach-Object { @{path=$_.FullName.Substring($script:evidence.Length+1);bytes=$_.Length;sha256=(Hash $_.FullName)} })

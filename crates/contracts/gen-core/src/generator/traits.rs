@@ -75,6 +75,15 @@ pub trait Generator {
         None
     }
 
+    /// Device bytes of weights this provider keeps loaded **between** requests and releases before
+    /// any request that does not reuse them — a warm set it holds only after checking that it fits.
+    /// Metadata only; call within the serialized cache transaction. Admission may credit at most
+    /// this value, bounded by the current committed snapshot, as reclaimable. `None` (the default)
+    /// grants no credit.
+    fn retained_weight_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the

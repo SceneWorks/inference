@@ -1247,6 +1247,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         claim = multi_cuda.execution_claim(row, cuda_policies, value, case_work, env)
                     else:
                         options = {'constraints': row}
+                        if backend == 'candle-cuda':
+                            # Headroom admission is the CUDA default; its release seal needs the owned-Job record below.
+                            options['require_owned_completion'] = True
                         if comparison_deadline_monotonic is not None:
                             options['original_deadline_monotonic'] = comparison_deadline_monotonic
                         claim = execution_claim(backend, policy, case_work, env, **options)

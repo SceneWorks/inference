@@ -81,7 +81,7 @@ pub use heads::{
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 pub use model::{
     BlockModulation, ImageDit, ImageDitTrace, ImageForward, JointDit, MiniMaxH3Dit, PackedForward,
-    PUBLISHED_DIT_TENSORS, PUBLISHED_IMAGE_DIT_TENSORS,
+    PreparedImageDit, PreparedJointDit, PUBLISHED_DIT_TENSORS, PUBLISHED_IMAGE_DIT_TENSORS,
 };
 pub use positions::{
     audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids,

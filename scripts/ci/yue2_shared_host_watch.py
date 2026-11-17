@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """External, fail-closed all-listener watch for one shared-host YuE2 CUDA run.
 
-This does not grant a physical lease. The in-job selected GPU1 census and owned process
-cleanup remain mandatory. The shared-gpu1 route observes concurrent foreign work and
-retains incomplete foreign inventory while the owned identity stays authenticated;
-strict shared-host retains exclusivity.
+This does not grant a physical lease. The in-job selected GPU1 census (free memory plus a
+quiet window under the host-global UUID lock) and owned process cleanup remain mandatory.
+The default shared-host route and shared-gpu1 observe concurrent foreign work and retain
+incomplete foreign inventory while the owned identity stays authenticated: other jobs on
+the host never refuse by presence. Only the retired gpu0-with-reviewed-gpu1 route keeps
+its exact old-group exclusivity.
 """
 from __future__ import annotations
 
@@ -29,6 +31,8 @@ LEGACY_ZERO_JOB = {
 }
 STATUSES = ("in_progress", "queued", "pending", "requested", "waiting")
 SHARED_GPU1_INVENTORY_ATTEMPTS = 3
+# Routes whose watch records foreign runners/runs/jobs instead of refusing them.
+OBSERVING_MODES = frozenset({"shared-host", "shared-gpu1"})
 
 
 class InventorySnapshotError(RuntimeError):
@@ -250,7 +254,7 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
         require(owned["runner_name"] == "cuda-windows-2" and owned["runner_id"] == 2619,
                 "reviewed GPU1 route must own the other Windows listener")
     for name, (row, _) in observed.items():
-        if mode == "shared-gpu1":
+        if mode in OBSERVING_MODES:
             continue  # Foreign runner occupancy is observed, never mistaken for owned exclusivity.
         expected_busy = name == owned["runner_name"] or (
             mode == "gpu0-with-reviewed-gpu1" and companion_state == "active" and
@@ -267,7 +271,7 @@ def classify(data: dict, own_id: int, head: str, workflow: str,
                 require(all(job is owned or job.get("status") == "completed" for job in own_jobs),
                         "another owned job is active")
             continue
-        if mode == "shared-gpu1":
+        if mode in OBSERVING_MODES:
             foreign_runs.append({"repository": key[0], "run_id": key[1],
                                  "status": run.get("status"), "job_count": len(data["jobs"].get(key, []))})
             continue  # Keep the complete inventory in each watch receipt without blocking foreign work.
@@ -510,7 +514,7 @@ def watch(own_id: int, head: str, workflow: str, output: Path, seconds: int, int
                 return snapshot(reviewed_gpu1=mode == "gpu0-with-reviewed-gpu1")
             except (InventorySnapshotError, subprocess.CalledProcessError,
                     subprocess.TimeoutExpired, TimeoutError, json.JSONDecodeError) as error:
-                if mode != "shared-gpu1":
+                if mode not in OBSERVING_MODES:
                     raise
                 # A changing REST status count or transport failure never
                 # supplies a partial inventory. Retain the rejected page,
