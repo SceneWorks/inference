@@ -1,5 +1,6 @@
 """Metadata-only MLX bounded-training asset binding tests; no model inputs are loaded."""
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -42,14 +43,18 @@ class MlxTrainingAssets(unittest.TestCase):
                 self.assertTrue(pin.files, name)
                 self.assertNotIn("..", Path(pin.subdir).parts)
 
-    def test_roots_are_ordered_tilde_expanded_and_unique(self):
-        home = Path("/Users/runner")
-        roots = assets.candidate_roots({"MLX_GEN_MODELS_ROOT": "~/.cache/huggingface/hub"}, home)
-        self.assertEqual([root for _, root in roots], [
-            home / ".cache/huggingface/hub", assets.PROVISIONED_HUB, home / "sceneworks-rw-weights/hub"])
-        roots = assets.candidate_roots({"MLX_GEN_MODELS_ROOT": str(assets.PROVISIONED_HUB)}, home)
-        self.assertEqual(len(roots), 2)
-        self.assertEqual(len(assets.candidate_roots({"MLX_GEN_MODELS_ROOT": "relative"}, home)), 2)
+    def test_roots_are_ordered_tilde_expanded_resolved_and_unique(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            roots = assets.candidate_roots({"MLX_GEN_MODELS_ROOT": "~/.cache/huggingface/hub"}, home)
+            self.assertEqual([root for _, root in roots], [
+                Path(os.path.realpath(home / ".cache/huggingface/hub")),
+                Path(os.path.realpath(assets.PROVISIONED_HUB)),
+                Path(os.path.realpath(home / "sceneworks-rw-weights/hub"))])
+            self.assertTrue(roots[0][0].startswith("MLX_GEN_MODELS_ROOT="))
+            roots = assets.candidate_roots({"MLX_GEN_MODELS_ROOT": str(assets.PROVISIONED_HUB)}, home)
+            self.assertEqual(len(roots), 2)
+            self.assertEqual(len(assets.candidate_roots({"MLX_GEN_MODELS_ROOT": "relative"}, home)), 2)
 
     def test_resolution_requires_the_complete_pin_and_reports_an_inventory(self):
         pin = assets.Pin("org/model", "a" * 40, "tier", files=("config.json",))
@@ -62,28 +67,31 @@ class MlxTrainingAssets(unittest.TestCase):
             (snapshot / "config.json").write_bytes(b"")
             self.assertIsNone(assets.resolve(pin, roots))
             report = assets.inventory([pin], roots, ("org/other",))
-            self.assertEqual(report["org/model"]["roots"][f"second:{second}"], {"a" * 40: {"tier": ["config.json"]}})
-            self.assertEqual(report["org/model"]["roots"][f"first:{first}"], "root absent")
-            self.assertEqual(report["org/other"]["roots"][f"second:{second}"], "repository absent")
+            self.assertEqual(report["org/model"]["roots"]["second"], {"a" * 40: {"tier": ["config.json"]}})
+            self.assertEqual(report["org/model"]["roots"]["first"], "root absent")
+            self.assertEqual(report["org/other"]["roots"]["second"], "repository absent")
             (snapshot / "config.json").write_text("{}", encoding="utf-8")
             self.assertEqual(assets.resolve(pin, roots), snapshot)
             root_pin = assets.Pin("org/model", "a" * 40, "tier", files=("config.json",), binds_root=True)
             self.assertEqual(assets.resolve(root_pin, roots), second)
 
-    def test_a_symlinked_root_is_never_a_binding_source(self):
+    def test_a_symlinked_root_resolves_to_its_real_store(self):
         pin = assets.Pin("org/model", "b" * 40, files=("config.json",))
         with tempfile.TemporaryDirectory() as directory:
-            real = Path(directory) / "real"
+            home = Path(directory).resolve()
+            real = home / "store"
             (real / pin.relative()).mkdir(parents=True)
             (real / pin.relative() / "config.json").write_text("{}", encoding="utf-8")
-            link = Path(directory) / "link"
+            link = home / ".cache" / "hub"
+            link.parent.mkdir()
             try:
                 link.symlink_to(real, target_is_directory=True)
             except OSError:
                 self.skipTest("symlinks unavailable")
-            self.assertTrue(assets.linked_root(link))
-            self.assertIsNone(assets.resolve(pin, [("link", link)]))
-            self.assertEqual(assets.resolve(pin, [("link", link), ("real", real)]), real / pin.relative())
+            roots = assets.candidate_roots({"MLX_GEN_MODELS_ROOT": "~/.cache/hub"}, home)
+            self.assertEqual(roots[0][1], real)
+            self.assertIn(f"-> {real}", roots[0][0])
+            self.assertEqual(assets.resolve(pin, roots), real / pin.relative())
 
     def test_main_binds_only_the_exact_planned_case_on_the_provisioned_mac(self):
         identity = next(iter(assets.MLX_TRAINING_PROOFS))

@@ -5,8 +5,9 @@ The explicit model-proof workflow binds no per-family snapshot environment for M
 provisioned Mac (nax-macos-2), so each bounded MLX training proof below names the exact pinned
 Hub snapshot(s) its test reads, and this setup resolves each one under the runner-local model
 roots, in order: `$MLX_GEN_MODELS_ROOT` (the repository variable, `~` expanded), the provisioned
-`/Volumes/Models/huggingface/hub`, and the runner-local `~/sceneworks-rw-weights/hub`. A root that
-is (or sits under) a symlink is never used. The resolved paths are appended to `GITHUB_ENV`.
+`/Volumes/Models/huggingface/hub`, and the runner-local `~/sceneworks-rw-weights/hub`, each resolved
+to its real path (the runner's `~/.cache/huggingface/hub` is a symlink to its model store). The
+resolved snapshot paths are appended to `GITHUB_ENV`.
 
 This reads file metadata only: the production readers inside the ONE manual invocation still
 authenticate/load the actual inputs; a path is not runtime proof. When a pin is absent the setup
@@ -140,7 +141,13 @@ def exact_bindings(rows: list[dict], backend: str, runner: str | None) -> dict[s
 
 
 def candidate_roots(env: dict[str, str], home: Path) -> list[tuple[str, Path]]:
-    """The ordered runner-local model roots; a configured `~` root expands against this runner."""
+    """The ordered runner-local model roots as `(label, resolved root)`.
+
+    A configured `~` root expands against this runner. Every root is resolved to its real path (a
+    `~/.cache/huggingface/hub` that is a symlink to the provisioned store is that store); the label
+    keeps the configured spelling and its resolved target for the receipt and the inventory, and
+    two spellings of one real directory are probed once.
+    """
     roots = []
     configured = env.get("MLX_GEN_MODELS_ROOT", "")
     if configured:
@@ -151,15 +158,11 @@ def candidate_roots(env: dict[str, str], home: Path) -> list[tuple[str, Path]]:
     roots.append(("runner-local", home / "sceneworks-rw-weights" / "hub"))
     unique, seen = [], set()
     for label, root in roots:
-        if root not in seen:
-            seen.add(root)
-            unique.append((label, root))
+        real = Path(os.path.realpath(root))
+        if real not in seen:
+            seen.add(real)
+            unique.append((f"{label}={root}" + (f" -> {real}" if real != root else ""), real))
     return unique
-
-
-def linked_root(root: Path) -> bool:
-    """A root that is, or sits under, a symlink is never a binding source."""
-    return any(part.is_symlink() for part in (root, *root.parents) if part != part.parent)
 
 
 def complete(path: Path, pin: Pin) -> list[str]:
@@ -173,9 +176,9 @@ def complete(path: Path, pin: Pin) -> list[str]:
 
 
 def resolve(pin: Pin, roots: list[tuple[str, Path]]) -> Path | None:
-    """The first non-linked root holding the complete pinned snapshot."""
+    """The first (resolved) root holding the complete pinned snapshot."""
     for _, root in roots:
-        if linked_root(root) or not root.is_dir():
+        if not root.is_dir():
             continue
         path = root / pin.relative()
         if path.is_dir() and not complete(path, pin):
@@ -212,10 +215,7 @@ def inventory(pins: list[Pin], roots: list[tuple[str, Path]], also: tuple[str, .
             "pinned": [{"revision": p.revision, "subdir": p.subdir, "files": list(p.files)} for p in same],
             "roots": {}})
         for label, root in roots:
-            key = f"{label}:{root}"
-            if linked_root(root):
-                entry["roots"][key] = "root is (under) a symlink; never used"
-                continue
+            key = label
             if not root.is_dir():
                 entry["roots"][key] = "root absent"
                 continue
@@ -263,7 +263,7 @@ def main() -> int:
     if missing:
         every = list({pin: None for case in MLX_TRAINING_PROOFS.values() for pin in case.values()})
         print(json.dumps({"case": identities[0], "missing": missing,
-                          "roots": [f"{label}:{root}" for label, root in roots],
+                          "roots": [label for label, _ in roots],
                           "inventory": inventory(every, roots, INVENTORY_ALSO)}, indent=2), flush=True)
         raise ValueError("pinned MLX training snapshot(s) absent from every runner-local root: " + ", ".join(missing))
     with open(github_env, "a", encoding="utf-8") as out:
@@ -271,7 +271,8 @@ def main() -> int:
             if "\n" in str(path) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
                 raise ValueError(f"invalid binding {name}")
             out.write(f"{name}={path}\n")
-    print(json.dumps({"case": identities[0], "installed_paths": {k: str(v) for k, v in resolved.items()},
+    print(json.dumps({"case": identities[0], "roots": [label for label, _ in roots],
+                      "installed_paths": {k: str(v) for k, v in resolved.items()},
                       "claim": "metadata-only asset binding; actual production reader authentication "
                                "belongs to the one manual invocation"}), flush=True)
     return 0
