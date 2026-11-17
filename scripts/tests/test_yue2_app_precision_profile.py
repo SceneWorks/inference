@@ -641,6 +641,18 @@ class PrecisionControlTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "present on another backend"):
                 check()
 
+    def test_first_capture_admission_releases_the_lock_while_waiting_later_ones_hold_it(self):
+        calls = []
+        census = types.SimpleNamespace(
+            admitted_cuda_census=lambda deadline, lock=None: calls.append(lock) or ("raw", []),
+            cuda_physical_census=Mock())
+        held = object()
+        with patch.dict("sys.modules", {"yue2_precision_proof": census}), \
+             patch.object(control, "remaining_app_budget", return_value=3600):
+            control.cuda_admission_census("before-a", held, first=True)
+            control.cuda_admission_census("before-b", held)
+        self.assertEqual(calls, [held, None])
+
     def test_busy_cuda_preflight_refuses_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
@@ -745,9 +757,11 @@ class PrecisionControlTests(unittest.TestCase):
             control.prepare_cases(MODULE_PATH.parent / "yue2-app-precision-cases", cases, "cuda")
             labels = []
             held = []
-            def preflight(_backend, _evidence, label, held_lock=None):
+            firsts = []
+            def preflight(_backend, _evidence, label, held_lock=None, first=False):
                 labels.append(label)
                 held.append(held_lock)
+                firsts.append(first)
                 if label == "after-cases":
                     raise ValueError("post-case physical owner changed")
             with patch.object(control, "preflight", side_effect=preflight), \
@@ -769,6 +783,8 @@ class PrecisionControlTests(unittest.TestCase):
             lock.assert_called_once()
             self.assertEqual(set(map(id, held)), {id(lock.return_value)})
             lock.return_value.release.assert_called_once_with()
+            # Only the first case admission (before any capture) releases the lock while waiting.
+            self.assertEqual(firsts, [True] + [False] * (len(labels) - 1))
             self.assertTrue((root / "evidence" / "cases-manifest.json").is_file())
 
     def test_listening_wav_inventory_is_run_owned_and_stream_hashed(self):

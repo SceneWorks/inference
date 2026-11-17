@@ -1179,7 +1179,8 @@ try {
     } finally { Pop-Location }
     $status.product_exit_code=0
     Validate-Product (Join-Path $script:evidence 'product-worker') $protocol
-    $status.after=@(Wait-OwnedRelease)
+    # The product run's drain already confirmed owned release with its real owned map; record the card.
+    $status.after=@(Check-Device)
     $status.status='passed'
 } catch {
     $status.error=$_.Exception.Message

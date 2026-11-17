@@ -198,18 +198,19 @@ def shared_gpu1_lock(deadline: float):
     return lock
 
 
-def cuda_admission_census(label: str, held_lock=None) -> tuple[str, list[str]]:
+def cuda_admission_census(label: str, held_lock=None, first: bool = False) -> tuple[str, list[str]]:
     """Free memory plus a quiet window under the UUID lock; foreign actors never refuse.
 
     A standalone preflight takes the lock only for its census. Under `held_lock` (the
-    capture sequence) the census waits without letting another CI job in.
+    capture sequence) the first admission releases the lock between polls; later ones,
+    between cases of an admitted run, wait without letting another CI job in.
     """
     from yue2_precision_proof import admitted_cuda_census, cuda_physical_census  # type: ignore[import-not-found]
     if label == "after-cases":
         return cuda_physical_census(admission=False)
     deadline = time.monotonic() + remaining_app_budget()
     if held_lock is not None:
-        return admitted_cuda_census(deadline)
+        return admitted_cuda_census(deadline, held_lock) if first else admitted_cuda_census(deadline)
     lock = shared_gpu1_lock(deadline)
     try:
         return admitted_cuda_census(deadline, lock)
@@ -217,7 +218,7 @@ def cuda_admission_census(label: str, held_lock=None) -> tuple[str, list[str]]:
         lock.release()
 
 
-def preflight(backend: str, evidence: Path, label: str, held_lock=None) -> dict:
+def preflight(backend: str, evidence: Path, label: str, held_lock=None, first: bool = False) -> dict:
     # The merged engine control owns the typed process census. Refuse if absent;
     # a generic process-name guess would weaken the shared physical-host lock.
     from yue2_precision_proof import (  # type: ignore[import-not-found]
@@ -240,7 +241,7 @@ def preflight(backend: str, evidence: Path, label: str, held_lock=None) -> dict:
             else:
                 from yue2_cuda_idle_context import check_shared_gpu1_dispatch  # type: ignore[import-not-found]
                 check_shared_gpu1_dispatch()
-    census, busy = (cuda_admission_census(label, held_lock)
+    census, busy = (cuda_admission_census(label, held_lock, first)
                     if backend == "cuda" else metal_census())
     if backend == "cuda" and label != "initial" and not busy:
         initial = json.loads((evidence / "preflight-initial.json").read_text(encoding="utf-8"))
@@ -608,7 +609,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             require(sha256(case) == row.get("run_case_sha256"), f"run-owned case {name} changed")
             require(json.loads(case.read_text(encoding="utf-8")).get("id") == case_id(backend, name),
                     f"run-owned case {name} has wrong backend")
-            preflight(backend, evidence, f"before-{name}", held_lock)
+            preflight(backend, evidence, f"before-{name}", held_lock, first=not completed_audio)
             command = ["node", "scripts/yue2-memory-profile.mjs", "capture", "--case-file", str(case),
                        "--inference-repo", str(engine), "--data-dir", str(data), "--gpu-id", "1",
                        "--out", str(output)]

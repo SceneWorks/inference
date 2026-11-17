@@ -1351,15 +1351,19 @@ class SupervisorTests(unittest.TestCase):
              patch.object(safety.windows, 'trusted_nvidia_smi', return_value='C:\\Windows\\System32\\nvidia-smi.exe'), \
              patch.object(safety, '_bounded_output', side_effect=output):
             probe = safety.SystemProbe(policy)
-            self.assertEqual(probe.record_global_used_baseline(), 30721 * 1024**2)
+            # The baseline is the raw card value: the rounding MiB is charged to the child only.
+            self.assertEqual(probe.record_global_used_baseline(), 30720 * 1024**2)
             card['used'] = 30720 + 15360
             owner = type('Owner', (), {'members': lambda self: {123}})()
             free, charged = probe.gpu_free_and_tree_bytes(owner)
-            self.assertEqual(charged, 15360 * 1024**2)
+            self.assertEqual(charged, 15361 * 1024**2)
             self.assertLess(charged, policy.child_gpu_cap_bytes)
             self.assertEqual(probe.gpu_usage_basis, 'global-used-upper-bound')
+            # The whole-card value stays recorded as the upper bound.
+            self.assertEqual(probe.last_global_used_upper_bound_bytes, (30720 + 15360 + 1) * 1024**2)
             card['used'] = 30000  # the co-tenant freed memory: never a negative charge
             self.assertEqual(probe.gpu_free_and_tree_bytes(owner)[1], 0)
+            self.assertEqual(probe.last_global_used_upper_bound_bytes, 30001 * 1024**2)
 
     def test_windows_wddm_unowned_na_does_not_replace_exact_owned_usage(self):
         data = json.loads(self.policy.canonical_bytes)

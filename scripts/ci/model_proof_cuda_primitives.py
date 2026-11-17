@@ -123,7 +123,8 @@ def claim_uuids(uuids, guard, out, deadline, public, locker, required_free_bytes
             wait_notice(notice, "a selected UUID lock is held by another CI job", clock)
             sleep(min(1, max(0, deadline - clock())))
             continue
-        # Judged only once every lock is held, so the logged reason is the real one.
+        # Judged after every lock is taken, but on the inventory read just before locking;
+        # sample_headroom below re-reads each card under the lock before admission.
         short = [shortfall(guard, device, needed[device["uuid"].casefold()]) for device in selected
                  if not guard.has_headroom(device, needed[device["uuid"].casefold()])]
         if short:

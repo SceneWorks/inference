@@ -540,6 +540,7 @@ class SystemProbe:
         # the UUID lock). The WDDM global-used fallback charges only growth above it to the child,
         # so a co-tenant's resident memory is never counted against the child cap.
         self.global_used_baseline_bytes: int | None = None
+        self.last_global_used_upper_bound_bytes: int | None = None
         actual = {"Darwin": "darwin-mlx", "Linux": "linux-cpu" if policy.backend == "linux-cpu" else "linux-cuda",
                   "Windows": "windows-cpu" if policy.backend == "windows-cpu" else "windows-cuda"}.get(platform.system(), "unsupported")
         if actual != policy.backend:
@@ -675,9 +676,12 @@ class SystemProbe:
             else:
                 raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has unknown usage: {line[:160]!r}")
         if unknown_owned:
-            free, used = self._windows_global_used_upper_bound()
-            if self.global_used_baseline_bytes is not None:
-                used = max(0, used - self.global_used_baseline_bytes)
+            # The raw whole-card value stays the upper bound; the child is charged only its
+            # growth above the pre-spawn baseline (a co-tenant freeing memory can understate it).
+            free, upper = self._windows_global_used_upper_bound()
+            self.last_global_used_upper_bound_bytes = upper
+            used = (upper if self.global_used_baseline_bytes is None
+                    else max(0, upper - self.global_used_baseline_bytes))
             self.gpu_usage_basis = "global-used-upper-bound"
         else:
             self.gpu_usage_basis = "owned-process-attributed"
@@ -688,7 +692,8 @@ class SystemProbe:
         if self.policy.backend != "windows-cuda":
             return None
         try:
-            _, used = self._windows_global_used_upper_bound()
+            # Raw card counters: the rounding MiB stays on the charge side, never the baseline.
+            _, used = self._windows_global_used_counters()
         except SupervisionError:
             # A TCC card reports per-process memory, so the fallback (and this baseline) never applies.
             self.global_used_baseline_bytes = None
@@ -703,6 +708,11 @@ class SystemProbe:
         reserved/unattributed memory. The extra MiB covers rounded SMI counters.
         This is a conservative cap input, never an attributed child peak.
         """
+        free, used = self._windows_global_used_counters()
+        return free, used + 1024**2
+
+    def _windows_global_used_counters(self) -> tuple[int, int]:
+        """Free and card-wide used bytes (max of used and total minus free) from one WDDM sample."""
         if self.policy.backend != "windows-cuda":
             raise SupervisionError("probe-failure", "global-used bound requires Windows CUDA")
         assert self.policy.cuda_device_uuid
@@ -721,7 +731,7 @@ class SystemProbe:
         if (total <= 0 or used > total or free > total or used + free > total + 2):
             raise SupervisionError("probe-failure", f"WDDM global-used card counters are inconsistent: {raw[:160]!r}")
         mib = 1024**2
-        return free * mib, (max(used, total - free) + 1) * mib
+        return free * mib, max(used, total - free) * mib
 
     def gpu_free(self) -> int:
         assert self.policy.cuda_device_uuid
@@ -1071,6 +1081,7 @@ class _CudaWatch:
         self.policy, self.probe, self.admission, self.role = policy, probe, admission, role
         self.peak = 0
         self.global_upper_bound_peak = 0
+        self.global_growth_peak = 0
         self.global_upper_bound_samples = 0
         self.samples: list[dict[str, object]] = []
         self.failed = FailedTicks(f"CUDA probe {policy.cuda_device_uuid}")
@@ -1083,6 +1094,7 @@ class _CudaWatch:
                 "policySha256": self.policy.sha256}
         if self.global_upper_bound_samples:
             result["peakGlobalUsedUpperBoundBytes"] = self.global_upper_bound_peak
+            result["peakChildGlobalUsedGrowthBytes"] = self.global_growth_peak
             result["globalUsedUpperBoundSampleCount"] = self.global_upper_bound_samples
             if self.peak == 0:
                 result["peakGpuUnknownReason"] = "global GPU used upper bound sampled; no attributable child GPU-memory sample"
@@ -1545,15 +1557,23 @@ def _run_admitted(
                             continue  # other explicit UUIDs still get this tick's checks
                         failures.succeeded()
                         basis = getattr(sampler, "gpu_usage_basis", "owned-process-attributed")
+                        # Global basis: device_used is the child charge (growth above the
+                        # pre-spawn baseline); the raw whole-card value is the upper bound.
+                        upper_bound = None
                         if basis == "global-used-upper-bound":
                             if device.backend != "windows-cuda":
                                 raise SupervisionError("probe-failure", "global-used bound is only valid for Windows WDDM")
-                            state.global_upper_bound_peak = max(state.global_upper_bound_peak, device_used)
+                            upper_bound = getattr(sampler, "last_global_used_upper_bound_bytes", None)
+                            if upper_bound is None:
+                                upper_bound = device_used
+                            state.global_upper_bound_peak = max(state.global_upper_bound_peak, upper_bound)
+                            state.global_growth_peak = max(state.global_growth_peak, device_used)
                             state.global_upper_bound_samples += 1
                             if not multi_cuda:
                                 samples.append({"phase": "cuda-global-used-upper-bound-sample",
                                                 "cudaDeviceUuid": device.cuda_device_uuid,
-                                                "globalUsedUpperBoundBytes": device_used,
+                                                "globalUsedUpperBoundBytes": upper_bound,
+                                                "childGlobalUsedGrowthBytes": device_used,
                                                 "gpuFreeBytes": device_free, "at_ns": time.time_ns()})
                                 gpu_sample_bytes += len(canonical(samples[-1]))
                                 if len(samples) * 160 + gpu_sample_bytes > policy.event_cap_bytes:
@@ -1568,7 +1588,8 @@ def _run_admitted(
                             sample = {"phase": "device-sample", "cudaDeviceUuid": device.cuda_device_uuid,
                                       "gpuFreeBytes": device_free, "rootExited": status is not None, "at_ns": time.time_ns()}
                             if basis == "global-used-upper-bound":
-                                sample["globalUsedUpperBoundBytes"] = device_used
+                                sample["globalUsedUpperBoundBytes"] = upper_bound
+                                sample["childGlobalUsedGrowthBytes"] = device_used
                                 sample["gpuUsageBasis"] = basis
                             else:
                                 sample["ownedGpuBytes"] = device_used
@@ -1590,9 +1611,11 @@ def _run_admitted(
                                 "elapsedSeconds": clock() - started,
                                 "atNs": time.time_ns(),
                                 "ownedGpuBytes": device_used if basis == "owned-process-attributed" else None,
-                                "globalUsedUpperBoundBytes": device_used if basis == "global-used-upper-bound" else None,
+                                "globalUsedUpperBoundBytes": upper_bound,
+                                "childGlobalUsedGrowthBytes": device_used if basis == "global-used-upper-bound" else None,
                                 "sampledOwnedPeakBytes": state.peak if state.peak > 0 else None,
                                 "sampledGlobalUpperBoundPeakBytes": state.global_upper_bound_peak if state.global_upper_bound_samples else None,
+                                "sampledChildGlobalUsedGrowthPeakBytes": state.global_growth_peak if state.global_upper_bound_samples else None,
                                 "globalUpperBoundSampleCount": state.global_upper_bound_samples,
                             }
                             raise error
