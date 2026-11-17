@@ -1203,6 +1203,101 @@ fn run_oracle(cpu_only: bool) {
             logical_f32_readback(&sampled).unwrap(),
             logical_f32_readback(&reentry).unwrap()
         );
+        // PAG scale == 0.0 is bit-identical; active PAG works for cached & uncached reference KV
+        // and for both guidance == 1.0 (2-pass) and guidance == 4.0 (3-pass).
+        let zero_pag_resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
+            mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+            &gen_core_moss_image::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+                steps: Some(2),
+                guidance: Some(4.0),
+                width: 48,
+                height: 32,
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![0]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let zero_pag_sampled = crate::edit::EditSampling {
+            transformer: &model,
+            resolved: &zero_pag_resolved,
+            positive: &positive_batch,
+            negative: &negative_batch,
+            references: refs,
+            use_cache: true,
+        }
+        .run(&hidden, &CancelFlag::new(), &mut |_| {})
+        .unwrap();
+        assert_eq!(
+            logical_f32_readback(&sampled)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            logical_f32_readback(&zero_pag_sampled)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        for guidance in [1.0_f32, 4.0] {
+            let active_pag_resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
+                mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+                &gen_core_moss_image::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+                    steps: Some(2),
+                    guidance: Some(guidance),
+                    width: 48,
+                    height: 32,
+                    pag: Some(mlx_gen::gen_core::PagConfig {
+                        scale: 2.0,
+                        layers: Some(vec![0]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let cached_pag = crate::edit::EditSampling {
+                transformer: &model,
+                resolved: &active_pag_resolved,
+                positive: &positive_batch,
+                negative: if guidance == 1.0 {
+                    &[]
+                } else {
+                    &negative_batch
+                },
+                references: refs,
+                use_cache: true,
+            }
+            .run(&hidden, &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+            let uncached_pag = crate::edit::EditSampling {
+                transformer: &model,
+                resolved: &active_pag_resolved,
+                positive: &positive_batch,
+                negative: if guidance == 1.0 {
+                    &[]
+                } else {
+                    &negative_batch
+                },
+                references: refs,
+                use_cache: false,
+            }
+            .run(&hidden, &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+            let cached_vals = logical_f32_readback(&cached_pag).unwrap();
+            let uncached_vals = logical_f32_readback(&uncached_pag).unwrap();
+            assert!(cached_vals.iter().all(|v| v.is_finite()));
+            assert_eq!(cached_vals, uncached_vals);
+            if guidance == 4.0 {
+                assert_ne!(cached_vals, logical_f32_readback(&sampled).unwrap());
+            }
+        }
     }
     if !cpu_only {
         sampler_precision(&f);

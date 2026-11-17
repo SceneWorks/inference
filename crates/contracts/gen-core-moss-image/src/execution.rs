@@ -601,6 +601,32 @@ mod tests {
                     stop: 1.0,
                 });
                 assert!(completed_identity(None, Some(&fabricated), &descriptor("mlx")).is_err());
+
+                // Active PAG on edit base + edit receipt propagates into quality_policy.pag.
+                let mut active_base = edit.base.clone().into_data();
+                let pag_resolved = gen_core::PagResolved {
+                    scale: 2.5,
+                    adaptive_scale: 0.5,
+                    layers: vec![20],
+                    start: 0.0,
+                    stop: 0.5,
+                };
+                let pag_exec = pag_resolved.execution_report(50);
+                active_base.resolved.pag = Some(pag_resolved);
+                active_base.pag = Some(pag_exec.clone());
+                let mut active_edit = edit;
+                active_edit.base = MossImageExecutionReport::new(active_base).unwrap();
+                active_edit.pag = Some(pag_exec);
+                let active_shared =
+                    completed_identity(None, Some(&active_edit), &descriptor("mlx")).unwrap();
+                let ExecutionFact::Resolved { value: quality } =
+                    &active_shared.resolved().unwrap().quality_policy
+                else {
+                    panic!("quality facts")
+                };
+                assert_eq!(quality["pag"]["layers"], json!([20]));
+                assert_eq!(quality["pag"]["active_steps"], 25);
+                assert_eq!(quality["pag"]["total_steps"], 50);
             }
         }
     }

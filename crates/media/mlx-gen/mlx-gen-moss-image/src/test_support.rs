@@ -205,6 +205,51 @@ impl Generator for CpuGenerator {
     ) -> gen_core::Result<gen_core::GenerationOutput> {
         with_cpu(|| self.0.generate(req, progress))
     }
+    fn generate_with_report(
+        &self,
+        req: &gen_core::GenerationRequest,
+        progress: &mut dyn FnMut(gen_core::Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        with_cpu(|| self.0.generate_with_report(req, progress))
+    }
+    fn generate_with_execution_report(
+        &self,
+        req: &gen_core::GenerationRequest,
+        progress: &mut dyn FnMut(gen_core::Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        with_cpu(|| self.0.generate_with_execution_report(req, progress))
+    }
+    fn generate_moss_image_edit(
+        &self,
+        req: &gen_core::GenerationRequest,
+        inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(gen_core::Progress),
+    ) -> gen_core::Result<MossImageAdvancedOutput> {
+        with_cpu(|| self.0.generate_moss_image_edit(req, inputs, progress))
+    }
+    fn generate_moss_image_edit_with_execution_report(
+        &self,
+        req: &gen_core::GenerationRequest,
+        inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(gen_core::Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedMossImageEdit> {
+        with_cpu(|| {
+            self.0
+                .generate_moss_image_edit_with_execution_report(req, inputs, progress)
+        })
+    }
+    fn moss_image_edit_request_peak(
+        &self,
+        req: &gen_core::GenerationRequest,
+        inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
+    ) -> gen_core::Result<u64> {
+        with_cpu(|| self.0.moss_image_edit_request_peak(req, inputs))
+    }
+    fn moss_image_edit_execution_report(
+        &self,
+    ) -> Option<gen_core::moss_image_edit::MossImageEditExecutionReport> {
+        self.0.moss_image_edit_execution_report()
+    }
     fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
         self.0.moss_image_execution_report()
     }
