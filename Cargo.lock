@@ -4038,6 +4038,7 @@ dependencies = [
  "libc",
  "safetensors 0.4.5",
  "sceneworks-gen-core-moss-image-policy",
+ "sceneworks-gen-core-pag-policy",
  "sceneworks-load-progress",
  "serde",
  "serde_json",
@@ -4173,6 +4174,15 @@ dependencies = [
 
 [[package]]
 name = "sceneworks-gen-core-moss-image-policy"
+version = "0.1.0"
+dependencies = [
+ "sceneworks-gen-core-pag-policy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sceneworks-gen-core-pag-policy"
 version = "0.1.0"
 dependencies = [
  "serde",

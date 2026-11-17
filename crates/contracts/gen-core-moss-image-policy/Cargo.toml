@@ -10,6 +10,7 @@ repository = "https://github.com/SceneWorks/inference"
 name = "gen_core_moss_image_policy"
 
 [dependencies]
+sceneworks-gen-core-pag-policy = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

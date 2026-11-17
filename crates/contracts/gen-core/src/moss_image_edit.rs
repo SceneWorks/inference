@@ -82,6 +82,8 @@ pub struct MossImageEditExecutionReport {
     pub references: Vec<MossImageEditReferenceReceipt>,
     pub reference_max_edge: u32,
     pub use_kv_cache: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pag: Option<crate::PagExecutionReport>,
 }
 impl MossImageEditExecutionReport {
     pub fn validate(&self) -> Result<()> {
@@ -106,6 +108,34 @@ impl MossImageEditExecutionReport {
             return Err(Error::Unsupported(
                 "invalid MOSS edit execution identity or policy".into(),
             ));
+        }
+        if self.pag != self.base.data().pag || self.pag.is_some() != r.pag.is_some() {
+            return Err(Error::Unsupported(
+                "invalid MOSS edit PAG execution report".into(),
+            ));
+        }
+        if let Some(pag) = &self.pag {
+            pag.validate_with_capability(&crate::moss_image::moss_image_pag_capability())
+                .map_err(|e| Error::Unsupported(format!("MOSS-Image: {e}")))?;
+            let actual_steps = match &self.base.data().sampling {
+                crate::moss_image::MossImageSamplingReceipt::Euler { sigmas } => {
+                    sigmas.len().saturating_sub(1) as u32
+                }
+                crate::moss_image::MossImageSamplingReceipt::Dmd { step_codes, .. } => {
+                    step_codes.len() as u32
+                }
+            };
+            if pag.total_steps != actual_steps
+                || r.pag
+                    .as_ref()
+                    .map(|resolved_pag| resolved_pag.execution_report(actual_steps))
+                    .as_ref()
+                    != Some(pag)
+            {
+                return Err(Error::Unsupported(
+                    "invalid MOSS edit PAG execution report".into(),
+                ));
+            }
         }
         for reference in &self.references {
             if reference.encoded_dimensions
@@ -144,6 +174,8 @@ impl<'de> Deserialize<'de> for MossImageEditExecutionReport {
             references: Vec<MossImageEditReferenceReceipt>,
             reference_max_edge: u32,
             use_kv_cache: bool,
+            #[serde(default)]
+            pag: Option<crate::PagExecutionReport>,
         }
         let w = Wire::deserialize(deserializer)?;
         let report = Self {
@@ -158,6 +190,7 @@ impl<'de> Deserialize<'de> for MossImageEditExecutionReport {
             references: w.references,
             reference_max_edge: w.reference_max_edge,
             use_kv_cache: w.use_kv_cache,
+            pag: w.pag,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)
@@ -175,4 +208,186 @@ pub fn reference_dimensions(width: u32, height: u32, max_edge: u32) -> Result<[u
     let scale = (limit as f64 / width.max(height) as f64).min(1.0);
     let aligned = |n: u32| (((n as f64 * scale / 16.0 + 0.5).floor() as u32) * 16).clamp(16, limit);
     Ok([aligned(width), aligned(height)])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::moss_image::{
+        moss_image_schedule, MossImageAssetReceipt, MossImageAssetRole,
+        MossImageConditioningInputReceipt, MossImageConditioningReceipt,
+        MossImageConditioningSource, MossImageDtype, MossImageExecutionData,
+        MossImageExecutionDevice, MossImageOptions, MossImageOutputKind, MossImageResolved,
+        MossImageSampleReceipt, MossImageSamplingReceipt, MossImageVariant, SFT_REPO, SFT_REVISION,
+        SNAPSHOT_FILES,
+    };
+    use crate::{GenerationRequest, PagConfig};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn build_edit_report(pag: Option<PagConfig>) -> MossImageEditExecutionReport {
+        let req = GenerationRequest {
+            steps: Some(30),
+            guidance: Some(4.0),
+            pag,
+            moss_image: Some(MossImageOptions {
+                uncond_skip_layers: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = MossImageResolved::resolve(MossImageVariant::Sft, &req).unwrap();
+        let sigmas = moss_image_schedule(resolved.steps, resolved.shift, resolved.training_shift)
+            .expect("schedule");
+        let actual_steps = (sigmas.len() - 1) as u32;
+        let pag_exec = resolved
+            .pag
+            .as_ref()
+            .map(|resolved_pag| resolved_pag.execution_report(actual_steps));
+        let assets = SNAPSHOT_FILES
+            .iter()
+            .copied()
+            .filter(|p| *p != "LICENSE")
+            .map(|p| {
+                let role = if p.starts_with("transformer/") {
+                    MossImageAssetRole::Transformer
+                } else if p.starts_with("text_encoder/") {
+                    MossImageAssetRole::TextEncoder
+                } else if p.starts_with("tokenizer/") {
+                    MossImageAssetRole::Tokenizer
+                } else if p.starts_with("scheduler/") {
+                    MossImageAssetRole::Scheduler
+                } else {
+                    MossImageAssetRole::Vae
+                };
+                MossImageAssetReceipt {
+                    role,
+                    repository: SFT_REPO.into(),
+                    revision: SFT_REVISION.into(),
+                    relative_path: p.into(),
+                    sha256: HASH.into(),
+                }
+            })
+            .collect();
+        let cond_input = MossImageConditioningInputReceipt {
+            source: MossImageConditioningSource::Text,
+            sha256: HASH.into(),
+            sequence_length: 8,
+            valid_tokens: 8,
+        };
+        let component_dtypes: BTreeMap<String, MossImageDtype> = [
+            ("transformer", MossImageDtype::Bf16),
+            ("text_encoder", MossImageDtype::Bf16),
+            ("vae", MossImageDtype::F32),
+            ("latents", MossImageDtype::F32),
+            ("time_embedding", MossImageDtype::Bf16),
+            ("shared_block_modulation", MossImageDtype::Bf16),
+            ("video_head_modulation", MossImageDtype::Bf16),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v))
+        .collect();
+        let base = MossImageExecutionReport::new(MossImageExecutionData {
+            execution_device: MossImageExecutionDevice::Cuda,
+            selected_stream_device: None,
+            resolved,
+            assets,
+            sampling: MossImageSamplingReceipt::Euler { sigmas },
+            samples: vec![MossImageSampleReceipt {
+                seed: Some(7),
+                noise_sha256: HASH.into(),
+            }],
+            conditioning: vec![MossImageConditioningReceipt {
+                positive: cond_input.clone(),
+                negative: Some(cond_input),
+            }],
+            images_per_prompt: 1,
+            latent_shape: [1, 128, 64, 64],
+            output_kind: MossImageOutputKind::Images,
+            component_dtypes,
+            adapter_reports: vec![],
+            pag: pag_exec.clone(),
+        })
+        .unwrap();
+        MossImageEditExecutionReport {
+            base,
+            adapter_path: "/fixture/moss_edit.safetensors".into(),
+            edit_contract: EDIT_CONTRACT.into(),
+            adapter_repository: EDIT_REPOSITORY.into(),
+            adapter_revision: EDIT_REVISION.into(),
+            adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+            config_sha256: EDIT_CONFIG_SHA256.into(),
+            applied_projections: 252,
+            references: vec![MossImageEditReferenceReceipt {
+                original_dimensions: [512, 512],
+                encoded_dimensions: [512, 512],
+                pixels_sha256: HASH.into(),
+                resized_pixels_sha256: HASH.into(),
+                latent_sha256: HASH.into(),
+            }],
+            reference_max_edge: 512,
+            use_kv_cache: true,
+            pag: pag_exec,
+        }
+    }
+
+    #[test]
+    fn edit_report_pag_round_trips_and_rejects_both_base_vs_edit_mismatch_directions() {
+        let no_pag = build_edit_report(None);
+        no_pag.validate().unwrap();
+        let no_pag_wire = serde_json::to_value(&no_pag).unwrap();
+        assert!(no_pag_wire.get("pag").is_none());
+        assert_eq!(
+            serde_json::from_value::<MossImageEditExecutionReport>(no_pag_wire.clone()).unwrap(),
+            no_pag
+        );
+
+        let with_pag = build_edit_report(Some(PagConfig {
+            scale: 2.0,
+            layers: Some(vec![20]),
+            ..Default::default()
+        }));
+        with_pag.validate().unwrap();
+        let pag_exec = with_pag.pag.clone().expect("edit PAG report");
+        let with_pag_wire = serde_json::to_value(&with_pag).unwrap();
+        assert_eq!(
+            serde_json::from_value::<MossImageEditExecutionReport>(with_pag_wire.clone()).unwrap(),
+            with_pag
+        );
+
+        // Mismatch 1: base.pag == Some(_), edit.pag == None (silently dropping executed PAG).
+        let mut dropped_edit_pag = with_pag.clone();
+        dropped_edit_pag.pag = None;
+        assert!(matches!(
+            dropped_edit_pag.validate(),
+            Err(Error::Unsupported(_))
+        ));
+        let mut omitted_wire = with_pag_wire.clone();
+        omitted_wire.as_object_mut().unwrap().remove("pag");
+        assert!(serde_json::from_value::<MossImageEditExecutionReport>(omitted_wire).is_err());
+        let mut null_wire = with_pag_wire;
+        null_wire["pag"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<MossImageEditExecutionReport>(null_wire).is_err());
+
+        // Mismatch 2: base.pag == None, edit.pag == Some(_) (fabricating PAG on a non-PAG run).
+        let mut fabricated_edit_pag = no_pag;
+        fabricated_edit_pag.pag = Some(pag_exec.clone());
+        assert!(matches!(
+            fabricated_edit_pag.validate(),
+            Err(Error::Unsupported(_))
+        ));
+        let mut fabricated_wire = no_pag_wire;
+        fabricated_wire["pag"] = serde_json::to_value(&pag_exec).unwrap();
+        assert!(serde_json::from_value::<MossImageEditExecutionReport>(fabricated_wire).is_err());
+
+        // Mismatch 3: base.pag == Some(p1), edit.pag == Some(p2) with differing fields.
+        let mut differing_edit_pag = with_pag;
+        differing_edit_pag.pag.as_mut().unwrap().scale = 3.5;
+        assert!(matches!(
+            differing_edit_pag.validate(),
+            Err(Error::Unsupported(_))
+        ));
+    }
 }

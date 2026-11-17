@@ -8,7 +8,7 @@ mod support;
 
 #[test]
 fn published_native_and_wasm_corpus() {
-    assert_eq!(support::run(), 21);
+    assert_eq!(support::run(), 28);
 }
 
 // These cases preserve gen-core's existing MOSS resolver and edit_request behavior. The same
