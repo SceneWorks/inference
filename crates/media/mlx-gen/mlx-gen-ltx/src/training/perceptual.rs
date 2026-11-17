@@ -17,8 +17,9 @@ pub(super) struct AuxStep<'a> {
     pub(super) plan: &'a StepPlan,
     /// The step's (item, bucket) cache entry (selects its cached reference).
     pub(super) image: usize,
-    /// The entry's latent tokens per side (to unpatchify the x0 estimate).
-    pub(super) latent_edge: usize,
+    /// The entry's single-frame latent grid `(h, w)` — its own aspect canvas — to unpatchify the
+    /// x0 estimate.
+    pub(super) latent_hw: (usize, usize),
 }
 
 /// The LTX-2.5 loop's [`AuxDriver`] (sc-24830): each example's depth reference (its clean video
@@ -94,7 +95,7 @@ pub(super) fn load_perceptual_path_for(
 pub(super) fn aux_driver(
     path: PerceptualPath,
     cache: &[(Array, Array, Option<Array>)],
-    latent_edges: &[usize],
+    latent_hws: &[(usize, usize)],
     schedule: &BucketSchedule,
     accum: u32,
     cancel: &mlx_gen::gen_core::runtime::CancelFlag,
@@ -102,7 +103,7 @@ pub(super) fn aux_driver(
     AuxDriver::prepare(
         path,
         cache.len(),
-        |entry| unflatten_latent(&cache[entry].0, latent_edges[entry % latent_edges.len()]),
+        |entry| unflatten_latent(&cache[entry].0, latent_hws[entry]),
         schedule,
         accum,
         cancel,

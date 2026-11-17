@@ -21,6 +21,7 @@ impl LtxTrainer {
         // the largest (epic 2123 E7).
         let edges = bucket_edges(cfg);
         let latent_edges: Vec<usize> = edges.iter().map(|&e| latent_edge_of(e)).collect();
+        // The square `edge²` worst case: every aspect canvas holds at most `edge²` pixels.
         let latent_edge = guard_latent_edge(&edges);
 
         // sc-4942 — LTX trains in **f32 activations** (× the Q-packed base), NOT bf16, even though the
@@ -67,6 +68,9 @@ impl LtxTrainer {
         // loss-weight map — `None` when the technique is off.
         let mut cache: Vec<(Array, Array, Option<Array>)> =
             Vec::with_capacity(req.items.len() * edges.len());
+        // Each cache entry's single-frame latent grid `(h, w)` — its item's own aspect canvas at
+        // its bucket edge (item-major, 1:1 with `cache`).
+        let mut latent_hws: Vec<(usize, usize)> = Vec::with_capacity(cache.capacity());
         // sc-5637 — preview-sample prompts, pre-encoded inside the `te`/`tok` scope below (the Gemma
         // encoder is freed before the train loop). LTX is distilled (no CFG) → one ctx per prompt.
         let mut sample_ctxs: Vec<(String, Array)> = Vec::new();
@@ -86,7 +90,11 @@ impl LtxTrainer {
                     current: i as u32 + 1,
                     total,
                 });
-                let img = center_crop_square(&decode_image(&item.image_path)?);
+                // Decoded once, whole; cut + resized onto its aspect-keeping canvas per bucket edge
+                // (about `edge²` px, never upscaled, sides multiples of [`CANVAS_STRIDE`], long
+                // side within [`CANVAS_MAX_SIDE`] — never centre-cropped to a square). Each step
+                // trains ONE cached entry, so entries of different shapes never share a batch.
+                let img = decode_image(&item.image_path)?;
                 // sc-24828: the item's mask is read and checked once, resampled per bucket below.
                 let subject_mask = PreparedSubjectMask::load_if_enabled(
                     "ltx_2_3 trainer",
@@ -99,8 +107,12 @@ impl LtxTrainer {
                 for (clean, mask_weight) in encode_bucket_latents(
                     &edges,
                     |edge| {
-                        let prep = preprocess_conditioning_image(&img, edge, edge)?; // (1,3,1,edge,edge)
-                        self.vae.encode(&prep) // (1,128,1,le,le), normalized, f32
+                        let (canvas, source) =
+                            canvas_source(&img, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                        let (w, h) = canvas.size();
+                        latent_hws.push(canvas_latent_hw((w, h)));
+                        let prep = preprocess_conditioning_image(&source, w, h)?; // (1,3,1,h,w)
+                        self.vae.encode(&prep) // (1,128,1,h/32,w/32), normalized, f32
                     },
                     |shape| still_subject_weight("ltx_2_3 trainer", subject_mask.as_ref(), shape),
                 )? {
@@ -139,24 +151,25 @@ impl LtxTrainer {
         // before the loop.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image and resampled onto its decoded size.
+            // cropped like the image (its canvas source box) and resampled onto its decoded size.
             path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
                 "ltx trainer",
                 &req.items,
                 cfg,
                 latent_edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
 
-        // The RoPE position grid is identical across items at a fixed latent resolution (single
-        // frame) — build it once per bucket (sc-2127: each step uses its sampled bucket's grid).
-        // Preview-sample rendering (sc-5637) uses the largest bucket's grid at `latent_edge`.
-        let bucket_positions: Vec<Array> = latent_edges
-            .iter()
-            .map(|&le| create_position_grid(1, 1, le, le))
-            .collect();
-        let preview_positions = &bucket_positions[largest_bucket(&latent_edges)];
+        // The RoPE position grid depends only on the (single-frame) latent grid — build it once
+        // per distinct canvas grid (each item keeps its own aspect, so items at one bucket edge
+        // need not share a grid); each step uses its entry's own grid (sc-2127). Preview-sample
+        // rendering (sc-5637) uses item 0's entry at the largest bucket — its own aspect canvas
+        // within the `edge²` area the memory guard prices.
+        let (grid_positions, entry_grid) = entry_position_grids(&latent_hws);
+        let preview_entry = largest_bucket(&latent_edges);
+        let preview_hw = latent_hws[preview_entry];
+        let preview_positions = &grid_positions[entry_grid[preview_entry]];
 
         // --- adapter targets + trainable factors ---
         let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
@@ -252,7 +265,7 @@ impl LtxTrainer {
             Some(path) => Some(aux_driver(
                 path,
                 &cache,
-                &latent_edges,
+                &latent_hws,
                 &schedule,
                 accum,
                 &Default::default(),
@@ -266,9 +279,9 @@ impl LtxTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (entry, bucket) = step_entry(&schedule, step);
+            let (entry, _bucket) = step_entry(&schedule, step);
             let (clean, ctx, mask_weight) = &cache[entry];
-            let positions = &bucket_positions[bucket];
+            let positions = &grid_positions[entry_grid[entry]];
             // σ ~ U(1e-3, 1-1e-3), deterministic in seed (the reference's uniform timestep).
             let mut sigma = {
                 let k = random::key(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64))?;
@@ -287,7 +300,7 @@ impl LtxTrainer {
                 path: p.path,
                 plan: &p.plan,
                 image: p.entry,
-                latent_edge: latent_edges[bucket],
+                latent_hw: latent_hws[entry],
             });
             let noise = random::normal::<f32>(
                 clean.shape(),
@@ -378,7 +391,7 @@ impl LtxTrainer {
                         ctx,
                         preview_positions,
                         sample_seed,
-                        latent_edge,
+                        preview_hw,
                         compute_dtype,
                     ) {
                         Ok(image) => on_progress(TrainingProgress::Sample {
@@ -427,36 +440,71 @@ impl LtxTrainer {
     }
 }
 
-/// Flatten a single-frame VAE latent `(1, 128, 1, le, le)` to the patchified `(1, S, 128)` the DiT
-/// consumes (`S = le·le`) — the reference's `transpose(reshape(latent, (B, C, -1)), (0, 2, 1))`.
+/// Every LTX-2.3 training-canvas side is a multiple of this: the video VAE's 32× spatial
+/// downscale times the DiT's 1×1 patch (one latent cell is one token).
+pub(super) const CANVAS_STRIDE: u32 = SPATIAL_SCALE as u32;
+/// The longest LTX-2.3 training-canvas side: the DiT's spatial RoPE span (`rope_max_pos` 2048 px),
+/// so every cached still's positions stay inside the table inference renders with.
+pub(super) const CANVAS_MAX_SIDE: Option<u32> = Some(2048);
+
+/// The single-frame latent grid `(h, w)` of a `(width, height)` training canvas (one token per
+/// 32 px cell).
+pub(super) fn canvas_latent_hw((width, height): (u32, u32)) -> (usize, usize) {
+    (
+        (height / CANVAS_STRIDE) as usize,
+        (width / CANVAS_STRIDE) as usize,
+    )
+}
+
+/// The single-frame RoPE position grids of the cache, one per distinct latent grid `(h, w)` in
+/// first-seen order, plus each entry's index into them (`grids[entry_grid[i]]` is entry `i`'s).
+pub(super) fn entry_position_grids(latent_hws: &[(usize, usize)]) -> (Vec<Array>, Vec<usize>) {
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    let mut grids = Vec::new();
+    let entry_grid = latent_hws
+        .iter()
+        .map(|&(h, w)| match seen.iter().position(|&g| g == (h, w)) {
+            Some(i) => i,
+            None => {
+                seen.push((h, w));
+                grids.push(create_position_grid(1, 1, h, w));
+                seen.len() - 1
+            }
+        })
+        .collect();
+    (grids, entry_grid)
+}
+
+/// Flatten a single-frame VAE latent `(1, 128, 1, h, w)` to the patchified `(1, S, 128)` the DiT
+/// consumes (`S = h·w`) — the reference's `transpose(reshape(latent, (B, C, -1)), (0, 2, 1))`.
 pub(super) fn flatten_latent(latent: &Array) -> Result<Array> {
-    let sh = latent.shape(); // [1, 128, 1, le, le]
+    let sh = latent.shape(); // [1, 128, 1, h, w]
     let (b, c) = (sh[0], sh[1]);
     let s = sh[2] * sh[3] * sh[4];
     let flat = latent.reshape(&[b, c, s])?; // (1, 128, S)
     Ok(flat.transpose_axes(&[0, 2, 1])?) // (1, S, 128)
 }
 
-/// The inverse of [`flatten_latent`] for a square single-frame latent: the patchified
-/// `(1, S, 128)` with `S = latent_edge²` back to the decoder's NCHW `(1, 128, le, le)` (the
+/// The inverse of [`flatten_latent`] for a single-frame latent on its `(h, w)` grid: the
+/// patchified `(1, S, 128)` with `S = h·w` back to the decoder's NCHW `(1, 128, h, w)` (the
 /// per-channel-normalized space `LtxVideoVae::encode` produces).
-pub(super) fn unflatten_latent(flat: &Array, latent_edge: usize) -> Result<Array> {
+pub(super) fn unflatten_latent(flat: &Array, (h, w): (usize, usize)) -> Result<Array> {
     let sh = flat.shape();
-    let le = latent_edge as i32;
-    if sh.len() != 3 || sh[1] != le * le {
+    let (h, w) = (h as i32, w as i32);
+    if sh.len() != 3 || sh[1] != h * w {
         return Err(mlx_gen::Error::Msg(format!(
-            "ltx_2_3 trainer: expected a patchified (B, {}, C) still latent, got {sh:?}",
-            le * le
+            "ltx_2_3 trainer: expected a patchified (B, {}, C) {h}x{w} still latent, got {sh:?}",
+            h * w
         )));
     }
     Ok(flat
         .transpose_axes(&[0, 2, 1])?
-        .reshape(&[sh[0], sh[2], le, le])?)
+        .reshape(&[sh[0], sh[2], h, w])?)
 }
 
 /// One LTX-2.3 item's cached latents, one per bucket edge in `edges` order (the item-major layout
 /// [`BucketSchedule::cache_index`] indexes, sc-2127): `encode(edge)` the unpatchified
-/// `(1, 128, 1, le, le)` latent, `mask_weight(latent.shape())` — the item's subject mask resampled
+/// `(1, 128, 1, h, w)` latent (the item's aspect canvas at that edge), `mask_weight(latent.shape())` — the item's subject mask resampled
 /// onto **that** latent's grid (sc-24828) — then both patchified by the same [`flatten_latent`] →
 /// `(1, S, 128)` so the weight lines up token-for-token with that bucket's clean latent; each pair
 /// evaluated so it survives the encoder's drop.
@@ -480,15 +528,16 @@ pub(super) fn encode_bucket_latents(
 }
 
 /// The subject-masked loss weight (sc-24828) of one unpatchified still latent
-/// `(1, 128, 1, le, le)`: the image went through `center_crop_square`, so the mask's crop is
-/// [`CropBox::center_square`], area-averaged onto the latent's `(le, le)` grid and broadcast over
-/// every channel — the latent's exact shape. `None` when off.
+/// `(1, 128, 1, h, w)`: the mask (same dimensions as the image) takes the image's canvas source
+/// box ([`canvas_crop`], the whole frame within 4:1 — edge-independent), area-averaged onto the
+/// latent's `(h, w)` grid and broadcast over every channel — the latent's exact shape. `None`
+/// when off.
 pub(super) fn still_subject_weight(
     label: &str,
     mask: Option<&PreparedSubjectMask>,
     latent_shape: &[i32],
 ) -> Result<Option<Array>> {
-    prepared_subject_mask_weight(label, mask, CropBox::center_square, latent_shape)
+    prepared_subject_mask_weight(label, mask, canvas_crop, latent_shape)
 }
 
 /// Enumerate the `attn1`/`attn2` × `suffixes` targets across the DiT's `num_layers` blocks, resolve
@@ -581,7 +630,7 @@ pub(super) fn compute_step_loss_grads(
                 // x0 estimate in f32 from the raw velocity (`noise − clean`): x0 = x_t − σ·v.
                 let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma }
                     .recover_x0(&x_t_f32, &v.as_dtype(Dtype::Float32)?)
-                    .and_then(|x| unflatten_latent(&x, a.latent_edge))
+                    .and_then(|x| unflatten_latent(&x, a.latent_hw))
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 a.path
                     .aux_loss(a.plan, a.image, &x0_hat)

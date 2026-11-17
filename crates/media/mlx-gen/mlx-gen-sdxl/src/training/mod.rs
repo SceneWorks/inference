@@ -127,9 +127,9 @@ impl SdxlFamilyHooks for SdxlHooks {
     }
 
     /// SDXL micro-conditioning `time_ids`, hardcoded `[512,512,0,0,512,512]` (the vendored
-    /// `generate_latents` quirk) — ignores the real `edge` so the LoRA trains under the conditioning
-    /// inference applies it under.
-    fn time_ids(&self, batch: i32, _edge: u32) -> Array {
+    /// `generate_latents` quirk) — ignores the real canvas `width × height` so the LoRA trains
+    /// under the conditioning inference applies it under.
+    fn time_ids(&self, batch: i32, _width: u32, _height: u32) -> Array {
         text_time_ids(batch)
     }
 
@@ -192,7 +192,7 @@ impl SdxlFamilyHooks for SdxlHooks {
         pooled: &Array,
         guidance: f32,
         seed: u64,
-        edge: u32,
+        size: (u32, u32),
         steps: usize,
         _dtype: Dtype,
     ) -> Result<Image> {
@@ -204,7 +204,7 @@ impl SdxlFamilyHooks for SdxlHooks {
             pooled,
             guidance,
             seed,
-            edge,
+            size,
             steps,
         )
     }

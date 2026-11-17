@@ -16,10 +16,12 @@
 //!   ([`QwenImage21Transformer::forward`] takes the raw sigma and scales it by 1000 inside), and
 //!   `x_t = (1 − t)·x0 + t·noise`. The pipeline's Euler step is `x ← x + v·(σ_{i+1} − σ_i)`, so the
 //!   DiT's velocity is `dx/dσ = noise − x0` — no sign flip.
-//! - **Latents** are the RGBA autoencoder's posterior **mode** of the centre-cropped, resized image
-//!   (an RGB image is the opaque RGBA case: a constant `+1` alpha plane, exactly the reference
-//!   route's `img.convert("RGBA")`), normalised `(z − mean)/std` and packed unpatched to
-//!   `[1, (edge/16)², z_dim]` — the very tensor the DiT denoises in.
+//! - **Latents** are the RGBA autoencoder's posterior **mode** of the whole image resized onto its
+//!   aspect-keeping training canvas (about `edge²` pixels, never upscaled, sides multiples of
+//!   [`CANVAS_STRIDE`] — never centre-cropped to a square; an RGB image is the opaque RGBA case: a
+//!   constant `+1` alpha plane, exactly the reference route's `img.convert("RGBA")`), normalised
+//!   `(z − mean)/std` and packed unpatched to `[1, (h/16)·(w/16), z_dim]` — the very tensor the
+//!   DiT denoises in.
 //! - **Caption features** are the Qwen3-VL language tower's last-layer hidden states for the T2I
 //!   prompt template with the system prefix dropped ([`QwenImage21TextEncoder::encode_prompt`]) —
 //!   the same conditioning the render path feeds the DiT.
@@ -68,6 +70,7 @@ use std::rc::Rc;
 
 use crate::config::ConfigFile;
 
+use gen_core_train::canvas::{canvas_crop, training_canvas, TrainingCanvas};
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -75,7 +78,7 @@ use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{
     build_lokr_targets, build_lora_targets, factorization, LoraParams, TrainAdapter,
 };
@@ -104,7 +107,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::config::{
     SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
-    IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, VAE_SCALE_FACTOR,
+    IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, PRESETS, SIZE_MULTIPLE, VAE_SCALE_FACTOR,
 };
 use crate::loader;
 use crate::memory_strategy::derived::{MLX_EVAL_SLACK_BYTES, VAE_PIPELINED_DECODE_MAPS};
@@ -133,6 +136,35 @@ use crate::{UPSTREAM_LICENSE, UPSTREAM_LICENSE_NOTICE};
 /// [`TrainerDescriptor::id`] convention), so a trained adapter's `baseModel` names the route it
 /// applies to. Pinned equal to [`crate::MODEL_ID`] by a test.
 pub const TRAINER_ID: &str = "qwen_image_2_1";
+
+/// Every captioned training canvas side is a multiple of this: the latent grid is
+/// `2 · (size // 32)` per side — two 16-px VAE cells — so a canvas on the 32-px grid packs to
+/// exactly `(h/16)·(w/16)` tokens with nothing truncated. The candle twin's constant.
+pub(crate) const CANVAS_STRIDE: u32 = SIZE_MULTIPLE;
+
+/// The longest canvas side a captioned item trains at — the longest side any render preset uses
+/// (`Capabilities::max_size`). The RoPE rows are built per call from position ids (no fixed
+/// table), so this bounds the canvas to the family's render range rather than a positional limit.
+pub(crate) const CANVAS_MAX_SIDE: Option<u32> = Some(longest_preset_side());
+
+/// The longest side over [`PRESETS`] (2752 on the released table).
+const fn longest_preset_side() -> u32 {
+    let mut longest = 0;
+    let mut i = 0;
+    while i < PRESETS.len() {
+        let p = PRESETS[i];
+        let side = if p.width > p.height {
+            p.width
+        } else {
+            p.height
+        };
+        if side > longest {
+            longest = side;
+        }
+        i += 1;
+    }
+    longest
+}
 
 /// The LoKr delta-reconstruction dtype — what the shared inference loader reconstructs LyCORIS
 /// deltas at (bf16), so a trained LoKr round-trips through the sc-24156 apply path.
@@ -318,12 +350,12 @@ impl FootprintFacts {
 /// The shape of one training run, as far as memory is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingShape {
-    /// Bucketed square training edge, in pixels — the **largest** resolution bucket's edge when
-    /// the run trains several (sc-2127, epic 2123 E7).
+    /// Bucketed training edge, in pixels — the **largest** resolution bucket's edge when the run
+    /// trains several (sc-2127, epic 2123 E7). Every target trains within its `edge²` area.
     pub edge: u32,
-    /// Latent tokens of the largest **target**. `0` means the square `edge × edge` target every
-    /// text-to-image item trains at; an edit run (sc-24161) keeps each target's aspect ratio
-    /// (`edit_target_size`), so it prices its largest target explicitly.
+    /// Latent tokens of the largest **target**. `0` means the square `edge × edge` worst case; a
+    /// captioned item is priced at that worst case (its canvas area never exceeds it), an edit run
+    /// (sc-24161) at each target's aspect fit (`edit_target_size`), explicitly.
     pub target_tokens: u64,
     /// Target latent tokens cached across the whole dataset — every item at every resolution
     /// bucket (sc-2127). `0` means one target per item at [`target_tokens`](Self::target_tokens)
@@ -1189,16 +1221,38 @@ pub fn prefix_score_elements(layout: &JointLayout) -> u64 {
         .sum()
 }
 
-/// The size an item's **target** trains at. A captioned (text-to-image) item is the centre-cropped
-/// `edge × edge` square, as before. An edit pair's target keeps its **aspect ratio** — the render
-/// path's own fit, [`calculate_dimensions`]`(edge², w/h)` on the 32-px grid — because its references
-/// keep theirs: cropping the target square while the references stay whole would teach the adapter
-/// "zoom into the middle" and break the spatial correspondence the edit is about (sc-24161).
-/// Reads only the image header.
+/// The size an item's **target** trains at — [`target_canvas`]'s canvas. Reads only the image
+/// header.
 fn edit_target_size(item: &TrainingItem, edge: u32) -> Result<(u32, u32)> {
-    if !item.is_edit_pair() {
-        return Ok((edge, edge));
+    Ok(target_canvas(item, edge)?.size())
+}
+
+/// The target size the memory preflight prices an item at, at bucket `edge`: an edit pair's real
+/// [`edit_target_size`] (its header is read), a captioned item's square `edge × edge` — the worst
+/// case of its [`training_canvas`] (whose area never exceeds `edge²` and whose sides are multiples
+/// of the 32-px grid `edge` already sits on), priced without reading the file.
+fn preflight_target_size(item: &TrainingItem, edge: u32) -> Result<(u32, u32)> {
+    if item.is_edit_pair() {
+        edit_target_size(item, edge)
+    } else {
+        Ok((edge, edge))
     }
+}
+
+/// An item's **target** geometry at bucket `edge`: the source box it is cut to and the size it is
+/// resized onto. Both kinds keep the target's **aspect ratio** within about `edge²` pixels:
+///
+/// * a captioned (text-to-image) item trains on its aspect-preserving canvas
+///   ([`training_canvas`] at [`CANVAS_STRIDE`] / [`CANVAS_MAX_SIDE`]: never upscaled past the
+///   source, the whole frame unless it is more elongated than 4:1 — [`canvas_crop`]). The DiT takes
+///   `h ≠ w` and renders non-square, so a centre square would only discard frame and upscale.
+/// * an edit pair's target is the render path's own fit, [`calculate_dimensions`]`(edge², w/h)` on
+///   the 32-px grid, uncropped — because its references keep theirs: cropping the target while the
+///   references stay whole would teach the adapter "zoom into the middle" and break the spatial
+///   correspondence the edit is about (sc-24161).
+///
+/// Reads only the image header. The candle twin's rule, verbatim.
+fn target_canvas(item: &TrainingItem, edge: u32) -> Result<TrainingCanvas> {
     let (w, h) = mlx_gen::gen_core::__model_input_result!(
         image::image_dimensions(&item.image_path),
         "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::edit_target_size/image::image_dimensions",
@@ -1216,10 +1270,23 @@ fn edit_target_size(item: &TrainingItem, edge: u32) -> Result<(u32, u32)> {
             item.image_path.display()
         )));
     }
-    Ok(calculate_dimensions(
+    if !item.is_edit_pair() {
+        return Ok(training_canvas(
+            (w, h),
+            edge,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        ));
+    }
+    let (width, height) = calculate_dimensions(
         f64::from(edge) * f64::from(edge),
         f64::from(w) / f64::from(h),
-    ))
+    );
+    Ok(TrainingCanvas {
+        crop: CropBox::full(w, h),
+        width,
+        height,
+    })
 }
 
 /// Latent tokens of a `(width, height)` target.
@@ -1228,15 +1295,16 @@ fn target_tokens((width, height): (u32, u32)) -> u64 {
 }
 
 /// The target-latent sizing of a bucketed run (sc-2127): the latent tokens of the single largest
-/// target (every item at its [`edit_target_size`] for every bucket edge — the largest edge decides
-/// it, epic 2123 E7) and the target tokens the latent cache holds across the dataset (every item
-/// once per edge). With one edge the cache total is the per-item sum the single-bucket cache held.
-/// Reads only image headers.
+/// target (every item at its [`preflight_target_size`] for every bucket edge — the largest edge
+/// decides it, epic 2123 E7) and the target tokens the latent cache holds across the dataset (every
+/// item once per edge). With one edge the cache total is the per-item sum the single-bucket cache
+/// held. A captioned item is priced at its square worst case, so this is an upper bound for a
+/// non-square canvas. Reads only edit-target image headers.
 fn bucketed_target_tokens(items: &[TrainingItem], edges: &[u32]) -> Result<(u64, u64)> {
     let (mut largest, mut cached) = (0u64, 0u64);
     for item in items {
         for &edge in edges {
-            let tokens = target_tokens(edit_target_size(item, edge)?);
+            let tokens = target_tokens(preflight_target_size(item, edge)?);
             largest = largest.max(tokens);
             cached += tokens;
         }
@@ -1280,12 +1348,14 @@ fn item_branches(
 }
 
 /// An item's packed target latents, one per bucket edge in `edges` order (sc-2127), each at
-/// [`edit_target_size`] for that edge: a captioned item's centre-cropped square (unchanged), an
-/// edit pair's whole picture at its aspect-preserving fit. The image is decoded once.
+/// [`target_canvas`] for that edge: a captioned item's aspect-preserving training canvas, an edit
+/// pair's whole picture at its aspect-preserving fit. The image is decoded once, whole, and cut +
+/// resized per edge.
 ///
 /// Each latent comes with (subject-masked loss, sc-24828) its own latent loss-weight map: the
 /// item's mask is read and checked **once**, then cropped with the same rule as the image
-/// (`center_square` / `full`), area-resampled onto **that bucket's** latent grid and packed by the
+/// ([`canvas_crop`] / `full`; the mask shares the image's dimensions), area-resampled onto **that
+/// bucket's** latent grid and packed by the
 /// same [`pack_latents`], so it lines up element-for-element with that bucket's packed target.
 /// `None` when the technique is off (no file read).
 fn encode_item_targets(
@@ -1296,17 +1366,19 @@ fn encode_item_targets(
 ) -> Result<Vec<(Array, Option<Array>)>> {
     let label = format!("{TRAINER_ID} trainer");
     let mask = PreparedSubjectMask::load_if_enabled(&label, item, mask)?;
-    let decoded = decode_image(&item.image_path)?;
-    let (image, crop): (Image, fn(u32, u32) -> CropBox) = if item.is_edit_pair() {
-        (decoded, CropBox::full)
-    } else {
-        (center_crop_square(&decoded), CropBox::center_square)
-    };
+    let image = decode_image(&item.image_path)?;
+    let edit = item.is_edit_pair();
+    let crop: fn(u32, u32) -> CropBox = if edit { CropBox::full } else { canvas_crop };
     edges
         .iter()
         .map(|&edge| {
-            let (width, height) = edit_target_size(item, edge)?;
-            let z = encode_latents_unpacked(vae, &image, width, height)?;
+            let z = if edit {
+                let (width, height) = edit_target_size(item, edge)?;
+                encode_latents_unpacked(vae, &image, width, height)?
+            } else {
+                let (canvas, source) = canvas_source(&image, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                encode_latents_unpacked(vae, &source, canvas.width, canvas.height)?
+            };
             let weight = prepared_subject_mask_weight(&label, mask.as_ref(), crop, z.shape())?
                 .map(|w| pack_latents(&w))
                 .transpose()?;
@@ -1761,16 +1833,19 @@ fn render_sample(
     neg: Option<&JointBranch>,
     reference_latents: &[Array],
     seed: u64,
-    edge: u32,
+    (width, height): (u32, u32),
     steps: usize,
     guidance: f32,
     cancel: &CancelFlag,
 ) -> Result<Image> {
     // The terminal-sigma stretch is undefined at one step.
     let steps = steps.max(2);
-    let sigmas =
-        crate::scheduler::sigmas(scheduler, steps, crate::scheduler::image_tokens(edge, edge))?;
-    let latents = create_noise(seed, edge, edge, dit.config().in_channels)?;
+    let sigmas = crate::scheduler::sigmas(
+        scheduler,
+        steps,
+        crate::scheduler::image_tokens(width, height),
+    )?;
+    let latents = create_noise(seed, width, height, dit.config().in_channels)?;
     let negative = if guidance > 1.0 { neg } else { None };
     let references = (!reference_latents.is_empty()).then(|| ReferenceConditioning {
         latents: reference_latents,
@@ -1785,8 +1860,8 @@ fn render_sample(
             prompt_embeds: &pos.text,
             negative_embeds: negative.map(|neg| &neg.text),
             true_cfg_scale: guidance,
-            width: edge,
-            height: edge,
+            width,
+            height,
             sampler: None,
             seed,
             cancel,
@@ -1798,9 +1873,9 @@ fn render_sample(
         },
         &mut |_: Progress| {},
     )?;
-    let tiling = crate::memory_strategy::default_decode_is_bounded(edge, edge)
+    let tiling = crate::memory_strategy::default_decode_is_bounded(width, height)
         .then(|| TilingConfig::spatial_only(DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32));
-    decode_rgb(vae, &latents, edge, edge, tiling.as_ref(), Some(cancel))
+    decode_rgb(vae, &latents, width, height, tiling.as_ref(), Some(cancel))
 }
 
 impl Trainer for QwenImage21Trainer {
@@ -1886,6 +1961,10 @@ struct RunPlan<'r> {
     /// (epic 2123 E7).
     edges: Vec<u32>,
     edge: u32,
+    /// The preview canvas `(width, height)`: item 0's target ([`target_canvas`]) at the largest
+    /// edge — a shape the run trains at, within the `edge²` area the preflight prices; the square
+    /// `edge` when previews are off (no header read).
+    preview_size: (u32, u32),
 }
 
 /// The resume admission (sc-24163): the run's adapter stem, its dataset fingerprint, and the
@@ -2026,7 +2105,7 @@ impl QwenImage21Trainer {
             sample_caps: &sample_caps,
             sample_neg: sample_neg.as_ref(),
             edit: plan.edit,
-            edge: plan.edge,
+            preview_size: plan.preview_size,
             pool,
         };
         run_train_loop(
@@ -2073,6 +2152,10 @@ impl QwenImage21Trainer {
         };
         let edges = bucket_edges(cfg);
         let edge = largest_edge(&edges);
+        let preview_size = match req.items.first() {
+            Some(item) if sampling_requested => edit_target_size(item, edge)?,
+            _ => (edge, edge),
+        };
         Ok(RunPlan {
             req,
             edit,
@@ -2085,6 +2168,7 @@ impl QwenImage21Trainer {
             sample_prompts,
             edges,
             edge,
+            preview_size,
         })
     }
 
@@ -2111,18 +2195,20 @@ impl QwenImage21Trainer {
             prompts.push((
                 item.caption.as_str(),
                 item.reference_image_paths.as_slice(),
-                edit_target_size(item, edge)?,
+                preflight_target_size(item, edge)?,
                 true,
             ));
         }
-        // Previews render square at `edge²`, the positive prompts and the empty negative alike.
+        // Previews render at `plan.preview_size` (item 0's target at the largest edge), the
+        // positive prompts and the empty negative alike.
+        let preview_size = plan.preview_size;
         prompts.extend(
             plan.sample_prompts
                 .iter()
-                .map(|prompt| (prompt.as_str(), sample_reference_paths, (edge, edge), false)),
+                .map(|prompt| (prompt.as_str(), sample_reference_paths, preview_size, false)),
         );
         if plan.sampling_requested {
-            prompts.push(("", sample_reference_paths, (edge, edge), false));
+            prompts.push(("", sample_reference_paths, preview_size, false));
         }
         for (text, reference_paths, size, cached) in prompts {
             let tokens = match plan.vision.as_ref() {
@@ -2283,7 +2369,8 @@ impl QwenImage21Trainer {
         let req = plan.req;
         let encoder: QwenImage21TextEncoder =
             loader::load_text_encoder_from(&self.root.join("text_encoder"), plan.vision.as_ref())?;
-        // Previews render square (`render_sample`), so their branches assemble at `edge²`.
+        // Previews render at `plan.preview_size` (`render_sample`), so their branches assemble
+        // there.
         let encode = |prompt: &str, references: &[PreparedReference]| {
             encode_branch(
                 &encoder,
@@ -2291,7 +2378,7 @@ impl QwenImage21Trainer {
                 self.drop_count,
                 prompt,
                 references,
-                (plan.edge, plan.edge),
+                plan.preview_size,
             )
         };
         // One `Vec` of per-edge branches per item (sc-2127), in `edges` order.
@@ -2381,7 +2468,7 @@ impl QwenImage21Trainer {
         let mut perceptual = load_perceptual_path(cfg)?;
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image (an edit pair's whole frame, else the centre square).
+            // cropped like the image (an edit pair's whole frame, else its canvas crop).
             path.attach_subject_masks(
                 mlx_gen::train::subject_mask::PerceptualSubjectMasks::load_with(
                     &format!("{TRAINER_ID} trainer"),
@@ -2392,7 +2479,7 @@ impl QwenImage21Trainer {
                         if item.is_edit_pair() {
                             CropBox::full
                         } else {
-                            CropBox::center_square
+                            canvas_crop
                         }
                     },
                 )?,
@@ -2448,7 +2535,8 @@ struct QwenLoop<'a> {
     sample_caps: &'a [(String, JointBranch)],
     sample_neg: Option<&'a JointBranch>,
     edit: bool,
-    edge: u32,
+    /// The preview canvas `(width, height)` ([`RunPlan::preview_size`]).
+    preview_size: (u32, u32),
     /// The run's effective pool bound, recorded by every memory-trace stage.
     pool: usize,
 }
@@ -2562,7 +2650,7 @@ impl TrainLoopFamily for QwenLoop<'_> {
                     self.sample_neg,
                     sample_reference_latents,
                     sample_seed,
-                    self.edge,
+                    self.preview_size,
                     cfg.sample_steps as usize,
                     cfg.sample_guidance_scale,
                     &self.req.cancel,
@@ -3086,7 +3174,7 @@ mod tests {
     /// sc-2127: each item caches one branch and one target latent per bucket edge, in edge order —
     /// the conditioning encoded once (shared text rows), the target block / latent sized for that
     /// edge — and each bucket entry is bit-identical to a single-bucket run at that edge. Covers
-    /// a captioned item (square) and an edit pair (aspect-preserving per edge).
+    /// a captioned item (square canvas) and an edit pair (aspect-preserving per edge).
     ///
     /// *Mutations that red this:* `item_branches` building every layout at the first edge;
     /// `encode_item_targets` encoding every latent at one edge.
@@ -3147,8 +3235,8 @@ mod tests {
     /// sc-24828 × sc-2127: with subject-masked loss on and two buckets, every bucket's packed
     /// weight is resampled onto **that bucket's** latent grid — the shape of that bucket's packed
     /// target — and the masked-out (right-half) tokens are zero while the subject (left-half)
-    /// tokens carry the subject weight. Covers a captioned item (centre square) and an edit pair
-    /// (whole picture).
+    /// tokens carry the subject weight. Covers a captioned item (whole frame on its canvas) and an
+    /// edit pair (whole picture).
     ///
     /// *Mutations that red this:* `encode_item_targets` resampling the mask once at the first
     /// bucket's grid and reusing it for every bucket.
@@ -3787,9 +3875,47 @@ mod tests {
         println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::edit_training_assembles_the_render_paths_joint_sequence");
     }
 
+    /// A captioned portrait trains whole on its own aspect canvas on the 32-px latent grid (never a
+    /// centre square, never upscaled past its area, within the `edge²` the preflight prices), and
+    /// the preview noise + resolution shift follow a non-square `(width, height)`. Pure arithmetic
+    /// (the candle twin's test).
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        assert_eq!(CANVAS_STRIDE, 32);
+        assert_eq!(CANVAS_MAX_SIDE, Some(2752));
+        let c = training_canvas((1365, 2048), 1024, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!(c.crop, CropBox::full(1365, 2048));
+        assert_eq!(c.size(), (832, 1248));
+        assert!(c.area() <= 1024 * 1024);
+        assert_eq!(
+            training_canvas((1365, 2048), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE).size(),
+            (1344, 2048)
+        );
+        // `target_canvas` reads the header: a small captioned 60×90 at edge 64 → 32×64, whole frame.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("p.png");
+        image::RgbImage::from_pixel(60, 90, image::Rgb([1, 2, 3]))
+            .save(&path)
+            .unwrap();
+        let item = TrainingItem::captioned(path, "a portrait".into());
+        let canvas = target_canvas(&item, 64).unwrap();
+        assert_eq!(
+            (canvas.size(), canvas.crop),
+            ((32, 64), CropBox::full(60, 90))
+        );
+        // The preflight prices a captioned item at the square worst case without reading it.
+        let missing = TrainingItem::captioned("/nonexistent/x.png".into(), "x".into());
+        assert_eq!(preflight_target_size(&missing, 64).unwrap(), (64, 64));
+        assert_eq!(
+            crate::scheduler::image_tokens(1344, 2048),
+            128 * 84,
+            "the resolution shift sees the canvas's own token count"
+        );
+    }
+
     /// Major (review): an edit target keeps its aspect ratio — a 2:1 target trains as a 2:1 target
     /// block, not a centre-cropped square — so it stays spatially aligned with its (whole)
-    /// references. Text-to-image items are unchanged (square).
+    /// references. A captioned item trains on its own aspect canvas (160×64 for the 2:1 swatch).
     ///
     /// *Mutation that reds this:* `edit_target_size` returning `(edge, edge)` for edit pairs, or
     /// `encode_item_target` centre-cropping an edit target.
@@ -3810,7 +3936,7 @@ mod tests {
             "calculate_dimensions(128², 2) on the 32-px grid"
         );
         let captioned = TrainingItem::captioned(target, "a swatch".into());
-        assert_eq!(edit_target_size(&captioned, edge).unwrap(), (edge, edge));
+        assert_eq!(edit_target_size(&captioned, edge).unwrap(), (160, 64));
 
         let tokenizer = loader::load_tokenizer(&root).unwrap();
         let drop = system_prompt_drop_count(&tokenizer).unwrap();
@@ -3834,8 +3960,8 @@ mod tests {
             h * 2 * h,
             "the target latent covers the whole 2:1 picture"
         );
-        let square = encode_item_target(&vae, &captioned, edge).unwrap();
-        assert_eq!(square.shape()[1], (128 / 16) * (128 / 16));
+        let captioned_x0 = encode_item_target(&vae, &captioned, edge).unwrap();
+        assert_eq!(captioned_x0.shape()[1], (160 / 16) * (64 / 16));
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::a_wide_edit_target_trains_as_a_wide_target_block");
     }

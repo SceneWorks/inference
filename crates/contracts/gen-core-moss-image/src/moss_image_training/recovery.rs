@@ -9,6 +9,7 @@ use gen_core::{train::BucketSchedule, train::TrainingRequest};
 use gen_core::{Error, Result};
 use gen_core_train::{
     aspect_ratio::{self, AspectSchedule},
+    canvas::training_canvas,
     subject_mask::CropBox,
 };
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,19 @@ use sha2::{Digest, Sha256};
 
 pub const STREAM_VERSION: &str = "moss-stateless-draw-v1";
 pub const STATE_VERSION: &str = "moss-complete-state-v2";
+/// Assignment policy of the default (no `aspect_ratio_buckets`) path: each item at each square
+/// bucket edge trains on the shared aspect-preserving canvas
+/// ([`gen_core_train::canvas::training_canvas`]) at stride [`CANVAS_STRIDE`], and micro-batches
+/// larger than one are homogeneous in canvas size. It replaced `legacy-square-bucket-v1` (centre
+/// square at `edge²`), so a resume state written under the square policy is refused by the plan
+/// identity rather than resumed on different geometry.
+pub const LEGACY_CANVAS_POLICY: &str = "aspect-canvas-bucket-v1";
+/// Canvas side multiple for the default path: the same multiple-of-32 rule rectangular rows obey,
+/// which also keeps every side a multiple of the 16-pixel packed-token grid.
+pub const CANVAS_STRIDE: u32 = 32;
+/// Batch-list shuffle domain of the default path's homogeneous micro-batches (distinct from the
+/// rectangular schedule's per-bucket and batch-list constants).
+const LEGACY_BATCH_SEED: u64 = 0x4341_4e56_4241_0001;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryGeometry {
@@ -47,6 +61,11 @@ pub struct DataPlan {
     pub entries: Vec<EntryGeometry>,
     pub identity: String,
     legacy: std::cell::OnceCell<BucketSchedule>,
+    /// Homogeneous micro-batches per epoch of the default path (`batch_size > 1` only); constant
+    /// because every epoch permutes the same `(item, bucket)` multiset.
+    legacy_batches_per_epoch: std::cell::OnceCell<usize>,
+    /// The most recently built default-path epoch `(epoch, batches)`.
+    legacy_epoch: std::cell::RefCell<Option<(u64, Vec<Vec<usize>>)>>,
     legacy_items: usize,
     legacy_buckets: Vec<gen_core::train::ResolutionBucket>,
     legacy_seed: u64,
@@ -190,31 +209,9 @@ impl DataPlan {
         };
         let mut entries = Vec::new();
         for (item, &(source_w, source_h)) in dimensions.iter().enumerate() {
-            let rows: Vec<(usize, AspectRatioBucket)> = if let Some(schedule) = &rectangular {
-                let b = schedule.assignments[item];
-                vec![(b, c.aspect_ratio_buckets[b])]
-            } else {
-                c.training_buckets()
-                    .iter()
-                    .enumerate()
-                    .map(|(b, r)| {
-                        let edge = if r.resolution == 0 {
-                            512
-                        } else {
-                            ((r.resolution / 32) * 32).max(32)
-                        };
-                        (
-                            b,
-                            AspectRatioBucket {
-                                width: edge,
-                                height: edge,
-                                repeats: r.repeats,
-                            },
-                        )
-                    })
-                    .collect()
-            };
-            for (bucket, row) in rows {
+            if let Some(schedule) = &rectangular {
+                let bucket = schedule.assignments[item];
+                let row: AspectRatioBucket = c.aspect_ratio_buckets[bucket];
                 let crop = aspect_ratio::center_crop(source_w, source_h, row.width, row.height)?;
                 entries.push(EntryGeometry {
                     item,
@@ -223,13 +220,37 @@ impl DataPlan {
                     height: row.height,
                     crop: [crop.x, crop.y, crop.width, crop.height],
                 });
+                continue;
+            }
+            if source_w == 0 || source_h == 0 {
+                return Err(Error::Msg(format!(
+                    "MOSS dataset item {item} has a zero-pixel side ({source_w}x{source_h})"
+                )));
+            }
+            // Default path: each square bucket edge is an area budget; the item keeps its own
+            // aspect on a canvas of at most edge² pixels, both sides multiples of 32.
+            for (bucket, row) in c.training_buckets().iter().enumerate() {
+                let edge = if row.resolution == 0 {
+                    512
+                } else {
+                    ((row.resolution / 32) * 32).max(32)
+                };
+                let canvas = training_canvas((source_w, source_h), edge, CANVAS_STRIDE, None);
+                entries.push(EntryGeometry {
+                    item,
+                    bucket,
+                    width: canvas.width,
+                    height: canvas.height,
+                    crop: [
+                        canvas.crop.x,
+                        canvas.crop.y,
+                        canvas.crop.width,
+                        canvas.crop.height,
+                    ],
+                });
             }
         }
-        let policy = if rectangular.is_some() {
-            aspect_ratio::RECTANGULAR_POLICY
-        } else {
-            "legacy-square-bucket-v1"
-        };
+        let policy = Self::policy(c);
         let identity = format!(
             "{:x}",
             Sha256::digest(
@@ -241,6 +262,8 @@ impl DataPlan {
             entries,
             identity,
             legacy: std::cell::OnceCell::new(),
+            legacy_batches_per_epoch: std::cell::OnceCell::new(),
+            legacy_epoch: std::cell::RefCell::new(None),
             legacy_items: req.items.len(),
             legacy_buckets: c.training_buckets(),
             legacy_seed: c.seed,
@@ -249,7 +272,56 @@ impl DataPlan {
             inputs: None,
         })
     }
-    /// Zero-based micro-step to the exact sample draw cursor and homogeneous rectangular batch.
+    /// The assignment policy a config's plan is built under (part of the plan identity).
+    pub fn policy(config: &gen_core::train::TrainingConfig) -> &'static str {
+        if config.aspect_ratio_buckets.is_empty() {
+            LEGACY_CANVAS_POLICY
+        } else {
+            aspect_ratio::RECTANGULAR_POLICY
+        }
+    }
+    fn legacy_schedule(&self) -> &BucketSchedule {
+        self.legacy.get_or_init(|| {
+            BucketSchedule::new(self.legacy_items, &self.legacy_buckets, self.legacy_seed)
+        })
+    }
+    /// Default-path epoch `epoch` as homogeneous micro-batches: that epoch's ordered draws
+    /// grouped by canvas `(width, height)` (draw order kept within a group, groups in order of
+    /// first draw), each group chunked by `batch_size` keeping its tail, then the batch list
+    /// shuffled with the seed and epoch.
+    fn build_legacy_epoch(&self, epoch: u64) -> Result<Vec<Vec<usize>>> {
+        let legacy = self.legacy_schedule();
+        let len = legacy.epoch_len();
+        let first = usize::try_from(epoch)
+            .ok()
+            .and_then(|e| e.checked_mul(len))
+            .filter(|f| f.checked_add(len).is_some())
+            .ok_or_else(|| Error::Msg("MOSS sample cursor overflow".into()))?;
+        let mut slots = std::collections::HashMap::<(u32, u32), usize>::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for k in 0..len {
+            let entry = legacy.cache_index(first + k);
+            let geometry = self
+                .entries
+                .get(entry)
+                .ok_or_else(|| Error::Msg("MOSS schedule entry outside the plan".into()))?;
+            let slot = *slots
+                .entry((geometry.width, geometry.height))
+                .or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+            groups[slot].push(entry);
+        }
+        let mut batches: Vec<Vec<usize>> = groups
+            .iter()
+            .flat_map(|group| group.chunks(self.batch_size).map(<[usize]>::to_vec))
+            .collect();
+        BucketSchedule::shuffle_items(&mut batches, self.legacy_seed ^ LEGACY_BATCH_SEED, epoch, 0);
+        Ok(batches)
+    }
+    /// Zero-based micro-step to the exact sample draw cursor and a micro-batch whose entries
+    /// share one canvas size (the rectangular bucket, or the default path's canvas).
     pub fn batch(&self, micro_step: u32) -> Result<BatchDraw> {
         if let Some(schedule) = &self.rectangular {
             let n = schedule.epoch(0).len();
@@ -279,10 +351,42 @@ impl DataPlan {
                 sample_cursor,
                 entries: selected.items.clone(),
             })
+        } else if self.batch_size > 1 {
+            let len = self.legacy_schedule().epoch_len();
+            if len == 0 {
+                return Err(Error::Msg("MOSS schedule is empty".into()));
+            }
+            let per_epoch = match self.legacy_batches_per_epoch.get() {
+                Some(&n) => n,
+                None => {
+                    let n = self.build_legacy_epoch(0)?.len();
+                    *self.legacy_batches_per_epoch.get_or_init(|| n)
+                }
+            };
+            if per_epoch == 0 {
+                return Err(Error::Msg("MOSS schedule is empty".into()));
+            }
+            let epoch = u64::from(micro_step) / (per_epoch as u64);
+            let batch = micro_step as usize % per_epoch;
+            let mut cached = self.legacy_epoch.borrow_mut();
+            if cached.as_ref().is_none_or(|(e, _)| *e != epoch) {
+                *cached = Some((epoch, self.build_legacy_epoch(epoch)?));
+            }
+            let batches = &cached.as_ref().expect("epoch built above").1;
+            let prior = batches[..batch].iter().map(|b| b.len() as u64).sum::<u64>();
+            // Every epoch draws each scheduled (item, bucket) exactly once: `len` samples.
+            let sample_cursor = epoch
+                .checked_mul(len as u64)
+                .and_then(|v| v.checked_add(prior))
+                .ok_or_else(|| Error::Msg("MOSS absolute sample cursor overflow".into()))?;
+            Ok(BatchDraw {
+                epoch,
+                batch: batch as u64,
+                sample_cursor,
+                entries: batches[batch].clone(),
+            })
         } else {
-            let legacy = self.legacy.get_or_init(|| {
-                BucketSchedule::new(self.legacy_items, &self.legacy_buckets, self.legacy_seed)
-            });
+            let legacy = self.legacy_schedule();
             let first = (micro_step as usize)
                 .checked_mul(self.batch_size)
                 .ok_or_else(|| Error::Msg("MOSS sample cursor overflow".into()))?;
@@ -451,12 +555,7 @@ impl RunState {
             version: STATE_VERSION.into(),
             stream_version: STREAM_VERSION.into(),
             effective_identity: identity.clone(),
-            assignment_policy: if req.config.aspect_ratio_buckets.is_empty() {
-                "legacy-square-bucket-v1"
-            } else {
-                aspect_ratio::RECTANGULAR_POLICY
-            }
-            .into(),
+            assignment_policy: DataPlan::policy(&req.config).into(),
             crop_policy: aspect_ratio::CROP_POLICY.into(),
             geometry: plan.entries.clone(),
             plan_identity: plan.identity.clone(),
@@ -679,17 +778,51 @@ mod tests {
         for step in 0..12 {
             for entry in plan.batch(step).unwrap().entries {
                 let geometry = &plan.entries[entry];
-                assert_eq!(geometry.width, rows[geometry.bucket].resolution);
-                assert_eq!(geometry.height, rows[geometry.bucket].resolution);
-                *observed.entry((geometry.item, geometry.width)).or_insert(0) += 1;
+                let edge = rows[geometry.bucket].resolution;
+                let (source_w, source_h) = dimensions[geometry.item];
+                // Each resolution is an area budget: the item keeps its own aspect (whole frame,
+                // never a centre square) on a 32-multiple canvas of at most edge² pixels.
+                assert_eq!(geometry.crop, [0, 0, source_w, source_h]);
+                assert_eq!((geometry.width % 32, geometry.height % 32), (0, 0));
+                assert!(
+                    u64::from(geometry.width) * u64::from(geometry.height)
+                        <= u64::from(edge).pow(2)
+                );
+                assert_eq!(
+                    geometry.width > geometry.height,
+                    source_w > source_h,
+                    "canvas keeps the source orientation"
+                );
+                assert_eq!(geometry.width == geometry.height, source_w == source_h);
+                *observed
+                    .entry((geometry.item, geometry.bucket))
+                    .or_insert(0) += 1;
             }
         }
         for item in 0..3 {
-            for row in &rows {
-                assert_eq!(observed.get(&(item, row.resolution)), Some(&1));
+            for bucket in 0..rows.len() {
+                assert_eq!(observed.get(&(item, bucket)), Some(&1));
             }
         }
         assert_eq!(observed.len(), 12);
+        let canvas = |item: usize, bucket: usize| {
+            let g = plan
+                .entries
+                .iter()
+                .find(|g| g.item == item && g.bucket == bucket)
+                .unwrap();
+            (g.width, g.height)
+        };
+        // 640×480 at 256: scaled to ~65 536 px and 32-floored; at 768 and 1024 it is below the
+        // budget and trains at its own size (never upscaled).
+        assert_eq!(canvas(0, 0), (288, 192));
+        assert_eq!(canvas(0, 2), (640, 480));
+        assert_eq!(canvas(0, 3), (640, 480));
+        assert_eq!(canvas(1, 3), (480, 640));
+        // A square source still trains at the square edge.
+        for (bucket, row) in rows.iter().enumerate() {
+            assert_eq!(canvas(2, bucket), (row.resolution, row.resolution));
+        }
         req.config.resolution_buckets.clear();
         req.config.aspect_ratio_buckets = rows
             .iter()
@@ -703,6 +836,178 @@ mod tests {
         assert_eq!(tied.entries.len(), 3);
         assert!(tied.entries.iter().all(|e|e.bucket==0 && e.width==256 && e.height==256),
             "rectangular equal-aspect rows choose the earliest row, NOT the legacy resolution ladder");
+    }
+
+    fn default_path_request(
+        n_items: usize,
+        buckets: Vec<gen_core::train::ResolutionBucket>,
+        batch_size: u32,
+    ) -> TrainingRequest {
+        TrainingRequest {
+            items: (0..n_items)
+                .map(|i| {
+                    gen_core::train::TrainingItem::captioned(
+                        format!("image{i}.png").into(),
+                        String::new(),
+                    )
+                })
+                .collect(),
+            output_dir: "unused".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            config: gen_core::train::TrainingConfig {
+                resolution_buckets: buckets,
+                batch_size,
+                steps: 1000,
+                gradient_accumulation: 1,
+                seed: 173,
+                ..Default::default()
+            },
+            cancel: gen_core::CancelFlag::new(),
+        }
+    }
+
+    #[test]
+    fn default_path_portrait_trains_its_whole_frame_on_an_aspect_canvas() {
+        let bucket = |resolution| gen_core::train::ResolutionBucket {
+            resolution,
+            repeats: 1,
+        };
+        let req = default_path_request(1, vec![bucket(1024), bucket(2048)], 1);
+        let plan = DataPlan::new(&req, &[(1365, 2048)]).unwrap();
+        assert_eq!(plan.entries.len(), 2);
+        for (geometry, edge) in plan.entries.iter().zip([1024u64, 2048]) {
+            // The whole frame — not the old centred 1365² square.
+            assert_eq!(geometry.crop, [0, 0, 1365, 2048]);
+            assert_eq!((geometry.width % 32, geometry.height % 32), (0, 0));
+            assert!(geometry.height > geometry.width);
+            assert!(u64::from(geometry.width) * u64::from(geometry.height) <= edge * edge);
+            let aspect = f64::from(geometry.width) / f64::from(geometry.height);
+            assert!((aspect - 1365.0 / 2048.0).abs() < 0.03, "{aspect}");
+        }
+        // At 2048 the portrait is within the area budget: its own size, 32-floored, not upscaled.
+        assert_eq!(
+            (plan.entries[1].width, plan.entries[1].height),
+            (1344, 2048)
+        );
+        // Packed-token math still holds on the non-square canvas (16-pixel tokens).
+        let tokens: u64 = plan
+            .entries
+            .iter()
+            .map(|g| u64::from(g.width / 16) * u64::from(g.height / 16))
+            .sum();
+        assert_eq!(plan.cached_token_count().unwrap(), tokens);
+        assert_eq!(plan.entries[1].width % 16, 0);
+        assert!(DataPlan::new(&req, &[(0, 2048)]).is_err());
+    }
+
+    #[test]
+    fn default_path_batches_are_homogeneous_complete_and_deterministic() {
+        let rows = vec![
+            gen_core::train::ResolutionBucket {
+                resolution: 256,
+                repeats: 1,
+            },
+            gen_core::train::ResolutionBucket {
+                resolution: 512,
+                repeats: 2,
+            },
+        ];
+        // Squares (one smaller-than-1024 square shares the square canvases) and portraits.
+        let dims = [
+            (1024, 1024),
+            (1365, 2048),
+            (1024, 1024),
+            (1365, 2048),
+            (800, 800),
+        ];
+        let req = default_path_request(dims.len(), rows.clone(), 2);
+        let plan = DataPlan::new(&req, &dims).unwrap();
+        let again = DataPlan::new(&req, &dims).unwrap();
+        let draws_per_epoch: u64 = (dims.len() as u64) * 3;
+        let mut step = 0u32;
+        let mut cursor = 0u64;
+        let mut epoch_orders = Vec::new();
+        for epoch in 0..3u64 {
+            let mut counts = std::collections::BTreeMap::new();
+            let mut order = Vec::new();
+            let mut saw_tail = false;
+            loop {
+                let draw = plan.batch(step).unwrap();
+                if draw.epoch != epoch {
+                    break;
+                }
+                assert_eq!(
+                    draw,
+                    again.batch(step).unwrap(),
+                    "deterministic across plans"
+                );
+                assert_eq!(
+                    draw,
+                    plan.batch(step).unwrap(),
+                    "deterministic across calls"
+                );
+                assert_eq!(draw.sample_cursor, cursor);
+                assert!(!draw.entries.is_empty() && draw.entries.len() <= 2);
+                saw_tail |= draw.entries.len() == 1;
+                let first = &plan.entries[draw.entries[0]];
+                for &entry in &draw.entries {
+                    let g = &plan.entries[entry];
+                    assert_eq!((g.width, g.height), (first.width, first.height));
+                    *counts.entry(entry).or_insert(0u32) += 1;
+                }
+                cursor += draw.entries.len() as u64;
+                order.push(draw.entries);
+                step += 1;
+            }
+            assert_eq!(cursor, (epoch + 1) * draws_per_epoch);
+            assert!(saw_tail, "odd groups keep their tails");
+            assert_eq!(counts.len(), plan.entries.len());
+            for (entry, count) in counts {
+                assert_eq!(count, rows[plan.entries[entry].bucket].repeats);
+            }
+            epoch_orders.push(order);
+        }
+        // Constant batches per epoch; the batch order reshuffles per epoch.
+        assert!(epoch_orders
+            .iter()
+            .all(|o| o.len() == epoch_orders[0].len()));
+        assert_ne!(epoch_orders[0], epoch_orders[1]);
+        // A resume state on the homogeneous path validates; the replaced square policy is refused.
+        let identity = RunIdentity {
+            digest: "identity".into(),
+            source_checkpoint: "fixture-only".into(),
+            dataset_fingerprint: "dataset".into(),
+            effective_config: "controls".into(),
+        };
+        let state = RunState::after_step(&req, &plan, &identity, 7, 7, 0, 0.5).unwrap();
+        assert_eq!(state.assignment_policy, LEGACY_CANVAS_POLICY);
+        state.validate(&req, &plan, &identity).unwrap();
+        let mut old = state.clone();
+        old.assignment_policy = "legacy-square-bucket-v1".into();
+        assert!(old.validate(&req, &plan, &identity).is_err());
+        // The 1365×2048 portrait's 256 entry (item-major: item 1, bucket 0) under the old
+        // centre-square geometry.
+        let mut old = state;
+        assert_eq!((old.geometry[2].item, old.geometry[2].bucket), (1, 0));
+        assert_ne!(old.geometry[2].width, old.geometry[2].height);
+        old.geometry[2].width = 256;
+        old.geometry[2].height = 256;
+        old.geometry[2].crop = [0, 341, 1365, 1365];
+        assert!(old.validate(&req, &plan, &identity).is_err());
+
+        // batch_size 1 keeps the historical one-draw-per-step schedule exactly.
+        let single = default_path_request(dims.len(), rows.clone(), 1);
+        let plan = DataPlan::new(&single, &dims).unwrap();
+        let schedule = BucketSchedule::new(dims.len(), &rows, 173);
+        for step in 0..40u32 {
+            let draw = plan.batch(step).unwrap();
+            let k = step as usize;
+            assert_eq!(draw.entries, vec![schedule.cache_index(k)]);
+            assert_eq!(draw.sample_cursor, u64::from(step));
+            assert_eq!(draw.batch, u64::from(step));
+            assert_eq!(draw.epoch, (k / schedule.epoch_len()) as u64);
+        }
     }
 
     #[test]

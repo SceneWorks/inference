@@ -56,15 +56,16 @@ use std::rc::Rc;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
+use mlx_gen::train::canvas::{canvas_crop, training_canvas, TrainingCanvas};
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, crop_image, decode_image};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, AuxModelFootprint, Parameterization, PerceptualPath, StepPlan,
     X0Decoder,
 };
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::trainer_loop::{
     adapter_optimizer, adapter_stem, build_adapter, cache_items, draw_flow_step,
     encode_preview_prompts, ensure_cached, flow_step_noise, flow_velocity_batch, largest_edge,
@@ -86,7 +87,7 @@ use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::{MageFlowConfig, FAMILY, VAE_DOWNSAMPLE_FACTOR};
+use crate::config::{MageFlowConfig, FAMILY, MAX_SIZE, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::GsKey;
 use crate::pipeline::{denoise, encode_noise_tokens, generation_layout, mage_flow_sigmas};
 use crate::rope_embedder::{ImgShape, MsRope, PackContext, PackLayout};
@@ -128,43 +129,81 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
     Ok((x_t, target, sigma))
 }
 
-/// A cached training sample: the clean VAE-latent tokens `[1, grid·grid, 128]`, the encoded
-/// conditioning `[1, txt_tokens, hidden]`, its post-drop token count, the square latent `grid` the
+/// Every training canvas side is a multiple of this: one Mage-VAE latent cell (16 px) — the DiT
+/// packs one token per latent cell (`patch_size == 1`).
+const CANVAS_STRIDE: u32 = VAE_DOWNSAMPLE_FACTOR;
+/// The longest canvas side the trainer keeps — the family's render cap ([`MAX_SIZE`]). The msrope
+/// table bounds the packed sequence, not the resolution, so this bounds the trained positions to
+/// what inference renders.
+const CANVAS_MAX_SIDE: Option<u32> = Some(MAX_SIZE);
+
+/// A latent grid `(gh, gw)` in latent cells (`patch_size == 1`, so also the image token grid) —
+/// non-square for a non-square training canvas.
+type LatentGrid = (i32, i32);
+
+/// A cached training sample: the clean VAE-latent tokens `[1, gh·gw, 128]`, the encoded
+/// conditioning `[1, txt_tokens, hidden]`, its post-drop token count, the latent grid `(gh, gw)` the
 /// tokens were encoded at (native-resolution packing is per-sample, so each caption keeps its own
-/// length and — with resolution buckets, sc-2127 — each sample its own grid), and (subject-masked
-/// loss, sc-24828) that bucket's latent loss-weight map in the same token layout as `latent_tokens`
+/// length and each (item, bucket) entry its own aspect-keeping grid, sc-2127), and (subject-masked
+/// loss, sc-24828) that entry's latent loss-weight map in the same token layout as `latent_tokens`
 /// — `None` when the technique is off.
 struct CachedSample {
     latent_tokens: Array,
     txt: Array,
     txt_tokens: i32,
-    grid: i32,
+    grid: LatentGrid,
     mask_weight: Option<Array>,
 }
 
 /// The Mage latent token layout: an NCHW latent grid `[1, C, gh, gw]` → `[1, gh·gw, C]` (one token
 /// per latent cell, row-major; `patch_size == 1`). Shared by the clean latent and its subject-mask
 /// weight so the two line up element-for-element.
-fn latent_grid_to_tokens(grid_nchw: &Array, grid: i32) -> Result<Array> {
+fn latent_grid_to_tokens(grid_nchw: &Array, (gh, gw): LatentGrid) -> Result<Array> {
     let channels = grid_nchw.shape()[1]; // LATENT_CHANNELS in production
     Ok(grid_nchw
         .transpose_axes(&[0, 2, 3, 1])?
-        .reshape(&[1, grid * grid, channels])?)
+        .reshape(&[1, gh * gw, channels])?)
 }
 
-/// The square latent grid side for a training `edge` (`patch_size == 1`, so this is also the image
-/// token side).
-fn latent_grid(edge: u32) -> i32 {
-    (edge / VAE_DOWNSAMPLE_FACTOR) as i32
+/// The latent grid `(gh, gw)` of a training canvas `(width, height)` (`patch_size == 1`, so this is
+/// also the image token grid).
+fn latent_grid((width, height): (u32, u32)) -> LatentGrid {
+    (
+        (height / VAE_DOWNSAMPLE_FACTOR) as i32,
+        (width / VAE_DOWNSAMPLE_FACTOR) as i32,
+    )
 }
 
 /// The one-segment pack layout of a cached sample: its own latent grid + its caption tokens. Shared
-/// by the adapter and full fine-tune steps so a bucketed sample is always packed at the grid it was
-/// cached at (sc-2127).
+/// by the adapter and full fine-tune steps so a bucketed sample is always packed at the (generally
+/// non-square) grid it was cached at (sc-2127), and msrope positions follow its own `h × w`.
 fn sample_layout(sample: &CachedSample) -> Result<PackLayout> {
     PackLayout::generation(
-        vec![ImgShape::latent(sample.grid, sample.grid)],
+        vec![ImgShape::latent(sample.grid.0, sample.grid.1)],
         vec![sample.txt_tokens],
+    )
+}
+
+/// The preview canvas `(width, height)`: item 0's training canvas at the largest bucket edge — the
+/// shape its cache entry at that edge was encoded at (item-major cache, `edges.len()` entries per
+/// item), within the `edge²` area the memory preflight prices.
+fn preview_size(cache: &[CachedSample], edges: &[u32]) -> (u32, u32) {
+    let largest = edges
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &edge)| edge)
+        .map_or(0, |(bucket, _)| bucket);
+    cache.get(largest).map_or_else(
+        || {
+            let edge = largest_edge(edges);
+            (edge, edge)
+        },
+        |sample| {
+            (
+                sample.grid.1 as u32 * VAE_DOWNSAMPLE_FACTOR,
+                sample.grid.0 as u32 * VAE_DOWNSAMPLE_FACTOR,
+            )
+        },
     )
 }
 
@@ -616,12 +655,14 @@ impl MageFlowTrainer {
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
 
-        // Training resolutions → square latent grids, one edge per resolution bucket (sc-2127; just
-        // `[resolution]` when buckets are off). `bucket_edges` floors each to a multiple of 32 (a
-        // subset of Mage's 16× stride, so the latent tiles cleanly). `patch_size == 1`, so each
-        // sample's token count is exactly its latent grid. Previews render at the largest edge.
+        // Training resolutions → one edge per resolution bucket (sc-2127; just `[resolution]` when
+        // buckets are off). Each edge is an area budget: every item trains on its aspect-keeping
+        // canvas at about `edge²` pixels (never upscaled, sides multiples of [`CANVAS_STRIDE`] —
+        // never centre-cropped to a square). `patch_size == 1`, so each sample's token count is
+        // exactly its latent grid. The memory preflight prices the largest edge's square (every
+        // canvas is at most that area); previews render at item 0's canvas at that edge.
         let edges = bucket_edges(cfg);
-        let preview_edge = largest_edge(&edges);
+        let max_edge = largest_edge(&edges);
 
         let compute_dtype = resolve_compute_dtype(&cfg.train_dtype);
 
@@ -629,16 +670,16 @@ impl MageFlowTrainer {
         // below (which casts the frozen base and builds adapter factors). The full path seeds its own
         // f32 master weights from the raw checkpoint instead of freezing `self.transformer`.
         if cfg.full_finetune {
-            return self.train_full_impl(req, &edges, preview_edge, compute_dtype, on_progress);
+            return self.train_full_impl(req, &edges, compute_dtype, on_progress);
         }
 
         // Epic 2123 E7: the auxiliary perceptual models count against the budget before anything
         // heavy runs (one cached reference per (item, bucket) entry, sized at the largest edge).
-        let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
+        let aux_gb = perceptual_footprint_gb(cfg, max_edge, req.items.len() * edges.len());
         if aux_gb > 0.0 {
             preflight_aux_memory(
                 cfg,
-                preview_edge,
+                max_edge,
                 aux_gb,
                 crate::memory::production_safe_budget_gb()?,
             )?;
@@ -652,6 +693,7 @@ impl MageFlowTrainer {
 
         // --- prepare → cache: VAE-latents + prompt-embeds into memory before the loop ---
         let (cache, sample_caps) = self.prepare_caches(req, &edges, on_progress)?;
+        let preview_size = preview_size(&cache, &edges);
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
@@ -660,7 +702,7 @@ impl MageFlowTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
 
@@ -706,7 +748,7 @@ impl MageFlowTrainer {
             mae,
             compute_dtype,
             sample_caps: &sample_caps,
-            preview_edge,
+            preview_size,
         };
         run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
@@ -727,7 +769,22 @@ impl MageFlowTrainer {
         on_progress(TrainingProgress::LoadingModel);
         let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len() * edges.len());
         cache_items(req, on_progress, |item| {
-            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // Decoded once, whole (cut only beyond 4:1 — the box is edge-independent); resized onto
+            // its aspect-keeping canvas per bucket edge. Every micro-step trains one cached entry,
+            // so entries of different shapes never share a batch.
+            let decoded = decode_image(&item.image_path)?;
+            let img = crop_image(&decoded, canvas_crop(decoded.width, decoded.height));
+            let canvases: Vec<TrainingCanvas> = edges
+                .iter()
+                .map(|&edge| {
+                    training_canvas(
+                        (decoded.width, decoded.height),
+                        edge,
+                        CANVAS_STRIDE,
+                        CANVAS_MAX_SIDE,
+                    )
+                })
+                .collect();
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let mask = PreparedSubjectMask::load_if_enabled(
                 "mage_flow_base trainer",
@@ -744,8 +801,8 @@ impl MageFlowTrainer {
             let (txt, txt_tokens) = encode_caption(text_encoder, &item.caption)?;
             eval([&txt])?;
             for (grid, latent_tokens, mask_weight) in
-                encode_buckets(edges, mask.as_ref(), |edge| {
-                    let nchw = preprocess_to_nchw(&img, edge)?;
+                encode_buckets(&canvases, mask.as_ref(), |canvas| {
+                    let nchw = preprocess_to_nchw(&img, canvas.size())?;
                     // Mage-VAE encode at t = 0 → posterior **mean** (`sample_posterior = false`), no
                     // latent scale/shift. `[1, 128, gh, gw]`.
                     self.vae.encode_mean(&nchw)
@@ -804,7 +861,6 @@ impl MageFlowTrainer {
         &mut self,
         req: &TrainingRequest,
         edges: &[u32],
-        preview_edge: u32,
         compute_dtype: Dtype,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<TrainingOutput> {
@@ -833,6 +889,7 @@ impl MageFlowTrainer {
 
         // Cache the dataset + drop the text encoder (shared with the LoRA path).
         let (cache, sample_caps) = self.prepare_caches(req, edges, on_progress)?;
+        let preview_size = preview_size(&cache, edges);
 
         let mae = mae_loss(&cfg.loss_type, LossTypeFold::Normalized);
         let opt = adapter_optimizer(cfg)?;
@@ -862,7 +919,7 @@ impl MageFlowTrainer {
             mae,
             compute_dtype,
             sample_caps: &sample_caps,
-            preview_edge,
+            preview_size,
         };
         // A full-tune run reports preview failures on stderr only (no run warnings).
         run_train_loop(&mut family, req, &stem, start, on_progress, &mut Vec::new())
@@ -911,7 +968,7 @@ fn render_previews_with(
     req: &TrainingRequest,
     step: u32,
     sample_caps: &[SamplePrompt],
-    preview_edge: u32,
+    preview_size: (u32, u32),
     log: &PreviewLog<'_>,
     sink: &mut PreviewSink<'_>,
 ) {
@@ -930,7 +987,7 @@ fn render_previews_with(
                 vae,
                 txt,
                 *txt_tokens,
-                preview_edge,
+                preview_size,
                 cfg.sample_steps.max(1) as usize,
                 cfg.sample_guidance_scale,
                 sample_seed as i64,
@@ -952,7 +1009,8 @@ struct MageAdapterLoop<'a> {
     mae: bool,
     compute_dtype: Dtype,
     sample_caps: &'a [SamplePrompt],
-    preview_edge: u32,
+    /// The preview canvas `(width, height)` ([`preview_size`]).
+    preview_size: (u32, u32),
 }
 
 impl TrainLoopFamily for MageAdapterLoop<'_> {
@@ -1007,7 +1065,7 @@ impl TrainLoopFamily for MageAdapterLoop<'_> {
             self.req,
             step,
             self.sample_caps,
-            self.preview_edge,
+            self.preview_size,
             &preview_log("[sc-14055]", "preview sample", true),
             sink,
         );
@@ -1034,7 +1092,8 @@ struct MageFullLoop<'a> {
     mae: bool,
     compute_dtype: Dtype,
     sample_caps: &'a [SamplePrompt],
-    preview_edge: u32,
+    /// The preview canvas `(width, height)` ([`preview_size`]).
+    preview_size: (u32, u32),
 }
 
 impl TrainLoopFamily for MageFullLoop<'_> {
@@ -1114,7 +1173,7 @@ impl TrainLoopFamily for MageFullLoop<'_> {
                 self.req,
                 step,
                 self.sample_caps,
-                self.preview_edge,
+                self.preview_size,
                 &preview_log("[sc-14056]", "full-tune preview", false),
                 sink,
             ),
@@ -1270,30 +1329,32 @@ fn resolve_target_paths(transformer: &MageTransformer, cfg: &TrainingConfig) -> 
     )
 }
 
-/// Resize a center-cropped square core [`Image`] to `edge × edge` and normalise to the reference's
-/// `[-1, 1]` NCHW input (`pixel / 127.5 − 1`), matching `pipeline::reference_nchw`.
-fn preprocess_to_nchw(image: &Image, edge: u32) -> Result<Array> {
+/// Resize a core [`Image`] (already cut to its canvas source box) onto its training canvas
+/// `(width, height)` and normalise to the reference's `[-1, 1]` NCHW input (`pixel / 127.5 − 1`),
+/// matching `pipeline::reference_nchw`.
+fn preprocess_to_nchw(image: &Image, (width, height): (u32, u32)) -> Result<Array> {
     let rgb = image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
         .ok_or_else(|| {
             mlx_gen::Error::Msg("mage_flow_base trainer: dataset image is not valid RGB8".into())
         })?;
-    let resized = if rgb.dimensions() == (edge, edge) {
+    let resized = if rgb.dimensions() == (width, height) {
         rgb
     } else {
-        image::imageops::resize(&rgb, edge, edge, image::imageops::FilterType::CatmullRom)
+        image::imageops::resize(&rgb, width, height, image::imageops::FilterType::CatmullRom)
     };
-    let mut values = vec![0f32; 3 * edge as usize * edge as usize];
+    let (w, h) = (width as usize, height as usize);
+    let mut values = vec![0f32; 3 * w * h];
     for channel in 0..3usize {
-        for y in 0..edge as usize {
-            for x in 0..edge as usize {
+        for y in 0..h {
+            for x in 0..w {
                 let pixel = resized.get_pixel(x as u32, y as u32)[channel] as f32;
-                values[(channel * edge as usize + y) * edge as usize + x] = pixel / 127.5 - 1.0;
+                values[(channel * h + y) * w + x] = pixel / 127.5 - 1.0;
             }
         }
     }
     Ok(Array::from_slice(
         &values,
-        &[1, 3, edge as i32, edge as i32],
+        &[1, 3, height as i32, width as i32],
     ))
 }
 
@@ -1325,12 +1386,12 @@ struct AuxStep<'a> {
     entry: usize,
 }
 
-/// Mage latent tokens `[1, g·g, C]` → the decoder's NCHW grid `[1, C, g, g]` (inverse of
+/// Mage latent tokens `[1, gh·gw, C]` → the decoder's NCHW grid `[1, C, gh, gw]` (inverse of
 /// [`latent_grid_to_tokens`]).
-fn tokens_to_latent_grid(tokens: &Array, grid: i32) -> Result<Array> {
+fn tokens_to_latent_grid(tokens: &Array, (gh, gw): LatentGrid) -> Result<Array> {
     let channels = tokens.shape()[2];
     Ok(tokens
-        .reshape(&[1, grid, grid, channels])?
+        .reshape(&[1, gh, gw, channels])?
         .transpose_axes(&[0, 3, 1, 2])?)
 }
 
@@ -1483,14 +1544,14 @@ fn render_sample(
     vae: &MageVae,
     cond_txt: &Array,
     cond_tokens: i32,
-    edge: u32,
+    size: (u32, u32),
     steps: usize,
     guidance: f32,
     seed: i64,
 ) -> Result<Image> {
-    let grid = latent_grid(edge);
+    let (gh, gw) = latent_grid(size);
     let key = GsKey::default();
-    let tokens = encode_noise_tokens(grid, grid, seed, &key, Dtype::Bfloat16)?;
+    let tokens = encode_noise_tokens(gh, gw, seed, &key, Dtype::Bfloat16)?;
     let cond = cond_txt.as_dtype(Dtype::Bfloat16)?;
     let sigmas = mage_flow_sigmas(steps)?;
     // CFG-off preview: one segment, positive conditioning only (matching the generate path at cfg 1).
@@ -1500,7 +1561,7 @@ fn render_sample(
     } else {
         None
     };
-    let layout = generation_layout(&[(grid, grid)], vec![cond_tokens])?;
+    let layout = generation_layout(&[(gh, gw)], vec![cond_tokens])?;
     let cfg = if uses_cfg { guidance } else { 1.0 };
     let final_tokens = denoise(
         transformer,
@@ -1512,40 +1573,40 @@ fn render_sample(
         false,
         &sigmas,
     )?;
-    let image_u8 = crate::pipeline::decode(vae, &final_tokens, grid, grid)?;
+    let image_u8 = crate::pipeline::decode(vae, &final_tokens, gh, gw)?;
     eval([&image_u8])?;
     let pixels = image_u8
         .try_as_slice::<u8>()
         .map_err(|e| mlx_gen::Error::Msg(format!("mage_flow_base trainer preview: {e}")))?
         .to_vec();
     Ok(Image {
-        width: (grid * VAE_DOWNSAMPLE_FACTOR as i32) as u32,
-        height: (grid * VAE_DOWNSAMPLE_FACTOR as i32) as u32,
+        width: (gw * VAE_DOWNSAMPLE_FACTOR as i32) as u32,
+        height: (gh * VAE_DOWNSAMPLE_FACTOR as i32) as u32,
         pixels,
     })
 }
 
-/// sc-2127 × sc-24828: one item's cache entries, one per bucket edge (item-major order) — the
-/// bucket's latent grid, its clean latent (`encode(edge)` = `[1, C, grid, grid]`) laid out as
-/// tokens by [`latent_grid_to_tokens`], and its subject-mask loss weight: the item's already-loaded
-/// mask cropped with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's
-/// UNPACKED latent grid and laid out into tokens by the SAME [`latent_grid_to_tokens`]. `None`
-/// weights when masked loss is off.
+/// sc-2127 × sc-24828: one item's cache entries, one per bucket edge's training canvas (item-major
+/// order) — the canvas's latent grid, its clean latent (`encode(canvas)` = `[1, C, gh, gw]`) laid
+/// out as tokens by [`latent_grid_to_tokens`], and its subject-mask loss weight: the item's
+/// already-loaded mask (same dimensions as its image) cut to the image's own canvas source box,
+/// area-averaged onto THAT entry's UNPACKED latent grid and laid out into tokens by the SAME
+/// [`latent_grid_to_tokens`]. `None` weights when masked loss is off.
 #[allow(clippy::type_complexity)]
 fn encode_buckets(
-    edges: &[u32],
+    canvases: &[TrainingCanvas],
     mask: Option<&PreparedSubjectMask>,
-    mut encode: impl FnMut(u32) -> Result<Array>,
-) -> Result<Vec<(i32, Array, Option<Array>)>> {
-    edges
+    mut encode: impl FnMut(&TrainingCanvas) -> Result<Array>,
+) -> Result<Vec<(LatentGrid, Array, Option<Array>)>> {
+    canvases
         .iter()
-        .map(|&edge| {
-            let grid = latent_grid(edge);
-            let latent = encode(edge)?;
+        .map(|canvas| {
+            let grid = latent_grid(canvas.size());
+            let latent = encode(canvas)?;
             let mask_weight = prepared_subject_mask_weight(
                 "mage_flow_base trainer",
                 mask,
-                CropBox::center_square,
+                |_, _| canvas.crop,
                 latent.shape(),
             )?
             .map(|w| latent_grid_to_tokens(&w, grid))
@@ -1718,7 +1779,7 @@ mod tests {
             height: edge,
             pixels: swatch.into_raw(),
         };
-        let nchw = preprocess_to_nchw(&core, edge).unwrap();
+        let nchw = preprocess_to_nchw(&core, (edge, edge)).unwrap();
         let latent_tokens = vae
             .encode_mean(&nchw)
             .unwrap()
@@ -1733,7 +1794,7 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
-            grid,
+            grid: (grid, grid),
             mask_weight: None,
         };
         let noise = random::normal::<f32>(
@@ -1872,7 +1933,7 @@ mod tests {
         let grid_shape = [1, dit_cfg.in_channels, g, g];
         let latent =
             random::normal::<f32>(&grid_shape, None, None, Some(&random::key(1).unwrap())).unwrap();
-        let latent_tokens = latent_grid_to_tokens(&latent, g).unwrap();
+        let latent_tokens = latent_grid_to_tokens(&latent, (g, g)).unwrap();
         let txt_tokens = 3;
         let txt = random::normal::<f32>(
             &[1, txt_tokens, dit_cfg.context_in_dim],
@@ -1892,11 +1953,11 @@ mod tests {
             latent_tokens: latent_tokens.clone(),
             txt: txt.clone(),
             txt_tokens,
-            grid: g,
+            grid: (g, g),
             mask_weight: v.map(|v| {
                 latent_grid_to_tokens(
                     &subject_mask_weight(v, g as usize, g as usize, &grid_shape).unwrap(),
-                    g,
+                    (g, g),
                 )
                 .unwrap()
             }),
@@ -2017,19 +2078,20 @@ mod tests {
         println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_loss_paths");
     }
 
-    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
-    /// bucket's latent token shape `[1, grid², C]`, and the background (right half of the
-    /// center-square crop, with `background_weight` 0) is zero at both grids. The 48×32 image's
-    /// center square is x ∈ [8, 40); the subject is x < 24 — the crop's left half. Token
-    /// `y·grid + x`, every channel, carries latent cell `(y, x)`.
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each entry's weight map has THAT
+    /// entry's latent token shape `[1, gh·gw, C]` on the item's own (non-square) canvas — the whole
+    /// frame, not a centre square — and the background (the frame's right half, with
+    /// `background_weight` 0) is zero at both grids. The 64×32 image keeps its whole frame at edge
+    /// 64 (grid 2×4) and scales to 32×16 at edge 32 (grid 1×2). Token `y·gw + x`, every channel,
+    /// carries latent cell `(y, x)`.
     #[test]
     fn subject_mask_weight_is_computed_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();
-        let (iw, ih) = (48u32, 32u32);
+        let (iw, ih) = (64u32, 32u32);
         let image_path = tmp.path().join("a.png");
         image::RgbImage::new(iw, ih).save(&image_path).unwrap();
         let mask_path = tmp.path().join("a_mask.png");
-        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 32 { 255 } else { 0 }]))
             .save(&mask_path)
             .unwrap();
         let item = gen_core::TrainingItem {
@@ -2044,15 +2106,18 @@ mod tests {
         };
         let mask =
             mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
-        let edges = [4 * VAE_DOWNSAMPLE_FACTOR, 6 * VAE_DOWNSAMPLE_FACTOR];
+        let canvases: Vec<TrainingCanvas> = [64u32, 32]
+            .iter()
+            .map(|&edge| training_canvas((iw, ih), edge, CANVAS_STRIDE, CANVAS_MAX_SIDE))
+            .collect();
         let ch = 8usize;
-        let entries = encode_buckets(&edges, Some(&mask), |edge| {
-            let g = latent_grid(edge);
-            Ok(Array::zeros::<f32>(&[1, ch as i32, g, g])?)
+        let entries = encode_buckets(&canvases, Some(&mask), |canvas| {
+            let (gh, gw) = latent_grid(canvas.size());
+            Ok(Array::zeros::<f32>(&[1, ch as i32, gh, gw])?)
         })
         .unwrap();
         assert_eq!(entries.len(), 2);
-        for ((grid, x0, w), want) in entries.iter().zip([4i32, 6]) {
+        for ((grid, x0, w), want) in entries.iter().zip([(2i32, 4i32), (1, 2)]) {
             assert_eq!(*grid, want);
             let w = w.as_ref().expect("mask loss on ⇒ a weight map");
             assert_eq!(
@@ -2060,23 +2125,64 @@ mod tests {
                 x0.shape(),
                 "weight must match its own bucket's latent"
             );
-            assert_eq!(x0.shape(), &[1, want * want, ch as i32]);
-            let g = want as usize;
+            assert_eq!(x0.shape(), &[1, want.0 * want.1, ch as i32]);
+            let (gh, gw) = (want.0 as usize, want.1 as usize);
             let dense = multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
             let v = dense.as_slice::<f32>();
-            for y in 0..g {
-                for x in 0..g {
+            for y in 0..gh {
+                for x in 0..gw {
                     for k in 0..ch {
-                        let val = v[(y * g + x) * ch + k];
-                        if x < g / 2 {
-                            assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                        let val = v[(y * gw + x) * ch + k];
+                        if x < gw / 2 {
+                            assert!(val > 0.99, "subject cell ({y},{x}) of {gh}x{gw} = {val}");
                         } else {
-                            assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                            assert_eq!(val, 0.0, "background cell ({y},{x}) of {gh}x{gw}");
                         }
                     }
                 }
             }
         }
+    }
+
+    /// A portrait keeps its aspect on Mage's 16 px grid (no square crop, no upscale, within `edge²`
+    /// and the `MAX_SIZE` side cap), its NCHW input and packed layout follow the non-square canvas,
+    /// and the preview renders at item 0's canvas at the largest edge.
+    #[test]
+    fn a_portrait_caches_and_previews_on_its_own_aspect_canvas() {
+        let c = training_canvas((1365, 2048), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!(c.size(), (1360, 2048));
+        assert_eq!(latent_grid(c.size()), (128, 85));
+        let small = training_canvas((60, 90), 64, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!(small.size(), (48, 64));
+        let img = Image {
+            width: 60,
+            height: 90,
+            pixels: vec![128u8; 60 * 90 * 3],
+        };
+        let nchw = preprocess_to_nchw(&img, small.size()).unwrap();
+        assert_eq!(nchw.shape(), &[1, 3, 64, 48]);
+        let (gh, gw) = latent_grid(small.size());
+        let sample = CachedSample {
+            latent_tokens: Array::zeros::<f32>(&[1, gh * gw, LATENT_CHANNELS]).unwrap(),
+            txt: Array::zeros::<f32>(&[1, 7, 8]).unwrap(),
+            txt_tokens: 7,
+            grid: (gh, gw),
+            mask_weight: None,
+        };
+        assert_eq!(
+            sample_layout(&sample).unwrap(),
+            PackLayout::generation(vec![ImgShape::latent(4, 3)], vec![7]).unwrap()
+        );
+        // Item 0's entries at edges [32, 64]: the preview takes the 64 entry's canvas.
+        let small_entry = CachedSample {
+            latent_tokens: Array::zeros::<f32>(&[1, 2, LATENT_CHANNELS]).unwrap(),
+            txt: Array::zeros::<f32>(&[1, 7, 8]).unwrap(),
+            txt_tokens: 7,
+            grid: (2, 1),
+            mask_weight: None,
+        };
+        assert_eq!(preview_size(&[small_entry, sample], &[32, 64]), (48, 64));
+        assert_eq!(preview_size(&[], &[32, 64]), (64, 64));
     }
 
     fn rb(resolution: u32, repeats: u32) -> gen_core::ResolutionBucket {
@@ -2121,14 +2227,17 @@ mod tests {
             resolution_buckets: vec![rb(512, 1), rb(1024, 1)],
             ..Default::default()
         };
-        let grids: Vec<i32> = bucket_edges(&cfg).into_iter().map(latent_grid).collect();
+        let grids: Vec<i32> = bucket_edges(&cfg)
+            .into_iter()
+            .map(|edge| latent_grid((edge, edge)).0)
+            .collect();
         assert_eq!(grids, vec![32, 64]);
         for g in grids {
             let sample = CachedSample {
                 latent_tokens: Array::zeros::<f32>(&[1, g * g, LATENT_CHANNELS]).unwrap(),
                 txt: Array::zeros::<f32>(&[1, 7, 8]).unwrap(),
                 txt_tokens: 7,
-                grid: g,
+                grid: (g, g),
                 mask_weight: None,
             };
             assert_eq!(
@@ -2323,7 +2432,7 @@ mod tests {
             height: edge,
             pixels: swatch.into_raw(),
         };
-        let nchw = preprocess_to_nchw(&core, edge).unwrap();
+        let nchw = preprocess_to_nchw(&core, (edge, edge)).unwrap();
         let latent_tokens = vae
             .encode_mean(&nchw)
             .unwrap()
@@ -2339,7 +2448,7 @@ mod tests {
             latent_tokens,
             txt,
             txt_tokens,
-            grid,
+            grid: (grid, grid),
             mask_weight: None,
         };
 
@@ -2619,13 +2728,13 @@ mod depth_anchoring_tests {
                     Some(&random::key(200 + i).unwrap()),
                 )
                 .unwrap();
-                let latent_tokens = latent_grid_to_tokens(&latent, g).unwrap();
+                let latent_tokens = latent_grid_to_tokens(&latent, (g, g)).unwrap();
                 eval([&latent_tokens, &txt]).unwrap();
                 CachedSample {
                     latent_tokens,
                     txt,
                     txt_tokens: 3,
-                    grid: g,
+                    grid: (g, g),
                     mask_weight: None,
                 }
             })

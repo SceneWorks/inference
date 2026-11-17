@@ -62,7 +62,8 @@ use std::path::PathBuf;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::canvas::canvas_crop;
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
@@ -329,8 +330,9 @@ impl LensTrainer {
 
         on_progress(TrainingProgress::Preparing);
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
-        // off). The pre-flight guard and the preview render use the largest (epic 2123 E7); each
-        // cached latent carries its OWN grid (see `latent_grid`) for the DiT's img ids.
+        // off). The pre-flight guard sizes for the largest (epic 2123 E7) at its square `edge²`, the
+        // worst case of every aspect canvas; each cached latent carries its OWN (non-square) grid
+        // (see `latent_grid`) for the DiT's img ids.
         let edges = bucket_edges(cfg);
         let edge = largest_edge(&edges);
         preflight(req, &edges, edge, want_bf16)?;
@@ -341,7 +343,8 @@ impl LensTrainer {
 
         // --- prepare → load → cache: VAE-latents + 4-layer caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
-        let cache = self.cache_dataset(req, &edges, compute_dtype, on_progress)?;
+        let (cache, preview_size) =
+            self.cache_dataset(req, &edges, edge, compute_dtype, on_progress)?;
 
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
         // per job, by the `AuxDriver` before the loop.
@@ -353,7 +356,7 @@ impl LensTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         let sample_caps = self.encode_previews(req, compute_dtype)?;
@@ -428,7 +431,7 @@ impl LensTrainer {
             lora_dtype,
             checkpoint_blocks: use_checkpoint.then_some(block_locals.as_slice()),
             sample_caps: &sample_caps,
-            edge,
+            preview_size,
         };
         run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
@@ -459,18 +462,31 @@ impl LensTrainer {
     }
 
     /// The caching pass: per item, its caption features + mask once and one packed latent per
-    /// bucket edge. Item-major: `cache[item * edges.len() + bucket]` (sc-2127). See [`CacheEntry`].
+    /// bucket edge, each on the item's own aspect-keeping canvas at that edge ([`encode_latents`]).
+    /// Item-major: `cache[item * edges.len() + bucket]` (sc-2127). See [`CacheEntry`]. Also returns
+    /// the preview canvas `(width, height)`: the first cached item's canvas at `preview_edge` (the
+    /// largest bucket edge), or the square `preview_edge` when nothing was cached.
     fn cache_dataset(
         &self,
         req: &TrainingRequest,
         edges: &[u32],
+        preview_edge: u32,
         compute_dtype: Dtype,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<Vec<CacheEntry>> {
+    ) -> Result<(Vec<CacheEntry>, (u32, u32))> {
         let cfg = &req.config;
         let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
+        let mut preview_size: Option<(u32, u32)> = None;
         cache_items(req, on_progress, |item| {
-            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Every
+            // micro-step trains one cached entry, so entries of different shapes never share a batch.
+            let img = decode_image(&item.image_path)?;
+            // The source box (edge-independent; the whole frame within 4:1) the mask shares.
+            let crop = canvas_crop(img.width, img.height);
+            if preview_size.is_none() {
+                let (canvas, _) = canvas_source(&img, preview_edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                preview_size = Some(canvas.size());
+            }
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let subject_mask = PreparedSubjectMask::load_if_enabled(
                 "lens trainer",
@@ -489,27 +505,22 @@ impl LensTrainer {
             to_eval.extend(features.iter());
             eval(to_eval)?;
             // The caption features + mask are resolution-independent: encode them once, then one
-            // latent per bucket edge, each tagged with its own grid side and (sc-24828) paired with
-            // its own packed subject-mask weight.
-            for (&edge, (x0, mask_weight)) in edges.iter().zip(encode_buckets(
+            // latent per bucket edge, each tagged with its own `(latent_h, latent_w)` grid and
+            // (sc-24828) paired with its own packed subject-mask weight.
+            for (x0, grid, mask_weight) in encode_buckets(
                 edges,
                 subject_mask.as_ref(),
+                crop,
                 |edge| encode_latents(&self.vae, &img, edge), // [1, seq, 128]
-            )?) {
-                cache.push((
-                    x0,
-                    features.clone(),
-                    mask.clone(),
-                    latent_grid(edge),
-                    mask_weight,
-                ));
+            )? {
+                cache.push((x0, features.clone(), mask.clone(), grid, mask_weight));
             }
             Ok(())
         })?;
         // A cancel mid-cache is a genuine cancellation → typed `Error::Canceled`; an empty cache
         // with no cancel is a real "no usable dataset items" error.
         ensure_cached(cache.len(), &req.cancel, "lens trainer")?;
-        Ok(cache)
+        Ok((cache, preview_size.unwrap_or((preview_edge, preview_edge))))
     }
 
     /// sc-5637 — pre-encode the preview-sample prompts into the conditioning batch the preview
@@ -583,7 +594,9 @@ struct LensLoop<'a> {
     lora_dtype: Option<Dtype>,
     checkpoint_blocks: Option<&'a [Vec<String>]>,
     sample_caps: &'a [SamplePrompt],
-    edge: u32,
+    /// The preview canvas `(width, height)`: the first cached item's training canvas at the largest
+    /// bucket edge (a shape the run trains at, within the `edge²` area the pre-flight prices).
+    preview_size: (u32, u32),
 }
 
 impl TrainLoopFamily for LensLoop<'_> {
@@ -654,7 +667,7 @@ impl TrainLoopFamily for LensLoop<'_> {
                     features,
                     mask,
                     sample_seed,
-                    self.edge,
+                    self.preview_size,
                     cfg.sample_steps.max(1) as usize,
                     cfg.sample_guidance_scale,
                     self.compute_dtype,
@@ -712,13 +725,25 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 const PREFLIGHT_F32: (f64, f64, f64) = (15.43, 6.618e-3, 1.308e-7);
 const PREFLIGHT_BF16: (f64, f64, f64) = (7.875, 3.266e-3, 7.666e-8);
 
-/// The Lens latent grid side for a training `edge`: a cell maps to a 16×16 pixel tile (Flux.2 8× VAE ∘
-/// 2× DiT patchify), so an `edge`-square image packs to `[1, grid², 128]` and the DiT's img ids span a
-/// `grid × grid` lattice. The ÷32 bucket guarantees the VAE-encoded `edge/8` is even, so the 2×2
-/// patchify divides cleanly. Per bucket (sc-2127): every cached latent carries the grid of the edge
-/// it was encoded at.
-fn latent_grid(edge: u32) -> usize {
-    (edge / VAE_SCALE_FACTOR) as usize // latent_h == latent_w (square)
+/// Every training canvas side is a multiple of this: one packed latent cell ([`VAE_SCALE_FACTOR`] =
+/// the Flux.2 8× VAE ∘ 2× DiT patchify), so the VAE-encoded `h/8 × w/8` is even on both axes and the
+/// 2×2 patchify divides cleanly.
+const CANVAS_STRIDE: u32 = VAE_SCALE_FACTOR;
+
+/// The longest canvas side the trainer keeps — the family's render cap (the descriptor's
+/// `max_size`, 2080; the Lens RoPE itself is unbounded).
+const CANVAS_MAX_SIDE: Option<u32> = Some(2080);
+
+/// The Lens packed latent grid `(latent_h, latent_w)` of a training canvas `(width, height)`: a cell
+/// maps to a 16×16 pixel tile (Flux.2 8× VAE ∘ 2× DiT patchify), so the canvas packs to
+/// `[1, latent_h·latent_w, 128]` and the DiT's img ids span a `latent_h × latent_w` lattice. Per
+/// (item, bucket) entry (sc-2127): every cached latent carries the grid of the canvas it was encoded
+/// at — non-square for a non-square source.
+fn latent_grid((width, height): (u32, u32)) -> (usize, usize) {
+    (
+        (height / VAE_SCALE_FACTOR) as usize,
+        (width / VAE_SCALE_FACTOR) as usize,
+    )
 }
 
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
@@ -819,21 +844,26 @@ fn resolve_target_paths(transformer: &LensTransformer, cfg: &TrainingConfig) -> 
     )
 }
 
-/// Encode a center-cropped square image into a Lens training latent `[1, latent·latent, 128]` — the
-/// inverse of the Lens `_decode`. The Lens latent space *is* the Flux.2 one, so this is the Flux.2
+/// Encode a whole image on its training canvas at bucket `edge` ([`canvas_source`]: its own aspect at
+/// about `edge²` pixels on the [`CANVAS_STRIDE`] grid, never upscaled, never centre-cropped to a
+/// square) into a Lens training latent `[1, latent_h·latent_w, 128]`, returned with its
+/// `(latent_h, latent_w)` grid — the inverse of the Lens `_decode`. The Lens latent space *is* the
+/// Flux.2 one, so this is the Flux.2
 /// `encode_init_latents` chain built from public helpers: `preprocess_ref_image` (resize + `[−1,1]`
 /// NHWC) → `Flux2Vae::encode_mean` (latent mean) → NCHW → 2×2 `patchify_latents` →
 /// `Flux2Vae::bn_normalize_nchw` → `pack_latents`. `pack_latents`/`patchify_latents` are plain
 /// row-major reshapes consistent with the lens `vae::decode` plain-reshape path, so the latent lives in
 /// exactly the space the DiT predicts in. `crop_to_even`/`match_latent_spatial_size` (in the fork's
-/// `encode_init_latents`) are no-ops at the ÷32-bucketed square edge, so they are elided.
-fn encode_latents(vae: &Flux2Vae, image: &Image, edge: u32) -> Result<Array> {
-    let pre = preprocess_ref_image(image, edge, edge)?; // NHWC [1, edge, edge, 3]
-    let enc = vae.encode_mean(&pre)?; // NHWC [1, edge/8, edge/8, 32]
+/// `encode_init_latents`) are no-ops on the ÷16 canvas, so they are elided.
+fn encode_latents(vae: &Flux2Vae, image: &Image, edge: u32) -> Result<(Array, (usize, usize))> {
+    let (canvas, source) = canvas_source(image, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+    let (w, h) = canvas.size();
+    let pre = preprocess_ref_image(&source, w, h)?; // NHWC [1, h, w, 3]
+    let enc = vae.encode_mean(&pre)?; // NHWC [1, h/8, w/8, 32]
     let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for the packing helpers
-    let patchified = patchify_latents(&enc)?; // [1, 128, edge/16, edge/16]
+    let patchified = patchify_latents(&enc)?; // [1, 128, h/16, w/16]
     let normed = vae.bn_normalize_nchw(&patchified)?; // (x − mean)/std on the packed 128-ch
-    pack_latents(&normed) // [1, latent·latent, 128]
+    Ok((pack_latents(&normed)?, latent_grid((w, h)))) // [1, (h/16)·(w/16), 128]
 }
 
 /// Lay a latent-grid tensor `[1, C, H, W]` out EXACTLY like [`encode_latents`] lays out the VAE
@@ -845,23 +875,25 @@ fn pack_like_latent(grid: &Array) -> Result<Array> {
 }
 
 /// The subject-mask loss weight (sc-24828) for one cached (item, bucket) latent `x0`, packed like it
-/// (`[1, seq, 4·C]`, `seq = (H/2)·(W/2)` on the square bucket): the item's already-loaded mask is
-/// center-cropped like the image, area-averaged onto THIS bucket's UNPACKED `[1, C, H, W]` latent
-/// grid, then run through [`pack_like_latent`]. `None` when the technique is off.
+/// (`[1, seq, 4·C]`, `seq = latent_h·latent_w`, the entry's `grid`): the item's already-loaded mask
+/// is cut to the image's own source box `crop` ([`canvas_crop`]: the whole frame within 4:1),
+/// area-averaged onto THIS bucket's UNPACKED `[1, C, 2·latent_h, 2·latent_w]` latent grid, then run
+/// through [`pack_like_latent`]. `None` when the technique is off.
 fn latent_subject_mask_weight(
     mask: Option<&PreparedSubjectMask>,
+    crop: CropBox,
     x0: &Array,
+    (gh, gw): (usize, usize),
 ) -> Result<Option<Array>> {
     let sh = x0.shape();
-    let (seq, feat) = (sh[1], sh[2]);
-    let side = (seq as f64).sqrt().round() as i32;
-    if sh.len() != 3 || side * side != seq || feat % 4 != 0 {
+    let (gh, gw) = (gh as i32, gw as i32);
+    if sh.len() != 3 || sh[1] != gh * gw || sh[2] % 4 != 0 {
         return Err(Error::Msg(format!(
-            "lens trainer: subject mask needs a square packed latent, got {sh:?}"
+            "lens trainer: subject mask needs a packed [1, {gh}·{gw}, 4·C] latent, got {sh:?}"
         )));
     }
-    let unpacked = [1, feat / 4, side * 2, side * 2];
-    prepared_subject_mask_weight("lens trainer", mask, CropBox::center_square, &unpacked)?
+    let unpacked = [1, sh[2] / 4, gh * 2, gw * 2];
+    prepared_subject_mask_weight("lens trainer", mask, |_, _| crop, &unpacked)?
         .map(|w| pack_like_latent(&w))
         .transpose()
 }
@@ -926,7 +958,7 @@ fn compute_loss_grads(
     mask_weight: Option<&Array>,
     dtype: Dtype,
     lora_dtype: Option<Dtype>,
-    latent: usize,
+    latent: (usize, usize),
     checkpoint_blocks: Option<&[Vec<String>]>,
 ) -> Result<(f32, LoraParams)> {
     let (losses, grads) = compute_step_loss_grads(
@@ -970,31 +1002,32 @@ struct AuxStep<'a> {
     entry: usize,
 }
 
-/// A packed Lens latent `[1, grid², 4·C]` (the [`encode_latents`] layout: `patchify_latents` →
-/// `pack_latents`) back to the unpatchified NCHW grid `[1, C, 2·grid, 2·grid]` — the exact inverse
+/// A packed Lens latent `[1, gh·gw, 4·C]` (the [`encode_latents`] layout: `patchify_latents` →
+/// `pack_latents`) at grid `(gh, gw)` back to the unpatchified NCHW grid `[1, C, 2·gh, 2·gw]` — the
+/// exact inverse
 /// of those two reshapes. The values stay batch-normalized: TAEF2 decodes the FLUX.2 transformer's
 /// (batch-normalized) latent unpatchified (its published diffusers wrapper swaps the VAE's latent
 /// batch-norm for an identity one), so no de-normalization is applied.
-fn unpack_to_decoder_layout(packed: &Array, grid: usize) -> Result<Array> {
+fn unpack_to_decoder_layout(packed: &Array, (gh, gw): (usize, usize)) -> Result<Array> {
     let sh = packed.shape();
-    let g = grid as i32;
-    if sh.len() != 3 || sh[1] != g * g || sh[2] % 4 != 0 {
+    let (gh, gw) = (gh as i32, gw as i32);
+    if sh.len() != 3 || sh[1] != gh * gw || sh[2] % 4 != 0 {
         return Err(Error::Msg(format!(
             "lens trainer: expected a packed [B, {}, 4·C] latent, got {sh:?}",
-            g * g
+            gh * gw
         )));
     }
     let (b, c4) = (sh[0], sh[2]);
     let c = c4 / 4;
-    // Inverse pack: [B, g·g, 4C] → [B, 4C, g, g].
+    // Inverse pack: [B, gh·gw, 4C] → [B, 4C, gh, gw].
     let grid_nchw = packed
-        .reshape(&[b, g, g, c4])?
+        .reshape(&[b, gh, gw, c4])?
         .transpose_axes(&[0, 3, 1, 2])?;
     // Inverse patchify: channel `c·4 + i·2 + j` at `(h, w)` → pixel `(2h + i, 2w + j)` of `c`.
     Ok(grid_nchw
-        .reshape(&[b, c, 2, 2, g, g])?
+        .reshape(&[b, c, 2, 2, gh, gw])?
         .transpose_axes(&[0, 1, 4, 2, 5, 3])?
-        .reshape(&[b, c, 2 * g, 2 * g])?)
+        .reshape(&[b, c, 2 * gh, 2 * gw])?)
 }
 
 /// [`compute_loss_grads`] with the step's perceptual plan (epic 2123 E8): on an aux-only step the
@@ -1020,7 +1053,7 @@ fn compute_step_loss_grads(
     mask_weight: Option<&Array>,
     dtype: Dtype,
     lora_dtype: Option<Dtype>,
-    latent: usize,
+    latent: (usize, usize),
     checkpoint_blocks: Option<&[Vec<String>]>,
     aux: Option<AuxStep<'_>>,
 ) -> Result<(StepLosses, LoraParams)> {
@@ -1052,15 +1085,15 @@ fn compute_step_loss_grads(
                     Some(&mask),
                     &timestep,
                     1,
-                    latent,
-                    latent,
+                    latent.0,
+                    latent.1,
                     &p,
                     locals,
                     alpha,
                 )
                 .map_err(|e| Exception::custom(e.to_string()))?,
             None => transformer
-                .forward(&x_t, &feats, Some(&mask), &timestep, 1, latent, latent)
+                .forward(&x_t, &feats, Some(&mask), &timestep, 1, latent.0, latent.1)
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diffusion = if diffusion_on {
@@ -1222,27 +1255,29 @@ fn run_train_step(
 //   cargo test -p mlx-gen-lens --release --lib grads_match -- --ignored --nocapture
 // ===========================================================================================
 /// One `train_impl` cache entry (item-major, `cache[item * n_buckets + bucket]`, sc-2127): packed
-/// clean latent, caption features, caption mask, that latent's grid side, and — subject-masked loss
-/// on (sc-24828) — that bucket's packed latent loss-weight map (`None` when off).
-type CacheEntry = (Array, Vec<Array>, Array, usize, Option<Array>);
+/// clean latent, caption features, caption mask, that latent's `(latent_h, latent_w)` grid, and —
+/// subject-masked loss on (sc-24828) — that bucket's packed latent loss-weight map (`None` when off).
+type CacheEntry = (Array, Vec<Array>, Array, (usize, usize), Option<Array>);
 
-/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
-/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
-/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
-/// and laid out like that latent. Packed like the latent by
-/// [`latent_subject_mask_weight`]. `None` weights when masked loss is off.
+/// sc-2127 × sc-24828: one item's clean latent + its `(latent_h, latent_w)` grid per bucket edge
+/// (`encode(edge)`, item-major order), each paired with its subject-mask loss weight — the item's
+/// already-loaded mask cut to the image's source box `crop`, area-averaged onto THAT bucket's latent
+/// grid and laid out like that latent. Packed like the latent by [`latent_subject_mask_weight`].
+/// `None` weights when masked loss is off.
+#[allow(clippy::type_complexity)]
 fn encode_buckets(
     edges: &[u32],
     mask: Option<&PreparedSubjectMask>,
-    mut encode: impl FnMut(u32) -> Result<Array>,
-) -> Result<Vec<(Array, Option<Array>)>> {
+    crop: CropBox,
+    mut encode: impl FnMut(u32) -> Result<(Array, (usize, usize))>,
+) -> Result<Vec<(Array, (usize, usize), Option<Array>)>> {
     edges
         .iter()
         .map(|&edge| {
-            let x0 = encode(edge)?;
-            let mask_weight = latent_subject_mask_weight(mask, &x0)?;
+            let (x0, grid) = encode(edge)?;
+            let mask_weight = latent_subject_mask_weight(mask, crop, &x0, grid)?;
             eval([&x0])?;
-            Ok((x0, mask_weight))
+            Ok((x0, grid, mask_weight))
         })
         .collect()
 }
@@ -1401,7 +1436,7 @@ mod first_step_repro {
             None,
             dtype,
             lora_dtype,
-            latent,
+            (latent, latent),
             checkpoint_blocks,
         )
         .unwrap();
@@ -1457,7 +1492,7 @@ mod first_step_repro {
             None,
             Dtype::Float32,
             None,
-            latent,
+            (latent, latent),
             checkpoint_blocks,
         )
         .unwrap();
@@ -1783,11 +1818,10 @@ mod tests {
     use std::path::PathBuf;
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
-    /// bucket's latent shape, and the background (right half of the center-square crop, with
-    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
-    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
-    /// Packed latent `[1, (g/2)², 4·C]`, C = 2: cell `(y, x)` sits at token
-    /// `(y/2)·(g/2) + x/2`, feature `c·4 + (y%2)·2 + x%2`.
+    /// bucket's (non-square) latent shape, and the background (the right half of the whole 48×32
+    /// frame — its canvas crop — with `background_weight` 0) is zero at both grids; the subject is
+    /// x < 24. Packed latent `[1, (gh/2)·(gw/2), 4·C]`, C = 2: unpacked cell `(y, x)` sits at token
+    /// `(y/2)·(gw/2) + x/2`, feature `c·4 + (y%2)·2 + x%2`.
     #[test]
     fn subject_mask_weight_is_computed_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1810,13 +1844,17 @@ mod tests {
         };
         let mask =
             mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
-        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
-            let g = (edge / 8) as i32;
-            Ok(Array::zeros::<f32>(&[1, (g / 2) * (g / 2), 8])?)
+        let crop = canvas_crop(iw, ih);
+        assert_eq!(crop, CropBox::full(iw, ih));
+        // A 3:2 canvas per edge: packed grids 2×3 and 4×6 (unpacked 4×6 and 8×12).
+        let entries = encode_buckets(&[32, 64], Some(&mask), crop, |edge| {
+            let (gh, gw) = ((edge / 16) as usize, (edge / 16) as usize * 3 / 2);
+            Ok((Array::zeros::<f32>(&[1, (gh * gw) as i32, 8])?, (gh, gw)))
         })
         .unwrap();
         assert_eq!(entries.len(), 2);
-        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+        for ((x0, grid, w), (gh, gw)) in entries.iter().zip([(4usize, 6usize), (8, 12)]) {
+            assert_eq!(*grid, (gh / 2, gw / 2));
             let w = w.as_ref().expect("mask loss on ⇒ a weight map");
             assert_eq!(
                 w.shape(),
@@ -1825,13 +1863,13 @@ mod tests {
             );
             let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
             let v = dense.as_slice::<f32>();
-            for y in 0..g {
-                for x in 0..g {
-                    let val = v[((y / 2) * (g / 2) + x / 2) * 8 + (y % 2) * 2 + x % 2];
-                    if x < g / 2 {
-                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+            for y in 0..gh {
+                for x in 0..gw {
+                    let val = v[((y / 2) * (gw / 2) + x / 2) * 8 + (y % 2) * 2 + x % 2];
+                    if x < gw / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {gh}x{gw} = {val}");
                     } else {
-                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {gh}x{gw}");
                     }
                 }
             }
@@ -2031,7 +2069,7 @@ mod tests {
                 weight,
                 Dtype::Float32,
                 None,
-                latent,
+                (latent, latent),
                 ckpt.then_some(locals.as_slice()),
             )
             .unwrap();
@@ -2096,7 +2134,8 @@ mod tests {
         let prepared =
             PreparedSubjectMask::load_if_enabled("t", &item, cfg.subject_mask_loss.as_ref())
                 .unwrap();
-        let w = latent_subject_mask_weight(prepared.as_ref(), &x0)
+        let crop = canvas_crop(16, 16);
+        let w = latent_subject_mask_weight(prepared.as_ref(), crop, &x0, (2, 2))
             .unwrap()
             .expect("technique on ⇒ a weight");
         assert_eq!(w.shape(), x0.shape());
@@ -2126,7 +2165,7 @@ mod tests {
         )
         .unwrap();
         assert!(off.is_none());
-        assert!(latent_subject_mask_weight(off.as_ref(), &x0)
+        assert!(latent_subject_mask_weight(off.as_ref(), crop, &x0, (2, 2))
             .unwrap()
             .is_none());
     }
@@ -2162,8 +2201,8 @@ mod tests {
 
     #[test]
     fn latent_grid_is_per_bucket_edge() {
-        // sc-2127: each cached latent carries the grid of ITS edge — the DiT's img ids span
-        // `grid × grid`, and `grid²` must equal the packed latent's token count `(edge/16)²`.
+        // sc-2127: each cached latent carries the grid of ITS canvas — the DiT's img ids span
+        // `latent_h × latent_w`, and their product must equal the packed latent's token count.
         let rb = |resolution, repeats| gen_core::ResolutionBucket {
             resolution,
             repeats,
@@ -2172,12 +2211,33 @@ mod tests {
             resolution_buckets: vec![rb(512, 16), rb(770, 4), rb(1024, 1)],
             ..base_config()
         };
-        let grids: Vec<usize> = bucket_edges(&cfg).into_iter().map(latent_grid).collect();
-        assert_eq!(grids, vec![32, 48, 64]);
-        for edge in bucket_edges(&cfg) {
-            let tokens = (edge as usize / 16).pow(2);
-            assert_eq!(latent_grid(edge).pow(2), tokens, "edge {edge}");
-        }
+        // A square source keeps the square canvas at every edge.
+        let grids: Vec<(usize, usize)> = bucket_edges(&cfg)
+            .into_iter()
+            .map(|edge| {
+                let c = mlx_gen::train::canvas::training_canvas(
+                    (4096, 4096),
+                    edge,
+                    CANVAS_STRIDE,
+                    CANVAS_MAX_SIDE,
+                );
+                latent_grid(c.size())
+            })
+            .collect();
+        assert_eq!(grids, vec![(32, 32), (48, 48), (64, 64)]);
+        // A 1365×2048 portrait trains on its own aspect (no square crop, no upscale) on the 16 px
+        // grid: (width, height) → (latent_h, latent_w) = (height/16, width/16).
+        let c = mlx_gen::train::canvas::training_canvas(
+            (1365, 2048),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        let (lh, lw) = latent_grid(c.size());
+        assert_eq!((lh as u32 * 16, lw as u32 * 16), (c.height, c.width));
+        assert_eq!(latent_grid((1360, 2048)), (128, 85));
     }
 
     #[test]
@@ -2431,7 +2491,13 @@ mod depth_anchoring_tests {
         let side = 2 * g as i32;
         let x0 = pack_like_latent(&rnd(&[1, 2, side, side], k)).unwrap();
         let feats = (0..2).map(|i| rnd(&[1, 3, 6], 300 + k + i)).collect();
-        (x0, feats, Array::ones::<f32>(&[1, 3]).unwrap(), g, None)
+        (
+            x0,
+            feats,
+            Array::ones::<f32>(&[1, 3]).unwrap(),
+            (g, g),
+            None,
+        )
     }
 
     struct Fixture {
@@ -2510,7 +2576,7 @@ mod depth_anchoring_tests {
     fn unpack_inverts_the_lens_packing() {
         let sq = rnd(&[1, 3, 6, 6], 6);
         let packed = pack_like_latent(&sq).unwrap();
-        let back = unpack_to_decoder_layout(&packed, 3).unwrap();
+        let back = unpack_to_decoder_layout(&packed, (3, 3)).unwrap();
         assert_eq!(back.shape(), sq.shape());
         let err = back
             .subtract(&sq)
@@ -2521,7 +2587,22 @@ mod depth_anchoring_tests {
             .unwrap()
             .item::<f32>();
         assert_eq!(err, 0.0);
-        assert!(unpack_to_decoder_layout(&packed, 2).is_err());
+        assert!(unpack_to_decoder_layout(&packed, (2, 2)).is_err());
+        // A non-square grid inverts too (packed rows are latent_w wide).
+        let rect = rnd(&[1, 3, 4, 6], 7);
+        let packed = pack_like_latent(&rect).unwrap();
+        let back = unpack_to_decoder_layout(&packed, (2, 3)).unwrap();
+        assert_eq!(back.shape(), rect.shape());
+        let err = back
+            .subtract(&rect)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert_eq!(err, 0.0);
+        assert!(unpack_to_decoder_layout(&packed, (3, 2)).is_ok_and(|b| b.shape() != rect.shape()));
     }
 
     /// AC (a)/(b), dense and block-checkpointed. Mutation: force `diffusion_on = true` ⇒ red.
@@ -2609,8 +2690,8 @@ mod depth_anchoring_tests {
                 Some(mask),
                 &Array::from_slice(&[t], &[1]),
                 1,
-                *g,
-                *g,
+                g.0,
+                g.1,
             )
             .unwrap();
         let x0_hat = subtract(&x_t, multiply(&v, Array::from_f32(t)).unwrap()).unwrap();
@@ -2790,7 +2871,7 @@ mod depth_anchoring_tests {
         let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
             adapter.install_as(dit, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
             let v = dit
-                .forward(&x_t, &feats, Some(&mask), &timestep, 1, g, g)
+                .forward(&x_t, &feats, Some(&mask), &timestep, 1, g.0, g.1)
                 .map_err(|e| Exception::custom(e.to_string()))?;
             Ok(vec![reduce_loss(&subtract(&v, &target)?, None, false)?])
         };

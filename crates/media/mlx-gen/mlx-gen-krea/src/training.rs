@@ -22,7 +22,9 @@
 //!   Z-Image trainer, whose Rust `forward()` negates). `x_t = (1 − t)·x0 + t·noise`.
 //! - **Latents** by the Qwen-Image VAE encode: `preprocess_init_image` (resize + `[−1,1]` NCHW) →
 //!   [`QwenVae::encode`](crate::vae::QwenVae) (per-channel-normalized 16-ch latent) → drop the singleton
-//!   temporal axis → `[1, 16, edge/8, edge/8]`, exactly the latent the DiT predicts in.
+//!   temporal axis → `[1, 16, h/8, w/8]` at the item's aspect-keeping canvas (about `edge²` pixels,
+//!   never upscaled, sides multiples of [`CANVAS_STRIDE`] — never a centre square), exactly the
+//!   latent the DiT predicts in.
 //! - **Caption features** are the Qwen3-VL-4B condition encoder's stacked 12 select-layers
 //!   `[1, n_tok, 12, 2560]` (the DiT's `text_fusion` aggregator consumes them). Single-conditional (no
 //!   CFG) for the regression, B = 1 → `mask = None`. The encoder loads **Q8** (~4.5 GB vs ~8 GB dense
@@ -51,18 +53,19 @@
 
 use std::path::PathBuf;
 
+use gen_core_train::canvas::canvas_crop;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::taehv::TaehvConfig;
 use mlx_gen::train::trainer_loop::{
     adapter_optimizer, adapter_stem, block_local_targets, build_adapter, cache_items,
@@ -108,6 +111,21 @@ const TRAINER_ENCODER_BITS: i32 = 8;
 /// sigmoid `to_gate` and the SwiGLU FFN are reachable as explicit targets but are not in the default
 /// set (the standard PEFT attention surface).
 const DEFAULT_TARGET_MODULES: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+
+/// Every training canvas side is a multiple of this: one VAE cell (8 px) times the DiT's 2×2 patch.
+const CANVAS_STRIDE: u32 = 16;
+
+/// The longest canvas side the trainer keeps — the family's 4096 px render cap.
+const CANVAS_MAX_SIDE: Option<u32> = Some(4096);
+
+/// The pixel canvas `(width, height)` of a cached `[1, 16, h/8, w/8]` latent.
+fn preview_canvas(latent_shape: &[i32]) -> (u32, u32) {
+    let n = latent_shape.len();
+    (
+        latent_shape[n - 1].max(1) as u32 * 8,
+        latent_shape[n - 2].max(1) as u32 * 8,
+    )
+}
 
 /// The production [`Trainer`] for the base `krea/Krea-2-Raw` DiT: a frozen base (Qwen3-VL-4B encoder +
 /// single-stream DiT + Qwen-Image VAE + tokenizer) that caches a captioned dataset to
@@ -342,6 +360,14 @@ impl KreaRawTrainer {
         // --- prepare → load → cache: VAE-latents + caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let cache = self.cache_dataset(req, &edges, on_progress)?;
+        // Previews render at item 0's canvas at the largest edge — a shape the run trains at,
+        // within the `edge²` area the pre-flight priced: read back off item 0's cached latent.
+        let preview_size = edges
+            .iter()
+            .position(|&e| e == edge)
+            .and_then(|bucket| cache.get(bucket))
+            .map(|entry| preview_canvas(entry.0.shape()))
+            .unwrap_or((edge, edge));
         let (sample_caps, sample_neg) = self.encode_previews(req)?;
 
         // Every caption is cached now — free the 4 B-param encoder and evict its buffers before the
@@ -361,7 +387,7 @@ impl KreaRawTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
 
@@ -428,7 +454,7 @@ impl KreaRawTrainer {
             checkpoint_blocks: use_checkpoint.then_some(block_locals.as_slice()),
             sample_caps: &sample_caps,
             sample_neg: sample_neg.as_ref(),
-            edge,
+            preview_size,
         };
         run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
@@ -468,7 +494,10 @@ impl KreaRawTrainer {
         let cfg = &req.config;
         let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         cache_items(req, on_progress, |item| {
-            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // Decoded once, whole; cut + resized onto its aspect-keeping canvas per bucket edge.
+            // Every micro-step trains one cached entry, so entries of different shapes never share
+            // a batch.
+            let img = decode_image(&item.image_path)?;
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let mask = PreparedSubjectMask::load_if_enabled(
                 "krea trainer",
@@ -485,7 +514,8 @@ impl KreaRawTrainer {
             // The caption context is resolution-independent: encode it once, then one latent per
             // bucket edge (the DiT derives its patch grid / RoPE from the latent's own shape).
             for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), |edge| {
-                encode_latents(&self.vae, &img, edge) // [1, 16, edge/8, edge/8]
+                let (canvas, source) = canvas_source(&img, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                encode_latents(&self.vae, &source, canvas.size()) // [1, 16, h/8, w/8]
             })? {
                 cache.push((x0, context.clone(), mask_weight));
             }
@@ -557,7 +587,8 @@ struct KreaLoop<'a> {
     checkpoint_blocks: Option<&'a [Vec<String>]>,
     sample_caps: &'a [SamplePrompt],
     sample_neg: Option<&'a Array>,
-    edge: u32,
+    /// The preview canvas `(width, height)`: item 0's training canvas at the largest bucket edge.
+    preview_size: (u32, u32),
 }
 
 impl TrainLoopFamily for KreaLoop<'_> {
@@ -644,7 +675,7 @@ impl TrainLoopFamily for KreaLoop<'_> {
                     ctx_pos,
                     neg,
                     sample_seed,
-                    self.edge,
+                    self.preview_size,
                     cfg.sample_steps.max(1) as usize,
                     cfg.sample_guidance_scale,
                     &self.req.cancel,
@@ -864,15 +895,16 @@ fn resolve_target_paths(transformer: &Krea2Transformer, cfg: &TrainingConfig) ->
     )
 }
 
-/// Encode a center-cropped square image into a Krea training latent `[1, 16, edge/8, edge/8]` — the
+/// Encode an image resized to its training canvas `(width, height)` into a Krea training latent
+/// `[1, 16, height/8, width/8]` — the
 /// Qwen-Image VAE encode the DiT predicts in: `preprocess_init_image` (resize + `[−1,1]` NCHW) →
 /// [`QwenVae::encode`] (per-channel-normalized 16-ch latent, `[1,16,1,edge/8,edge/8]`) → drop the
 /// singleton temporal axis. The encode already applies the per-channel `latents_mean`/`latents_std`
 /// normalization (the DiT operates in that normalized space; `decode` de-normalizes).
-fn encode_latents(vae: &QwenVae, image: &Image, edge: u32) -> Result<Array> {
-    let pre = preprocess_init_image(image, edge, edge)?; // [1, 3, edge, edge] in [-1, 1]
-    let lat = vae.encode(&pre)?; // [1, 16, 1, edge/8, edge/8]
-    Ok(lat.squeeze_axes(&[2])?) // [1, 16, edge/8, edge/8]
+fn encode_latents(vae: &QwenVae, image: &Image, (width, height): (u32, u32)) -> Result<Array> {
+    let pre = preprocess_init_image(image, width, height)?; // [1, 3, h, w] in [-1, 1]
+    let lat = vae.encode(&pre)?; // [1, 16, 1, h/8, w/8]
+    Ok(lat.squeeze_axes(&[2])?) // [1, 16, h/8, w/8]
 }
 
 /// Encode a caption into the DiT's `text_fusion` context `[1, n_tok, 12, 2560]` — the Qwen3-VL-4B
@@ -1036,14 +1068,14 @@ fn render_sample(
     ctx_pos: &Array,
     ctx_neg: &Array,
     seed: u64,
-    edge: u32,
+    (width, height): (u32, u32),
     steps: usize,
     guidance: f32,
     cancel: &CancelFlag,
 ) -> Result<Image> {
-    let (hl, wl) = ((edge / 8) as i32, (edge / 8) as i32);
+    let (hl, wl) = ((height / 8) as i32, (width / 8) as i32);
     let noise = random::normal::<f32>(&[1, 16, hl, wl], None, None, Some(&random::key(seed)?))?;
-    let img_seq = (edge as f64 / 16.0).powi(2);
+    let img_seq = (width as f64 / 16.0) * (height as f64 / 16.0);
     let sigmas = krea_sigmas(steps, dynamic_mu(img_seq));
     // Hoist the step-invariant text fusion + host RoPE out of the per-step closure (F-079), matching the
     // inference render paths: `prepare` depends only on the context + latent geometry (never the noise
@@ -1090,8 +1122,8 @@ fn render_sample(
 }
 
 /// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
-/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
-/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cut to
+/// the image's own source box ([`canvas_crop`]), area-averaged onto THAT bucket's latent grid
 /// and laid out like that latent. `None` weights when masked loss is off.
 fn encode_buckets(
     edges: &[u32],
@@ -1102,12 +1134,8 @@ fn encode_buckets(
         .iter()
         .map(|&edge| {
             let x0 = encode(edge)?;
-            let mask_weight = prepared_subject_mask_weight(
-                "krea trainer",
-                mask,
-                CropBox::center_square,
-                x0.shape(),
-            )?;
+            let mask_weight =
+                prepared_subject_mask_weight("krea trainer", mask, canvas_crop, x0.shape())?;
             eval([&x0])?;
             Ok((x0, mask_weight))
         })
@@ -1124,9 +1152,23 @@ mod tests {
     use std::path::PathBuf;
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
-    /// bucket's latent shape, and the background (right half of the center-square crop, with
-    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
-    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    /// bucket's latent shape, and the background (right half of the image, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image is within 4:1, so its source
+    /// box is the whole frame; the subject is x < 24 — the frame's left half.
+    /// A portrait keeps its aspect on the 16 px grid, and the preview reads its canvas back off a
+    /// non-square cached latent `[1, 16, h/8, w/8]` as `(width, height)`.
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        let c = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            2048,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(c.size(), (1360, 2048));
+        assert_eq!(preview_canvas(&[1, 16, 256, 170]), (1360, 2048));
+    }
+
     #[test]
     fn subject_mask_weight_is_computed_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();

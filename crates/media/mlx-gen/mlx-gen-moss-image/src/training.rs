@@ -20,7 +20,7 @@ use gen_core_moss_image::{moss_image::*, moss_image_training as contract};
 use mlx_gen::gen_core::{self};
 use mlx_gen::train::{
     checkpoint,
-    dataset::center_crop_square,
+    dataset::crop_image,
     lora::{accumulate_grads, build_lokr_targets, build_lora_targets, LoraParams, TrainAdapter},
     schedule::{lr_multiplier, schedule_updates},
 };
@@ -544,8 +544,13 @@ pub(crate) fn pack_mean(mean: &Array) -> Result<Array> {
         .transpose_axes(&[0, 5, 2, 4, 1, 3])?
         .reshape(&[s[0], 128, s[1] / 2, s[2] / 2])?)
 }
-fn encode_image(vae: &Flux2Vae, image: &mlx_gen::media::Image, edge: u32) -> Result<Array> {
-    let pixels = mlx_gen::img2img::preprocess_init_image(image, edge, edge)?
+fn encode_image(
+    vae: &Flux2Vae,
+    image: &mlx_gen::media::Image,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
+    let pixels = mlx_gen::img2img::preprocess_init_image(image, width, height)?
         .transpose_axes(&[0, 2, 3, 1])?;
     vae.bn_normalize_nchw(&pack_mean(&vae.encode_mean(&pixels)?)?)
 }
@@ -746,12 +751,17 @@ fn encode_entry(
     crate::pipeline::check(&req.cancel)?;
     let source = plan.decode_rgb(geometry.item, host_budget)?;
     let latent = if req.config.aspect_ratio_buckets.is_empty() {
-        let image = center_crop_square(&mlx_gen::media::Image {
-            width: source.width(),
-            height: source.height(),
-            pixels: source.into_raw(),
-        });
-        encode_image(vae, &image, geometry.width)?
+        // Default path: cut the plan's aspect-preserving source box and resize it onto the
+        // plan's (non-square) canvas.
+        let image = crop_image(
+            &mlx_gen::media::Image {
+                width: source.width(),
+                height: source.height(),
+                pixels: source.into_raw(),
+            },
+            geometry.crop_box(),
+        );
+        encode_image(vae, &image, geometry.width, geometry.height)?
     } else {
         let row = gen_core::AspectRatioBucket {
             width: geometry.width,

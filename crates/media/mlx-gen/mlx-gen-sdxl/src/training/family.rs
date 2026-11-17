@@ -12,7 +12,8 @@
 //!   1. **Prompt encoding** — SDXL dual-CLIP vs Kolors ChatGLM3 ([`SdxlFamilyHooks::encode_prompt`]);
 //!      the preview-sample CFG batch via [`SdxlFamilyHooks::encode_sample_cfg`].
 //!   2. **Micro-conditioning `time_ids`** — SDXL's hardcoded `[512,512,0,0,512,512]` vs Kolors'
-//!      real-resolution `(H,W,0,0,H,W)` ([`SdxlFamilyHooks::time_ids`]).
+//!      real-resolution `(H,W,0,0,H,W)` of each entry's training canvas
+//!      ([`SdxlFamilyHooks::time_ids`]).
 //!   3. **Noise / objective** — SDXL's renormalized k-diffusion sigma noising (float table-index `t`)
 //!      vs Kolors' direct DDPM `√ᾱ_t·x0 + √(1−ᾱ_t)·noise` (integer `t`). The float-vs-integer split is
 //!      surfaced explicitly as [`TrainTimestep`]; the noise call hides behind
@@ -23,15 +24,23 @@
 //!      ([`SdxlFamilyHooks::render_sample`]); freeing the text encoder(s) after caching via
 //!      [`SdxlFamilyHooks::free_text_encoders`].
 //!
+//! **Aspect-preserving canvas.** Each captioned image is decoded whole and resized onto its own
+//! training canvas at every bucket edge ([`canvas_source`]: about `edge²` pixels, never upscaled,
+//! sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square). The memory guard still
+//! prices the square `edge²` (every canvas is within it); each step trains ONE cached entry, so
+//! entries of different shapes never share a batch; previews render at item 0's canvas at the
+//! largest edge.
+//!
 //! The U-Net and VAE are the **same** concrete SDXL types in both crates (Kolors reuses
 //! `mlx_gen_sdxl::{UNet2DConditionModel, Autoencoder}`), so they are threaded as plain parameters
 //! rather than hidden behind the trait.
 
 use std::path::Path;
 
+use gen_core_train::canvas::canvas_crop;
 use mlx_gen::gen_core::BucketSchedule;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -41,7 +50,7 @@ use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::tae::TinyDecoderSpec;
 use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::{
@@ -57,6 +66,14 @@ use mlx_rs::{random, Array, Dtype};
 use crate::pipeline::encode_init_latents;
 use crate::unet::UNet2DConditionModel;
 use crate::vae::Autoencoder;
+
+/// Every training canvas side is a multiple of this: the VAE's 8 px cell times the SDXL UNet's two
+/// 2× downsamples (three blocks), so the latent grid halves twice and re-concatenates exactly on
+/// the way up. Also the legacy square bucket floor ([`bucket_edges`]).
+pub const CANVAS_STRIDE: u32 = 32;
+/// No positional cap: the UNet has no positional table, so only the shared 4:1 aspect bound
+/// applies.
+pub const CANVAS_MAX_SIDE: Option<u32> = None;
 
 /// The SDXL-family reconstructs its LoKr delta at **f32** (the f32-everywhere merge path); training
 /// must match so the adapter round-trips through the inference loader. Shared by both families.
@@ -115,8 +132,9 @@ pub trait SdxlFamilyHooks {
     /// [`Self::encode_sample_cfg`] must not be called again.
     fn free_text_encoders(&mut self);
 
-    /// Micro-conditioning `time_ids` for the given latent `edge`, `batch` rows.
-    fn time_ids(&self, batch: i32, edge: u32) -> Array;
+    /// Micro-conditioning `time_ids` for a training canvas of `width × height` pixels, `batch`
+    /// rows.
+    fn time_ids(&self, batch: i32, width: u32, height: u32) -> Array;
 
     /// Sample a training timestep for this step, deterministic in `seed`.
     fn sample_timestep(&self, seed: u64) -> Result<TrainTimestep>;
@@ -143,7 +161,8 @@ pub trait SdxlFamilyHooks {
 
     /// Render one preview sample from the **in-progress adapter** already installed on `unet`:
     /// seeded prior → CFG denoise → VAE decode. `conditioning`/`pooled` are the pre-encoded CFG batch;
-    /// `dtype` is the trainer compute dtype (used by Kolors' sampler; SDXL ignores it).
+    /// `dtype` is the trainer compute dtype (used by Kolors' sampler; SDXL ignores it). `size` is
+    /// the preview canvas `(width, height)` — item 0's training canvas at the largest bucket edge.
     #[allow(clippy::too_many_arguments)]
     fn render_sample(
         &self,
@@ -153,7 +172,7 @@ pub trait SdxlFamilyHooks {
         pooled: &Array,
         guidance: f32,
         seed: u64,
-        edge: u32,
+        size: (u32, u32),
         steps: usize,
         dtype: Dtype,
     ) -> Result<Image>;
@@ -530,9 +549,10 @@ pub fn preflight_memory_guard_with_budget<H: SdxlFamilyHooks>(
 }
 
 /// One cached training sample: an item's clean latent at ONE bucket edge, its (shared, refcounted)
-/// conditioning/pooled, and the family micro-conditioning `time_ids` built for that same edge. Keeping
-/// `time_ids` in the entry means a step can never pair a latent with ids built for another bucket
-/// (sc-2127 — Kolors' ids are the real `(H, W, 0, 0, H, W)`). Likewise the subject-masked loss
+/// conditioning/pooled, and the family micro-conditioning `time_ids` built for that entry's own
+/// training canvas. Keeping `time_ids` in the entry means a step can never pair a latent with ids
+/// built for another bucket or another item's aspect (sc-2127 — Kolors' ids are the real
+/// `(H, W, 0, 0, H, W)`). Likewise the subject-masked loss
 /// weight (sc-24828) is resampled for, and stored with, the latent of that same edge.
 pub(crate) struct CachedSample {
     pub(crate) x0: Array,
@@ -545,29 +565,27 @@ pub(crate) struct CachedSample {
 
 /// Push one dataset item's cache entries — one per bucket edge, in `edges` order (the item-major
 /// layout [`BucketSchedule::cache_index`] indexes) — encoding the latent per edge via
-/// `encode_latent`, pairing it with `time_ids[bucket]` (built for that edge) and with
-/// `mask_weight(x0.shape())` (sc-24828: the item's subject mask resampled onto **that** latent's
-/// grid). The item's conditioning is encoded once by the caller and cloned (refcounted) into each
-/// entry.
+/// `encode_latent` (which returns it with the `time_ids` of the canvas it was encoded at) and
+/// pairing it with `mask_weight(x0.shape())` (sc-24828: the item's subject mask resampled onto
+/// **that** latent's grid). The item's conditioning is encoded once by the caller and cloned
+/// (refcounted) into each entry.
 fn push_bucket_entries(
     cache: &mut Vec<CachedSample>,
     edges: &[u32],
-    time_ids: &[Array],
     cond: &Array,
     pooled: &Array,
-    mut encode_latent: impl FnMut(u32) -> Result<Array>,
+    mut encode_latent: impl FnMut(u32) -> Result<(Array, Array)>,
     mut mask_weight: impl FnMut(&[i32]) -> Result<Option<Array>>,
 ) -> Result<()> {
-    debug_assert_eq!(edges.len(), time_ids.len());
-    for (&edge, ids) in edges.iter().zip(time_ids) {
-        let x0 = encode_latent(edge)?;
+    for &edge in edges {
+        let (x0, time_ids) = encode_latent(edge)?;
         let mask_weight = mask_weight(x0.shape())?;
         eval(std::iter::once(&x0).chain(mask_weight.as_ref()))?;
         cache.push(CachedSample {
             x0,
             cond: cond.clone(),
             pooled: pooled.clone(),
-            time_ids: ids.clone(),
+            time_ids,
             mask_weight,
         });
     }
@@ -690,8 +708,9 @@ pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
 }
 
 /// The subject-masked loss weight (sc-24828) for one cached latent whose shape is the family's
-/// **NHWC** `[1, h, w, 4]` (from `encode_init_latents` of the [`center_crop_square`] image at one
-/// bucket edge): the item's prepared mask is cropped with [`CropBox::center_square`],
+/// **NHWC** `[1, h, w, 4]` (from `encode_init_latents` of the item's [`canvas_source`] at one
+/// bucket edge): the item's prepared mask (same dimensions as the image) is cut to the canvas's
+/// source box ([`canvas_crop`] — the whole frame unless the source is beyond 4:1),
 /// area-averaged onto **that latent's** `(h, w)` grid and laid out by [`nhwc_weight`] to broadcast
 /// over the channel axis — `x0`'s exact shape. `None` when off (`mask` is `None`).
 fn nhwc_subject_weight(
@@ -707,7 +726,7 @@ fn nhwc_subject_weight(
             "{label}: subject mask expects an NHWC latent, got shape {x0_shape:?}"
         )));
     }
-    prepared_subject_mask_weight(label, mask, CropBox::center_square, &x0_shape[..3])?
+    prepared_subject_mask_weight(label, mask, canvas_crop, &x0_shape[..3])?
         .map(|w| nhwc_weight(&w, x0_shape))
         .transpose()
 }
@@ -786,9 +805,10 @@ pub fn train_family<H: SdxlFamilyHooks>(
     // --- prepare → load → cache: VAE-latents + (conditioning, pooled) into memory ---
     on_progress(TrainingProgress::LoadingModel); // base already resident from load_trainer
     let total = req.items.len() as u32;
-    // Family micro-conditioning `time_ids` per bucket edge (B=1) — matches the inference path so the
-    // LoRA trains under the conditioning it is applied under, at the size each latent was cached at.
-    let time_ids: Vec<Array> = edges.iter().map(|&e| hooks.time_ids(1, e)).collect();
+    // The preview canvas: item 0's training canvas at the largest bucket edge (a shape the run
+    // trains at, within the `edge²` the guard prices); the square edge only if caching was
+    // cancelled before item 0.
+    let mut preview_size = (max_edge, max_edge);
     // Item-major: `cache[item * edges.len() + bucket]` (sc-2127); each entry carries its latent's
     // subject-mask loss weight (sc-24828) — `None` when the technique is off.
     let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len() * edges.len());
@@ -800,20 +820,32 @@ pub fn train_family<H: SdxlFamilyHooks>(
             current: i as u32 + 1,
             total,
         });
-        let img = center_crop_square(&decode_image(&item.image_path)?);
+        // Decoded once, whole; cut (only beyond 4:1) and resized onto its aspect-keeping canvas per
+        // bucket edge. Every step trains ONE cached entry, so different shapes never share a batch.
+        let img = decode_image(&item.image_path)?;
+        if i == 0 {
+            preview_size = canvas_source(&img, max_edge, CANVAS_STRIDE, CANVAS_MAX_SIDE)
+                .0
+                .size();
+        }
         // sc-24828: the item's mask is read and checked once, resampled per bucket below.
         let mask =
             PreparedSubjectMask::load_if_enabled(label, item, cfg.subject_mask_loss.as_ref())?;
         let (cond, pooled) = hooks.encode_prompt(&item.caption)?;
         eval([&cond, &pooled])?;
-        // scaled latent [1,h,w,4] per bucket edge, with its own subject-mask weight
+        // scaled latent [1,h,w,4] per bucket edge, with the family micro-conditioning `time_ids`
+        // of its own canvas (B=1 — matches the inference path, so the LoRA trains under the
+        // conditioning it is applied under at that size) and its own subject-mask weight
         push_bucket_entries(
             &mut cache,
             &edges,
-            &time_ids,
             &cond,
             &pooled,
-            |edge| encode_init_latents(vae, &img, edge, edge),
+            |edge| {
+                let (canvas, src) = canvas_source(&img, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                let x0 = encode_init_latents(vae, &src, canvas.width, canvas.height)?;
+                Ok((x0, hooks.time_ids(1, canvas.width, canvas.height)))
+            },
             |shape| nhwc_subject_weight(label, mask.as_ref(), shape),
         )?;
     }
@@ -838,7 +870,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
             &req.items,
             cfg,
             edges.len(),
-            CropBox::center_square,
+            canvas_crop,
         )?);
     }
 
@@ -1042,7 +1074,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
                     pooled,
                     cfg.sample_guidance_scale,
                     sample_seed,
-                    max_edge,
+                    preview_size,
                     cfg.sample_steps.max(1) as usize,
                     compute_dtype,
                 ) {
@@ -1194,18 +1226,12 @@ mod bucket_tests {
     }
 
     /// sc-2127: each item is cached once per bucket edge, item-major, and every entry's
-    /// micro-conditioning `time_ids` is the one built for the edge its latent was encoded at (the
-    /// Kolors `(H, W, 0, 0, H, W)` shape), so a step never pairs a latent with another bucket's ids.
+    /// micro-conditioning `time_ids` is the one built for the canvas its latent was encoded at (the
+    /// Kolors `(H, W, 0, 0, H, W)` shape — a 1365×2048 portrait's canvas, height first), so a step
+    /// never pairs a latent with another bucket's (or another aspect's) ids.
     #[test]
-    fn bucket_entries_pair_each_latent_with_its_edges_time_ids() {
+    fn bucket_entries_pair_each_latent_with_its_canvas_time_ids() {
         let edges = [512u32, 768, 1024];
-        let time_ids: Vec<Array> = edges
-            .iter()
-            .map(|&e| {
-                let e = e as f32;
-                Array::from_slice(&[e, e, 0.0, 0.0, e, e], &[1, 6])
-            })
-            .collect();
         let cond = Array::from_slice(&[1.0f32], &[1, 1]);
         let pooled = Array::from_slice(&[2.0f32], &[1, 1]);
         let mut cache = Vec::new();
@@ -1213,12 +1239,23 @@ mod bucket_tests {
             push_bucket_entries(
                 &mut cache,
                 &edges,
-                &time_ids,
                 &cond,
                 &pooled,
                 |edge| {
-                    let side = (edge / 8) as i32;
-                    Ok(mlx_rs::ops::zeros::<f32>(&[1, side, side, 4])?)
+                    let c = gen_core_train::canvas::training_canvas(
+                        (1365, 2048),
+                        edge,
+                        CANVAS_STRIDE,
+                        CANVAS_MAX_SIDE,
+                    );
+                    let (w, h) = (c.width as f32, c.height as f32);
+                    let x0 = mlx_rs::ops::zeros::<f32>(&[
+                        1,
+                        (c.height / 8) as i32,
+                        (c.width / 8) as i32,
+                        4,
+                    ])?;
+                    Ok((x0, Array::from_slice(&[h, w, 0.0, 0.0, h, w], &[1, 6])))
                 },
                 |_| Ok(None),
             )
@@ -1226,15 +1263,17 @@ mod bucket_tests {
         }
         assert_eq!(cache.len(), 2 * edges.len());
         for (k, entry) in cache.iter().enumerate() {
-            let latent_edge = entry.x0.shape()[1] as u32 * 8;
-            assert_eq!(
-                latent_edge,
-                edges[k % edges.len()],
-                "entry {k} is item-major"
+            let (lh, lw) = (
+                entry.x0.shape()[1] as u32 * 8,
+                entry.x0.shape()[2] as u32 * 8,
             );
+            let edge = edges[k % edges.len()];
+            assert!(lh > lw, "entry {k}: portrait canvas");
+            assert_eq!((lh % 32, lw % 32), (0, 0), "entry {k}: 32-strided");
+            assert!(lh * lw <= edge * edge, "entry {k}: within the edge² budget");
             let ids: Vec<f32> = entry.time_ids.as_slice::<f32>().to_vec();
-            let e = latent_edge as f32;
-            assert_eq!(ids, vec![e, e, 0.0, 0.0, e, e], "entry {k} time_ids");
+            let (h, w) = (lh as f32, lw as f32);
+            assert_eq!(ids, vec![h, w, 0.0, 0.0, h, w], "entry {k} time_ids");
         }
     }
 
@@ -1248,17 +1287,16 @@ mod bucket_tests {
     }
 
     /// sc-24828 × sc-2127: with subject-masked loss on and three buckets, every cache entry's
-    /// weight is the item's mask resampled onto **that entry's** latent grid (centre-square crop of
-    /// a non-square image) — `x0`'s exact shape — with the masked-out (right-half-of-crop) cells
-    /// zero and the subject cells at the subject weight.
+    /// weight is the item's mask resampled onto **that entry's** aspect-keeping latent grid (the
+    /// whole non-square frame) — `x0`'s exact shape — with the masked-out (right-half) cells zero
+    /// and the subject cells at the subject weight.
     ///
     /// *Mutation that reds this:* `push_bucket_entries` resampling the mask once at the first
     /// bucket's latent shape and reusing it for every bucket.
     #[test]
     fn bucket_entries_resample_the_subject_mask_per_edge() {
         let tmp = tempfile::tempdir().unwrap();
-        // 96×64 image: the centre square is x ∈ [16, 80). The subject is x < 48 — exactly the
-        // crop's left half.
+        // 96×64 image, kept whole. The subject is x < 48 — exactly the frame's left half.
         let image_path = tmp.path().join("a.png");
         image::RgbImage::from_pixel(96, 64, image::Rgb([90, 120, 150]))
             .save(&image_path)
@@ -1277,22 +1315,21 @@ mod bucket_tests {
             .unwrap()
             .expect("mask loss on");
         let edges = [256u32, 512, 768];
-        let time_ids: Vec<Array> = edges
-            .iter()
-            .map(|_| Array::from_slice(&[0.0f32; 6], &[1, 6]))
-            .collect();
         let cond = Array::from_slice(&[1.0f32], &[1, 1]);
         let pooled = Array::from_slice(&[2.0f32], &[1, 1]);
         let mut cache = Vec::new();
         push_bucket_entries(
             &mut cache,
             &edges,
-            &time_ids,
             &cond,
             &pooled,
             |edge| {
-                let side = (edge / 8) as i32;
-                Ok(mlx_rs::ops::zeros::<f32>(&[1, side, side, 4])?)
+                // A 3:2 landscape latent grid per edge (16×24, 32×48, 48×72).
+                let lh = (edge / 16) as i32;
+                Ok((
+                    mlx_rs::ops::zeros::<f32>(&[1, lh, lh * 3 / 2, 4])?,
+                    Array::from_slice(&[0.0f32; 6], &[1, 6]),
+                ))
             },
             |shape| nhwc_subject_weight("sdxl", Some(&mask), shape),
         )
@@ -1301,7 +1338,7 @@ mod bucket_tests {
         for (k, entry) in cache.iter().enumerate() {
             let weight = entry.mask_weight.as_ref().expect("mask loss on ⇒ a weight");
             assert_eq!(weight.shape(), entry.x0.shape(), "entry {k} weight shape");
-            let side = entry.x0.shape()[2] as usize;
+            let side = entry.x0.shape()[2] as usize; // latent width
             let flat = weight.reshape(&[-1]).unwrap();
             for (cell, chans) in flat.as_slice::<f32>().chunks(4).enumerate() {
                 let want = if cell % side < side / 2 { 1.0 } else { 0.0 };

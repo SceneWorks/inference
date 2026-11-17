@@ -135,7 +135,7 @@ fn aux<'a>(p: &'a PerceptualPath, plan: &'a StepPlan) -> Option<AuxStep<'a>> {
         path: p,
         plan,
         image: 0,
-        latent_edge: LE,
+        latent_hw: (LE, LE),
     })
 }
 
@@ -150,7 +150,7 @@ fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
     let d = aux_driver(
         path(),
         &cache_of(&f, 1),
-        &[LE],
+        &[(LE, LE)],
         &one_item(),
         1,
         &Default::default(),
@@ -224,7 +224,7 @@ fn depth_off_is_bit_identical_to_the_legacy_step() {
     let d = aux_driver(
         path(),
         &cache_of(&f, 1),
-        &[LE],
+        &[(LE, LE)],
         &one_item(),
         1,
         &Default::default(),
@@ -253,13 +253,20 @@ fn depth_off_is_bit_identical_to_the_legacy_step() {
 fn buckets_interleave_with_per_entry_references_at_their_own_edge() {
     let z = random::normal::<f32>(&[1, 4, 1, 3, 3], None, None, Some(&random::key(5).unwrap()))
         .unwrap();
-    let back = unflatten_latent(&flatten_latent(&z).unwrap(), 3).unwrap();
+    let back = unflatten_latent(&flatten_latent(&z).unwrap(), (3, 3)).unwrap();
     assert_eq!(back.shape(), &[1, 4, 3, 3]);
     assert_eq!(
         bits(&back.flatten(None, None).unwrap()),
         bits(&z.flatten(None, None).unwrap())
     );
-    assert!(unflatten_latent(&flatten_latent(&z).unwrap(), 2).is_err());
+    assert!(unflatten_latent(&flatten_latent(&z).unwrap(), (2, 2)).is_err());
+    // A non-square (aspect-canvas) grid round-trips on its own `(h, w)`.
+    let r = random::normal::<f32>(&[1, 4, 1, 2, 3], None, None, Some(&random::key(6).unwrap()))
+        .unwrap();
+    let back = unflatten_latent(&flatten_latent(&r).unwrap(), (2, 3)).unwrap();
+    assert_eq!(back.shape(), &[1, 4, 2, 3]);
+    assert!(unflatten_latent(&flatten_latent(&r).unwrap(), (3, 2)).is_ok());
+    assert!(unflatten_latent(&flatten_latent(&r).unwrap(), (2, 2)).is_err());
 
     let f = fixture();
     let items = 2usize;
@@ -291,7 +298,10 @@ fn buckets_interleave_with_per_entry_references_at_their_own_edge() {
         .collect();
     drop(f);
     let schedule = BucketSchedule::new(items, &buckets, 7);
-    let mut d = aux_driver(path(), &cache, &edges, &schedule, 1, &Default::default()).unwrap();
+    let hws: Vec<(usize, usize)> = (0..items)
+        .flat_map(|_| edges.iter().map(|&le| (le, le)))
+        .collect();
+    let mut d = aux_driver(path(), &cache, &hws, &schedule, 1, &Default::default()).unwrap();
     assert_eq!(d.path().reference_computations(), cache.len());
     let steps = 2 * schedule.epoch_len() as u32;
     let mut kinds = Vec::new();

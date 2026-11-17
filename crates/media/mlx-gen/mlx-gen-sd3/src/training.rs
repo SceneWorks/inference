@@ -23,8 +23,11 @@
 //!   [`crate::pipeline`] `timestep * NUM_TRAIN_TIMESTEPS`). The trainer samples a normalized
 //!   `t ∈ (0,1)` for the noising (`x_t`/target), then SCALES it to `t·1000` at the forward call. This
 //!   is the top SD3-vs-Krea/z-image delta (those pass `t` raw); pinned by a test.
-//! - **Latents** by the SD3.5 16-ch VAE encode: `preprocess_init_image` (resize + `[−1,1]` NCHW) →
-//!   [`Vae::encode`](mlx_gen_z_image::vae::Vae) → `[1, 16, edge/8, edge/8]` (NO temporal axis, NO
+//! - **Latents** by the SD3.5 16-ch VAE encode of each image's aspect-keeping training canvas
+//!   ([`canvas_source`]: the whole frame at about `edge²` pixels, never upscaled, sides multiples of
+//!   [`CANVAS_STRIDE`], scaled down at its aspect past the positional cap [`canvas_max_side`] — never
+//!   centre-cropped to a square): `preprocess_init_image` (resize + `[−1,1]` NCHW) →
+//!   [`Vae::encode`](mlx_gen_z_image::vae::Vae) → `[1, 16, h/8, w/8]` (NO temporal axis, NO
 //!   pack/transpose — the SD3 latent stays plain NCHW, unlike z-image's packed DiT input).
 //! - **Conditioning** is the SD3 triple-TE aggregator's `(context [1,333,4096], pooled [1,2048])`
 //!   pair (cached per sample). The three encoders (CLIP-L + CLIP-G + T5-XXL) load in an `Option` so
@@ -62,7 +65,8 @@ use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::canvas::canvas_crop;
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
@@ -111,6 +115,28 @@ pub const SD3_5_LARGE_TRAINER_ID: &str = crate::config::SD3_5_LARGE_ID;
 /// targets are enumerated by the arch-driven [`AdaptableHost`], so the only Medium-specific code is
 /// loading the Medium arch (T4 sc-7885).
 pub const SD3_5_MEDIUM_TRAINER_ID: &str = crate::config::SD3_5_MEDIUM_ID;
+
+/// Every training canvas side is a multiple of this: one VAE cell (8 px) times the MMDiT's 2×2
+/// patch, so the latent tiles the patch grid exactly.
+const CANVAS_STRIDE: u32 = crate::pipeline::SPATIAL_SCALE * 2;
+
+/// The longest canvas side (pixels) `variant`'s MMDiT can position-encode: its learned positional
+/// table spans `pos_embed_max_size` patches per side and is centre-cropped to each latent's own
+/// patch grid (`cropped_pos_embed` refuses a larger grid) — `pos_embed_max_size · patch · 8`
+/// (Large 192 → 3072 px, Medium 384 → 6144 px).
+fn canvas_max_side(variant: Sd3Variant) -> u32 {
+    let (max, patch) = match variant {
+        Sd3Variant::Large | Sd3Variant::LargeTurbo => (
+            crate::config::LARGE_POS_EMBED_MAX_SIZE,
+            crate::config::LARGE_PATCH_SIZE,
+        ),
+        Sd3Variant::Medium => (
+            crate::config::MEDIUM_POS_EMBED_MAX_SIZE,
+            crate::config::MEDIUM_PATCH_SIZE,
+        ),
+    };
+    (max * patch) as u32 * crate::pipeline::SPATIAL_SCALE
+}
 
 /// The LoKr delta-reconstruction dtype, matching the inference loader so a trained LoKr round-trips
 /// through the apply path. bf16 — the family compute dtype.
@@ -447,7 +473,7 @@ impl Sd3LoraTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
 
@@ -550,6 +576,15 @@ impl Sd3LoraTrainer {
     /// worker with an UNCATCHABLE SIGKILL. We predict it and refuse up front with a catchable,
     /// actionable error BEFORE the (minutes-long) latent caching, UNLESS the run will
     /// block-checkpoint (LoRA + the toggle). LoKr always takes the dense path, so it is guarded.
+    /// The variant this trainer is built for, derived from its registered descriptor id.
+    fn variant(&self) -> Sd3Variant {
+        if self.descriptor.id == crate::config::SD3_5_MEDIUM_ID {
+            Sd3Variant::Medium
+        } else {
+            Sd3Variant::Large
+        }
+    }
+
     fn preflight(
         &self,
         req: &TrainingRequest,
@@ -561,13 +596,8 @@ impl Sd3LoraTrainer {
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
         // F-035: select the preflight constants by variant — Medium (2.5B/24-block) was refused via
-        // the Large (8.1B/38-block) constants (~3× overstated). The trainer is built for one
-        // variant; derive it from the registered descriptor id.
-        let variant = if self.descriptor.id == crate::config::SD3_5_MEDIUM_ID {
-            Sd3Variant::Medium
-        } else {
-            Sd3Variant::Large
-        };
+        // the Large (8.1B/38-block) constants (~3× overstated).
+        let variant = self.variant();
         // Epic 2123 E7: the training-time aux models (TAESD3 + Depth-Anything-V2) count against the
         // budget on BOTH paths; one cached reference per (item, bucket) entry, sized at the largest
         // edge. A checkpointed run with no aux models stays unguarded (see the guard).
@@ -587,6 +617,7 @@ impl Sd3LoraTrainer {
     ) -> Result<Vec<CacheEntry>> {
         let cfg = &req.config;
         let total = req.items.len() as u32;
+        let max_side = canvas_max_side(self.variant());
         let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
@@ -596,7 +627,11 @@ impl Sd3LoraTrainer {
                 current: i as u32 + 1,
                 total,
             });
-            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Every
+            // micro-step trains one cached entry, so entries of different shapes never share a batch.
+            let img = decode_image(&item.image_path)?;
+            // The source box (edge-independent; the whole frame within 4:1) the mask shares.
+            let crop = canvas_crop(img.width, img.height);
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let mask = PreparedSubjectMask::load_if_enabled(
                 "sd3 trainer",
@@ -617,9 +652,10 @@ impl Sd3LoraTrainer {
             )?;
             eval([&cond.context, &cond.pooled])?;
             // The caption conditioning is resolution-independent: encode it once, then one latent per
-            // bucket edge (the MMDiT derives its patch grid from the latent's own shape).
-            for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), |edge| {
-                encode_init_latents(&self.vae, &img, edge) // [1, 16, edge/8, edge/8]
+            // bucket edge (the MMDiT derives its patch grid + positional crop from the latent's own
+            // `(h, w)`).
+            for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), crop, |edge| {
+                encode_init_latents(&self.vae, &img, edge, max_side) // [1, 16, h/8, w/8]
             })? {
                 let cond = Sd3Conditioning {
                     context: cond.context.clone(),
@@ -860,13 +896,17 @@ fn resolve_target_paths(transformer: &Sd3Transformer, cfg: &TrainingConfig) -> V
         .collect()
 }
 
-/// Encode a center-cropped square image into an SD3.5 training latent `[1, 16, edge/8, edge/8]` — the
-/// 16-ch VAE encode the MMDiT predicts in: `preprocess_init_image` (resize + `[−1,1]` NCHW) →
-/// [`Vae::encode`] (16-ch latent in the scaled/shifted latent space, `[1,16,edge/8,edge/8]`). Unlike
-/// z-image's packed DiT input, the SD3 latent stays plain NCHW — NO pack/transpose, NO temporal axis.
-fn encode_init_latents(vae: &Vae, image: &Image, edge: u32) -> Result<Array> {
-    let pre = preprocess_init_image(image, edge, edge)?; // [1, 3, edge, edge] in [-1, 1]
-    vae.encode(&pre) // [1, 16, edge/8, edge/8]
+/// Encode a whole image on its training canvas at bucket `edge` ([`canvas_source`]: its own aspect
+/// at about `edge²` pixels on the [`CANVAS_STRIDE`] grid, long side within `max_side`) into an SD3.5
+/// training latent `[1, 16, h/8, w/8]` — the 16-ch VAE encode the MMDiT predicts in:
+/// `preprocess_init_image` (resize + `[−1,1]` NCHW) → [`Vae::encode`] (16-ch latent in the
+/// scaled/shifted latent space). Unlike z-image's packed DiT input, the SD3 latent stays plain NCHW —
+/// NO pack/transpose, NO temporal axis.
+fn encode_init_latents(vae: &Vae, image: &Image, edge: u32, max_side: u32) -> Result<Array> {
+    let (canvas, source) = canvas_source(image, edge, CANVAS_STRIDE, Some(max_side));
+    let (w, h) = canvas.size();
+    let pre = preprocess_init_image(&source, w, h)?; // [1, 3, h, w] in [-1, 1]
+    vae.encode(&pre) // [1, 16, h/8, w/8]
 }
 
 /// Sample a normalized flow-match timestep `t ∈ [1e-3, 1−1e-3]`. The SD3.5 default is **logit-normal**
@@ -1240,24 +1280,22 @@ fn run_train_step(
 }
 
 /// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
-/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
-/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
-/// and laid out like that latent. `None` weights when masked loss is off.
+/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cut to the
+/// image's own source box `crop` ([`canvas_crop`]: the whole frame within 4:1), area-averaged onto
+/// THAT bucket's (non-square) latent grid and laid out like that latent. `None` weights when masked
+/// loss is off.
 fn encode_buckets(
     edges: &[u32],
     mask: Option<&PreparedSubjectMask>,
+    crop: CropBox,
     mut encode: impl FnMut(u32) -> Result<Array>,
 ) -> Result<Vec<(Array, Option<Array>)>> {
     edges
         .iter()
         .map(|&edge| {
             let x0 = encode(edge)?;
-            let mask_weight = prepared_subject_mask_weight(
-                "sd3 trainer",
-                mask,
-                CropBox::center_square,
-                x0.shape(),
-            )?;
+            let mask_weight =
+                prepared_subject_mask_weight("sd3 trainer", mask, |_, _| crop, x0.shape())?;
             eval([&x0])?;
             Ok((x0, mask_weight))
         })
@@ -1272,9 +1310,9 @@ mod tests {
     use std::path::PathBuf;
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
-    /// bucket's latent shape, and the background (right half of the center-square crop, with
-    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
-    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    /// bucket's (non-square) latent shape, and the background (the right half of the whole 48×32
+    /// frame — its canvas crop — with `background_weight` 0) is zero at both grids; the subject is
+    /// x < 24.
     #[test]
     fn subject_mask_weight_is_computed_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1297,13 +1335,16 @@ mod tests {
         };
         let mask =
             mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
-        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
-            let g = (edge / 8) as i32;
-            Ok(Array::zeros::<f32>(&[1, 16, g, g])?)
+        let crop = canvas_crop(iw, ih);
+        assert_eq!(crop, CropBox::full(iw, ih));
+        // A 3:2 canvas per edge: latent grids 4×6 and 8×12.
+        let entries = encode_buckets(&[32, 64], Some(&mask), crop, |edge| {
+            let gh = (edge / 8) as i32;
+            Ok(Array::zeros::<f32>(&[1, 16, gh, gh * 3 / 2])?)
         })
         .unwrap();
         assert_eq!(entries.len(), 2);
-        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+        for ((x0, w), (gh, gw)) in entries.iter().zip([(4usize, 6usize), (8, 12)]) {
             let w = w.as_ref().expect("mask loss on ⇒ a weight map");
             assert_eq!(
                 w.shape(),
@@ -1312,17 +1353,34 @@ mod tests {
             );
             let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
             let v = dense.as_slice::<f32>();
-            for y in 0..g {
-                for x in 0..g {
-                    let val = v[y * g + x];
-                    if x < g / 2 {
-                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+            for y in 0..gh {
+                for x in 0..gw {
+                    let val = v[y * gw + x];
+                    if x < gw / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {gh}x{gw} = {val}");
                     } else {
-                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {gh}x{gw}");
                     }
                 }
             }
         }
+    }
+
+    /// The canvas cap is the positional table each variant can crop, and a portrait trains on
+    /// its own aspect (no square crop, no upscale) on the 16 px grid within it.
+    #[test]
+    fn a_portrait_trains_on_its_own_aspect_canvas_within_the_pos_embed() {
+        assert_eq!(canvas_max_side(Sd3Variant::Large), 3072);
+        assert_eq!(canvas_max_side(Sd3Variant::Medium), 6144);
+        let max = Some(canvas_max_side(Sd3Variant::Large));
+        let c = mlx_gen::train::canvas::training_canvas((1365, 2048), 1024, CANVAS_STRIDE, max);
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        let c = mlx_gen::train::canvas::training_canvas((1365, 2048), 2048, CANVAS_STRIDE, max);
+        assert_eq!(c.size(), (1360, 2048));
+        // A 4:1 strip at the 2048 edge scales down at its aspect to the 192-patch table.
+        let c = mlx_gen::train::canvas::training_canvas((8000, 2000), 2048, CANVAS_STRIDE, max);
+        assert!(c.width / 16 <= 192 && c.width > 3 * c.height);
     }
 
     fn base_config() -> TrainingConfig {
