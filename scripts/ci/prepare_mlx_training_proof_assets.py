@@ -55,7 +55,9 @@ def proof(package: str, fqn: str, target: str = "integration") -> str:
 
 # Candle-side pins where the repository matches (prepare_cohort/bespoke_training_proof_assets.py);
 # MLX-converted repositories at the revisions the MLX real-weight lanes and code reference.
-KOLORS = Pin("Kwai-Kolors/Kolors-diffusers", "7e091c75199e910a26cd1b51ed52c28de5db3711",
+# Upstream ChatGLM3 ships no fast tokenizer.json, which the MLX Kolors loader needs; the SceneWorks
+# MLX re-host's bf16 tier is the same diffusers layout with the derived tokenizer.json overlay.
+KOLORS = Pin("SceneWorks/kolors-mlx", "aadbd49f53b66a33ef1be09384eac409cbc44061", "bf16",
              files=("model_index.json", "unet/config.json", "vae/config.json", "text_encoder/config.json",
                     "tokenizer/tokenizer.json"))
 LENS = Pin("SceneWorks/Lens", "5c5521d4417a3cae55816929ece69319d1e7712a",
@@ -128,7 +130,7 @@ MLX_TRAINING_PROOFS: dict[str, dict[str, Pin]] = {
 # Repositories reported by a failure inventory beside the pinned ones: plausible alternative homes
 # of the same weights (upstream vs SceneWorks re-host, raw vs MLX-converted), so one failed dispatch
 # shows every candidate the Mac holds.
-INVENTORY_ALSO = ("microsoft/Mage-Flow-Base", "SceneWorks/Lens-Turbo", "stabilityai/stable-diffusion-3.5-medium", "SceneWorks/z-image-turbo-mlx", "SceneWorks/krea-2-turbo-mlx",
+INVENTORY_ALSO = ("microsoft/Mage-Flow-Base", "Kwai-Kolors/Kolors-diffusers", "SceneWorks/Lens-Turbo", "stabilityai/stable-diffusion-3.5-medium", "SceneWorks/z-image-turbo-mlx", "SceneWorks/krea-2-turbo-mlx",
                   "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "SceneWorks/qwen-image-2-1-mlx")
 
 
