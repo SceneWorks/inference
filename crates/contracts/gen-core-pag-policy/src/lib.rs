@@ -480,6 +480,9 @@ impl PagExecutionReport {
 
     /// Validate that this execution report represents a canonical [`PagResolved`] outcome for
     /// `capability` and `self.total_steps`.
+    ///
+    /// Zero-scale PAG no-ops are canonically represented only as `None` on outer execution
+    /// reports, so `self.scale` must be strictly positive.
     pub fn validate_with_capability(
         &self,
         capability: &PagCapability,
@@ -492,6 +495,12 @@ impl PagExecutionReport {
             adaptive_scale: Some(self.adaptive_scale),
         };
         let resolved = capability.resolve(Some(&cfg))?;
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(PagPolicyError::invalid(format!(
+                "PagExecutionReport.scale must be > 0 (got {}); represent zero-scale PAG no-ops as None",
+                self.scale
+            )));
+        }
         if resolved.layers != self.layers {
             return Err(PagPolicyError::invalid(
                 "PagExecutionReport.layers must be sorted, deduplicated, and non-empty",

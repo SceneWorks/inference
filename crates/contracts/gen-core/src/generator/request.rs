@@ -993,6 +993,21 @@ impl GenerationRequest {
         Ok(())
     }
 
+    /// Return the single effective [`PagConfig`](crate::PagConfig) across top-level [`Self::pag`]
+    /// and [`MossImageOptions::pag`](crate::moss_image::MossImageOptions::pag), rejecting
+    /// conflicting specifications when both are present and unequal (SW-7173).
+    pub fn effective_pag(&self) -> Result<Option<&crate::PagConfig>> {
+        let moss_pag = self.moss_image.as_ref().and_then(|m| m.pag.as_ref());
+        match (self.pag.as_ref(), moss_pag) {
+            (None, None) => Ok(None),
+            (Some(p), None) | (None, Some(p)) => Ok(Some(p)),
+            (Some(a), Some(b)) if a == b => Ok(Some(a)),
+            (Some(_), Some(_)) => Err(Error::Msg(
+                "conflicting top-level pag and moss_image.pag controls".into(),
+            )),
+        }
+    }
+
     /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.
     pub fn keyframes(&self) -> Vec<KeyframeRef<'_>> {
         self.conditioning

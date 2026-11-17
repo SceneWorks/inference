@@ -663,22 +663,26 @@ impl Capabilities {
         self.approximation.resolve(id, req.approximation.as_ref())
     }
 
-    /// Resolve [`GenerationRequest::pag`] against [`Capabilities::pag`] (SW-7173).
+    /// Resolve [`GenerationRequest::effective_pag`] (covering both top-level
+    /// [`GenerationRequest::pag`] and [`crate::moss_image::MossImageOptions::pag`]) against
+    /// [`Capabilities::pag`] (SW-7173).
     ///
-    /// Returns `Ok(None)` when `req.pag` is `None` or resolves to `scale == 0.0` (strict zero-pass
-    /// no-op). Returns [`Error::Unsupported`] when `self.pag` is `None` and `req.pag` is `Some`,
-    /// or [`Error::Msg`] when any PAG parameter is non-finite, out of range, or names a block
-    /// index outside `0..num_blocks`.
+    /// Returns `Ok(None)` when neither PAG field is set or the effective config resolves to
+    /// `scale == 0.0` (strict zero-pass no-op). Returns [`Error::Unsupported`] when `self.pag` is
+    /// `None` and an effective PAG config is `Some`, or [`Error::Msg`] when top-level `pag` and
+    /// `moss_image.pag` conflict or any PAG parameter is non-finite, out of range, or names a
+    /// block index outside `0..num_blocks`.
     pub fn resolve_pag(
         &self,
         id: &str,
         req: &GenerationRequest,
     ) -> Result<Option<crate::PagResolved>> {
-        crate::resolve_pag(self.pag.as_ref(), id, req.pag.as_ref()).map_err(|err| {
-            match err.kind() {
-                crate::PagPolicyErrorKind::Unsupported => Error::Unsupported(err.to_string()),
-                crate::PagPolicyErrorKind::Invalid => Error::Msg(format!("{id}: {err}")),
-            }
+        let effective = req
+            .effective_pag()
+            .map_err(|err| Error::Msg(format!("{id}: {err}")))?;
+        crate::resolve_pag(self.pag.as_ref(), id, effective).map_err(|err| match err.kind() {
+            crate::PagPolicyErrorKind::Unsupported => Error::Unsupported(err.to_string()),
+            crate::PagPolicyErrorKind::Invalid => Error::Msg(format!("{id}: {err}")),
         })
     }
 
@@ -739,7 +743,10 @@ impl Capabilities {
                 "{id}: Veda attention requires MiniMax-H3"
             )));
         }
-        if req.pag.is_some() && self.pag.is_none() {
+        let effective_pag = req
+            .effective_pag()
+            .map_err(|err| Error::Msg(format!("{id}: {err}")))?;
+        if effective_pag.is_some() && self.pag.is_none() {
             return Err(Error::Unsupported(format!(
                 "{id}: Perturbed-Attention Guidance (PAG) is not supported by this model"
             )));
@@ -1268,7 +1275,7 @@ impl Capabilities {
             }
         }
         req.ensure_finite_floats()?;
-        if let (Some(cap), Some(pag)) = (&self.pag, &req.pag) {
+        if let (Some(cap), Some(pag)) = (&self.pag, effective_pag) {
             cap.resolve(Some(pag))
                 .map_err(|err| Error::Msg(format!("{id}: {err}")))?;
         }

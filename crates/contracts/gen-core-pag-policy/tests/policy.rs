@@ -22,7 +22,7 @@ fn sample_capability() -> PagCapability {
 
 #[test]
 fn portable_native_and_wasm_corpus() {
-    assert_eq!(support::run(), 16);
+    assert_eq!(support::run(), 18);
 }
 
 #[test]
@@ -126,9 +126,20 @@ fn execution_report_records_resolved_parameters_and_validates_consistency() {
     wrong_steps.active_steps = 3;
     assert!(wrong_steps.validate_with_capability(&cap).is_err());
 
-    let mut out_of_range = report;
+    let mut out_of_range = report.clone();
     out_of_range.layers = vec![42];
     assert!(out_of_range.validate_with_capability(&cap).is_err());
+
+    // Zero-scale no-ops are canonically represented only as None; PagExecutionReport rejects <= 0.
+    for zero in [0.0_f32, -0.0_f32, -1.0_f32] {
+        let zero_report = PagExecutionReport {
+            scale: zero,
+            active_steps: 0,
+            ..report.clone()
+        };
+        let err = zero_report.validate_with_capability(&cap).unwrap_err();
+        assert_eq!(err.kind(), PagPolicyErrorKind::Invalid);
+    }
 }
 
 #[test]

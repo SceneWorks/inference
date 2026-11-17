@@ -1,4 +1,4 @@
-use gen_core_pag_policy::{resolve_pag, PagCapability, PagConfig};
+use gen_core_pag_policy::{resolve_pag, PagCapability, PagConfig, PagExecutionReport};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -6,12 +6,29 @@ use serde_json::{json, Value};
 struct Case {
     name: String,
     capability: Option<PagCapability>,
+    #[serde(default)]
     config: Option<PagConfig>,
+    #[serde(default)]
+    validate_report: Option<PagExecutionReport>,
+    #[serde(default)]
     total_steps: u32,
     expected: Value,
 }
 
 fn evaluate(case: &Case) -> Value {
+    if let Some(report) = &case.validate_report {
+        let cap = case
+            .capability
+            .as_ref()
+            .expect("validate_report capability");
+        return match report.validate_with_capability(cap) {
+            Ok(()) => json!({ "ok_report": report }),
+            Err(err) => json!({
+                "error_kind": err.kind(),
+                "error": err.to_string(),
+            }),
+        };
+    }
     match &case.capability {
         Some(cap) => match cap.resolve(case.config.as_ref()) {
             Ok(resolved) => {

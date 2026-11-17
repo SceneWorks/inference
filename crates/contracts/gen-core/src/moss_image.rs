@@ -822,22 +822,20 @@ fn validate_execution_receipt(data: &MossImageExecutionData) -> Result<()> {
         }
     };
     require(
-        r.pag.is_some() == data.pag.as_ref().is_some_and(|p| p.scale > 0.0),
+        r.pag.is_some() == data.pag.is_some(),
         "receipt PAG report disagrees with resolved PAG controls",
     )?;
-    if let Some(pag) = &data.pag {
+    if let (Some(resolved_pag), Some(pag)) = (&r.pag, &data.pag) {
         pag.validate_with_capability(&moss_image_pag_capability())
             .map_err(|e| Error::Unsupported(format!("MOSS-Image: {e}")))?;
         require(
             pag.total_steps == actual_steps,
             "receipt PAG total_steps differs from executed step count",
         )?;
-        if let Some(resolved_pag) = &r.pag {
-            require(
-                *pag == resolved_pag.execution_report(actual_steps),
-                "receipt PAG report differs from resolved PAG controls",
-            )?;
-        }
+        require(
+            *pag == resolved_pag.execution_report(actual_steps),
+            "receipt PAG report differs from resolved PAG controls",
+        )?;
     }
     let batch = data.conditioning.len();
     let count = batch.checked_mul(data.images_per_prompt as usize);
@@ -1344,6 +1342,60 @@ mod execution_receipt_tests {
             sigmas[1] = 0.5;
         }
         assert!(MossImageExecutionReport::new(bad).is_err());
+    }
+    #[test]
+    fn noop_pag_produces_none_and_zero_scale_pag_receipt_is_rejected() {
+        for noop_req in [
+            GenerationRequest::default(),
+            GenerationRequest {
+                pag: Some(crate::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![20]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            GenerationRequest {
+                moss_image: Some(MossImageOptions {
+                    pag: Some(crate::PagConfig {
+                        scale: 0.0,
+                        layers: Some(vec![0, 41]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            let resolved = MossImageResolved::resolve(MossImageVariant::Sft, &noop_req).unwrap();
+            assert_eq!(resolved.pag, None);
+            let mut data = example(MossImageAcceleration::Off);
+            data.resolved = resolved;
+            let report = MossImageExecutionReport::new(data.clone()).unwrap();
+            assert_eq!(report.pag(), None);
+            assert!(serde_json::to_value(&report).unwrap().get("pag").is_none());
+
+            let zero_pag = crate::PagExecutionReport {
+                layers: vec![20],
+                active_steps: 0,
+                total_steps: 50,
+                scale: 0.0,
+                adaptive_scale: 0.0,
+                start: 0.0,
+                stop: 1.0,
+            };
+            assert!(zero_pag
+                .validate_with_capability(&moss_image_pag_capability())
+                .is_err());
+
+            let mut polluted = data;
+            polluted.pag = Some(zero_pag.clone());
+            assert!(MossImageExecutionReport::new(polluted).is_err());
+
+            let mut wire = serde_json::to_value(&report).unwrap();
+            wire["pag"] = serde_json::to_value(&zero_pag).unwrap();
+            assert!(serde_json::from_value::<MossImageExecutionReport>(wire).is_err());
+        }
     }
     #[test]
     fn asset_receipt_uses_approved_logical_identity_for_renamed_file_sc26325() {

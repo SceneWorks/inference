@@ -148,7 +148,7 @@ pub fn completed_identity(
                     "component_dtypes":data.component_dtypes,
                     "adapters":data.adapter_reports.iter().map(|a| json!({"applied":a.applied,"skipped":a.skipped})).collect::<Vec<_>>(),
                 });
-                if let Some(pag) = edit.and_then(|e| e.pag.as_ref()).or(data.pag.as_ref()) {
+                if let Some(pag) = data.pag.as_ref() {
                     quality["pag"] = json!({
                         "layers": pag.layers,
                         "active_steps": pag.active_steps,
@@ -588,6 +588,19 @@ mod tests {
                 assert!(
                     completed_identity(Some(&edit.base), Some(&edit), &descriptor("mlx")).is_err()
                 );
+
+                // Fabricated edit.pag on a non-PAG base receipt must be rejected.
+                let mut fabricated = edit.clone();
+                fabricated.pag = Some(gen_core::PagExecutionReport {
+                    layers: vec![20],
+                    active_steps: 50,
+                    total_steps: 50,
+                    scale: 2.0,
+                    adaptive_scale: 0.0,
+                    start: 0.0,
+                    stop: 1.0,
+                });
+                assert!(completed_identity(None, Some(&fabricated), &descriptor("mlx")).is_err());
             }
         }
     }
