@@ -1040,8 +1040,9 @@ mod vram_probe {
                     "nvidia-smi pmon returned physical GPU {gpu}, expected {expected_gpu}; refusing cross-device evidence"
                 ));
             }
-            // An empty card prints one dash row (`1  -  -  -  -  -`): no process, nothing to record.
-            if fields[1] == "-" && fields[2] == "-" {
+            // An empty card prints one row of dashes (`0  -  -  -  -  -`): no process, nothing
+            // to record. Only an all-dash row counts; a dash PID next to real metrics is malformed.
+            if fields[1..].iter().all(|field| *field == "-") {
                 continue;
             }
             let pid = fields[1]
@@ -1350,6 +1351,14 @@ mod vram_probe {
             assert!(pure_compute_pids("1 420 ? 0 0\n", 1)
                 .unwrap_err()
                 .contains("unknown process type"));
+            // The full-width empty row from scripts/tests/test_yue2_empty_gpu0.py::PMON_EMPTY.
+            let pmon_empty = "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command\n\
+                              # Idx           #    C/G      %      %      %      %      %      %     MB     MB    name\n    \
+                              0          -     -      -      -      -      -      -      -      -      -    -\n";
+            assert!(pure_compute_pids(pmon_empty, 0).unwrap().is_empty());
+            assert!(pure_compute_pids("0 - - 12 3 - - - - - - -\n", 0)
+                .unwrap_err()
+                .contains("malformed PID"));
             assert!(pure_compute_pids("garbage\n", 1)
                 .unwrap_err()
                 .contains("malformed"));

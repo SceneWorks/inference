@@ -1388,8 +1388,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("Join-Path $env:PUBLIC 'SceneWorks\\gpu-locks'", source)
         self.assertIn("$path=Join-Path $directory ($script:control.gpu_uuid+'.lock')", source)
         self.assertIn('Write-Host "CUDA admission waiting: $reason"', source)
-        main = source.split("Exact-Fields $c @('campaign'", 1)[1]
-        self.assertIn("'required_free_mib'", main.split("\n", 1)[0])
+        main = source.split("$fields=@('campaign'", 1)[1]
+        # required_free_mib is optional: present -> validated field, absent -> the derived default.
+        self.assertNotIn("'required_free_mib'", main.split("\n", 1)[0])
+        self.assertIn("$hasRequiredFree=$c.PSObject.Properties.Name -ccontains 'required_free_mib'", main)
+        self.assertIn("if ($hasRequiredFree) { $fields+='required_free_mib' }", main)
+        default = ("if (-not $hasRequiredFree) { $c | Add-Member -NotePropertyName required_free_mib "
+                   "-NotePropertyValue $script:DefaultRequiredFreeMib }")
+        self.assertIn(default, main)
+        # The default is inserted only after the supplied fields pass Exact-Fields; inserting
+        # it first would make every control that omits the field fail as "Unexpected control fields".
+        self.assertLess(main.index("Exact-Fields $c $fields"), main.index(default))
+        self.assertIn("$script:DefaultRequiredFreeMib=36864\n", source)
+        self.assertIn("Require ((Integer $c.required_free_mib) -and $c.required_free_mib -gt 0)", main)
         order = ("$status.before=@(Wait-DeviceAdmissible $true)", "'native' $c.timeout_seconds",
                  "Wait-DeviceAdmissible $false | Out-Null", "'product-native' $c.timeout_seconds")
         for needle in order:
@@ -1439,7 +1450,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ):
             self.assertIn(invariant, source)
         # Only SelfTest owns this budget. Product compile/campaign deadlines remain untouched.
-        product = source.split("Exact-Fields $c @('campaign'", 1)[1]
+        product = source.split("$fields=@('campaign'", 1)[1]
         self.assertNotIn("SelfTestPositiveTimeoutSeconds", product)
         self.assertIn("'build' 10800", product)
 
