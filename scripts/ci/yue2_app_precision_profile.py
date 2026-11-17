@@ -190,11 +190,38 @@ def verified_case_stages(case_path: Path, backend: str, name: str) -> tuple[str,
     return STAGES
 
 
-def preflight(backend: str, evidence: Path, label: str) -> dict:
+def shared_gpu1_lock(deadline: float):
+    """Take the host-global GPU1 UUID lock (waiting with a logged reason) and return it."""
+    from yue2_cuda_idle_context import SharedGpu1Lock  # type: ignore[import-not-found]
+    lock = SharedGpu1Lock()
+    lock.acquire(deadline, {})
+    return lock
+
+
+def cuda_admission_census(label: str, held_lock=None) -> tuple[str, list[str]]:
+    """Free memory plus a quiet window under the UUID lock; foreign actors never refuse.
+
+    A standalone preflight takes the lock only for its census. Under `held_lock` (the
+    capture sequence) the census waits without letting another CI job in.
+    """
+    from yue2_precision_proof import admitted_cuda_census, cuda_physical_census  # type: ignore[import-not-found]
+    if label == "after-cases":
+        return cuda_physical_census(admission=False)
+    deadline = time.monotonic() + remaining_app_budget()
+    if held_lock is not None:
+        return admitted_cuda_census(deadline)
+    lock = shared_gpu1_lock(deadline)
+    try:
+        return admitted_cuda_census(deadline, lock)
+    finally:
+        lock.release()
+
+
+def preflight(backend: str, evidence: Path, label: str, held_lock=None) -> dict:
     # The merged engine control owns the typed process census. Refuse if absent;
     # a generic process-name guess would weaken the shared physical-host lock.
     from yue2_precision_proof import (  # type: ignore[import-not-found]
-        cuda_physical_census, metal_census, physical_busy_message, retain_cuda_physical_evidence,
+        metal_census, physical_busy_message, retain_cuda_physical_evidence,
         retain_reviewed_baseline, same_selected_cuda_device,
     )
 
@@ -213,7 +240,7 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
             else:
                 from yue2_cuda_idle_context import check_shared_gpu1_dispatch  # type: ignore[import-not-found]
                 check_shared_gpu1_dispatch()
-    census, busy = (cuda_physical_census(admission=label != "after-cases")
+    census, busy = (cuda_admission_census(label, held_lock)
                     if backend == "cuda" else metal_census())
     if backend == "cuda" and label != "initial" and not busy:
         initial = json.loads((evidence / "preflight-initial.json").read_text(encoding="utf-8"))
@@ -570,6 +597,9 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             "run-owned case manifest/backend mismatch")
     shutil.copy2(cases / "manifest.json", evidence / "cases-manifest.json")
     completed_audio = []
+    # The capture sequence holds the host-global GPU1 UUID lock from its first admission
+    # through the final release census.
+    held_lock = shared_gpu1_lock(time.monotonic() + remaining_app_budget()) if backend == "cuda" else None
     try:
         for row in manifest["cases"]:
             name = row["name"]
@@ -578,7 +608,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             require(sha256(case) == row.get("run_case_sha256"), f"run-owned case {name} changed")
             require(json.loads(case.read_text(encoding="utf-8")).get("id") == case_id(backend, name),
                     f"run-owned case {name} has wrong backend")
-            preflight(backend, evidence, f"before-{name}")
+            preflight(backend, evidence, f"before-{name}", held_lock)
             command = ["node", "scripts/yue2-memory-profile.mjs", "capture", "--case-file", str(case),
                        "--inference-repo", str(engine), "--data-dir", str(data), "--gpu-id", "1",
                        "--out", str(output)]
@@ -612,9 +642,11 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                 json.dumps({"backend": backend, "status": "partial", "cases": completed_audio}, indent=2) + "\n",
                 encoding="utf-8",
             )
-        preflight(backend, evidence, "after-cases")
+        preflight(backend, evidence, "after-cases", held_lock)
         return collect(output, evidence, backend, app, engine)
     finally:
+        if held_lock is not None:
+            held_lock.release()
         copy_partial(output, evidence, backend)
 
 

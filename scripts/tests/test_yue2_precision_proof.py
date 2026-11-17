@@ -27,6 +27,27 @@ SPEC.loader.exec_module(CONTROL)
 WORKFLOW = ROOT / ".github/workflows/yue2-precision-proof.yml"
 
 
+class FakeGpuLock:
+    """Stands in for the Windows-only host-global UUID lock; records acquire/release order."""
+    events: list = []
+
+    def __init__(self, *args, **kwargs):
+        self.held = False
+
+    def acquire(self, deadline, notice):
+        self.held = True
+        FakeGpuLock.events.append("lock")
+
+    def release(self):
+        if self.held:
+            FakeGpuLock.events.append("unlock")
+        self.held = False
+
+    def pause(self, seconds, deadline, notice):
+        self.release()
+        self.acquire(deadline, notice)
+
+
 class PrecisionControlTests(unittest.TestCase):
     @staticmethod
     def concurrency_settings(source):
@@ -545,6 +566,7 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
                  patch.object(IDLE, "check_shared_gpu1_dispatch"), \
+                 patch.object(IDLE, "SharedGpu1Lock", FakeGpuLock), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", return_value=(census, [])) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
@@ -579,6 +601,7 @@ class PrecisionControlTests(unittest.TestCase):
             census = '{"diagnosticFiles":{},"diagnosticFileBytesB64":{}}'
             launched = []
             events = []
+            FakeGpuLock.events = []
             def identity(path, label, out):
                 events.append(f"identity-{label}")
                 return {"binary_sha256": "verified"}
@@ -609,6 +632,7 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(CONTROL, "verify_revisions"), \
                  patch.object(CONTROL.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()), \
                  patch.object(IDLE, "check_shared_gpu1_dispatch"), \
+                 patch.object(IDLE, "SharedGpu1Lock", FakeGpuLock), \
                  patch.object(CONTROL, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(CONTROL, "cuda_physical_census", side_effect=physical_census) as physical, \
                  patch.object(CONTROL, "retain_cuda_physical_evidence", return_value=[]), \
@@ -631,6 +655,13 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertEqual([row["label"] for row in report["owned_children"]],
                              ["quant"] if zero_quant else ["quant", "vae", "precision"])
             self.assertEqual(physical.call_count, 4 if zero_quant else 8)
+            # The host-global UUID lock is held from admission through the final census.
+            self.assertEqual(FakeGpuLock.events, ["lock", "unlock"])
+            # No stable baseline in these stub censuses: each child measurement says so.
+            self.assertEqual([row["label"] for row in report["memory_measurements"]],
+                             [row["label"] for row in report["owned_children"]])
+            self.assertTrue(all(row["contaminated"] for row in report["memory_measurements"]))
+            self.assertIsNone(report["external_peak_minus_baseline_mib"])
             for label in [row[0] for row in launched]:
                 start = events.index(f"identity-{label}")
                 launch = events.index(f"launch-{label}")
