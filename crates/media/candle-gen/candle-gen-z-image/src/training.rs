@@ -11,8 +11,10 @@
 //!
 //! ## The Z-Image realities that shape the hooks (flow-match, not DDPM ε-prediction)
 //!
-//!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
-//!     ([`decode_square`] + [`square_image_tensor`]), encode the **deterministic latent mean** (the stock z_image
+//!  1. **Cache** — for each captioned image: decode it whole and resize it onto its aspect-keeping
+//!     canvas at each bucket edge ([`decode_rgb`] + [`canvas_image_tensor`]: about `edge²` pixels,
+//!     never upscaled, sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square),
+//!     encode the **deterministic latent mean** (the stock z_image
 //!     [`Encoder`](VaeEncoder) → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
 //!     reproducible), and encode the caption through the Qwen3 text encoder with the *exact* gen-core
 //!     [`TokenizerConfig`](gen_core_tokenizer::TokenizerConfig) inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
@@ -61,7 +63,7 @@ use candle_gen::gen_core::train::{
     TrainingRequest,
 };
 use candle_gen::gen_core::{self, Image, LoadSpec, Modality, WeightsSource};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, run_flow_match_training, step_terms,
     validate_flow_match_request, weighted_velocity_loss, AuxStep, FlowMatchTrainer, SamplePlan,
@@ -73,7 +75,7 @@ use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
 use gen_core_tokenizer::TextTokenizer;
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -88,6 +90,12 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::dit::{ZImageTransformer2DModel, Z_IMAGE_ATTN_TARGETS};
 use crate::pipeline::{LATENT_CHANNELS, PATCH_SIZE, SPATIAL_SCALE};
+
+/// Every training canvas side is a multiple of this: one VAE cell (8 px) times the DiT's 2×2 patch.
+pub(crate) const CANVAS_STRIDE: u32 = SPATIAL_SCALE * PATCH_SIZE;
+/// The longest canvas side the trainer keeps — the family's render cap (`Capabilities::max_size`,
+/// 2048 on both Turbo and Base). The RoPE axes (`axes_lens`) reach well past it.
+pub(crate) const CANVAS_MAX_SIDE: Option<u32> = Some(2048);
 use crate::MODEL_ID;
 
 /// Cap on preview prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-8650) — the
@@ -249,8 +257,8 @@ fn compute_loss_grads(
     }
 }
 
-/// Encode the **deterministic latent mean** of a VAE-input image `[1, 3, edge, edge]` (range
-/// `[-1, 1]`) to a clean latent `[1, 16, edge/8, edge/8]`: run the encoder, take the distribution
+/// Encode the **deterministic latent mean** of a VAE-input image `[1, 3, h, w]` (range
+/// `[-1, 1]`) to a clean latent `[1, 16, h/8, w/8]`: run the encoder, take the distribution
 /// **mean** (the first channel half, skipping `DiagonalGaussian`'s sampling), then `(mean − shift)·
 /// scale` — the same affine `AutoEncoderKL::encode` applies, minus the stochastic draw.
 fn vae_encode_mean(encoder: &VaeEncoder, img: &Tensor, shift: f64, scale: f64) -> Result<Tensor> {
@@ -291,25 +299,35 @@ fn encode_caption(
 ///    [`encode_caption`] returns and `prepare_inputs` consumes), 1:1 with [`SamplePlan::prompts`].
 ///  * `vae` — the resident `AutoEncoderKL` **decoder** (`Arc` as inference holds it); the cache pass
 ///    loads only the VAE `Encoder`, so the full VAE is loaded here for the preview decode path.
-///  * `edge` — the square preview edge: the largest training-bucket edge
-///    ([`bucket_edges`], just `bucket_resolution(cfg.resolution)` with buckets off — the edge the
-///    cached latents use) the seeded preview noise + the `mu` shift are shaped at.
+///  * `size` — the preview canvas `(width, height)`: item 0's training canvas at the largest
+///    training-bucket edge ([`bucket_edges`]) — a shape the cached latents train at, within the
+///    `edge²` area the memory preflight prices — the seeded preview noise + the `mu` shift are
+///    shaped at.
 pub struct ZImageSampleState {
     caps: Vec<Tensor>,
     vae: Arc<AutoEncoderKL>,
-    edge: u32,
+    size: (u32, u32),
 }
 
-/// Seeded initial Gaussian latent noise `[1, 16, edge/8, edge/8]` (f32) for a preview render — the
+/// Seeded initial Gaussian latent noise `[1, 16, height/8, width/8]` (f32) for a preview render — the
 /// training-side twin of [`crate::pipeline::Pipeline::render`]'s noise init (sc-8650): a
 /// fixed-algorithm CPU `StdRng` (sc-3673 launch-portable discipline) seeded by `seed`, built on CPU
 /// then moved to `device`, exactly as inference draws its prior.
-fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> {
-    let lat = (edge / SPATIAL_SCALE) as usize;
-    let n = LATENT_CHANNELS * lat * lat;
+fn sample_noise_latent((width, height): (u32, u32), seed: u64, device: &Device) -> Result<Tensor> {
+    let (lw, lh) = (
+        (width / SPATIAL_SCALE) as usize,
+        (height / SPATIAL_SCALE) as usize,
+    );
+    let n = LATENT_CHANNELS * lh * lw;
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
-    Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat, lat), &Device::Cpu)?.to_device(device)?)
+    Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lh, lw), &Device::Cpu)?.to_device(device)?)
+}
+
+/// The post-patchify image sequence length of a `(width, height)` canvas — the length the
+/// resolution-dependent `mu` shift is computed from.
+fn image_seq_len((width, height): (u32, u32)) -> usize {
+    ((width / SPATIAL_SCALE / PATCH_SIZE) * (height / SPATIAL_SCALE / PATCH_SIZE)) as usize
 }
 
 /// VAE-decode a final preview latent `[1, 16, 1, h, w]` → RGB8 [`Image`] — the training-side twin of
@@ -625,6 +643,9 @@ impl FlowMatchTrainer for ZImageTrainer {
         // Item-major over the bucket edges: `cache[item * edges.len() + bucket]` — the layout the
         // driver's `BucketSchedule` indexes (sc-2127).
         let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len() * edges.len());
+        // The preview canvas: item 0's training canvas at the largest bucket edge (a shape the run
+        // trains at); the square edge only if caching was cancelled before item 0.
+        let mut preview_size = (edge, edge);
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -641,19 +662,27 @@ impl FlowMatchTrainer for ZImageTrainer {
                 item,
                 req.config.subject_mask_loss.as_ref(),
             )?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Every
+            // micro-step trains one cached entry (the shared flow-match driver never stacks
+            // entries), so entries of different shapes never share a batch.
+            let rgb = decode_rgb(&item.image_path)?;
+            if i == 0 {
+                preview_size = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE).size();
+            }
             for &edge in &edges {
-                let img = square_image_tensor(&square, edge, device)?;
+                let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                let img = canvas_image_tensor(&rgb, &canvas, device)?;
                 let x0 = vae_encode_mean(
                     &vae_encoder,
                     &img,
                     vae_cfg.shift_factor,
                     vae_cfg.scaling_factor,
                 )?;
+                // The mask (same dimensions as the image) takes the image's own source box.
                 let mask_weight = prepared_subject_mask_weight(
                     LABEL,
                     mask.as_ref(),
-                    CropBox::center_square,
+                    |_, _| canvas.crop,
                     x0.dims(),
                     device,
                 )?;
@@ -686,7 +715,7 @@ impl FlowMatchTrainer for ZImageTrainer {
                 state: Some(ZImageSampleState {
                     caps,
                     vae: Arc::new(vae),
-                    edge,
+                    size: preview_size,
                 }),
             }
         };
@@ -838,16 +867,15 @@ fn render_preview(
         ))
     })?;
     let steps = (cfg.sample_steps as usize).max(1);
-    let lat = (state.edge / SPATIAL_SCALE) as usize;
     // The DiT is built at the bf16 compute dtype (`build_dit`); the inference forward does NOT cast
     // its inputs (unlike Krea's), so feed bf16 latents + conditioning — exactly as `compute_loss_grads`
     // does (`x_t`/`cap_feats` → `compute_dtype`) — or the first matmul hits an F32×BF16 mismatch.
     let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
 
-    // Seeded launch-portable prior at the training resolution (square `edge`). `prepare_inputs`
+    // Seeded launch-portable prior at the preview canvas (item 0's training canvas). `prepare_inputs`
     // pads `cap` to SEQ_MULTI_OF (+ mask) and adds the singleton frame axis to the latents →
-    // (1, 16, 1, lat, lat) — the exact tensor surface train + infer feed the DiT.
-    let noise = sample_noise_latent(state.edge, seed, device)?;
+    // (1, 16, 1, h/8, w/8) — the exact tensor surface train + infer feed the DiT.
+    let noise = sample_noise_latent(state.size, seed, device)?;
     let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), device)?;
     let cap_feats = prepared.cap_feats.to_dtype(compute_dtype)?;
     let cap_mask = prepared.cap_mask;
@@ -855,9 +883,8 @@ fn render_preview(
     // Distilled flow-match Euler schedule — pass `Some(mu)` (the resolution-dependent shift) so the
     // σ table stays consistent with the `1 − σ` conditioning (the `None` arm desyncs them and
     // speckles; see `pipeline::Pipeline::render`). `mu` is derived from the post-patchify seq len.
-    let image_seq_len = ((lat as u32 / PATCH_SIZE) * (lat as u32 / PATCH_SIZE)) as usize;
     let mu = calculate_shift(
-        image_seq_len,
+        image_seq_len(state.size),
         BASE_IMAGE_SEQ_LEN,
         MAX_IMAGE_SEQ_LEN,
         BASE_SHIFT,
@@ -979,6 +1006,40 @@ mod tests {
 
     /// `build_batch`: `x_t = (1−σ)x0 + σ·noise`, `target = noise − x0`, `timestep = 1−σ` (the Z-Image
     /// convention layered over the shared `flow_match::build_batch`).
+    /// The captioned-item canvas keeps the source aspect on the DiT's 16 px grid (no square crop,
+    /// no upscale), and the preview noise + `mu` sequence length follow a non-square canvas.
+    /// Pure arithmetic.
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        assert_eq!(CANVAS_STRIDE, 16);
+        let c = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(
+            c.crop,
+            gen_core_train::subject_mask::CropBox::full(1365, 2048)
+        );
+        assert_eq!(c.size(), (832, 1248));
+        assert!(c.area() <= 1024 * 1024);
+        assert_eq!(
+            gen_core_train::canvas::training_canvas(
+                (1365, 2048),
+                2048,
+                CANVAS_STRIDE,
+                CANVAS_MAX_SIDE
+            )
+            .size(),
+            (1360, 2048)
+        );
+        let noise = sample_noise_latent((1360, 2048), 7, &Device::Cpu).unwrap();
+        assert_eq!(noise.dims(), &[1, LATENT_CHANNELS, 256, 170]);
+        assert_eq!(image_seq_len((1360, 2048)), 128 * 85);
+        assert_eq!(image_seq_len((1024, 1024)), 64 * 64);
+    }
+
     #[test]
     fn build_batch_math() {
         let dev = Device::Cpu;
@@ -2046,7 +2107,7 @@ mod training_adapter_tests {
         let state = ZImageSampleState {
             caps: vec![Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap()],
             vae: Arc::new(vae),
-            edge: 16,
+            size: (16, 16),
         };
         let tcfg = TrainingConfig {
             sample_steps: 2,

@@ -7,9 +7,10 @@
 //!
 //! Cache → loop → save, mirroring the MLX trainer's lifecycle bands:
 //!
-//!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
-//!     ([`dataset::load_image_tensor`]), encode the **deterministic latent mean**
-//!     (`VaeMomentsEncoder::encode_mean` → `mean × 0.13025`, the user's `.mean` decision — candle's
+//!  1. **Cache** — for each captioned image: decode it whole and resize it onto its aspect-keeping
+//!     canvas at each bucket edge ([`decode_rgb`] + [`canvas_image_tensor`]: about `edge²` pixels,
+//!     never upscaled, sides multiples of [`CANVAS_STRIDE`] — never centre-cropped to a square),
+//!     encode the **deterministic latent mean** (`VaeMomentsEncoder::encode_mean` → `mean × 0.13025`, the user's `.mean` decision — candle's
 //!     stock VAE hides the mean, hence the vendored encoder), and encode the caption through the dual
 //!     CLIP into `[1, 77, 2048]`. The CLIP + VAE encoders are dropped after caching.
 //!  2. **Loop** — sample a uniform integer DDPM timestep `t`, form `noisy = √ᾱ·x0 + √(1-ᾱ)·noise`
@@ -56,7 +57,7 @@ use candle_gen::gen_core::train::{
 };
 use candle_gen::gen_core::{self, BucketSchedule, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, step_sample, step_terms,
     weighted_velocity_loss, AuxDriver, AuxStep, StepLosses, StepSample,
@@ -74,7 +75,8 @@ use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::canvas::canvas_crop;
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
@@ -98,6 +100,14 @@ use crate::MODEL_ID;
 /// `SAMPLE_PROMPT_CAP` the FlowMatch driver applies to the flow-match families — a preview is a
 /// best-effort progress signal, so a long `sample_prompts` list never blows the per-cadence cost up.
 const SAMPLE_PROMPT_CAP: usize = 4;
+
+/// Every training canvas side is a multiple of this: the VAE's 8 px cell times the UNet's two 2×
+/// downsamples (three blocks), so the latent grid halves twice and re-concatenates exactly on the
+/// way up. Also the legacy square bucket floor ([`bucket_edges`]).
+const CANVAS_STRIDE: u32 = 32;
+/// No positional cap: the SDXL UNet is fully convolutional + attention without a positional table,
+/// so only the shared 4:1 aspect bound applies.
+const CANVAS_MAX_SIDE: Option<u32> = None;
 
 /// Freeze an inference-only encoder output before retaining it for the training loop. Candle's eager
 /// graph keeps every input, activation, and weight reachable from an output tensor, so caching the
@@ -731,25 +741,28 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
     }
 }
 
-/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
-/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean latent), each paired with its subject-mask
-/// loss weight on THAT bucket's latent grid (`None` when masked loss is off). `decode_square`
-/// center-crops, so the mask is cropped with [`CropBox::center_square`].
+/// One item's item-major cache entries (sc-2127 × sc-24828): the image at `image_path`, decoded
+/// once whole ([`decode_rgb`]), resized onto its aspect-keeping canvas at each bucket edge and
+/// encoded by `encode` (`[1, 3, h, w]` → clean latent), each paired with its subject-mask loss
+/// weight on THAT bucket's latent grid (`None` when masked loss is off). The mask shares the image's dimensions, so it takes the canvas's own source
+/// box (the whole frame unless the source is beyond 4:1).
 fn encode_item_buckets(
-    square: &SquareImage,
+    image_path: &Path,
     edges: &[u32],
     mask: Option<&PreparedSubjectMask>,
     device: &Device,
     mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
 ) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+    let rgb = decode_rgb(image_path)?;
     edges
         .iter()
         .map(|&edge| {
-            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
+            let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+            let x0 = encode(&canvas_image_tensor(&rgb, &canvas, device)?)?;
             let mask_weight = prepared_subject_mask_weight(
                 "sdxl trainer",
                 mask,
-                CropBox::center_square,
+                |_, _| canvas.crop,
                 x0.dims(),
                 device,
             )?;
@@ -959,16 +972,19 @@ impl SdxlTrainer {
                 total,
             });
             let cond = cache_frozen_encoder_output(clip.encode(&item.caption)?);
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-                                                           // The item's subject mask, read + checked once (None when masked loss is off).
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge
+            // (`encode_item_buckets`). Every step trains ONE cached entry, so entries of different
+            // shapes never share a batch.
+            // The item's subject mask, read + checked once (None when masked loss is off).
             let mask = PreparedSubjectMask::load_if_enabled(
                 "sdxl trainer",
                 item,
                 cfg.subject_mask_loss.as_ref(),
             )?;
-            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |img| {
-                Ok(cache_frozen_encoder_output(vae.encode_mean(img)?))
-            })?;
+            let buckets =
+                encode_item_buckets(&item.image_path, &edges, mask.as_ref(), device, |img| {
+                    Ok(cache_frozen_encoder_output(vae.encode_mean(img)?))
+                })?;
             for (x0, mask_weight) in buckets {
                 cache.push((x0, cond.clone(), mask_weight));
             }
@@ -1105,9 +1121,10 @@ impl SdxlTrainer {
 
         // --- train loop ---
         // Preview latent grid (sc-8650): the cached `x0`'s spatial dims are the exact /8 latent grid the
-        // dataset was encoded at, so a preview denoises at the training resolution (parity with the
-        // bucketed `edge` the cache loop used). Read once from the first item's entry at the LARGEST
-        // bucket (sc-2127; item-major cache, so that is `cache[largest_bucket]`).
+        // dataset was encoded at, so a preview denoises at a shape the run trains at — item 0's
+        // aspect-keeping canvas (non-square for a non-square item) at the LARGEST bucket edge
+        // (sc-2127; item-major cache, so that is `cache[largest_bucket]`), within the `edge²` area
+        // the memory preflight prices.
         let (lat_h, lat_w) = {
             let (_, _, h, w) = cache[largest_bucket(&edges)].0.dims4()?;
             (h, w)
@@ -1127,7 +1144,7 @@ impl SdxlTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         let mut aux_driver = match perceptual {
@@ -1645,20 +1662,21 @@ mod tests {
     }
 
     /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
-    /// of ITS OWN shape (built on that bucket's grid), and the masked-out region is zero.
+    /// of ITS OWN shape (built on that bucket's aspect-keeping grid), and the masked-out region is
+    /// zero — the whole frame is kept, so the subject (the left half) stays the left half.
     #[test]
     fn subject_mask_weight_follows_each_buckets_latent() {
         use candle_core::IndexOp;
         use candle_gen::gen_core::train::TrainingItem;
         use candle_gen::gen_core::SubjectMaskLoss;
         let dir = tempfile::tempdir().unwrap();
-        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        // 192×128 (3:2) image; the subject is its left half (x < 96).
         let image_path = dir.path().join("img.png");
-        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+        image::RgbImage::from_pixel(192, 128, image::Rgb([128, 64, 32]))
             .save(&image_path)
             .unwrap();
         let mask_path = dir.path().join("mask.png");
-        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+        image::GrayImage::from_fn(192, 128, |x, _| image::Luma([if x < 96 { 255 } else { 0 }]))
             .save(&mask_path)
             .unwrap();
         let item = TrainingItem {
@@ -1674,26 +1692,56 @@ mod tests {
             subject_weight: 1.0,
         };
         let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
-        let square = decode_square(&item.image_path).unwrap();
         let dev = Device::Cpu;
-        // A stand-in /8 encoder: `[1, 3, edge, edge]` → `[1, 3, edge/8, edge/8]`.
+        // A stand-in /8 encoder: `[1, 3, h, w]` → `[1, 3, h/8, w/8]`.
         let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?);
-        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        let entries =
+            encode_item_buckets(&item.image_path, &[64, 128], Some(&mask), &dev, encode).unwrap();
         assert_eq!(entries.len(), 2);
-        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
-            assert_eq!(x0.dims(), &[1, 3, grid, grid]);
+        // Edge 64 → 64×32 canvas (8×4 latent); edge 128 → 128×96 (16×12): landscape, 32-strided.
+        for ((x0, w), (gw, gh)) in entries.iter().zip([(8usize, 4usize), (16, 12)]) {
+            assert_eq!(x0.dims(), &[1, 3, gh, gw]);
             let w = w.as_ref().expect("masked loss is on");
-            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            assert_eq!(w.dims(), x0.dims(), "bucket {gw}x{gh}: weight shape");
             let rows = w.i((0, 0)).unwrap().to_vec2::<f32>().unwrap();
             for row in rows {
                 for (x, v) in row.into_iter().enumerate() {
-                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
-                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                    let want = if x < gw / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {gw}x{gh}: column {x}");
                 }
             }
         }
-        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        let off = encode_item_buckets(&item.image_path, &[64, 128], None, &dev, encode).unwrap();
         assert!(off.iter().all(|(_, w)| w.is_none()));
+    }
+
+    /// The training canvas keeps a portrait's aspect on the UNet's 32 px grid (no square crop, no
+    /// upscale, area within the square `edge²` the preflight prices), and only a source beyond 4:1
+    /// is cut — the same box the perceptual masks take.
+    #[test]
+    fn a_portrait_trains_on_its_own_32_strided_canvas() {
+        use gen_core_train::subject_mask::CropBox;
+        let c = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(c.crop, CropBox::full(1365, 2048));
+        assert_eq!(c.size(), (832, 1248));
+        assert_eq!((c.width % 32, c.height % 32), (0, 0));
+        assert!(c.area() <= 1024 * 1024);
+        // Never upscaled: a 640×960 source at edge 1024 trains at its own size.
+        let small = gen_core_train::canvas::training_canvas(
+            (640, 960),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(small.size(), (640, 960));
+        assert_eq!(canvas_crop(1365, 2048), CropBox::full(1365, 2048));
+        let strip = canvas_crop(5000, 1000);
+        assert_eq!((strip.x, strip.width, strip.height), (500, 4000, 1000));
     }
 
     /// F-083 / sc-11173: the trainer preview drives the SAME curated sampler SDXL inference uses, not

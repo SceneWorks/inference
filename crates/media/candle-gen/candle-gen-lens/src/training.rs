@@ -25,8 +25,11 @@
 //!    layers ([`DEFAULT_SELECTED_LAYERS`] = 5/11/17/23) captured + cropped at [`TXT_OFFSET`] (the
 //!    harmony-preamble offset) — exactly the inference `encode_one`. Cached once; the encoder is dropped
 //!    before the DiT loads.
-//!  - **Latents from a neural VAE encode.** Each image is `Flux2Vae`-encoded to the packed DiT latent
-//!    `[1, S, 128]` ([`crate::vae::encode`], posterior mean) and cached.
+//!  - **Latents from a neural VAE encode.** Each image is decoded whole and resized onto its
+//!    aspect-keeping canvas per bucket edge (about `edge²` pixels, never upscaled, sides multiples of
+//!    [`CANVAS_STRIDE`] — never centre-cropped to a square), then `Flux2Vae`-encoded to the packed DiT
+//!    latent `[1, S, 128]` ([`crate::vae::encode`], posterior mean, an `(H/16) × (W/16)` grid) and
+//!    cached with that grid.
 //!  - **Targets:** the fused dual-stream attention projections [`LENS_ATTN_TARGETS`]
 //!    (`img_qkv`/`txt_qkv`/`to_out.0`/`to_add_out`); train only the adapter, freeze the gpt-oss encoder
 //!    + VAE + DiT base.
@@ -49,7 +52,7 @@ use candle_gen::gen_core::train::{
     TrainingRequest,
 };
 use candle_gen::gen_core::{self, CancelFlag, Image, LoadSpec, Modality, Progress, WeightsSource};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, run_flow_match_training, step_terms,
     validate_flow_match_request, weighted_velocity_loss, AuxStep, FlowMatchTrainer, SamplePlan,
@@ -78,6 +81,13 @@ const SAMPLE_PROMPT_CAP: usize = 4;
 /// Error-message prefix shared by [`validate_flow_match_request`] and the driver's `no usable dataset
 /// items` guard.
 const LABEL: &str = "lens trainer";
+
+/// Every training canvas side is a multiple of this: the packed latent cell ([`VAE_SCALE_FACTOR`] =
+/// the FLUX.2 VAE's 8 px times its 2×2 patchify), one DiT token per cell.
+pub(crate) const CANVAS_STRIDE: u32 = VAE_SCALE_FACTOR;
+/// The longest canvas side the trainer keeps — the family's render cap (the descriptor's
+/// `max_size`, 2080; the Lens RoPE itself is unbounded).
+pub(crate) const CANVAS_MAX_SIDE: Option<u32> = Some(2080);
 
 /// gpt-oss is encoded at bf16 for caching (it only produces the cached, frozen features; kept f32 in
 /// the cache and dropped before the DiT loads).
@@ -209,13 +219,14 @@ fn unpack_to_decoder_latent(packed: &Tensor, h: usize, w: usize) -> Result<Tenso
 }
 
 /// The subject-mask loss weight for one cached bucket latent (sc-24828 × sc-2127), `None` when the
-/// technique is off. The item's mask (loaded once) takes [`decode_square`]'s centre-square crop and
-/// is area-averaged onto this bucket's **unpacked** 32-ch
+/// technique is off. The item's mask (loaded once, same dimensions as the image) is cut to the image's
+/// own source box `crop` (its training canvas's — the whole frame within 4:1) and is area-averaged onto this bucket's **unpacked** 32-ch
 /// VAE latent grid `[1, C, 2·lat_h, 2·lat_w]` (C = 32), then packed through the very 2×2 patchify + flatten
 /// the cached latent went through ([`pack_unpacked_latent`]) — so each of the 128 packed channels
 /// carries the weight of its own 2×2 sub-position, element-for-element with `x0` `[1, S, 128]`.
 fn bucket_mask_weight(
     mask: Option<&PreparedSubjectMask>,
+    crop: CropBox,
     x0: &Tensor,
     lat_h: usize,
     lat_w: usize,
@@ -223,7 +234,7 @@ fn bucket_mask_weight(
 ) -> Result<Option<Tensor>> {
     // `x0` is `[1, S, 4·C]` (2×2 patchify folds 4 sub-positions into each channel group).
     let unpacked = [1usize, x0.dim(2)? / 4, 2 * lat_h, 2 * lat_w];
-    prepared_subject_mask_weight(LABEL, mask, CropBox::center_square, &unpacked, device)?
+    prepared_subject_mask_weight(LABEL, mask, |_, _| crop, &unpacked, device)?
         .map(|w| pack_unpacked_latent(&w).map_err(Into::into))
         .transpose()
 }
@@ -283,9 +294,10 @@ struct LensPromptCond {
 ///    `[2, S, 2880]` / `[2, S]` joint batch exactly like the inference `Pipeline::encode_prompt`.
 ///  * `vae` — the resident [`Flux2Vae`] **decoder** (`Arc` as inference holds it); the cache pass loads
 ///    only the encoder, so the decoder is loaded here for the preview path.
-///  * `latent_h` / `latent_w` — the packed latent grid (`edge / 16`) the seeded preview noise + the DiT
-///    forward are shaped at — the largest training-bucket edge ([`bucket_edges`], just
-///    `bucket_resolution(cfg.resolution)` with buckets off — the edge the cached latents use).
+///  * `latent_h` / `latent_w` — the packed latent grid (`height / 16`, `width / 16`) the seeded preview
+///    noise + the DiT forward are shaped at — item 0's training canvas at the largest training-bucket
+///    edge ([`bucket_edges`]): a shape the run trains at, within the `edge²` area the memory preflight
+///    prices.
 pub struct LensSampleState {
     conds: Vec<LensPromptCond>,
     vae: Arc<Flux2Vae>,
@@ -317,6 +329,14 @@ fn encode_prompt_cond(
     }
     let mask = Tensor::cat(&[&pos_mask, &neg_mask], 0)?;
     Ok(LensPromptCond { features, mask })
+}
+
+/// The packed preview latent grid `(latent_h, latent_w)` of a preview canvas `(width, height)`.
+fn preview_latent_grid((width, height): (u32, u32)) -> (usize, usize) {
+    (
+        (height / VAE_SCALE_FACTOR) as usize,
+        (width / VAE_SCALE_FACTOR) as usize,
+    )
 }
 
 /// Deterministic packed initial noise `[1, latent_h·latent_w, 128]` for a preview render (sc-8650) — the
@@ -611,6 +631,9 @@ impl FlowMatchTrainer for LensTrainer {
         // Item-major over the bucket edges: `cache[item * edges.len() + bucket]` — the layout the
         // driver's `BucketSchedule` indexes (sc-2127).
         let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len() * edges.len());
+        // The preview canvas: item 0's training canvas at the largest bucket edge (a shape the run
+        // trains at); the square edge only if caching was cancelled before item 0.
+        let mut preview_size = (edge, edge);
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -627,11 +650,20 @@ impl FlowMatchTrainer for LensTrainer {
                 item,
                 req.config.subject_mask_loss.as_ref(),
             )?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. The shared
+            // harness trains one cached entry per micro-step, so entries of different shapes never
+            // share a batch.
+            let rgb = decode_rgb(&item.image_path)?;
+            if i == 0 {
+                preview_size = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE).size();
+            }
             for &edge in &edges {
-                let img = square_image_tensor(&square, edge, device)?; // [1,3,edge,edge] in [-1,1]
-                let (x0, lh, lw) = vae_encode(&vae, &img)?; // [1, S, 128] packed latent (mean), f32
-                let mask_weight = bucket_mask_weight(mask.as_ref(), &x0, lh, lw, device)?;
+                let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                let img = canvas_image_tensor(&rgb, &canvas, device)?; // [1,3,h,w] in [-1,1]
+                                                                       // [1, S, 128] packed latent (mean), f32, on the (h/16, w/16) grid.
+                let (x0, lh, lw) = vae_encode(&vae, &img)?;
+                let mask_weight =
+                    bucket_mask_weight(mask.as_ref(), canvas.crop, &x0, lh, lw, device)?;
                 cache.push((x0, feats.clone(), (lh, lw), mask_weight));
             }
         }
@@ -640,11 +672,11 @@ impl FlowMatchTrainer for LensTrainer {
         // `SAMPLE_PROMPT_CAP` of the configured prompts into the joint CFG batch (positive + the shared
         // empty-negative unconditional branch), using the same `encode_caption` the cache loop uses
         // (train/infer conditioning parity), and load a resident `Flux2Vae` *decoder* (the cache pass
-        // built an encoder-only VAE). The previews render at the largest bucket edge (`edge / 16`
-        // packed grid; the single cached edge when buckets are off). The driver renders these from the
-        // in-progress adapter each cadence.
+        // built an encoder-only VAE). The previews render on item 0's canvas at the largest bucket
+        // edge (an `(h/16, w/16)` packed grid). The driver renders these from the in-progress adapter
+        // each cadence.
         let sample_plan = if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
-            let lat = (edge / VAE_SCALE_FACTOR) as usize;
+            let (latent_h, latent_w) = preview_latent_grid(preview_size);
             let prompts: Vec<String> = req
                 .config
                 .sample_prompts
@@ -670,8 +702,8 @@ impl FlowMatchTrainer for LensTrainer {
                 state: Some(LensSampleState {
                     conds,
                     vae: Arc::new(vae_decoder),
-                    latent_h: lat,
-                    latent_w: lat,
+                    latent_h,
+                    latent_w,
                 }),
             }
         } else {
@@ -1179,22 +1211,23 @@ mod tests {
     }
 
     /// sc-24828 × sc-2127: with two resolution buckets and masked loss on, the item's mask (loaded
-    /// once) yields a weight per bucket that is packed exactly like that bucket's latent — same
-    /// `[1, S, 4·C]` shape — and the masked-out region (the right half of the centre crop) is zero.
+    /// once) yields a weight per bucket that is packed exactly like that bucket's (non-square)
+    /// latent — same `[1, S, 4·C]` shape — over the image's whole frame (its canvas crop), and the
+    /// masked-out region (the right two thirds) is zero.
     #[test]
     fn bucket_mask_weight_follows_each_bucket_latent() {
         use candle_gen::gen_core::train::TrainingItem;
         let dev = Device::Cpu;
         let dir = tempfile::tempdir().unwrap();
-        // A 48x32 landscape image: centre crop x in [8, 40); subject = crop's left half [8, 24).
+        // A 48x32 landscape image kept whole (3:2); subject = its left third [0, 16).
         let img = dir.path().join("img.png");
         image::RgbImage::new(48, 32).save(&img).unwrap();
+        let crop = gen_core_train::canvas::canvas_crop(48, 32);
+        assert_eq!(crop, CropBox::full(48, 32));
         let mask_path = dir.path().join("mask.png");
-        image::GrayImage::from_fn(48, 32, |x, _| {
-            image::Luma([if (8..24).contains(&x) { 255 } else { 0 }])
-        })
-        .save(&mask_path)
-        .unwrap();
+        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 16 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
         let mut item = TrainingItem::captioned(img, "c".into());
         item.subject_mask_path = Some(mask_path);
         let on = candle_gen::gen_core::SubjectMaskLoss {
@@ -1205,9 +1238,9 @@ mod tests {
             .unwrap()
             .expect("masked loss on");
         let c = 2usize; // unpacked channels; packed = 4·c
-        for (lh, lw) in [(2usize, 2usize), (4, 4)] {
+        for (lh, lw) in [(2usize, 3usize), (4, 6)] {
             let x0 = Tensor::zeros((1, lh * lw, 4 * c), DType::F32, &dev).unwrap();
-            let w = bucket_mask_weight(Some(&mask), &x0, lh, lw, &dev)
+            let w = bucket_mask_weight(Some(&mask), crop, &x0, lh, lw, &dev)
                 .unwrap()
                 .expect("weight");
             assert_eq!(w.dims(), x0.dims(), "bucket {lh}x{lw}");
@@ -1216,13 +1249,39 @@ mod tests {
                 let j = tok % lw;
                 for (ch, v) in row.iter().enumerate() {
                     let x = 2 * j + ch % 2; // unpacked column of this packed element
-                    let expected = if x < lw { 1.0 } else { 0.0 };
+                                            // The unpacked grid is 2·lw wide; the subject is its left third.
+                    let expected = if x < 2 * lw / 3 { 1.0 } else { 0.0 };
                     assert_eq!(*v, expected, "bucket {lh}x{lw} token {tok} channel {ch}");
                 }
             }
         }
         let x0 = Tensor::zeros((1, 4, 4 * c), DType::F32, &dev).unwrap();
-        assert!(bucket_mask_weight(None, &x0, 2, 2, &dev).unwrap().is_none());
+        assert!(bucket_mask_weight(None, crop, &x0, 2, 2, &dev)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The captioned-item canvas keeps the source aspect on the packed 16 px grid (no square crop,
+    /// no upscale, within the 2080 render cap), and the preview noise follows that non-square
+    /// `(h/16, w/16)` grid with the seq-len-fit `mu` of its own token count.
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        use gen_core_train::canvas::training_canvas;
+        let c = training_canvas((1365, 2048), 1024, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        assert_eq!(c.crop, CropBox::full(1365, 2048));
+        let c = training_canvas((1365, 2048), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!(c.size(), (1360, 2048));
+        // A 4:1 strip at the 2048 edge (4096 long) scales down at its aspect to the render cap.
+        let c = training_canvas((8000, 2000), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert!(c.width <= 2080 && c.width > 3 * c.height && c.height.is_multiple_of(16));
+        let (lh, lw) = preview_latent_grid((1360, 2048));
+        assert_eq!((lh, lw), (128, 85));
+        let noise = sample_noise_latent(lh, lw, 7, &Device::Cpu).unwrap();
+        assert_eq!(noise.dims(), &[1, 128 * 85, 128]);
+        assert_eq!(lens_mu(8, lh, lw), lens_mu(8, lw, lh));
+        assert_ne!(lens_mu(8, lh, lw), lens_mu(8, lh, lh));
     }
 
     /// The candle Lens trainer declares subject-masked loss (sc-24828).

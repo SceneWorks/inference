@@ -64,13 +64,16 @@ fn snapshot() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Two solid-colour swatch PNGs + captions in `dir`.
+/// Two solid-colour swatch PNGs + captions in `dir`: a square and a 2:3 portrait, so every run
+/// trains a non-square aspect-preserving canvas (the portrait at edge 64 is 48×64, never a
+/// centre-cropped square).
 fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
     let mut items = Vec::new();
     for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
-        let mut img = image::RgbImage::new(96, 96);
+        let (w, h) = if i == 0 { (96, 96) } else { (96, 144) };
+        let mut img = image::RgbImage::new(w, h);
         for px in img.pixels_mut() {
             *px = image::Rgb(*color);
         }

@@ -23,7 +23,10 @@ use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
+use gen_core_train::canvas::{canvas_crop, TrainingCanvas};
+
+use crate::training::{CANVAS_MAX_SIDE, CANVAS_STRIDE};
 use candle_gen::train::flow_match;
 use candle_gen::{CandleError, Result};
 
@@ -195,14 +198,20 @@ impl KreaControlTrainer {
             let cap = encode_caption(&tokenizer, &text_encoder, &item.caption)?
                 .to_dtype(DType::BF16)?
                 .to_device(&cpu)?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-            let control_square = decode_square(control_path)?;
+            // Decoded once, whole; resized onto the target's aspect-keeping canvas per bucket edge.
+            let target_rgb = decode_rgb(&item.image_path)?;
+            let control_rgb = decode_rgb(control_path)?;
             for &edge in &edges {
-                // Target and control at the SAME bucket edge, so the control latent stays
-                // pixel-aligned with the target latent. Latents stay f32 (the flow-match mix runs
-                // f32).
-                let target = square_image_tensor(&square, edge, device)?;
-                let control = square_image_tensor(&control_square, edge, device)?;
+                // Target and control on the SAME canvas (the target's), so the control latent stays
+                // pixel-aligned with the target latent; the control takes its own aspect-bound box.
+                // Latents stay f32 (the flow-match mix runs f32).
+                let canvas = image_canvas(&target_rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                let control_canvas = TrainingCanvas {
+                    crop: canvas_crop(control_rgb.width(), control_rgb.height()),
+                    ..canvas
+                };
+                let target = canvas_image_tensor(&target_rgb, &canvas, device)?;
+                let control = canvas_image_tensor(&control_rgb, &control_canvas, device)?;
                 let x0 = vae_encoder.encode(&target)?.to_device(&cpu)?;
                 let ctrl = vae_encoder.encode(&control)?.to_device(&cpu)?;
                 samples.push(ControlSample {

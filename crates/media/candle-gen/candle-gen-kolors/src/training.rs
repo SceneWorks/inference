@@ -2,6 +2,11 @@
 //! conditioning is deliberately not the SDXL dual-CLIP path: captions are encoded by the snapshot's
 //! ChatGLM3 tokenizer/model, projected from 4096 to 2048, and paired with Kolors' 5632-wide pooled
 //! plus size embedding.
+//!
+//! Each captioned image is decoded whole and resized onto its aspect-keeping canvas at every bucket
+//! edge (about `edge²` pixels, never upscaled, sides multiples of [`CANVAS_STRIDE`] — never
+//! centre-cropped to a square); its `time_ids` name that canvas, exactly as inference names the
+//! render size.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +26,7 @@ use candle_gen::gen_core::{
     self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
 };
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, effective_weight_decay, noise_seed, prepared_subject_mask_weight,
     sample_noise, step_sample, step_terms, weighted_velocity_loss, AuxDriver, AuxStep, StepLosses,
@@ -40,7 +45,8 @@ use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
 use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::canvas::canvas_crop;
+use gen_core_train::subject_mask::PreparedSubjectMask;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::chatglm3::ChatGlmModel;
@@ -55,6 +61,13 @@ const ADDITION_TIME_EMBED_DIM: usize = 256;
 const PROJECTION_INPUT_DIM: usize = 5632;
 const CONTEXT_DIM: usize = 4096;
 const CROSS_ATTENTION_DIM: usize = 2048;
+/// Every training canvas side is a multiple of this: the VAE's 8 px cell times the SDXL UNet's two
+/// 2× downsamples (three blocks), so the latent grid halves twice and re-concatenates exactly on
+/// the way up. Also the legacy square bucket floor ([`bucket_edges`]).
+const CANVAS_STRIDE: u32 = 32;
+/// No positional cap: the UNet has no positional table, so only the shared 4:1 aspect bound
+/// applies.
+const CANVAS_MAX_SIDE: Option<u32> = None;
 
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
@@ -95,40 +108,46 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
     }
 }
 
-/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
-/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean latent), each paired with its subject-mask
-/// loss weight on THAT bucket's latent grid (`None` when masked loss is off). `decode_square`
-/// center-crops, so the mask is cropped with [`CropBox::center_square`].
+/// One item's cache entry at one bucket edge: the clean latent, its subject-mask loss weight
+/// (`None` when masked loss is off) and the canvas `(width, height)` it was encoded at.
+type BucketEntry = (Tensor, Option<Tensor>, (u32, u32));
+
+/// One item's item-major cache entries (sc-2127 × sc-24828): the image at `image_path`, decoded
+/// once whole ([`decode_rgb`]), resized onto its aspect-keeping canvas at each bucket edge and
+/// encoded by `encode` (`[1, 3, h, w]` → clean latent), each paired with its subject-mask loss
+/// weight on THAT bucket's latent grid (`None` when masked loss is off) and its canvas size. The
+/// mask shares the image's dimensions, so it takes the canvas's own source box (the whole frame
+/// unless the source is beyond 4:1).
 fn encode_item_buckets(
-    square: &SquareImage,
+    image_path: &Path,
     edges: &[u32],
     mask: Option<&PreparedSubjectMask>,
     device: &Device,
     mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
-) -> Result<Vec<(Tensor, Option<Tensor>)>> {
+) -> Result<Vec<BucketEntry>> {
+    let rgb = decode_rgb(image_path)?;
     edges
         .iter()
         .map(|&edge| {
-            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
-            let mask_weight = prepared_subject_mask_weight(
-                LABEL,
-                mask,
-                CropBox::center_square,
-                x0.dims(),
-                device,
-            )?;
-            Ok((x0, mask_weight))
+            let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+            let x0 = encode(&canvas_image_tensor(&rgb, &canvas, device)?)?;
+            let mask_weight =
+                prepared_subject_mask_weight(LABEL, mask, |_, _| canvas.crop, x0.dims(), device)?;
+            Ok((x0, mask_weight, canvas.size()))
         })
         .collect()
 }
 
-/// One SDXL-style `time_ids` row (`[h, w, 0, 0, h, w]`) per bucket edge, in bucket order, at
-/// `dtype` (sc-2127). A step selects the row of the bucket its cached latent was encoded at, so the
-/// micro-conditioning always names the size the latent really has.
-fn bucket_time_ids(device: &Device, edges: &[u32], dtype: DType) -> Result<Vec<Tensor>> {
-    edges
+/// One SDXL-style `time_ids` row per cache entry, at `dtype`: `[h, w, 0, 0, h, w]` of the canvas
+/// `(width, height)` that entry's latent was encoded at. Inference conditions on `original ==
+/// target == the render size` with no crop ([`build_time_ids`]); a training canvas is the whole
+/// source frame resized (never cropped, bar the >4:1 bound), so naming the canvas as both sizes is
+/// exactly the conditioning the adapter will meet at that render size — and a step always names the
+/// size its latent really has, square or not.
+fn canvas_time_ids(device: &Device, sizes: &[(u32, u32)], dtype: DType) -> Result<Vec<Tensor>> {
+    sizes
         .iter()
-        .map(|&edge| Ok(build_time_ids(device, 1, edge, edge)?.to_dtype(dtype)?))
+        .map(|&(width, height)| Ok(build_time_ids(device, 1, height, width)?.to_dtype(dtype)?))
         .collect()
 }
 
@@ -547,6 +566,8 @@ impl KolorsTrainer {
         };
         // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
         let mut cache = Vec::with_capacity(req.items.len() * edges.len());
+        // The canvas `(width, height)` of each cache entry (1:1 with `cache`) — its `time_ids`.
+        let mut canvas_sizes = Vec::with_capacity(req.items.len() * edges.len());
         for (index, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -556,16 +577,19 @@ impl KolorsTrainer {
                 total: req.items.len() as u32,
             });
             let (context, pooled) = cache_caption(&caption_encoder, &item.caption)?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-                                                           // The item's subject mask, read + checked once (None when masked loss is off); each
-                                                           // bucket's weight (sc-24828) is broadcast to that bucket's latent shape.
+            // The item's subject mask, read + checked once (None when masked loss is off); each
+            // bucket's weight (sc-24828) is broadcast to that bucket's latent shape. The image is
+            // decoded once, whole, and resized onto its aspect-keeping canvas per bucket edge; every
+            // step trains ONE cached entry, so entries of different shapes never share a batch.
             let mask =
                 PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
-            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |image| {
-                Ok(vae.encode_mean(image)?.detach())
-            })?;
-            for (x0, mask_weight) in buckets {
+            let buckets =
+                encode_item_buckets(&item.image_path, &edges, mask.as_ref(), device, |image| {
+                    Ok(vae.encode_mean(image)?.detach())
+                })?;
+            for (x0, mask_weight, size) in buckets {
                 cache.push((x0, context.clone(), pooled.clone(), mask_weight));
+                canvas_sizes.push(size);
             }
         }
         drop(caption_encoder);
@@ -648,7 +672,7 @@ impl KolorsTrainer {
         let mut update = 0;
         let mut steps_run = 0;
         let mut last_loss = 0.0;
-        let time_ids = bucket_time_ids(device, &edges, dtype)?;
+        let time_ids = canvas_time_ids(device, &canvas_sizes, dtype)?;
         // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let sample_order =
@@ -666,7 +690,7 @@ impl KolorsTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         let mut aux_driver = match perceptual {
@@ -689,7 +713,7 @@ impl KolorsTrainer {
             let sample = step_sample(aux_driver.as_mut(), step, &sample_order);
             let index = sample.entry;
             let (x0, context, pooled, mask_weight) = &cache[index];
-            let step_time_ids = &time_ids[index % edges.len()];
+            let step_time_ids = &time_ids[index];
             let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(step as u64));
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
@@ -870,23 +894,49 @@ mod tests {
         assert!(trainer_descriptor().techniques.subject_mask_loss);
     }
 
-    /// sc-2127: the trainer declares buckets, every bucket gets the `time_ids` of its own edge, and
-    /// the item-major cache index a step samples maps (`index % n_buckets`) to the bucket the
-    /// schedule chose — so the micro-conditioning never names a size the latent does not have.
+    /// sc-2127: the trainer declares buckets, every cache entry gets the `time_ids` of its own
+    /// canvas — `(h, w, 0, 0, h, w)` in (height, width) order, so a portrait names its tall side
+    /// first — and the item-major cache index a step samples maps (`index % n_buckets`) to the
+    /// bucket the schedule chose, so the micro-conditioning never names a size the latent does not
+    /// have.
     #[test]
-    fn each_bucket_conditions_on_its_own_edge() {
+    fn each_entry_conditions_on_its_own_canvas() {
         use candle_gen::gen_core::ResolutionBucket;
+        use gen_core_train::subject_mask::CropBox;
         assert!(trainer_descriptor().techniques.resolution_buckets);
         let edges = [512u32, 1024];
-        let rows = bucket_time_ids(&Device::Cpu, &edges, DType::F32).unwrap();
+        // A 1365×2048 portrait at both edges: 32-strided, aspect kept, area within edge².
+        let sizes: Vec<(u32, u32)> = edges
+            .iter()
+            .map(|&edge| {
+                gen_core_train::canvas::training_canvas(
+                    (1365, 2048),
+                    edge,
+                    CANVAS_STRIDE,
+                    CANVAS_MAX_SIDE,
+                )
+                .size()
+            })
+            .collect();
+        assert_eq!(sizes, vec![(416, 608), (832, 1248)]);
+        let rows = canvas_time_ids(&Device::Cpu, &sizes, DType::F32).unwrap();
         assert_eq!(rows.len(), 2);
-        for (row, edge) in rows.iter().zip(edges) {
-            let e = edge as f32;
+        for (row, (w, h)) in rows.iter().zip(sizes) {
+            let (w, h) = (w as f32, h as f32);
             assert_eq!(
                 row.to_vec2::<f32>().unwrap(),
-                vec![vec![e, e, 0.0, 0.0, e, e]]
+                vec![vec![h, w, 0.0, 0.0, h, w]]
             );
         }
+        // Never upscaled: a 640×960 source at edge 1024 trains (and conditions) at its own size.
+        let small = gen_core_train::canvas::training_canvas(
+            (640, 960),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(small.size(), (640, 960));
+        assert_eq!(small.crop, CropBox::full(640, 960));
         let buckets = [
             ResolutionBucket {
                 resolution: 512,
@@ -908,19 +958,20 @@ mod tests {
     }
 
     /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
-    /// of ITS OWN shape (built on that bucket's grid), and the masked-out region is zero.
+    /// of ITS OWN shape (built on that bucket's aspect-keeping grid), and the masked-out region is
+    /// zero — the whole frame is kept, so the subject (the left half) stays the left half.
     #[test]
     fn subject_mask_weight_follows_each_buckets_latent() {
         use candle_gen::candle_core::IndexOp;
         use candle_gen::gen_core::SubjectMaskLoss;
         let dir = tempfile::tempdir().unwrap();
-        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        // 192×128 (3:2) image; the subject is its left half (x < 96).
         let image_path = dir.path().join("img.png");
-        image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
+        image::RgbImage::from_pixel(192, 128, image::Rgb([128, 64, 32]))
             .save(&image_path)
             .unwrap();
         let mask_path = dir.path().join("mask.png");
-        image::GrayImage::from_fn(48, 32, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+        image::GrayImage::from_fn(192, 128, |x, _| image::Luma([if x < 96 { 255 } else { 0 }]))
             .save(&mask_path)
             .unwrap();
         let item = TrainingItem {
@@ -936,26 +987,28 @@ mod tests {
             subject_weight: 1.0,
         };
         let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
-        let square = decode_square(&item.image_path).unwrap();
         let dev = Device::Cpu;
-        // A stand-in /8 encoder: `[1, 3, edge, edge]` → `[1, 3, edge/8, edge/8]`.
+        // A stand-in /8 encoder: `[1, 3, h, w]` → `[1, 3, h/8, w/8]`.
         let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?);
-        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        let entries =
+            encode_item_buckets(&item.image_path, &[64, 128], Some(&mask), &dev, encode).unwrap();
         assert_eq!(entries.len(), 2);
-        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
-            assert_eq!(x0.dims(), &[1, 3, grid, grid]);
+        // Edge 64 → 64×32 canvas (8×4 latent); edge 128 → 128×96 (16×12): landscape, 32-strided.
+        for ((x0, w, size), (gw, gh)) in entries.iter().zip([(8usize, 4usize), (16, 12)]) {
+            assert_eq!(x0.dims(), &[1, 3, gh, gw]);
+            assert_eq!(*size, (gw as u32 * 8, gh as u32 * 8));
             let w = w.as_ref().expect("masked loss is on");
-            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            assert_eq!(w.dims(), x0.dims(), "bucket {gw}x{gh}: weight shape");
             let rows = w.i((0, 0)).unwrap().to_vec2::<f32>().unwrap();
             for row in rows {
                 for (x, v) in row.into_iter().enumerate() {
-                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
-                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                    let want = if x < gw / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "bucket {gw}x{gh}: column {x}");
                 }
             }
         }
-        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
-        assert!(off.iter().all(|(_, w)| w.is_none()));
+        let off = encode_item_buckets(&item.image_path, &[64, 128], None, &dev, encode).unwrap();
+        assert!(off.iter().all(|(_, w, _)| w.is_none()));
     }
 
     #[test]

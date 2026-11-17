@@ -21,7 +21,7 @@ use candle_gen::gen_core::{
     self, safetensors_file_metadata, safetensors_path_tensor_headers, CancelFlag, Image, LoadSpec,
     Modality, Progress, SafetensorsTensorHeader, WeightsSource,
 };
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, run_flow_match_training, step_terms,
     weighted_velocity_loss, AuxStep, FlowMatchTrainer, SamplePlan, StepLosses,
@@ -34,6 +34,7 @@ use candle_gen::train::perceptual::{
 };
 use candle_gen::train::taehv::{TaehvConfig, TaehvDecoder};
 use candle_gen::{CandleError, Result};
+use gen_core_train::canvas::TrainingCanvas;
 use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use crate::config::{
@@ -56,6 +57,14 @@ use candle_gen::train::lora::{LoraHost, LoraLinear};
 use gen_core_ltx::ltx_checkpoint::{LtxBundle, LtxCheckpointLayout, LtxComponent};
 
 const LABEL: &str = "ltx trainer";
+
+/// Every LTX-2.3 training-canvas side is a multiple of this: the video VAE's 32× spatial
+/// downscale times the DiT's 1×1 patch (one latent cell is one token).
+const CANVAS_STRIDE: u32 = SPATIAL_SCALE as u32;
+/// The longest LTX-2.3 training-canvas side: the DiT's spatial RoPE span
+/// (`TransformerConfig::ltx_2_3().rope_max_pos[1..]` = 2048 px), so every cached still's positions
+/// stay inside the table inference renders with.
+const CANVAS_MAX_SIDE: Option<u32> = Some(2048);
 const SAMPLE_PROMPT_CAP: usize = 4;
 const TRAIN_TEXT_MAX_LENGTH: usize = 128;
 const SAFE_MEMORY_FRACTION: f64 = 0.85;
@@ -1253,9 +1262,10 @@ pub struct LtxSampleState {
     contexts: Vec<SampleContext>,
     vae: Arc<LtxVideoVae>,
     aux: TrainingAux,
-    /// LTX-2.3 preview latent edge: the largest training bucket's (sc-2127); `0` for LTX-2.5, whose
-    /// previews take their geometry from the validation plan.
-    latent_edge: usize,
+    /// LTX-2.3 preview latent grid `(h, w)`: item 0's training canvas at the largest training bucket
+    /// edge (sc-2127; a shape the cached latents train at, within the `edge²` the memory guard
+    /// prices); `(0, 0)` for LTX-2.5, whose previews take their geometry from the validation plan.
+    latent_hw: (usize, usize),
 }
 
 enum SampleContext {
@@ -1277,7 +1287,7 @@ pub struct AvTrainingPositions {
 }
 
 /// Run-wide state the driver threads into every micro-step. LTX-2.3 carries nothing run-wide: its
-/// RoPE position grid depends on the sample's resolution bucket, so it lives in each
+/// RoPE position grid depends on the sample's own canvas grid, so it lives in each
 /// [`TrainingCached::Ltx23`] entry (sc-2127).
 #[derive(Clone)]
 pub enum TrainingAux {
@@ -1300,12 +1310,14 @@ impl LoraHost for TrainingDiT {
 }
 
 pub enum TrainingCached {
-    /// One `(item, bucket)` still: clean latent tokens, caption context, the bucket's RoPE
-    /// position grid (shared across items by refcounted clone), and `mask_weight`, the
-    /// subject-mask loss weight `[1, F·h·w, 1]` over that bucket's flattened latent tokens
-    /// (sc-24828); `None` when subject-masked loss is off.
+    /// One `(item, bucket)` still: clean latent tokens over its single-frame latent grid
+    /// `latent_hw = (h, w)` (the item's own aspect canvas, so `h ≠ w` in general), caption context,
+    /// that grid's RoPE position grid (shared by refcounted clone across every entry of the same
+    /// grid), and `mask_weight`, the subject-mask loss weight `[1, F·h·w, 1]` over the flattened
+    /// latent tokens (sc-24828); `None` when subject-masked loss is off.
     Ltx23 {
         clean: Tensor,
+        latent_hw: (usize, usize),
         context: Tensor,
         positions: Tensor,
         mask_weight: Option<Tensor>,
@@ -1986,43 +1998,43 @@ fn preflight_aux_against_budget(
     )
 }
 
-/// A cached LTX-2.3 still's flattened tokens `(1, S, C)` (`S = le²`, one frame) as the decoder's
-/// NCHW `(1, C, le, le)` — the inverse of [`flatten_latent`] for a square single-frame grid.
-fn ltx23_latent_nchw(tokens: &Tensor) -> Result<Tensor> {
+/// A cached LTX-2.3 still's flattened tokens `(1, S, C)` over its single-frame latent grid
+/// `(h, w)` (`S = h·w`) as the decoder's NCHW `(1, C, h, w)` — the inverse of [`flatten_latent`];
+/// a token count that does not match the grid is a typed error.
+fn ltx23_latent_nchw(tokens: &Tensor, (h, w): (usize, usize)) -> Result<Tensor> {
     let (_, s, _) = tokens.dims3()?;
-    let le = (s as f64).sqrt().round() as usize;
-    if le * le != s {
+    if h * w != s {
         return Err(CandleError::Msg(format!(
-            "{LABEL}: a still latent of {s} tokens is not a square single-frame grid"
+            "{LABEL}: a still latent of {s} tokens is not a single-frame {h}x{w} grid"
         )));
     }
-    Ok(unflatten_latent(tokens, 1, le, le)?.squeeze(2)?)
+    Ok(unflatten_latent(tokens, 1, h, w)?.squeeze(2)?)
 }
 
-/// One LTX-2.3 resolution bucket's still geometry (sc-2127): the floored pixel edge the image is
-/// resized to, its latent edge, and the matching single-frame RoPE position grid.
-struct Ltx23BucketGrid {
-    edge: u32,
-    latent_edge: usize,
-    positions: Tensor,
+/// The single-frame latent grid `(h, w)` of an LTX-2.3 training canvas (one token per 32 px cell).
+fn ltx23_latent_hw(canvas: &TrainingCanvas) -> (usize, usize) {
+    (
+        canvas.height as usize / SPATIAL_SCALE,
+        canvas.width as usize / SPATIAL_SCALE,
+    )
 }
 
-/// The per-bucket still geometry of `cfg`, in [`TrainingConfig::training_buckets`] order (exactly the
-/// one legacy `bucket_resolution(cfg.resolution)` grid when buckets are off).
-fn ltx23_bucket_grids(cfg: &TrainingConfig, device: &Device) -> Result<Vec<Ltx23BucketGrid>> {
-    bucket_edges(cfg)
-        .into_iter()
-        .map(|edge| {
-            let latent_edge = edge as usize / SPATIAL_SCALE;
-            let positions =
-                create_position_grid(1, latent_edge, latent_edge, DEFAULT_FPS as f32, device)?;
-            Ok(Ltx23BucketGrid {
-                edge,
-                latent_edge,
-                positions,
-            })
-        })
-        .collect()
+/// The single-frame RoPE position grids of the LTX-2.3 cache, one per distinct latent grid `(h, w)`.
+/// Every entry of one grid shares the SAME tensor (refcounted clone), so the DiT's training RoPE
+/// cache — keyed by the positions tensor's id ([`LtxDiT::prepare_training_positions`]) — holds one
+/// table per distinct canvas shape, not one per cache entry.
+#[derive(Default)]
+struct Ltx23PositionGrids(Vec<((usize, usize), Tensor)>);
+
+impl Ltx23PositionGrids {
+    fn get(&mut self, (h, w): (usize, usize), device: &Device) -> Result<Tensor> {
+        if let Some((_, positions)) = self.0.iter().find(|(hw, _)| *hw == (h, w)) {
+            return Ok(positions.clone());
+        }
+        let positions = create_position_grid(1, h, w, DEFAULT_FPS as f32, device)?;
+        self.0.push(((h, w), positions.clone()));
+        Ok(positions)
+    }
 }
 
 fn available_device_bytes() -> u64 {
@@ -3164,13 +3176,14 @@ pub(crate) fn production_masked_av_lifecycle(
 }
 
 /// One bucket's LTX-2.3 subject-mask loss weight (sc-24828), from the item's already-loaded `mask`
-/// ([`PreparedSubjectMask::load_if_enabled`]), aligned token-for-token with that bucket's flattened
-/// clean latent: `None` when off. The mask is cropped like the image ([`decode_square`] centre-crops
-/// a square), area-averaged onto the encoded latent's `(h, w)` grid as `[1, 1, F, h, w]` (an image
-/// mask applies to every latent frame), then flattened by the latent's own [`flatten_latent`] to
-/// `[1, F·h·w, 1]` (broadcast over the channels).
+/// ([`PreparedSubjectMask::load_if_enabled`]), aligned token-for-token with that entry's flattened
+/// clean latent: `None` when off. The mask (same dimensions as the image) is cut to the image's
+/// canvas source box `crop`, area-averaged onto the encoded latent's `(h, w)` grid as
+/// `[1, 1, F, h, w]` (an image mask applies to every latent frame), then flattened by the latent's
+/// own [`flatten_latent`] to `[1, F·h·w, 1]` (broadcast over the channels).
 fn ltx23_subject_mask_weight(
     mask: Option<&PreparedSubjectMask>,
+    crop: CropBox,
     latent_shape: &[usize],
     device: &Device,
 ) -> Result<Option<Tensor>> {
@@ -3179,38 +3192,45 @@ fn ltx23_subject_mask_weight(
             "{LABEL}: subject mask needs a [B, C, F, h, w] latent, got {latent_shape:?}"
         )));
     };
-    let weight = prepared_subject_mask_weight(
-        LABEL,
-        mask,
-        CropBox::center_square,
-        &[1, 1, frames, h, w],
-        device,
-    )?;
+    let weight =
+        prepared_subject_mask_weight(LABEL, mask, |_, _| crop, &[1, 1, frames, h, w], device)?;
     Ok(weight.map(|w| flatten_latent(&w)).transpose()?)
 }
 
-/// One item's item-major LTX-2.3 cache entries (sc-2127 × sc-24828): the decoded `square` resized to
-/// each bucket grid's edge and encoded by `encode` (`[1, 3, 1, edge, edge]` still → `[1, C, F, h, w]`
-/// latent), flattened to tokens, paired with the caption `context`, that bucket's RoPE positions and
-/// the subject-mask weight on THAT bucket's latent grid.
+/// One item's item-major LTX-2.3 cache entries (sc-2127 × sc-24828): the whole decoded `rgb`
+/// resized onto its aspect-keeping training canvas at each bucket edge (about `edge²` pixels, never
+/// upscaled, sides multiples of [`CANVAS_STRIDE`], long side within [`CANVAS_MAX_SIDE`] — never
+/// centre-cropped to a square) and encoded by `encode` (`[1, 3, 1, h_px, w_px]` still →
+/// `[1, C, F, h, w]` latent), flattened to tokens, paired with the caption `context`, the RoPE
+/// positions of the latent's OWN `(h, w)` grid (from `positions`) and the subject-mask weight on
+/// that grid.
 fn ltx23_item_buckets(
-    square: &SquareImage,
-    grids: &[Ltx23BucketGrid],
+    rgb: &image::RgbImage,
+    edges: &[u32],
+    positions: &mut Ltx23PositionGrids,
     mask: Option<&PreparedSubjectMask>,
     context: &Tensor,
     device: &Device,
     mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
 ) -> Result<Vec<TrainingCached>> {
-    grids
+    edges
         .iter()
-        .map(|grid| {
-            let video = square_image_tensor(square, grid.edge, device)?.unsqueeze(2)?;
+        .map(|&edge| {
+            let canvas = image_canvas(rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+            let video = canvas_image_tensor(rgb, &canvas, device)?.unsqueeze(2)?;
             let latent = encode(&video)?;
-            let mask_weight = ltx23_subject_mask_weight(mask, latent.dims(), device)?;
+            let (_, _, frames, h, w) = latent.dims5()?;
+            if frames != 1 {
+                return Err(CandleError::Msg(format!(
+                    "{LABEL}: a still encoded to {frames} latent frames, expected 1"
+                )));
+            }
+            let mask_weight = ltx23_subject_mask_weight(mask, canvas.crop, latent.dims(), device)?;
             Ok(TrainingCached::Ltx23 {
                 clean: flatten_latent(&latent)?.to_dtype(DType::F32)?,
+                latent_hw: (h, w),
                 context: context.clone(),
-                positions: grid.positions.clone(),
+                positions: positions.get((h, w), device)?,
                 mask_weight,
             })
         })
@@ -3225,6 +3245,7 @@ fn compute_ltx23_loss_grads(
     dit: &LtxDiT,
     vars: &[Var],
     clean: &Tensor,
+    latent_hw: (usize, usize),
     context: &Tensor,
     positions: &Tensor,
     sigma: f64,
@@ -3237,6 +3258,7 @@ fn compute_ltx23_loss_grads(
         dit,
         vars,
         clean,
+        latent_hw,
         context,
         positions,
         sigma,
@@ -3251,12 +3273,15 @@ fn compute_ltx23_loss_grads(
 
 /// The LTX-2.3 step's loss terms on the raw velocity (epic 2123 E8): the (subject-mask weighted)
 /// regression toward `noise − clean` when the diffusion term contributes, and on a planned step with
-/// aux losses the weighted perceptual term on the x0 estimate `x_t − σ·v`, unflattened to the
-/// decoder's NCHW and decoded by TAELTX2.3. No aux step ⇒ exactly the legacy loss tensor.
+/// aux losses the weighted perceptual term on the x0 estimate `x_t − σ·v`, unflattened over the
+/// still's own latent grid `latent_hw` to the decoder's NCHW and decoded by TAELTX2.3. No aux step
+/// ⇒ exactly the legacy loss tensor.
+#[allow(clippy::too_many_arguments)]
 fn ltx23_step_loss(
     velocity: &Tensor,
     target: &Tensor,
     x_t: &Tensor,
+    latent_hw: (usize, usize),
     sigma: f64,
     mask_weight: Option<&Tensor>,
     mae: bool,
@@ -3274,7 +3299,7 @@ fn ltx23_step_loss(
                 sigma: sigma as f32,
             }
             .recover_x0(&x_t.to_dtype(DType::F32)?, &velocity.to_dtype(DType::F32)?)?;
-            a.aux_loss(&ltx23_latent_nchw(&x0_hat)?)?
+            a.aux_loss(&ltx23_latent_nchw(&x0_hat, latent_hw)?)?
         }
         _ => None,
     };
@@ -3290,6 +3315,7 @@ fn compute_ltx23_step_loss_grads(
     dit: &LtxDiT,
     vars: &[Var],
     clean: &Tensor,
+    latent_hw: (usize, usize),
     context: &Tensor,
     positions: &Tensor,
     sigma: f64,
@@ -3311,9 +3337,17 @@ fn compute_ltx23_step_loss_grads(
         let breakdown_ref = &breakdown;
         segments.push(Box::new(move |state: &[Tensor]| {
             let velocity = dit.velocity_out(&state[0], ctx_ref)?;
-            let (loss, losses) =
-                ltx23_step_loss(&velocity, &target, x_t_ref, sigma, mask_weight, mae, aux)
-                    .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+            let (loss, losses) = ltx23_step_loss(
+                &velocity,
+                &target,
+                x_t_ref,
+                latent_hw,
+                sigma,
+                mask_weight,
+                mae,
+                aux,
+            )
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
             breakdown_ref.set(Some(losses));
             Ok(vec![loss])
         }));
@@ -3331,8 +3365,16 @@ fn compute_ltx23_step_loss_grads(
         ))
     } else {
         let velocity = dit.forward(&x_t, sigma, context, positions)?;
-        let (loss, losses) =
-            ltx23_step_loss(&velocity, &target, &x_t, sigma, mask_weight, mae, aux)?;
+        let (loss, losses) = ltx23_step_loss(
+            &velocity,
+            &target,
+            &x_t,
+            latent_hw,
+            sigma,
+            mask_weight,
+            mae,
+            aux,
+        )?;
         Ok((losses, loss.backward()?))
     }
 }
@@ -3400,7 +3442,9 @@ impl FlowMatchTrainer for LtxTrainer {
     /// A cached LTX-2.3 still's clean tokens as the decoder's NCHW latent.
     fn reference_latent(&self, cached: &Self::Cached, _aux: &Self::Aux) -> Result<Tensor> {
         match cached {
-            TrainingCached::Ltx23 { clean, .. } => ltx23_latent_nchw(clean),
+            TrainingCached::Ltx23 {
+                clean, latent_hw, ..
+            } => ltx23_latent_nchw(clean, *latent_hw),
             TrainingCached::Ltx25(example) => {
                 let (Some(clean), Some(geometry)) =
                     (example.video_clean.as_ref(), example.video_geometry)
@@ -3459,12 +3503,17 @@ impl FlowMatchTrainer for LtxTrainer {
                 )?;
                 let tokenizer = TrainingTokenizer::Gemma3(tokenizer);
                 let encoder = TrainingTextEncoder::Gemma3(Box::new(encoder));
-                // sc-2127 — one spatial edge (+ its RoPE grid) per resolution bucket; stills, so the
-                // frame axis stays 1. Previews render at the largest bucket.
-                let grids = ltx23_bucket_grids(&req.config, device)?;
-                let latent_edge = grids.iter().map(|g| g.latent_edge).max().unwrap_or(0);
-                // Item-major: `cached[item * grids.len() + bucket]`.
-                let mut cached = Vec::with_capacity(req.items.len() * grids.len());
+                // sc-2127 — one spatial edge per resolution bucket; each still trains on its own
+                // aspect canvas there (RoPE grid per distinct latent grid); the frame axis stays 1.
+                let edges = bucket_edges(&req.config);
+                let max_edge = edges.iter().copied().max().unwrap_or(0);
+                let mut positions = Ltx23PositionGrids::default();
+                // Previews render at item 0's canvas at the largest bucket edge (a shape the run
+                // trains at); the square edge only if caching was cancelled before item 0.
+                let square = max_edge as usize / SPATIAL_SCALE;
+                let mut latent_hw = (square, square);
+                // Item-major: `cached[item * edges.len() + bucket]`.
+                let mut cached = Vec::with_capacity(req.items.len() * edges.len());
                 for (i, item) in req.items.iter().enumerate() {
                     if req.cancel.is_cancelled() {
                         break;
@@ -3474,16 +3523,28 @@ impl FlowMatchTrainer for LtxTrainer {
                         total: req.items.len() as u32,
                     });
                     let context = encode_context(&tokenizer, &encoder, &item.caption, device)?;
-                    let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-                                                                   // The item's subject mask, read + checked once (None when masked loss is off).
+                    // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge.
+                    // Every micro-step trains ONE cached entry, so entries of different shapes
+                    // never share a batch.
+                    let rgb = decode_rgb(&item.image_path)?;
+                    if i == 0 {
+                        latent_hw = ltx23_latent_hw(&image_canvas(
+                            &rgb,
+                            max_edge,
+                            CANVAS_STRIDE,
+                            CANVAS_MAX_SIDE,
+                        ));
+                    }
+                    // The item's subject mask, read + checked once (None when masked loss is off).
                     let mask = PreparedSubjectMask::load_if_enabled(
                         LABEL,
                         item,
                         req.config.subject_mask_loss.as_ref(),
                     )?;
                     cached.extend(ltx23_item_buckets(
-                        &square,
-                        &grids,
+                        &rgb,
+                        &edges,
+                        &mut positions,
                         mask.as_ref(),
                         &context,
                         device,
@@ -3514,7 +3575,7 @@ impl FlowMatchTrainer for LtxTrainer {
                                 contexts,
                                 vae: Arc::new(vae),
                                 aux: TrainingAux::Ltx23,
-                                latent_edge,
+                                latent_hw,
                             }),
                         }
                     } else {
@@ -3676,7 +3737,7 @@ impl FlowMatchTrainer for LtxTrainer {
                             contexts,
                             vae: Arc::new(vae),
                             aux: TrainingAux::Ltx25(aux.clone()),
-                            latent_edge: 0,
+                            latent_hw: (0, 0),
                         }),
                     }
                 } else {
@@ -3843,6 +3904,7 @@ impl FlowMatchTrainer for LtxTrainer {
                 TrainingDiT::Ltx23(dit),
                 TrainingCached::Ltx23 {
                     clean,
+                    latent_hw,
                     context,
                     positions,
                     mask_weight,
@@ -3858,6 +3920,7 @@ impl FlowMatchTrainer for LtxTrainer {
                     dit,
                     vars,
                     clean,
+                    *latent_hw,
                     context,
                     positions,
                     sigma,
@@ -3933,10 +3996,9 @@ impl FlowMatchTrainer for LtxTrainer {
     ) -> Result<Image> {
         match (dit, &state.contexts[index], &state.aux) {
             (TrainingDiT::Ltx23(dit), SampleContext::Ltx23(context), TrainingAux::Ltx23) => {
-                let edge = state.latent_edge;
-                let positions =
-                    &create_position_grid(1, edge, edge, DEFAULT_FPS as f32, &self.device)?;
-                let latent = crate::pipeline::create_noise(seed, 1, edge, edge, &self.device)?;
+                let (h, w) = state.latent_hw;
+                let positions = &create_position_grid(1, h, w, DEFAULT_FPS as f32, &self.device)?;
+                let latent = crate::pipeline::create_noise(seed, 1, h, w, &self.device)?;
                 let noise = flatten_latent(&latent)?;
                 let cancel = CancelFlag::new();
                 let mut progress = |_: Progress| {};
@@ -3951,7 +4013,7 @@ impl FlowMatchTrainer for LtxTrainer {
                     None,
                     |x, sigma| Ok(dit.forward(x, sigma as f64, context, positions)?),
                 )?;
-                let latent = unflatten_latent(&out.to_dtype(DType::F32)?, 1, edge, edge)?;
+                let latent = unflatten_latent(&out.to_dtype(DType::F32)?, 1, h, w)?;
                 frames_to_images(&state.vae.decode(&latent)?)?
                     .into_iter()
                     .next()
@@ -4418,7 +4480,17 @@ mod tests {
         };
         let run = |w: Option<&Tensor>, checkpoint: bool| {
             compute_ltx23_loss_grads(
-                &dit, &set.vars, &clean, &context, &positions, 0.4, &noise, false, w, checkpoint,
+                &dit,
+                &set.vars,
+                &clean,
+                (2, 2),
+                &context,
+                &positions,
+                0.4,
+                &noise,
+                false,
+                w,
+                checkpoint,
             )
             .unwrap()
         };
@@ -4550,44 +4622,76 @@ mod tests {
         assert!(err.contains("2048px"), "{err}");
     }
 
-    /// sc-2127: one still grid per bucket, in bucket order — floored edge, latent edge and a RoPE
-    /// grid with that bucket's token count (one frame); buckets off ⇒ the single legacy grid.
-    /// (Mutation: building every grid from the max edge makes the 512 grid the wrong size.)
+    /// Aspect canvas: the RoPE position grids follow each latent's own `(h, w)` — a portrait and a
+    /// landscape grid of equal token count get different grids, each equal to a direct
+    /// `create_position_grid` — and an equal grid hands back the SAME tensor (one training-RoPE
+    /// table per canvas shape, the DiT's cache being keyed by tensor id).
     #[test]
-    fn ltx23_bucket_grids_follow_each_bucket_edge() {
+    fn ltx23_position_grids_follow_each_latent_grid_and_share_equal_shapes() {
         let dev = Device::Cpu;
-        let legacy = ltx23_bucket_grids(&bucketed(1000, &[]), &dev).unwrap();
-        assert_eq!(legacy.len(), 1);
-        assert_eq!(legacy[0].edge, 992);
-        let grids = ltx23_bucket_grids(&bucketed(1000, &[512, 1024]), &dev).unwrap();
-        assert_eq!(
-            grids.iter().map(|g| g.edge).collect::<Vec<_>>(),
-            [512, 1024]
-        );
-        for g in &grids {
-            assert_eq!(g.latent_edge, g.edge as usize / SPATIAL_SCALE);
-            let expected =
-                create_position_grid(1, g.latent_edge, g.latent_edge, DEFAULT_FPS as f32, &dev)
-                    .unwrap();
-            assert_eq!(g.positions.dims(), expected.dims(), "edge {}", g.edge);
+        let mut grids = Ltx23PositionGrids::default();
+        let portrait = grids.get((4, 2), &dev).unwrap();
+        let landscape = grids.get((2, 4), &dev).unwrap();
+        for (got, (h, w)) in [(&portrait, (4, 2)), (&landscape, (2, 4))] {
+            let want = create_position_grid(1, h, w, DEFAULT_FPS as f32, &dev).unwrap();
+            assert_eq!(
+                got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                "{h}x{w}"
+            );
         }
-        assert_ne!(grids[0].positions.dims(), grids[1].positions.dims());
+        assert_ne!(portrait.id(), landscape.id());
+        assert_eq!(grids.get((4, 2), &dev).unwrap().id(), portrait.id());
+        assert_eq!(grids.0.len(), 2);
+    }
+
+    /// The captioned-still canvas keeps the source aspect on the VAE's 32 px token grid (no square
+    /// crop, no upscale), the spatial RoPE span caps its long side, and the preview latent grid
+    /// follows the non-square canvas.
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        use gen_core_train::canvas::{canvas_crop, training_canvas};
+        let c = training_canvas((1365, 2048), 1024, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!((c.width % 32, c.height % 32), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024, "{c:?}");
+        assert_eq!(c.crop, canvas_crop(1365, 2048));
+        assert_eq!((c.crop.width, c.crop.height), (1365, 2048), "whole frame");
+        let (h, w) = ltx23_latent_hw(&c);
+        assert_eq!((h, w), (c.height as usize / 32, c.width as usize / 32));
+        assert!(h > w);
+        // A source under the edge's area trains at its own (stride-floored) size.
+        assert_eq!(
+            training_canvas((1365, 2048), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE).size(),
+            (1344, 2048)
+        );
+        // A 4:1 strip at a 2048 edge stays within the 2048 px RoPE span.
+        let strip = training_canvas((8192, 2048), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert!(
+            strip.width <= 2048 && strip.width > strip.height,
+            "{strip:?}"
+        );
+        // The preview noise and its RoPE grid follow `(h, w)`.
+        let noise = crate::pipeline::create_noise(7, 1, h, w, &Device::Cpu).unwrap();
+        assert_eq!(noise.dims(), &[1, LATENT_CHANNELS, 1, h, w]);
+        let positions = create_position_grid(1, h, w, DEFAULT_FPS as f32, &Device::Cpu).unwrap();
+        assert_eq!(positions.dims(), &[1, 3, h * w, 2]);
     }
 
     /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached still carries a weight
-    /// lined up with ITS OWN flattened latent tokens (and positions), and the masked-out region is
-    /// zero. (Mutation: weighting every bucket on the first bucket's grid misaligns bucket 2.)
+    /// lined up with ITS OWN flattened, aspect-canvas latent tokens (and positions), the mask taking
+    /// the whole frame like the image, and the masked-out region is zero. (Mutation: weighting every
+    /// bucket on the first bucket's grid misaligns bucket 2.)
     #[test]
     fn subject_mask_weight_follows_each_buckets_latent_tokens() {
         let dev = Device::Cpu;
         let dir = tempfile::tempdir().unwrap();
-        // 96×64 image → center square x ∈ [16, 80); the subject is that square's left half (x < 48).
+        // 128×64 landscape, kept whole; the subject is the frame's left half (x < 64).
         let image_path = dir.path().join("img.png");
-        image::RgbImage::from_pixel(96, 64, image::Rgb([128, 64, 32]))
+        image::RgbImage::from_pixel(128, 64, image::Rgb([128, 64, 32]))
             .save(&image_path)
             .unwrap();
         let mask_path = dir.path().join("mask.png");
-        image::GrayImage::from_fn(96, 64, |x, _| image::Luma([if x < 48 { 255 } else { 0 }]))
+        image::GrayImage::from_fn(128, 64, |x, _| image::Luma([if x < 64 { 255 } else { 0 }]))
             .save(&mask_path)
             .unwrap();
         let item = candle_gen::gen_core::train::TrainingItem {
@@ -4603,18 +4707,30 @@ mod tests {
             subject_weight: 1.0,
         };
         let mask = PreparedSubjectMask::load(LABEL, &item, &cfg).unwrap();
-        let square = decode_square(&item.image_path).unwrap();
-        let grids = ltx23_bucket_grids(&bucketed(64, &[64, 128]), &dev).unwrap();
+        let rgb = decode_rgb(&item.image_path).unwrap();
+        let edges = bucket_edges(&bucketed(64, &[64, 128]));
         let context = Tensor::zeros((1, 3, 8), DType::F32, &dev).unwrap();
-        // A stand-in /32 still encoder: `[1, 3, 1, e, e]` → `[1, 3, 1, e/32, e/32]`.
+        // A stand-in /32 still encoder: `[1, 3, 1, h, w]` → `[1, 3, 1, h/32, w/32]`.
         let encode =
             |video: &Tensor| Ok(video.squeeze(2)?.avg_pool2d(SPATIAL_SCALE)?.unsqueeze(2)?);
-        let entries =
-            ltx23_item_buckets(&square, &grids, Some(&mask), &context, &dev, encode).unwrap();
+        let mut positions = Ltx23PositionGrids::default();
+        let entries = ltx23_item_buckets(
+            &rgb,
+            &edges,
+            &mut positions,
+            Some(&mask),
+            &context,
+            &dev,
+            encode,
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
-        for (entry, grid) in entries.iter().zip(&grids) {
+        // Edge 64: 128×64 at ~64² px floored to 32 → a 64×32 canvas (1×2 latent). Edge 128: the
+        // source is under 128², so it trains at its own 128×64 (2×4 latent) — never upscaled.
+        for (entry, (lh, lw)) in entries.iter().zip([(1usize, 2usize), (2, 4)]) {
             let TrainingCached::Ltx23 {
                 clean,
+                latent_hw,
                 positions,
                 mask_weight,
                 ..
@@ -4622,18 +4738,19 @@ mod tests {
             else {
                 panic!("an LTX-2.3 entry");
             };
-            let side = grid.latent_edge;
-            assert_eq!(clean.dim(1).unwrap(), side * side);
-            assert_eq!(positions.dims(), grid.positions.dims());
+            assert_eq!(*latent_hw, (lh, lw));
+            assert_eq!(clean.dim(1).unwrap(), lh * lw);
+            assert_eq!(positions.dims(), &[1, 3, lh * lw, 2]);
             let w = mask_weight.as_ref().expect("masked loss is on");
-            assert_eq!(w.dims(), &[1, side * side, 1], "edge {}", grid.edge);
+            assert_eq!(w.dims(), &[1, lh * lw, 1], "grid {lh}x{lw}");
             let values = w.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             for (i, v) in values.into_iter().enumerate() {
-                let want = if i % side < side / 2 { 1.0 } else { 0.0 };
-                assert_eq!(v, want, "edge {}: token {i}", grid.edge);
+                let want = if i % lw < lw / 2 { 1.0 } else { 0.0 };
+                assert_eq!(v, want, "grid {lh}x{lw}: token {i}");
             }
         }
-        let off = ltx23_item_buckets(&square, &grids, None, &context, &dev, encode).unwrap();
+        let off =
+            ltx23_item_buckets(&rgb, &edges, &mut positions, None, &context, &dev, encode).unwrap();
         assert!(off.iter().all(|e| matches!(
             e,
             TrainingCached::Ltx23 {
@@ -5307,6 +5424,7 @@ mod depth_anchoring_tests {
             &f.dit,
             &f.set.vars,
             &f.clean,
+            (2, 2),
             &f.context,
             &f.positions,
             sigma,
@@ -5331,7 +5449,7 @@ mod depth_anchoring_tests {
         let d = AuxDriver::prepare(
             path(),
             1,
-            |_| ltx23_latent_nchw(&f.clean),
+            |_| ltx23_latent_nchw(&f.clean, (2, 2)),
             &sched,
             1,
             &Default::default(),
@@ -5454,18 +5572,19 @@ mod depth_anchoring_tests {
     }
 
     /// The flattened `(1, S, C)` cache latent unflattens to the decoder's NCHW and round-trips
-    /// `flatten_latent`; a non-square token count is a typed error.
+    /// `flatten_latent` on a non-square (aspect-canvas) grid; a token count that does not match
+    /// the cached grid is a typed error.
     #[test]
     fn cached_tokens_map_to_the_decoder_layout() {
         let dev = Device::Cpu;
-        let z = splitmix_uniform(&[1, 8, 1, 3, 3], 5, 1.0, 0.0, &dev).unwrap();
-        let back = ltx23_latent_nchw(&flatten_latent(&z).unwrap()).unwrap();
-        assert_eq!(back.dims(), &[1, 8, 3, 3]);
+        let z = splitmix_uniform(&[1, 8, 1, 3, 2], 5, 1.0, 0.0, &dev).unwrap();
+        let back = ltx23_latent_nchw(&flatten_latent(&z).unwrap(), (3, 2)).unwrap();
+        assert_eq!(back.dims(), &[1, 8, 3, 2]);
         let a = back.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = z.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b);
         let odd = splitmix_uniform(&[1, 6, 8], 6, 1.0, 0.0, &dev).unwrap();
-        assert!(ltx23_latent_nchw(&odd).is_err());
+        assert!(ltx23_latent_nchw(&odd, (2, 2)).is_err());
     }
 
     /// AC (d), E7: depth grows the guarded footprint by TAELTX2.3 + DA2 (more for Large); the aux

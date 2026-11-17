@@ -12,7 +12,7 @@ use candle_gen::gen_core::train::{
 use candle_gen::gen_core::{
     self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
 };
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, step_sample, step_terms,
     validate_flow_match_request, weighted_velocity_loss, AuxDriver, AuxStep, StepLosses,
@@ -23,7 +23,8 @@ use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, Result};
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::canvas::canvas_crop;
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use crate::adapt::AdaptLinear;
 use crate::conditioner::AnimaTextConditioner;
@@ -35,6 +36,13 @@ use crate::transformer::CosmosDiT;
 use crate::vae::load_vae_encoder;
 
 const LABEL: &str = "anima trainer";
+/// Every training canvas side is a multiple of this: one Qwen-Image VAE cell (8 px) times the
+/// Cosmos DiT's 2×2 spatial patch.
+const CANVAS_STRIDE: u32 = crate::config::VAE_COMPRESSION * 2;
+/// The longest canvas side the trainer keeps — the family's render cap ([`crate::RES_MAX`],
+/// 1536), inside the Cosmos RoPE `max_size` (120 post-patch positions ≈ 1920 px) that
+/// `rope.rs` rejects beyond.
+const CANVAS_MAX_SIDE: Option<u32> = Some(crate::RES_MAX);
 
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
@@ -364,8 +372,9 @@ fn load_perceptual_path(
 }
 
 /// Epic 2123 E7: refuse a depth job whose resident DiT (`base_bytes`, its on-disk weights — the lower
-/// bound the aux models stack on) plus TAEW2.1 + the losses' frozen models at the largest bucket
-/// (`entries` cached references) exceeds `budget_bytes`. No-op when no aux loss is enabled. The
+/// bound the aux models stack on) plus TAEW2.1 + the losses' frozen models at the largest bucket's
+/// square `edge²` (every aspect canvas is at most that area — the worst case; `entries` cached
+/// references) exceeds `budget_bytes`. No-op when no aux loss is enabled. The
 /// trainer has one (dense) backward path.
 fn check_perceptual_memory(
     cfg: &candle_gen::gen_core::train::TrainingConfig,
@@ -506,19 +515,25 @@ impl AnimaTrainer {
             // onto that bucket's latent grid (`None` when masked loss is off).
             let mask =
                 PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge (about
+            // `edge²` pixels, never upscaled, sides multiples of [`CANVAS_STRIDE`] — never
+            // centre-cropped to a square). Every micro-step trains one cached entry, so entries of
+            // different shapes never share a batch; the DiT prepares one RoPE table per distinct
+            // latent shape (`prepare_training`, priced by `training_geometry_bytes`).
+            let rgb = decode_rgb(&item.image_path)?;
             for &edge in &edges {
-                let image = square_image_tensor(&square, edge, device)?;
+                let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                let image = canvas_image_tensor(&rgb, &canvas, device)?;
                 let x0 = vae_encoder
                     .encode(&image)?
                     .unsqueeze(2)?
                     .to_dtype(DType::F32)?;
-                // `decode_square` centre-crops to a square, so the mask takes the same crop; the
+                // The mask (same dimensions as the image) takes the image's own source box; the
                 // weight is built on `x0`'s `[1, 16, 1, h, w]` shape (last two axes = latent H, W).
                 let mask_weight = prepared_subject_mask_weight(
                     LABEL,
                     mask.as_ref(),
-                    CropBox::center_square,
+                    |_, _| canvas.crop,
                     x0.dims(),
                     device,
                 )?;
@@ -611,7 +626,7 @@ impl AnimaTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         let mut aux_driver = match perceptual {
@@ -843,6 +858,38 @@ mod tests {
         assert!(!descriptor.supports_control && !descriptor.supports_full_finetune);
         assert!(descriptor.techniques.subject_mask_loss);
         assert!(descriptor.techniques.resolution_buckets, "sc-2127");
+    }
+
+    /// The captioned-item canvas keeps the source aspect on the DiT's 16 px grid (no square crop,
+    /// no upscale, within `edge²`), stays inside the 1536 render cap, and every canvas it yields
+    /// builds a Cosmos RoPE for its own non-square post-patch `h × w` grid.
+    #[test]
+    fn a_portrait_trains_on_its_own_aspect_canvas_within_the_rope_table() {
+        use gen_core_train::canvas::training_canvas;
+        let c = training_canvas((1365, 2048), 1024, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        assert_eq!(
+            c.crop,
+            gen_core_train::subject_mask::CropBox::full(1365, 2048)
+        );
+        let dit = crate::config::DitConfig::anima();
+        // A 4:1 strip and the portrait at the shipped 1536 ceiling: long side capped at 1536.
+        for (dims, edge) in [
+            ((8000, 2000), 1536),
+            ((1365, 2048), 1536),
+            ((2048, 1365), 1024),
+        ] {
+            let c = training_canvas(dims, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+            assert!(
+                c.width.max(c.height) <= crate::RES_MAX,
+                "{dims:?}@{edge}: {c:?}"
+            );
+            assert!(c.area() <= u64::from(edge) * u64::from(edge));
+            let (pe_h, pe_w) = ((c.height / 16) as usize, (c.width / 16) as usize);
+            let rope = crate::rope::cosmos_image_rope(&dit, 1, pe_h, pe_w, &Device::Cpu).unwrap();
+            assert_eq!(rope.cos.dim(1).unwrap(), pe_h * pe_w, "{dims:?}@{edge}");
+        }
     }
 
     #[test]
