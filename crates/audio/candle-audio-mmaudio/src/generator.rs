@@ -421,6 +421,48 @@ impl MmAudioPipeline {
         )
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        frames: &[Image],
+        src_fps: f32,
+        duration: f32,
+        prompt: &str,
+        negative_prompt: &str,
+        steps: usize,
+        cfg: f64,
+        seed: u64,
+        progress: &mut dyn FnMut(PipelineProgress),
+        probe: &dyn Fn() -> bool,
+    ) -> AudioResult<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &descriptor(),
+            probe,
+            || {
+                self.synthesize(
+                    frames,
+                    src_fps,
+                    duration,
+                    prompt,
+                    negative_prompt,
+                    steps,
+                    cfg,
+                    seed,
+                    &mut |value| candle_audio::execution::callback(|| progress(value)),
+                    &|| candle_audio::execution::callback(probe),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    1,
+                ))
+            },
+        )
+    }
+
     /// The **injectable assembly core** (the sc-12843 wiring): from already-encoded conditioning
     /// features + a prior `x0`, reconfigure the DiT to the features' sequence lengths, run the
     /// Euler / CFG flow-matching sampler (reference `flow_matching.py` + `ode_wrapper`), and decode
@@ -456,6 +498,22 @@ impl MmAudioPipeline {
             .empty_conditions_with_text(1, neg_text_feat)
             .map_err(AudioError::from)?;
 
+        candle_audio::execution::runtime(x0.device(), x0.dtype());
+        candle_audio::execution::sampling(
+            "mmaudio-euler",
+            candle_audio::execution::json!({"cfg_bits":cfg.to_bits(),"steps":steps}),
+        );
+        candle_audio::execution::schedule(
+            "mmaudio-euler",
+            &(0..=steps)
+                .map(|i| i as f64 / steps as f64)
+                .collect::<Vec<_>>(),
+            "velocity",
+        );
+        candle_audio::execution::policy(
+            "conditioning",
+            candle_audio::execution::json!({"latent_shape":x0.dims(),"clip_shape":clip_feat.dims(),"sync_shape":sync_feat.dims(),"text_shape":text_feat.dims()}),
+        );
         let mut x = x0.clone();
         for i in 0..steps {
             if probe() {
@@ -484,6 +542,47 @@ impl MmAudioPipeline {
             .map_err(AudioError::from)?; // (1, 1, S)
         let samples: Vec<f32> = wav.flatten_all()?.to_vec1()?;
         Ok(samples)
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_from_features_with_execution_report(
+        &self,
+        clip_feat: &Tensor,     // (1, clip_seq_len, 1024)
+        sync_feat: &Tensor,     // (1, sync_seq_len, 768)
+        text_feat: &Tensor,     // (1, 77, 1024)
+        neg_text_feat: &Tensor, // (1, 77, 1024)
+        x0: &Tensor,            // (1, latent_seq_len, 20)
+        cfg: f64,
+        steps: usize,
+        progress: &mut dyn FnMut(PipelineProgress),
+        probe: &dyn Fn() -> bool,
+    ) -> AudioResult<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &descriptor(),
+            probe,
+            || {
+                candle_audio::execution::unavailable("native MMAudio feature route consumes caller-supplied initial noise without a frozen noise identity");
+                self.synthesize_from_features(
+                    clip_feat,
+                    sync_feat,
+                    text_feat,
+                    neg_text_feat,
+                    x0,
+                    cfg,
+                    steps,
+                    &mut |value| candle_audio::execution::callback(|| progress(value)),
+                    &|| candle_audio::execution::callback(probe),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    1,
+                ))
+            },
+        )
     }
 
     fn encode_clip_visual(&self, frames: &[FrameView<'_>]) -> AudioResult<Tensor> {
@@ -534,7 +633,11 @@ pub(crate) fn seeded_prior(
     latent_dim: usize,
     dev: &Device,
 ) -> CResult<Tensor> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+        "mmaudio/generator.rs",
+        "rand-0.9-StdRng",
+        seed,
+    ));
     let n = latent_seq_len * latent_dim;
     let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
     Tensor::from_vec(data, (1, latent_seq_len, latent_dim), dev)
@@ -631,6 +734,23 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 impl Generator for MmAudioGenerator {
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(gen_core::AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture_terminal_streaming(self, req, on_chunk, on_progress)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

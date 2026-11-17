@@ -31,6 +31,17 @@ fn needs_prompt_encoding(
             && inputs.negative.is_none())
 }
 
+fn selected_stream_device() -> Option<MossImageSelectedStreamDevice> {
+    match mlx_rs::Stream::task_local_or_default()
+        .get_device()
+        .and_then(|device| device.get_type())
+        .ok()?
+    {
+        mlx_rs::DeviceType::Cpu => Some(MossImageSelectedStreamDevice::Cpu),
+        mlx_rs::DeviceType::Gpu => Some(MossImageSelectedStreamDevice::Metal),
+    }
+}
+
 fn incremental_peak(peak: u64, owned: u64, committed: u64) -> u64 {
     peak.saturating_sub(owned.min(committed))
 }
@@ -400,6 +411,19 @@ impl MossImage {
         progress: &mut dyn FnMut(Progress),
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
+        self.execute_with_execution(request, inputs, progress, edit)
+            .map(|(output, _)| output)
+    }
+    fn execute_with_execution(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+        edit: Option<MossImageEditInputs<'_>>,
+    ) -> Result<(
+        MossImageAdvancedOutput,
+        gen_core::generator::ExecutionIdentity,
+    )> {
         let mut state = self
             .state
             .lock()
@@ -417,12 +441,35 @@ impl MossImage {
             progress,
             edit,
         );
+        let result = result.and_then(|output| {
+            check(&request.cancel)?;
+            let mut execution = gen_core_moss_image::execution::completed_identity(
+                state.report.as_ref(),
+                edit_report.as_ref(),
+                &self.descriptor,
+            )?;
+            gen_core_moss_image::execution::record_custom_adapter_policy(
+                &mut execution,
+                &self.spec.adapters,
+                &state.apply_reports,
+            )?;
+            Ok((output, execution))
+        });
         if result.is_err() {
             *edit_report = None;
             state.failed();
         }
         if result.is_err() || edit.is_some() {
-            self.sources.drain_cache()?;
+            if let Err(error) = self.sources.drain_cache() {
+                *edit_report = None;
+                state.failed();
+                return Err(error);
+            }
+        }
+        if result.is_ok() && request.cancel.is_cancelled() {
+            *edit_report = None;
+            state.failed();
+            return Err(Error::Canceled);
         }
         result
     }
@@ -440,6 +487,7 @@ impl MossImage {
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
         check(&request.cancel)?;
+        let device_before = selected_stream_device();
         self.sources.ensure_unchanged()?;
         let (resolved, count, sources, edit_assets) = self.admit(request, inputs, edit)?;
         // Only the selected immutable renderer may overlap conditioning activations.
@@ -522,6 +570,8 @@ impl MossImage {
         }
         let report = MossImageExecutionReport::new(MossImageExecutionData {
             execution_device: MossImageExecutionDevice::Mlx,
+            selected_stream_device: device_before
+                .filter(|device| Some(*device) == selected_stream_device()),
             resolved,
             assets: asset_receipts,
             sampling,
@@ -947,14 +997,54 @@ impl MossImageAdvancedGenerator for MossImage {
         self.execute(request, inputs, on_progress, None)
             .map_err(Into::into)
     }
+
+    fn generate_moss_advanced_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedMossImageAdvanced> {
+        let (output, execution) =
+            self.execute_with_execution(request, inputs, on_progress, None)?;
+        gen_core::generator::CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
+    }
 }
 impl Generator for MossImage {
+    fn generate_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        let (output, execution) = self.execute_with_execution(
+            request,
+            MossImageAdvancedInputs::default(),
+            progress,
+            None,
+        )?;
+        let MossImageAdvancedOutput::Images(images) = output else {
+            unreachable!("default image output")
+        };
+        gen_core::generator::CompletedGeneration::new(
+            gen_core::GenerationReport::from_output(GenerationOutput::Images(images)),
+            execution,
+            &self.descriptor,
+        )
+    }
     fn generate_moss_image_edit(
         &self,
         request: &GenerationRequest,
         inputs: MossImageEditInputs<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
+        self.generate_moss_image_edit_with_execution_report(request, inputs, progress)
+            .map(|completed| completed.output)
+    }
+    fn generate_moss_image_edit_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedMossImageEdit> {
         // Clear both receipts even if edit validation rejects before execution starts.
         {
             let mut state = self
@@ -970,8 +1060,9 @@ impl Generator for MossImage {
         }
         inputs.validate()?;
         let request = edit_request(request)?;
-        self.execute(&request, inputs.advanced, progress, Some(inputs))
-            .map_err(Into::into)
+        let (output, execution) =
+            self.execute_with_execution(&request, inputs.advanced, progress, Some(inputs))?;
+        gen_core::generator::CompletedMossImageEdit::new(output, execution, &self.descriptor)
     }
     fn moss_image_edit_request_peak(
         &self,

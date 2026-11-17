@@ -112,6 +112,8 @@ impl KeyframeNoise {
                 // Two independent sub-streams per keyframe: the posterior sample and the
                 // augmentation are separate draws in the reference too.
                 let base = KEYFRAME_ENCODE_SEED.wrapping_add((index as u64).wrapping_mul(2));
+                candle_gen::execution::stream("h3_keyframe_posterior", base);
+                candle_gen::execution::stream("h3_keyframe_augmentation", base.wrapping_add(1));
                 let mut r0 = rand::rngs::StdRng::seed_from_u64(base);
                 let mut r1 = rand::rngs::StdRng::seed_from_u64(base.wrapping_add(1));
                 let n = shape.iter().product::<usize>();
@@ -121,6 +123,7 @@ impl KeyframeNoise {
                 ))
             }
             Self::Provided(pair) => {
+                candle_gen::execution::unavailable("H3 explicit keyframe posterior/augmentation tensors have no recorded content digest");
                 let (posterior, aug) = pair.as_ref();
                 for (what, t) in [("posterior", posterior), ("augmentation", aug)] {
                     if t.dims() != shape {

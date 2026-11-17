@@ -135,7 +135,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
+    self, reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
     Progress, Quant, SizeFloor, StepSupport, WeightsSource,
 };
@@ -163,13 +163,13 @@ use crate::MODEL_ID;
 /// One render phase's start/finish log pair at `info` (sc-26691): the campaign's only window into
 /// where a multi-minute render is spending its time. Dropped without [`Self::done`] (an early `?`
 /// return) it logs nothing further — the error carries the story from there.
-struct PhaseLog {
+pub(crate) struct PhaseLog {
     phase: &'static str,
     started: std::time::Instant,
 }
 
 impl PhaseLog {
-    fn start(phase: &'static str) -> Self {
+    pub(crate) fn start(phase: &'static str) -> Self {
         tracing::info!(phase, "minimax-h3: phase start");
         Self {
             phase,
@@ -177,7 +177,7 @@ impl PhaseLog {
         }
     }
 
-    fn done(self) {
+    pub(crate) fn done(self) {
         tracing::info!(
             phase = self.phase,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
@@ -254,7 +254,7 @@ pub const MAX_STEPS: u32 = 200;
 /// An omitted seed uses gen-core's shared time-derived policy rather than a provider-local
 /// constant. The resolved value is then handed to either partition's initial latent draw, so all
 /// request paths preserve explicit-seed reproducibility.
-fn resolve_seed(req: &GenerationRequest) -> u64 {
+pub(crate) fn resolve_seed(req: &GenerationRequest) -> u64 {
     req.seed.unwrap_or_else(candle_gen::gen_core::default_seed)
 }
 
@@ -339,7 +339,7 @@ fn task_component_dirs(task: MiniMaxH3Task) -> &'static [&'static str] {
 /// produce the actionable "missing `<component>/config.json`" error against the root —
 /// `mlx_gen_minimax_h3::model`'s `resolve_dit_dir` makes the identical choice for the identical
 /// reason.
-fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a Path> {
+pub(crate) fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a Path> {
     match spec.components.get(component) {
         Some(WeightsSource::Dir(p)) => Some(p.as_path()),
         _ => None,
@@ -368,7 +368,9 @@ fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a P
 /// forbids, so it is a typed refusal at the registry boundary instead. This model publishes no NVFP4
 /// tier — `mlx_gen_minimax_h3::convert` packs MLX affine `q4`/`q8` only — so there is nothing to
 /// route it to.
-fn requested_tier(spec: &LoadSpec) -> candle_gen::gen_core::Result<Option<crate::tier::Tier>> {
+pub(crate) fn requested_tier(
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<Option<crate::tier::Tier>> {
     match spec.quantize {
         None => Ok(None),
         Some(Quant::Q4) => Ok(Some(crate::tier::Tier::Q4)),
@@ -402,7 +404,7 @@ fn require_component(root: &Path, component: &str) -> Result<()> {
 /// The tiered components are staged outside the snapshot root, so the check cannot be expressed as
 /// `root.join(component)` for them. Identical check, identical messages — only the path arithmetic
 /// moves to the caller.
-fn require_component_shards(dir: &Path, component: &str) -> Result<()> {
+pub(crate) fn require_component_shards(dir: &Path, component: &str) -> Result<()> {
     if !dir.is_dir() {
         return Err(CandleError::Msg(format!(
             "{MODEL_ID}: the snapshot has no `{component}/` component at {}",
@@ -670,6 +672,72 @@ fn terminal_device_sample(device: &Device) -> serde_json::Value {
 #[cfg(not(feature = "cuda"))]
 fn terminal_device_sample(_device: &Device) -> serde_json::Value {
     serde_json::json!({"method": "unavailable_without_cuda", "poolAvailable": false})
+}
+
+/// **The text-only conditioner pass**: map the Qwen3-VL-32B layer-50 tap from `te_dir`, run it
+/// over `(ids, mask)`, release it and synchronize — the phase H3 `t2va` and MiniMax-H3-Image
+/// `text2image` (SW-7091) both run, over the byte-identical `text_encoder/`.
+///
+/// The prefix trim is what keeps this to the 50 layers the tap runs: `lm_prefixes` names
+/// `embed_tokens` and layers `0..50`, so the header-only mmap never materializes layers 50-63,
+/// the final norm or `lm_head`.
+///
+/// With `grounded`, the pass is the vision-grounded one MiniMax-H3-Image `edit` (SW-7092) runs:
+/// the tower's merged embeds spliced over the `<|image_pad|>` runs and its deepstack features
+/// injected (`forward_with_images`). The tower itself was run, and released, before this.
+pub(crate) fn run_conditioner(
+    te_dir: &Path,
+    ids: &candle_gen::candle_core::Tensor,
+    mask: &candle_gen::candle_core::Tensor,
+    grounded: Option<&crate::text_encoder::GroundedVision>,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<candle_gen::candle_core::Tensor> {
+    with_conditioner(te_dir, device, |te| {
+        candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
+            None => te.forward(ids, mask),
+            Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
+        })
+    })
+}
+
+/// Keep one prepared conditioner alive for a phase containing multiple independent prompts.
+/// The streamed route still keeps its stack on the host and copies only the current layer.
+/// Release the stack before returning, including when a prompt fails or is cancelled.
+pub(crate) fn with_conditioner<T>(
+    te_dir: &Path,
+    device: &Device,
+    encode: impl FnOnce(&MiniMaxH3TextEncoder) -> Result<T>,
+) -> Result<T> {
+    let cfg = MiniMaxH3TeConfig::from_component_dir(te_dir)?;
+    let shards = candle_gen::loader::sorted_safetensors(te_dir, "minimax-h3 te")?;
+    let prefixes = lm_prefixes(LM_PREFIX, &cfg);
+    let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+    let policy = crate::block_stream::current();
+    let load_device = if policy.is_some() {
+        &Device::Cpu
+    } else {
+        device
+    };
+    let w = candle_gen::Weights::from_files_filtered_host_packed(
+        &shards,
+        load_device,
+        TE_STORE_DTYPE,
+        &refs,
+    )?;
+    let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+    drop(w);
+    if let Some(policy) = policy {
+        if policy.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        te.prepare_streamed(&cfg, device)?;
+    }
+    let result = encode(&te);
+    // Candle is eager: no output retains the encoder's weights or a lazy forward graph.
+    drop(te);
+    crate::dit::release_device_memory(device)?;
+    result
 }
 
 /// Whether the resolved source supports byte-preserving host-to-device block migration.
@@ -976,37 +1044,14 @@ impl MiniMaxH3 {
         let phase = PhaseLog::start("text_encoder");
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
-        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
-        let shards =
-            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
-        let prefixes = lm_prefixes(LM_PREFIX, &cfg);
-        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let policy = crate::block_stream::current();
-        let load_device = if policy.is_some() {
-            &Device::Cpu
-        } else {
-            &self.device
-        };
-        let w = candle_gen::Weights::from_files_filtered_host_packed(
-            &shards,
-            load_device,
-            TE_STORE_DTYPE,
-            &refs,
+        let context = run_conditioner(
+            &self.tiers.text_encoder_dir,
+            &ids,
+            &mask,
+            None,
+            &self.device,
+            on_progress,
         )?;
-        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
-        drop(w);
-        if let Some(policy) = policy {
-            if policy.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            te.prepare_streamed(&cfg, &self.device)?;
-        }
-        let context =
-            candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&ids, &mask))?;
-        // candle is eager, so `context` is already materialized here and dropping the encoder
-        // genuinely frees its weights — there is no lazy graph holding them alive.
-        drop(te);
-        crate::dit::release_device_memory(&self.device)?;
         phase.done();
         Ok(context)
     }
@@ -1133,6 +1178,12 @@ impl MiniMaxH3 {
         // wrong 66 GB. See [`MiniMaxH3Task`] and `tests/ref2va_checkpoint.rs`.
         let (task, references) = self.resolve_task(req)?;
         let patch = self.task_dit_config(task)?.patch_size;
+        candle_gen::execution::policy(
+            "h3_task",
+            serde_json::json!({
+                "task": format!("{task:?}"), "patch": patch, "guidance": "distilled_no_cfg"
+            }),
+        );
         if let Some(refs) = &references {
             return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
         }
@@ -2086,6 +2137,21 @@ fn reference_short_edge_for(req: &GenerationRequest) -> Result<i32> {
     Ok(candle_gen::gen_core::effective_reference_image_short_edge(req) as i32)
 }
 
+fn capture_h3_execution<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    loaded_adapter_count: usize,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        // The job-local DiT folds these adapters, but no byte-bound installation receipt survives.
+        candle_gen::execution::unobserved_adapters(
+            loaded_adapter_count,
+            "candle-gen-minimax-h3/src/model.rs",
+        );
+    })
+}
+
 impl Generator for MiniMaxH3 {
     fn veda_execution_report(&self) -> Option<candle_gen::gen_core::VedaExecutionReport> {
         Some(self.veda_report.borrow().clone())
@@ -2238,12 +2304,31 @@ impl Generator for MiniMaxH3 {
         crate::memory_strategy::begin_request(&self.contract, self.device.clone(), context)
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_h3_execution(self, req, on_progress, self.adapters.len())
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<GenerationOutput> {
-        Ok(self.generate_impl(req, on_progress)?)
+        let output = self.generate_impl(req, on_progress)?;
+        let report = self.veda_report.borrow();
+        candle_gen::execution::policy(
+            "h3_veda_completed",
+            serde_json::json!({
+                "kernel": report.kernel, "predictor": report.predictor, "plan": report.plan,
+                "exact_plan": report.exact_plan, "execution_grid": report.execution_grid,
+                "plan_grid": report.plan_grid, "sparse_calls": report.sparse_calls,
+                "dense_calls": report.dense_calls, "dense_fallback": report.fallback_reason.is_some()
+            }),
+        );
+        Ok(output)
     }
 }
 
@@ -2346,6 +2431,15 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
 ///   streaming. Deferred loads validate source migration support before materialization;
 ///   the request chooses whether the prepared host stack executes under a window.
 fn reject_unread_slots(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
+    reject_unread_slots_for(spec, MODEL_ID)
+}
+
+/// [`reject_unread_slots`] under another engine id of this crate — MiniMax-H3-Image (SW-7091)
+/// reads none of these slots either.
+pub(crate) fn reject_unread_slots_for(
+    spec: &LoadSpec,
+    model_id: &str,
+) -> candle_gen::gen_core::Result<()> {
     let mut unread: Vec<&str> = Vec::new();
     if spec.control.is_some() {
         unread.push("control");
@@ -2376,7 +2470,7 @@ fn reject_unread_slots(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
         return Ok(());
     }
     Err(candle_gen::gen_core::Error::Unsupported(format!(
-        "{MODEL_ID}: the candle lane reads none of these LoadSpec slots — {}. No code in this \
+        "{model_id}: the candle lane reads none of these LoadSpec slots — {}. No code in this \
          crate opens them, so honoring the load would render as though they were never set. \
          `control`/`extra_controls`/`ip_adapter` need the conditioning branches this lane has not \
          ported; `pid` and `identity` have no seam in this latent space; `text_encoder` is \
@@ -2718,6 +2812,60 @@ mod tests {
     ];
 
     use super::*;
+
+    struct AdapterReportFixture(ModelDescriptor);
+
+    impl Generator for AdapterReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+
+        fn validate(&self, _req: &GenerationRequest) -> gen_core::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            candle_gen::execution::rng_scheme("adapter-report-fixture");
+            candle_gen::execution::draw("initial_noise", 7, 0);
+            candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+            candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(GenerationOutput::Video {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }],
+                fps: 1,
+                audio: None,
+            })
+        }
+    }
+
+    #[test]
+    fn h3_report_refuses_loaded_adapters_without_receipt_but_allows_clean_attempt() {
+        use candle_gen::gen_core::generator::ExecutionIdentity;
+
+        let fixture = AdapterReportFixture(descriptor());
+        let req = GenerationRequest::default();
+        let clean = capture_h3_execution(&fixture, &req, &mut |_| {}, 0).unwrap();
+        assert!(matches!(
+            clean.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+        let adapted = capture_h3_execution(&fixture, &req, &mut |_| {}, 2).unwrap();
+        let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+            panic!("loaded adapters need an applied-stack receipt")
+        };
+        assert!(reason
+            .missing_facts
+            .iter()
+            .any(|fact| fact.contains("selected adapter count 2")));
+    }
 
     /// **The offload policy is forced, not echoed** — the tripwire the measured `vramGbByTier`
     /// depends on.
@@ -3108,8 +3256,10 @@ mod tests {
     /// size: deliberately blunt, in exchange for being exact about the regression that was live.
     fn staged_phases() -> [(&'static str, &'static [Phase]); 5] {
         [
+            // Both single-prompt renders and the training caption batch delegate their
+            // conditioner lifetime to this scope; pin the map and release at their owner.
             (
-                "fn encode_prompt(",
+                "fn with_conditioner<T>(",
                 &[(
                     "the 66.7 GB Qwen3-VL-32B text encoder",
                     TE_MAPS,

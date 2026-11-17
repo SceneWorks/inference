@@ -339,11 +339,13 @@ impl Flux1DevControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let (control_image, control_scale) = self.resolve_control(req)?;
+        observe_control_scale(control_scale);
         let plan = run.plan();
         let sigmas = plan.denoise_sigmas();
         let spans = plan.denoise_spans();
         let sampler_name = plan.sampler();
         let guidance = plan.guidance();
+        mlx_gen::image_execution::scalar("flux.guidance", guidance);
         // Sequential residency drops text weights before loading the VAE. Keep one Conditioning
         // phase open across that handoff so the control-image VAE encode is included without
         // retaining the text weights beside its large packed latent.
@@ -509,6 +511,28 @@ impl ControlBranch for Flux1DevControl {
     }
 }
 
+impl Flux1DevControl {
+    /// Load-time selections bound to every reported attempt.
+    fn observe_loaded(&self) {
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.loaded_sequential_residency",
+            &self.residency.is_sequential(),
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.load_precision_policy",
+            &self.loaded_spec.precision,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.load_quantization_policy",
+            &self.loaded_spec.quantize,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Flux1DevControl.applied_adapter_controls",
+            &crate::model::applied_adapter_controls(&self.loaded_spec),
+        );
+    }
+}
+
 impl Generator for Flux1DevControl {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -527,7 +551,7 @@ impl Generator for Flux1DevControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn generate_planned(
@@ -566,6 +590,53 @@ impl Generator for Flux1DevControl {
             &self.memory_strategy,
             context,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                self.observe_loaded();
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+
+    /// The admitted runner's entry: the same planned body, captured as one attempt that covers
+    /// the work inside its Conditioning/Denoise/Decode scopes.
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || self.observe_loaded(),
+        )
+    }
+}
+
+impl Flux1DevControl {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -978,5 +1049,51 @@ mod tests {
             !err.to_string().contains("single .safetensors file"),
             "expected an eager-load failure: {err}"
         );
+    }
+}
+
+fn observe_control_scale(control_scale: f32) {
+    mlx_gen::image_execution::scalar("flux.control_scale", control_scale);
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model_control::descriptor_dev_control();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_control_strength_distinguishes_same_seed_and_schedule() {
+        let weak = capture(|| observe_control_scale(0.25));
+        let strong = capture(|| observe_control_scale(0.75));
+        let weak = weak.resolved().unwrap();
+        let strong = strong.resolved().unwrap();
+        assert_eq!(weak.randomness, strong.randomness);
+        assert_eq!(weak.schedule, strong.schedule);
+        assert_ne!(weak.provider_choices, strong.provider_choices);
     }
 }

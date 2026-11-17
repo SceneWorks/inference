@@ -512,6 +512,10 @@ fn every_registered_generator_advertises_its_exact_latent_space() {
             // external decoder can consume it, so the descriptor deliberately advertises
             // nothing and fails closed against every decoder swap.
             "minimax_h3" => None,
+            // MiniMax-H3-Image (SW-7091) denoises in a 24-channel latent its OWN 2-D ViT decoder
+            // (`vae_diffusers/`) upsamples 16x in its output projection; no published latent
+            // space names it and no external decoder consumes it, so it fails closed too.
+            "minimax_h3_image" => None,
             family => panic!(
                 "{} has unclassified latent lineage for registered family {family}",
                 descriptor.id
@@ -1217,6 +1221,7 @@ fn complete_catalog_has_stable_conforming_surface() {
             "mage_flow_edit_base",
             "mage_flow_edit_turbo",
             "minimax_h3",
+            "minimax_h3_image",
             "mochi_1",
             "moss_image_base",
             "moss_image_sft",
@@ -1261,6 +1266,7 @@ fn complete_catalog_has_stable_conforming_surface() {
             "ltx_2_3",
             "ltx_2_5_distilled",
             "mage_flow_base",
+            "minimax_h3_image",
             "moss_image_base",
             "moss_image_sft",
             "qwen_image_2_1",
@@ -1294,9 +1300,11 @@ fn complete_catalog_has_stable_conforming_surface() {
     // `flux3_klein`, a generator with its own complete row: 66 / 56; sc-26239 adds
     // `flux3_klein_base`, a generator with its own complete row: 67 / 57; the sc-26240
     // `flux3_klein_base` trainer reuses that generator's id and row and adds no id; sc-24214
-    // adds `supra2_img`, a generator with its own complete row: 70 / 60 with the MOSS pair).
+    // adds `supra2_img`, a generator with its own complete row: 70 / 60 with the MOSS pair;
+    // `krea_2_turbo_control` and SW-7091's `minimax_h3_image` each add a generator id with its own
+    // row: 72 / 62).
     //
-    // Registration is never conditioned on the mapping: 54 < 64 because ten ids load nothing
+    // Registration is never conditioned on the mapping: 55 < 65 because ten ids load nothing
     // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
     // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
     // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -1308,8 +1316,8 @@ fn complete_catalog_has_stable_conforming_surface() {
         .chain(&text_embedders)
         .chain(&transforms)
         .collect();
-    assert_eq!(distinct.len(), 71);
-    assert_eq!(super::provider_components().len(), 61);
+    assert_eq!(distinct.len(), 72);
+    assert_eq!(super::provider_components().len(), 62);
 }
 
 /// The manifest emitter runs on **this** catalog's three slices, and its output is

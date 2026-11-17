@@ -381,6 +381,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "minimax_h3",
         components: &["minimax_h3", "qwen3_vl_32b_instruct"],
     },
+    // MiniMax-H3-Image (SW-7090): its own DiT / VAE / tokenizer under the MiniMax-H3-Image
+    // Community License, plus the same byte-identical Qwen3-VL-32B text encoder (Apache-2.0).
+    ProviderComponents {
+        provider_id: "minimax_h3_image",
+        components: &["minimax_h3_image", "qwen3_vl_32b_instruct"],
+    },
     // --- mochi -------------------------------------------------------------------------------
     // No adapters, ControlNets, refiners or safety models.
     ProviderComponents {
@@ -981,8 +987,9 @@ mod tests {
         // sc-26239: `flux3_klein_base` registers with its own complete row (77 / 67).
         // sc-26323: both MOSS providers join the union (79 / 69).
         // sc-24213: `supra2_img` registers with its own complete row (80 / 70).
-        assert_eq!(registered.len(), 80, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 70);
+        // SW-7090: `minimax_h3_image` registers with its own complete row (81 / 71).
+        assert_eq!(registered.len(), 81, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 71);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1049,12 +1056,12 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            31,
+            32,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
              sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239; MOSS Base/SFT in sc-26323; \
-             supra2_img in sc-24213)"
+             supra2_img in sc-24213, minimax_h3_image in SW-7090)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1091,14 +1098,15 @@ mod tests {
         // licences on `gen_core_iris::restoration_train::TRAINING_RESOURCES` and never ship in an
         // export). sc-26240 adds the `flux3_klein_base` trainer, which reuses the sc-26239
         // generator row. The epic's MOSS trainers (`moss_image_base`, `moss_image_sft`) reuse
-        // their generator rows, so they add two registrations without adding two rows.
+        // their generator rows, so they add two registrations without adding two rows. SW-7097's
+        // `minimax_h3_image` trainer reuses the minimax_h3_image generator row.
         let unique: BTreeSet<_> = trainers.iter().collect();
         assert_eq!(
             unique.len(),
             trainers.len(),
             "duplicate native trainer registrations"
         );
-        assert_eq!(trainers.len(), 23);
+        assert_eq!(trainers.len(), 24);
         for id in ["moss_image_base", "moss_image_sft"] {
             assert!(
                 trainers.iter().any(|trainer| trainer == id),

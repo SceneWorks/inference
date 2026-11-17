@@ -127,10 +127,47 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> Result<Box<dyn Generator>> {
     }))
 }
 
-mlx_gen::impl_generator!(Seedvr2Generator {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Seedvr2Generator {
+    fn generate_execution_attempt(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl mlx_gen::Generator for Seedvr2Generator {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
+    fn descriptor(&self) -> &mlx_gen::ModelDescriptor {
+        &self.descriptor
+    }
+    fn validate(&self, req: &mlx_gen::GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        let s = self;
+        s.validate_impl(req).map_err(Into::into)
+    }
+    fn generate(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
+    }
+}
 
 /// Refuse the [`Conditioning::VideoClip`] knobs SeedVR2 does not implement (sc-20263).
 ///
@@ -257,6 +294,7 @@ impl Seedvr2Generator {
                 return Err(Error::Canceled);
             }
             let seed = base_seed.wrapping_add(i as u64);
+            mlx_gen::video_execution::output_index(i as usize);
             // F-162 / F-164 (sc-11133): fold each image's per-tile progress into ONE monotone bar
             // across the whole count loop. `generate_with_progress` reports `(tile_idx, n_tiles)`
             // (a lone `(1,1)` on the single-pass path); mapping it to

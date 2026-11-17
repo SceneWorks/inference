@@ -222,6 +222,7 @@ impl SenseNovaGenerator {
             memory_strategy::validate_artifact_tier(&self.loaded_spec)
                 .map_err(CandleError::from)?;
             let cfg = NeoChatConfig::from_dir(&self.root)?;
+
             let vb = backbone_vb(&self.root, &self.device)?;
             let mut model =
                 if memory_strategy::streamable_spec(self.descriptor.id, &self.loaded_spec) {
@@ -358,6 +359,14 @@ fn decode_generated_image(
 }
 
 impl Generator for SenseNovaGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -628,6 +637,7 @@ pub(crate) fn snapshot_store_dtype(root: &Path) -> Option<DType> {
 #[doc(hidden)]
 pub fn load_understanding_for_diagnostics(root: &Path) -> Result<(T2iModel, SenseNovaTokenizer)> {
     let cfg = NeoChatConfig::from_dir(root)?;
+
     let device = candle_gen::default_device()?;
     let vb = backbone_vb(root, &device)?;
     let model = T2iModel::from_weights(&vb, &cfg)?;
@@ -644,6 +654,7 @@ pub struct SenseNovaUnderstanding {
     spec: LoadSpec,
     contract: gen_core::MemoryProviderContract,
     inventory: memory_strategy::CheckpointInventory,
+    document_numeric_policy: Option<serde_json::Value>,
 }
 
 impl SenseNovaUnderstanding {
@@ -714,6 +725,7 @@ impl SenseNovaUnderstanding {
 
     fn apply_request_memory(request: &GenerationRequest, options: &mut T2iOptions) {
         let memory = request.memory;
+        candle_gen::execution::policy("sensenova/lib/memory", format!("{memory:?}").into());
         options.attention_score_budget = memory
             .filter(|memory| memory.chunk_attention)
             .and_then(|memory| memory.attention_chunk_size)
@@ -780,6 +792,52 @@ impl SenseNovaUnderstanding {
     }
 
     /// Progress-capable sibling preserving the original entry point.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        question: &str,
+        images: &[Tensor],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        options: T2iOptions,
+        cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(String, candle_llm::core_llm::ExecutionIdentity)> {
+        let scope = candle_llm::core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(policy) = &self.document_numeric_policy {
+            scope.observe_numeric_policy(policy.clone());
+        }
+        let output = self.run_vqa_with_progress(
+            context,
+            request,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            options,
+            cancel,
+            &mut |event| {
+                candle_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            return Err(CandleError::Canceled);
+        }
+        let execution = scope.finish_document(
+            MODEL_ID,
+            "candle",
+            serde_json::json!({"format":"text","trim_whitespace":true,"think_mode":false}),
+        );
+        execution
+            .validate(MODEL_ID, "candle", 1)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_vqa_with_progress(
         &self,
@@ -852,6 +910,54 @@ impl SenseNovaUnderstanding {
     }
 
     /// Progress-capable sibling preserving the original entry point.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(InterleaveOutput, candle_llm::core_llm::ExecutionIdentity)> {
+        let scope = candle_llm::core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(policy) = &self.document_numeric_policy {
+            scope.observe_numeric_policy(policy.clone());
+        }
+        let output = self.run_interleave_with_progress(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            cancel,
+            &mut |event| {
+                candle_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let execution = scope.finish_document(MODEL_ID, "candle", serde_json::json!({"format":"interleaved_document","image_encoding":"model_space_rgb_nchw","image_dtypes":output.images.iter().map(|image| format!("{:?}",image.dtype())).collect::<Vec<_>>(),"image_count":output.images.len(),"image_shapes":output.images.iter().map(|image| image.dims()).collect::<Vec<_>>()}));
+        execution
+            .validate(MODEL_ID, "candle", 1)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_interleave_with_progress(
         &self,
@@ -927,6 +1033,7 @@ pub fn load_understanding_with_spec(spec: &LoadSpec) -> Result<SenseNovaUndersta
         .validate_numeric_tier(spec)
         .map_err(CandleError::from)?;
     let cfg = NeoChatConfig::from_dir(root)?;
+
     let device = candle_gen::default_device()?;
     let vb = backbone_vb(root, &device)?;
     let model = if memory_strategy::streamable_spec(MODEL_ID, spec) {
@@ -937,6 +1044,13 @@ pub fn load_understanding_with_spec(spec: &LoadSpec) -> Result<SenseNovaUndersta
     let tokenizer = SenseNovaTokenizer::from_dir(root)?;
     let contract = memory_strategy::provider_contract(MODEL_ID, spec).map_err(CandleError::from)?;
     inventory.ensure_unchanged().map_err(CandleError::from)?;
+    let document_numeric_policy = snapshot_store_dtype(root).map(|store_dtype| {
+        serde_json::json!({
+            "backbone_quantization": format!("{:?}", spec.quantize),
+            "store_dtype": format!("{store_dtype:?}"),
+            "device": format!("{device:?}")
+        })
+    });
     Ok(SenseNovaUnderstanding {
         model,
         tokenizer,
@@ -944,6 +1058,7 @@ pub fn load_understanding_with_spec(spec: &LoadSpec) -> Result<SenseNovaUndersta
         spec: spec.clone(),
         contract,
         inventory,
+        document_numeric_policy,
     })
 }
 

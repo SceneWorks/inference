@@ -1,0 +1,1 @@
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-bonsai-gguf-preflight.json"

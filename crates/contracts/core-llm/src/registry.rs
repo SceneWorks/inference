@@ -200,7 +200,7 @@ impl ModelRequirements {
             vision: req.has_image() || video,
             video,
             audio: req.has_audio(),
-            constraints: req.constraint.iter().copied().collect(),
+            constraints: req.constraint.iter().cloned().collect(),
         }
     }
 

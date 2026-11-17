@@ -49,6 +49,7 @@ pub mod error;
 pub mod gguf;
 pub mod image;
 pub mod llava;
+pub mod modelopt;
 pub mod models;
 pub mod prepare;
 pub mod primitives;

@@ -139,6 +139,15 @@ pub enum ModelOutputType {
 }
 
 impl ModelOutputType {
+    /// Nodes actually consumed by the tile decoder, including only executed Euler transitions.
+    fn execution_schedule(self, timesteps: &[f32]) -> Vec<f32> {
+        let mut schedule = timesteps.to_vec();
+        if self == Self::Velocity {
+            schedule.push(0.0);
+        }
+        schedule
+    }
+
     fn parse(s: &str) -> Result<Self> {
         match s {
             "x0" => Ok(Self::X0),
@@ -1887,6 +1896,14 @@ impl NaDiffusionDecoder {
         let context = self.stage_4(feature, is_origin, pad_trailing)?;
         context.eval()?;
         let schedule = self.timesteps();
+        mlx_gen::video_execution::sampling(
+            "ltx_diffusion_decoder",
+            "euler",
+            &format!("{:?}", self.cfg.model_output_type),
+            serde_json::json!({}),
+        );
+        let execution_schedule = self.cfg.model_output_type.execution_schedule(&schedule);
+        mlx_gen::video_execution::schedule("ltx_diffusion_decoder", &execution_schedule);
         let mut x_t = x_t_init.clone();
         for i in 0..schedule.len() - 1 {
             let out = self.diff_step(&context, &x_t, schedule[i])?;

@@ -66,7 +66,7 @@ use candle_gen::{CandleError, Result, Weights};
 use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
-use crate::nn::{rms_weighted, sdpa_planned, silu};
+use crate::nn::{rms_weighted, sdpa_planned, silu_f32_rounded};
 
 #[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
 #[cfg(test)]
@@ -144,6 +144,13 @@ impl LoraResidual {
     /// The per-adapter strength this residual folds at.
     pub fn scale(&self) -> f64 {
         self.scale
+    }
+
+    /// `a · b`, the `[in, out]` delta this residual adds before its strength — read by the
+    /// layout-and-tier install test, which compares the folds of differently spelled files.
+    #[cfg(test)]
+    pub(crate) fn delta(&self) -> Result<Tensor> {
+        Ok(self.a.matmul(&self.b)?)
     }
 }
 
@@ -226,12 +233,57 @@ impl LinearNoBias {
         let in_features = *dims.last().expect("LinearNoBias::forward: x has no axes");
         let rows = x.elem_count() / in_features;
         let x = x.reshape((rows, in_features))?;
-        let mut y = self.inner.forward_upcast(&x)?;
+        let y = self.inner.forward_upcast(&x)?;
+        let y = self.add_lokr(&x, y)?;
+        let mut out_dims = dims;
+        *out_dims
+            .last_mut()
+            .expect("LinearNoBias::forward: x has no axes") = self.inner.out_features();
+        Ok(y.reshape(out_dims)?)
+    }
+
+    /// A **residual-only** projection slot (SW-7096): no base tensor at all (the shared seam's
+    /// external-base storage), so the strict install can push LoRA/LoKr residuals onto it — shape-
+    /// checked against `[out, in]` exactly as onto a real leaf — for a projection whose own base is
+    /// not a `LinearNoBias` (the raw bias-Linear heads, the AdaLN projection). The owner computes
+    /// its base, then calls [`Self::add_residuals`].
+    pub(crate) fn residual_slot(
+        in_features: usize,
+        out_features: usize,
+        dtype: DType,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: AdaptLinear::for_external_base(in_features, out_features, dtype, device)?,
+            base_bytes: 0,
+            adapters: Vec::new(),
+            lokr_adapters: Vec::new(),
+        })
+    }
+
+    /// `y + Σ residual(x)` over any leading dims, under the same rules as [`Self::forward`].
+    pub(crate) fn add_residuals(&self, x: &Tensor, y: Tensor) -> Result<Tensor> {
+        if !self.is_adapted() {
+            return Ok(y);
+        }
+        let in_features = *x.dims().last().expect("add_residuals: x has no axes");
+        let out_dims = y.dims().to_vec();
+        let out_features = *out_dims.last().expect("add_residuals: y has no axes");
+        let rows = x.elem_count() / in_features;
+        let x = x.reshape((rows, in_features))?;
+        let y = y.reshape((rows, out_features))?;
+        let y = self.inner.apply_residuals(&x, y)?;
+        let y = self.add_lokr(&x, y)?;
+        Ok(y.reshape(out_dims)?)
+    }
+
+    /// Add every structured-LoKr residual to a 2-D `y`.
+    fn add_lokr(&self, x: &Tensor, mut y: Tensor) -> Result<Tensor> {
         for adapter in &self.lokr_adapters {
             if adapter.scale == 0.0 {
                 continue;
             }
-            let residual = adapter.factors.residual(&x)?;
+            let residual = adapter.factors.residual(x)?;
             let output_dtype = y.dtype();
             let residual = residual.to_dtype(output_dtype)?;
             if adapter.swap_output_halves {
@@ -256,11 +308,7 @@ impl LinearNoBias {
                 y = (y + residual)?;
             }
         }
-        let mut out_dims = dims;
-        *out_dims
-            .last_mut()
-            .expect("LinearNoBias::forward: x has no axes") = self.inner.out_features();
-        Ok(y.reshape(out_dims)?)
+        Ok(y)
     }
 
     /// Attach a forward-time LoRA residual. `a` is `[in, rank]`, `b` is `[rank, out]` with
@@ -304,6 +352,13 @@ impl LinearNoBias {
             swap_output_halves,
             scale,
         });
+    }
+
+    /// The shared projection itself, for the trainer's live `Var`-backed residuals (SW-7098) —
+    /// pushed through [`AdaptLinear::push_trainable_lora`] and its LoKr twins, so a device copy of
+    /// a host block carries the same leaves and every loss reaches them.
+    pub(crate) fn trainable_mut(&mut self) -> &mut AdaptLinear {
+        &mut self.inner
     }
 
     /// Drop every attached residual, reverting to the bare base.
@@ -496,6 +551,49 @@ impl DitAttention {
     ///
     /// `cancel` reaches the attention kernel: the fused path checks it once per call (one call =
     /// one layer), the budgeted fallback before every query chunk (sc-26691).
+    /// The attention scores of `x` (`q·kᵀ·scale` over the normalized, rotated q / k, every head),
+    /// reduced to `(max |score|, mean over heads and query rows of the softmax's largest
+    /// probability)` — evidence for the trainer's real-weight gradient gate (SW-7098). Test-only.
+    #[cfg(test)]
+    pub(crate) fn score_stats(
+        &self,
+        x: &Tensor,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+    ) -> Result<(f32, f32)> {
+        let (b, seq, _) = x.dims3()?;
+        let (h, d) = (self.heads, self.head_dim);
+        let q = self.to_q.forward(x)?.reshape((b, seq, h, d))?;
+        let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
+        let q = rms_weighted(&q, &self.norm_q, self.qk_norm_eps)?;
+        let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
+        let (q, k) = match rope {
+            Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
+            None => (q, k),
+        };
+        let qh = q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let kt = k
+            .transpose(1, 2)?
+            .transpose(2, 3)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        let mut max_abs = 0f32;
+        let mut prob_sum = 0f64;
+        for head in 0..h {
+            let scores = (qh.narrow(1, head, 1)?.matmul(&kt.narrow(1, head, 1)?)?
+                * (1.0 / (d as f64).sqrt()))?;
+            max_abs = max_abs.max(scores.abs()?.max_all()?.to_scalar::<f32>()?);
+            let probs =
+                candle_gen::candle_nn::ops::softmax(&scores, candle_gen::candle_core::D::Minus1)?;
+            prob_sum += f64::from(
+                probs
+                    .max_keepdim(candle_gen::candle_core::D::Minus1)?
+                    .sum_all()?
+                    .to_scalar::<f32>()?,
+            );
+        }
+        Ok((max_abs, (prob_sum / (b * h * seq) as f64) as f32))
+    }
+
     pub(crate) fn forward_veda(
         &self,
         x: &Tensor,
@@ -838,7 +936,9 @@ impl DitFeedForward {
     fn forward_span(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.proj.forward(x)?;
         let (gate, value) = split_gate_value(&h)?;
-        self.out.forward(&(silu(&gate)?.mul(&value)?))
+        // torch's `hidden_states * F.silu(gate)`: SiLU at float32, rounded once (SW-7092).
+        let activated = silu_f32_rounded(&gate)?;
+        self.out.forward(&activated.mul(&value)?)
     }
 }
 

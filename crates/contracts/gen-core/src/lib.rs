@@ -59,6 +59,7 @@ pub mod generator;
 pub mod guidance;
 pub mod h3_adapter_memory;
 pub mod h3_conditioning_memory;
+pub mod h3_image;
 pub mod h3_memory;
 pub mod h3_reference;
 pub mod hdr;
@@ -114,7 +115,7 @@ pub use audio_dsp::{
 pub use audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 pub use audio_transform::{
     AudioTarget, AudioTransform, AudioTransformCapabilities, AudioTransformDescriptor,
-    AudioTransformKind, AudioTransformRequest,
+    AudioTransformKind, AudioTransformRequest, CompletedAudioTransform,
 };
 pub use caption::{
     apply_caption_trigger_words, CaptionCapabilities, CaptionFinishReason, CaptionOptions,
@@ -324,8 +325,8 @@ pub use transcribe::{
     TranscriptOutput, TranscriptSegment, TranscriptWord,
 };
 pub use transform::{
-    InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
-    TransformRequest,
+    CompletedTransform, InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities,
+    TransformDescriptor, TransformRequest,
 };
 
 /// gen-core's package version, for the version-skew runtime guard (sc-4482).

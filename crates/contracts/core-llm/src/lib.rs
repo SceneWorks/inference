@@ -63,9 +63,13 @@ pub mod constraint;
 pub mod defaults;
 pub mod detok;
 pub mod error;
+pub mod execution_identity;
+pub mod json_schema;
 pub mod kv_compression;
 pub mod message;
+pub mod minimax_h3_image_pe;
 pub mod model_config;
+pub mod modelopt;
 pub mod mtp_head;
 pub mod output;
 pub mod paging;
@@ -86,6 +90,7 @@ pub mod switch;
 pub mod template;
 pub mod text_llm;
 pub mod thinking;
+pub mod token_execution;
 pub mod tokenizer;
 pub mod tool;
 pub mod vision_preprocess;
@@ -101,6 +106,12 @@ pub use constraint::{
 pub use defaults::{speculative_default, DecodeBackend, DecodeDefaults, RecommendedDepths};
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
+pub use execution_identity::{
+    ExecutionDraw, ExecutionFact, ExecutionIdentity, ExecutionRandomness, ExecutionReplaySupport,
+    ExecutionUnavailable, NumericScheduleDigest, ResolvedExecutionIdentity,
+    EXECUTION_IDENTITY_VERSION,
+};
+pub use json_schema::{JsonSchema, SchemaState};
 pub use kv_compression::{
     compressed_kv_cache_bytes, kv_model_family, plan_kv_cache, plan_kv_cache_without_reader,
     qualified_kv_model_family, qualify_kv_compression, CompressedKvAllocation, KvAttentionGeometry,
@@ -128,8 +139,8 @@ pub use prefix::{
     PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
-    detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
-    SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
+    check_prepare_output, detect_format, ModelFormat, PrepareReport, PrepareSpec,
+    SnapshotPreparerRegistration, SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
 pub use prism::{
     apply_hadamard_forward_in_place, apply_hadamard_inverse_in_place, decode_block_into,
@@ -184,16 +195,16 @@ pub use speculative::{
 pub use starvector::{
     emit_svg_done, generated_token_budget, starvector_conditioning_image, svg_finish_reason,
     svg_text_output, validate_advertised_generated_token_cap, validate_generated_token_budget,
-    validate_loaded_svg_context_cap, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,
-    StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput,
-    StarVectorProvider, StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus,
-    StarVectorTier, VisionEncoderArchitecture,
+    validate_loaded_svg_context_cap, CompletedStarVector, DecoderArchitecture, ImagePreprocessing,
+    ProjectionMetadata, StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason,
+    StarVectorOutput, StarVectorProvider, StarVectorRequest, StarVectorStreamEvent,
+    StarVectorStreamStatus, StarVectorTier, VisionEncoderArchitecture,
 };
 pub use stop::{StopChunk, StopMatcher};
 pub use template::{
     ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template, RenderOptions,
 };
-pub use text_llm::TextLlm;
+pub use text_llm::{CompletedTextLlm, TextLlm};
 pub use thinking::{ThinkingSegmenter, ThinkingSpan};
 pub use tokenizer::{Tokenizer, TokenizerDecodeStream};
 pub use tool::{ToolCall, ToolCallSegmenter, ToolSpec};

@@ -18,6 +18,28 @@ pub const MODALITY_NUM: usize = 3;
 /// `scale_msa`, `gate_msa`, `shift_mlp`, `scale_mlp`, `gate_mlp`, in that order.
 pub const MODULATION_PARAMS: usize = 6;
 
+/// Which published transformer a [`MiniMaxH3DitConfig`] describes.
+///
+/// MiniMax-H3-Image (`MiniMaxH3ImageTransformer2DModel`, SW-7091) is the MiniMax-H3 transformer
+/// **without its audio stream** and with one output head per distilled sampling step in place of
+/// `proj_out`. Every block, the token refiner, the MM-RoPE and `norm_out` are the same modules at
+/// the same shipped geometry, so the variant only decides which top-level tensors load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DitVariant {
+    /// `MiniMaxH3Transformer3DModel`: video + audio inputs, one `proj_out` + `audio_proj_out`.
+    #[default]
+    AudioVideo,
+    /// `MiniMaxH3ImageTransformer2DModel`: image rows only (tagged video), no audio tensors, and
+    /// `pdd_proj_out.{0..num_pdd_heads}` — sampling step `i` projects through head `i`.
+    Image {
+        /// Distilled sampling steps, one output head each. Shipped: 6.
+        num_pdd_heads: usize,
+    },
+}
+
+/// The `_class_name` MiniMax-H3-Image's `transformer_diffusers/config.json` carries.
+pub const IMAGE_DIT_CLASS: &str = "MiniMaxH3ImageTransformer2DModel";
+
 /// Geometry of `MiniMaxH3Transformer3DModel`, read from `transformer/config.json`.
 ///
 /// The defaults are the shipped values. Every field is dimension-parametric so the parity fixture
@@ -39,7 +61,7 @@ pub struct MiniMaxH3DitConfig {
     pub ffn_dim: usize,
     /// Video latent channels. Shipped: 24.
     pub in_channels: usize,
-    /// Audio latent channels. Shipped: 32.
+    /// Audio latent channels. Shipped: 32. `0` on [`DitVariant::Image`], which has no audio stream.
     pub audio_in_channels: usize,
     /// `(t, h, w)` patch. Shipped: `[1, 2, 2]`.
     pub patch_size: [usize; 3],
@@ -63,6 +85,8 @@ pub struct MiniMaxH3DitConfig {
     pub qk_norm_eps: f64,
     /// Epsilon of the refiner's `final_norm` and of `norm_out`. Shipped: 1e-5.
     pub final_norm_eps: f64,
+    /// Which published transformer this is — decides the top-level tensor set.
+    pub variant: DitVariant,
 }
 
 impl Default for MiniMaxH3DitConfig {
@@ -86,11 +110,35 @@ impl Default for MiniMaxH3DitConfig {
             norm_eps: 1e-5,
             qk_norm_eps: 1e-5,
             final_norm_eps: 1e-5,
+            variant: DitVariant::AudioVideo,
         }
     }
 }
 
 impl MiniMaxH3DitConfig {
+    /// The shipped MiniMax-H3-Image geometry (`transformer_diffusers/config.json` @ 492fd8c4): the
+    /// H3 stack at the same dims, no audio stream, six per-step output heads.
+    pub fn image() -> Self {
+        Self {
+            audio_in_channels: 0,
+            variant: DitVariant::Image { num_pdd_heads: 6 },
+            ..Self::default()
+        }
+    }
+
+    /// Whether this transformer carries the audio stream (`audio_proj_in` / `audio_proj_out`).
+    pub fn has_audio(&self) -> bool {
+        matches!(self.variant, DitVariant::AudioVideo)
+    }
+
+    /// The per-step output heads, or `None` for the single `proj_out` of H3 video.
+    pub fn num_pdd_heads(&self) -> Option<usize> {
+        match self.variant {
+            DitVariant::AudioVideo => None,
+            DitVariant::Image { num_pdd_heads } => Some(num_pdd_heads),
+        }
+    }
+
     /// `heads · head_dim` — the attention inner width, 7168 in the shipped model.
     pub fn inner_dim(&self) -> usize {
         self.num_attention_heads * self.attention_head_dim
@@ -147,7 +195,89 @@ impl MiniMaxH3DitConfig {
                 self.rope_theta
             )));
         }
+        match self.variant {
+            DitVariant::AudioVideo if self.audio_in_channels == 0 => {
+                return Err(CandleError::Msg(
+                    "minimax-h3 dit: the audio+video transformer needs audio_in_channels > 0"
+                        .into(),
+                ))
+            }
+            DitVariant::Image { num_pdd_heads: 0 } => {
+                return Err(CandleError::Msg(
+                    "minimax-h3-image dit: num_pdd_heads must be positive; the checkpoint has one \
+                     output head per distilled step"
+                        .into(),
+                ))
+            }
+            DitVariant::Image { .. } if self.audio_in_channels != 0 => {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3-image dit: the image transformer has no audio stream, got \
+                     audio_in_channels {}",
+                    self.audio_in_channels
+                )))
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Parse a DiT partition's `config.json`, dispatching on its `_class_name`:
+    /// [`IMAGE_DIT_CLASS`] parses through [`Self::from_image_diffusers_json`], anything else through
+    /// [`Self::from_diffusers_json`] (the H3 video transformer, whose published config carries
+    /// `MiniMaxH3Transformer3DModel`).
+    pub fn from_partition_json(text: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| CandleError::Msg(format!("minimax-h3 dit config: {e}")))?;
+        if v.get("_class_name").and_then(serde_json::Value::as_str) == Some(IMAGE_DIT_CLASS) {
+            Self::from_image_diffusers_json(text)
+        } else {
+            Self::from_diffusers_json(text)
+        }
+    }
+
+    /// Parse MiniMax-H3-Image's `transformer_diffusers/config.json`.
+    ///
+    /// Requires `_class_name` [`IMAGE_DIT_CLASS`] and `num_pdd_heads`, and **refuses** an
+    /// `audio_in_channels` key: the image transformer has no audio stream, so a config that names
+    /// one is not this checkpoint. Every shared key is required exactly as in
+    /// [`Self::from_diffusers_json`].
+    pub fn from_image_diffusers_json(text: &str) -> Result<Self> {
+        let mut v: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| CandleError::Msg(format!("minimax-h3-image dit config: {e}")))?;
+        let class = v.get("_class_name").and_then(serde_json::Value::as_str);
+        if class != Some(IMAGE_DIT_CLASS) {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3-image dit config: `_class_name` must be {IMAGE_DIT_CLASS}, got {class:?}"
+            )));
+        }
+        let obj = v.as_object_mut().ok_or_else(|| {
+            CandleError::Msg("minimax-h3-image dit config: not a JSON object".into())
+        })?;
+        if obj.contains_key("audio_in_channels") {
+            return Err(CandleError::Msg(
+                "minimax-h3-image dit config: carries `audio_in_channels`, but the image \
+                 transformer has no audio stream"
+                    .into(),
+            ));
+        }
+        let heads = obj
+            .get("num_pdd_heads")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3-image dit config: missing or non-numeric `num_pdd_heads`".into(),
+                )
+            })? as usize;
+        // The shared keys go through the one strict parser; the audio width it requires is pinned
+        // to a placeholder and then cleared, so no shared key's rule is restated here.
+        obj.insert("audio_in_channels".into(), serde_json::json!(1));
+        let mut cfg = Self::from_diffusers_json(&v.to_string())?;
+        cfg.audio_in_channels = 0;
+        cfg.variant = DitVariant::Image {
+            num_pdd_heads: heads,
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Parse the published `transformer/config.json`.
@@ -213,6 +343,7 @@ impl MiniMaxH3DitConfig {
             norm_eps: float("norm_eps")?,
             qk_norm_eps: float("qk_norm_eps")?,
             final_norm_eps: float("final_norm_eps")?,
+            variant: DitVariant::AudioVideo,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -312,6 +443,56 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(full).unwrap();
         v["patch_size"] = serde_json::json!([2, 2]);
         assert!(MiniMaxH3DitConfig::from_diffusers_json(&v.to_string()).is_err());
+    }
+
+    const IMAGE_CONFIG: &str = r#"{
+        "_class_name": "MiniMaxH3ImageTransformer2DModel",
+        "_diffusers_version": "0.42.0.dev0",
+        "num_attention_heads": 56, "attention_head_dim": 128, "hidden_size": 5376,
+        "num_layers": 50, "num_refiner_layers": 2, "ffn_dim": 14336, "in_channels": 24,
+        "patch_size": [1, 2, 2], "text_dim": 5120, "freq_dim": 256,
+        "time_embed_hidden_dim": 5376, "time_embed_dim": 2688, "rope_freq_dim": 16,
+        "rope_theta": 10000.0, "norm_eps": 1e-05, "qk_norm_eps": 1e-05, "final_norm_eps": 1e-05,
+        "num_pdd_heads": 6
+    }"#;
+
+    /// SW-7091: the published `transformer_diffusers/config.json` parses to the H3 geometry with no
+    /// audio stream and six heads, and the AdaLN width is still `6 · 3 · 5376` (the image
+    /// transformer keeps MiniMax-H3's three-way modality table).
+    #[test]
+    fn parses_the_published_image_config() {
+        let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(IMAGE_CONFIG).unwrap();
+        assert_eq!(cfg, MiniMaxH3DitConfig::image());
+        assert_eq!(cfg.num_pdd_heads(), Some(6));
+        assert!(!cfg.has_audio());
+        assert_eq!(cfg.adaln_out_features(), 96_768);
+        assert_eq!(cfg.video_patch_dim(), 96);
+        assert_eq!(
+            MiniMaxH3DitConfig::from_partition_json(IMAGE_CONFIG).unwrap(),
+            cfg
+        );
+        assert_eq!(MiniMaxH3DitConfig::default().num_pdd_heads(), None);
+        assert!(MiniMaxH3DitConfig::default().has_audio());
+    }
+
+    /// The image parser refuses a config that is not the image transformer: the wrong class, an
+    /// audio stream, or no head count.
+    #[test]
+    fn the_image_config_is_refused_unless_it_is_the_image_transformer() {
+        let base: serde_json::Value = serde_json::from_str(IMAGE_CONFIG).unwrap();
+        let mut wrong_class = base.clone();
+        wrong_class["_class_name"] = serde_json::json!("MiniMaxH3Transformer3DModel");
+        assert!(MiniMaxH3DitConfig::from_image_diffusers_json(&wrong_class.to_string()).is_err());
+        let mut audio = base.clone();
+        audio["audio_in_channels"] = serde_json::json!(32);
+        let e = MiniMaxH3DitConfig::from_image_diffusers_json(&audio.to_string()).unwrap_err();
+        assert!(e.to_string().contains("audio"), "{e}");
+        let mut no_heads = base.clone();
+        no_heads.as_object_mut().unwrap().remove("num_pdd_heads");
+        assert!(MiniMaxH3DitConfig::from_image_diffusers_json(&no_heads.to_string()).is_err());
+        let mut zero_heads = base;
+        zero_heads["num_pdd_heads"] = serde_json::json!(0);
+        assert!(MiniMaxH3DitConfig::from_image_diffusers_json(&zero_heads.to_string()).is_err());
     }
 
     /// A non-positive rotary base yields NaN frequencies, which would propagate through every

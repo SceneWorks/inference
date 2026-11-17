@@ -184,6 +184,15 @@ pub(crate) fn build_residency(
     )
 }
 
+/// A successful Anima render has strict-applied every load-time adapter in this order.
+fn applied_adapter_controls(spec: &LoadSpec) -> Vec<(usize, mlx_gen::runtime::AdapterKind, f32)> {
+    spec.adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect()
+}
+
 impl Generator for Anima {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -198,7 +207,24 @@ impl Generator for Anima {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_impl(req, &req.preview, on_progress)
+                .map_err(Into::into)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let preview = mlx_gen::image_execution::isolated_preview(&req.preview);
+        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            let mut progress =
+                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+            self.generate_impl(req, &preview, &mut progress)
+                .map_err(Into::into)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -245,6 +271,7 @@ impl Anima {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        preview: &mlx_gen::PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
@@ -280,6 +307,16 @@ impl Anima {
         let attention = crate::memory_strategy::attention_plan(req);
         let window_size = crate::memory_strategy::transformer_window_size(req)?;
         let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        mlx_gen::image_execution::policy_debug("stage_residency", &stage_residency);
+        mlx_gen::image_execution::policy_debug("attention_budget", &attention.budget);
+        mlx_gen::image_execution::policy_debug("transformer_window", &window_size);
+        mlx_gen::image_execution::policy_debug("decode_tiling", &decode_tiling);
+        mlx_gen::image_execution::policy_debug(
+            "applied_adapter_controls",
+            &applied_adapter_controls(&self.loaded_spec),
+        );
+        mlx_gen::image_execution::scalar("guidance", guidance);
+        mlx_gen::image_execution::policy_debug("cfg_active", &cfg_on);
         if window_size.is_some() && !self.streamable {
             return Err(Error::Unsupported(format!(
                 "{}: bounded transformer residency requires a DeferredMaterialization load",
@@ -368,7 +405,7 @@ impl Anima {
                         scheduler.as_deref(),
                         req.scheduler_shift,
                         seed,
-                        &req.preview,
+                        preview,
                         &req.cancel,
                         on_progress,
                         attention,
@@ -723,6 +760,37 @@ mod tests {
                 "packed tier + adapter must NOT be rejected as unsupported, got: {e}"
             );
         }
+    }
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_and_order() {
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let first = AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora);
+        let second = AdapterSpec::new("/fixture/two".into(), 1.0, AdapterKind::Lokr);
+        let spec = LoadSpec::new(WeightsSource::Dir("/fixture/base".into()))
+            .with_adapters(vec![first.clone(), second.clone()]);
+        assert_eq!(
+            applied_adapter_controls(&spec),
+            vec![(0, AdapterKind::Lora, 0.5), (1, AdapterKind::Lokr, 1.0)]
+        );
+        let different_scale = LoadSpec::new(WeightsSource::Dir("/fixture/base".into()))
+            .with_adapters(vec![
+                AdapterSpec::new(first.path, 0.75, first.kind),
+                second.clone(),
+            ]);
+        assert_ne!(
+            applied_adapter_controls(&spec),
+            applied_adapter_controls(&different_scale)
+        );
+        let reversed =
+            LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+                second,
+                AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora),
+            ]);
+        assert_ne!(
+            applied_adapter_controls(&spec),
+            applied_adapter_controls(&reversed)
+        );
     }
 
     // ── Sequential residency (epic 10834, sc-10840): weight-free proof the dispatch HONORS

@@ -198,6 +198,15 @@ impl Variant {
         3.5
     }
 
+    pub(crate) fn resolved_guidance(self, requested: Option<f32>) -> f32 {
+        let guidance = if self.supports_guidance() {
+            requested.unwrap_or(self.default_guidance())
+        } else {
+            0.0
+        };
+        candle_gen::execution::f32_policy("flux/effective_guidance", guidance)
+    }
+
     /// T5 sequence length the prompt is padded to (diffusers FluxPipeline default): schnell 256,
     /// dev 512. FLUX attends every T5 position, so this is parity-critical.
     pub const fn t5_max_len(self) -> usize {
@@ -236,7 +245,39 @@ pub struct FluxGenerator {
     load_binding: gen_core::RenderLoadBinding,
 }
 
+impl FluxGenerator {
+    /// Load-time selections bound to every reported attempt.
+    fn observe_loaded(&self) {
+        self.pipe.observe_adapter_provenance();
+        candle_gen::execution::policy(
+            "loaded/loaded_quant",
+            format!("{:?}", self.loaded_quant).into(),
+        );
+    }
+}
+
 impl Generator for FluxGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || self.observe_loaded())
+    }
+
+    /// The admitted runner's entry: the same planned body, captured as one attempt.
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            self.observe_loaded()
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -1248,5 +1289,29 @@ mod tests {
         println!(
             "\nMODEL_INFERENCE_BODY_COMPLETED tests::flux_schnell_probed_generate_for_offload_ab"
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_guidance_distinguishes_defaults_overrides_and_loaded_variant() {
+        let report = |variant: Variant, requested| {
+            candle_gen::testkit::execution_policy(|| {
+                variant.resolved_guidance(requested);
+            })
+        };
+        assert_eq!(report(Variant::Dev, None), report(Variant::Dev, Some(3.5)));
+        assert_ne!(report(Variant::Dev, None), report(Variant::Dev, Some(4.5)));
+        assert_eq!(
+            report(Variant::Schnell, None),
+            report(Variant::Schnell, Some(99.0))
+        );
+        assert_ne!(
+            descriptor_for(Variant::Schnell).id,
+            descriptor_for(Variant::Dev).id
+        );
+        assert_ne!(report(Variant::Dev, None), report(Variant::Schnell, None));
     }
 }

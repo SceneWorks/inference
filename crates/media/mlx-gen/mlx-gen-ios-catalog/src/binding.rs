@@ -44,6 +44,7 @@ impl fmt::Debug for GenerationView<'_> {
             .field("sampler", &r.sampler)
             .field("scheduler", &r.scheduler)
             .field("scheduler_shift", &r.scheduler_shift)
+            .field("h3_image_sampler", &r.h3_image_sampler)
             .field("guidance_method", &r.guidance_method)
             .field("guidance_eta", &r.guidance_eta)
             .field("guidance_momentum", &r.guidance_momentum)
@@ -327,6 +328,11 @@ pub(crate) mod tests {
         check(&request);
         request.reference_image_resize_mode =
             Some(mlx_gen::gen_core::ReferenceImageResizeMode::Max);
+        check(&request);
+        // SW-7106: the H3-Image sampler and its LCM parameters change the rendered work.
+        request.h3_image_sampler = Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(1.1));
+        check(&request);
+        request.h3_image_sampler = Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.9));
         check(&request);
     }
 

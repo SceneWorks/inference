@@ -147,7 +147,9 @@ pub(super) fn render_once(recipe: &RenderRecipe<'_>) -> RenderReceipt {
     // which the `t2va` path never reads. The tier that loads is still whatever is staged.
     if let Some(p) = lora {
         let w = Weights::from_file(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
-        let alpha = resolve_alpha(&w).unwrap_or_else(|e| panic!("alpha: {e}"));
+        let alpha = resolve_alpha(&w)
+            .unwrap_or_else(|e| panic!("alpha: {e}"))
+            .unwrap_or(DEFAULT_LORA_ALPHA);
         println!(
             "[render] adapter {} — {} tensors, resolved alpha {alpha}, fold {} at rank 128",
             p.file_name().unwrap_or_default().to_string_lossy(),

@@ -17,6 +17,7 @@
 //! (cross-encoder, loose), so this is strictly safe. Real-CFG / uncond-id is sc-3075; quant is sc-3076.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mlx_rs::ops::{concatenate_axis, divide, maximum, sqrt, square, sum_axes};
 use mlx_rs::{Array, Dtype};
@@ -32,7 +33,7 @@ use mlx_gen_face::{Detection, FaceAnalysis};
 use mlx_gen_flux::config::FluxVariant;
 use mlx_gen_flux::model::{load_flux1, Flux1};
 
-use crate::ca::PulidCa;
+use crate::ca::{CaActivity, PulidCa};
 use crate::eva_clip::{transform, EvaConfig, EvaVisionTransformer};
 use crate::idformer::{IdFormer, IdFormerConfig};
 
@@ -345,6 +346,20 @@ pub(crate) fn compile_plan(
     Ok(Some(compile_constructed_plan(req)?.bind_load(spec)))
 }
 
+impl PulidFlux {
+    /// Load-time selections bound to every reported attempt.
+    fn observe_loaded(&self) {
+        mlx_gen::image_execution::policy_debug(
+            "PulidFlux.load_precision_policy",
+            &self.loaded_spec.precision,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "PulidFlux.load_quantization_policy",
+            &self.loaded_spec.quantize,
+        );
+    }
+}
+
 impl Generator for PulidFlux {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -371,18 +386,7 @@ impl Generator for PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        if self.identity_inventory.is_none() {
-            return Err(gen_core::Error::Unsupported(
-                "pulid_flux: a constructor-built model has no load spec to plan against; compile \
-                 `compile_constructed_plan` before loading its sub-models and call `generate_planned`"
-                    .into(),
-            ));
-        }
-        let plan = compile_plan(&self.loaded_spec, req)?
-            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))?;
-        self.generate_planned(req, &plan, None, on_progress)?
-            .output
-            .ok_or_else(|| gen_core::Error::Msg("PuLID render produced no image".into()))
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn generate_planned(
@@ -418,6 +422,64 @@ impl Generator for PulidFlux {
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
         crate::memory_strategy::begin_request(&self.loaded_spec, &self.memory_strategy, context)
     }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                self.observe_loaded();
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+
+    /// The admitted runner's entry: the same planned body, captured as one attempt that covers
+    /// the work inside its Conditioning/Denoise/Decode scopes.
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || self.observe_loaded(),
+        )
+    }
+}
+
+impl PulidFlux {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        if self.identity_inventory.is_none() {
+            return Err(gen_core::Error::Unsupported(
+                "pulid_flux: a constructor-built model has no load spec to plan against; compile \
+                 `compile_constructed_plan` before loading its sub-models and call `generate_planned`"
+                    .into(),
+            ));
+        }
+        let plan = compile_plan(&self.loaded_spec, req)?
+            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))?;
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("PuLID render produced no image".into()))
+    }
 }
 
 impl PulidFlux {
@@ -444,7 +506,21 @@ impl PulidFlux {
             return Err(Error::Canceled);
         }
         let (image, id_weight) = self.reference_face(req)?;
-        let mk_ca = |emb: Array| {
+        mlx_gen::image_execution::scalar("pulid.identity_weight", id_weight);
+        let bounded_attention_selected = req.memory.is_some_and(|memory| memory.chunk_attention);
+        // The identity embedding is computed inside the Conditioning phase (below); its route is
+        // observed there, once the embedding exists.
+        let observe_embedding = |embedding: &Array| {
+            observe_identity_route(
+                (image.width, image.height),
+                embedding.shape(),
+                embedding.dtype(),
+                bounded_attention_selected,
+            );
+        };
+        let positive_activity = Arc::new(CaActivity::default());
+        let negative_activity = Arc::new(CaActivity::default());
+        let mk_ca = |emb: Array, activity: Arc<CaActivity>| {
             PulidCa::from_weights(
                 &self.pulid,
                 "pulid_ca",
@@ -454,10 +530,8 @@ impl PulidFlux {
                 NUM_SINGLE_BLOCKS,
             )
             .map(|ca| {
-                ca.with_bounded_attention(
-                    req.cancel.clone(),
-                    req.memory.is_some_and(|memory| memory.chunk_attention),
-                )
+                ca.with_bounded_attention(req.cancel.clone(), bounded_attention_selected)
+                    .with_activity(activity)
             })
         };
         // The reference face is consumed into the injector; hand the FLUX backbone a plain request
@@ -472,6 +546,7 @@ impl PulidFlux {
         // dropped, inside the same Conditioning phase as text. This avoids retaining the large
         // identity arrays beside text encoding and keeps the measured phase complete.
         let true_cfg = req.true_cfg.unwrap_or(1.0);
+        mlx_gen::image_execution::scalar("pulid.true_cfg", true_cfg);
         let result = if true_cfg > 1.0 + 1e-3 {
             // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
             let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
@@ -479,6 +554,7 @@ impl PulidFlux {
                 .timestep_to_start_cfg
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
+            observe_cfg_branch(Some(start_cfg));
             self.flux.generate_with_prepared_injector_cfg_planned(
                 &flux_req,
                 neg_prompt,
@@ -492,14 +568,19 @@ impl PulidFlux {
                         image.width as usize,
                         &req.cancel,
                     )?;
+                    observe_embedding(&pos);
                     let neg = self.compute_uncond_id_embedding()?;
                     mlx_rs::transforms::eval([&pos, &neg])?;
-                    Ok((mk_ca(pos)?, mk_ca(neg)?))
+                    Ok((
+                        mk_ca(pos, positive_activity.clone())?,
+                        mk_ca(neg, negative_activity.clone())?,
+                    ))
                 },
                 on_progress,
             )
         } else {
             // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
+            observe_cfg_branch(None);
             self.flux.generate_with_prepared_injector_planned(
                 &flux_req,
                 run,
@@ -510,12 +591,16 @@ impl PulidFlux {
                         image.width as usize,
                         &req.cancel,
                     )?;
+                    observe_embedding(&id_embedding);
                     mlx_rs::transforms::eval([&id_embedding])?;
-                    mk_ca(id_embedding)
+                    mk_ca(id_embedding, positive_activity.clone())
                 },
                 on_progress,
             )
         };
+        if result.is_ok() {
+            observe_completed_route(&positive_activity, &negative_activity);
+        }
         self.verify_identity_inventory()?;
         result
     }
@@ -527,6 +612,35 @@ impl PulidFlux {
                 inventory.ensure_unchanged().map_err(Into::into)
             })
     }
+}
+
+fn observe_identity_route(
+    reference_size: (u32, u32),
+    embedding_shape: &[i32],
+    embedding_dtype: Dtype,
+    bounded_attention: bool,
+) {
+    mlx_gen::image_execution::policy_debug("pulid.reference_size", &reference_size);
+    mlx_gen::image_execution::policy_debug("pulid.embedding_shape", &embedding_shape);
+    mlx_gen::image_execution::policy_debug("pulid.embedding_dtype", &embedding_dtype);
+    mlx_gen::image_execution::policy_debug("pulid.ca_budget_selected", &bounded_attention);
+}
+
+fn observe_cfg_branch(start_step: Option<usize>) {
+    mlx_gen::image_execution::policy_debug("pulid.cfg_start_step", &start_step);
+    mlx_gen::image_execution::policy_debug("pulid.dual_branch_cfg_selected", &start_step.is_some());
+}
+
+fn observe_completed_route(positive: &CaActivity, negative: &CaActivity) {
+    mlx_gen::image_execution::policy_debug("pulid.real_cfg", &negative.forward_entered());
+    mlx_gen::image_execution::policy_debug(
+        "pulid.ca_active",
+        &(positive.attention_used() || negative.attention_used()),
+    );
+    mlx_gen::image_execution::policy_debug(
+        "pulid.ca_bounded_attention",
+        &(positive.attention_chunked() || negative.attention_chunked()),
+    );
 }
 
 // ---- registration -------------------------------------------------------------------------------
@@ -833,6 +947,130 @@ mod tests {
             err.to_string().contains("compile_constructed_plan"),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn completed_policy_distinguishes_ca_budget_and_cfg_start() {
+        let capture = |bounded, start| {
+            mlx_gen::image_execution::complete_image_attempt(
+                &descriptor(),
+                &CancelFlag::new(),
+                || {
+                    observe_identity_route((512, 512), &[1, 32, 2048], Dtype::Float32, bounded);
+                    observe_cfg_branch(start);
+                    mlx_gen::image_execution::sampled_native(
+                        "flow_match",
+                        "sigma",
+                        Dtype::Float32,
+                        &[1.0, 0.0],
+                        42,
+                    );
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    }]))
+                },
+            )
+            .unwrap()
+            .execution
+        };
+        let ordinary = capture(false, None);
+        let bounded = capture(true, None);
+        let real_early = capture(false, Some(1));
+        let real_late = capture(false, Some(4));
+        for identity in [&ordinary, &bounded, &real_early, &real_late] {
+            assert!(identity.resolved().is_some());
+        }
+        let quality = |identity: &gen_core::generator::ExecutionIdentity| {
+            identity.resolved().unwrap().quality_policy.clone()
+        };
+        assert_ne!(quality(&ordinary), quality(&bounded));
+        assert_ne!(quality(&ordinary), quality(&real_early));
+        assert_ne!(quality(&real_early), quality(&real_late));
+    }
+
+    #[test]
+    fn completed_policy_does_not_claim_a_negative_forward_from_cfg_selection() {
+        let completed = mlx_gen::image_execution::complete_image_attempt(
+            &descriptor(),
+            &CancelFlag::new(),
+            || {
+                // A one-step render with start=2 selects the dual-branch route but never
+                // reaches its negative forward. The injector observations remain empty.
+                observe_identity_route((512, 512), &[1, 32, 2048], Dtype::Float32, false);
+                observe_cfg_branch(Some(2));
+                let positive = CaActivity::default();
+                let negative = CaActivity::default();
+                positive.record_forward();
+                observe_completed_route(&positive, &negative);
+                mlx_gen::image_execution::sampled_native(
+                    "flow_match",
+                    "sigma",
+                    Dtype::Float32,
+                    &[1.0, 0.0],
+                    42,
+                );
+                Ok(GenerationOutput::Images(vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap();
+        let policy = match &completed.execution.resolved().unwrap().quality_policy {
+            gen_core::generator::ExecutionFact::Resolved { value } => value,
+            other => panic!("expected resolved quality policy: {other:?}"),
+        };
+        assert_eq!(policy["pulid.dual_branch_cfg_selected"], "true");
+        assert_eq!(policy["pulid.cfg_start_step"], "Some(2)");
+        assert_eq!(policy["pulid.real_cfg"], "false");
+        assert_eq!(policy["pulid.ca_active"], "false");
+    }
+
+    #[test]
+    fn completed_policy_does_not_claim_ca_from_zero_identity_strength() {
+        let completed = mlx_gen::image_execution::complete_image_attempt(
+            &descriptor(),
+            &CancelFlag::new(),
+            || {
+                observe_identity_route((512, 512), &[1, 32, 2048], Dtype::Float32, true);
+                observe_cfg_branch(None);
+                let positive = CaActivity::default();
+                let negative = CaActivity::default();
+                positive.record_forward();
+                positive.record_attention(
+                    0.0,
+                    mlx_gen::attention::AttentionBudget::CONSTRAINED,
+                    1,
+                    16,
+                    1024,
+                    32,
+                );
+                observe_completed_route(&positive, &negative);
+                mlx_gen::image_execution::sampled_native(
+                    "flow_match",
+                    "sigma",
+                    Dtype::Float32,
+                    &[1.0, 0.0],
+                    42,
+                );
+                Ok(GenerationOutput::Images(vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap();
+        let policy = match &completed.execution.resolved().unwrap().quality_policy {
+            gen_core::generator::ExecutionFact::Resolved { value } => value,
+            other => panic!("expected resolved quality policy: {other:?}"),
+        };
+        assert_eq!(policy["pulid.ca_budget_selected"], "true");
+        assert_eq!(policy["pulid.ca_active"], "false");
+        assert_eq!(policy["pulid.ca_bounded_attention"], "false");
     }
 
     /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).

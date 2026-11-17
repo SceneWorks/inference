@@ -390,6 +390,23 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
                     or job.get("if") != "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"):
                 errors.append(f"{name} changed its bounded weight-set dispatch route")
             continue
+        if name == "mlx-minimax-h3-image-publish":
+            # SW-7104: nax-macos-2 (`rw-mage`) by default; exactly one dispatch-only profile picks
+            # `nax-macos` (`rw-starvector`) for Michael's one-time loan of his dev Mac (the `-nax-macos`
+            # profiles, both stages or `-pe` only).
+            expected = ["self-hosted", "macOS", "ARM64",
+                        "${{ startsWith(inputs.profile, 'minimax-h3-image-publish-mlx-nax-macos') && "
+                        "'rw-starvector' || 'rw-mage' }}"]
+            if runs_on != expected or job.get("if") != (
+                "github.event_name == 'workflow_dispatch' && "
+                "(inputs.profile == 'minimax-h3-image-publish' || "
+                "inputs.profile == 'minimax-h3-image-publish-mlx' || "
+                "inputs.profile == 'minimax-h3-image-publish-mlx-pe' || "
+                "inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos' || "
+                "inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos-pe')"
+            ):
+                errors.append(f"{name} changed its bounded weight-set dispatch route")
+            continue
         if name == PRESERVED_LOCAL_JOB:
             if runs_on != PRESERVED_LOCAL_RUNS_ON:
                 errors.append(f"{name} changed its exact local runner selector")

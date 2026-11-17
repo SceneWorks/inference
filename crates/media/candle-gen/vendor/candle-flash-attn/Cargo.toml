@@ -21,8 +21,9 @@ candle = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb00
 half = { version = "2.3.1", features = ["num-traits"] }
 
 [build-dependencies]
-cudaforge = "0.1.2"
+cudaforge = "=0.1.6"
 anyhow = { version = "1", features = ["backtrace"] }
+sha2 = "0.10"
 
 [features]
 default = []

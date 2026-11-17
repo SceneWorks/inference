@@ -401,7 +401,9 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or(DEFAULT_STEPS as usize);
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("kolors/pipeline/guidance", format!("{guidance:?}").into());
         let use_guide = guidance > 1.0;
+        candle_gen::execution::policy("kolors/pipeline/use_guide", format!("{use_guide:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
@@ -559,7 +561,9 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or(DEFAULT_STEPS as usize);
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("kolors/pipeline/guidance", format!("{guidance:?}").into());
         let use_guide = guidance > 1.0;
+        candle_gen::execution::policy("kolors/pipeline/use_guide", format!("{use_guide:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
@@ -611,6 +615,7 @@ impl Pipeline {
         for index in 0..req.count {
             ensure_not_cancelled(req)?;
             let seed = base_seed.wrapping_add(u64::from(index));
+            candle_gen::execution::draw("image_initial_noise", seed, index as usize);
             let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
             let rendered = if let Some(name) = curated {
                 self.denoise_curated_with_unet(
@@ -687,7 +692,8 @@ impl Pipeline {
             crate::MODEL_ID,
         )?;
         let mut images = Vec::with_capacity(latents.len());
-        for latent in &latents {
+        for (output_index, latent) in latents.iter().enumerate() {
+            candle_gen::execution::output_index(output_index);
             ensure_not_cancelled(req)?;
             on_progress(Progress::Decoding);
             images.push(common::decode(&decoder.0, pid_decoder.as_ref(), latent)?);

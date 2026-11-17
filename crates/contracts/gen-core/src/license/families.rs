@@ -141,6 +141,72 @@ pub const MINIMAX_H3_COMMUNITY: LicenseFamily = LicenseFamily {
     ],
 };
 
+/// MiniMax-H3-Image Community License Agreement — MiniMax-H3-Image and its prompt expander
+/// MiniMax-H3-Image-PE (the LICENSE's closing note: the T2I PE model "is part of MiniMax H3 and is
+/// accordingly subject to this Agreement", though it is derived from Apache-2.0 Qwen3.8-27B).
+///
+/// The text is the [`MINIMAX_H3_COMMUNITY`] agreement with the model renamed and the date moved,
+/// **except §IV.1**, which is a different commercial gate: prior written authorization (requested
+/// through <https://platform.minimax.io/license>) once the Annualized Revenue of the licensee and
+/// its affiliates *exceeds* 1 million USD — not H3's 20 million — **or** whenever it provides a
+/// Hosted Service to third parties at any revenue. The hosted-service half has no typed term, so
+/// it is recorded as a [`LicenseTerm::DeployerObligation`] quoting the clause. The territorial
+/// exclusion (§V.4: EU, UK, Republic of Korea, USA) and the safeguards duty (§V.5) are H3's.
+///
+/// Text read at <https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/raw/main/LICENSE> on
+/// 2026-11-10 (dated November 10, 2026).
+pub const MINIMAX_H3_IMAGE_COMMUNITY: LicenseFamily = LicenseFamily {
+    id: "minimax-h3-image-community",
+    spdx_id: "LicenseRef-MiniMax-H3-Image-Community",
+    name: "MiniMax-H3-Image Community License Agreement",
+    text_url: "https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/raw/main/LICENSE",
+    terms: &[
+        // §IV.1 "if the Annualized Revenue of you and/or your affiliates exceeds 1 Million USD" —
+        // "exceeds", so the amount itself is below the threshold: Exclusive.
+        LicenseTerm::RevenueCeiling {
+            amount_usd: 1_000_000,
+            boundary: CeilingBoundary::Exclusive,
+        },
+        // §IV.1 names the request channel.
+        LicenseTerm::RegistrationRequired {
+            contact: Some("https://platform.minimax.io/license"),
+        },
+        // §IV.1's second trigger, independent of revenue.
+        LicenseTerm::DeployerObligation {
+            text: "You shall obtain a separate, prior written authorization from MiniMax by \
+                   sending a request through https://platform.minimax.io/license if you provide \
+                   Hosted Service(s) to any Third Parties",
+        },
+        // §V.2 binding each recipient or user to the Section V / Exhibit A restrictions.
+        LicenseTerm::DownstreamRestrictions {
+            family: "minimax-h3-image-community",
+        },
+        // §III.1 a copy of the Agreement to every third-party recipient.
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "minimax-h3-image-community",
+        },
+        // §IV.2 "You shall prominently display 'MiniMax-H3-Image' on the user interface of
+        // commercial product or service that uses MiniMax-H3-Image".
+        LicenseTerm::AttributionRequired,
+        // §III.4 the "NOTICE" text file.
+        LicenseTerm::NoticeFileRequired,
+        // §V.4, the territorial restriction (same Excluded Territories as H3).
+        LicenseTerm::DeployerObligation {
+            text: "You may not use, reproduce, modify, distribute, or display the \
+                   MiniMax-H3-Image Works or any of their Outputs or results outside the \
+                   Applicable Territory (worldwide EXCLUDING the European Union, the United \
+                   Kingdom, the Republic of Korea and the United States of America)",
+        },
+        // §V.5, the safeguards obligation.
+        LicenseTerm::DeployerObligation {
+            text: "you must implement, maintain, test, and periodically review reasonable and \
+                   proportionate technical and organizational safeguards designed to prevent and \
+                   mitigate access, uses, and Outputs that violate this Section V or Exhibit A",
+        },
+        LicenseTerm::AcceptableUsePolicy { url: None },
+    ],
+};
+
 /// MIT License.
 ///
 /// Text read at <https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt> on
@@ -1150,6 +1216,7 @@ pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     LTX_2_COMMUNITY,
     META_SAM_LICENSE,
     MINIMAX_H3_COMMUNITY,
+    MINIMAX_H3_IMAGE_COMMUNITY,
     MIT,
     NVIDIA_NSCLV1,
     NVIDIA_OPEN_MODEL,
@@ -1188,6 +1255,7 @@ mod tests {
             LTX_2_COMMUNITY,
             META_SAM_LICENSE,
             MINIMAX_H3_COMMUNITY,
+            MINIMAX_H3_IMAGE_COMMUNITY,
             MIT,
             NVIDIA_NSCLV1,
             NVIDIA_OPEN_MODEL,
@@ -1195,7 +1263,7 @@ mod tests {
             STABILITY_AI_COMMUNITY,
             TONGYI_QIANWEN,
         ];
-        assert_eq!(LICENSE_FAMILIES.len(), 23);
+        assert_eq!(LICENSE_FAMILIES.len(), 24);
         assert_eq!(LICENSE_FAMILIES, DECLARED);
 
         for family in LICENSE_FAMILIES {
@@ -1334,6 +1402,7 @@ mod tests {
                 "krea-2-community",
                 "ltx-2-community",
                 "minimax-h3-community",
+                "minimax-h3-image-community",
                 "stability-ai-community"
             ]
         );
@@ -1363,6 +1432,7 @@ mod tests {
                 "ltx-2-community",
                 "meta-sam-license",
                 "minimax-h3-community",
+                "minimax-h3-image-community",
                 "nvidia-nsclv1",
             ],
             "restrictions-as-enforceable-provisions is the heavier duty and only these state it"
@@ -1383,6 +1453,7 @@ mod tests {
                 "ltx-2-community",
                 "meta-sam-license",
                 "minimax-h3-community",
+                "minimax-h3-image-community",
                 "nvidia-nsclv1",
                 "nvidia-open-model",
                 "qwen-research",
@@ -1457,6 +1528,7 @@ mod tests {
                 "flux-kommunity-v1-0",
                 "ltx-2-community",
                 "minimax-h3-community",
+                "minimax-h3-image-community",
             ]
         );
         assert_eq!(registration_without_contact, vec!["ltx-2-community"]);
@@ -1738,6 +1810,22 @@ mod tests {
                     "attribution_required",
                     "notice_file_required",
                     // §V.4, the territorial exclusion (EU / UK / Republic of Korea / USA).
+                    "deployer_obligation:You may not use, reproduce, modify, distribute, ",
+                    "deployer_obligation:you must implement, maintain, test, and periodic",
+                    "acceptable_use_policy:<none>",
+                ],
+            ),
+            (
+                "minimax-h3-image-community",
+                vec![
+                    "revenue_ceiling:1000000:exclusive",
+                    "registration_required:https://platform.minimax.io/license",
+                    // §IV.1's hosted-service trigger, independent of revenue.
+                    "deployer_obligation:You shall obtain a separate, prior written autho",
+                    "downstream_restrictions:minimax-h3-image-community",
+                    "downstream_license_copy:minimax-h3-image-community",
+                    "attribution_required",
+                    "notice_file_required",
                     "deployer_obligation:You may not use, reproduce, modify, distribute, ",
                     "deployer_obligation:you must implement, maintain, test, and periodic",
                     "acceptable_use_policy:<none>",

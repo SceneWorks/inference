@@ -1789,3 +1789,50 @@ fn loha_additive_installer_rejects_packed_base_per_target() {
         .expect("a LoHa on a dense base must still install");
     assert_eq!(report.applied, 1, "the LoHa materializes on a dense base");
 }
+
+#[test]
+fn execution_report_adapters_preserve_actual_order_scale_expert_and_skips() {
+    let specs = vec![
+        AdapterSpec::new("specific.safetensors".into(), 0.25, AdapterKind::Lora),
+        AdapterSpec::new("shared.safetensors".into(), 0.5, AdapterKind::Lokr),
+    ];
+    let report = WanLoraReport {
+        applied: 3,
+        per_spec: vec![
+            WanSpecOutcome {
+                spec_index: 1,
+                applied: 2,
+                skipped: vec!["missing".into()],
+            },
+            WanSpecOutcome {
+                spec_index: 0,
+                applied: 1,
+                skipped: vec![],
+            },
+        ],
+        ..Default::default()
+    };
+    let folded = execution_adapter_policy(&specs, &report, MoeExpert::High, "dense_fold");
+    assert_eq!(folded["entries"][0]["load_index"], 1);
+    assert_eq!(folded["entries"][0]["scale_bits"], 0.5_f32.to_bits());
+    assert_eq!(
+        folded["entries"][0]["skipped"],
+        serde_json::json!(["missing"])
+    );
+    assert_ne!(
+        folded,
+        execution_adapter_policy(&specs, &report, MoeExpert::Low, "dense_fold")
+    );
+    assert_ne!(
+        folded,
+        execution_adapter_policy(&specs, &report, MoeExpert::High, "packed_additive")
+    );
+    let empty = execution_adapter_policy(
+        &[],
+        &WanLoraReport::default(),
+        MoeExpert::High,
+        "dense_fold",
+    );
+    assert_eq!(empty["entries"], serde_json::json!([]));
+    assert_eq!(empty["applied_targets"], 0);
+}

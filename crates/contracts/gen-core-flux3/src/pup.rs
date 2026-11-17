@@ -1661,6 +1661,19 @@ pub fn run_text_llm(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<String> {
+    run_text_llm_with_execution_report(llm, plan, options, cancel, on_progress)
+        .map(|(text, _)| text)
+}
+
+/// Run the actual upsampler and retain its same-attempt token execution identity. Providers
+/// composing text and image generation must not drop the auxiliary model's sampling facts.
+pub fn run_text_llm_with_execution_report(
+    llm: &dyn TextLlm,
+    plan: &UpsamplePlan,
+    options: &UpsampleOptions,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(String, core_llm::ExecutionIdentity)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -1677,7 +1690,7 @@ pub fn run_text_llm(
         return Err(Error::Canceled);
     }
     let mut tokens = 0u32;
-    let output = llm.generate(&request, &mut |event| {
+    let output = llm.generate_with_execution_report(&request, &mut |event| {
         if let StreamEvent::Token {
             channel: Channel::Content,
             ..
@@ -1695,10 +1708,10 @@ pub fn run_text_llm(
         Err(core_llm::Error::Canceled) => return Err(Error::Canceled),
         Err(e) => return Err(Error::Msg(format!("flux3 prompt upsampler: {e}"))),
     };
-    if cancel.is_cancelled() || output.finish_reason == Some(FinishReason::Cancelled) {
+    if cancel.is_cancelled() || output.output.finish_reason == Some(FinishReason::Cancelled) {
         return Err(Error::Canceled);
     }
-    Ok(output.text)
+    Ok((output.output.text, output.execution))
 }
 
 /// The whole pre-generation step: decide, run (when an upsampler is loaded), finish. The

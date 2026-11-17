@@ -1,0 +1,1 @@
+"%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l

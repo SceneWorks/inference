@@ -75,6 +75,52 @@ pub fn unpack_tokens(
         ])?)
 }
 
+/// Pack an NCHW latent image into ViT tokens `[B, H·W, C]` —
+/// `MiniMaxH3ImageViTDecoder2d.forward`'s `permute(0, 2, 3, 1).reshape(B, H·W, C)`, so token order
+/// is `(h, w)` row-major, matching [`crate::rope::create_token_ids_2d`].
+pub fn pack_tokens_2d(x: &Array) -> Result<Array> {
+    let s = x.shape();
+    if s.len() != 4 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 pack_tokens_2d: expected [B, C, H, W], got {s:?}"
+        )));
+    }
+    let (b, c, h, w) = (s[0], s[1], s[2], s[3]);
+    Ok(x.transpose_axes(&[0, 2, 3, 1])?.reshape(&[b, h * w, c])?)
+}
+
+/// Unpack 2-D ViT patch tokens back to an NCHW image.
+///
+/// `tokens` is `[B, H·W, out_channels · patch_size²]` with the channel axis laid out
+/// `(c, ph, pw)` row-major; the result is `[B, out_channels, H·patch_size, W·patch_size]` — the
+/// reference's `view(B, H, W, C, p, p).permute(0, 3, 1, 4, 2, 5)`.
+pub fn unpack_tokens_2d(
+    tokens: &Array,
+    out_channels: i32,
+    patch_size: i32,
+    lat_h: i32,
+    lat_w: i32,
+) -> Result<Array> {
+    let s = tokens.shape();
+    if s.len() != 3 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 unpack_tokens_2d: expected [B, N, C], got {s:?}"
+        )));
+    }
+    let (b, n, c) = (s[0], s[1], s[2]);
+    let expected_c = out_channels * patch_size * patch_size;
+    if n != lat_h * lat_w || c != expected_c {
+        return Err(Error::Msg(format!(
+            "minimax-h3 unpack_tokens_2d: expected [B, {}, {expected_c}], got {s:?}",
+            lat_h * lat_w
+        )));
+    }
+    Ok(tokens
+        .reshape(&[b, lat_h, lat_w, out_channels, patch_size, patch_size])?
+        .transpose_axes(&[0, 3, 1, 4, 2, 5])?
+        .reshape(&[b, out_channels, lat_h * patch_size, lat_w * patch_size])?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +155,40 @@ mod tests {
         let video = unpack_tokens(&tokens, 1, 2, 1, 1, 1, 1).unwrap();
         assert_eq!(video.shape(), &[1, 1, 1, 2, 2]);
         assert_eq!(video.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn pack_2d_orders_tokens_h_then_w_and_round_trips() {
+        let vals: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let x = Array::from_slice(&vals, &[1, 2, 2, 3]);
+        let tokens = pack_tokens_2d(&x).unwrap();
+        assert_eq!(tokens.shape(), &[1, 6, 2]);
+        // token (h=0, w=1) carries channel 0 = 1 and channel 1 = 7.
+        // `as_slice` reads the raw buffer, so compare through a contiguous copy of the view.
+        let dense = |a: &Array| mlx_gen::array::contiguous(a).unwrap();
+        assert_eq!(&dense(&tokens).as_slice::<f32>()[2..4], &[1.0, 7.0]);
+        let back = unpack_tokens_2d(&tokens, 2, 1, 2, 3).unwrap();
+        assert_eq!(dense(&back).as_slice::<f32>(), x.as_slice::<f32>());
+        assert!(pack_tokens_2d(&spread(&[1, 2, 1, 2, 3])).is_err());
+    }
+
+    /// A 2×2 latent with a 2×2 patch: each token's 4 features fill its own pixel block, so pixel
+    /// row 0 interleaves tokens (0,0) and (0,1). A wrong permute keeps the shape and moves pixels.
+    #[test]
+    fn unpack_2d_places_each_token_in_its_own_block() {
+        let vals: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let tokens = Array::from_slice(&vals, &[1, 4, 4]);
+        let img =
+            mlx_gen::array::contiguous(&unpack_tokens_2d(&tokens, 1, 2, 2, 2).unwrap()).unwrap();
+        assert_eq!(img.shape(), &[1, 1, 4, 4]);
+        assert_eq!(
+            img.as_slice::<f32>(),
+            &[
+                0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0, 8.0, 9.0, 12.0, 13.0, 10.0, 11.0, 14.0,
+                15.0
+            ]
+        );
+        assert!(unpack_tokens_2d(&tokens, 1, 2, 2, 3).is_err());
     }
 
     #[test]

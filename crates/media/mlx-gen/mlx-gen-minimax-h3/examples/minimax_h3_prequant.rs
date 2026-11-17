@@ -19,6 +19,20 @@
 //!   cargo run --release --example minimax_h3_prequant -p mlx-gen-minimax-h3
 //! ```
 //!
+//!
+//! # MiniMax-H3-Image DiT (SW-7093)
+//!
+//! `MINIMAX_H3_COMPONENT=image_dit` takes the `MiniMaxAI/MiniMax-H3-Image` **snapshot root** as
+//! `MINIMAX_H3_SRC` and writes one tier directory (`transformer_diffusers/` + the byte-copied
+//! `pdd_fused_heads.safetensors`) to `MINIMAX_H3_OUT`; the text encoder is not converted, since
+//! every tier reads MiniMax-H3's own tier artifact.
+//!
+//! ```sh
+//! MINIMAX_H3_SRC=<image snapshot root> MINIMAX_H3_OUT=<tiers>/q4 MINIMAX_H3_TIER=q4 \
+//! MINIMAX_H3_COMPONENT=image_dit \
+//!   cargo run --release --example minimax_h3_prequant -p mlx-gen-minimax-h3
+//! ```
+//!
 //! `MINIMAX_H3_COMPONENT` selects which converter runs (`transformer`, the default, or
 //! `text_encoder`). `MINIMAX_H3_ADALN_BITS` overrides the AdaLN projection width independently of
 //! the tier — the [`AdaLnTierPolicy`](mlx_gen_minimax_h3::convert::AdaLnTierPolicy) knob, DiT only.
@@ -38,7 +52,8 @@
 use std::path::PathBuf;
 
 use mlx_gen_minimax_h3::convert::{
-    quantize_minimax_h3_dit, quantize_minimax_h3_text_encoder, tier_bits, AdaLnTierPolicy,
+    quantize_minimax_h3_dit, quantize_minimax_h3_image_dit, quantize_minimax_h3_text_encoder,
+    tier_bits, AdaLnTierPolicy,
 };
 use mlx_gen_minimax_h3::model::{DIT_COMPONENT, TEXT_ENCODER_COMPONENT};
 
@@ -55,10 +70,11 @@ fn main() {
     );
     let tier = env("MINIMAX_H3_TIER").expect("MINIMAX_H3_TIER=q4|q8");
     let component = env("MINIMAX_H3_COMPONENT").unwrap_or_else(|| DIT_COMPONENT.to_string());
+    const IMAGE_DIT: &str = "image_dit";
     assert!(
-        component == DIT_COMPONENT || component == TEXT_ENCODER_COMPONENT,
-        "MINIMAX_H3_COMPONENT must be {DIT_COMPONENT:?} or {TEXT_ENCODER_COMPONENT:?}, got \
-         {component:?}"
+        component == DIT_COMPONENT || component == TEXT_ENCODER_COMPONENT || component == IMAGE_DIT,
+        "MINIMAX_H3_COMPONENT must be {DIT_COMPONENT:?}, {TEXT_ENCODER_COMPONENT:?} or \
+         {IMAGE_DIT:?}, got {component:?}"
     );
 
     assert!(
@@ -104,6 +120,9 @@ fn main() {
     let written = if component == TEXT_ENCODER_COMPONENT {
         quantize_minimax_h3_text_encoder(&src, &dst, bits, &mut on_shard)
             .expect("quantize_minimax_h3_text_encoder")
+    } else if component == IMAGE_DIT {
+        quantize_minimax_h3_image_dit(&src, &dst, bits, adaln, &mut on_shard)
+            .expect("quantize_minimax_h3_image_dit")
     } else {
         quantize_minimax_h3_dit(&src, &dst, bits, adaln, &mut on_shard)
             .expect("quantize_minimax_h3_dit")
@@ -112,10 +131,15 @@ fn main() {
     // The hosted size the manifest records is the WHOLE directory — shards plus `config.json` plus
     // the index — not just the tensor bytes, because that is what a user downloads.
     let mut hosted: u64 = 0;
-    for entry in std::fs::read_dir(&dst).expect("read tier dir") {
-        let entry = entry.expect("dir entry");
-        if entry.path().is_file() {
-            hosted += entry.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut dirs = vec![dst.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read tier dir") {
+            let entry = entry.expect("dir entry");
+            if entry.path().is_dir() {
+                dirs.push(entry.path());
+            } else {
+                hosted += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
         }
     }
     println!(

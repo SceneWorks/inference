@@ -135,6 +135,10 @@ impl Wan {
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
         let guidance = cfg.sample_guide_scale.resolve_single(req.guidance);
+        mlx_gen::video_execution::policy(
+            "wan_dense",
+            serde_json::json!({"sequential":sequential,"approximation":format!("{approximation:?}")}),
+        );
         let cfg_disabled = guidance <= 1.0;
         let neg_prompt = req
             .negative_prompt
@@ -206,6 +210,7 @@ impl Wan {
         // Seeded init noise (f32) — shape matches the reference; exact RNG values differ across the
         // mlx-python/mlx-rs split (expected).
         let key = random::key(seed)?;
+        mlx_gen::video_execution::draw(0, "wan_initial_normal", seed);
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         // --- Stage 1b (TI2V only): encode the conditioning image + build the mask-blend init ---
@@ -274,6 +279,10 @@ impl Wan {
             //     forward-time residuals on the built DiT (base stays packed; LoKr/LoHa rejected up
             //     front, deferred to sc-10050/sc-10051).
             let prequantized = self.config.quantization.is_some();
+            mlx_gen::video_execution::policy(
+                "wan_weight_tier",
+                serde_json::json!({"stored":format!("{:?}",self.config.quantization),"applied":format!("{:?}",self.quant)}),
+            );
             if !prequantized {
                 self.merge_adapters(&mut w)?;
             }

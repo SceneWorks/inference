@@ -32,6 +32,17 @@ pub enum SamplingRoute {
 }
 
 impl SamplingRoute {
+    /// Noise consumed by this selected runtime route; initial noise always comes from the
+    /// per-output global MLX seed, while acceleration and curated stochastic steps use StepRng.
+    pub fn execution_rng_scheme(self) -> &'static str {
+        match self {
+            Self::Ancestral => "mlx-global-normal-v1;initial-then-ancestral-step-draws",
+            Self::Lcm => "mlx-global-normal-initial-v1;lcm-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64",
+            Self::Lightning | Self::Hyper | Self::CfgPp(_) => "mlx-global-normal-initial-v1;no-step-draws",
+            Self::Curated(_) => "mlx-global-normal-initial-v1;curated-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64",
+        }
+    }
+
     pub fn is_acceleration(self) -> bool {
         matches!(self, Self::Lcm | Self::Lightning | Self::Hyper)
     }

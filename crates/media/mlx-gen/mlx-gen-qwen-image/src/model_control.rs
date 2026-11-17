@@ -107,6 +107,7 @@ pub struct QwenImageControl {
     memory_strategy: gen_core::MemoryProviderContract,
     precision: Precision,
     quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
 }
 
 /// The heavy render-phase components — the base MMDiT transformer, the VACE control branch, the VAE,
@@ -184,6 +185,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -366,7 +368,7 @@ impl Generator for QwenImageControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -396,6 +398,46 @@ impl Generator for QwenImageControl {
             self.quant,
             context,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImageControl.precision",
+                    &self.precision,
+                );
+                mlx_gen::image_execution::policy_debug("QwenImageControl.quant", &self.quant);
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImageControl.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "QwenImageControl.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl QwenImageControl {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -429,6 +471,8 @@ impl QwenImageControl {
 
         // Shared step/sampler/guidance/seed resolution (F-117).
         let params = resolve_run_params(req, req.width, req.height)?;
+        mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
+        mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         let (control_image, control_scale) = self.resolve_control(req)?;
 
         // Phase A: prompt → embeds (epic 10834 Phase 1, sc-11006; sc-11125). Under `Sequential` the

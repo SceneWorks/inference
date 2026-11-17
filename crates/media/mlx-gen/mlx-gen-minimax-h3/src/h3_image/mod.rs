@@ -1,0 +1,86 @@
+//! **MiniMax-H3-Image** (`MiniMaxAI/MiniMax-H3-Image`) on MLX: the `minimax_h3_image` generator —
+//! `text2image` and `edit` with 1-16 reference images — built from this crate's H3 layers.
+//!
+//! The image model is the MiniMax-H3 transformer without its audio stream, distilled to a fixed
+//! six-step sampler with one output head per step, over one packed `[text | image]` sequence whose
+//! image is a single latent frame. It shares H3's text encoder (byte-identical Qwen3-VL-32B,
+//! layer-50 tap), H3's DiT layers, H3's velocity-Euler scheduler, and SW-7089's 2-D image VAE.
+//! Host-side request math (sizes, canvas, sigmas, refusals, prompt truncation) is
+//! [`mlx_gen::gen_core::h3_image`].
+//!
+//! | | |
+//! |---|---|
+//! | [`layout`] | the `text2image` / `edit` packed sequences: positions, tags |
+//! | [`dit`] | [`dit::MiniMaxH3ImageDit`] (644 tensors) and the per-step [`dit::ImageDenoiser`] |
+//! | [`model`] | the generator: descriptor, load, validate, staged generate |
+//! | [`sampler`] | the MLX ops behind gen-core's shared Euler / LCM sampler step |
+//! | [`tier`] | q8 / q4 DiT tier resolution; the text encoder is H3's own tier artifact |
+//! | [`memory`] | the shared-ladder contract: rungs 0-3, and 4 on a deferred load |
+//! | [`admission`] | per-phase host / GPU estimates and the ladder walk (derived, unmeasured) |
+
+pub mod admission;
+pub mod dit;
+pub mod layout;
+pub mod memory;
+pub mod model;
+pub mod sampler;
+pub mod tier;
+
+pub use dit::{
+    image_row_classes, velocity_euler_delta, ImageDenoiser, ImageDitTrace, MiniMaxH3ImageDit,
+    IMAGE_DIT_COMPONENT, PUBLISHED_IMAGE_DIT_TENSORS,
+};
+pub use layout::ImageLayout;
+pub use model::{
+    reference_condition_rows, reference_noise, reference_vae_pixels, resize_reference,
+    MiniMaxH3Image, IMAGE_MODEL_ID,
+};
+
+/// Add the MLX MiniMax-H3-Image generator, its three memory registrations and its trainer
+/// (SW-7097) to an explicit media registry builder. Separate from [`crate::register_providers`] so
+/// H3 video's catalog surface is unchanged; the media catalog composes both.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory::IMAGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory::IMAGE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory::IMAGE_MEMORY_BEHAVIOR)
+        .register_trainer(crate::training::TRAINER_REGISTRATION)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    /// One generator at its own id, with its memory seams wired (the builder refuses a memory
+    /// registration with no generator, and a fixture/behavior with no memory registration).
+    #[test]
+    fn the_image_registry_builds_with_one_generator() {
+        let registry = super::register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new())
+            .build()
+            .expect("registry");
+        let ids: Vec<&str> = registry.generators().map(|g| (g.descriptor)().id).collect();
+        assert_eq!(ids, vec![super::IMAGE_MODEL_ID]);
+        assert_eq!(registry.memory_strategy_registrations().len(), 1);
+    }
+
+    /// SW-7094: the shared weights-free conformance over the image registration at both load
+    /// shapes — every implemented rung, rung 3 included, is driven through the safety check and
+    /// the request scope, and every published contract surface conforms.
+    #[test]
+    fn the_image_registry_conforms_with_rung_3_implemented() {
+        use mlx_gen::gen_core::{LoadShape, LoadSpec, WeightsSource};
+        let registry = super::register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new())
+            .build()
+            .expect("registry");
+        for shape in [
+            LoadShape::EagerMaterialization,
+            LoadShape::DeferredMaterialization,
+        ] {
+            let spec =
+                LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_load_shape(shape);
+            gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+        }
+        gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
+    }
+}

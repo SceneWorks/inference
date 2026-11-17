@@ -1,5 +1,4 @@
 //! Frozen MOSS edit adapter and tensor-neutral execution inputs.
-use crate::moss_image::MossImageAcceleration;
 pub use gen_core::moss_image_edit::reference_dimensions;
 pub use gen_core::moss_image_edit::{
     MossImageEditExecutionReport, MossImageEditInputs, MossImageEditReferenceReceipt,
@@ -76,26 +75,14 @@ impl MossEditReferenceMemory {
 }
 /// Resolve edit-only defaults without mutating an ordinary request or accepting img2img strength.
 pub fn edit_request(request: &GenerationRequest) -> Result<GenerationRequest> {
+    let policy_request = gen_core::moss_image::moss_policy_request(request);
+    let edited = gen_core_moss_image_policy::apply_edit_defaults(&policy_request)
+        .map_err(|error| Error::Unsupported(error.message().into()))?;
     let mut request = request.clone();
-    let options = request.moss_image.get_or_insert_with(Default::default);
-    if options.acceleration != MossImageAcceleration::Off
-        || options.slg.is_some()
-        || options
-            .uncond_skip_layers
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
-    {
-        return Err(Error::Unsupported("MOSS edit requires ordinary Base/SFT, full-layer CFG, and no SLG; edit+DMD is unvalidated".into()));
-    }
-    if !request.conditioning.is_empty() {
-        return Err(Error::Unsupported(
-            "MOSS edit references must be supplied once through typed edit inputs".into(),
-        ));
-    }
-    options.uncond_skip_layers = Some(vec![]);
-    request.steps.get_or_insert(30);
-    request.guidance.get_or_insert(4.0);
-    request.scheduler_shift.get_or_insert(5.0);
+    request.moss_image = edited.moss_image.map(Into::into);
+    request.steps = edited.steps;
+    request.guidance = edited.guidance;
+    request.scheduler_shift = edited.scheduler_shift;
     Ok(request)
 }
 pub fn edit_adapter_shapes() -> BTreeMap<String, Vec<usize>> {
@@ -125,6 +112,7 @@ pub fn edit_adapter_shapes() -> BTreeMap<String, Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::moss_image::MossImageAcceleration;
     #[test]
     fn ordered_slots_and_aggregate_reference_memory() {
         let image = |width, height, value| Image {

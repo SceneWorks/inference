@@ -1170,6 +1170,22 @@ fn materialize_decoder(weights: &mut Weights, groups: &[Vec<Array>]) -> CoreResu
     Ok(())
 }
 
+/// The by-name refusal of a ModelOpt NVFP4 snapshot (SW-7099): MLX does not execute NVFP4, and a
+/// ModelOpt checkpoint's projections are packed U8 codes, so it loads only a converted tier. A
+/// missing or unreadable config is left to the loader's own error.
+fn modelopt_refusal(dir: &Path) -> CoreResult<()> {
+    let Some(config) = read_json(dir, "config.json") else {
+        return Ok(());
+    };
+    match core_llm::modelopt::modelopt_nvfp4(&config) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(CoreError::Unsupported(
+            core_llm::modelopt::dense_runtime_refusal("MLX"),
+        )),
+        Err(why) => Err(CoreError::Unsupported(why)),
+    }
+}
+
 impl LlamaProvider {
     fn new_execution_fence() -> core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream> {
         core_llm::text_llm::OwnedExecutionFence::new(
@@ -1784,6 +1800,9 @@ impl LlamaProvider {
                     .into(),
             ));
         }
+        // SW-7099: a ModelOpt NVFP4 snapshot is refused by name before admission too — MLX loads
+        // the tier converted from it, never its packed U8 codes as dense weights.
+        modelopt_refusal(Path::new(&spec.source))?;
         // sc-24135: NVFP4 is refused by name before admission, so a memory refusal cannot mask it.
         let quant = spec.quantize.map(quant_spec).transpose()?;
         let required = crate::load_memory::required_bytes(spec)?;
@@ -2609,6 +2628,7 @@ fn campaign_cancellation_probe_request() -> TextLlmRequest {
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
 struct JsonMask<'a> {
     inner: JsonConstraint<'a>,
+    constraint: Constraint,
     table: &'a ConstraintDecodeTable,
     stop_ids: Vec<u32>,
     accepted: Vec<i32>,
@@ -2619,14 +2639,26 @@ struct JsonMask<'a> {
 }
 
 impl<'a> JsonMask<'a> {
+    #[cfg(test)]
     fn new(
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+        reasoning: bool,
+    ) -> Self {
+        Self::for_constraint(&Constraint::Json, table, stop_ids, reasoning)
+    }
+
+    /// Enforce `constraint` (any [`Constraint`] kind) once the reasoning block, if open, closes.
+    fn for_constraint(
+        constraint: &Constraint,
         table: &'a ConstraintDecodeTable,
         stop_ids: impl IntoIterator<Item = u32>,
         reasoning: bool,
     ) -> Self {
         let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
         Self {
-            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            inner: JsonConstraint::for_constraint(constraint, table, stop_ids.iter().copied()),
+            constraint: constraint.clone(),
             table,
             stop_ids,
             accepted: Vec::new(),
@@ -2704,7 +2736,11 @@ impl RewindableConstraintMask for JsonMask<'_> {
             return;
         }
         self.accepted.truncate(checkpoint);
-        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        self.inner = JsonConstraint::for_constraint(
+            &self.constraint,
+            self.table,
+            self.stop_ids.iter().copied(),
+        );
         self.reasoning_tail.clear();
         self.reasoning = self.initial_reasoning;
         let accepted = self.accepted.clone();
@@ -3107,6 +3143,20 @@ impl<'a> TextPipeline<'a> {
     }
 }
 
+/// The numeric policy a completed report binds: the resident projection format the loaded
+/// decoder holds and the device. Recorded for every load — a dense load (`requested = None`)
+/// observes its resident format too; `requested_quantization` is then `null`.
+fn numeric_policy(
+    requested: Option<Quantize>,
+    resident_projection_quantized: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "requested_quantization": requested.map(|requested| format!("{requested:?}")),
+        "resident_projection_quantized": resident_projection_quantized,
+        "device": "metal",
+    })
+}
+
 impl TextLlm for LlamaProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
@@ -3126,6 +3176,36 @@ impl TextLlm for LlamaProvider {
 
     fn load_report(&self) -> Option<core_llm::LoadReport> {
         Some(self.load_report.clone())
+    }
+
+    fn plan_execution(
+        &self,
+        _request: &core_llm::TextLlmRequest,
+    ) -> core_llm::Result<core_llm::ExecutionIdentity> {
+        Ok(core_llm::token_execution::unavailable(
+            "token_runtime_plan_unavailable",
+            "Sampler fallback, prefix reuse and adaptive decode are observed only during execution",
+            "completed_decode_path",
+        ))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        request: &core_llm::TextLlmRequest,
+        events: &mut dyn FnMut(core_llm::StreamEvent),
+    ) -> core_llm::Result<core_llm::CompletedTextLlm> {
+        let scope = core_llm::token_execution::TokenExecutionScope::new();
+        scope.observe_numeric_policy(numeric_policy(
+            self.load_report.requested,
+            self.is_quantized(),
+        ));
+        let output = self.generate(request, &mut |event| {
+            core_llm::token_execution::without_observations(|| events(event))
+        })?;
+        if request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
+        scope.finish_text(output, self.descriptor())
     }
 
     fn generate(
@@ -4126,12 +4206,13 @@ impl LlamaProvider {
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
             self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
-        let mut json_mask = match req.constraint {
-            Some(Constraint::Json) => {
+        let mut json_mask = match &req.constraint {
+            Some(constraint) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask::new(
+                Some(JsonMask::for_constraint(
+                    constraint,
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
                     constraint_starts_in_reasoning,
@@ -5179,7 +5260,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // legacy `mtp` field by the load path.
             speculative: vec![prompt_lookup_capabilities(SPECULATIVE_MAX_DEPTH)],
             // JSON-constrained decoding (sc-7166).
-            supported_constraints: vec![ConstraintKind::Json],
+            supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
         },
     }
 }
@@ -6060,3 +6141,22 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod numeric_policy_tests {
+    use super::*;
+
+    /// A dense load (no requested quantization) still binds its resident format and device; the
+    /// quantized policy value is unchanged from the requested-only form.
+    #[test]
+    fn dense_and_quantized_loads_both_observe_resident_numeric_policy() {
+        let dense = numeric_policy(None, false);
+        assert_eq!(dense["requested_quantization"], serde_json::Value::Null);
+        assert_eq!(dense["resident_projection_quantized"], false);
+        assert_eq!(dense["device"], "metal");
+        let quantized = numeric_policy(Some(Quantize::Q4), true);
+        assert_eq!(quantized["requested_quantization"], "Q4");
+        assert_eq!(quantized["resident_projection_quantized"], true);
+        assert_ne!(dense, quantized);
+    }
+}

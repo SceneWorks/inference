@@ -111,6 +111,7 @@ pub struct QwenImageEdit {
     memory_strategy: gen_core::MemoryProviderContract,
     precision: Precision,
     quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
 }
 
 /// The heavy render-phase components (the edit MMDiT transformer, the VAE, and the optional PiD
@@ -186,6 +187,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -377,7 +379,7 @@ impl Generator for QwenImageEdit {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -408,6 +410,43 @@ impl Generator for QwenImageEdit {
             context,
         )
     }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug("QwenImageEdit.precision", &self.precision);
+                mlx_gen::image_execution::policy_debug("QwenImageEdit.quant", &self.quant);
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImageEdit.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "QwenImageEdit.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl QwenImageEdit {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
 }
 
 impl QwenImageEdit {
@@ -431,6 +470,8 @@ impl QwenImageEdit {
         // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
         let params = resolve_run_params(req, out_w, out_h)?;
+        mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
+        mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
         // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
         // the reference + the LM over pos/neg, materializes, then DROPS it + `clear_cache()` so its

@@ -63,6 +63,42 @@ pub const ENCODER_NORM_NUM_GROUPS: i32 = 32;
 /// The encoder's norm epsilon — **1e-6**, not the decoder's 1e-5.
 pub const ENCODER_NORM_EPS: f32 = 1e-6;
 
+/// MiniMax-H3-**Image** decoder depth (`vae_diffusers/config.json` `decoder_num_layers`).
+pub const IMAGE_DECODER_NUM_LAYERS: usize = 24;
+/// MiniMax-H3-Image decoder attention heads; `heads · dim_head` = 1024 is its model dim.
+pub const IMAGE_DECODER_NUM_HEADS: i32 = 16;
+/// MiniMax-H3-Image partial rotary ratio: `int(64 · 0.5)` = 32 rotated head dims, split over the
+/// **two** `(h, w)` position axes (8 frequencies per axis). 32 is not a multiple of 6, which is
+/// why the video decoder's 3-axis validation refused this config.
+pub const IMAGE_DECODER_ROPE_DIM_RATIO: f32 = 0.5;
+
+/// Which ViT decoder the VAE carries.
+///
+/// The two MiniMax checkpoints share every decoder layer (block, attention, gated FFN, registers,
+/// zero CLS token, partial rotary at theta 100) and differ only in how the latent grid is laid out
+/// as tokens and how `proj_out` unpacks them. One decoder type covers both; this is the switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecoderLayout {
+    /// MiniMax-H3 video (`MiniMaxH3VideoViTDecoder3d`): `(t, h, w)` rotary coordinates and an
+    /// output patch of `patch_size_t × patch_size²` pixels per token.
+    #[default]
+    Video3d,
+    /// MiniMax-H3-Image (`MiniMaxH3ImageViTDecoder2d`): `(h, w)` rotary coordinates only and a
+    /// spatial-only `patch_size²` output patch. There is no time axis, so no temporal chunking and
+    /// no `token_drop` seam either.
+    Image2d,
+}
+
+impl DecoderLayout {
+    /// Rotary position axes — 3 for `(t, h, w)`, 2 for `(h, w)`.
+    pub fn rope_axes(self) -> i32 {
+        match self {
+            Self::Video3d => 3,
+            Self::Image2d => 2,
+        }
+    }
+}
+
 /// Per-channel latent de-normalization mean (`latents_mean`, 24 entries).
 pub const LATENTS_MEAN: [f32; LATENT_CHANNELS] = [
     0.858_090_34,
@@ -177,6 +213,8 @@ pub struct MiniMaxH3VaeConfig {
     /// decoder's 1e-5; `vae/config.json` ships both (`norm_eps` and `decoder_norm_eps`) and using
     /// one for the other is a silent numeric change.
     pub encoder_norm_eps: f32,
+    /// Which decoder token layout this VAE uses. [`DecoderLayout::Video3d`] for MiniMax-H3.
+    pub decoder_layout: DecoderLayout,
 }
 
 impl Default for MiniMaxH3VaeConfig {
@@ -206,6 +244,7 @@ impl Default for MiniMaxH3VaeConfig {
             temporal_downsample_factors: ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS.to_vec(),
             norm_num_groups: ENCODER_NORM_NUM_GROUPS,
             encoder_norm_eps: ENCODER_NORM_EPS,
+            decoder_layout: DecoderLayout::Video3d,
         }
     }
 }
@@ -216,8 +255,27 @@ impl MiniMaxH3VaeConfig {
         self.num_heads * self.head_dim
     }
 
+    /// The shipped `MiniMaxAI/MiniMax-H3-Image` VAE (`vae_diffusers/`,
+    /// `AutoencoderKLMiniMaxH3Image`): the H3 encoder geometry and latent statistics with the
+    /// 24-layer / 1024-dim 2-D decoder.
+    ///
+    /// `clip_length` is 1 and `token_drop` 0 because an image is one frame: the image VAE has no
+    /// temporal chunk plan, and those two fields only drive the video decode's chunking.
+    pub fn image() -> Self {
+        Self {
+            num_layers: IMAGE_DECODER_NUM_LAYERS,
+            num_heads: IMAGE_DECODER_NUM_HEADS,
+            rope_dim_ratio: IMAGE_DECODER_ROPE_DIM_RATIO,
+            clip_length: 1,
+            token_drop: 0,
+            decoder_layout: DecoderLayout::Image2d,
+            ..Self::default()
+        }
+    }
+
     /// Rotated head dims — `int(head_dim · rope_dim_ratio)`, matching the reference's
-    /// `int()` truncation. Must be divisible by `2 · 3` (the 3 position axes, half-split rotary).
+    /// `int()` truncation. Must be divisible by `2 · axes` (half-split rotary over
+    /// [`DecoderLayout::rope_axes`] position axes).
     pub fn rope_apply_dim(&self) -> i32 {
         (self.head_dim as f32 * self.rope_dim_ratio) as i32
     }
@@ -227,9 +285,19 @@ impl MiniMaxH3VaeConfig {
         1 + self.num_register_tokens
     }
 
-    /// Output features of `proj_out` — `out_channels · patch_size_t · patch_size²`.
+    /// Frames each decoded token expands to: `patch_size_t` for the video decoder, 1 for the image
+    /// decoder (its `proj_out` emits a spatial-only patch even though the shared encoder half
+    /// still compresses time by `patch_size_t`).
+    pub fn decoder_patch_size_t(&self) -> i32 {
+        match self.decoder_layout {
+            DecoderLayout::Video3d => self.patch_size_t,
+            DecoderLayout::Image2d => 1,
+        }
+    }
+
+    /// Output features of `proj_out` — `out_channels · decoder_patch_size_t · patch_size²`.
     pub fn patch_dim(&self) -> i32 {
-        self.out_channels * self.patch_size_t * self.patch_size * self.patch_size
+        self.out_channels * self.decoder_patch_size_t() * self.patch_size * self.patch_size
     }
 
     /// Parse a diffusers `vae/config.json` body. The four decoder knobs the diffusers config omits
@@ -237,6 +305,13 @@ impl MiniMaxH3VaeConfig {
     pub fn from_diffusers_json(text: &str) -> Result<Self> {
         let v: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| Error::Msg(format!("minimax-h3 vae/config.json: {e}")))?;
+        let cfg = Self::parse_diffusers(&v)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// The field mapping both diffusers configs share; the caller sets the layout and validates.
+    fn parse_diffusers(v: &serde_json::Value) -> Result<Self> {
         let num = |key: &str| -> Result<f64> {
             v.get(key)
                 .and_then(serde_json::Value::as_f64)
@@ -294,7 +369,45 @@ impl MiniMaxH3VaeConfig {
             temporal_downsample_factors: vec_i32("temporal_downsample_factors")?,
             norm_num_groups: num("norm_num_groups")? as i32,
             encoder_norm_eps: num("norm_eps")? as f32,
+            decoder_layout: DecoderLayout::Video3d,
         };
+        Ok(cfg)
+    }
+
+    /// Parse a diffusers `vae_diffusers/config.json` body for MiniMax-H3-Image
+    /// (`AutoencoderKLMiniMaxH3Image`).
+    ///
+    /// The image config carries no `clip_length` / `token_drop` (there is no temporal chunk plan);
+    /// everything else is read exactly as [`Self::from_diffusers_json`] reads it, and the decoder
+    /// layout is [`DecoderLayout::Image2d`]. A `_class_name` naming any other class is refused, so
+    /// the video config cannot be fed through this path and silently decoded with 2 rotary axes.
+    pub fn from_image_diffusers_json(text: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| Error::Msg(format!("minimax-h3-image vae config.json: {e}")))?;
+        if let Some(class) = v.get("_class_name").and_then(serde_json::Value::as_str) {
+            if class != "AutoencoderKLMiniMaxH3Image" {
+                return Err(Error::Msg(format!(
+                    "minimax-h3-image vae config.json: _class_name is {class:?}, expected \
+                     \"AutoencoderKLMiniMaxH3Image\" (the image VAE's diffusers config)"
+                )));
+            }
+        }
+        let mut obj = v
+            .as_object()
+            .cloned()
+            .ok_or_else(|| Error::Msg("minimax-h3-image vae config.json: not an object".into()))?;
+        for key in ["clip_length", "token_drop"] {
+            if obj.contains_key(key) {
+                return Err(Error::Msg(format!(
+                    "minimax-h3-image vae config.json: unexpected {key}; the image VAE has no \
+                     temporal chunk plan"
+                )));
+            }
+        }
+        obj.insert("clip_length".into(), 1.into());
+        obj.insert("token_drop".into(), 0.into());
+        let mut cfg = Self::parse_diffusers(&serde_json::Value::Object(obj))?;
+        cfg.decoder_layout = DecoderLayout::Image2d;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -312,10 +425,12 @@ impl MiniMaxH3VaeConfig {
             )));
         }
         let rope = self.rope_apply_dim();
-        if rope == 0 || rope % 6 != 0 {
+        let axes = self.decoder_layout.rope_axes();
+        if rope <= 0 || rope % (2 * axes) != 0 {
             return Err(Error::Msg(format!(
-                "minimax-h3 vae: rope_apply_dim {rope} must be a positive multiple of 6 \
-                 (3 position axes, half-split rotary)"
+                "minimax-h3 vae: rope_apply_dim {rope} must be a positive multiple of {} \
+                 ({axes} position axes, half-split rotary)",
+                2 * axes
             )));
         }
         if rope > self.head_dim {
@@ -523,6 +638,92 @@ mod tests {
             ..Default::default()
         };
         assert!(illegal.validate().is_err());
+    }
+
+    /// The published `MiniMaxAI/MiniMax-H3-Image` `vae_diffusers/config.json`, verbatim in every
+    /// field the parser reads.
+    const IMAGE_DIFFUSERS_JSON: &str = r#"{
+        "_class_name": "AutoencoderKLMiniMaxH3Image", "_diffusers_version": "0.42.0.dev0",
+        "in_channels": 3, "out_channels": 3, "latent_channels": 24,
+        "block_out_channels": [128,256,256,512,512,1024], "layers_per_block": 2,
+        "spatial_downsample_factors": [2,2,2,2,1,1],
+        "temporal_downsample_factors": [1,2,2,1,1,1],
+        "norm_num_groups": 32, "norm_eps": 1e-06, "spatial_padding_mode": "reflect",
+        "decoder_num_layers": 24, "decoder_num_attention_heads": 16,
+        "decoder_attention_head_dim": 64, "decoder_num_register_tokens": 4,
+        "decoder_ffn_mult": 4, "decoder_rope_theta": 100.0, "decoder_rope_dim_ratio": 0.5,
+        "decoder_norm_eps": 1e-05,
+        "latents_mean": [0.858090341091156,-0.9606591463088989,1.0661640167236328,-0.5090325474739075,-0.2727581858634949,-1.3675414323806763,-0.2553254961967468,-0.26907554268836975,-0.5376840829849243,-0.0464097298681736,0.6657370328903198,0.19690127670764923,-0.5460608005523682,-0.4035342037677765,-0.23683024942874908,0.25928452610969543,-0.30133944749832153,0.211341992020607,-1.1206848621368408,0.3581933379173279,-0.04225143790245056,0.2604829967021942,0.22864092886447906,0.7056031823158264],
+        "latents_std": [1.2223774194717407,1.2767263650894165,1.6831774711608887,1.7549455165863037,1.5636216402053833,2.194143533706665,0.9653137922286987,1.0569885969161987,0.841948926448822,0.7729952931404114,1.8955937623977661,0.946841835975647,0.7996809482574463,0.44988900423049927,0.7197399735450745,0.6936293244361877,2.961095094680786,2.7694199085235596,3.0496184825897217,2.1088054180145264,3.276226282119751,3.1627357006073,2.2816812992095947,2.6127843856811523]
+    }"#;
+
+    #[test]
+    fn image_diffusers_json_parses_to_the_image_defaults() {
+        let parsed = MiniMaxH3VaeConfig::from_image_diffusers_json(IMAGE_DIFFUSERS_JSON).unwrap();
+        assert_eq!(parsed, MiniMaxH3VaeConfig::image());
+        assert_eq!(parsed.decoder_layout, DecoderLayout::Image2d);
+        assert_eq!(parsed.dim(), 1024);
+        assert_eq!(parsed.num_layers, 24);
+        // 64 · 0.5 = 32 rotated dims over 2 axes -> 8 frequencies per axis.
+        assert_eq!(parsed.rope_apply_dim(), 32);
+        assert_eq!(
+            parsed.rope_apply_dim() % (2 * parsed.decoder_layout.rope_axes()),
+            0
+        );
+        // proj_out is the published [768, 1024]: 3 · 16 · 16, no temporal factor.
+        assert_eq!(parsed.patch_dim(), 768);
+        // The shared encoder half still compresses time 4x; only the decoder patch is 2-D.
+        assert_eq!(parsed.patch_size_t, 4);
+        assert_eq!(parsed.decoder_patch_size_t(), 1);
+        // The statistics are H3's own, verified identical on the published configs.
+        let video = MiniMaxH3VaeConfig::default();
+        assert_eq!(parsed.latents_mean, video.latents_mean);
+        assert_eq!(parsed.latents_std, video.latents_std);
+    }
+
+    /// The 3-axis validation is what refused the H3-Image config before the 2-D layout existed;
+    /// it still refuses that ratio for the video layout.
+    #[test]
+    fn the_image_rope_ratio_is_legal_only_on_the_two_axis_layout() {
+        assert!(MiniMaxH3VaeConfig::image().validate().is_ok());
+        let msg = MiniMaxH3VaeConfig {
+            decoder_layout: DecoderLayout::Video3d,
+            ..MiniMaxH3VaeConfig::image()
+        }
+        .validate()
+        .expect_err("32 rotated dims cannot split over 3 axes")
+        .to_string();
+        assert!(msg.contains("multiple of 6"), "{msg}");
+        // A ratio legal for 3 axes but not 2: 64 · 0.375 = 24 -> 24 % 4 == 0, legal; 64 · 0.1875
+        // = 12 -> legal on both; 64 · 0.09375 = 6 -> 6 % 4 != 0, refused on the image layout.
+        let msg = MiniMaxH3VaeConfig {
+            rope_dim_ratio: 0.093_75,
+            ..MiniMaxH3VaeConfig::image()
+        }
+        .validate()
+        .expect_err("6 rotated dims cannot split over 2 axes")
+        .to_string();
+        assert!(msg.contains("multiple of 4"), "{msg}");
+    }
+
+    #[test]
+    fn the_image_parser_refuses_the_video_config() {
+        let video = IMAGE_DIFFUSERS_JSON.replace(
+            "\"_class_name\": \"AutoencoderKLMiniMaxH3Image\"",
+            "\"_class_name\": \"AutoencoderKLMiniMaxH3\"",
+        );
+        let msg = MiniMaxH3VaeConfig::from_image_diffusers_json(&video)
+            .expect_err("the video class is not the image VAE")
+            .to_string();
+        assert!(msg.contains("_class_name"), "{msg}");
+        let chunked = IMAGE_DIFFUSERS_JSON.replace(
+            "\"latent_channels\": 24,",
+            "\"latent_channels\": 24, \"clip_length\": 17,",
+        );
+        let msg = MiniMaxH3VaeConfig::from_image_diffusers_json(&chunked)
+            .expect_err("an image config carries no temporal chunk plan")
+            .to_string();
+        assert!(msg.contains("clip_length"), "{msg}");
     }
 
     #[test]

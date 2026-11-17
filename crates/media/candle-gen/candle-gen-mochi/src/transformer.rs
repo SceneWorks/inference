@@ -592,6 +592,7 @@ impl MochiTransformer3DModel {
         let pw = wd / p;
         let inner = self.cfg.inner_dim();
 
+        candle_gen::execution::runtime(hidden.device(), DType::F32);
         // f32 activation stream (the parity regime).
         let hidden = hidden.to_dtype(DType::F32)?;
         let enc = enc.to_dtype(DType::F32)?;

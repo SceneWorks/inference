@@ -98,6 +98,68 @@ fn identity_stage<T>(cancel: &CancelFlag, work: impl FnOnce() -> Result<T>) -> R
     Ok(output)
 }
 
+fn complete_pulid_image(
+    cancel: &CancelFlag,
+    route: &'static str,
+    run: impl FnOnce() -> Result<Image>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_direct(&PulidFlux::execution_descriptor(), cancel, || {
+        candle_gen::execution::policy("direct_route", route.into());
+        candle_gen::execution::unavailable(
+            "candle-gen-pulid/src/pulid_flux.rs: face analysis, identity injection, and loaded decoder have no complete execution receipt",
+        );
+        let image = run().map_err(candle_gen::gen_core::Error::from)?;
+        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+    })
+}
+
+#[cfg(test)]
+mod direct_completion_tests {
+    use super::*;
+    use candle_gen::gen_core::{generator::ExecutionIdentity, GenerationOutput};
+
+    fn image(width: u32) -> Image {
+        Image {
+            width,
+            height: 1,
+            pixels: vec![0; width as usize * 3],
+        }
+    }
+
+    #[test]
+    fn pulid_direct_completion_binds_only_successful_attempts() {
+        let cancel = CancelFlag::default();
+        let first =
+            complete_pulid_image(&cancel, "pulid/pulid_flux/generate", || Ok(image(2))).unwrap();
+        assert!(
+            matches!(first.execution, ExecutionIdentity::Unavailable { reason } if reason.missing_facts.iter().any(|fact| fact.contains("face analysis")))
+        );
+        assert!(
+            matches!(first.generation.output, Some(GenerationOutput::Images(images)) if images[0].width == 2)
+        );
+
+        assert!(
+            complete_pulid_image(&cancel, "pulid/pulid_flux/generate", || {
+                Err(CandleError::Msg("test failure".into()))
+            })
+            .is_err()
+        );
+        let retry =
+            complete_pulid_image(&cancel, "pulid/pulid_flux/generate", || Ok(image(4))).unwrap();
+        assert!(
+            matches!(retry.generation.output, Some(GenerationOutput::Images(images)) if images[0].width == 4)
+        );
+
+        let canceled = CancelFlag::default();
+        let signal = canceled.clone();
+        let result = complete_pulid_image(&canceled, "pulid/pulid_flux/generate", || {
+            signal.cancel();
+            Ok(image(8))
+        });
+        assert!(matches!(result, Err(candle_gen::gen_core::Error::Canceled)));
+    }
+}
+
 /// Default PuLID `id_weight` (the reference-face strength; 0–3, upstream default 1.0).
 pub const DEFAULT_ID_WEIGHT: f32 = 1.0;
 /// Default dev guidance for the PuLID photoreal recipe.
@@ -344,6 +406,15 @@ pub fn compile_pulid_plan(
 }
 
 impl PulidFlux {
+    fn execution_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+        // PuLID is a direct provider rather than a registered Generator. Keep the FLUX.1-dev
+        // backbone contract while naming the provider that actually produced the image.
+        let mut descriptor = candle_gen_flux::descriptor_dev();
+        descriptor.id = "pulid_flux";
+        descriptor.family = "pulid";
+        descriptor
+    }
+
     /// Load the FLUX.1-dev backbone + the EVA tower + the IDFormer + the PuLID CA weights + the native
     /// face stack (with the BiSeNet parser) from the [`PulidFluxPaths`].
     pub fn load(paths: &PulidFluxPaths) -> Result<Self> {
@@ -552,6 +623,21 @@ impl PulidFlux {
         identity_stage(cancel, || self.idformer.forward(&id_cond, &eva_out.hidden))
     }
 
+    /// Bind a completed planned image to observations from this same PuLID attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        complete_pulid_image(&req.cancel, "pulid/pulid_flux/generate", || {
+            self.generate_planned(req, reference, plan, &mut report_progress)
+        })
+    }
+
     /// Reference-image identity T2I from the trajectory [`compile_pulid_plan`] froze before load:
     /// condition the FLUX.1-dev generation on `reference`'s PuLID id_embedding at `req.id_weight` (a
     /// single distilled forward per step — no true-CFG).
@@ -570,6 +656,32 @@ impl PulidFlux {
         self.check_plan(req, reference, plan)?;
         let run = RenderRun::new(plan, &req.cancel, None);
         self.generate_inner(req, reference, plan, &run, on_progress)
+    }
+
+    /// Bind an admitted planned PuLID render's output to observations from that same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &PulidFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        complete_pulid_image(
+            &req.cancel,
+            "pulid/pulid_flux/generate_with_memory_context",
+            || {
+                self.generate_with_memory_context_planned(
+                    context,
+                    req,
+                    reference,
+                    plan,
+                    &mut report_progress,
+                )
+            },
+        )
     }
 
     /// Execute one bespoke PuLID request, planned before load, under the exact admission handshake

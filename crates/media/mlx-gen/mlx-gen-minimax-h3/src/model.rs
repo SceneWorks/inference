@@ -111,7 +111,7 @@ pub const MAX_STEPS: u32 = 200;
 
 /// Quantization group size the shared vision tower is built with — the same value every other
 /// consumer of `mlx-gen-boogu`'s tower passes.
-const VISION_GROUP_SIZE: i32 = 64;
+pub(crate) const VISION_GROUP_SIZE: i32 = 64;
 
 /// Which MiniMax-H3 **task** a request is, and therefore which DiT partition it loads.
 ///
@@ -308,7 +308,29 @@ const _: () = {
 /// encoder's GPU view of its weights needed re-reads before it verified (sc-23053, sc-27451).
 pub const GPU_VISIBILITY_RECOVERED: &str = "gpu_visibility_recovered";
 
+impl MiniMaxH3 {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
 impl Generator for MiniMaxH3 {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_with_report(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+        })
+    }
+
     fn veda_execution_report(&self) -> Option<mlx_gen::gen_core::VedaExecutionReport> {
         Some(self.veda_report.borrow().clone())
     }
@@ -326,7 +348,9 @@ impl Generator for MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     /// The render plus its non-fatal warnings (sc-27451): GPU weight-visibility re-reads the text
@@ -373,9 +397,9 @@ impl Generator for MiniMaxH3 {
     /// **Two axes, not one.** The route gate can only judge what a `MemoryRunContext` carries —
     /// geometry, tier, parameters — so everything that is a property of the *load* rather than the
     /// request is judged by the capability table instead, from a contract resolved at load time.
-    /// The deferred-shape and no-adapter prerequisites of rung 4 are both in that half
-    /// ([`crate::memory_strategy::streamable`]). A selection this accepts is one `generate` can run
-    /// only while both halves stay complete; sc-18650 fixed the case where the second was missing.
+    /// Rung 4's deferred-shape prerequisite is in that half
+    /// ([`crate::memory_strategy::streamable`]); since SW-7096 an adapter no longer bears on it,
+    /// because the block stream re-applies the residuals to every rebuilt block.
     fn memory_strategy_safety_check(
         &self,
         context: &mlx_gen::gen_core::MemoryRunContext,

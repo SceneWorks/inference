@@ -1,0 +1,1 @@
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen3vl-baseline --load-profile candle-dense-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline-preflight.json"

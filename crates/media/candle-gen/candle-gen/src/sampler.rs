@@ -19,6 +19,12 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::preview::{PreviewCounter, PreviewHook};
 use crate::{CandleError, Result};
 
+/// The actual shared-driver name/default/fallback resolution; pure metadata, no denoise.
+pub(crate) fn resolved_solver(name: Option<&str>) -> gen_core::sampling::Solver {
+    name.and_then(gen_core::sampling::Solver::from_name)
+        .unwrap_or(gen_core::sampling::Solver::Euler)
+}
+
 /// Lift a `candle_core::Result` into the backend-neutral `gen_core::Result` (the `LatentOps` trait is
 /// declared in gen-core, so its methods return `gen_core::Result`). Routes through the existing
 /// candle-gen bridge: `candle_core::Error -> CandleError -> gen_core::Error::Backend`.
@@ -64,6 +70,7 @@ impl LatentOps for CandleLatentOps {
         // off the raw init-noise seed). Seeded CPU StdRng draw -> launch-portable, then matched to the
         // latent's shape/device/dtype.
         let sub = seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
+        crate::execution::stream("curated_step_noise", sub);
         let mut rng = StdRng::seed_from_u64(sub);
         let data = crate::seeded_normal_vec(&mut rng, x.elem_count());
         let noise = ge(Tensor::from_vec(data, x.shape().clone(), x.device()))?;
@@ -229,17 +236,24 @@ pub fn run_curated_sampler_spans(
     preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
-    use gen_core::sampling::{
-        denoise as gc_denoise, sampler_by_name, Euler, Sampler, SolverRunState,
-    };
+    use gen_core::sampling::{denoise as gc_denoise, SolverRunState};
 
     let ops = CandleLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
-    let sampler: Box<dyn Sampler<CandleLatentOps>> = sampler_name
-        .and_then(sampler_by_name::<CandleLatentOps>)
-        .unwrap_or_else(|| Box::new(Euler));
+    let solver = resolved_solver(sampler_name);
+    let sampler = solver.boxed::<CandleLatentOps>();
     let mut state = SolverRunState::new(sampler.solver(), sigmas);
+    if let Some(run) = phase_scope {
+        // A planned render iterates its plan's seeds, not `for_each_image_seed`, so its
+        // per-image initial-noise draw is recorded here, before this output's runtime and
+        // schedule, as `for_each_image_seed` does: output index = seed - plan base seed.
+        let index = seed.wrapping_sub(run.plan().base_seed()) as usize;
+        crate::execution::draw("image_initial_noise", seed, index);
+    }
+    crate::execution::runtime(latents.device(), latents.dtype());
+    crate::execution::schedule(solver.name(), sigmas, &format!("{:?}", ms.prediction()));
+
     // Built HERE, not by the family, so frame numbering can only ever key off the schedule this
     // driver actually integrates. `None` allocates nothing and adds no per-eval work.
     let previews = preview.map(|hook| (hook, PreviewCounter::new(sigmas)));
@@ -317,6 +331,7 @@ pub fn run_flow_sampler(
     preview: Option<&PreviewHook<'_>>,
     predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
+    crate::execution::policy("flow_timestep_convention", format!("{conv:?}").into());
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
     run_curated_sampler(
         sampler_name,
@@ -346,6 +361,7 @@ pub fn run_flow_sampler_spans(
     preview: Option<&PreviewHook<'_>>,
     predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
+    crate::execution::policy("flow_timestep_convention", format!("{conv:?}").into());
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
     run_curated_sampler_spans(
         sampler_name,
@@ -545,16 +561,16 @@ pub fn run_av_curated_sampler(
     on_progress: &mut dyn FnMut(Progress),
     mut predict: impl FnMut(&AvLatents, f32) -> Result<AvLatents>,
 ) -> Result<AvLatents> {
-    use gen_core::sampling::{
-        denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
-    };
+    use gen_core::sampling::{denoise as gc_denoise, FlowModelSampling};
 
     let ops = CandleAvLatentOps;
     let ms = FlowModelSampling::new(TimestepConvention::Sigma);
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
-    let sampler: Box<dyn Sampler<CandleAvLatentOps>> = sampler_name
-        .and_then(sampler_by_name::<CandleAvLatentOps>)
-        .unwrap_or_else(|| Box::new(Euler));
+    let solver = resolved_solver(sampler_name);
+    let sampler = solver.boxed::<CandleAvLatentOps>();
+    crate::execution::runtime(latents.video.device(), latents.video.dtype());
+    crate::execution::runtime(latents.audio.device(), latents.audio.dtype());
+    crate::execution::schedule(solver.name(), sigmas, "Flow/Sigma/audio-video");
 
     let mut denoise_fn = |x: &AvLatents, sigma: f32| -> gen_core::Result<AvLatents> {
         if cancel.is_cancelled() {
@@ -769,6 +785,12 @@ pub fn run_scm_sampler_from(
     let start = start_step.min(n);
     let total = (n - start).max(1) as u32;
     let single_step = scheduler.is_single_step();
+    crate::execution::runtime(latents.device(), latents.dtype());
+    crate::execution::schedule("scm", &scheduler.timesteps[start..], "TrigFlow");
+    crate::execution::policy(
+        "scm",
+        serde_json::json!({"sigma_data_bits":scheduler.sigma_data.to_bits(),"single_step":single_step}),
+    );
     // Step-index keyed: this loop has no σ schedule for the sigma-keyed counter to search.
     let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(n - start)));
     let mut latents = latents;
@@ -842,6 +864,98 @@ mod tests {
 
     fn t(v: &[f32]) -> Tensor {
         Tensor::from_vec(v.to_vec(), v.len(), &Device::Cpu).unwrap()
+    }
+
+    /// The planned (spans) path iterates the plan's seeds rather than `for_each_image_seed`, so it
+    /// must record each image's initial-noise draw itself; without it a planned render's report is
+    /// Unavailable. Tiny CPU latent and a zero-velocity stand-in predictor: no model weights.
+    #[test]
+    fn planned_spans_path_records_each_image_draw() {
+        use gen_core::generator::{ExecutionIdentity, ExecutionRandomness};
+        let descriptor = gen_core::ModelDescriptor {
+            id: "spans_probe",
+            family: "probe",
+            backend: "candle",
+            modality: gen_core::Modality::Image,
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            capabilities: gen_core::Capabilities {
+                max_count: 2,
+                ..Default::default()
+            },
+        };
+        let req = gen_core::GenerationRequest {
+            width: 512,
+            height: 512,
+            count: 2,
+            seed: Some(40),
+            ..Default::default()
+        };
+        let plan = gen_core::RenderPlan::base_image(
+            &descriptor,
+            &req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 0.0,
+                sigmas: vec![1.0, 0.5, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+        let completed = crate::execution::capture_direct(&descriptor, &req.cancel, || {
+            crate::execution::rng_scheme("fixture-metadata-v1");
+            let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+            run.encode(|| Ok::<_, gen_core::Error>(()))?;
+            let images = run.images_with_denoise_phases(
+                &mut |_| {},
+                |_seed| Ok::<_, gen_core::Error>(t(&[0.25, -0.5])),
+                |seed, latent, progress| {
+                    run.begin_denoise_phase(0)?;
+                    run_flow_sampler_spans(
+                        Some("euler"),
+                        TimestepConvention::Sigma,
+                        plan.denoise_sigmas(),
+                        &plan.denoise_spans(),
+                        Some(&run),
+                        true,
+                        latent,
+                        seed,
+                        &req.cancel,
+                        progress,
+                        None,
+                        |x, _| x.zeros_like().map_err(Into::into),
+                    )
+                    .map_err(gen_core::Error::from)
+                },
+                |_, _, _| {
+                    Ok(gen_core::Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    })
+                },
+            )?;
+            Ok(gen_core::GenerationOutput::Images(images))
+        })
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = completed.execution else {
+            panic!("unresolved: {:?}", completed.execution)
+        };
+        let ExecutionRandomness::Draws { draws, .. } = identity.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(
+            draws
+                .iter()
+                .map(|draw| (draw.seed, draw.output_index))
+                .collect::<Vec<_>>(),
+            [(Some(40), 0), (Some(41), 1)]
+        );
     }
     fn vec1(x: &Tensor) -> Vec<f32> {
         x.flatten_all().unwrap().to_vec1::<f32>().unwrap()

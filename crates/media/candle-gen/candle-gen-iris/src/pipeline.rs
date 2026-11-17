@@ -118,6 +118,15 @@ pub fn denoise(
     preview: &PreviewSink,
 ) -> Result<Tensor> {
     let plan = params.plan()?;
+    candle_gen::execution::runtime(dit.device(), dit.compute_dtype());
+    candle_gen::execution::policy(
+        "iris_resolved_controls",
+        serde_json::json!({
+            "cfg_bits":params.cfg_scale.to_bits(),"cfg_interval_bits":[params.cfg_interval.0.to_bits(),params.cfg_interval.1.to_bits()],
+            "order":params.order,"shift_bits":params.shift.to_bits(),"caption_overflow":format!("{:?}",params.caption_overflow),
+            "quantized":dit.is_quantized(),
+        }),
+    );
     let device = dit.device();
     let rows = conditioning.cond.len();
     if rows == 0 || noise.dim(0)? != rows {

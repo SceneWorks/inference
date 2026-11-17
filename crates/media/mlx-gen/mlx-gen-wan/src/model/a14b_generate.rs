@@ -2,7 +2,39 @@
 
 use super::*;
 
+impl Wan14b {
+    fn generate_execution_attempt(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &request.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(request),
+            on_progress,
+            |on_progress| self.generate_impl(request, on_progress),
+        )
+        .map_err(Into::into)
+    }
+}
+
 impl Generator for Wan14b {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -23,16 +55,9 @@ impl Generator for Wan14b {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        mlx_gen::sc20686::observe_generation(
-            &self.root,
-            &request.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(request),
-            on_progress,
-            |on_progress| self.generate_impl(request, on_progress),
-        )
-        .map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(request, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -196,6 +221,10 @@ impl Wan14b {
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
         let (low_gs, high_gs) = cfg.sample_guide_scale.resolve_dual(req.guidance);
+        mlx_gen::video_execution::policy(
+            "wan_moe",
+            serde_json::json!({"sequential":sequential,"low_guidance_bits":low_gs.to_bits(),"high_guidance_bits":high_gs.to_bits()}),
+        );
         let neg_prompt = req
             .negative_prompt
             .clone()
@@ -266,6 +295,7 @@ impl Wan14b {
         // shape; exact seeded-RNG values differ across the mlx-python/mlx-rs split (expected). I2V
         // (like the reference) starts from pure noise — the image enters via the `y` channel-concat.
         let key = random::key(seed)?;
+        mlx_gen::video_execution::draw(0, "wan_initial_normal", seed);
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         // --- Stage 1b (I2V only): build the channel-concat conditioning `y` (→ VAE encoder freed) ---
@@ -377,6 +407,10 @@ impl Wan14b {
             //   • dense bf16 snapshot + `spec.quantize` → quantize each expert in-memory after the fold.
             // Either way both experts are quantized independently.
             let prequantized = self.config.quantization.is_some();
+            mlx_gen::video_execution::policy(
+                "wan_weight_tier",
+                serde_json::json!({"stored":format!("{:?}",self.config.quantization),"applied":format!("{:?}",self.quant)}),
+            );
             if !prequantized {
                 self.merge_adapters(&mut low_w, &mut high_w)?;
             }

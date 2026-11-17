@@ -18,6 +18,10 @@ import yaml
 
 from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 from scripts.ci.real_weights_workflow import script_references as real_weights_script_references
+from scripts.ci.real_weights_workflow import (
+    CALLED_WORKFLOWS as REAL_WEIGHTS_CALLED_WORKFLOWS,
+    all_script_references as real_weights_all_script_references,
+)
 from pathlib import Path
 
 
@@ -879,8 +883,18 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 40 since sc-25690 added the dispatch-only `mlx-iris-memory-probe` job;
         # 41 since sc-26214 added the dispatch-only `mlx-veda` job;
         # 42 since sc-26234 added the dispatch-only `mlx-flux3-klein` job;
-        # 43 since sc-24217 added the dispatch-only `mlx-supra2` job.
-        MACOS_HUB_LOCK: 43,
+        # 43 since sc-24217 added the dispatch-only `mlx-supra2` job;
+        # 44 since SW-7089 added the dispatch-only `mlx-minimax-h3-image` job;
+        # 45 since SW-7099 added the dispatch-only `mlx-minimax-h3-image-pe` job;
+        # 46 since `minimax-h3-image-reference` materializes the VAE row it produces from on a
+        # reference cache miss, separately from the `mlx-minimax-h3-image` gate job;
+        # 47 since SW-7097 added the dispatch-only `mlx-minimax-h3-image-train` job;
+        # 48 since SW-7098 added the dispatch-only `mlx-minimax-h3-image-train-load` job;
+        # 49 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-publish` job;
+        # 50 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-pe-render` job.
+        MACOS_HUB_LOCK: 50,
+        # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
+        # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
         # 19 since sc-26235 added the dispatch-only `candle-flux3-klein` job;
         # 18 since sc-25901 added the dispatch-only `candle-qwen-image-2-1-turbo` job;
@@ -890,12 +904,20 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 14 since sc-25680 added the `candle-iris` job;
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
-        # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 20,
+        # 11 since sc-18932 added the `candle-minimax-h3` job;
+        # 23 since SW-7097 added the dispatch-only `candle-minimax-h3-image-train` job;
+        # 24 since SW-7098's Candle trainer gates install the lock in that job too;
+        # 26 since SW-7104's `candle-minimax-h3-image-pe-publish` installs it to publish and again
+        # in its snapshot materialization;
+        # 27 since SW-7104 added the dispatch-only `candle-minimax-h3-image-pe-render` job;
+        # 28 since SW-7104's acceptance step installs it for the `minimax-h3-image-acceptance` profile.
+        WINDOWS_HUB_LOCK: 28,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
-        MACOS_MAGE_LOCK: 1,
+        # 2 since SW-7089's MiniMax-H3-Image diffusers reference (now the cached
+        # `minimax-h3-image-reference` job) is produced in the same reviewed Mage reference environment.
+        MACOS_MAGE_LOCK: 2,
     }
     actual_lock_counts = {lock: locks_seen.count(lock) for lock in set(locks_seen)}
     if actual_lock_counts != expected_lock_counts:
@@ -1142,6 +1164,36 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                           "--inventory", "--copied-inventory"):
             self.assertNotIn(forbidden, runs)
         self.assertNotIn("SANA_SNAPSHOT", boundary["env"])
+
+    def test_model_producer_steps_run_under_the_metal_lease_launcher(self) -> None:
+        """A step that runs a real-weights model producer (a `dump_*_real.py` tool) on a self-hosted
+        macOS runner must run under `inference_metal_launcher.py`, via the step or job default shell.
+        The check also reads scripts a step sources, so moving the body into a script cannot hide it.
+        Jobs in the reusable workflows `real-weights.yml` calls are checked too."""
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        for path in REAL_WEIGHTS_CALLED_WORKFLOWS:
+            workflow["jobs"].update(yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"])
+        producer = re.compile(r"dump_[A-Za-z0-9_]*_real\.py")
+        repo = REAL_WEIGHTS_WORKFLOW.parents[2]
+        seen = 0
+        for name, job in workflow["jobs"].items():
+            if "macOS" not in job.get("runs-on", []):
+                continue
+            default_shell = job.get("defaults", {}).get("run", {}).get("shell", "")
+            for step in job.get("steps", []):
+                run = step.get("run")
+                if not run:
+                    continue
+                text = run
+                for script in re.findall(r"source (scripts/ci/\S+\.sh)", run):
+                    text += (repo / script).read_text(encoding="utf-8")
+                if not producer.search(text):
+                    continue
+                seen += 1
+                shell = step.get("shell", default_shell)
+                self.assertIn("scripts/ci/inference_metal_launcher.py", shell,
+                              f"{name}: step {step.get('name')!r} runs a model producer without the Metal lease launcher")
+        self.assertGreater(seen, 0)
 
     def test_ios_prequant_is_single_manual_cpu_route_with_receipt_only(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
@@ -1522,13 +1574,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `mlx-iris-memory-probe` and `candle-iris-memory-probe`; 18 Windows after sc-25901 added
         # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 42 macOS after
         # sc-26234 added `mlx-flux3-klein`; 19 Windows after sc-26235 added `candle-flux3-klein`;
-        # 20 Windows after sc-24214 added `candle-supra2`; 43 macOS after sc-24217 added `mlx-supra2`.
+        # 20 Windows after sc-24214 added `candle-supra2`; 43 macOS after sc-24217 added `mlx-supra2`;
+        # 44 macOS / 21 Windows after SW-7089 added `mlx-minimax-h3-image` / `candle-minimax-h3-image`;
+        # 45 macOS / 22 Windows after SW-7099 added the MiniMax-H3-Image-PE pair; 46 macOS after the
+        # cached `minimax-h3-image-reference` job split from `mlx-minimax-h3-image`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 43)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 20)
+        # 47 macOS / 23 Windows after SW-7097 added the H3-Image trainer pair; 48 / 24 after SW-7098
+        # added the MLX load of the Candle-trained adapter and the Candle trainer gates; 49 / 26
+        # after SW-7104 added the tier publication pair (its Windows job installs the client to
+        # publish and again in the PE lane's own materialization script); 50 / 27 after SW-7104
+        # added the PE-expansion render pair; 50 / 28 after the Candle acceptance step installs it
+        # for the acceptance-only profile.
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 50)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 28)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -5501,6 +5562,8 @@ class WindowsBashSelectionTests(unittest.TestCase):
         self-hosted Windows job in every workflow selects Git Bash before any bash step."""
         checked = 0
         for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            if path in REAL_WEIGHTS_CALLED_WORKFLOWS:
+                continue  # its jobs are checked, inlined, as part of `real-weights.yml`'s
             text = (
                 real_weights_inline_text()
                 if path == REAL_WEIGHTS_WORKFLOW
@@ -5731,7 +5794,10 @@ class WorkflowFileSizeTests(unittest.TestCase):
     def test_real_weights_externalized_step_bodies_resolve_exactly_once(self) -> None:
         repository = WORKFLOW.parents[2]
         workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        references = real_weights_script_references(workflow_text)
+        # The caller's bodies and those of the reusable workflows it calls (SW-F363's H3-Image
+        # lanes), each body referenced from exactly one step.
+        references = real_weights_all_script_references()
+        self.assertTrue(real_weights_script_references(workflow_text))
         on_disk = sorted(
             path.relative_to(repository).as_posix()
             for path in (repository / "scripts" / "ci" / "real-weights").rglob("*")
@@ -5744,10 +5810,55 @@ class WorkflowFileSizeTests(unittest.TestCase):
         self.assertEqual(len([ref for ref in references if ref not in reusable]),
                          len({ref for ref in references if ref not in reusable}), "a workload body is shared")
         self.assertEqual(sorted(set(references)), on_disk, "orphaned or missing step body")
+        called_jobs = set()
+        for path in REAL_WEIGHTS_CALLED_WORKFLOWS:
+            called = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertIn("workflow_call", called.get("on", called.get(True)))
+            self.assertFalse(called_jobs & set(called["jobs"]))
+            called_jobs |= set(called["jobs"])
+            self.assertTrue(
+                any(job.get("uses") == f"./.github/workflows/{path.name}"
+                    for job in yaml.safe_load(workflow_text)["jobs"].values()),
+                f"real-weights.yml must call {path.name}",
+            )
         self.assertEqual(
             set(yaml.safe_load(real_weights_inline_text())["jobs"]),
-            set(yaml.safe_load(workflow_text)["jobs"]),
+            set(yaml.safe_load(workflow_text)["jobs"]) | called_jobs,
         )
+
+    # A step that runs before a job's first `actions/checkout` sees either no repository (fresh
+    # workspace) or the previous run's tree (stale workspace), so it must never execute a
+    # checked-in script or local action: that guard would be missing or out of date.
+    PRE_CHECKOUT_REPOSITORY_SCRIPT = re.compile(
+        r"(?<![\w.-])(?:\./)?(?:scripts|\.github)[/\\][\w./\\-]+\.(?:sh|cmd|ps1|py|bat|js|mjs)\b"
+    )
+
+    @classmethod
+    def pre_checkout_repository_script_errors(cls, workflow: dict) -> list[str]:
+        errors = []
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                uses = str(step.get("uses", ""))
+                if uses.startswith("actions/checkout@"):
+                    break
+                if uses.startswith("./") or cls.PRE_CHECKOUT_REPOSITORY_SCRIPT.search(step.get("run") or ""):
+                    errors.append(f"{job_name}: {step.get('name', uses)!r} runs a repository file before checkout")
+        return errors
+
+    def test_no_step_before_checkout_runs_a_repository_script(self) -> None:
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+                self.assertEqual(self.pre_checkout_repository_script_errors(workflow), [])
+        mutant = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        steps = mutant["jobs"]["ios-pricing-compile-only"]["steps"]
+        self.assertNotIn("actions/checkout@", str(steps[0].get("uses", "")))
+        steps[0]["run"] = ("source scripts/ci/real-weights/ios-pricing-compile-only/"
+                           "require-immutable-source-and-non-dev-mac-placement.sh")
+        self.assertEqual(len(self.pre_checkout_repository_script_errors(mutant)), 1)
+        steps[0]["run"] = "true"
+        steps.insert(0, {"uses": "./.github/actions/cleanup-runner-storage"})
+        self.assertEqual(len(self.pre_checkout_repository_script_errors(mutant)), 1)
 
 
 class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):

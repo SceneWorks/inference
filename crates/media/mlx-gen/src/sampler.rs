@@ -49,6 +49,12 @@ pub trait DiffusionSampler {
     /// The conditioning timestep fed to the model at step `i` (the value the U-Net embeds).
     fn timestep(&self, i: usize) -> f32;
 
+    /// Actual scalar state consumed by this instantiated sampler, including truncated terminal
+    /// nodes. The encoding is provider-versioned; absent facts must not be inferred from a request.
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        None
+    }
+
     /// Scale the latents into the model's expected input space at step `i`. The default is identity
     /// (samplers that fold the scaling into [`Self::step`], e.g. the ancestral Euler sampler, and
     /// the flow-match sampler whose `c_in = 1`); diffusers' Euler divides by `√(σ²+1)`.
@@ -63,6 +69,27 @@ pub trait DiffusionSampler {
     /// CFG-combined) model output. `x` is the **un-scaled** latents (NOT the
     /// [`Self::scale_model_input`] output), matching diffusers' `step(model_output, t, sample)`.
     fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array>;
+}
+
+/// Numeric encoding v1: initial scale, update dtype (0=f32, 1=latents), input dtype code
+/// (0=no input cast), followed by (timestep,c_in,a_x,a_out,a_noise) per step.
+fn execution_policy_coefficients(
+    policy: &impl SamplerPolicy,
+    model_dtype: Option<Dtype>,
+) -> Vec<f32> {
+    let mut values = vec![
+        policy.init_noise_scale(),
+        match policy.step_dtype() {
+            StepDtype::F32 => 0.0,
+            StepDtype::Latents => 1.0,
+        },
+        model_dtype.map_or(0, sampling_dtype_code) as f32,
+    ];
+    for i in 0..policy.num_steps() {
+        let step = policy.coeffs(i);
+        values.extend([step.timestep, step.c_in, step.a_x, step.a_out, step.a_noise]);
+    }
+    values
 }
 
 // =================================================================================================
@@ -88,10 +115,15 @@ impl StepRng {
     /// Unit-normal noise for step `step`, drawn from a distinct subkey. The multiplier de-correlates
     /// consecutive steps; the `+1` keeps step 0 off the raw seed used for the init-noise prior.
     fn normal(&self, shape: &[i32], step: usize) -> Result<Array> {
+        self.normal_reported(shape, step, "curated_solver_step_normal")
+    }
+
+    fn normal_reported(&self, shape: &[i32], step: usize, purpose: &str) -> Result<Array> {
         let sub = self
             .seed
             .wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
         let key = random::key(sub)?;
+        crate::video_execution::draw_current(purpose, sub);
         Ok(random::normal::<f32>(shape, None, None, Some(&key))?)
     }
 }
@@ -831,7 +863,10 @@ pub fn run_flow_sampler_with_latent_hook(
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler_with_latent_hook(run, &ms, latents, on_latent, predict)
+    let (sampler, sigmas, seed, dtype) = (run.sampler_name, run.sigmas, run.seed, latents.dtype());
+    let output = run_curated_sampler_with_latent_hook(run, &ms, latents, on_latent, predict)?;
+    crate::image_execution::sampled_flow(sampler, conv, dtype, sigmas, seed);
+    Ok(output)
 }
 
 pub fn run_flow_sampler_with_latent_hook_spans(
@@ -844,7 +879,8 @@ pub fn run_flow_sampler_with_latent_hook_spans(
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler_with_latent_hook_spans(
+    let (sampler, sigmas, seed, dtype) = (run.sampler_name, run.sigmas, run.seed, latents.dtype());
+    let output = run_curated_sampler_with_latent_hook_spans(
         run,
         &ms,
         latents,
@@ -852,7 +888,11 @@ pub fn run_flow_sampler_with_latent_hook_spans(
         phase_scope,
         on_latent,
         predict,
-    )
+    )?;
+    // The same successful-sampling observation as the unscoped wrapper: a planned render that
+    // skipped it would report its device, solver, schedule and seed as unobserved.
+    crate::image_execution::sampled_flow(sampler, conv, dtype, sigmas, seed);
+    Ok(output)
 }
 
 // =================================================================================================
@@ -911,8 +951,16 @@ impl LatentOps for MlxAvLatentOps {
         // Distinct subkeys per stream (the audio seed is XOR-shifted) so the two streams' stochastic
         // noise is decorrelated; each reuses the per-step `StepRng` derivation.
         Ok(AvLatents {
-            video: MlxLatentOps.randn_like(&x.video, seed, step)?,
-            audio: MlxLatentOps.randn_like(&x.audio, seed ^ 0xA5A5_5A5A_C3C3_3C3C, step)?,
+            video: StepRng::new(seed).normal_reported(
+                x.video.shape(),
+                step,
+                "curated_video_step_normal",
+            )?,
+            audio: StepRng::new(seed ^ 0xA5A5_5A5A_C3C3_3C3C).normal_reported(
+                x.audio.shape(),
+                step,
+                "curated_audio_xor_step_normal",
+            )?,
         })
     }
 }
@@ -1103,6 +1151,13 @@ impl LcmSampler {
 }
 
 impl DiffusionSampler for LcmSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "LcmSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, Some(self.model_dtype)),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1158,6 +1213,13 @@ impl LightningSampler {
 }
 
 impl DiffusionSampler for LightningSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "LightningSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, Some(self.model_dtype)),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1243,6 +1305,13 @@ impl TcdSampler {
 }
 
 impl DiffusionSampler for TcdSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "TcdSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, Some(self.model_dtype)),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1307,6 +1376,13 @@ impl FlowMatchSampler {
 }
 
 impl DiffusionSampler for FlowMatchSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "FlowMatchSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, None),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1338,6 +1414,63 @@ impl DiffusionSampler for FlowMatchSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The planned (spans) FLOW path must record the same successful-sampling observation as the
+    /// unscoped wrapper; without it a planned render's report is Unavailable. Tiny CPU-sized
+    /// latent and a constant-velocity stand-in predictor: no model weights.
+    #[test]
+    fn flow_spans_path_records_the_sampling_observation() {
+        use gen_core::{Capabilities, Modality, ModelDescriptor};
+        let descriptor = ModelDescriptor {
+            id: "spans_probe",
+            family: "probe",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        let sigmas = [1.0_f32, 0.5, 0.0];
+        let cancel = CancelFlag::new();
+        let completed =
+            crate::image_execution::complete_image_attempt(&descriptor, &cancel, || {
+                // A provider always records its own quality policy; the probe stands in for it.
+                crate::image_execution::policy("probe.decode", serde_json::json!("untiled"));
+                let mut progress = |_: Progress| {};
+                run_flow_sampler_with_latent_hook_spans(
+                    SamplerRun {
+                        sampler_name: Some("euler"),
+                        sigmas: &sigmas,
+                        seed: 31,
+                        cancel: &cancel,
+                        on_progress: &mut progress,
+                    },
+                    TimestepConvention::Sigma,
+                    Array::from_slice(&[0.25_f32, -0.5], &[1, 2]),
+                    &[0..1, 1..2],
+                    None,
+                    |_, _| {},
+                    |x, _| Ok(x.multiply(Array::from_f32(0.0))?),
+                )?;
+                Ok(gen_core::GenerationOutput::Images(vec![gen_core::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            })
+            .unwrap();
+        let report = completed
+            .execution
+            .resolved()
+            .unwrap_or_else(|| panic!("unresolved: {:?}", completed.execution));
+        let gen_core::generator::ExecutionRandomness::Draws { draws, .. } = &report.randomness
+        else {
+            panic!("draws")
+        };
+        assert_eq!(draws[0].seed, Some(31));
+    }
 
     #[test]
     fn scoped_span_evaluates_final_output_before_leaving_its_phase() {

@@ -77,6 +77,12 @@ pub fn denoise(
         ));
     }
     let dt = euler_dt(steps) as f64;
+    candle_gen::execution::runtime(z0.device(), z0.dtype());
+    candle_gen::execution::schedule("supra2-euler", &euler_timesteps(steps), "flow-velocity");
+    candle_gen::execution::policy(
+        "supra2_guidance",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"cfg":uncond.is_some(),"dt_bits":dt.to_bits()}),
+    );
     let mut z = z0;
     for (i, t) in euler_timesteps(steps).into_iter().enumerate() {
         if cancel.is_cancelled() {

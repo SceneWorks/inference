@@ -41,6 +41,12 @@ use crate::quant::QLinear;
 /// the stream untouched. The two seams are orthogonal — [`IpFlux::forward`] drives the IP one,
 /// [`IpFlux::forward_injected`] drives this one.
 pub trait DitImageInjector {
+    /// Resolved injector settings. Model/adapter bytes are bound separately by the application.
+    /// Unknown implementations cannot claim a complete execution identity.
+    fn execution_policy(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Residual to add to the image stream after double block `block_idx`, or `None`.
     fn after_double(&self, block_idx: usize, img_hidden: &Tensor) -> Result<Option<Tensor>>;
     /// Cheap gate so the DiT skips slicing the image-token tail on single blocks with no injection.

@@ -88,6 +88,16 @@ fn lifetime<'a>(x: &'a str) -> &'a str { x }
 
 
 class WorkflowPolicy(unittest.TestCase):
+    def test_flash_archive_builder_excludes_fork_prs_from_self_hosted_windows(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / '.github/workflows/flash-attn-prebuilt.yml').read_text(encoding='utf-8'))
+        context = {'github.repository': {'SceneWorks/inference'}}
+        fork = {**context, 'github.event.pull_request.head.repo.full_name': {'other/fork'}}
+        same_repo = {**context, 'github.event.pull_request.head.repo.full_name': {'SceneWorks/inference'}}
+        self.assertFalse(policy.automatic_jobs(workflow, 'pull_request', fork)['windows'])
+        self.assertTrue(policy.automatic_jobs(workflow, 'pull_request', same_repo)['windows'])
+        self.assertTrue(policy.automatic_jobs(workflow, 'push', context)['windows'])
+
     def test_direct_backend_defaults_listing_and_compact_selector_bypasses_are_rejected(self):
         for command in (
             'cargo test --lib --tests',
@@ -174,6 +184,20 @@ for line in result.stdout.splitlines():
 
 
 class WorkflowExecutionGraph(unittest.TestCase):
+    def test_flash_archive_scripts_only_allow_reviewed_ci_modes(self):
+        graph = policy.RunGraph(ROOT)
+        graph.script('scripts/ci/flash_attn_prebuilt.py',
+                     ['--directory', 'objects', '--output', 'flash.tar.gz', '--target', 'x86_64-unknown-linux-gnu', '--revision', 'a' * 40], ())
+        self.assertFalse([item for item in graph.findings if item[0] == 'unknown'])
+        graph = policy.RunGraph(ROOT)
+        graph.script('scripts/ci/fetch_flash_attn_prebuilt.py',
+                     ['--target', 'x86_64-pc-windows-msvc', '--cache', 'cache', '--github-env'], ())
+        self.assertFalse([item for item in graph.findings if item[0] == 'unknown'])
+        graph = policy.RunGraph(ROOT)
+        graph.script('scripts/ci/fetch_flash_attn_prebuilt.py',
+                     ['--target', 'x86_64-pc-windows-msvc', '--', 'cargo', 'test'], ())
+        self.assertTrue([item for item in graph.findings if item[0] == 'unknown'])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

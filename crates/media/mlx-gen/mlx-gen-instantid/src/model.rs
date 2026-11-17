@@ -20,6 +20,7 @@ use mlx_rs::ops::{concatenate_axis, multiply, zeros};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::generator::{CompletedGeneration, ExecutionFact};
 use mlx_gen::gen_core::{
     GenerationRequest, MemoryGeometry, MemoryNumericTier, MemoryPhase, MemoryRequestScope,
     MemoryRunContext, MemoryRunOutcome, MemoryStrategy,
@@ -56,6 +57,37 @@ use crate::restore;
 /// The InstantID compute dtype — fp16, matching the production SDXL path (the VAE stays f32 inside
 /// the SDXL loader).
 const DTYPE: Dtype = Dtype::Float16;
+
+/// Descriptor used only to validate a completed report from the direct InstantID API.
+fn report_descriptor() -> mlx_gen::gen_core::ModelDescriptor {
+    let mut descriptor = mlx_gen_sdxl::descriptor();
+    descriptor.id = crate::memory_strategy::PROVIDER_ID;
+    descriptor.family = "instantid";
+    descriptor
+}
+
+fn capture_instantid_action(
+    cancel: &CancelFlag,
+    action: &'static str,
+    selected_adapters: usize,
+    on_progress: &mut dyn FnMut(Progress),
+    run: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Image>,
+) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+    let descriptor = report_descriptor();
+    let mut progress = |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+    mlx_gen::image_execution::complete_image_attempt(&descriptor, cancel, || {
+        mlx_gen::image_execution::choice("instantid.direct_route", ExecutionFact::resolved(action));
+        if selected_adapters != 0 {
+            mlx_gen::image_execution::unavailable(
+                "instantid_adapter_application_unobserved",
+                "loaded SDXL adapters have no per-target application report on this direct route",
+                "loaded_adapter_application",
+            );
+        }
+        let image = run(&mut progress)?;
+        Ok(mlx_gen::gen_core::GenerationOutput::Images(vec![image]))
+    })
+}
 
 /// Number of face landmarks `draw_kps` indexes (`[left_eye, right_eye, nose, mouth_left,
 /// mouth_right]`).
@@ -854,6 +886,126 @@ impl InstantId {
         result
     }
 
+    /// Generate one identity image with observations from this exact provider attempt.
+    pub fn generate_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate(req, reference, progress),
+        )
+    }
+
+    pub fn generate_angle_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        view_angle: &str,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_angle",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_angle(req, reference, view_angle, progress),
+        )
+    }
+
+    pub fn generate_with_kps_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        kps_norm: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_with_kps",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_with_kps(req, reference, kps_norm, progress),
+        )
+    }
+
+    pub fn generate_with_parameters_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        kps: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_with",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_with(req, embedding, kps, progress),
+        )
+    }
+
+    pub fn generate_pose_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_pose",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_pose(req, reference, keypoints, progress),
+        )
+    }
+
+    pub fn generate_pose_with_parameters_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        face_kps: Option<&[(f32, f32)]>,
+        keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_pose_with",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_pose_with(req, embedding, face_kps, keypoints, progress),
+        )
+    }
+
+    pub fn restore_face_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        base: &Image,
+        embedding: &[f32],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/restore_face",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| {
+                mlx_gen::image_execution::unavailable(
+                "instantid_restore_base_identity_unobserved",
+                "face restoration composites a caller-supplied base image without its execution identity",
+                "base_image_execution",
+            );
+                self.restore_face(req, base, embedding, progress)
+            },
+        )
+    }
+
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
     /// the largest face, then generate. Requires [`with_face`](Self::with_face).
     pub fn generate(
@@ -1072,6 +1224,20 @@ impl InstantId {
         ip_scale: f32,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        mlx_gen::image_execution::policy_debug(
+            "instantid.quantize_requested_bits",
+            &self.reload.quant_bits,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "instantid.staged_residency",
+            &self.staged_residency,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "instantid.adapter_count",
+            &self.reload.paths.adapters.len(),
+        );
+        mlx_gen::image_execution::policy_debug("instantid.control_branches", &controls.len());
+        mlx_gen::image_execution::policy_debug("instantid.pid_decode", &req.use_pid);
         let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
         let scheduler_curated = req
             .scheduler
@@ -1100,43 +1266,47 @@ impl InstantId {
             mlx_rs::random::seed(req.seed)?;
             let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
             let init = multiply(&noise, scalar(sigmas[0]))?;
-            denoise_curated(
-                Self::require(&self.unet, "UNet")?,
-                Some(sampler_name),
-                &ms,
-                &sigmas,
-                init,
-                conditioning,
-                pooled,
-                time_ids,
-                req.guidance,
-                req.seed,
-                &req.cancel,
-                on_progress,
-                controls,
-                Some((face_tokens, ip_scale)),
-                Some(face_tokens),
-            )
+            mlx_gen::image_execution::with_primary_seed(req.seed, || {
+                denoise_curated(
+                    Self::require(&self.unet, "UNet")?,
+                    Some(sampler_name),
+                    &ms,
+                    &sigmas,
+                    init,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    req.guidance,
+                    req.seed,
+                    &req.cancel,
+                    on_progress,
+                    controls,
+                    Some((face_tokens, ip_scale)),
+                    Some(face_tokens),
+                )
+            })
         } else {
             // Bespoke ancestral default (byte-exact N1): InstantID's production EulerAncestral over the
             // seeded prior, dual conditioning via `denoise_ip_multi_control`.
             let prior = seeded_prior(&self.sampler, req.seed, width, height)?;
             let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
             let d = Denoiser::new(Self::require(&self.unet, "UNet")?, &ancestral);
-            denoise_ip_multi_control(
-                &d,
-                prior,
-                conditioning,
-                pooled,
-                time_ids,
-                req.guidance,
-                &req.cancel,
-                on_progress,
-                controls,
-                face_tokens,
-                face_tokens,
-                ip_scale,
-            )
+            mlx_gen::image_execution::with_primary_seed(req.seed, || {
+                denoise_ip_multi_control(
+                    &d,
+                    prior,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    req.guidance,
+                    &req.cancel,
+                    on_progress,
+                    controls,
+                    face_tokens,
+                    face_tokens,
+                    ip_scale,
+                )
+            })
         }
     }
 
@@ -1343,6 +1513,7 @@ impl InstantId {
                 0.0,
             ),
         };
+        mlx_gen::image_execution::policy_debug("instantid.pose_face_visible", &face_kps.is_some());
         // MultiControlNet branch order matches the reference: [IdentityNet(kps), OpenPose(skeleton)].
         let latents = {
             let id_ctx = self.control_ctx(
@@ -1516,6 +1687,84 @@ fn restored_image_dims(image: &Image) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_report_requires_same_attempt_sampler_and_refuses_unbound_restore() {
+        use mlx_gen::gen_core::generator::{ExecutionIdentity, ExecutionRandomness};
+
+        let image = || Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        };
+        let cancel = CancelFlag::new();
+        let first = capture_instantid_action(&cancel, "instantid/generate", 0, &mut |_| {}, |_| {
+            mlx_gen::image_execution::policy_debug("instantid.fixture_controls", &1usize);
+            mlx_gen::image_execution::with_primary_seed(7, || {
+                mlx_gen::image_execution::sampled_native_from_primary_seed(
+                    "euler_ancestral",
+                    "native-sampler-scalar-state",
+                    DTYPE,
+                    &[1.0, 0.0],
+                    "mlx-global-normal-initial-v1;subsequent-draws=resolved-sampler-policy",
+                );
+            });
+            Ok(image())
+        })
+        .unwrap();
+        assert!(matches!(
+            first.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+        let resolved = first.execution.resolved().unwrap();
+        assert_eq!(resolved.output_units, 1);
+        assert!(matches!(
+            &resolved.randomness,
+            ExecutionRandomness::Draws { draws, .. }
+                if draws.len() == 1 && draws[0].output_index == 0 && draws[0].seed == Some(7)
+        ));
+        assert_eq!(
+            resolved.provider_choices["instantid.direct_route"],
+            ExecutionFact::resolved("instantid/generate")
+        );
+
+        let missing =
+            capture_instantid_action(&cancel, "instantid/generate_pose", 0, &mut |_| {}, |_| {
+                Ok(image())
+            })
+            .unwrap();
+        assert!(matches!(
+            missing.execution,
+            ExecutionIdentity::Unavailable { .. }
+        ));
+
+        let adapters =
+            capture_instantid_action(&cancel, "instantid/generate", 1, &mut |_| {}, |_| {
+                Ok(image())
+            })
+            .unwrap();
+        assert!(matches!(
+            adapters.execution,
+            ExecutionIdentity::Unavailable { ref reason }
+                if reason.code == "instantid_adapter_application_unobserved"
+        ));
+
+        let restore =
+            capture_instantid_action(&cancel, "instantid/restore_face", 0, &mut |_| {}, |_| {
+                mlx_gen::image_execution::unavailable(
+                    "instantid_restore_base_identity_unobserved",
+                    "base image execution identity was not supplied",
+                    "base_image_execution",
+                );
+                Ok(image())
+            })
+            .unwrap();
+        assert!(matches!(
+            restore.execution,
+            ExecutionIdentity::Unavailable { ref reason }
+                if reason.code == "instantid_restore_base_identity_unobserved"
+        ));
+    }
 
     struct RecordingScope(Rc<RefCell<Vec<String>>>);
 
