@@ -536,6 +536,10 @@ class SystemProbe:
         # {pid: lifetime peak bytes} from the kernel's own per-process high-water mark: macOS
         # ri_lifetime_max_phys_footprint, Linux VmHWM. Windows has no per-process ledger here.
         self.lifetime_peaks: dict[int, int] = {}
+        # Card-wide used memory recorded just before the child is created (while the caller holds
+        # the UUID lock). The WDDM global-used fallback charges only growth above it to the child,
+        # so a co-tenant's resident memory is never counted against the child cap.
+        self.global_used_baseline_bytes: int | None = None
         actual = {"Darwin": "darwin-mlx", "Linux": "linux-cpu" if policy.backend == "linux-cpu" else "linux-cuda",
                   "Windows": "windows-cpu" if policy.backend == "windows-cpu" else "windows-cuda"}.get(platform.system(), "unsupported")
         if actual != policy.backend:
@@ -672,10 +676,25 @@ class SystemProbe:
                 raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has unknown usage: {line[:160]!r}")
         if unknown_owned:
             free, used = self._windows_global_used_upper_bound()
+            if self.global_used_baseline_bytes is not None:
+                used = max(0, used - self.global_used_baseline_bytes)
             self.gpu_usage_basis = "global-used-upper-bound"
         else:
             self.gpu_usage_basis = "owned-process-attributed"
         return free, used
+
+    def record_global_used_baseline(self) -> int | None:
+        """Pre-spawn card-wide used bytes for the WDDM fallback; None when the card is not WDDM."""
+        if self.policy.backend != "windows-cuda":
+            return None
+        try:
+            _, used = self._windows_global_used_upper_bound()
+        except SupervisionError:
+            # A TCC card reports per-process memory, so the fallback (and this baseline) never applies.
+            self.global_used_baseline_bytes = None
+            return None
+        self.global_used_baseline_bytes = used
+        return used
 
     def _windows_global_used_upper_bound(self) -> tuple[int, int]:
         """One exact WDDM card sample bounds child use when its per-PID value is N/A.
@@ -1297,6 +1316,11 @@ def _run_admitted(
             label = f"CUDA {device.cuda_device_uuid} " if multi_cuda else ""
             raise SupervisionError(error.reason, f"{label}preflight {error.detail}") from error
         device_admission["gpuAvailableBytes"] = available_gpu
+        record_baseline = getattr(sampler, "record_global_used_baseline", None)
+        if callable(record_baseline):
+            # Co-tenants (desktop apps, loaded models) stay outside the child's cap: the WDDM
+            # fallback measures growth above this pre-spawn card sample.
+            device_admission["gpuGlobalUsedBaselineBytes"] = record_baseline()
         if state.role == 0:
             gpu_free = available_gpu
         if available_gpu < device.gpu_free_reserve_bytes + device_admission["gpuEstimateBytes"]:

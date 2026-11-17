@@ -190,11 +190,11 @@ class ChildCudaVisibility(unittest.TestCase):
         return (patch.object(resources, 'os', SimpleNamespace(name='nt', fstat=os.fstat)),
                 patch.dict(sys.modules, {'msvcrt': SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)}))
 
-    def test_default_claim_admits_foreign_compute_unknown_contexts_and_busy_utilization(self):
+    def test_default_claim_admits_foreign_compute_unknown_contexts_and_resident_model(self):
         # CI_IMPACT: fake Windows lock and inventory only. The owner's desktop app holds a
         # compute context and a loaded model on a display GPU; headroom alone decides admission.
         card = {'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 12000,
-                'free_mib': 86304, 'utilization_percent': 85}
+                'free_mib': 86304, 'utilization_percent': 12}
         rows = [[APPROVED, '123', 'private.exe', 'C'], [APPROVED, '124', 'opaque', 'unknown'],
                 [APPROVED, '125', 'dwm.exe', 'C+G']]
         self.assertFalse(guard.idle(card, rows))
@@ -207,7 +207,7 @@ class ChildCudaVisibility(unittest.TestCase):
                 with resources.execution_claim('candle-cuda', GPU_POLICY, root,
                                                {'PUBLIC': str(root), 'RUNNER_NAME': 'MOCK runner'}) as receipt:
                     self.assertEqual(receipt['activity_profile'], resources.SHARED_CUDA_HEADROOM_ACTIVITY)
-                    self.assertEqual(receipt['admission_utilization_percent'], [85] * 5)
+                    self.assertEqual(receipt['admission_utilization_percent'], [12] * 5)
                     self.assertFalse(receipt['isolated_benchmark_claim'])
             self.assertTrue(receipt['post_execution_verified'])
             self.assertTrue(receipt['lease_released'])
@@ -221,21 +221,29 @@ class ChildCudaVisibility(unittest.TestCase):
         # CI_IMPACT: fake Windows lock and inventory only; no GPU, process, model, or Cargo.
         short = {'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 30000,
                  'free_mib': 68304 - 16384 * 2, 'utilization_percent': 0}
-        policy = SimpleNamespace(**{**vars(GPU_POLICY), 'deadline_seconds': 0.05})
+        policy = SimpleNamespace(**{**vars(GPU_POLICY), 'deadline_seconds': 0.05, 'poll_millis': 10})
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             locks = []
             os_patch, lock_patch = self._fake_windows(locks)
+            now = [0.0]
+            def advance(seconds):
+                now[0] += seconds
+            # Deterministic clock: each refused poll sleeps 10 ms of a 50 ms claim deadline.
             with os_patch, lock_patch, patch.object(guard, 'inventory', return_value=([short], [])), \
+                    patch.object(resources.time, 'monotonic', side_effect=lambda: now[0]), \
+                    patch.object(resources.time, 'sleep', side_effect=advance), \
                     patch.object(guard, 'sample_baseline') as baseline, patch('sys.stderr') as stderr:
                 with self.assertRaises(resources.CudaClaimRejected) as caught:
                     with resources.execution_claim('candle-cuda', policy, root, {'PUBLIC': str(root)}):
                         self.fail('refused claim must never execute a body')
             baseline.assert_not_called()
-            self.assertEqual(locks, [1, 2])
+            # The UUID lock is released between refused polls so other CI jobs can use the card.
+            self.assertGreaterEqual(len(locks), 4)
+            self.assertEqual(locks, [1, 2] * (len(locks) // 2))
             diagnostic = caught.exception.diagnostic
             self.assertFalse(diagnostic['predicates']['free_memory_above_policy_headroom'])
-            self.assertIn('deadline expired waiting for headroom', diagnostic['admission_error'])
+            self.assertIn('original CUDA claim deadline expired', diagnostic['admission_error'])
             self.assertGreaterEqual(diagnostic['admission_wait']['headroom_shortfalls'], 1)
             self.assertLess(len(json.dumps(diagnostic)), 4096)
             printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
@@ -318,11 +326,33 @@ class ChildCudaVisibility(unittest.TestCase):
             self.assertFalse(diagnostic['samples'][0]['post_owned_exit_primary_metadata_valid'])
             self.assertNotIn('private-process-name', json.dumps(diagnostic))
 
+    def test_unquiet_window_restarts_sampling_after_releasing_the_lock(self):
+        # CI_IMPACT: mocked SMI snapshots; another tenant's burst refuses, then a quiet window admits.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 5}
+        burst = dict(card, utilization_percent=90)
+        rows = [[APPROVED, '123', 'desktop-app', 'C']]
+        snapshots = [([card], rows), ([card], rows), ([burst], rows), ([card], rows)] + [([card], rows)] * 10
+        locks = []
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            os_patch, lock_patch = self._fake_windows(locks)
+            with os_patch, lock_patch, patch.object(guard, 'inventory', side_effect=snapshots) as inventory, \
+                    patch.object(guard.time, 'sleep'), patch('sys.stderr') as stderr:
+                with resources.execution_claim('candle-cuda', GPU_POLICY, output, {'PUBLIC': str(output)}) as claim:
+                    self.assertFalse(claim['post_execution_verified'])
+            self.assertEqual(inventory.call_count, len(snapshots))
+            self.assertTrue(claim['post_execution_verified'])
+            self.assertEqual(claim['admission_wait']['stable_sample_restarts'], 1)
+            self.assertEqual(locks, [1, 2, 1, 2])
+            printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
+            self.assertIn('utilization 90% (> 30%)', printed)
+
     def test_headroom_loss_during_locked_sampling_waits_and_restarts_with_a_logged_reason(self):
         # CI_IMPACT: mocked SMI snapshots; foreign utilization swings are diagnostic only.
         card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
                 'free_mib': 96003, 'utilization_percent': 0}
-        busy = dict(card, utilization_percent=100)
+        busy = dict(card, utilization_percent=10)
         short = dict(card, used_mib=60000, free_mib=37887)
         rows = [[APPROVED, '123', 'private-process-name', 'C']]
         snapshots = ([([card], rows)] + [([busy], rows)] * 2 + [([short], rows)]
@@ -339,9 +369,9 @@ class ChildCudaVisibility(unittest.TestCase):
             self.assertTrue(claim['post_execution_verified'])
             self.assertEqual(claim['admission_wait']['stable_sample_restarts'], 1)
             self.assertEqual(claim['admission_wait']['headroom_shortfalls'], 1)
-            self.assertEqual(claim['admission_utilization_percent'], [100] * 5)
+            self.assertEqual(claim['admission_utilization_percent'], [10] * 5)
             printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
-            self.assertIn('free memory fell below reserve + child cap', printed)
+            self.assertIn('37887 MiB free is below the requirement', printed)
 
     def test_settle_deadline_expires_without_additional_driver_probe(self):
         # CI_IMPACT: pure deadline control; no driver, CUDA or model work.

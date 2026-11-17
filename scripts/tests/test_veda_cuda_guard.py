@@ -200,21 +200,42 @@ class VedaCudaGuardTests(unittest.TestCase):
                 self.assertFalse(handle.closed)
                 handle.close()
 
-    def test_default_claim_admits_on_headroom_despite_foreign_compute_display_and_utilization(self):
-        # The owner's desktop app holds a CUDA context and a model; the card drives a display.
-        busy = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=40000, free_mib=57887, utilization_percent=60)
+    def test_default_claim_admits_on_headroom_despite_foreign_compute_display_and_resident_model(self):
+        # The owner's desktop app holds a CUDA context and a loaded model; the card drives a display.
+        quiet = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=40000, free_mib=57887, utilization_percent=12)
         rows = [["GPU-test", "7", "desktop-app", "C"], ["GPU-test", "8", "dwm", "C+G"], ["GPU-test", "9", "x", "unknown"]]
-        self.assertFalse(s0.idle(busy, rows))
-        self.assertTrue(s0.has_headroom(busy, 4096))
+        self.assertFalse(s0.idle(quiet, rows))
+        self.assertTrue(s0.has_headroom(quiet, 4096))
+        jitter = [dict(quiet, used_mib=40000 + delta, free_mib=57887 - delta, utilization_percent=util)
+                  for delta, util in ((0, 12), (200, 25), (40, 10), (120, 20), (100, 15))]
         fake_lock = Mock()
         with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
-                patch.dict(sys.modules, {"msvcrt": fake_lock}), patch.object(s0, "inventory", return_value=([busy], rows)), \
+                patch.dict(sys.modules, {"msvcrt": fake_lock}), \
+                patch.object(s0, "inventory", side_effect=[([quiet], rows)] + [([card], rows) for card in jitter]), \
                 patch.object(s0.time, "sleep"):
             admitted, handle, _ = s0.claim_device(Path(out), 4096)
             self.assertEqual(admitted["uuid"], "GPU-test")
             handle.close()
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
+                patch.dict(sys.modules, {"msvcrt": Mock()}), patch.object(s0, "inventory", return_value=([quiet], rows)):
             with self.assertRaisesRegex(RuntimeError, "no unclaimed idle"):
                 s0.claim_device(Path(out), strict=True)
+
+    def test_default_claim_requires_a_quiet_stable_window(self):
+        card = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=20000, free_mib=77887, utilization_percent=5)
+        cases = {
+            "utilization 31%": [dict(card, utilization_percent=31)],
+            "utilization moved 16 points": [dict(card, utilization_percent=5), dict(card, utilization_percent=21)],
+            "memory.used moved 257 MiB": [card, dict(card, used_mib=20257, free_mib=77630)],
+            "memory.used grew 129 MiB": [card] * 4 + [dict(card, used_mib=20129, free_mib=77758)],
+        }
+        for reason, window in cases.items():
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as out, \
+                    patch.dict(os.environ, {"PUBLIC": out}), patch.dict(sys.modules, {"msvcrt": Mock()}), \
+                    patch.object(s0, "inventory", side_effect=[([card], [])] + [([item], []) for item in window]), \
+                    patch.object(s0.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    s0.claim_device(Path(out), 4096)
 
     def test_default_claim_refuses_only_insufficient_or_unstable_headroom_with_reason(self):
         card = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=1164, free_mib=96723, utilization_percent=0)
@@ -236,7 +257,7 @@ class VedaCudaGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "required_free_mib"):
                 s0.claim_device(Path(out))
 
-    def test_headroom_recheck_tolerates_foreign_growth_and_context_changes(self):
+    def test_in_session_headroom_recheck_tolerates_foreign_growth_activity_and_context_changes(self):
         card = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=1164, free_mib=96723, utilization_percent=0)
         grown = dict(card, used_mib=30000, free_mib=67887, utilization_percent=90)
         baseline = dict(uuid="GPU-test", reserved_baseline_mib=1164, process_identities=[])

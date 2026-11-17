@@ -85,8 +85,8 @@ class SharedHeadroom(unittest.TestCase):
 
     def test_shared_headroom_waits_before_body_and_restarts_five_samples_without_other_veto(self):
         policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20})
-        busy = self.card(100, used_mib=20875, free_mib=76564)
-        ready = self.card(100, used_mib=2186, free_mib=95253)
+        busy = self.card(10, used_mib=20875, free_mib=76564)
+        ready = self.card(10, used_mib=2186, free_mib=95253)
         observations = [([busy], [])]*2 + [([ready], [])]*11
         seen=[]
         receipt, count = self.claim(observations, policy=policy, clock=FakeClock(), body=lambda r:seen.append(r))
@@ -116,9 +116,10 @@ class SharedHeadroom(unittest.TestCase):
         with self.assertRaises(resources.CudaClaimRejected):
             self.claim([([busy], []),TimeoutError('MOCK primary query failed')],clock=FakeClock())
 
-    def test_shared_activity_and_changing_foreign_contexts_are_diagnostic_in_both_phases(self):
+    def test_changing_foreign_contexts_are_diagnostic_and_release_activity_is_not_judged(self):
         # CI_IMPACT: synthetic claim + five admission + five release snapshots, no real processes.
-        utilization = [3, 4, 6, 100, 3, 6, 99, 5, 4, 3, 100]
+        # Admission needs a quiet window (<= 30%, spread <= 15); release only checks identity/counters.
+        utilization = [3, 4, 6, 18, 3, 6, 99, 5, 4, 3, 100]
         snapshots = [([self.card(value)], [[UUID, str(100 + index), 'MOCK', kind]])
                      for index, (value, kind) in enumerate(zip(utilization, ['C', 'C+G', 'G', 'C', 'unknown',
                                                                              'C', 'G', 'C+G', 'C', 'G', 'C']))]
@@ -152,7 +153,7 @@ class SharedHeadroom(unittest.TestCase):
         def driver(args, deadline):
             if '--id=' + UUID not in args or '-x' in args or any('query-compute-apps' in arg for arg in args):
                 raise TimeoutError('MOCK optional host census exhausted sampling deadline')
-            return f'1, {UUID}, MOCK, 596.36, 97887, 5247, 92192, 100'
+            return f'1, {UUID}, MOCK, 596.36, 97887, 5247, 92192, 10'
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             fake_os = SimpleNamespace(name='nt', fstat=os.fstat)
@@ -167,7 +168,7 @@ class SharedHeadroom(unittest.TestCase):
                         'root_returncode': 0, 'waited_returncode': 0, 'job_member_pids': [], 'owned_pids': []}
                 self.assertTrue(receipt['post_execution_verified'])
                 self.assertEqual(probe.call_count, 11)
-                self.assertEqual(receipt['admission_utilization_percent'], [100] * 5)
+                self.assertEqual(receipt['admission_utilization_percent'], [10] * 5)
                 self.assertIsNone(receipt['admission_background_activity']['samples'][0]['selected_process_count'])
 
     def test_primary_timeout_preserves_refusal_details_and_never_enters_body(self):

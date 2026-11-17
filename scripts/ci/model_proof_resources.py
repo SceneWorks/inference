@@ -413,8 +413,12 @@ def _wait_notice(observation: dict, reason: str) -> None:
 
 
 def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int | None,
-                           policy, deadline: float, observation: dict, notice: dict | None = None):
-    """Wait only for valid selected-card cap+reserve headroom before any body exists."""
+                           policy, deadline: float, observation: dict, notice: dict | None = None,
+                           pause_unlocked=time.sleep):
+    """Wait only for valid selected-card cap+reserve headroom before any body exists.
+
+    `pause_unlocked` releases the UUID lock while waiting so other CI jobs that fit can run.
+    """
     notice = {} if notice is None else notice
     while True:
         if time.monotonic() >= deadline:
@@ -457,13 +461,17 @@ def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int 
         if remaining <= 0:
             continue
         pause = min(policy.poll_millis / 1000, remaining)
-        time.sleep(pause)
+        pause_unlocked(pause)
         observation['headroom_wait_seconds'] += pause
 
 
 def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_index: int,
-                              policy, baseline: dict, deadline: float, observation: dict):
-    """Restart five fresh samples only for valid headroom loss, within the same deadline."""
+                              policy, baseline: dict, deadline: float, observation: dict,
+                              pause_unlocked=time.sleep, window_reason=lambda: None):
+    """Restart five fresh samples after headroom loss or an unstable card, within the same deadline.
+
+    The lock is released for one poll interval before each restart.
+    """
     notice = {}
     while True:
         try:
@@ -479,12 +487,18 @@ def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_i
                      and last.get('selected_index_matches_admission') is True
                      and proof_cuda_shared_release({**card, 'uuid': uuid}, uuid, physical_index,
                                                    baseline['admitted_total_mib']))
-            if (str(error) != 'physical GPU occupied during model-proof-admission' or not valid
-                    or last.get('predicates', {}).get('free_memory_above_policy_headroom') is not False):
+            if str(error) != 'physical GPU occupied during model-proof-admission' or not valid:
                 raise
             observation['stable_sample_restarts'] += 1
-            _wait_notice(notice, f'{uuid}: free memory fell below reserve + child cap during stable sampling')
-            _shared_admission_wait(reader, output, uuid, physical_index, policy, deadline, observation, notice)
+            reason = window_reason() or 'free memory fell below reserve + child cap'
+            _wait_notice(notice, f'{uuid}: card not admissible during stable sampling: {reason}')
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                pause = min(policy.poll_millis / 1000, remaining)
+                pause_unlocked(pause)
+                observation['headroom_wait_seconds'] += pause
+            _shared_admission_wait(reader, output, uuid, physical_index, policy, deadline, observation, notice,
+                                   pause_unlocked)
 
 
 def effective_claim_deadline(started: float, policy, original_deadline_monotonic: float | None = None) -> float:
@@ -585,16 +599,31 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         if started >= claim_deadline:
             raise ValueError('original comparison deadline expired before physical-device claim')
         lock_notice = {}
-        while not claimed:
+        def acquire():
+            nonlocal claimed
+            while not claimed:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    claimed = True
+                except OSError:
+                    if time.monotonic() >= claim_deadline:
+                        raise ValueError('approved wait deadline expired before physical-device claim')
+                    _wait_notice(lock_notice, f'{uuid}: UUID lock held by another CI job')
+                    time.sleep(policy.poll_millis / 1000)
+        acquire()
+        def pause_unlocked(seconds):
+            """Release the UUID lock while waiting for this card, then take it back."""
+            nonlocal claimed
             handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            claimed = False
+            time.sleep(seconds)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                claimed = True
-            except OSError:
-                if time.monotonic() >= claim_deadline:
-                    raise ValueError('approved wait deadline expired before physical-device claim')
-                _wait_notice(lock_notice, f'{uuid}: UUID lock held by another CI job')
-                time.sleep(policy.poll_millis / 1000)
+                acquire()
+            except ValueError as error:
+                raise CudaClaimRejected({'requested_uuid': uuid, 'admission_error': str(error),
+                                         'admission_wait': dict(admission_wait)}) from error
         from scripts.release import veda_cuda_guard
         activity_profile = bound_cuda_activity_profile(constraints)
         shared_headroom = activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY
@@ -603,7 +632,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         admission_wait = {'primary_polls': 0, 'headroom_shortfalls': 0,
                           'stable_sample_restarts': 0, 'headroom_wait_seconds': 0.0}
         devices, processes = (_shared_admission_wait(inventory_reader, output, uuid,
-            constraints.get('required_cuda_physical_index'), policy, claim_deadline, admission_wait)
+            constraints.get('required_cuda_physical_index'), policy, claim_deadline, admission_wait,
+            pause_unlocked=pause_unlocked)
             if shared_headroom else veda_cuda_guard.inventory(output, 'model-proof-claimed-device'))
         matched = [device for device in devices if device['uuid'] == uuid]
         required_index = constraints.get('required_cuda_physical_index')
@@ -622,8 +652,9 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                   'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME'),
                   'activity_profile': activity_profile, 'claim_utilization_percent': matched[0]['utilization_percent']}
         if shared_headroom:
-            record['activity_policy'] = ('non-isolated correctness; exact-card identity and policy cap plus reserve free; '
-                                         'background utilization and contexts are diagnostic only')
+            record['activity_policy'] = ('non-isolated correctness; exact-card identity and policy cap plus reserve free '
+                                         'on a quiet card (memory.used spread/growth, utilization level/spread bounded); '
+                                         'foreign contexts are diagnostic only')
             record['isolated_benchmark_claim'] = False
             record['lease_released'] = False
             record['claim_deadline_monotonic'] = claim_deadline
@@ -648,14 +679,22 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             selected_uuid, rows, activity_profile=activity_profile)
         settle_deadline = (claim_deadline if shared_headroom
                            else min(claim_deadline, time.monotonic() + 30))
-        probe = lambda: veda_cuda_guard.sample_baseline(
-            matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
-            identity_key=identity_key, permit_bounded_growth=True,
-            require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader)
+        window = {}
+        def probe():
+            # Headroom admission also needs a quiet card across the window (fresh per attempt).
+            check = idle_check
+            if shared_headroom:
+                check, window['state'] = veda_cuda_guard.stable_window(idle_check)
+            return veda_cuda_guard.sample_baseline(
+                matched[0], output, 'model-proof-admission', context_baseline, idle_check=check,
+                identity_key=identity_key, permit_bounded_growth=True,
+                require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader)
         try:
             if shared_headroom:
                 selected, baseline = _shared_admission_samples(probe, inventory_reader, output, uuid,
-                    matched[0]['index'], policy, context_baseline, settle_deadline, admission_wait)
+                    matched[0]['index'], policy, context_baseline, settle_deadline, admission_wait,
+                    pause_unlocked=pause_unlocked,
+                    window_reason=lambda: window.get('state', {}).get('reason'))
             else:
                 selected, baseline = settled_cuda_samples(probe, output, 'model-proof-admission', uuid,
                     matched[0]['index'], policy, context_baseline, settle_deadline, activity_profile=activity_profile)

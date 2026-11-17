@@ -23,6 +23,12 @@ MAX_BASELINE_UTILIZATION_PERCENT = 5
 BASELINE_SAMPLES = 5
 BASELINE_INTERVAL_SECONDS = 0.5
 MAX_SAMPLING_SECONDS = 5
+# Default admission also needs a quiet card across the sampling window (same rule as the
+# SceneWorks wrapper): memory not moving and utilization low and steady.
+STABLE_MAX_USED_SPREAD_MIB = 256
+STABLE_MAX_USED_GROWTH_MIB = 128
+STABLE_MAX_UTILIZATION_PERCENT = 30
+STABLE_MAX_UTILIZATION_SPREAD = 15
 
 
 def command(args: list[str], deadline: float | None = None) -> str:
@@ -204,12 +210,57 @@ def claim_device(out: Path, required_free_mib: int | None = None, *, strict: boo
                         "no unclaimed physical CUDA device with stable headroom") + ": " + "; ".join(refusals))
 
 
+def stable_window(admit, samples: int = BASELINE_SAMPLES):
+    """Wrap a per-sample check with the quiet-card rule over one sampling window.
+
+    Returns (check, state); state["reason"] names the first failed condition. A utilization
+    the driver reports as N/A is not judged. Foreign contexts never matter.
+    """
+    observed: list[dict] = []
+    state = {"reason": None}
+
+    def check(device: dict, rows) -> bool:
+        if not admit(device, rows):
+            state["reason"] = (f'{device.get("free_mib")} MiB free is below the requirement'
+                               if counters_valid(device) else "invalid memory counters")
+            return False
+        observed.append(device)
+        used = [item["used_mib"] for item in observed]
+        utilization = [item.get("utilization_percent") for item in observed
+                       if item.get("utilization_percent") is not None]
+        if any(type(value) is not int for value in utilization):
+            state["reason"] = "invalid utilization counter"
+        elif max(used) - min(used) > STABLE_MAX_USED_SPREAD_MIB:
+            state["reason"] = f"memory.used moved {max(used) - min(used)} MiB (> {STABLE_MAX_USED_SPREAD_MIB})"
+        elif utilization and max(utilization) > STABLE_MAX_UTILIZATION_PERCENT:
+            state["reason"] = f"utilization {max(utilization)}% (> {STABLE_MAX_UTILIZATION_PERCENT}%)"
+        elif utilization and max(utilization) - min(utilization) > STABLE_MAX_UTILIZATION_SPREAD:
+            state["reason"] = (f"utilization moved {max(utilization) - min(utilization)} points "
+                               f"(> {STABLE_MAX_UTILIZATION_SPREAD})")
+        elif len(observed) >= samples and used[-1] - used[0] > STABLE_MAX_USED_GROWTH_MIB:
+            state["reason"] = f"memory.used grew {used[-1] - used[0]} MiB (> {STABLE_MAX_USED_GROWTH_MIB})"
+        else:
+            return True
+        return False
+
+    return check, state
+
+
 def sample_headroom(device: dict, out: Path, phase: str, required_free_mib: int,
-                    baseline: dict | None = None) -> tuple[dict, dict]:
-    """Five stable samples that each keep `required_free_mib` free; foreign activity is diagnostic."""
-    return sample_baseline(device, out, phase, baseline,
-                           idle_check=lambda current, _rows: has_headroom(current, required_free_mib),
-                           permit_bounded_growth=True, require_stable_contexts=False)
+                    baseline: dict | None = None, *, stable: bool = True) -> tuple[dict, dict]:
+    """Five samples that each keep `required_free_mib` free; with `stable`, on a quiet card.
+
+    Foreign display/compute contexts and loaded models never refuse admission.
+    """
+    headroom = lambda current, _rows: has_headroom(current, required_free_mib)
+    check, state = stable_window(headroom) if stable else (headroom, {"reason": None})
+    try:
+        return sample_baseline(device, out, phase, baseline, idle_check=check,
+                               permit_bounded_growth=True, require_stable_contexts=False)
+    except RuntimeError as error:
+        if state["reason"] is None:
+            raise
+        raise RuntimeError(f"{error}: {state['reason']}") from error
 
 
 def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=None,
@@ -221,7 +272,8 @@ def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=
 
 
 def verify_headroom(device: dict, out: Path, phase: str, baseline: dict, required_free_mib: int):
-    sample_headroom(device, out, phase, required_free_mib, baseline)
+    """Re-check headroom inside an admitted session; quietness was settled at admission."""
+    sample_headroom(device, out, phase, required_free_mib, baseline, stable=False)
 
 
 def persist_receipt(out: Path, receipt: dict):

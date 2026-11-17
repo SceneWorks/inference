@@ -162,27 +162,49 @@ class MultiCudaResources(unittest.TestCase):
             self.assertFalse(locked)
             self.assertTrue(records[0]['post_execution_verified'], 'resource cleanup is not body/model acceptance')
 
-    def test_claim_waits_on_headroom_not_activity_and_prints_the_reason(self):
+    def test_claim_waits_under_the_lock_for_headroom_and_quiet_and_logs_the_real_reason(self):
         guard = primitives.component('veda_cuda_guard.py', primitives.GUARD_SHA)
-        busy = {'uuid': ROLE0, 'index': 1, 'total_mib': 97887, 'used_mib': 40000, 'free_mib': 57887, 'utilization_percent': 80}
-        short = dict(busy, used_mib=96000, free_mib=1887)
+        quiet = {'uuid': ROLE0, 'index': 1, 'total_mib': 97887, 'used_mib': 40000, 'free_mib': 57887, 'utilization_percent': 10}
+        short = dict(quiet, used_mib=96000, free_mib=1887)
+        busy = dict(quiet, utilization_percent=80)
+        broken = dict(quiet, free_mib=None)
         rows = [[ROLE0, '7', 'desktop-app', 'C'], [ROLE0, '8', 'x', 'unknown']]
-        snapshots = iter([([short], rows), ([short], rows)] + [([busy], rows)] * 6)
-        clock = iter(range(0, 1000))
-        locker = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_: None)
+        # lock held -> short -> invalid counters -> busy window -> quiet window
+        snapshots = iter([([quiet], rows), ([short], rows), ([broken], rows), ([quiet], rows), ([busy], rows),
+                          ([quiet], rows)] + [([quiet], rows)] * 5)
+        lock_calls = []
+        def locking(_fd, operation, _count):
+            lock_calls.append(operation)
+            if len(lock_calls) == 1:
+                raise OSError('MOCK held by another CI job')
+        locker = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)
+        clock = iter(range(0, 10**6, 100))
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.object(guard, 'inventory', side_effect=lambda *_args, **_kw: next(snapshots)), \
                 patch.object(guard.time, 'sleep'), patch('sys.stderr') as stderr:
-            checked, handles, baselines, _ = primitives.claim_uuids(
-                [ROLE0], guard, Path(temporary), 10**6, Path(temporary).resolve(), locker,
+            checked, handles, _, _ = primitives.claim_uuids(
+                [ROLE0], guard, Path(temporary), 10**9, Path(temporary).resolve(), locker,
                 {ROLE0: 4 << 30}, clock=lambda: next(clock), sleep=lambda _s: None)
             for handle in handles:
                 handle.close()
         self.assertEqual(checked[0]['uuid'], ROLE0)
-        printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
-        self.assertIn('1887 MiB free < 4096 MiB required', printed)
-        self.assertEqual(printed.count('CUDA admission waiting'), 1, 'notices are rate limited, not per poll')
+        lines = [line for line in ''.join(call.args[0] for call in stderr.write.call_args_list).splitlines() if line]
+        self.assertEqual(len(lines), 4)
+        self.assertIn('lock is held by another CI job', lines[0])
+        self.assertIn('1887 MiB free < 4096 MiB required', lines[1])
+        self.assertIn('invalid memory counters', lines[2])
+        self.assertIn('utilization 80%', lines[3])
+        # Every refusal after the lock is taken releases it again (lock, unlock pairs), then the
+        # admitted claim keeps its final lock.
+        self.assertEqual(lock_calls, [1, 1, 2, 1, 2, 1, 2, 1])
 
+    def test_wait_notice_is_rate_limited(self):
+        clock = iter([0, 10, 59, 60, 61])
+        state = {}
+        with patch('sys.stderr') as stderr:
+            for _ in range(5):
+                primitives.wait_notice(state, 'MOCK reason', clock=lambda: next(clock))
+        self.assertEqual(sum('MOCK reason' in call.args[0] for call in stderr.write.call_args_list), 2)
 
 if __name__ == '__main__':
     unittest.main()
