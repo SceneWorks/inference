@@ -45,6 +45,12 @@ RUNNERS = {
     'candle-metal': 'macos-15',
     'candle-cuda': ['self-hosted', 'windows', 'cuda', 'real-weights'],
 }
+# Provisioned self-hosted Macs a request may select by name, each pinned by a label only it carries.
+# `nax` is the established secondary Mac (rw-llm); `nax-primary` the primary Mac (rw-starvector).
+NAX_ROUTES = {
+    'nax': {'name': 'nax-macos-2', 'labels': ['self-hosted', 'macOS', 'ARM64', 'rw-llm']},
+    'nax-primary': {'name': 'nax-macos', 'labels': ['self-hosted', 'macOS', 'ARM64', 'rw-starvector']},
+}
 POLICY_BACKENDS = {'mlx': 'darwin-mlx', 'candle-metal': 'darwin-mlx',
                    'candle-cpu': 'linux-cpu', 'candle-cuda': 'windows-cuda'}
 IRIS_QUANT_PROOFS = frozenset(
@@ -555,14 +561,17 @@ def request(raw: str, backend: str) -> dict:
         raise ValueError('unknown fixed proof backend')
     value = json.loads(raw)
     if (not isinstance(value, dict) or not {'selection', 'policy'} <= set(value)
-            or not set(value) <= {'selection', 'policy', 'runner', 'configuration', 'training_comparison'} | multi_cuda.FIELDS):
+            or not set(value) <= {'selection', 'policy', 'runner', 'configuration', 'training_comparison', 'download_missing'} | multi_cuda.FIELDS):
         raise ValueError('request requires selection and explicit resource policy; only declared runner/configuration/comparison/resource options may be optional')
     if 'configuration' in value and (not isinstance(value['configuration'], str) or not NAME.fullmatch(value['configuration'])):
         raise ValueError('configuration must select one fixed declared name')
-    if value.get('runner', 'hosted') not in ('hosted', 'nax'):
-        raise ValueError('runner must be hosted or the existing provisioned nax route')
-    if value.get('runner') == 'nax' and backend not in ('mlx', 'candle-metal'):
+    if value.get('runner', 'hosted') not in ('hosted', *NAX_ROUTES):
+        raise ValueError('runner must be hosted or an existing provisioned nax route')
+    if value.get('runner') in NAX_ROUTES and backend not in ('mlx', 'candle-metal'):
         raise ValueError('nax is only the existing macOS route')
+    if 'download_missing' in value and (type(value['download_missing']) is not bool
+                                        or (value['download_missing'] and backend != 'mlx')):
+        raise ValueError('download_missing is an explicit boolean, honoured only by the MLX training asset setup')
     if not isinstance(value['selection'], str) or not value['selection']:
         raise ValueError('selection must be explicitly provided')
     policy = value['policy']
@@ -722,8 +731,8 @@ def require_host(backend: str, env: dict[str, str], route: str = 'hosted') -> No
     if env.get('RUNNER_OS') != expected:
         raise ValueError('wrong proof host platform')
     if expected == 'macOS':
-        if route == 'nax' and env.get('RUNNER_NAME') != 'nax-macos-2':
-            raise ValueError('provisioned model route must be nax-macos-2, never the shared dev Mac')
+        if route in NAX_ROUTES and env.get('RUNNER_NAME') != NAX_ROUTES[route]['name']:
+            raise ValueError(f"provisioned model route {route} must run on {NAX_ROUTES[route]['name']}")
         if route == 'hosted' and env.get('MODEL_PROOF_RUNNER_ENVIRONMENT') != 'github-hosted':
             raise ValueError('fixture route requires the isolated hosted Mac environment')
 
@@ -1723,7 +1732,7 @@ def main() -> int:
                     extra_path = Path(directory) / f'cuda-policy-role-{role}.json'
                     write_json(extra_path, secondary)
                     load_policy(extra_path)
-            runner = ['self-hosted', 'macOS', 'ARM64', 'rw-llm'] if value.get('runner') == 'nax' else RUNNERS[args.backend]
+            runner = NAX_ROUTES[value['runner']]['labels'] if value.get('runner') in NAX_ROUTES else RUNNERS[args.backend]
             iris_route = ((args.backend == 'mlx' and value.get('runner') == 'nax')
                           or args.backend == 'candle-cuda')
             asset_setup = ('iris-quant' if iris_route and len(rows) == 1
@@ -1742,6 +1751,8 @@ def main() -> int:
             from scripts.ci.prepare_mlx_training_proof_assets import exact_bindings as mlx_training_bindings
             if mlx_training_bindings(rows, args.backend, value.get('runner')) is not None:
                 asset_setup = 'mlx-training'
+            if value.get('download_missing') and asset_setup != 'mlx-training':
+                raise ValueError('download_missing applies only to a bound MLX training proof')
             if (args.backend == 'candle-cuda' and len(rows) == 1
                     and rows[0]['package'] == 'candle-gen-krea'
                     and rows[0]['fqn'] == 'imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose'):

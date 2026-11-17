@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROVISIONED_HUB = Path("/Volumes/Models/huggingface/hub")
+# The provisioned Macs a request routes to (model_inference_proofs.NAX_ROUTES) -> runner name.
+NAX_RUNNERS = {"nax": "nax-macos-2", "nax-primary": "nax-macos"}
 LISTING_TIMEOUT_SECONDS = 20.0
 
 
@@ -132,7 +134,7 @@ INVENTORY_ALSO = ("microsoft/Mage-Flow-Base", "SceneWorks/Lens-Turbo", "stabilit
 
 def exact_bindings(rows: list[dict], backend: str, runner: str | None) -> dict[str, Pin] | None:
     """The pinned bindings of ONE exact registered MLX training proof on the provisioned Mac."""
-    if backend != "mlx" or runner != "nax" or len(rows) != 1:
+    if backend != "mlx" or runner not in NAX_RUNNERS or len(rows) != 1:
         return None
     row = rows[0]
     if row.get("target_kind") not in ("test", "lib") or "selected_configuration" in row:
@@ -240,29 +242,76 @@ def inventory(pins: list[Pin], roots: list[tuple[str, Path]], also: tuple[str, .
     return report
 
 
+def primary_root(roots: list[tuple[str, Path]]) -> Path:
+    """Where a missing pin is downloaded: the resolved `MLX_GEN_MODELS_ROOT` target, else the first
+    existing root."""
+    for label, root in roots:
+        if label.startswith("MLX_GEN_MODELS_ROOT=") and root.is_dir():
+            return root
+    for _, root in roots:
+        if root.is_dir():
+            return root
+    raise ValueError("no existing runner-local model root to download into")
+
+
+def hub_download(pin: Pin, cache_dir: Path) -> None:
+    """Fetch the WHOLE pinned repository revision into the Hub cache at `cache_dir` through the
+    repository's existing helper (`ensure_model_snapshot.download_snapshot`, i.e.
+    `huggingface_hub.snapshot_download`; its own login/`HF_TOKEN` authenticates gated repos)."""
+    hub_path = os.environ.get("MLX_PROOF_HF_HUB_PATH", "")
+    if hub_path:
+        sys.path.insert(0, hub_path)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.release.ensure_model_snapshot import download_snapshot
+    download_snapshot(repo_id=pin.repository, revision=pin.revision, cache_dir=str(cache_dir))
+
+
+def bind(bindings: dict[str, Pin], roots: list[tuple[str, Path]], download_missing: bool,
+         download=hub_download) -> tuple[dict[str, Path | None], list[dict]]:
+    """Resolve every binding; with `download_missing`, fetch each pinned revision that no root holds
+    (once per repository revision) into the primary root and resolve again."""
+    resolved = {name: resolve(pin, roots) for name, pin in bindings.items()}
+    downloads: list[dict] = []
+    if download_missing and any(path is None for path in resolved.values()):
+        target = primary_root(roots)
+        fetched = set()
+        for name, pin in bindings.items():
+            if resolved[name] is not None or (pin.repository, pin.revision) in fetched:
+                continue
+            fetched.add((pin.repository, pin.revision))
+            print(f"downloading {pin.repository}@{pin.revision} (whole repository) into {target}", flush=True)
+            download(pin, target)
+            downloads.append({"repository": pin.repository, "revision": pin.revision, "cache_dir": str(target)})
+        resolved = {name: resolve(pin, roots) for name, pin in bindings.items()}
+    return resolved, downloads
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     args = parser.parse_args()
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     identities = plan.get("bindings", [])
+    request = plan.get("request", {})
+    route = request.get("runner")
     if (plan.get("backend") != "mlx" or plan.get("selected") != 1 or len(identities) != 1
-            or identities[0] not in MLX_TRAINING_PROOFS or plan.get("request", {}).get("runner") != "nax"
-            or plan.get("asset_setup") != "mlx-training"):
-        raise ValueError("MLX training asset setup requires one exact reviewed case on the provisioned Mac")
+            or identities[0] not in MLX_TRAINING_PROOFS or route not in NAX_RUNNERS
+            or plan.get("asset_setup") != "mlx-training"
+            or type(request.get("download_missing", False)) is not bool):
+        raise ValueError("MLX training asset setup requires one exact reviewed case on a provisioned Mac")
     env = dict(os.environ)
-    if env.get("RUNNER_OS") != "macOS" or env.get("RUNNER_NAME") != "nax-macos-2":
-        raise ValueError("MLX training proofs bind the provisioned secondary Mac's model roots")
+    if env.get("RUNNER_OS") != "macOS" or env.get("RUNNER_NAME") != NAX_RUNNERS[route]:
+        raise ValueError(f"MLX training proofs on route {route} bind {NAX_RUNNERS[route]}'s model roots")
     github_env = env.get("GITHUB_ENV", "")
     if not github_env:
         raise ValueError("GitHub Actions environment file is required")
     bindings = MLX_TRAINING_PROOFS[identities[0]]
     roots = candidate_roots(env, Path.home())
-    resolved = {name: resolve(pin, roots) for name, pin in bindings.items()}
+    resolved, downloads = bind(bindings, roots, request.get("download_missing", False))
     missing = [name for name, path in resolved.items() if path is None]
     if missing:
         every = list({pin: None for case in MLX_TRAINING_PROOFS.values() for pin in case.values()})
-        print(json.dumps({"case": identities[0], "missing": missing,
+        print(json.dumps({"case": identities[0], "missing": missing, "downloads": downloads,
                           "roots": [label for label, _ in roots],
                           "inventory": inventory(every, roots, INVENTORY_ALSO)}, indent=2), flush=True)
         raise ValueError("pinned MLX training snapshot(s) absent from every runner-local root: " + ", ".join(missing))
@@ -271,7 +320,7 @@ def main() -> int:
             if "\n" in str(path) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
                 raise ValueError(f"invalid binding {name}")
             out.write(f"{name}={path}\n")
-    print(json.dumps({"case": identities[0], "roots": [label for label, _ in roots],
+    print(json.dumps({"case": identities[0], "roots": [label for label, _ in roots], "downloads": downloads,
                       "installed_paths": {k: str(v) for k, v in resolved.items()},
                       "claim": "metadata-only asset binding; actual production reader authentication "
                                "belongs to the one manual invocation"}), flush=True)

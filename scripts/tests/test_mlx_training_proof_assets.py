@@ -27,6 +27,7 @@ class MlxTrainingAssets(unittest.TestCase):
             self.assertTrue(rows[identity].get("output_artifacts"), identity)
             row = self.row(identity)
             self.assertEqual(assets.exact_bindings([row], "mlx", "nax"), bindings)
+            self.assertEqual(assets.exact_bindings([row], "mlx", "nax-primary"), bindings)
             self.assertIsNone(assets.exact_bindings([row], "mlx", None))
             self.assertIsNone(assets.exact_bindings([row], "mlx", "hosted"))
             for backend in ("candle-cpu", "candle-metal", "candle-cuda"):
@@ -92,6 +93,47 @@ class MlxTrainingAssets(unittest.TestCase):
             self.assertEqual(roots[0][1], real)
             self.assertIn(f"-> {real}", roots[0][0])
             self.assertEqual(assets.resolve(pin, roots), real / pin.relative())
+
+    def test_download_missing_is_opt_in_and_fetches_only_absent_exact_revisions(self):
+        present = assets.Pin("org/present", "c" * 40, files=("config.json",))
+        absent = assets.Pin("org/absent", "d" * 40, "tier", files=("config.json",))
+        twin = assets.Pin("org/absent", "d" * 40, "other", files=("config.json",))
+        bindings = {"PRESENT": present, "ABSENT": absent, "TWIN": twin}
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory).resolve() / "hub"
+            (primary / present.relative()).mkdir(parents=True)
+            (primary / present.relative() / "config.json").write_text("{}", encoding="utf-8")
+            roots = [(f"MLX_GEN_MODELS_ROOT={primary}", primary)]
+            calls = []
+
+            def fake_download(pin, cache_dir):
+                calls.append((pin.repository, pin.revision, cache_dir))
+                for same in (absent, twin):
+                    (cache_dir / same.relative()).mkdir(parents=True, exist_ok=True)
+                    (cache_dir / same.relative() / "config.json").write_text("{}", encoding="utf-8")
+
+            resolved, downloads = assets.bind(bindings, roots, False, download=fake_download)
+            self.assertEqual(calls, [])
+            self.assertEqual(downloads, [])
+            self.assertIsNone(resolved["ABSENT"])
+            resolved, downloads = assets.bind(bindings, roots, True, download=fake_download)
+            self.assertEqual(calls, [("org/absent", "d" * 40, primary)])
+            self.assertEqual(downloads, [{"repository": "org/absent", "revision": "d" * 40, "cache_dir": str(primary)}])
+            self.assertEqual(resolved["ABSENT"], primary / absent.relative())
+            self.assertEqual(resolved["TWIN"], primary / twin.relative())
+            self.assertEqual(resolved["PRESENT"], primary / present.relative())
+
+    def test_request_validates_download_missing_and_the_primary_mac_route(self):
+        policy = {"backend": "darwin-mlx"}
+        value = proofs.request(json.dumps({"selection": "x", "policy": policy, "runner": "nax-primary",
+                                           "download_missing": True}), "mlx")
+        self.assertTrue(value["download_missing"])
+        for bad in ({"download_missing": "yes"}, {"download_missing": 1}, {"runner": "nax-3"}):
+            with self.assertRaises(ValueError):
+                proofs.request(json.dumps({"selection": "x", "policy": policy, **bad}), "mlx")
+        self.assertEqual(proofs.NAX_ROUTES["nax-primary"]["name"], "nax-macos")
+        self.assertIn("rw-starvector", proofs.NAX_ROUTES["nax-primary"]["labels"])
+        self.assertEqual(assets.NAX_RUNNERS, {k: v["name"] for k, v in proofs.NAX_ROUTES.items()})
 
     def test_main_binds_only_the_exact_planned_case_on_the_provisioned_mac(self):
         identity = next(iter(assets.MLX_TRAINING_PROOFS))
