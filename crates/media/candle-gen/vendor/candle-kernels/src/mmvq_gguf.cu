@@ -715,6 +715,160 @@ static __device__ void mmvq_core_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-column MMVQ with the weight decoded once per block.
+//
+// mmvq_core_impl calls vec_dot once per (column, row), so every activation column re-loads and
+// re-decodes the same weight block (for Q4_K the 6-bit scale/min unpacking and the nibble
+// loads). With 2..8 columns (speculative verify) that made the kernel compute-bound. The split
+// form loads/decodes a block once (`load`) and dots it with each column (`dot`): each (row,
+// column) accumulator receives exactly the same operations in the same k order as
+// mmvq_core_impl, so the results are bit-identical; only redundant work is removed.
+// ---------------------------------------------------------------------------
+
+struct mmvq_w_q8_0 {
+  int v[VDR_Q8_0_Q8_1_MMVQ];
+  half d;
+};
+
+struct mmvq_split_q8_0 {
+  typedef mmvq_w_q8_0 W;
+  static __device__ __forceinline__ void load(const void *__restrict__ vbq, const int kbx,
+                                              const int iqs, W &w) {
+    const block_q8_0 *bq8_0 = (const block_q8_0 *)vbq + kbx;
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+      w.v[i] = get_int_from_int8(bq8_0->qs, iqs + i);
+    }
+    w.d = bq8_0->d;
+  }
+  static __device__ __forceinline__ float dot(const W &w, const block_q8_1 *__restrict__ bq8_1,
+                                              const int iqs) {
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+      u[i] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
+    }
+    return vec_dot_q8_0_q8_1_impl<VDR_Q8_0_Q8_1_MMVQ>(w.v, u, w.d, __low2half(bq8_1->ds));
+  }
+};
+
+struct mmvq_w_q4_K {
+  int v[2];
+  uint16_t aux[2];
+  half2 dm;
+  int bq8_offset;
+};
+
+struct mmvq_split_q4_K {
+  typedef mmvq_w_q4_K W;
+  static __device__ __forceinline__ void load(const void *__restrict__ vbq, const int kbx,
+                                              const int iqs, W &w) {
+    const block_q4_K *bq4_K = (const block_q4_K *)vbq + kbx;
+    const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    const int *q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    w.v[0] = q4[0];
+    w.v[1] = q4[4];
+    const uint16_t *scales = (const uint16_t *)bq4_K->scales;
+    const int j = bq8_offset / 2;
+    if (j < 2) {
+      w.aux[0] = scales[j + 0] & 0x3f3f;
+      w.aux[1] = scales[j + 2] & 0x3f3f;
+    } else {
+      w.aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+      w.aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+    }
+    w.dm = bq4_K->dm;
+    w.bq8_offset = bq8_offset;
+  }
+  static __device__ __forceinline__ float dot(const W &w, const block_q8_1 *__restrict__ bq8_1,
+                                              const int iqs) {
+    int u[2 * QR4_K];
+    float d8[QR4_K];
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+      const block_q8_1 *bq8i = bq8_1 + w.bq8_offset + i;
+      d8[i] = __low2float(bq8i->ds);
+      const int *q8 = (const int *)bq8i->qs + ((iqs / 2) % 4);
+      u[2 * i + 0] = q8[0];
+      u[2 * i + 1] = q8[4];
+    }
+    const uint8_t *sc = (const uint8_t *)w.aux;
+    const uint8_t *m = sc + 2;
+    return vec_dot_q4_K_q8_1_impl_vmmq(w.v, u, sc, m, w.dm, d8);
+  }
+};
+
+template <typename dst_t, int qk, int qi, int vdr, typename Split, int ncols_dst>
+static __device__ void mmvq_split_impl(
+    const void *__restrict__ vx,
+    const block_q8_1 *__restrict__ y,
+    dst_t *__restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int stride_col_y, const int stride_col_dst) {
+
+  constexpr int nwarps = mmvq_nwarps_for(ncols_dst);
+  constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_for(ncols_dst);
+
+  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const int row0 = rows_per_cuda_block * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+  float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+  for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (tid % (qi / vdr));
+
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+      typename Split::W w;
+      Split::load(vx, (row0 + i) * blocks_per_row_x + kbx, kqs, w);
+#pragma unroll
+      for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j][i] += Split::dot(w, &y[j * stride_col_y + kby], kqs);
+      }
+    }
+  }
+
+  __shared__ float tmp_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_dst]
+                              [rows_per_cuda_block][WARP_SIZE];
+
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_cuda_block; ++i) {
+        tmp_shared[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y > 0) {
+    return;
+  }
+
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+      for (int l = 0; l < nwarps - 1; ++l) {
+        tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+      }
+      tmp[j][i] = warp_reduce_sum_f32(tmp[j][i]);
+    }
+    if (threadIdx.x < rows_per_cuda_block &&
+        (rows_per_cuda_block == 1 ||
+         uint32_t(row0 + threadIdx.x) < (uint32_t)nrows_x)) {
+      dst[j * stride_col_dst + row0 + threadIdx.x] =
+          (dst_t)tmp[j][threadIdx.x];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extern-C kernel entry points
 //
 // Macro expands `MMVQ_PLAIN_ENTRY(tag, block_q_t, qk, qi, vdr, vec_dot,
@@ -725,6 +879,7 @@ static __device__ void mmvq_core_impl(
 #define MMVQ_PLAIN_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
                           dst_tag, dst_c_type, ncols)                          \
   extern "C" __global__ void                                                   \
+      __launch_bounds__(((ncols) <= 4 ? 4 : 2) * WARP_SIZE, 1)                 \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda##ncols(                         \
           const void *__restrict__ vx, const void *__restrict__ vy,            \
           dst_c_type *__restrict__ dst, const int ncols_x, const int nrows_x,  \
@@ -733,6 +888,35 @@ static __device__ void mmvq_core_impl(
                     ncols>(vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x,  \
                             stride_col_y, stride_col_dst);                     \
   }
+
+#define MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag,       \
+                         dst_c_type, ncols)                                    \
+  extern "C" __global__ void                                                   \
+      __launch_bounds__(((ncols) <= 4 ? 4 : 2) * WARP_SIZE, 1)                 \
+      mmvq_gguf_##tag##_##dst_tag##_plain_cuda##ncols(                         \
+          const void *__restrict__ vx, const void *__restrict__ vy,            \
+          dst_c_type *__restrict__ dst, const int ncols_x, const int nrows_x,  \
+          const int stride_col_y, const int stride_col_dst) {                  \
+    mmvq_split_impl<dst_c_type, qk_val, qi_val, vdr_val, split_t, ncols>(      \
+        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y,       \
+        stride_col_dst);                                                       \
+  }
+
+#define MMVQ_SPLIT_DST_SET(tag, qk_val, qi_val, vdr_val, split_t, dst_tag,     \
+                           dst_c_type)                                         \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 1) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 2) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 3) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 4) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 5) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 6) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 7) \
+  MMVQ_SPLIT_ENTRY(tag, qk_val, qi_val, vdr_val, split_t, dst_tag, dst_c_type, 8)
+
+#define MMVQ_SPLIT_BATCH_SET(tag, qk_val, qi_val, vdr_val, split_t)            \
+  MMVQ_SPLIT_DST_SET(tag, qk_val, qi_val, vdr_val, split_t, bf16, __nv_bfloat16) \
+  MMVQ_SPLIT_DST_SET(tag, qk_val, qi_val, vdr_val, split_t, f16, half)         \
+  MMVQ_SPLIT_DST_SET(tag, qk_val, qi_val, vdr_val, split_t, f32, float)
 
 // -- plain entries for all 10 supported quant types, batch sizes 1..8, bf16 + f16 + f32 --
 #define MMVQ_PLAIN_BATCH_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot) \
@@ -793,14 +977,12 @@ MMVQ_PLAIN_BATCH_SET(q5_0, block_q5_0, QK5_0, QI5_0, VDR_Q5_0_Q8_1_MMVQ,
                      vec_dot_q5_0_q8_1)
 MMVQ_PLAIN_BATCH_SET(q5_1, block_q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ,
                      vec_dot_q5_1_q8_1)
-MMVQ_PLAIN_BATCH_SET(q8_0, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ,
-                     vec_dot_q8_0_q8_1)
+MMVQ_SPLIT_BATCH_SET(q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, mmvq_split_q8_0)
 MMVQ_PLAIN_BATCH_SET(q2_k, block_q2_K, QK_K, QI2_K, VDR_Q2_K_Q8_1_MMVQ,
                      vec_dot_q2_K_q8_1)
 MMVQ_PLAIN_BATCH_SET(q3_k, block_q3_K, QK_K, QI3_K, VDR_Q3_K_Q8_1_MMVQ,
                      vec_dot_q3_K_q8_1)
-MMVQ_PLAIN_BATCH_SET(q4_k, block_q4_K, QK_K, QI4_K, VDR_Q4_K_Q8_1_MMVQ,
-                     vec_dot_q4_K_q8_1)
+MMVQ_SPLIT_BATCH_SET(q4_k, QK_K, QI4_K, VDR_Q4_K_Q8_1_MMVQ, mmvq_split_q4_K)
 MMVQ_PLAIN_BATCH_SET(q5_k, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ,
                      vec_dot_q5_K_q8_1)
 MMVQ_PLAIN_BATCH_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
