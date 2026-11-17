@@ -215,7 +215,7 @@ fn device_free_bytes(device: &Device) -> Option<u64> {
 }
 
 /// The loaded `minimax_h3_image` provider. A staged or streamed request maps and releases each
-/// component in its own phase; a resident request keeps them warm in [`Self::warm`] (see the
+/// component in its own phase; a resident request keeps them warm in its `warm` field (see the
 /// module docs).
 pub struct MiniMaxH3Image {
     descriptor: ModelDescriptor,
