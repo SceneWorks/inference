@@ -77,8 +77,8 @@ use candle_gen::testkit::{
     cuda_mempool_used_high_bytes, env_parse_or, reset_cuda_mempool_high_water, VramProbe,
 };
 
-/// Max idle-baseline VRAM (GB) tolerated before the sampled peak is considered contaminated by
-/// another process. Matches the flux2 harness's `assert_trustworthy(1.0)`.
+/// Passed to `assert_trustworthy` for its existing signature; the testkit now records it only (a
+/// resident co-tenant under a stable baseline does not contaminate the peak).
 const MAX_BASELINE_GB: f64 = 1.0;
 
 /// The **logical** CUDA device candle renders on (`cuda:0`). The driver API respects

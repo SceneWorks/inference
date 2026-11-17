@@ -1,7 +1,9 @@
-"""Physical admission and owned-child policy preserved from CUDA S0 10c09c5e.
+"""Physical admission and owned-child policy for the Windows CUDA host.
 
-No guard widening: exact driver types, caps, timed samples, reserved/nonrising
-baseline and host-global UUID lock. Coordinator separately owns the shared host.
+Default admission is free-memory headroom held stable across timed samples under the
+host-global UUID lock (the CI-to-CI mutex). Foreign display or compute contexts and
+background utilization are recorded but never refuse. The strict `idle` predicate is
+kept only for timing benchmarks that co-tenant activity would corrupt.
 """
 from __future__ import annotations
 import csv
@@ -21,6 +23,12 @@ MAX_BASELINE_UTILIZATION_PERCENT = 5
 BASELINE_SAMPLES = 5
 BASELINE_INTERVAL_SECONDS = 0.5
 MAX_SAMPLING_SECONDS = 5
+# Default admission also needs a quiet card across the sampling window (same rule as the
+# SceneWorks wrapper): memory not moving and utilization low and steady.
+STABLE_MAX_USED_SPREAD_MIB = 256
+STABLE_MAX_USED_GROWTH_MIB = 128
+STABLE_MAX_UTILIZATION_PERCENT = 30
+STABLE_MAX_UTILIZATION_SPREAD = 15
 
 
 def command(args: list[str], deadline: float | None = None) -> str:
@@ -94,10 +102,24 @@ def typed_processes(xml: str) -> list[list[str]]:
 
 
 def idle(device: dict, processes: list[list[str]]) -> bool:
+    """Strict, benchmark-only: no foreign compute context, display baseline, ~zero utilization."""
     return (device["used_mib"] < MAX_GRAPHICS_BASELINE_MIB
             and device["utilization_percent"] < MAX_BASELINE_UTILIZATION_PERCENT
             and all(len(row) == 4 and row[3] in {"G", "C+G"} and row[1]
                     for row in processes if row[0] == device["uuid"]))
+
+
+def has_headroom(device: dict, required_free_mib: int) -> bool:
+    """Default admission: valid counters and at least `required_free_mib` free, whoever else is resident."""
+    return (type(required_free_mib) is int and required_free_mib > 0
+            and counters_valid(device) and device["free_mib"] >= required_free_mib)
+
+
+def counters_valid(device: dict) -> bool:
+    """Primary memory counters are integers within the card's total; no activity condition."""
+    total, used, free = (device.get(key) for key in ("total_mib", "used_mib", "free_mib"))
+    return (all(type(value) is int for value in (total, used, free))
+            and total > 0 and 0 <= used <= total and 0 <= free <= total)
 
 
 def process_identities(uuid: str, processes: list[list[str]]) -> list[tuple[str, str, str]]:
@@ -142,15 +164,26 @@ def sample_baseline(device: dict, out: Path, phase: str,
         (out / f"{phase}-samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8", newline="\n")
 
 
-def claim_device(out: Path):
+def claim_device(out: Path, required_free_mib: int | None = None, *, strict: bool = False):
+    """Lock one physical UUID and admit it after five stable samples taken under the lock.
+
+    Default: `required_free_mib` free in every sample. `strict=True` (timing benchmarks only)
+    keeps the original idle predicate and nonrising baseline.
+    """
+    if not strict and (type(required_free_mib) is not int or required_free_mib <= 0):
+        raise ValueError("headroom admission requires a positive required_free_mib")
     import msvcrt
+    admit = idle if strict else (lambda device, _rows: has_headroom(device, required_free_mib))
     devices, processes = inventory(out, "admission")
     (out / "admission-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2), encoding="utf-8", newline="\n")
     # Public is host-global for both listeners, unlike runner.temp/workspaces.
     lock_dir = Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
+    refusals = []
     for device in sorted(devices, key=lambda d: d["index"], reverse=True):
-        if not idle(device, processes):
+        if not admit(device, processes):
+            refusals.append(f'GPU {device["index"]}: ' + ("not idle" if strict else
+                            f'{device["free_mib"]} MiB free < {required_free_mib} MiB required'))
             continue
         handle = (lock_dir / f'{device["uuid"]}.lock').open("a+b")
         if handle.seek(0, 2) == 0:
@@ -161,16 +194,73 @@ def claim_device(out: Path):
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             handle.close()
+            refusals.append(f'GPU {device["index"]}: UUID lock held by another CI job')
             continue
         try:
-            checked, baseline = sample_baseline(device, out, "claimed-device")
+            checked, baseline = (sample_baseline(device, out, "claimed-device") if strict else
+                                 sample_headroom(device, out, "claimed-device", required_free_mib))
             return checked, handle, baseline
-        except RuntimeError:
+        except RuntimeError as error:
             handle.close()
+            refusals.append(f'GPU {device["index"]}: {error}')
         except Exception:
             handle.close()
             raise
-    raise RuntimeError("no unclaimed idle physical CUDA device; refusing benchmark")
+    raise RuntimeError(("no unclaimed idle physical CUDA device; refusing benchmark" if strict else
+                        "no unclaimed physical CUDA device with stable headroom") + ": " + "; ".join(refusals))
+
+
+def stable_window(admit, samples: int = BASELINE_SAMPLES):
+    """Wrap a per-sample check with the quiet-card rule over one sampling window.
+
+    Returns (check, state); state["reason"] names the first failed condition. A utilization
+    the driver reports as N/A is not judged. Foreign contexts never matter.
+    """
+    observed: list[dict] = []
+    state = {"reason": None}
+
+    def check(device: dict, rows) -> bool:
+        if not admit(device, rows):
+            state["reason"] = (f'{device.get("free_mib")} MiB free is below the requirement'
+                               if counters_valid(device) else "invalid memory counters")
+            return False
+        observed.append(device)
+        used = [item["used_mib"] for item in observed]
+        utilization = [item.get("utilization_percent") for item in observed
+                       if item.get("utilization_percent") is not None]
+        if any(type(value) is not int for value in utilization):
+            state["reason"] = "invalid utilization counter"
+        elif max(used) - min(used) > STABLE_MAX_USED_SPREAD_MIB:
+            state["reason"] = f"memory.used moved {max(used) - min(used)} MiB (> {STABLE_MAX_USED_SPREAD_MIB})"
+        elif utilization and max(utilization) > STABLE_MAX_UTILIZATION_PERCENT:
+            state["reason"] = f"utilization {max(utilization)}% (> {STABLE_MAX_UTILIZATION_PERCENT}%)"
+        elif utilization and max(utilization) - min(utilization) > STABLE_MAX_UTILIZATION_SPREAD:
+            state["reason"] = (f"utilization moved {max(utilization) - min(utilization)} points "
+                               f"(> {STABLE_MAX_UTILIZATION_SPREAD})")
+        elif len(observed) >= samples and used[-1] - used[0] > STABLE_MAX_USED_GROWTH_MIB:
+            state["reason"] = f"memory.used grew {used[-1] - used[0]} MiB (> {STABLE_MAX_USED_GROWTH_MIB})"
+        else:
+            return True
+        return False
+
+    return check, state
+
+
+def sample_headroom(device: dict, out: Path, phase: str, required_free_mib: int,
+                    baseline: dict | None = None, *, stable: bool = True) -> tuple[dict, dict]:
+    """Five samples that each keep `required_free_mib` free; with `stable`, on a quiet card.
+
+    Foreign display/compute contexts and loaded models never refuse admission.
+    """
+    headroom = lambda current, _rows: has_headroom(current, required_free_mib)
+    check, state = stable_window(headroom) if stable else (headroom, {"reason": None})
+    try:
+        return sample_baseline(device, out, phase, baseline, idle_check=check,
+                               permit_bounded_growth=True, require_stable_contexts=False)
+    except RuntimeError as error:
+        if state["reason"] is None:
+            raise
+        raise RuntimeError(f"{error}: {state['reason']}") from error
 
 
 def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=None,
@@ -179,6 +269,11 @@ def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=
     sample_baseline(device, out, phase, baseline, idle_check=idle_check,
                     identity_key=identity_key, permit_bounded_growth=permit_bounded_growth,
                     require_stable_contexts=require_stable_contexts, inventory_reader=inventory_reader)
+
+
+def verify_headroom(device: dict, out: Path, phase: str, baseline: dict, required_free_mib: int):
+    """Re-check headroom inside an admitted session; quietness was settled at admission."""
+    sample_headroom(device, out, phase, required_free_mib, baseline, stable=False)
 
 
 def persist_receipt(out: Path, receipt: dict):

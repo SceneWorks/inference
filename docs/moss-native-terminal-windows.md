@@ -6,9 +6,17 @@ workflow is dispatched on inference main, refuses feature/story workflow refs, a
 model, comparison/calibration corpus, model downloader, or adoption gate.
 
 `moss-native-terminal-windows.yml` selects the `cuda-windows-2` listener on
-MICHAEL-TRX50. Labels and GitHub concurrency are not host ownership: the coordinator
-must reconcile both repositories, all CI/listeners and external users before
-claiming physical GPU0. Existing GPU1 policies do not authorize GPU0 work.
+MICHAEL-TRX50. Labels and GitHub concurrency are not host ownership. Device
+admission follows the default CUDA rule: with the host-global
+`%PUBLIC%\SceneWorks\gpu-locks\<UUID>.lock` held (the same byte lock the Python
+CUDA claims take), GPU0 must keep `required_free_mib` free in every one of five
+samples taken 0.5 s apart, and the window must be quiet: memory.used spread at most
+256 MiB, last-minus-first growth at most 128 MiB, utilization at most 30% with a
+spread of at most 15 points (an N/A utilization is not judged). Other processes on
+the card (display, desktop apps, loaded models, foreign compute) are recorded in
+`ownership-observations.jsonl` and never refuse by presence. While waiting, the
+controller prints the refusal reason at most once a minute and releases the UUID
+lock between attempts before its first admission.
 
 Dispatch on inference `main`, supplying the exact frozen product feature-head SHA
 and strict data JSON:
@@ -33,17 +41,17 @@ The control object's exact fields are:
   "external_owners_reconciled": true,
   "deadline_utc": "<fresh UTC offset timestamp within six hours>",
   "timeout_seconds": 1800,
-  "desktop_baseline": [],
-  "baseline_max_memory_mib": 0,
-  "baseline_max_utilization_percent": 0
+  "required_free_mib": 36864
 }
 ```
 
-Baseline values must come from fresh device queries, not the zero placeholders.
-If a desktop process is explicitly admitted, each baseline row contains exactly
-`pid` (integer), `name`, and `created_utc` matching fresh Win32_Process identity.
-Missing/inaccessible or reused PID is refused. No process is implicitly exempted.
-The host-local UUID lock is created exclusively under the existing
+`required_free_mib` is optional; when present it must be a positive integer. It
+defaults to 36864 MiB: MOSS-Image's two shipped weight files (25,959 MiB per the
+SceneWorks manifest `estimatedSizeBytes`), plus 25% for activations and the CUDA
+context, plus the 2,048 MiB free reserve the other CUDA claims keep, rounded up to
+36 GiB. That figure is derived, not measured; pass a larger value if a run needs it. Owned children keep exact PID, name,
+creation-time and handle identity; any other GPU0 process is a recorded co-tenant.
+The campaign lease file is created exclusively under the existing
 `E:\sceneworks-evaluation\moss\device-locks` authority. Stale or conflicting locks
 are refused; they are not stolen. Every child ancestry edge requires a matching immutable parent identity and
 creation-time ordering. Retained handles are rechecked before GPU allowlisting;
@@ -68,12 +76,14 @@ Only an authenticated held process with unchanged PID and exact handle creation
 time may account for its stale NVML row for at most 30 seconds after its recorded
 exit. A successful empty CIM result is distinct from an inaccessible/failed query;
 a present CIM row must still match the immutable name/PID/creation identity.
-Handles remain retained during the bounded post-command drain. Both owned NVML
-rows and the sampled memory/utilization must converge to the admitted desktop
-baseline before the next phase. An unconfirmed drain retains the UUID lock for
-coordinator reconciliation. CPU fixtures cover the exit interleavings, stale rows,
-PID reuse, failed queries, and drain timeout; Windows CI also exercises real exited
-handles before disposal.
+Handles remain retained during the bounded post-command drain. The owned NVML
+rows must clear before the next phase, which then re-admits on free memory and a
+quiet window with the UUID lock still held. An unconfirmed drain retains the
+campaign lease for coordinator reconciliation. CPU fixtures cover the exit
+interleavings, stale rows, PID reuse, failed queries, drain timeout, admission of a
+busy-but-stable foreign compute process, refusal on growth, instability, busy
+utilization and short free memory with the logged reason, and UUID-lock contention;
+Windows CI also exercises real exited handles before disposal.
 
 Snapshots above are historical candidates. The CPU-only Rust `native_inventory`
 example rehashes all 41 shared frozen entries before admission, including four

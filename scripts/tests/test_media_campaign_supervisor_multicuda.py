@@ -415,6 +415,22 @@ class MultiCudaSupervisorTests(unittest.TestCase):
                 self.gpu_usage_basis = 'global-used-upper-bound'
                 return super().gpu_free_and_tree_bytes(owner)
 
+        class BaselineProbe(UpperBoundProbe):
+            # A 5000-byte co-tenant baseline: the whole card reads 5900, the child grew by 900.
+            def gpu_free_and_tree_bytes(self, owner):
+                free, used = super().gpu_free_and_tree_bytes(owner)
+                self.last_global_used_upper_bound_bytes = used + 5000
+                return free, used
+
+        timeline = Timeline()
+        probe = BaselineProbe(policy, timeline, 0, use=900)
+        result = self.run_fake(timeline, [probe], [policy], require_gpu_sample=False)
+        bounds = [sample for sample in result.samples if sample.get('phase') == 'cuda-global-used-upper-bound-sample']
+        self.assertTrue(bounds)
+        self.assertTrue(all(sample['globalUsedUpperBoundBytes'] == 5900 and
+                            sample['childGlobalUsedGrowthBytes'] == 900 for sample in bounds))
+        self.assertEqual(timeline.stopped, [])  # the cap judges the growth, not the whole card
+
         timeline = Timeline()
         probe = UpperBoundProbe(policy, timeline, 0, use=900)
         result = self.run_fake(timeline, [probe], [policy], require_gpu_sample=False)

@@ -910,8 +910,12 @@ mod vram_probe {
     //!
     //! All three are **device-level** `nvidia-smi memory.used` deltas over a recorded `baseline`
     //! (WDDM reports per-process `used_memory` as `[N/A]`, and the card must fit the *whole* device's
-    //! resident bytes anyway). Run on an otherwise-idle GPU; the report prints the baseline so a
-    //! non-zero pre-run residency is visible. The sampler is an in-process helper thread (part of the
+    //! resident bytes anyway). The GPU need not be idle (owner rule: no job requires an idle GPU):
+    //! other processes — a desktop's graphics, an app holding a loaded model — may be resident, as
+    //! long as their residency is STABLE across the baseline window, so peak − baseline is this
+    //! run's own footprint. A co-tenant that changes during the run is the caller's to detect (the
+    //! memory catalog walker re-samples the card after each case and retries a moved baseline).
+    //! The report prints the baseline so a non-zero pre-run residency is visible. The sampler is an in-process helper thread (part of the
     //! measurement, not a background job) polling every ~40 ms — fast enough to catch a multi-hundred-ms
     //! load/decode transient.
     //!
@@ -961,15 +965,11 @@ mod vram_probe {
     }
 
     impl VramReport {
-        /// Fail rather than publish a peak sampled from a busy or unreadable GPU. Returns `self` so a
-        /// harness can validate and then print/use the same report value.
-        pub fn assert_trustworthy(self, max_baseline_gb: f64) -> Self {
-            assert!(
-                self.baseline_gb < max_baseline_gb,
-                "sampled GPU was not idle (baseline {:.1} GB, required < {:.1} GB); the peak is contaminated",
-                self.baseline_gb,
-                max_baseline_gb
-            );
+        /// Fail rather than publish a peak sampled from an unreadable GPU. Returns `self` so a
+        /// harness can validate and then print/use the same report value. `_max_baseline_gb` is kept
+        /// for existing callers and no longer refuses: a resident co-tenant is not contamination
+        /// (the baseline's stability is what makes the delta this run's own).
+        pub fn assert_trustworthy(self, _max_baseline_gb: f64) -> Self {
             assert!(
                 self.peak_gb > 0.0,
                 "probe reported a 0.0 GB peak; nvidia-smi is unavailable or the query failed"
@@ -992,10 +992,9 @@ mod vram_probe {
         overall_peak_mib: u64,
     }
 
-    /// Stricter evidence configuration for WDDM runners whose otherwise-idle graphics residency is
-    /// non-zero. The ordinary [`VramProbe::assert_idle`] remains the right default for headless
-    /// lanes; this opt-in guard additionally proves repeated baseline stability and rejects a pure
-    /// compute process before allowing a device-level delta measurement.
+    /// Baseline-window configuration: `sample_count` readings `sample_interval_ms` apart must agree
+    /// within `max_drift_mib` before the lowest becomes the delta baseline. `max_baseline_gb` is kept
+    /// for existing callers and is only recorded: no baseline size or co-tenant process refuses.
     #[derive(Clone, Copy, Debug)]
     pub struct StableIdleConfig {
         pub max_baseline_gb: f64,
@@ -1041,6 +1040,11 @@ mod vram_probe {
                     "nvidia-smi pmon returned physical GPU {gpu}, expected {expected_gpu}; refusing cross-device evidence"
                 ));
             }
+            // An empty card prints one row of dashes (`0  -  -  -  -  -`): no process, nothing
+            // to record. Only an all-dash row counts; a dash PID next to real metrics is malformed.
+            if fields[1..].iter().all(|field| *field == "-") {
+                continue;
+            }
             let pid = fields[1]
                 .parse::<u32>()
                 .map_err(|_| format!("malformed PID in nvidia-smi pmon row: {line}"))?;
@@ -1059,11 +1063,13 @@ mod vram_probe {
         Ok(pids)
     }
 
-    fn validated_stable_baseline(
-        samples: &[u64],
-        config: StableIdleConfig,
-        pure_compute_pids: &[u32],
-    ) -> Result<u64, String> {
+    /// Window samples of the default baseline proof [`VramProbe::start`] and
+    /// [`VramProbe::assert_idle`] use: (count, max drift MiB, interval ms).
+    const DEFAULT_STABLE_WINDOW: (usize, u64, u64) = (5, 64, 200);
+    /// How long [`VramProbe::start`] waits for a co-tenant to hold still before it refuses.
+    const STABLE_BASELINE_WAIT: Duration = Duration::from_secs(600);
+
+    fn validated_stable_baseline(samples: &[u64], config: StableIdleConfig) -> Result<u64, String> {
         if config.sample_count < 2 || samples.len() != config.sample_count {
             return Err(format!(
                 "stable idle evidence needs exactly {} samples (at least 2), got {}",
@@ -1071,28 +1077,13 @@ mod vram_probe {
                 samples.len()
             ));
         }
-        if !config.max_baseline_gb.is_finite() || config.max_baseline_gb <= 0.0 {
-            return Err("stable idle maximum baseline must be finite and positive".to_owned());
-        }
-        if !pure_compute_pids.is_empty() {
-            return Err(format!(
-                "pure compute processes {:?} are resident on the profiled GPU; the peak is contaminated",
-                pure_compute_pids
-            ));
-        }
         let min = *samples.iter().min().expect("non-empty sample set");
         let max = *samples.iter().max().expect("non-empty sample set");
         if max.saturating_sub(min) > config.max_drift_mib {
             return Err(format!(
-                "idle baseline drifted from {min} MiB to {max} MiB (allowed {} MiB); the peak is contaminated",
+                "baseline drifted from {min} MiB to {max} MiB (allowed {} MiB); a co-tenant is \
+                 changing the card, so the peak would be contaminated",
                 config.max_drift_mib
-            ));
-        }
-        if mib_to_gb(max) >= config.max_baseline_gb {
-            return Err(format!(
-                "stable idle baseline reached {:.1} GB (required < {:.1} GB); the peak is contaminated",
-                mib_to_gb(max),
-                config.max_baseline_gb
             ));
         }
         // Subtract the lowest stable sample so the reported delta cannot be understated by a small
@@ -1113,11 +1104,42 @@ mod vram_probe {
         /// A failed query is fatal: treating it as a zero baseline would turn the absence of a
         /// measurement into a plausible low peak that could understate a manifest requirement.
         pub fn start(gpu: usize) -> Self {
-            let baseline = used_mib(gpu).unwrap_or_else(|| {
-                panic!(
-                    "cannot read VRAM for physical GPU {gpu} with nvidia-smi; refusing to record an untrustworthy peak"
-                )
-            });
+            // The baseline is the lowest sample of a STABLE window, retried (and logged at most once a
+            // minute) while a co-tenant is changing the card, so every probe -- including callers that
+            // only check `assert_trustworthy` -- subtracts a baseline that held still.
+            let (count, drift, interval) = DEFAULT_STABLE_WINDOW;
+            let config = StableIdleConfig::new(0.0, count, drift, interval);
+            let started = std::time::Instant::now();
+            let mut logged: Option<std::time::Instant> = None;
+            let baseline = loop {
+                let mut samples = Vec::with_capacity(count);
+                for index in 0..count {
+                    if index > 0 {
+                        std::thread::sleep(Duration::from_millis(interval));
+                    }
+                    samples.push(used_mib(gpu).unwrap_or_else(|| {
+                        panic!(
+                            "cannot read VRAM for physical GPU {gpu} with nvidia-smi; refusing to record an untrustworthy peak"
+                        )
+                    }));
+                }
+                match validated_stable_baseline(&samples, config) {
+                    Ok(baseline) => break baseline,
+                    Err(reason) if started.elapsed() < STABLE_BASELINE_WAIT => {
+                        if logged.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                            logged = Some(std::time::Instant::now());
+                            eprintln!(
+                                "[[CUDA_BASELINE_WAIT]] gpu={gpu} waited={}s reason={reason}",
+                                started.elapsed().as_secs()
+                            );
+                        }
+                    }
+                    Err(reason) => panic!(
+                        "no stable baseline on physical GPU {gpu} within {}s: {reason}",
+                        STABLE_BASELINE_WAIT.as_secs()
+                    ),
+                }
+            };
             Self {
                 gpu,
                 baseline_mib: baseline,
@@ -1127,21 +1149,23 @@ mod vram_probe {
             }
         }
 
-        /// Fail if the recorded baseline is not approximately idle. Returns `self` so callers that
-        /// need phase-relative measurements after a deliberate resident load can retain the trusted
-        /// pre-run baseline as provenance.
+        /// Prove a STABLE baseline with the default window (5 samples, 200 ms apart, <= 64 MiB
+        /// drift) and use its lowest sample. The GPU need not be idle: `max_baseline_gb` is kept for
+        /// existing callers and only recorded. Returns `self` so callers can keep the baseline.
         pub fn assert_idle(self, max_baseline_gb: f64) -> Self {
-            let baseline_gb = mib_to_gb(self.baseline_mib);
-            assert!(
-                baseline_gb < max_baseline_gb,
-                "sampled GPU was not idle (baseline {baseline_gb:.1} GB, required < {max_baseline_gb:.1} GB); the peak is contaminated"
-            );
-            self
+            let (samples, drift, interval) = DEFAULT_STABLE_WINDOW;
+            self.assert_stable_idle(StableIdleConfig::new(
+                max_baseline_gb,
+                samples,
+                drift,
+                interval,
+            ))
         }
 
-        /// Prove an idle WDDM device with repeated samples and process evidence, then use the lowest
-        /// stable sample as the delta baseline. This is intentionally opt-in: existing headless
-        /// evidence lanes retain their stricter one-shot ceilings.
+        /// Prove a stable WDDM baseline with repeated samples and process evidence, then use the
+        /// lowest stable sample as the delta baseline. Resident co-tenants (graphics, `C+G`, or a
+        /// pure-compute process such as an app holding a loaded model) are recorded, never refused;
+        /// only a moving baseline refuses, because then peak − baseline is not this run's own.
         pub fn assert_stable_idle(mut self, config: StableIdleConfig) -> Self {
             let mut samples = Vec::with_capacity(config.sample_count.max(1));
             samples.push(self.baseline_mib);
@@ -1174,10 +1198,10 @@ mod vram_probe {
                 .expect("nvidia-smi pmon output must be valid UTF-8");
             let compute = pure_compute_pids(&pmon, self.gpu)
                 .unwrap_or_else(|error| panic!("untrustworthy GPU process evidence: {error}"));
-            let baseline = validated_stable_baseline(&samples, config, &compute)
-                .unwrap_or_else(|error| panic!("untrustworthy stable idle baseline: {error}"));
+            let baseline = validated_stable_baseline(&samples, config)
+                .unwrap_or_else(|error| panic!("untrustworthy stable baseline: {error}"));
             eprintln!(
-                "[[CUDA_STABLE_IDLE]] gpu={} samplesMiB={samples:?} maxDriftMiB={} maxBaselineGb={:.1} pureComputePids={compute:?}",
+                "[[CUDA_STABLE_IDLE]] gpu={} samplesMiB={samples:?} maxDriftMiB={} maxBaselineGb={:.1} pureComputePids={compute:?} (co-tenants recorded, not refused)",
                 self.gpu, config.max_drift_mib, config.max_baseline_gb
             );
             self.baseline_mib = baseline;
@@ -1264,7 +1288,7 @@ mod vram_probe {
         }
 
         #[test]
-        fn trustworthy_report_rejects_busy_and_zero_peak_samples() {
+        fn trustworthy_report_rejects_only_an_unreadable_peak_never_a_resident_co_tenant() {
             let good = VramReport {
                 baseline_gb: 0.2,
                 load_peak_gb: 2.0,
@@ -1273,11 +1297,12 @@ mod vram_probe {
             };
             assert_eq!(good.assert_trustworthy(1.0).peak_gb, 3.0);
 
-            let busy = VramReport {
-                baseline_gb: 2.0,
+            // A desktop app holding a 30 GB model: the delta above it is still this run's.
+            let shared = VramReport {
+                baseline_gb: 30.0,
                 ..good
             };
-            assert!(std::panic::catch_unwind(|| busy.assert_trustworthy(1.0)).is_err());
+            assert_eq!(shared.assert_trustworthy(1.0).peak_gb, 3.0);
 
             let unreadable = VramReport {
                 peak_gb: 0.0,
@@ -1287,43 +1312,38 @@ mod vram_probe {
         }
 
         #[test]
-        fn idle_probe_rejects_a_contaminated_baseline() {
-            let probe = |baseline_mib| VramProbe {
-                gpu: 0,
-                baseline_mib,
-                load_peak_mib: baseline_mib,
-                steady_mib: baseline_mib,
-                overall_peak_mib: baseline_mib,
-            };
-
-            assert_eq!(probe(200).assert_idle(1.0).baseline_mib, 200);
-            assert!(std::panic::catch_unwind(|| probe(2_000).assert_idle(1.0)).is_err());
-        }
-
-        #[test]
-        fn stable_idle_evidence_rejects_drift_cap_and_compute_processes() {
+        fn stable_baseline_admits_any_size_or_co_tenant_and_rejects_only_drift() {
             let config = StableIdleConfig::new(2.0, 4, 64, 0);
             assert_eq!(
-                validated_stable_baseline(&[1_552, 1_552, 1_553, 1_552], config, &[]).unwrap(),
+                validated_stable_baseline(&[1_552, 1_552, 1_553, 1_552], config).unwrap(),
                 1_552
             );
+            // A resident 30 GiB model far above the old 2 GB ceiling: stable, so admitted.
+            assert_eq!(
+                validated_stable_baseline(&[31_000, 31_010, 31_000, 31_005], config).unwrap(),
+                31_000
+            );
             assert!(
-                validated_stable_baseline(&[1_552, 1_552, 1_700, 1_552], config, &[])
+                validated_stable_baseline(&[1_552, 1_552, 1_700, 1_552], config)
                     .unwrap_err()
                     .contains("drifted")
             );
-            assert!(validated_stable_baseline(&[1_950; 4], config, &[])
+            assert!(validated_stable_baseline(&[1_552; 3], config)
                 .unwrap_err()
-                .contains("required < 2.0 GB"));
-            assert!(validated_stable_baseline(&[1_552; 4], config, &[42])
-                .unwrap_err()
-                .contains("pure compute processes [42]"));
+                .contains("exactly 4 samples"));
         }
 
         #[test]
-        fn pmon_process_evidence_rejects_compute_wrong_gpu_and_unknown_rows() {
+        fn pmon_process_evidence_lists_compute_and_rejects_wrong_gpu_and_unknown_rows() {
             let wddm = "# gpu pid type sm mem\n1 3732 C+G - -\n1 6032 G - -\n";
             assert!(pure_compute_pids(wddm, 1).unwrap().is_empty());
+            // An empty headless/TCC card prints one dash row: no process, not malformed.
+            assert!(pure_compute_pids(
+                "# gpu pid type sm mem\n    0      -     -     -     -\n",
+                0
+            )
+            .unwrap()
+            .is_empty());
             assert_eq!(pure_compute_pids("1 420 C 0 0\n", 1).unwrap(), vec![420]);
             assert!(pure_compute_pids("0 420 C 0 0\n", 1)
                 .unwrap_err()
@@ -1331,6 +1351,14 @@ mod vram_probe {
             assert!(pure_compute_pids("1 420 ? 0 0\n", 1)
                 .unwrap_err()
                 .contains("unknown process type"));
+            // The full-width empty row from scripts/tests/test_yue2_empty_gpu0.py::PMON_EMPTY.
+            let pmon_empty = "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command\n\
+                              # Idx           #    C/G      %      %      %      %      %      %     MB     MB    name\n    \
+                              0          -     -      -      -      -      -      -      -      -      -    -\n";
+            assert!(pure_compute_pids(pmon_empty, 0).unwrap().is_empty());
+            assert!(pure_compute_pids("0 - - 12 3 - - - - - - -\n", 0)
+                .unwrap_err()
+                .contains("malformed PID"));
             assert!(pure_compute_pids("garbage\n", 1)
                 .unwrap_err()
                 .contains("malformed"));
