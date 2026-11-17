@@ -1144,13 +1144,6 @@ mod tests {
     }
 
     /// Small real tensor/tokenizer fixture: exercise the production batch and loader on CPU.
-    /// A provider that holds nothing warm grants no reclaimable credit.
-    #[test]
-    fn an_empty_warm_set_retains_nothing() {
-        let (_tmp, model) = caption_fixture();
-        assert_eq!(model.retained_weight_bytes(), None);
-    }
-
     fn caption_fixture() -> (tempfile::TempDir, MiniMaxH3Image) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -1225,6 +1218,13 @@ mod tests {
             memory_facts: None,
         };
         (tmp, model)
+    }
+
+    /// A provider that holds nothing warm grants no reclaimable credit.
+    #[test]
+    fn an_empty_warm_set_retains_nothing() {
+        let (_tmp, model) = caption_fixture();
+        assert_eq!(model.retained_weight_bytes(), None);
     }
 
     #[test]
