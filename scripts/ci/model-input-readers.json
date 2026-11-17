@@ -3886,6 +3886,18 @@
         "reader-binding"
       ]
     },
+    "mlx-gen-moss-image::loader::read_weights": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen-moss-image::text_encoder::tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
     "candle-gen-iris::train::frozen_cache::convnext_native_store": {
       "role": "tensor-input",
       "grades": [

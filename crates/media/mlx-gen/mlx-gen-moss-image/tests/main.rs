@@ -9,10 +9,15 @@
 //! `cargo test -p <crate> --test integration -- <name>::`.
 
 // --- shared modules (hand-maintained; preserved by regen) ---
+#[path = "common/model_inference_device.rs"]
+pub mod model_inference_device;
 // --- generated modules (do not edit) ---
 
 #[path = "native_smoke.rs"]
 mod native_smoke;
+
+#[path = "real_weights.rs"]
+mod real_weights;
 
 #[path = "small_vae.rs"]
 mod small_vae;
