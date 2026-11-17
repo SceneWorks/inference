@@ -135032,7 +135032,12 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "output_artifacts": [
+      "preview_first.png",
+      "preview_last.png",
+      "preview_base.png"
+    ]
   },
   {
     "package": "mlx-gen-anima",
@@ -168471,7 +168476,7 @@
     "source": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs",
     "input_contract": {
       "fixture_kind": "mixed",
-      "source_identity": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs::trainer_e2e::kolors_trainer_emits_preview_samples@73a17f0b72fc71272c23d7c8ccd322de310c86d8fef2ebfc25ca8ff38dc4e2d8",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs::trainer_e2e::kolors_trainer_emits_preview_samples@8e42f919fac83daddc818d9964d555e991452d95e19c3adec5532f5a1317115b",
       "requirements": [
         {
           "slot": "chatglm3-tokenizer",
@@ -168518,13 +168523,19 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs",
-            "case_source_sha256": "73a17f0b72fc71272c23d7c8ccd322de310c86d8fef2ebfc25ca8ff38dc4e2d8",
-            "writer": "same case invokes make_dataset: create 96x96 RgbImage, fill explicit [200,40,40] and [40,80,200] colors, img.save(tmp/img0.png and tmp/img1.png); pass those two paths as TrainingRequest.items -> KolorsTrainer::train -> train_family item loop -> decode_image(&item.image_path) -> image::open; see writer/case source and image-v24 exact read anchors"
+            "case_source_sha256": "8e42f919fac83daddc818d9964d555e991452d95e19c3adec5532f5a1317115b",
+            "writer": "trainer_e2e::kolors_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 0 img0.png a 512x768 RgbImage of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] and item 1 img1.png a 512x512 [200,40,40] square, each via img.save(&path); those two paths as TrainingRequest.items -> KolorsTrainer::train -> train_family item loop -> decode_image(&item.image_path) -> image::open"
           }
         }
       ],
       "case_generated_inputs": true
-    }
+    },
+    "output_artifacts": [
+      "preview_0.png",
+      "preview_1.png",
+      "preview_2.png",
+      "preview_3.png"
+    ]
   },
   {
     "package": "mlx-gen-kolors",
@@ -176026,8 +176037,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs",
-            "case_source_sha256": "48e259694f36a6db98ac956b30b0768d711ad454a9d703a91861f02f1a80f472",
-            "writer": "trainer_real_weights::short_train_produces_loadable_adapter -> exact root -> write_synth_image: numeric320x256 RGB gradient -> img.save(path) -> TrainingItem.image_path -> KreaRawTrainer::train_impl cache -> decode_image image::open(SAME written PNG path(s))"
+            "case_source_sha256": "d2f611000cd9a99598eb8ae6bd319c22b5788acf1f85d0b91fd86c5ad60ce318",
+            "writer": "trainer_real_weights::short_train_produces_loadable_adapter -> exact root -> write_synth_image(path, 512): 512x768 RGB of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] -> img.save(path) -> TrainingItem.image_path -> KreaRawTrainer::train_impl cache -> decode_image image::open(SAME written PNG path(s))"
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -176052,8 +176063,11 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs::trainer_real_weights::short_train_produces_loadable_adapter@48e259694f36a6db98ac956b30b0768d711ad454a9d703a91861f02f1a80f472"
-    }
+      "source_identity": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs::trainer_real_weights::short_train_produces_loadable_adapter@d2f611000cd9a99598eb8ae6bd319c22b5788acf1f85d0b91fd86c5ad60ce318"
+    },
+    "output_artifacts": [
+      "preview_0.png"
+    ]
   },
   {
     "package": "mlx-gen-krea",
@@ -178670,8 +178684,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs",
-            "case_source_sha256": "89a4eb6d93f23aff3c369d237b22adcf6fb8e8db322b68367e6155ae0b34e271",
-            "writer": "trainer_e2e::lens_trainer_emits_preview_samples: make_dataset source RGB [200, 40, 40] enumeration index 0 writes fresh img0.png via img.save(&path).unwrap();; that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-lens::training::decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding. Per-row source/write/read/consumer anchors retained."
+            "case_source_sha256": "948d9885367bbb12e0021b1220d02174437c94bd79b274c8bd0c2f880a913b30",
+            "writer": "trainer_e2e::lens_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 0 img0.png a 512x768 RgbImage of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] via img.save(&path).unwrap(); that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-lens::training::decode_image -> decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding."
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -178686,8 +178700,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs",
-            "case_source_sha256": "89a4eb6d93f23aff3c369d237b22adcf6fb8e8db322b68367e6155ae0b34e271",
-            "writer": "trainer_e2e::lens_trainer_emits_preview_samples: make_dataset source RGB [40, 80, 200] enumeration index 1 writes fresh img1.png via img.save(&path).unwrap();; that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-lens::training::decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding. Per-row source/write/read/consumer anchors retained."
+            "case_source_sha256": "948d9885367bbb12e0021b1220d02174437c94bd79b274c8bd0c2f880a913b30",
+            "writer": "trainer_e2e::lens_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 1 img1.png a 512x512 [200,40,40] square via img.save(&path).unwrap(); that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-lens::training::decode_image -> decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding."
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -178700,8 +178714,14 @@
           "slot": "generated-training-image-1"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs::trainer_e2e::lens_trainer_emits_preview_samples@89a4eb6d93f23aff3c369d237b22adcf6fb8e8db322b68367e6155ae0b34e271"
-    }
+      "source_identity": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs::trainer_e2e::lens_trainer_emits_preview_samples@948d9885367bbb12e0021b1220d02174437c94bd79b274c8bd0c2f880a913b30"
+    },
+    "output_artifacts": [
+      "preview_0.png",
+      "preview_1.png",
+      "preview_2.png",
+      "preview_3.png"
+    ]
   },
   {
     "package": "mlx-gen-lens",
@@ -185247,8 +185267,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs",
-            "case_source_sha256": "fd3f33e22d0e0bcbea3b87213ee9104e762f1de116187403af5c5cde97cf8ab8",
-            "writer": "trainer_e2e::ltx_trainer_emits_preview_samples: make_dataset writes fresh img0.png from literal RGB[200, 40, 40] via img.save(&path); repaired explicit Gemma spec -> original Trainer.train caching consumes that TrainingItem.image_path through actual decode_image/image::open and VAE encoding. Per-row write/read/consumer anchors retained."
+            "case_source_sha256": "9fece946afdfcc1f513416f19b2682142be76d0fbdf5d96c50d80217a9442ae4",
+            "writer": "trainer_e2e::ltx_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 0 img0.png a 512x768 RgbImage of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] via img.save(&path).unwrap(); that exact TrainingItem.image_path enters repaired explicit Gemma spec -> original Trainer.train caching -> decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding."
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -185263,8 +185283,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs",
-            "case_source_sha256": "fd3f33e22d0e0bcbea3b87213ee9104e762f1de116187403af5c5cde97cf8ab8",
-            "writer": "trainer_e2e::ltx_trainer_emits_preview_samples: make_dataset writes fresh img1.png from literal RGB[40, 80, 200] via img.save(&path); repaired explicit Gemma spec -> original Trainer.train caching consumes that TrainingItem.image_path through actual decode_image/image::open and VAE encoding. Per-row write/read/consumer anchors retained."
+            "case_source_sha256": "9fece946afdfcc1f513416f19b2682142be76d0fbdf5d96c50d80217a9442ae4",
+            "writer": "trainer_e2e::ltx_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 1 img1.png a 512x512 [200,40,40] square via img.save(&path).unwrap(); that exact TrainingItem.image_path enters repaired explicit Gemma spec -> original Trainer.train caching -> decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding."
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -185277,8 +185297,11 @@
           "slot": "generated-training-image-1"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx_trainer_emits_preview_samples@fd3f33e22d0e0bcbea3b87213ee9104e762f1de116187403af5c5cde97cf8ab8"
-    }
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx_trainer_emits_preview_samples@9fece946afdfcc1f513416f19b2682142be76d0fbdf5d96c50d80217a9442ae4"
+    },
+    "output_artifacts": [
+      "preview_0.png"
+    ]
   },
   {
     "package": "mlx-gen-ltx",
@@ -192988,8 +193011,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs",
-            "case_source_sha256": "b6aea67ce22bc2797cb52a38693342891823eb67d953fd4144735245f2a03e8c",
-            "writer": "trainer_e2e::mage_trainer_emits_preview_samples: make_dataset source RGB [200, 40, 40] enumeration index 0 writes fresh img0.png via img.save(&path).unwrap();; that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-mage::training::decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding. Per-row source/write/read/consumer anchors retained."
+            "case_source_sha256": "a4f7e5f76e7708ad66429271b59e98b09e27f905b6de34b6b33e3d70d3b86360",
+            "writer": "trainer_e2e::mage_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 0 img0.png a 512x768 RgbImage of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] via img.save(&path).unwrap(); that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-mage::training::decode_image -> decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding."
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -193004,8 +193027,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs",
-            "case_source_sha256": "b6aea67ce22bc2797cb52a38693342891823eb67d953fd4144735245f2a03e8c",
-            "writer": "trainer_e2e::mage_trainer_emits_preview_samples: make_dataset source RGB [40, 80, 200] enumeration index 1 writes fresh img1.png via img.save(&path).unwrap();; that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-mage::training::decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding. Per-row source/write/read/consumer anchors retained."
+            "case_source_sha256": "a4f7e5f76e7708ad66429271b59e98b09e27f905b6de34b6b33e3d70d3b86360",
+            "writer": "trainer_e2e::mage_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 1 img1.png a 512x512 [200,40,40] square via img.save(&path).unwrap(); that exact TrainingItem.image_path enters Trainer.train -> mlx-gen-mage::training::decode_image -> decode_image -> original image::open(path) -> RGB preprocessing -> VAE encoding."
           },
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -193018,8 +193041,14 @@
           "slot": "generated-training-image-1"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs::trainer_e2e::mage_trainer_emits_preview_samples@b6aea67ce22bc2797cb52a38693342891823eb67d953fd4144735245f2a03e8c"
-    }
+      "source_identity": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs::trainer_e2e::mage_trainer_emits_preview_samples@a4f7e5f76e7708ad66429271b59e98b09e27f905b6de34b6b33e3d70d3b86360"
+    },
+    "output_artifacts": [
+      "preview_0.png",
+      "preview_1.png",
+      "preview_2.png",
+      "preview_3.png"
+    ]
   },
   {
     "package": "mlx-gen-mage",
@@ -231308,8 +231337,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs",
-            "case_source_sha256": "5e87f2a1a7217720de5b8200b02a4064a62bcae66bece022fdf462358c52c93d",
-            "writer": "{\"current_format_rebound_case_sha256\": \"5e87f2a1a7217720de5b8200b02a4064a62bcae66bece022fdf462358c52c93d\", \"current_format_rebound_case_source\": \"crates/media/mlx-gen/mlx-gen-sd3/src/training.rs\", \"exact_token_equivalent_file_anchor\": {\"before_file_sha256\": \"ff5e4980282730eb5d1ae66cd6176a7414900d2a8341b6a3cdffb932311e6652\", \"current_file_sha256\": \"5e87f2a1a7217720de5b8200b02a4064a62bcae66bece022fdf462358c52c93d\", \"current_file_token_span\": [0, 130786], \"format_patch_sha256\": \"41c9975d7f9a350a75f942e66f8806ec631c829bc78edc72fd8684b1b05a613f\", \"validation\": {\"closure_elisions\": 0, \"literal_comment_and_nonformat_tokens\": \"PASS\", \"new_tokens\": 18075, \"old_tokens\": 18075}}, \"historical_case_source_sha256\": \"ff5e4980282730eb5d1ae66cd6176a7414900d2a8341b6a3cdffb932311e6652\", \"historical_same_case_writer_read_evidence\": \"training::real_weight_repro::medium_training_smoke_round_trip -> exact root local mk_png numeric solid-color256x256 RGB -> img.save(path) for a.png,b.png -> TrainingItem.image_path -> Sd3LoraTrainer train cache -> decode_image image::open(SAME PNG paths)\", \"meaning\": \"Original per-slot same-case writer/read proof is preserved as history. The exact current whole-case source is token-equivalent across approved formatter lineage; no source-mode/role/grade/slot/cardinality/model-control change.\", \"preceding_authorized_source_refresh\": []}"
+            "case_source_sha256": "65ad34b5e5042de1ebb08139f0a0c3c68c78b4333366b3d4a035c44f6c7ee480",
+            "writer": "training::real_weight_repro::medium_training_smoke_round_trip -> exact root local mk_png: a.png a 256x384 RGB of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] and b.png a 256x256 [200,40,40] square -> img.save(path) -> TrainingItem.image_path -> Sd3LoraTrainer train cache -> decode_image image::open(SAME PNG paths)"
           },
           "minimum_collections": 2,
           "minimum_items": 1,
@@ -231345,8 +231374,11 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs::training::real_weight_repro::medium_training_smoke_round_trip@5e87f2a1a7217720de5b8200b02a4064a62bcae66bece022fdf462358c52c93d"
-    }
+      "source_identity": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs::training::real_weight_repro::medium_training_smoke_round_trip@65ad34b5e5042de1ebb08139f0a0c3c68c78b4333366b3d4a035c44f6c7ee480"
+    },
+    "output_artifacts": [
+      "render.png"
+    ]
   },
   {
     "package": "mlx-gen-sd3",
@@ -237799,7 +237831,7 @@
     },
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/media/mlx-gen/mlx-gen-sdxl/tests/trainer_e2e.rs::trainer_e2e::sdxl_trainer_emits_preview_samples@e1437e79353c393939b4220ba2a855e2074a83c0001ccd3fa7e1c311ffc938a3",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-sdxl/tests/trainer_e2e.rs::trainer_e2e::sdxl_trainer_emits_preview_samples@dceecfaf70620d202ff1f88e9093a904f2d8614e61e8cd6092d4c310e50bdc05",
       "requirements": [
         {
           "slot": "sdxl-bpe-tokenizer-assets",
@@ -237869,8 +237901,8 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/tests/trainer_e2e.rs",
-            "case_source_sha256": "e1437e79353c393939b4220ba2a855e2074a83c0001ccd3fa7e1c311ffc938a3",
-            "writer": "make_dataset writes the file (bytes 1255-2001)"
+            "case_source_sha256": "dceecfaf70620d202ff1f88e9093a904f2d8614e61e8cd6092d4c310e50bdc05",
+            "writer": "make_dataset writes the file (bytes 1889-2968)"
           }
         }
       ],
@@ -237881,7 +237913,13 @@
         "crates/media/mlx-gen/src/train/dataset.rs::decode_image/image::open": "reference",
         "mlx-gen::Weights::from_file": "model-weights"
       }
-    }
+    },
+    "output_artifacts": [
+      "preview_0.png",
+      "preview_1.png",
+      "preview_2.png",
+      "preview_3.png"
+    ]
   },
   {
     "package": "mlx-gen-sdxl",
@@ -250856,8 +250894,8 @@
         {
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-wan/tests/trainer_e2e.rs",
-            "case_source_sha256": "590a799464963c1275e174a0d5b5b5ef8cb50ed0c0cc7088fc057f12897cdc02",
-            "writer": "trainer_e2e::wan_ti2v_5b_trainer_emits_preview_samples -> run_sample_smoke -> make_dataset(tmp): loops numeric [200,40,40]/[40,80,200]128x128 RGB images -> img.save(&path) to img0.png,img1.png -> returned TrainingItem.image_path -> WanMoeTrainer::train_impl cache -> decode_image actual image::open(SAME written paths)"
+            "case_source_sha256": "8faf4e0acdfda9308ad7d8fb617d3d850d1e304fd484d53784bc265495e5b70a",
+            "writer": "trainer_e2e::wan_ti2v_5b_trainer_emits_preview_samples: make_dataset(&tmp, 512) writes item 0 img0.png a 512x768 RgbImage of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] and item 1 img1.png a 512x512 [200,40,40] square, each via img.save(&path); those two paths as TrainingRequest.items -> run_sample_smoke -> WanMoeTrainer::train_impl cache -> decode_image(&item.image_path) -> image::open"
           },
           "minimum_collections": 2,
           "minimum_items": 1,
@@ -250882,8 +250920,11 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/tests/trainer_e2e.rs::trainer_e2e::wan_ti2v_5b_trainer_emits_preview_samples@590a799464963c1275e174a0d5b5b5ef8cb50ed0c0cc7088fc057f12897cdc02"
-    }
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/tests/trainer_e2e.rs::trainer_e2e::wan_ti2v_5b_trainer_emits_preview_samples@8faf4e0acdfda9308ad7d8fb617d3d850d1e304fd484d53784bc265495e5b70a"
+    },
+    "output_artifacts": [
+      "preview_0.png"
+    ]
   },
   {
     "package": "mlx-gen-wan",
@@ -261982,7 +262023,7 @@
     ],
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_e2e.rs::trainer_e2e::z_image_trainer_emits_preview_samples@cd05aab19f31c19991d5b28682de048d2871938b1e8c36886749c84720e5bc0e",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_e2e.rs::trainer_e2e::z_image_trainer_emits_preview_samples@55c1f2963c28ee8680407d8cb300af4073eb659c53d5fc0d718b6020c7da2406",
       "requirements": [
         {
           "slot": "tokenizer-retained-source",
@@ -262062,8 +262103,8 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_e2e.rs",
-            "case_source_sha256": "cd05aab19f31c19991d5b28682de048d2871938b1e8c36886749c84720e5bc0e",
-            "writer": "make_dataset writes the file (bytes 1126-1872)"
+            "case_source_sha256": "55c1f2963c28ee8680407d8cb300af4073eb659c53d5fc0d718b6020c7da2406",
+            "writer": "make_dataset writes the file (bytes 1760-2839)"
           }
         }
       ],
@@ -262075,7 +262116,13 @@
         "gen-core::tokenizer::TextTokenizer::from_file": "tokenizer",
         "mlx-gen::Weights::from_paths": "model-weights"
       }
-    }
+    },
+    "output_artifacts": [
+      "preview_0.png",
+      "preview_1.png",
+      "preview_2.png",
+      "preview_3.png"
+    ]
   },
   {
     "package": "mlx-gen-z-image",
