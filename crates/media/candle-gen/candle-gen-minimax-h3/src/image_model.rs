@@ -50,8 +50,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::h3_image as contract;
 use candle_gen::gen_core::{
     Capabilities, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape,
-    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, Quant,
-    SizeFloor, StepSupport, WeightsSource,
+    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 use gen_core_h3::h3_schedule::SigmaSchedule;
@@ -187,6 +187,18 @@ impl WarmComponents {
         .into_iter()
         .flatten()
         .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// Whether a request may keep its components warm: one whose request memory neither stages nor
+/// streams ([`crate::warm::keeps_components_warm`]), or one with no request memory (a resident
+/// admission carries none) on a generator not loaded with [`OffloadPolicy::Sequential`]. Without
+/// request memory the load-time policy stands, and a sequential load asked for each component to
+/// be dropped after its phase.
+fn keeps_components_warm(req: &GenerationRequest, load_policy: OffloadPolicy) -> bool {
+    match req.memory {
+        Some(_) => crate::warm::keeps_components_warm(req),
+        None => load_policy != OffloadPolicy::Sequential,
     }
 }
 
@@ -559,7 +571,7 @@ impl MiniMaxH3Image {
         // Resident requests whose warm set fits reuse (and leave behind) the warm components; any
         // other request releases them first, so its staged phases have the device to themselves.
         let mut warm = candle_gen::lock_recover(&self.warm);
-        let resident = crate::warm::keeps_components_warm(req)
+        let resident = keeps_components_warm(req, self.spec.offload_policy)
             && crate::block_stream::current().is_none()
             && self.warm_set_fits_now(req, &mut warm);
         if !resident && !warm.is_empty() {
@@ -927,6 +939,25 @@ mod tests {
             height,
             ..Default::default()
         }
+    }
+
+    /// A generator loaded with `OffloadPolicy::Sequential` keeps nothing warm for a request with
+    /// no request memory: the load asked for each component to be dropped after its phase. A
+    /// request's own memory policy still decides when it carries one.
+    #[test]
+    fn a_sequential_load_keeps_nothing_warm_without_request_memory() {
+        use candle_gen::gen_core::GenerationMemory;
+        let sequential = OffloadPolicy::Sequential;
+        let mut req = request(2048, 2048);
+        assert!(
+            !keeps_components_warm(&req, sequential),
+            "a sequential load stages a request with no request memory"
+        );
+        req.memory = Some(GenerationMemory::default());
+        assert!(
+            keeps_components_warm(&req, sequential),
+            "an explicit resident request memory overrides the load default"
+        );
     }
 
     /// The descriptor is its own image family — not H3 video's id, modality or flags.
