@@ -255,7 +255,16 @@ class SharedGpu1Tests(unittest.TestCase):
         self.assertIn("baseline moved +4000 MiB", moved["contamination"][0])
         changed = proof.child_memory_measurement(census(70000, foreign), census(70000, foreign[1:]),
                                                  samples, set())
-        self.assertEqual(changed["contamination"], ["foreign compute actors changed: [888, 4000] -> [888]"])
+        self.assertEqual(changed["contamination"], ["foreign compute actors changed: [4000] -> []"])
+        # A desktop C+G window opening or closing is not a CUDA co-tenant change.
+        desktop = proof.child_memory_measurement(census(70000, foreign), census(70000, foreign[:1]),
+                                                 samples, set())
+        self.assertFalse(desktop["contaminated"])
+        self.assertEqual(proof.headline_peak_minus_baseline(
+            [dict(clean, label="quant", peak_minus_baseline_mib=300),
+             dict(moved, label="vae", peak_minus_baseline_mib=99000),
+             dict(clean, label="precision")]), 12000)
+        self.assertIsNone(proof.headline_peak_minus_baseline([moved, changed]))
         missing = proof.child_memory_measurement(census(70000, foreign), None, samples, set())
         self.assertTrue(missing["contaminated"])
         self.assertEqual(missing["peak_minus_baseline_mib"], 12000)

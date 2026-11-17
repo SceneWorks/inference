@@ -662,6 +662,8 @@ class PrecisionControlTests(unittest.TestCase):
                              [row["label"] for row in report["owned_children"]])
             self.assertTrue(all(row["contaminated"] for row in report["memory_measurements"]))
             self.assertIsNone(report["external_peak_minus_baseline_mib"])
+            self.assertEqual(report["external_peak_minus_baseline_excluded"],
+                             [row["label"] for row in report["owned_children"]])
             for label in [row[0] for row in launched]:
                 start = events.index(f"identity-{label}")
                 launch = events.index(f"launch-{label}")

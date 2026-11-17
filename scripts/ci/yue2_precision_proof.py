@@ -350,8 +350,9 @@ def foreign_compute_pids(raw: str, owned: set[int]) -> set[int] | None:
         return None
     if not isinstance(actors, list):
         return None
+    # Pure compute only: desktop C+G/G windows opening or closing do not move a CUDA baseline.
     return {actor["pid"] for epoch in actors for actor in epoch
-            if actor.get("type") in ("C", "C+G") and actor.get("pid") not in owned}
+            if actor.get("type") == "C" and actor.get("pid") not in owned}
 
 
 def selected_used_mib(sample: dict) -> int | None:
@@ -387,6 +388,13 @@ def child_memory_measurement(pre_raw: str, post_raw: str | None, samples: list[d
             "peak_minus_baseline_mib": (peak - baseline if peak is not None and baseline is not None
                                         else None),
             "contaminated": bool(contamination), "contamination": contamination}
+
+
+def headline_peak_minus_baseline(measurements: list[dict]) -> int | None:
+    """Largest clean child delta. A contaminated measurement stays listed with its flag
+    but is never accepted as the headline value; None when no clean delta exists."""
+    return max((row["peak_minus_baseline_mib"] for row in measurements
+                if row["peak_minus_baseline_mib"] is not None and not row["contaminated"]), default=None)
 
 
 def retain_cuda_physical_evidence(evidence: Path, label: str, raw: str) -> list[dict]:
@@ -1070,8 +1078,6 @@ def _execute(args: argparse.Namespace, locks: list) -> None:
         peak = max((sample["phys_footprint_bytes"] for sample in samples), default=None)
     measurements = [{"label": row["label"], **row["memory_measurement"]}
                     for row in child_results if "memory_measurement" in row]
-    deltas = [row["peak_minus_baseline_mib"] for row in measurements
-              if row["peak_minus_baseline_mib"] is not None]
     receipt = evidence / "precision-receipt.json"
     receipt_schema_error = None
     if receipt.is_file():
@@ -1096,9 +1102,10 @@ def _execute(args: argparse.Namespace, locks: list) -> None:
               "external_peak_scope": "selected-device-global-capacity" if args.backend == "cuda" else "owned-process",
               "owned_cuda_peak_unavailable": args.backend == "cuda",
               "memory_measurements": measurements if args.backend == "cuda" else None,
-              "external_peak_minus_baseline_mib": max(deltas, default=None) if args.backend == "cuda" else None,
-              "external_peak_minus_baseline_contaminated": (any(row["contaminated"] for row in measurements)
-                                                           if args.backend == "cuda" else None),
+              "external_peak_minus_baseline_mib": (headline_peak_minus_baseline(measurements)
+                                                   if args.backend == "cuda" else None),
+              "external_peak_minus_baseline_excluded": ([row["label"] for row in measurements if row["contaminated"]]
+                                                        if args.backend == "cuda" else None),
               "sampler_faults": faults, "owned_test_pid": last_child["pid"] if last_child else None,
               "owned_test_released": bool(last_child and last_child["released"]),
               "owned_test_timed_out": timed_out, "owned_test_wait_error": wait_error,
