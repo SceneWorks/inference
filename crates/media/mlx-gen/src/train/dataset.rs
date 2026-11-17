@@ -8,6 +8,9 @@
 
 use std::path::Path;
 
+use gen_core_train::canvas::{training_canvas, TrainingCanvas};
+use gen_core_train::subject_mask::CropBox;
+
 use crate::media::Image;
 use crate::{Error, Result};
 
@@ -80,9 +83,69 @@ pub fn center_crop_square(image: &Image) -> Image {
     }
 }
 
+/// Cut `image` to `crop` (source pixels; clamped to the image). A no-op for the whole frame.
+pub fn crop_image(image: &Image, crop: CropBox) -> Image {
+    let (w, h) = (image.width, image.height);
+    let x0 = crop.x.min(w);
+    let y0 = crop.y.min(h);
+    let cw = crop.width.min(w - x0);
+    let ch = crop.height.min(h - y0);
+    if (x0, y0, cw, ch) == (0, 0, w, h) {
+        return image.clone();
+    }
+    let mut pixels = Vec::with_capacity((cw * ch * 3) as usize);
+    for y in y0..y0 + ch {
+        let row = ((y * w + x0) * 3) as usize;
+        pixels.extend_from_slice(&image.pixels[row..row + (cw * 3) as usize]);
+    }
+    Image {
+        width: cw,
+        height: ch,
+        pixels,
+    }
+}
+
+/// The aspect-preserving training canvas of `image` at bucket `edge` for a family whose canvas
+/// sides are multiples of `stride` and at most `max_side`
+/// ([`gen_core_train::canvas::training_canvas`]), with the source cut to the canvas's box — the
+/// whole frame unless the source is more elongated than the aspect bound. The family resizes the
+/// returned source to `canvas.size()` (never a centre square: the MLX twin of
+/// `candle_gen::train::dataset::canvas_image_tensor`).
+pub fn canvas_source(
+    image: &Image,
+    edge: u32,
+    stride: u32,
+    max_side: Option<u32>,
+) -> (TrainingCanvas, Image) {
+    let canvas = training_canvas((image.width, image.height), edge, stride, max_side);
+    (canvas, crop_image(image, canvas.crop))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_source_keeps_the_whole_frame_and_crops_only_extreme_strips() {
+        let img = Image {
+            width: 60,
+            height: 90,
+            pixels: (0..60 * 90 * 3).map(|i| (i % 251) as u8).collect(),
+        };
+        let (canvas, src) = canvas_source(&img, 64, 16, None);
+        assert_eq!(canvas.size(), (48, 64));
+        assert_eq!(src, img);
+        let strip = Image {
+            width: 200,
+            height: 20,
+            pixels: (0..200 * 20 * 3).map(|i| (i % 251) as u8).collect(),
+        };
+        let (canvas, src) = canvas_source(&strip, 64, 16, None);
+        assert_eq!((canvas.crop.x, canvas.crop.width), (60, 80));
+        assert_eq!((src.width, src.height), (80, 20));
+        // Row 0 of the crop starts at source column 60.
+        assert_eq!(src.pixels[0..3], strip.pixels[180..183]);
+    }
 
     #[test]
     fn bucket_edges_floor_every_bucket_and_default_to_the_legacy_edge() {
