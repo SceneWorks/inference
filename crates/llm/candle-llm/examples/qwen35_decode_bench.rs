@@ -10,7 +10,9 @@
 //!   cargo run --release --features cuda --example qwen35_decode_bench -- [cases] [max_new_tokens]
 //! ```
 //!
-//! `cases` is a `,`- or `+`-separated list from `greedy,t04,json,greedy_mtp,t04_mtp,json_mtp` (default: all).
+//! `cases` is a `,`- or `+`-separated list from `greedy,t04,json,greedy_mtp,t04_mtp,json_mtp`
+//! (default: all; also `greedy_json`, `greedy_json_mtp`, and `t04_auto` / `json_auto` for
+//! `Speculative::Auto`).
 
 use core_llm::{
     Constraint, LoadSpec, Message, Sampling, Speculative, SpeculativeProposer, StreamEvent,
@@ -55,6 +57,8 @@ fn main() {
             "t04_mtp" => (0.4, None, mtp),
             "json_mtp" => (0.4, Some(Constraint::Json), mtp),
             "greedy_json_mtp" => (0.0, Some(Constraint::Json), mtp),
+            "t04_auto" => (0.4, None, Some(Speculative::Auto)),
+            "json_auto" => (0.4, Some(Constraint::Json), Some(Speculative::Auto)),
             other => panic!("unknown case {other}"),
         };
         run(&*model, case, temp, constraint, spec, max_new);
