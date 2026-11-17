@@ -1055,9 +1055,11 @@ try {
     Require ($env:GITHUB_REF -ceq 'refs/heads/main') 'Terminal requires final inference main, not a feature/story ref'
     $c = $env:MOSS_NATIVE_CONTROL | ConvertFrom-Json
     $fields=@('campaign','inference_revision','snapshot_base','snapshot_shared','snapshot_dmd','gpu_uuid','physical_gpu_index','deadline_utc','timeout_seconds','owner','external_owners_reconciled')
-    if ($c.PSObject.Properties.Name -ccontains 'required_free_mib') { $fields+='required_free_mib' }
-    else { $c | Add-Member -NotePropertyName required_free_mib -NotePropertyValue $script:DefaultRequiredFreeMib }
+    $hasRequiredFree=$c.PSObject.Properties.Name -ccontains 'required_free_mib'
+    if ($hasRequiredFree) { $fields+='required_free_mib' }
+    # Validate the supplied fields first; the default is added only after Exact-Fields passes.
     Exact-Fields $c $fields
+    if (-not $hasRequiredFree) { $c | Add-Member -NotePropertyName required_free_mib -NotePropertyValue $script:DefaultRequiredFreeMib }
     Require ($c.campaign -cmatch '^sc-26325-native-[a-z0-9-]{1,48}$') 'Invalid fresh campaign'
     Require ($c.inference_revision -cmatch '^[0-9a-f]{40}$') 'Exact pinned inference SHA required'
     $status.inference=$c.inference_revision

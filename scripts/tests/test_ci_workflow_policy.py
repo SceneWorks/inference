@@ -1391,9 +1391,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         main = source.split("$fields=@('campaign'", 1)[1]
         # required_free_mib is optional: present -> validated field, absent -> the derived default.
         self.assertNotIn("'required_free_mib'", main.split("\n", 1)[0])
-        self.assertIn("if ($c.PSObject.Properties.Name -ccontains 'required_free_mib') { $fields+='required_free_mib' }", main)
-        self.assertIn("Add-Member -NotePropertyName required_free_mib -NotePropertyValue $script:DefaultRequiredFreeMib", main)
-        self.assertIn("Exact-Fields $c $fields", main)
+        self.assertIn("$hasRequiredFree=$c.PSObject.Properties.Name -ccontains 'required_free_mib'", main)
+        self.assertIn("if ($hasRequiredFree) { $fields+='required_free_mib' }", main)
+        default = ("if (-not $hasRequiredFree) { $c | Add-Member -NotePropertyName required_free_mib "
+                   "-NotePropertyValue $script:DefaultRequiredFreeMib }")
+        self.assertIn(default, main)
+        # The default is inserted only after the supplied fields pass Exact-Fields; inserting
+        # it first would make every control that omits the field fail as "Unexpected control fields".
+        self.assertLess(main.index("Exact-Fields $c $fields"), main.index(default))
         self.assertIn("$script:DefaultRequiredFreeMib=36864\n", source)
         self.assertIn("Require ((Integer $c.required_free_mib) -and $c.required_free_mib -gt 0)", main)
         order = ("$status.before=@(Wait-DeviceAdmissible $true)", "'native' $c.timeout_seconds",
