@@ -755,6 +755,35 @@ impl MiniMaxH3Dit {
         self.stream_window.is_some()
     }
 
+    /// Promote a streamed DiT's host block stack to the device, one block at a time, ending the
+    /// stream: every later [`Self::window_block`] borrows the resident block. Each host block is
+    /// released as its device copy replaces it, so the host stack drains as the device fills. Runs
+    /// after the streamed AdaLN precompute (the copies carry no `adaln_proj`); an installed adapter's
+    /// factors keep their identity, exactly as a window copy carries them. The trainer's resident +
+    /// checkpointed mode (SW-F369): one host→device transfer per run instead of two per step.
+    /// Returns the body bytes moved. A no-op on a DiT that is already resident.
+    pub(crate) fn promote_streamed_blocks(&mut self) -> Result<usize> {
+        if self.stream_window.is_none() {
+            return Ok(0);
+        }
+        let mut moved = 0usize;
+        for block in &mut self.blocks {
+            let resident = block.copy_to_device(&self.device)?;
+            moved += resident.body_nbytes();
+            *block = resident;
+        }
+        self.stream_window = None;
+        tracing::info!(
+            event = "h3_transformer_blocks_promoted",
+            component = "dit",
+            blocks = self.blocks.len(),
+            body_bytes = moved,
+            device = ?self.device.location(),
+            "Promoted host-resident DiT blocks to the device"
+        );
+        Ok(moved)
+    }
+
     /// The image transformer's stack input: `proj_in` over the packed image rows, cast to the text
     /// stream's dtype, scattered with the refined text rows into one `[1, seq_len, hidden]`
     /// sequence — the first stage of [`Self::forward_image`], shared with the trainer (SW-7098).

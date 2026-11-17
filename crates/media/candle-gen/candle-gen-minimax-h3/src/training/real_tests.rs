@@ -151,6 +151,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         &set_s.vars,
         &inputs(&text_s, &layout, &packed, &target, step),
         false,
+        true,
     )
     .unwrap();
     assert!(loss_s.is_finite());
@@ -177,6 +178,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
             &set.vars,
             &inputs(&text_s, &layout, &packed, &target, step),
             false,
+            true,
         )
         .unwrap()
         .0
@@ -324,6 +326,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         &modulation_r,
         &set_r.vars,
         &inputs(&text_r, &layout, &packed, &target, step),
+        false,
         false,
     )
     .unwrap();

@@ -506,9 +506,14 @@ pub struct TrainStepShape {
     /// LoKr dense-delta elements: the largest block's (streamed) and all blocks' (resident).
     pub lokr_delta_block_max: u64,
     pub lokr_delta_total: u64,
-    /// `true`: the blocks stream one at a time and the backward recomputes each from its saved
-    /// input; `false`: the whole DiT is resident and every block's activations are retained.
+    /// `true`: the backward recomputes each block from its saved input, so only the block inputs
+    /// are retained; `false`: the whole DiT is resident and every block's activations are retained.
     pub checkpointed: bool,
+    /// Under `checkpointed`: `true` keeps every block body resident on the device (no per-step
+    /// weight transfer), `false` streams the blocks through a one-block device window. The AdaLN
+    /// precompute runs streamed either way (one `adaln_proj` at a time), and the bodies move to the
+    /// device after it. Ignored when `checkpointed` is `false` (that run is always resident).
+    pub resident_blocks: bool,
     /// Heads one attention chunk covers (`heads` when attention is not chunked). Chunked training
     /// attention recomputes each chunk in the backward, so no call ever holds more than one chunk's
     /// scores (E20).
@@ -525,7 +530,7 @@ impl TrainStepShape {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrainStepBytes {
     /// DiT weights live at the peak: the trunk, the modulation tables and one block (streamed) or
-    /// every block (resident) — or the precompute's one AdaLN projection, when that is larger.
+    /// every block body (resident, checkpointed or not).
     pub weights: u64,
     /// Factors, gradients, accumulation and optimizer state, f32.
     pub adapter_state: u64,
@@ -595,8 +600,15 @@ pub fn train_step_bytes(
         (SCORE_ARRAYS_PER_ATTENTION_VJP * chunk_scores, chunk_scores)
     };
     let (weights_bytes, precompute) = if shape.checkpointed {
+        // The precompute streams one `adaln_proj` at a time in both checkpointed modes; resident
+        // bodies move to the device only after it, so they are never co-resident with it.
+        let bodies = if shape.resident_blocks {
+            sum(&weights.block_body)
+        } else {
+            max(&weights.block_body)
+        };
         (
-            weights.trunk + weights.modulation_tables + max(&weights.block_body),
+            weights.trunk + weights.modulation_tables + bodies,
             weights.trunk + weights.modulation_tables + max(&weights.block_adaln),
         )
     } else {
@@ -829,6 +841,7 @@ mod tests {
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
             checkpointed,
+            resident_blocks: false,
             attention_heads_per_chunk: 56,
         }
     }
@@ -871,5 +884,44 @@ mod tests {
             },
         );
         assert!(wide.total() > streamed.total());
+    }
+
+    /// Resident + checkpointed: every block body on the device, but only the block inputs retained
+    /// and one block's backward live — the streamed run's activations with the resident run's
+    /// weights, and strictly between the two.
+    #[test]
+    fn resident_checkpointed_holds_every_body_and_only_the_block_inputs() {
+        let g = DitGeometry::SHIPPED;
+        let w = weights();
+        let streamed = train_step_bytes(&g, &w, &shape(true));
+        let resident_ckpt = train_step_bytes(
+            &g,
+            &w,
+            &TrainStepShape {
+                resident_blocks: true,
+                ..shape(true)
+            },
+        );
+        let resident = train_step_bytes(&g, &w, &shape(false));
+        assert_eq!(
+            resident_ckpt.weights,
+            2_000_000_000 + 70_000_000 + 50 * 760_000_000
+        );
+        assert_eq!(resident_ckpt.retained, streamed.retained);
+        assert_eq!(resident_ckpt.block_backward, streamed.block_backward);
+        // The precompute still streams its AdaLN projections one at a time.
+        assert_eq!(resident_ckpt.precompute, streamed.precompute);
+        assert_eq!(resident_ckpt.total() - streamed.total(), 49 * 760_000_000);
+        assert!(resident_ckpt.total() < resident.total());
+        // Ignored when not checkpointed.
+        let ignored = train_step_bytes(
+            &g,
+            &w,
+            &TrainStepShape {
+                resident_blocks: true,
+                ..shape(false)
+            },
+        );
+        assert_eq!(ignored, resident);
     }
 }

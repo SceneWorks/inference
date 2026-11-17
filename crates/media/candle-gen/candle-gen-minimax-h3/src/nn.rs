@@ -432,14 +432,19 @@ fn differentiable_sdpa(
         )?;
         return Ok(out.to_dtype(dtype)?);
     }
-    let out = candle_gen::fused_attention::training_sdpa_standard_bhsd(
-        &q.to_dtype(DType::F32)?,
-        &k.to_dtype(DType::F32)?,
-        &v.to_dtype(DType::F32)?,
-        scale,
-        None,
-        plan,
-    )?;
+    // Inert unless a manual profiling scope is active (SW-F369). This times the forward only;
+    // the owner's recomputed backward runs inside the checkpointed segment's backward span.
+    // The inner `Result` keeps the owner's typed errors (a cancellation stays `Canceled`).
+    let out = candle_gen::train::profile::span("attention_forward", q.device(), || {
+        Ok(candle_gen::fused_attention::training_sdpa_standard_bhsd(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            &v.to_dtype(DType::F32)?,
+            scale,
+            None,
+            plan,
+        ))
+    })??;
     Ok(out.to_dtype(dtype)?)
 }
 

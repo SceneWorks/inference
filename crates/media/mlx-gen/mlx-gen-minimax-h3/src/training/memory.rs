@@ -242,6 +242,8 @@ pub fn estimate_training(
             lokr_delta_block_max: run.lokr_delta_block_max,
             lokr_delta_total: run.lokr_delta_total,
             checkpointed: run.checkpointed,
+            // The MLX trainer streams its checkpointed blocks.
+            resident_blocks: false,
             attention_heads_per_chunk: if run.chunked_attention {
                 training_attention_heads_per_chunk(text_rows + reference_rows + image_rows)
             } else {

@@ -10,15 +10,19 @@
 //! one float32 score tile at a time and recomputes it in the backward (the fused kernels have no
 //! backward).
 //!
-//! # Streamed, checkpointed backward (the default)
+//! # Checkpointed backward (the default)
 //!
-//! The frozen blocks never sit on the device together. Each block is one segment of the shared
-//! segmented VJP ([`checkpointed_backward`]): the forward copies block `l` from the host into the
-//! device window ([`MiniMaxH3Dit::window_block`]), runs it, drops it and keeps only its output —
-//! the next block's input. The backward walks the blocks in reverse, copying block `l` in again and
-//! back-propagating the cotangent from block `l + 1` through one recomputed block, which yields
-//! block `l`'s factor gradients and the cotangent for block `l − 1`. Checkpointing is therefore
-//! structural: one block's weights and one block's backward are live, whatever the depth.
+//! Each block is one segment of the shared segmented VJP ([`checkpointed_backward`]): the forward
+//! runs block `l` and keeps only its output — the next block's input. The backward walks the
+//! blocks in reverse, back-propagating the cotangent from block `l + 1` through one recomputed
+//! block, which yields block `l`'s factor gradients and the cotangent for block `l − 1`: one
+//! block's backward is live, whatever the depth.
+//!
+//! Where the block bodies live is the preflight's residency choice (SW-F369), not the
+//! checkpointing's: **resident** (every body on the device, read in place) when the run fits, or
+//! **streamed** — the frozen blocks never on the device together; the forward copies block `l`
+//! from the host into the device window ([`MiniMaxH3Dit::window_block`]), runs it and drops it,
+//! and the backward copies it in again for its recompute.
 //!
 //! # Resident backward (`gradient_checkpointing = false`)
 //!
@@ -108,6 +112,8 @@ impl StepConstants {
 }
 
 /// Block `layer` at the step's indices, through the device window when the stack is streamed.
+/// The profile spans (inert outside a manual profiling scope) split the window copy from the
+/// block's compute; both run once in the forward and once in the backward's recompute.
 fn run_block(
     dit: &MiniMaxH3Dit,
     modulation: &ImageModulation,
@@ -115,14 +121,20 @@ fn run_block(
     layer: usize,
     x: &Tensor,
 ) -> Result<Tensor> {
-    let block = dit.window_block(layer)?;
-    block.forward(
-        x,
-        modulation.cache.modulation(layer)?,
-        &constants.adaln,
-        dit.rope(),
-        &constants.tables,
-    )
+    let device = dit.device();
+    let block = candle_gen::train::profile::span("block_weights_window", device, || {
+        Ok(dit.window_block(layer))
+    })??;
+    let block_modulation = modulation.cache.modulation(layer)?;
+    candle_gen::train::profile::span("block_forward", device, || {
+        Ok(block.forward(
+            x,
+            block_modulation,
+            &constants.adaln,
+            dit.rope(),
+            &constants.tables,
+        ))
+    })?
 }
 
 /// `norm_out`, the step's head over the image rows, and the loss over the generated rows.
@@ -150,14 +162,22 @@ fn tail_loss(
     Ok(velocity_loss(&generated, inputs.target, mae)?)
 }
 
-/// One micro-step's `(loss, gradients)` for the adapter `vars` installed on `dit`.
+/// One micro-step's `(loss, gradients)` for the adapter `vars` installed on `dit`: segmented and
+/// recomputed per block when `checkpointed` (whether the blocks are resident or streamed), else
+/// one `backward()` over the retained forward (which requires the resident stack).
 pub(crate) fn loss_and_grads(
     dit: &MiniMaxH3Dit,
     modulation: &ImageModulation,
     vars: &[Var],
     inputs: &StepInputs<'_>,
     mae: bool,
+    checkpointed: bool,
 ) -> Result<(f32, GradStore)> {
+    if !checkpointed && dit.is_streamed() {
+        return Err(CandleError::Msg(
+            "minimax-h3-image trainer: a streamed DiT must be trained checkpointed".into(),
+        ));
+    }
     crate::nn::with_differentiable_attention(|| {
         let constants = StepConstants::new(dit, modulation, inputs)?;
         let h0 = dit.image_stack_input(
@@ -166,7 +186,7 @@ pub(crate) fn loss_and_grads(
             inputs.layout.text_indices(),
             inputs.layout.image_indices(),
         )?;
-        if dit.is_streamed() {
+        if checkpointed {
             let constants = &constants;
             let mut segments: Vec<Segment<'_>> = (0..dit.num_layers())
                 .map(|layer| -> Segment<'_> {
@@ -193,7 +213,10 @@ pub(crate) fn loss_and_grads(
             let loss = tail_loss(dit, modulation, &constants, inputs, &x, mae)?;
             drop(x);
             let value = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            Ok((value, loss.backward()?))
+            let grads = candle_gen::train::profile::span("whole_backward", dit.device(), || {
+                loss.backward()
+            })?;
+            Ok((value, grads))
         }
     })
 }

@@ -10,7 +10,7 @@
 //! | --- | --- |
 //! | conditioning | inference admission's own vision-tower / conditioning / reference-encode phases for each item at rung 4, plus the cache built so far |
 //! | latents | the VAE encoder's tiled encode of the largest target (admission's own tiled-encode term), plus the cache |
-//! | train | [`gen_core_train::h3_image::train_step_bytes`] (one streamed block, every block input, one block's backward) plus candle's float32 attention scores and allocator slack, plus the cache; host: the runtime-format DiT stack the streamed route keeps |
+//! | train | [`gen_core_train::h3_image::train_step_bytes`] (one streamed block or, resident, every block body; every block input; one block's backward) plus candle's float32 attention operands and allocator slack, plus the cache; host: the runtime-format DiT stack the load builds (and the streamed route keeps) |
 //! | preview | inference admission's whole-render peak at rung 4 for the preview request, plus the training state that stays resident through it |
 //!
 //! Every number is DERIVED (structural counts over the staged tier's headers and the request's
@@ -84,6 +84,10 @@ pub struct TrainingRunShape {
     /// retains each dense copy until its backward.
     pub packed_base: bool,
     pub checkpointed: bool,
+    /// Under `checkpointed`: keep every block body on the device ([`BlockResidency::Resident`])
+    /// instead of streaming the blocks through a one-block window. Chosen by
+    /// [`plan_block_residency`]; ignored when `checkpointed` is off (always resident).
+    pub resident_blocks: bool,
     /// Training attention through the bounded reference owner (no call holds more than one score
     /// tile; the backward recomputes it) — the trainer always runs this; `false` prices an
     /// unbounded composable attention.
@@ -298,6 +302,7 @@ pub fn estimate_training(
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
             checkpointed: run.checkpointed,
+            resident_blocks: run.resident_blocks,
             attention_heads_per_chunk: if run.chunked_attention {
                 training_attention_heads_per_chunk(text_rows + reference_rows + image_rows)
             } else {
@@ -349,7 +354,9 @@ pub fn estimate_training(
         host: host_dit,
     };
     // Previews run the generator with the training DiT's trunk and tables still on the device — and,
-    // resident, its whole block stack — the adapter state live, and (streamed) its host stack held.
+    // resident (checkpointed or not), its whole block stack — the adapter state live, and
+    // (streamed) its host stack held.
+    let streamed = run.checkpointed && !run.resident_blocks;
     let preview = match &run.preview {
         Some(item) => {
             let render = estimate(contract, facts, &request_shape(item), &selection)?;
@@ -359,18 +366,16 @@ pub fn estimate_training(
                     .saturating_add(cache)
                     .saturating_add(step.adapter_state)
                     .saturating_add(weights.trunk + weights.modulation_tables)
-                    .saturating_add(if run.checkpointed {
+                    .saturating_add(if streamed {
                         0
                     } else {
                         weights.block_body.iter().sum()
                     }),
-                host: render
-                    .peak_host_bytes()
-                    .saturating_add(if run.checkpointed {
-                        facts.dit_retained_host
-                    } else {
-                        0
-                    }),
+                host: render.peak_host_bytes().saturating_add(if streamed {
+                    facts.dit_retained_host
+                } else {
+                    0
+                }),
             }
         }
         None => PhaseBytes::default(),
@@ -382,6 +387,62 @@ pub fn estimate_training(
         preview,
         step,
     })
+}
+
+/// Where a checkpointed run keeps its 50 block bodies during the train phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockResidency {
+    /// Every body on the device: the forward and the backward recompute read them in place, so no
+    /// step transfers a weight. Still checkpointed (only the block inputs are retained).
+    Resident,
+    /// The bodies stay on the host and stream through a one-block device window, twice per step
+    /// (forward, then the backward's recompute) — the fallback for a device that cannot hold them.
+    Streamed,
+}
+
+impl BlockResidency {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Streamed => "streamed",
+        }
+    }
+}
+
+/// Choose the block residency of `run` against `budget` and return it with the estimate the
+/// preflight then admits: a checkpointed run keeps its blocks resident when that whole-run peak
+/// (every phase, the preview included) fits the budget, and streams them otherwise. A run with
+/// checkpointing off is always resident (its estimate prices the whole DiT and every activation).
+/// Pure arithmetic over the header facts and the request — no weight is read.
+pub fn plan_block_residency(
+    contract: &MemoryProviderContract,
+    facts: &ImageMemoryFacts,
+    tier: MemoryNumericTier,
+    run: &TrainingRunShape,
+    budget: MemoryBudget,
+) -> Result<(BlockResidency, TrainingRunShape, TrainingEstimate)> {
+    if !run.checkpointed {
+        let run = TrainingRunShape {
+            resident_blocks: false,
+            ..run.clone()
+        };
+        let estimate = estimate_training(contract, facts, tier, &run)?;
+        return Ok((BlockResidency::Resident, run, estimate));
+    }
+    let resident = TrainingRunShape {
+        resident_blocks: true,
+        ..run.clone()
+    };
+    let estimate = estimate_training(contract, facts, tier, &resident)?;
+    if budget.fits(estimate.peak_device()) {
+        return Ok((BlockResidency::Resident, resident, estimate));
+    }
+    let streamed = TrainingRunShape {
+        resident_blocks: false,
+        ..run.clone()
+    };
+    let estimate = estimate_training(contract, facts, tier, &streamed)?;
+    Ok((BlockResidency::Streamed, streamed, estimate))
 }
 
 /// A training budget of `free_bytes` of device memory (no further headroom: the caller's figure
@@ -413,8 +474,8 @@ pub fn admit_training(
     let mut advice = Vec::new();
     if !run.checkpointed {
         advice.push(
-            "enable Gradient Checkpointing (streams the frozen DiT one block at a time and \
-             recomputes each block in the backward)"
+            "enable Gradient Checkpointing (retains only each block's input and recomputes \
+             each block in the backward; the blocks stream from the host when they do not fit)"
                 .to_string(),
         );
     }
@@ -502,6 +563,7 @@ mod tests {
             lokr_rows_total: 0,
             packed_base: false,
             checkpointed,
+            resident_blocks: false,
             chunked_attention: true,
             preview: None,
         }
@@ -744,6 +806,77 @@ mod tests {
         };
         let per_item = text * 5376 * 4 + reference * 384 + image * 384;
         assert_eq!(cache_bytes(5376, &f32_run), 8 * per_item);
+    }
+
+    /// The usable training budget of a card whose free memory is `free_gib` GiB: the engine's
+    /// training safe fraction of it, as `flow_match::device_training_budget_bytes` computes.
+    fn card_budget(free_gib: f64) -> MemoryBudget {
+        budget_of(
+            (free_gib * candle_gen::train::flow_match::TRAIN_SAFE_FRAC * (1u64 << 30) as f64)
+                as u64,
+        )
+    }
+
+    fn at_edge(edge: u32, checkpointed: bool) -> TrainingRunShape {
+        TrainingRunShape {
+            items: vec![
+                TrainingItemShape {
+                    canvas: (edge, edge),
+                    caption_tokens: 256,
+                    references: vec![],
+                };
+                8
+            ],
+            ..run(checkpointed)
+        }
+    }
+
+    /// The residency rule: a 96 GB card (≈94 GiB free) keeps all 50 block bodies resident at 2048²
+    /// and at 1024² — no per-step weight transfer — while a 32 GB card streams them. The resident
+    /// choice is admitted; the estimate it returns prices every body plus the streamed run's
+    /// activations (block inputs only, one block's backward).
+    #[test]
+    fn the_residency_rule_keeps_blocks_resident_on_96_gb_and_streams_on_32_gb() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        let bodies: u64 = dit_weights(&f, false, &run(true)).block_body.iter().sum();
+        for edge in [2048u32, 1024] {
+            let r = at_edge(edge, true);
+            let (residency, chosen, est) =
+                plan_block_residency(&c, &f, t, &r, card_budget(94.0)).unwrap();
+            let streamed = estimate_training(&c, &f, t, &r).unwrap();
+            eprintln!(
+                "edge {edge}: resident train {:.1} GB (weights {:.1}, retained {:.1}, \
+                 block backward {:.1}), peak {:.1} GB in {}; streamed train {:.1} GB; budget {:.1} GB",
+                gb(est.train.device),
+                gb(est.step.weights),
+                gb(est.step.retained),
+                gb(est.step.block_backward),
+                gb(est.peak_device()),
+                est.binding_phase(),
+                gb(streamed.train.device),
+                gb(card_budget(94.0).effective_bytes()),
+            );
+            assert_eq!(residency, BlockResidency::Resident, "edge {edge}");
+            assert!(chosen.resident_blocks);
+            assert_eq!(
+                est.train.device,
+                streamed.train.device + bodies - bodies / 50
+            );
+            admit_training(&est, card_budget(94.0), &chosen, edge).unwrap();
+
+            let (residency, chosen, est) =
+                plan_block_residency(&c, &f, t, &r, card_budget(30.0)).unwrap();
+            assert_eq!(residency, BlockResidency::Streamed, "edge {edge}");
+            assert!(!chosen.resident_blocks);
+            assert_eq!(est, streamed);
+        }
+        // Checkpointing off is the fully resident run whatever the budget.
+        let (residency, chosen, _) =
+            plan_block_residency(&c, &f, t, &at_edge(1024, false), card_budget(30.0)).unwrap();
+        assert_eq!(residency, BlockResidency::Resident);
+        assert!(!chosen.resident_blocks && !chosen.checkpointed);
     }
 
     #[test]

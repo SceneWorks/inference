@@ -25,11 +25,14 @@
 //! 4. **Train** — the DiT loads in runtime format on the **host**; only its trunk (I/O
 //!    projections, the six heads, the token refiner) moves to the device. The AdaLN modulation of
 //!    the six published timesteps is projected once, one block's projection at a time, and every
-//!    projection is evicted. The 50 blocks then stream into a one-block device window, forward and
-//!    again in reverse for the backward (the private `step` module), so gradient checkpointing is structural: each
-//!    block's input is all the forward keeps. `gradient_checkpointing = false` is honored as the
-//!    resident alternative (whole DiT on the device, every activation retained), and the preflight
-//!    refuses it unless the device holds it.
+//!    projection is evicted. Each block is then one checkpointed segment (the private `step`
+//!    module): the forward keeps only each block's input, and the backward recomputes one block at
+//!    a time. Where the 50 block bodies live is the preflight's residency choice
+//!    ([`memory::plan_block_residency`], SW-F369): **resident** — moved to the device once, after
+//!    the precompute — when the whole run fits the device's training budget, else **streamed**
+//!    through a one-block device window, forward and again in reverse for the backward.
+//!    `gradient_checkpointing = false` is honored as the fully resident alternative (every
+//!    activation retained), and the preflight refuses it unless the device holds it.
 //!
 //! # Where this differs from the MLX twin
 //!
@@ -109,8 +112,8 @@ use crate::pipeline::patchify_video_latents;
 use crate::text_encoder::MiniMaxH3Tokenizer;
 
 use memory::{
-    admit_training, budget_of, contract_and_tier, estimate_training, TrainingItemShape,
-    TrainingRunShape,
+    admit_training, budget_of, contract_and_tier, plan_block_residency, BlockResidency,
+    TrainingItemShape, TrainingRunShape,
 };
 use step::{loss_and_grads, noised_rows, StepInputs};
 
@@ -628,23 +631,48 @@ impl MiniMaxH3ImageTrainer {
             packed_base: crate::tier::MiniMaxH3TierPaths::staged_bits(self.generator.dit_dir())?
                 .is_some(),
             checkpointed: plan.checkpointed,
+            // Chosen by the preflight's residency plan.
+            resident_blocks: false,
             chunked_attention: true,
             preview,
         })
     }
 
-    fn preflight(&self, plan: &RunPlan<'_>) -> Result<()> {
+    /// Price the run, choose where its block bodies live, and admit it — before any weight is
+    /// read. Returns the chosen residency.
+    fn preflight(&self, plan: &RunPlan<'_>) -> Result<BlockResidency> {
         let run = self.run_shape(plan)?;
         let (contract, tier) = contract_and_tier(&self.spec)?;
-        let estimate = estimate_training(&contract, &self.facts, tier, &run)?;
-        let budget = self.memory_budget_override.unwrap_or_else(|| {
+        let budget = budget_of(self.memory_budget_override.unwrap_or_else(|| {
             flow_match::device_training_budget_bytes(
                 self.generator.device(),
                 &format!("{TRAINER_ID} trainer"),
             )
-        });
-        admit_training(&estimate, budget_of(budget), &run, plan.edge)?;
-        Ok(())
+        }));
+        let (residency, run, estimate) =
+            plan_block_residency(&contract, &self.facts, tier, &run, budget)?;
+        admit_training(&estimate, budget, &run, plan.edge)?;
+        let gb = crate::image_memory_strategy::admission::decimal_gb;
+        tracing::info!(
+            event = "h3_image_training_residency",
+            residency = residency.name(),
+            checkpointed = plan.checkpointed,
+            peak_device_gb = gb(estimate.peak_device()),
+            train_device_gb = gb(estimate.train.device),
+            budget_gb = gb(budget.effective_bytes()),
+            "{TRAINER_ID} trainer: block residency chosen"
+        );
+        eprintln!(
+            "[SW-F369] {TRAINER_ID} trainer: DiT blocks {} (checkpointed: {}); derived peak \
+             ~{:.1} GB in {} (train step ~{:.1} GB) against a ~{:.1} GB training budget",
+            residency.name(),
+            plan.checkpointed,
+            gb(estimate.peak_device()),
+            estimate.binding_phase(),
+            gb(estimate.train.device),
+            gb(budget.effective_bytes()),
+        );
+        Ok(residency)
     }
 
     /// Every caption (and an edit's references) through the generator's own conditioning phase,
@@ -764,12 +792,14 @@ impl MiniMaxH3ImageTrainer {
         Ok(Cache { entries, text })
     }
 
-    /// The DiT: on the host with its trunk on the device (streamed, checkpointed), or resident;
-    /// the run's factors installed; the six timesteps' modulation projected and `adaln_proj`
-    /// evicted.
+    /// The DiT: loaded on the host with its trunk on the device (checkpointed) or whole on the
+    /// device; the run's factors installed; the six timesteps' modulation projected and
+    /// `adaln_proj` evicted; and — checkpointed with [`BlockResidency::Resident`] — the block
+    /// bodies then moved to the device once, so no step transfers a weight.
     fn build_dit(
         &self,
         plan: &RunPlan<'_>,
+        residency: BlockResidency,
         device: &Device,
     ) -> Result<(MiniMaxH3Dit, ImageModulation, LoraSet)> {
         let cfg = &plan.req.config;
@@ -787,6 +817,20 @@ impl MiniMaxH3ImageTrainer {
         }
         let modulation =
             image_modulation(&mut dit, schedule.timesteps(), plan.edit, &plan.req.cancel)?;
+        if plan.checkpointed && residency == BlockResidency::Resident {
+            if plan.req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let started = std::time::Instant::now();
+            let moved = dit.promote_streamed_blocks()?;
+            eprintln!(
+                "[SW-F369] {TRAINER_ID} trainer: moved {} block bodies ({:.1} GB) to the device \
+                 in {:.1} s; training checkpointed with resident blocks",
+                dit.num_layers(),
+                crate::image_memory_strategy::admission::decimal_gb(moved as u64),
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok((dit, modulation, set))
     }
 
@@ -800,7 +844,7 @@ impl MiniMaxH3ImageTrainer {
         let cfg = &req.config;
         let device = self.generator.device().clone();
         on_progress(TrainingProgress::Preparing);
-        self.preflight(&plan)?;
+        let residency = self.preflight(&plan)?;
         let stem = file_stem(&req.file_name).to_string();
         let fingerprint = request_fingerprint(req)?;
         // The run's mode against the snapshot's, from its metadata alone, before any model loads.
@@ -821,7 +865,7 @@ impl MiniMaxH3ImageTrainer {
 
         on_progress(TrainingProgress::LoadingModel);
         let mut cache = self.cache(&plan, on_progress)?;
-        let (dit, modulation, set) = self.build_dit(&plan, &device)?;
+        let (dit, modulation, set) = self.build_dit(&plan, residency, &device)?;
         // The caption rows are constants of every step: refine each item's once.
         for text in &mut cache.text {
             *text = dit.embed_context(text)?;
@@ -880,6 +924,7 @@ impl MiniMaxH3ImageTrainer {
                 entry,
                 &cache.text[entry.item],
                 mae,
+                plan.checkpointed,
                 &device,
             )?;
             last_loss = loss;
@@ -889,17 +934,19 @@ impl MiniMaxH3ImageTrainer {
             // The last step closes its window too, so the final step's preview and the saved
             // adapter see the same factors (a sub-`accum` tail is a true mean of what it holds).
             if step.is_multiple_of(accum) || step == cfg.steps {
-                apply_update(
-                    &mut opt,
-                    &mut accumulated,
-                    &set,
-                    pending,
-                    cfg,
-                    update_idx,
-                    total_updates,
-                    warmup_updates,
-                    cfg.seed,
-                )?;
+                candle_gen::train::profile::span("optimizer_step", &device, || {
+                    Ok(apply_update(
+                        &mut opt,
+                        &mut accumulated,
+                        &set,
+                        pending,
+                        cfg,
+                        update_idx,
+                        total_updates,
+                        warmup_updates,
+                        cfg.seed,
+                    ))
+                })??;
                 pending = 0;
                 update_idx += 1;
             }
@@ -1024,6 +1071,7 @@ fn micro_step(
     entry: &CachedItem,
     text_rows: &Tensor,
     mae: bool,
+    checkpointed: bool,
     device: &Device,
 ) -> Result<(f32, GradStore)> {
     let t = flow_match::sample_unit_timestep(
@@ -1064,6 +1112,7 @@ fn micro_step(
             step: st,
         },
         mae,
+        checkpointed,
     )
 }
 
