@@ -44,6 +44,8 @@ use crate::h3_image::dit::{denoiser_parts, DenoiserParts, MiniMaxH3ImageDit, Mod
 use crate::h3_image::layout::ImageLayout;
 use crate::tensor::slice_axis;
 
+use super::training_adapter::FrozenResiduals;
+
 /// The LoKr reconstruct dtype the H3-Image adapter install uses (the host's LyCORIS dtype, bf16),
 /// so a trained LoKr round-trips through it.
 pub(crate) const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
@@ -59,6 +61,9 @@ pub(crate) struct BlockTrainables {
 pub(crate) struct LossSpec<'a> {
     /// Every target (the resident path installs them all at once).
     pub(crate) adapter: &'a TrainAdapter,
+    /// The frozen training adapter's residuals on the trainable targets, appended back after every
+    /// trainable install ([`FrozenResiduals::reattach`]); empty without a training adapter.
+    pub(crate) frozen: &'a FrozenResiduals,
     /// Per block (the streamed path installs one block's at a time).
     pub(crate) blocks: &'a [BlockTrainables],
     pub(crate) alpha: f32,
@@ -260,6 +265,7 @@ fn resident_loss_and_grads(
             spec.lora_dtype,
             LOKR_DTYPE,
         )?;
+        spec.frozen.reattach(&mut *dit, None)?;
         let dit: &MiniMaxH3ImageDit = dit;
         let mut x = stack_input(dit, parts, inputs.packed).map_err(mlx_err)?;
         for (layer, block) in dit.blocks().iter().enumerate() {
@@ -305,17 +311,19 @@ pub(crate) fn install_concrete(
     spec: &LossSpec<'_>,
 ) -> Result<()> {
     if let Some(adapter) = &trainables.adapter {
+        let mut host = BlockHost {
+            index: layer,
+            block,
+        };
         adapter.install_as(
-            &mut BlockHost {
-                index: layer,
-                block,
-            },
+            &mut host,
             params,
             spec.alpha,
             spec.rank,
             spec.lora_dtype,
             LOKR_DTYPE,
         )?;
+        spec.frozen.reattach(&mut host, Some(layer))?;
     }
     Ok(())
 }
@@ -417,17 +425,19 @@ pub(crate) fn block_vjp(
                     .cloned()
                     .zip(xs[1..].iter().cloned())
                     .collect();
+                let mut host = BlockHost {
+                    index: layer,
+                    block: &mut *block,
+                };
                 adapter.install_as(
-                    &mut BlockHost {
-                        index: layer,
-                        block: &mut *block,
-                    },
+                    &mut host,
                     &traced,
                     spec.alpha,
                     spec.rank,
                     spec.lora_dtype,
                     LOKR_DTYPE,
                 )?;
+                spec.frozen.reattach(&mut host, Some(layer))?;
             }
             Ok(vec![run_block(
                 dit, block, layer, &xs[0], modulation, parts, step, bounded,
@@ -494,17 +504,19 @@ pub(crate) fn streamed_jvp(
                         .cloned()
                         .zip(xs[1..].iter().cloned())
                         .collect();
+                    let mut host = BlockHost {
+                        index: layer,
+                        block: &mut block,
+                    };
                     adapter.install_as(
-                        &mut BlockHost {
-                            index: layer,
-                            block: &mut block,
-                        },
+                        &mut host,
                         &traced,
                         spec.alpha,
                         spec.rank,
                         spec.lora_dtype,
                         LOKR_DTYPE,
                     )?;
+                    spec.frozen.reattach(&mut host, Some(layer))?;
                 }
                 Ok(vec![run_block(
                     dit, &block, layer, &xs[0], modulation, &parts, step, bounded,

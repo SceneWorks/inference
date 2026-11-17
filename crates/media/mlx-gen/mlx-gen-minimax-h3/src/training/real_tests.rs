@@ -437,8 +437,10 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         target: &target,
         step,
     };
+    let no_training_adapter = super::training_adapter::FrozenResiduals::default();
     let spec = |streamed: bool| LossSpec {
         adapter: &adapter,
+        frozen: &no_training_adapter,
         blocks: &blocks,
         alpha: cfg.alpha,
         rank: cfg.rank as f32,
