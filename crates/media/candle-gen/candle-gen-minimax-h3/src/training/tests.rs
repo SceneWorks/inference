@@ -239,3 +239,71 @@ fn the_registry_registers_the_trainer() {
     let ids: Vec<&str> = registry.trainers().map(|t| (t.descriptor)().id).collect();
     assert_eq!(ids, vec![TRAINER_ID]);
 }
+
+/// The training adapter is a declared technique on candle: the shared floor admits a run naming one
+/// (validate never reads the file), and refuses it on a full fine-tune.
+#[test]
+fn the_training_adapter_is_declared_and_passes_the_floor() {
+    let d = descriptor();
+    assert!(d.techniques.training_adapter);
+    let req = |config: TrainingConfig| TrainingRequest {
+        items: vec![TrainingItem::captioned(
+            "/nonexistent/a.png".into(),
+            "a cat".into(),
+        )],
+        config,
+        output_dir: "/nonexistent".into(),
+        file_name: "x.safetensors".into(),
+        trigger_words: vec![],
+        cancel: Default::default(),
+    };
+    let with_adapter = TrainingConfig {
+        training_adapter: Some("/nonexistent/fizgig.safetensors".into()),
+        ..gen_core_train::h3_image::default_training_config()
+    };
+    gen_core_train::h3_image::validate_floors(&d, &req(with_adapter.clone())).unwrap();
+    let full = TrainingConfig {
+        full_finetune: true,
+        ..with_adapter
+    };
+    assert!(gen_core_train::h3_image::validate_floors(&d, &req(full)).is_err());
+}
+
+/// No adapter configured prices nothing and reads nothing (the path would not exist).
+#[test]
+fn no_training_adapter_prices_nothing() {
+    let bytes = training_adapter::training_adapter_bytes(
+        Path::new("/nonexistent-dit"),
+        &cfg(),
+        &[],
+        None,
+        training_adapter::TRAINING_ADAPTER_STRENGTH,
+    )
+    .unwrap();
+    assert_eq!(
+        bytes,
+        gen_core_train::h3_image::TrainingAdapterBytes::default()
+    );
+}
+
+/// A preview loads the trainer's snapshot with the in-progress factors as its only adapter — the
+/// frozen training adapter never reaches a preview render, so the samples show what the saved
+/// adapter renders on the bare distilled base. Mutation: append the training adapter to the
+/// preview load ⇒ the adapter-list assert fails.
+#[test]
+fn a_preview_loads_only_the_trained_adapter() {
+    let setup = PreviewSetup {
+        spec: LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            "/nonexistent-minimax-h3-image".into(),
+        )),
+        prompts: vec!["a cat".into()],
+        size: (1024, 1024),
+        references: vec![],
+        adapter_kind: AdapterKind::Lora,
+    };
+    let preview = Path::new("/out/.run-preview.safetensors");
+    let spec = setup.generator_spec(preview);
+    assert_eq!(spec.adapters.len(), 1);
+    assert_eq!(spec.adapters[0].path, preview);
+    assert_eq!(spec.adapters[0].scale, 1.0);
+}

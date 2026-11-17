@@ -15,7 +15,8 @@
 //! * the **training canvas** — [`training_canvas`]: every target keeps its aspect at about the
 //!   bucket edge's area, never upscaled past its own;
 //! * the **training-step memory envelope** — [`train_step_bytes`], the structural count both
-//!   backends price their train phase with.
+//!   backends price their train phase with, and [`TrainingAdapterBytes`], the frozen de-distill
+//!   training adapter's share of it.
 //!
 //! # The flow-matching contract
 //!
@@ -36,6 +37,7 @@
 //! and 1 on well under 1 % of the steps, while the shared blocks the LoRA changes still feed them
 //! at every render).
 
+use gen_core::h3_adapter_memory::H3AdapterMemoryProfile;
 use gen_core::h3_image::{sampler_sigmas, FIXED_STEPS, MAX_REFERENCES, SIZE_STRIDE};
 use gen_core::license::components::MINIMAX_H3_IMAGE;
 
@@ -143,9 +145,14 @@ pub fn trainer_descriptor(backend: &'static str) -> TrainerDescriptor {
         // An edit pair carries the generator's own reference cap.
         max_reference_images: MAX_REFERENCES as u32,
         // Weight and gradient noise act at the shared adapter optimizer update; resolution buckets
-        // cache every item once per edge. Every other technique is refused by the shared floor.
+        // cache every item once per edge; the training adapter (a frozen de-distill LoRA such as
+        // `ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter`) is installed on the training
+        // DiT only — previews render through a fresh generator without it, and the saved adapter
+        // holds the trainable factors alone (see [`TrainingAdapterBytes`]). Every other technique
+        // is refused by the shared floor.
         techniques: TrainingTechniques {
             resolution_buckets: true,
+            training_adapter: true,
             ..TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -321,6 +328,93 @@ pub fn target_block(path: &str) -> Option<usize> {
         .0
         .parse()
         .ok()
+}
+
+/// The frozen **training adapter**'s footprint on the training DiT ([`TrainingConfig::training_adapter`]):
+/// H3-Image is a six-step distilled model, and plain flow-matching fine-tuning un-distills it (a
+/// long LoRA samples blurry, with ghosted limbs). A de-distill LoRA applied to the base at strength
+/// 1.0 for every training forward/backward — and absent from previews and the saved adapter — lets
+/// the user's adapter learn the concept instead of undoing the distillation (the Z-Image
+/// precedent, sc-25213).
+///
+/// Both backends install the file through their own **inference** H3-Image adapter install (the
+/// same key mapping a render uses: kohya, ComfyUI fused `qkv_proj`, diffusers/PEFT, LoKr) as a
+/// frozen forward-time residual over the untouched — possibly packed — base. These are the bytes
+/// that install holds, reduced from the inference adapter memory profile
+/// ([`H3AdapterMemoryProfile`], header-only) to what a block-streaming trainer needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrainingAdapterBytes {
+    /// Every installed factor plus its prepared caches.
+    pub resident: u64,
+    /// The share on modules outside the 50 blocks (refiner, I/O projections, heads) — resident
+    /// with the trunk whatever the block residency.
+    pub trunk: u64,
+    /// The largest single block's share — what one streamed block window adds.
+    pub block_max: u64,
+    /// Bytes per sequence row the residuals' forward keeps alive (their intermediates and outputs,
+    /// which autograd retains for the backward): the largest block's, and every block's.
+    pub rows_block_max: u64,
+    pub rows_total: u64,
+}
+
+impl TrainingAdapterBytes {
+    /// Reduce an inference adapter memory profile of the training adapter alone.
+    pub fn from_profile(profile: &H3AdapterMemoryProfile) -> Self {
+        let mut blocks = std::collections::BTreeMap::<usize, (u64, u64)>::new();
+        let mut trunk = 0u64;
+        let mut rows_total = 0u64;
+        for p in &profile.projections {
+            rows_total = rows_total.saturating_add(p.forward_bytes_per_row);
+            match target_block(&p.target.path) {
+                Some(block) => {
+                    let entry = blocks.entry(block).or_default();
+                    entry.0 = entry.0.saturating_add(p.resident_bytes);
+                    entry.1 = entry.1.saturating_add(p.forward_bytes_per_row);
+                }
+                None => trunk = trunk.saturating_add(p.resident_bytes),
+            }
+        }
+        let projected: u64 = profile
+            .projections
+            .iter()
+            .fold(0u64, |t, p| t.saturating_add(p.resident_bytes));
+        Self {
+            // The profile's own total is authoritative; never price below the per-projection sum.
+            resident: profile.resident_bytes.max(projected),
+            trunk,
+            block_max: blocks.values().map(|b| b.0).max().unwrap_or(0),
+            rows_block_max: blocks.values().map(|b| b.1).max().unwrap_or(0),
+            rows_total,
+        }
+    }
+
+    /// The bytes held on the training device: the trunk share plus one block window (`streamed`),
+    /// or everything (resident blocks).
+    pub fn device(&self, streamed: bool) -> u64 {
+        if streamed {
+            self.trunk.saturating_add(self.block_max)
+        } else {
+            self.resident
+        }
+    }
+
+    /// The bytes a streamed run keeps on the host beside its block stack (the blocks' share).
+    pub fn host(&self, streamed: bool) -> u64 {
+        if streamed {
+            self.resident.saturating_sub(self.trunk)
+        } else {
+            0
+        }
+    }
+
+    /// Bytes per sequence row the forward retains: one live block (checkpointed) or every block.
+    pub fn rows(&self, checkpointed: bool) -> u64 {
+        if checkpointed {
+            self.rows_block_max
+        } else {
+            self.rows_total
+        }
+    }
 }
 
 /// The distilled step one micro-step trains: its index (which output head and which AdaLN
@@ -794,6 +888,7 @@ mod tests {
         assert_eq!(d.max_reference_images, 16);
         assert!(d.techniques.resolution_buckets && d.techniques.weight_noise);
         assert!(!d.techniques.subject_mask_loss && !d.supports_control);
+        assert!(d.techniques.training_adapter);
         let c = default_training_config();
         assert_eq!(c.resolution, 2048);
         assert!(c.gradient_checkpointing);
@@ -923,5 +1018,61 @@ mod tests {
             },
         );
         assert_eq!(ignored, resident);
+    }
+
+    /// The training adapter's footprint splits the inference profile into the trunk share (always
+    /// resident), the largest block's share (one streamed window) and the forward's per-row bytes.
+    /// Mutations: sum the rows by max ⇒ the totals assert fails; count the refiner as a block ⇒ the
+    /// trunk assert fails; take the smallest block ⇒ the `block_max` assert fails.
+    #[test]
+    fn the_training_adapter_footprint_splits_trunk_and_blocks() {
+        use gen_core::h3_adapter_memory::{H3AdapterProjectionMemory, H3AdapterTarget};
+        use gen_core::h3_memory::RowDomain;
+        let projection = |path: &str, resident: u64, per_row: u64| H3AdapterProjectionMemory {
+            target: H3AdapterTarget {
+                path: path.to_owned(),
+                input: 8,
+                output: 8,
+                packed: false,
+                activation_width: 2,
+                activation_dtype: gen_core::weightsmeta::Dtype::BF16,
+                rows: RowDomain::Packed,
+            },
+            installed_bytes: resident,
+            resident_bytes: resident,
+            forward_fixed_bytes: 0,
+            forward_bytes_per_row: per_row,
+        };
+        let profile = H3AdapterMemoryProfile {
+            resident_bytes: 10 + 20 + 30 + 100,
+            install_peak_bytes: 500,
+            projections: vec![
+                projection("transformer_blocks.0.attn.to_q", 10, 2),
+                projection("transformer_blocks.0.ff.net.2", 20, 3),
+                projection("transformer_blocks.1.attn.to_k", 30, 4),
+                projection("token_refiner.refiner_blocks.0.attn.to_q", 100, 1),
+            ],
+        };
+        let bytes = TrainingAdapterBytes::from_profile(&profile);
+        assert_eq!(
+            bytes,
+            TrainingAdapterBytes {
+                resident: 160,
+                trunk: 100,
+                block_max: 30,
+                rows_block_max: 5,
+                rows_total: 10,
+            }
+        );
+        assert_eq!(bytes.device(true), 130);
+        assert_eq!(bytes.device(false), 160);
+        assert_eq!(bytes.host(true), 60);
+        assert_eq!(bytes.host(false), 0);
+        assert_eq!(bytes.rows(true), 5);
+        assert_eq!(bytes.rows(false), 10);
+        assert_eq!(
+            TrainingAdapterBytes::from_profile(&H3AdapterMemoryProfile::default()),
+            TrainingAdapterBytes::default()
+        );
     }
 }

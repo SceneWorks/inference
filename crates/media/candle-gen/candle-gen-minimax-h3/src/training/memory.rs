@@ -10,7 +10,7 @@
 //! | --- | --- |
 //! | conditioning | inference admission's own vision-tower / conditioning / reference-encode phases for each item at rung 4, plus the cache built so far |
 //! | latents | the VAE encoder's tiled encode of the largest target (admission's own tiled-encode term), plus the cache |
-//! | train | [`gen_core_train::h3_image::train_step_bytes`] (one streamed block or, resident, every block body; every block input; one block's backward) plus candle's float32 attention operands and allocator slack, plus the cache; host: the runtime-format DiT stack the load builds (and the streamed route keeps) |
+//! | train | [`gen_core_train::h3_image::train_step_bytes`] (one streamed block or, resident, every block body; every block input; one block's backward) plus candle's float32 attention operands and allocator slack, plus the cache, plus the frozen training adapter ([`TrainingAdapterBytes`]: every factor resident, or the trunk share and one block's window streamed; its retained forward rows); host: the runtime-format DiT stack the load builds (and the streamed route keeps, with the adapter's block share) |
 //! | preview | inference admission's whole-render peak at rung 4 for the preview request, plus the training state that stays resident through it |
 //!
 //! Every number is DERIVED (structural counts over the staged tier's headers and the request's
@@ -23,7 +23,8 @@ use candle_gen::gen_core::{
 };
 
 use gen_core_train::h3_image::{
-    train_step_bytes, DitGeometry, DitWeightBytes, TrainStepBytes, TrainStepShape, TRAINER_ID,
+    train_step_bytes, DitGeometry, DitWeightBytes, TrainStepBytes, TrainStepShape,
+    TrainingAdapterBytes, TRAINER_ID,
 };
 
 use crate::image_memory_strategy::admission::{
@@ -83,6 +84,8 @@ pub struct TrainingRunShape {
     /// The DiT tier is packed (q4 / q8): every projection dequantizes per forward, and autograd
     /// retains each dense copy until its backward.
     pub packed_base: bool,
+    /// The frozen training adapter's footprint (zero when none is configured).
+    pub training_adapter: TrainingAdapterBytes,
     pub checkpointed: bool,
     /// Under `checkpointed`: keep every block body on the device ([`BlockResidency::Resident`])
     /// instead of streaming the blocks through a one-block window. Chosen by
@@ -333,10 +336,14 @@ pub fn estimate_training(
         } else {
             run.lokr_rows_total
         };
+        // The frozen training adapter's residual intermediates and outputs, retained for the
+        // backward: one live block's (checkpointed) or every block's.
+        let training_adapter_rows = run.training_adapter.rows(run.checkpointed) * seq;
         let total = bytes.total()
             + live_blocks * f32_attention
             + dequantized
             + lokr_rows * seq * run.width
+            + training_adapter_rows
             + ALLOCATOR_SLACK_BYTES;
         if total > train.device {
             train.device = total;
@@ -349,14 +356,22 @@ pub fn estimate_training(
     };
     let conditioning = with_cache(conditioning);
     let latents = with_cache(latents);
+    let streamed = run.checkpointed && !run.resident_blocks;
+    // The frozen training adapter's factors: on the device in full (resident blocks), or its trunk
+    // share plus one block's window there and the blocks' share on the host (streamed).
+    let adapter_device = run.training_adapter.device(streamed);
+    let adapter_host = run.training_adapter.host(streamed);
     let train = PhaseBytes {
-        device: train.device.saturating_add(cache),
-        host: host_dit,
+        device: train
+            .device
+            .saturating_add(cache)
+            .saturating_add(adapter_device),
+        host: host_dit.saturating_add(adapter_host),
     };
     // Previews run the generator with the training DiT's trunk and tables still on the device — and,
     // resident (checkpointed or not), its whole block stack — the adapter state live, and
-    // (streamed) its host stack held.
-    let streamed = run.checkpointed && !run.resident_blocks;
+    // (streamed) its host stack held. The training adapter stays installed on that DiT (its
+    // trunk share, or all of it resident), though the preview's own generator never carries it.
     let preview = match &run.preview {
         Some(item) => {
             let render = estimate(contract, facts, &request_shape(item), &selection)?;
@@ -367,15 +382,14 @@ pub fn estimate_training(
                     .saturating_add(step.adapter_state)
                     .saturating_add(weights.trunk + weights.modulation_tables)
                     .saturating_add(if streamed {
-                        0
+                        run.training_adapter.trunk
                     } else {
-                        weights.block_body.iter().sum()
+                        weights.block_body.iter().sum::<u64>() + run.training_adapter.resident
                     }),
-                host: render.peak_host_bytes().saturating_add(if streamed {
-                    facts.dit_retained_host
-                } else {
-                    0
-                }),
+                host: render
+                    .peak_host_bytes()
+                    .saturating_add(if streamed { facts.dit_retained_host } else { 0 })
+                    .saturating_add(adapter_host),
             }
         }
         None => PhaseBytes::default(),
@@ -562,6 +576,7 @@ mod tests {
             lokr_rows_block_max: 0,
             lokr_rows_total: 0,
             packed_base: false,
+            training_adapter: TrainingAdapterBytes::default(),
             checkpointed,
             resident_blocks: false,
             chunked_attention: true,
@@ -884,5 +899,55 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
         let c = crate::image_memory_strategy::weights_free_contract(&spec).unwrap();
         assert!(streamed_selection(&c, tier(None)).is_err());
+    }
+
+    /// The frozen training adapter is priced in every residency: all of it on the device for
+    /// resident blocks, the trunk share plus one block's window when streamed (the blocks' share on
+    /// the host), plus its retained forward rows — one live block's checkpointed, every block's
+    /// otherwise. Mutations: drop the device term ⇒ the resident assert fails; price the whole
+    /// adapter streamed ⇒ the streamed device assert fails; drop the host share ⇒ the host assert
+    /// fails; take every block's rows checkpointed ⇒ the rows assert fails.
+    #[test]
+    fn the_training_adapter_is_priced_per_residency() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        // The shipped Fizgig adapter's shape: rank 16 over the 50 blocks' attention and MLP, bf16.
+        let ta = TrainingAdapterBytes {
+            resident: 150_000_000,
+            trunk: 0,
+            block_max: 3_000_000,
+            rows_block_max: 1_000,
+            rows_total: 50_000,
+        };
+        let with = |base: TrainingRunShape| TrainingRunShape {
+            training_adapter: ta,
+            ..base
+        };
+        let seq = {
+            let (text, reference, image) = train_rows(&run(true).items[0]);
+            text + reference + image
+        };
+        let streamed_run = run(true);
+        let resident_run = TrainingRunShape {
+            resident_blocks: true,
+            ..run(true)
+        };
+        for (base, device, rows, host) in [
+            (streamed_run, ta.block_max, ta.rows_block_max, ta.resident),
+            (resident_run, ta.resident, ta.rows_block_max, 0),
+            (run(false), ta.resident, ta.rows_total, 0),
+        ] {
+            let bare = estimate_training(&c, &f, t, &base).unwrap();
+            let adapted = estimate_training(&c, &f, t, &with(base.clone())).unwrap();
+            assert_eq!(
+                adapted.train.device,
+                bare.train.device + device + rows * seq,
+                "checkpointed {} resident {}",
+                base.checkpointed,
+                base.resident_blocks
+            );
+            assert_eq!(adapted.train.host, bare.train.host + host);
+        }
     }
 }

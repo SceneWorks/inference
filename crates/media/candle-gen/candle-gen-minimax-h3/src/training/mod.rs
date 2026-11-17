@@ -48,6 +48,16 @@
 //! * The trainable factors are installed once on the host blocks; a window copy carries them as
 //!   the same `Var` leaves, so no per-step re-install exists.
 //!
+//! # The training adapter
+//!
+//! `TrainingConfig::training_adapter` names a frozen de-distill LoRA (the shipped one is
+//! `ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter`): H3-Image is six-step distilled, and a
+//! plain flow-matching fine-tune un-distills it. The adapter is installed on the training DiT
+//! through the inference install as a frozen residual at strength 1.0, before the trainable factors
+//! — so every training forward and backward, in every block residency, runs on base + adapter —
+//! while previews render through a fresh generator without it and the saved adapter holds the
+//! trainable factors alone ([`training_adapter`]).
+//!
 //! # The saved adapter
 //!
 //! PEFT keys `transformer_blocks.{i}.<leaf>.lora_A.weight` / `.lora_B.weight` + a per-target
@@ -64,6 +74,7 @@
 
 pub mod memory;
 mod step;
+pub mod training_adapter;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -135,6 +146,9 @@ pub struct MiniMaxH3ImageTrainer {
     facts: ImageMemoryFacts,
     /// Test seam: replaces the device's training budget (bytes).
     memory_budget_override: Option<u64>,
+    /// The strength the configured training adapter is applied at
+    /// ([`training_adapter::TRAINING_ADAPTER_STRENGTH`]); a bench/experiment seam.
+    training_adapter_strength: f32,
 }
 
 /// Construct the trainer from a `MiniMaxAI/MiniMax-H3-Image` snapshot (the staged DiT tier as the
@@ -191,12 +205,20 @@ impl MiniMaxH3ImageTrainer {
             dit_cfg,
             facts,
             memory_budget_override: None,
+            training_adapter_strength: training_adapter::TRAINING_ADAPTER_STRENGTH,
         })
     }
 
     /// Replace the device budget the preflight compares against (bytes). A test seam.
     pub fn set_memory_budget_override(&mut self, bytes: Option<u64>) {
         self.memory_budget_override = bytes;
+    }
+
+    /// Apply a configured `TrainingConfig::training_adapter` at `strength` instead of the
+    /// production [`training_adapter::TRAINING_ADAPTER_STRENGTH`] (1.0). An experiment seam (the
+    /// throughput bench's A/B knob); it changes nothing when no adapter is configured.
+    pub fn set_training_adapter_strength(&mut self, strength: f32) {
+        self.training_adapter_strength = strength;
     }
 }
 
@@ -519,6 +541,19 @@ impl PreviewSetup {
         }))
     }
 
+    /// The load a preview renders with: the trainer's own snapshot with the in-progress factors at
+    /// `adapter` as its **only** adapter — never the run's frozen training adapter, so a preview
+    /// shows the bare distilled base plus the user's adapter, what the saved file renders.
+    fn generator_spec(&self, adapter: &Path) -> LoadSpec {
+        let mut spec = self.spec.clone();
+        spec.adapters = vec![AdapterSpec::new(
+            adapter.to_path_buf(),
+            1.0,
+            self.adapter_kind,
+        )];
+        spec
+    }
+
     /// Render `prompt` at `seed` through the registered generator with the adapter at `adapter`.
     fn render(
         &self,
@@ -527,13 +562,7 @@ impl PreviewSetup {
         seed: u64,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let mut spec = self.spec.clone();
-        spec.adapters = vec![AdapterSpec::new(
-            adapter.to_path_buf(),
-            1.0,
-            self.adapter_kind,
-        )];
-        let generator = crate::image_model::load_image(&spec)?;
+        let generator = crate::image_model::load_image(&self.generator_spec(adapter))?;
         let req = preview_request(prompt, seed, self.size, &self.references, cancel.clone());
         generator.validate(&req)?;
         match generator.generate(&req, &mut |_| {})? {
@@ -630,6 +659,13 @@ impl MiniMaxH3ImageTrainer {
             lokr_rows_total: total,
             packed_base: crate::tier::MiniMaxH3TierPaths::staged_bits(self.generator.dit_dir())?
                 .is_some(),
+            training_adapter: training_adapter::training_adapter_bytes(
+                self.generator.dit_dir(),
+                &self.dit_cfg,
+                &self.facts.task.projections,
+                cfg.training_adapter.as_deref(),
+                self.training_adapter_strength,
+            )?,
             checkpointed: plan.checkpointed,
             // Chosen by the preflight's residency plan.
             resident_blocks: false,
@@ -793,7 +829,8 @@ impl MiniMaxH3ImageTrainer {
     }
 
     /// The DiT: loaded on the host with its trunk on the device (checkpointed) or whole on the
-    /// device; the run's factors installed; the six timesteps' modulation projected and
+    /// device; the frozen training adapter (when configured) and the run's factors installed; the
+    /// six timesteps' modulation projected and
     /// `adaln_proj` evicted; and — checkpointed with [`BlockResidency::Resident`] — the block
     /// bodies then moved to the device once, so no step transfers a weight.
     fn build_dit(
@@ -809,6 +846,22 @@ impl MiniMaxH3ImageTrainer {
             device
         };
         let mut dit = self.generator.load_dit(load_device, plan.compute_dtype)?;
+        // The frozen de-distill residual first, where the generator installs a render's adapters:
+        // on the host blocks a streamed window copies (and the resident promotion moves), or on
+        // the device for a non-checkpointed load — so every residency runs on base + adapter.
+        if let Some(file) = &cfg.training_adapter {
+            let applied = training_adapter::install_training_adapter(
+                &mut dit,
+                file,
+                self.training_adapter_strength,
+            )?;
+            eprintln!(
+                "[SW-F369] {TRAINER_ID} trainer: training adapter {} applied to {applied} \
+                 projections at strength {} (frozen; previews and the saved adapter exclude it)",
+                file.display(),
+                self.training_adapter_strength
+            );
+        }
         let set = install_adapters(&mut dit, &plan.target_paths, cfg, device)?;
         let schedule = gen_core_h3::h3_schedule::SigmaSchedule::h3_image_distilled()
             .map_err(|e| Error::Msg(e.to_string()))?;
@@ -1202,3 +1255,5 @@ impl Trainer for MiniMaxH3ImageTrainer {
 mod real_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod training_adapter_tests;
