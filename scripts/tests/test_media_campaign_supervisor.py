@@ -1330,6 +1330,41 @@ class SupervisorTests(unittest.TestCase):
                                  for q in queries), 1)
             self.assertTrue(any(f'--id={gpu}' in q for q in queries))
 
+    def test_windows_wddm_fallback_charges_only_growth_above_the_prespawn_card_baseline(self):
+        # CI_IMPACT: mocked SMI only. A desktop app holds 30 GiB; the child adds 15 GiB under a
+        # 40 GiB cap. The fallback must charge the child 15 GiB, not the whole card.
+        data = json.loads(self.policy.canonical_bytes)
+        gpu = 'GPU-12345678-1234-1234-1234-123456789abc'
+        data.update(backend='windows-cuda', cudaDeviceUuid=gpu,
+                    gpuFreeReserveBytes=1024, childGpuCapBytes=40 * 1024**3)
+        path = self.root / 'windows-baseline-policy.json'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        policy = safety.load_policy(path)
+        card = {'used': 30720}
+        def output(argv, **_kwargs):
+            if '--query-gpu=uuid,memory.free' in argv:
+                return f'{gpu}, {98304 - card["used"]}\n'
+            if '--query-compute-apps=pid,used_gpu_memory,gpu_uuid' in argv:
+                return f'123, N/A, {gpu}\n456, N/A, {gpu}\n'
+            return f'{gpu}, WDDM, 98304, {card["used"]}, {98304 - card["used"]}\n'
+        with patch.object(safety.platform, 'system', return_value='Windows'), \
+             patch.object(safety.windows, 'trusted_nvidia_smi', return_value='C:\\Windows\\System32\\nvidia-smi.exe'), \
+             patch.object(safety, '_bounded_output', side_effect=output):
+            probe = safety.SystemProbe(policy)
+            # The baseline is the raw card value: the rounding MiB is charged to the child only.
+            self.assertEqual(probe.record_global_used_baseline(), 30720 * 1024**2)
+            card['used'] = 30720 + 15360
+            owner = type('Owner', (), {'members': lambda self: {123}})()
+            free, charged = probe.gpu_free_and_tree_bytes(owner)
+            self.assertEqual(charged, 15361 * 1024**2)
+            self.assertLess(charged, policy.child_gpu_cap_bytes)
+            self.assertEqual(probe.gpu_usage_basis, 'global-used-upper-bound')
+            # The whole-card value stays recorded as the upper bound.
+            self.assertEqual(probe.last_global_used_upper_bound_bytes, (30720 + 15360 + 1) * 1024**2)
+            card['used'] = 30000  # the co-tenant freed memory: never a negative charge
+            self.assertEqual(probe.gpu_free_and_tree_bytes(owner)[1], 0)
+            self.assertEqual(probe.last_global_used_upper_bound_bytes, 30001 * 1024**2)
+
     def test_windows_wddm_unowned_na_does_not_replace_exact_owned_usage(self):
         data = json.loads(self.policy.canonical_bytes)
         gpu = 'GPU-12345678-1234-1234-1234-123456789abc'

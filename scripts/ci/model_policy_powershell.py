@@ -212,7 +212,7 @@ class Analyzer:
                   'setenvironmentvariable getenvironmentvariable ispathrooted gettemppath '
                   'getfullpath getfilename parse matches match isnullorempty isnullorwhitespace '
                   'isnan isinfinity max min waitall getprocessbyid startnew open exists '
-                  'openstandardoutput openstandarderror newguid'.split())
+                  'openstandardoutput openstandarderror newguid lock unlock'.split())
     TYPES = set('datetime datetimeoffset datetimekind timespan math regex string stringcomparer '
                 'environment guid intptr valueType system.array system.collections.generic.hashset[string] '
                 'io.path io.file io.directory io.filemode io.fileaccess io.fileshare io.fileattributes '

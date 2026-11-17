@@ -6381,7 +6381,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy
-      - name: Claim idle physical GPU, build/lint exact source, and execute bounded S3 gates
+      - name: Claim physical GPU with free-memory headroom, build/lint exact source, and execute bounded S3 gates
         shell: cmd
         run: '"%REVIEWED_PYTHON%" scripts\release\veda_s3_cuda.py'
       - name: Preserve CUDA S3 evidence on success or failure

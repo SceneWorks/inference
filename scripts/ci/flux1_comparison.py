@@ -107,7 +107,7 @@ def snapshots(work, tier):
 
 
 PHASES = tuple(f"{arm}-{variant}" for arm in ("preflight", *evidence.ARMS) for variant in evidence.VARIANTS)
-RELEASE_RESERVE_SECONDS = 30  # execution_claim's final CUDA idle verification window
+RELEASE_RESERVE_SECONDS = 30  # execution_claim's final CUDA release verification window
 
 
 def cuda_claim_budget(policy):
