@@ -27,6 +27,27 @@ fn base_snapshot() -> String {
         .expect("set MAGE_BASE_SNAPSHOT to the full microsoft/Mage-Flow-Base snapshot root")
 }
 
+/// The trainer spec over [`base_snapshot`]: a flat upstream snapshot carries its own
+/// `text_encoder/` + `vae/`; a SceneWorks tier root (`SceneWorks/Mage-Flow-Base/<rev>/bf16`, which
+/// holds only the transformer) names them as staged components from `MAGE_TEXT_ENCODER_DIR` /
+/// `MAGE_VAE_DIR` (the shared `SceneWorks/Mage-Flow-Components-mlx` mirror).
+fn base_spec() -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base_snapshot().into()));
+    for (component, var) in [
+        (
+            mlx_gen_mage::COMPONENT_TEXT_ENCODER,
+            "MAGE_TEXT_ENCODER_DIR",
+        ),
+        (mlx_gen_mage::COMPONENT_VAE, "MAGE_VAE_DIR"),
+    ] {
+        if let Some(dir) = std::env::var_os(var) {
+            spec.components
+                .insert(component.into(), WeightsSource::Dir(dir.into()));
+        }
+    }
+    spec
+}
+
 /// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a 2:3 portrait of three
 /// distinct horizontal bands (blue / cream / green), item 1 a solid red square swatch, so every run
 /// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
@@ -102,10 +123,7 @@ fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
 
     let mut trainer = mlx_gen_mage::provider_registry()
         .unwrap()
-        .load_trainer(
-            "mage_flow_base",
-            &LoadSpec::new(WeightsSource::Dir(base_snapshot().into())),
-        )
+        .load_trainer("mage_flow_base", &base_spec())
         .expect("mage_flow_base trainer should be registered");
 
     let config = TrainingConfig {
@@ -264,10 +282,7 @@ fn mage_trainer_emits_preview_samples() {
 
     let mut trainer = mlx_gen_mage::provider_registry()
         .unwrap()
-        .load_trainer(
-            "mage_flow_base",
-            &LoadSpec::new(WeightsSource::Dir(base_snapshot().into())),
-        )
+        .load_trainer("mage_flow_base", &base_spec())
         .unwrap();
     let config = TrainingConfig {
         rank: 8,
@@ -360,10 +375,7 @@ fn mage_lora_reload_changes_generated_image() {
 
     let mut trainer = mlx_gen_mage::provider_registry()
         .unwrap()
-        .load_trainer(
-            "mage_flow_base",
-            &LoadSpec::new(WeightsSource::Dir(base_snapshot().into())),
-        )
+        .load_trainer("mage_flow_base", &base_spec())
         .unwrap();
     let config = TrainingConfig {
         rank: 8,

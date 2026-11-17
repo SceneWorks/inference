@@ -64,21 +64,31 @@ SDXL = Pin("stabilityai/stable-diffusion-xl-base-1.0", "462165984030d82259a11f43
 Z_IMAGE = Pin("Tongyi-MAI/Z-Image-Turbo", "f332072aa78be7aecdf3ee76d5c247082da564a6",
               files=("model_index.json", "transformer/config.json", "text_encoder/config.json",
                      "tokenizer/tokenizer.json", "vae/config.json"))
+# The SceneWorks tier root holds only the transformer; its text encoder and VAE are staged from the
+# shared components mirror (the Candle bounded Mage proof's exact pins).
 MAGE_BASE = Pin("SceneWorks/Mage-Flow-Base", "d642341926fcdb450c17c8fbda03759e8f731c9b", "bf16",
-                files=("transformer/config.json",))
+                files=("transformer/config.json", "transformer/diffusion_pytorch_model.safetensors"))
+MAGE_TEXT_ENCODER = Pin("SceneWorks/Mage-Flow-Components-mlx", "c936de2a107ee8d0869137e73943f6414f23adaa",
+                        "bf16/text_encoder", files=("config.json", "tokenizer.json", "model.safetensors"))
+MAGE_VAE = Pin("SceneWorks/Mage-Flow-Components-mlx", "c936de2a107ee8d0869137e73943f6414f23adaa", "bf16/vae",
+               files=("config.json", "diffusion_pytorch_model.safetensors"))
 LTX = Pin("SceneWorks/ltx-2.3-mlx", "254989c3ca7ee691187647f350b112c0c448789d", "q8", files=("config.json",))
 LTX_GEMMA = Pin("SceneWorks/ltx-2.3-mlx", "254989c3ca7ee691187647f350b112c0c448789d", "gemma",
                 files=("config.json", "tokenizer.json"))
 WAN_TI2V_5B = Pin("SceneWorks/wan2.2-ti2v-5b-mlx", "bb1b055249614cf9d7cf4373fbdbc184b77dee88", "bf16",
                   files=("config.json", "model.safetensors", "t5_encoder.safetensors", "tokenizer.json",
                          "vae.safetensors"))
-ANIMA = Pin("circlestone-labs/Anima", "53eec3898af698b2cf2a11379021fc9c5465d228", "split_files",
+# The revision provisioned on nax-macos-2 (run 44186227062's inventory); same split_files layout.
+ANIMA = Pin("circlestone-labs/Anima", "f7382c4bf9d7ffe4ceea593a0adbb470c56dd79b", "split_files",
             files=("diffusion_models/anima-base-v1.0.safetensors", "text_encoders/qwen_3_06b_base.safetensors",
                    "vae/qwen_image_vae.safetensors"), binds_root=True)
 KREA_RAW = Pin("krea/Krea-2-Raw", "4ad9f4b627a647fad78b3dfeebb09f2654aeb494",
                files=("model_index.json", "transformer/config.json", "text_encoder/config.json",
                       "tokenizer/tokenizer.json", "vae/config.json"))
-SD35_MEDIUM = Pin("stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80",
+# The shipped MLX turnkey's bf16 tier: a diffusers-layout snapshot the MLX SD3 loader recognizes as
+# `sd3.5-medium-mlx@5413e962/bf16` (artifact_inventory::SHIPPED_TURNKEYS); the upstream snapshot
+# is not provisioned on the Mac.
+SD35_MEDIUM = Pin("SceneWorks/sd3.5-medium-mlx", "5413e962bb326db248be2026a93b147c323392b6", "bf16",
                   files=("model_index.json", "transformer/config.json", "vae/config.json",
                          "text_encoder/config.json", "text_encoder_3/config.json"))
 QWEN_IMAGE_2_1 = Pin("Qwen/Qwen-Image-2.1", "790c92633540aa0cb11d9abf19eb46d861714758",
@@ -95,7 +105,8 @@ MLX_TRAINING_PROOFS: dict[str, dict[str, Pin]] = {
     proof("mlx-gen-lens", "trainer_e2e::lens_trainer_emits_preview_samples"): {"LENS_SNAPSHOT": LENS},
     proof("mlx-gen-sdxl", "trainer_e2e::sdxl_trainer_emits_preview_samples"): {"SDXL_SNAPSHOT": SDXL},
     proof("mlx-gen-z-image", "trainer_e2e::z_image_trainer_emits_preview_samples"): {"ZIMAGE_SNAPSHOT": Z_IMAGE},
-    proof("mlx-gen-mage", "trainer_e2e::mage_trainer_emits_preview_samples"): {"MAGE_BASE_SNAPSHOT": MAGE_BASE},
+    proof("mlx-gen-mage", "trainer_e2e::mage_trainer_emits_preview_samples"): {
+        "MAGE_BASE_SNAPSHOT": MAGE_BASE, "MAGE_TEXT_ENCODER_DIR": MAGE_TEXT_ENCODER, "MAGE_VAE_DIR": MAGE_VAE},
     proof("mlx-gen-ltx", "trainer_e2e::ltx_trainer_emits_preview_samples"): {
         "LTX_BASE_DIR": LTX, "LTX_GEMMA_DIR": LTX_GEMMA},
     proof("mlx-gen-wan", "trainer_e2e::wan_ti2v_5b_trainer_emits_preview_samples"): {
@@ -114,8 +125,7 @@ MLX_TRAINING_PROOFS: dict[str, dict[str, Pin]] = {
 # Repositories reported by a failure inventory beside the pinned ones: plausible alternative homes
 # of the same weights (upstream vs SceneWorks re-host, raw vs MLX-converted), so one failed dispatch
 # shows every candidate the Mac holds.
-INVENTORY_ALSO = ("microsoft/Mage-Flow-Base", "SceneWorks/Mage-Flow-Components-mlx", "SceneWorks/Lens-Turbo",
-                  "SceneWorks/sd3.5-medium-mlx", "SceneWorks/z-image-turbo-mlx", "SceneWorks/krea-2-turbo-mlx",
+INVENTORY_ALSO = ("microsoft/Mage-Flow-Base", "SceneWorks/Lens-Turbo", "stabilityai/stable-diffusion-3.5-medium", "SceneWorks/z-image-turbo-mlx", "SceneWorks/krea-2-turbo-mlx",
                   "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "SceneWorks/qwen-image-2-1-mlx")
 
 
