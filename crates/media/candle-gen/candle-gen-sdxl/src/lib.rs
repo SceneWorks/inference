@@ -220,9 +220,14 @@ use pipeline::{Components, Pipeline, SdxlComponents};
 /// `mlx-gen-sdxl` — this crate registers a SINGLE descriptor under `"sdxl"`.
 pub const MODEL_ID: &str = "sdxl";
 
-/// The no-adapter 1024² DDIM route was qualified with two fresh final PNGs on one
-/// physical GPU and a pinned runtime. Other SDXL routes retain their typed refusal.
-fn qualified_replay_route(req: &GenerationRequest, identity: &ResolvedExecutionIdentity) -> bool {
+/// The no-adapter 1024² DDIM dense and q4 routes were each qualified with two
+/// fresh final PNGs on one physical GPU and a pinned runtime. Other SDXL routes
+/// retain their typed refusal.
+fn qualified_replay_route(
+    req: &GenerationRequest,
+    identity: &ResolvedExecutionIdentity,
+    tier: Option<Quant>,
+) -> bool {
     let generic_refusal = "candle-execution-v1 observes execution choices but has no provider/runtime deterministic-kernel attestation; exact replay is not supported";
     if !matches!(&identity.deterministic_replay, ExecutionReplaySupport::NonDeterministic { reason } if reason == generic_refusal)
         || identity.provider_id != MODEL_ID
@@ -259,6 +264,11 @@ fn qualified_replay_route(req: &GenerationRequest, identity: &ResolvedExecutionI
     let ExecutionRandomness::Draws { scheme, draws } = &identity.randomness else {
         return false;
     };
+    let representations = match tier {
+        None => ["dense", "dense", "dense"],
+        Some(Quant::Q4) => ["packed_or_imported", "packed_or_imported", "packed"],
+        _ => return false,
+    };
     sampling == &serde_json::json!(["ddim"])
         && schedule.as_array().is_some_and(|entries| {
             entries.len() == 1
@@ -281,11 +291,12 @@ fn qualified_replay_route(req: &GenerationRequest, identity: &ResolvedExecutionI
             "sdxl/unet/representation",
         ]
         .iter()
-        .all(|key| {
+        .zip(representations)
+        .all(|(key, representation)| {
             quality["operations"][key]
                 .as_array()
                 .is_some_and(|observations| {
-                    observations.len() == 1 && observations[0]["value"] == "dense"
+                    observations.len() == 1 && observations[0]["value"] == representation
                 })
         })
         && scheme
@@ -471,8 +482,11 @@ impl Generator for SdxlGenerator {
             && self.quant.is_none()
             && self.dtype == DType::F16
         {
-            if let ExecutionIdentity::Resolved { identity } = &mut completed.execution {
-                if qualified_replay_route(req, identity) {
+            if let (ExecutionIdentity::Resolved { identity }, Ok(tier)) = (
+                &mut completed.execution,
+                resolved_numeric_tier(&self.file_pin_spec),
+            ) {
+                if qualified_replay_route(req, identity, tier.quant) {
                     identity.deterministic_replay = ExecutionReplaySupport::Deterministic {
                         scope: "same_device_pinned_runtime".into(),
                     };
@@ -1719,35 +1733,49 @@ mod tests {
             "provider_choices": {}, "output_units": 1
         })).unwrap()
         };
-        assert!(qualified_replay_route(&request, &identity()));
+        assert!(qualified_replay_route(&request, &identity(), None));
         let mut changed = identity();
         changed.randomness = ExecutionRandomness::NoDraws {
             reason: "unobserved".into(),
         };
-        assert!(!qualified_replay_route(&request, &changed));
+        assert!(!qualified_replay_route(&request, &changed, None));
         let mut changed = identity();
         if let ExecutionFact::Resolved { value } = &mut changed.quality_policy {
             value["operations"]["sdxl/unet/representation"][0]["value"] =
                 serde_json::json!("packed");
         }
-        assert!(!qualified_replay_route(&request, &changed));
+        assert!(!qualified_replay_route(&request, &changed, None));
+        let mut packed = identity();
+        if let ExecutionFact::Resolved { value } = &mut packed.quality_policy {
+            for key in [
+                "sdxl/clip_l/representation",
+                "sdxl/clip_bigg/representation",
+            ] {
+                value["operations"][key][0]["value"] = serde_json::json!("packed_or_imported");
+            }
+            value["operations"]["sdxl/unet/representation"][0]["value"] =
+                serde_json::json!("packed");
+        }
+        assert!(qualified_replay_route(&request, &packed, Some(Quant::Q4)));
+        assert!(!qualified_replay_route(&request, &packed, Some(Quant::Q8)));
+        assert!(!qualified_replay_route(&request, &packed, None));
         let mut changed = identity();
         if let ExecutionRandomness::Draws { draws, .. } = &mut changed.randomness {
             draws.swap(0, 1);
         }
-        assert!(!qualified_replay_route(&request, &changed));
+        assert!(!qualified_replay_route(&request, &changed, None));
         let mut changed = identity();
         changed.sampling = ExecutionFact::resolved(serde_json::json!(["euler"]));
-        assert!(!qualified_replay_route(&request, &changed));
+        assert!(!qualified_replay_route(&request, &changed, None));
         let mut changed = identity();
         changed.deterministic_replay = ExecutionReplaySupport::NonDeterministic {
             reason: "provider-specific limit".into(),
         };
-        assert!(!qualified_replay_route(&request, &changed));
+        assert!(!qualified_replay_route(&request, &changed, None));
         let changed = GenerationRequest {
             count: 2,
             ..request.clone()
         };
-        assert!(!qualified_replay_route(&changed, &identity()));
+        assert!(!qualified_replay_route(&changed, &identity(), None));
     }
 }
