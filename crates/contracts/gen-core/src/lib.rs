@@ -332,6 +332,13 @@ pub use transform::{
 /// gen-core's package version, for the version-skew runtime guard (sc-4482).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod pag;
+pub use guidance::{pag_apply, pag_apply_slice};
+pub use pag::{
+    resolve_pag, PagCapability, PagConfig, PagExecutionReport, PagPolicyError, PagPolicyErrorKind,
+    PagResolved, DEFAULT_PAG_MAX_SCALE,
+};
+
 pub mod veda;
 pub use veda::{VedaBudget, VedaExecutionReport, VedaRequest};
 

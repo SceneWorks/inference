@@ -13,6 +13,7 @@ pub use crate::moss_image_assets::{
     moss_image_asset, verify_moss_image_asset, MossImageAssetIdentity, MOSS_IMAGE_ASSETS,
 };
 use crate::{Error, GenerationRequest, Image, Result};
+pub use policy::{moss_image_pag_capability, MOSS_IMAGE_DEFAULT_PAG_LAYERS, MOSS_IMAGE_NUM_BLOCKS};
 
 pub const BASE_REPO: &str = "OpenMOSS-Team/MOSS-Image-Base";
 pub const BASE_REVISION: &str = "1ceede80badddd6a7812069619edaa5633587192";
@@ -101,6 +102,7 @@ pub struct MossImageOptions {
     /// None uses author default `[22]` for ordinary inference. Some(empty) disables skipping.
     pub uncond_skip_layers: Option<Vec<u32>>,
     pub slg: Option<MossSkipLayerGuidance>,
+    pub pag: Option<crate::PagConfig>,
     /// None uses the frozen training grid shift 1.0.
     pub training_shift: Option<f32>,
 }
@@ -125,6 +127,7 @@ pub struct MossImageResolved {
     pub max_sequence_length: u32,
     pub uncond_skip_layers: Vec<u32>,
     pub slg: Option<MossSkipLayerGuidance>,
+    pub pag: Option<crate::PagResolved>,
 }
 impl From<MossImageVariant> for policy::MossImageVariant {
     fn from(value: MossImageVariant) -> Self {
@@ -195,6 +198,7 @@ impl From<MossImageOptions> for policy::MossImageOptions {
             max_sequence_length: value.max_sequence_length,
             uncond_skip_layers: value.uncond_skip_layers,
             slg: value.slg.map(Into::into),
+            pag: value.pag,
             training_shift: value.training_shift,
         }
     }
@@ -206,6 +210,7 @@ impl From<policy::MossImageOptions> for MossImageOptions {
             max_sequence_length: value.max_sequence_length,
             uncond_skip_layers: value.uncond_skip_layers,
             slg: value.slg.map(Into::into),
+            pag: value.pag,
             training_shift: value.training_shift,
         }
     }
@@ -222,6 +227,7 @@ impl From<MossImageResolved> for policy::MossImageResolved {
             max_sequence_length: value.max_sequence_length,
             uncond_skip_layers: value.uncond_skip_layers,
             slg: value.slg.map(Into::into),
+            pag: value.pag,
         }
     }
 }
@@ -237,6 +243,7 @@ impl From<policy::MossImageResolved> for MossImageResolved {
             max_sequence_length: value.max_sequence_length,
             uncond_skip_layers: value.uncond_skip_layers,
             slg: value.slg.map(Into::into),
+            pag: value.pag,
         }
     }
 }
@@ -262,6 +269,7 @@ pub fn moss_policy_request(request: &GenerationRequest) -> policy::MossPolicyReq
         phases_present: request.phases.is_some(),
         conditioning_present: !request.conditioning.is_empty(),
         negative_prompt: request.negative_prompt.clone(),
+        pag: request.pag.clone(),
         moss_image: request.moss_image.clone().map(Into::into),
     }
 }
@@ -284,6 +292,9 @@ impl MossImageResolved {
     }
     pub fn skipping_active(&self, step: usize, actual_steps: usize) -> bool {
         policy::MossImageResolved::from(self.clone()).skipping_active(step, actual_steps)
+    }
+    pub fn pag_step_scale(&self, step: usize, actual_steps: usize) -> f32 {
+        policy::MossImageResolved::from(self.clone()).pag_step_scale(step, actual_steps)
     }
 }
 fn require(condition: bool, message: &str) -> Result<()> {
@@ -609,6 +620,8 @@ pub struct MossImageExecutionData {
     pub component_dtypes: BTreeMap<String, MossImageDtype>,
     #[serde(with = "adapter_receipt_wire")]
     pub adapter_reports: Vec<crate::AdapterApplyReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pag: Option<crate::PagExecutionReport>,
 }
 /// Validated actual completed execution, exposed by the additive Generator getter. The provider
 /// clears this before every attempt and publishes only after final success/cancellation checks.
@@ -624,6 +637,9 @@ impl MossImageExecutionReport {
     }
     pub fn data(&self) -> &MossImageExecutionData {
         &self.0
+    }
+    pub fn pag(&self) -> Option<&crate::PagExecutionReport> {
+        self.0.pag.as_ref()
     }
     pub fn into_data(self) -> MossImageExecutionData {
         self.0
@@ -776,27 +792,51 @@ fn validate_execution_receipt(data: &MossImageExecutionData) -> Result<()> {
         seen.len() == expected.len(),
         "receipt omits consumed config/shard/tokenizer/auxiliary assets",
     )?;
-    match (&data.sampling, r.acceleration) {
-        (MossImageSamplingReceipt::Euler { sigmas }, MossImageAcceleration::Off) => require(
-            *sigmas == moss_image_schedule(r.steps, r.shift, r.training_shift)?,
-            "receipt sigma schedule differs from effective controls",
-        )?,
+    let actual_steps = match (&data.sampling, r.acceleration) {
+        (MossImageSamplingReceipt::Euler { sigmas }, MossImageAcceleration::Off) => {
+            require(
+                *sigmas == moss_image_schedule(r.steps, r.shift, r.training_shift)?,
+                "receipt sigma schedule differs from effective controls",
+            )?;
+            (sigmas.len() - 1) as u32
+        }
         (
             MossImageSamplingReceipt::Dmd {
                 step_codes,
                 mix_matrix_sha256,
             },
             MossImageAcceleration::Dmd(_),
-        ) => require(
-            step_codes.len() == r.steps as usize
-                && step_codes.iter().all(|v| v.is_finite())
-                && valid_digest(mix_matrix_sha256),
-            "receipt DMD prefix/matrix digest is invalid",
-        )?,
+        ) => {
+            require(
+                step_codes.len() == r.steps as usize
+                    && step_codes.iter().all(|v| v.is_finite())
+                    && valid_digest(mix_matrix_sha256),
+                "receipt DMD prefix/matrix digest is invalid",
+            )?;
+            step_codes.len() as u32
+        }
         _ => {
             return Err(Error::Unsupported(
                 "MOSS receipt sampler/mode mismatch".into(),
             ))
+        }
+    };
+    require(
+        r.pag.is_some() == data.pag.as_ref().is_some_and(|p| p.scale > 0.0),
+        "receipt PAG report disagrees with resolved PAG controls",
+    )?;
+    if let Some(pag) = &data.pag {
+        pag.validate_with_capability(&moss_image_pag_capability())
+            .map_err(|e| Error::Unsupported(format!("MOSS-Image: {e}")))?;
+        require(
+            pag.total_steps == actual_steps,
+            "receipt PAG total_steps differs from executed step count",
+        )?;
+        if let Some(resolved_pag) = &r.pag {
+            require(
+                *pag == resolved_pag.execution_report(actual_steps),
+                "receipt PAG report differs from resolved PAG controls",
+            )?;
         }
     }
     let batch = data.conditioning.len();
@@ -1111,6 +1151,7 @@ mod execution_receipt_tests {
             output_kind: MossImageOutputKind::Images,
             component_dtypes,
             adapter_reports,
+            pag: None,
         }
     }
     #[test]

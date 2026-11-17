@@ -730,6 +730,7 @@ impl Flux3Klein {
                 artifacts: None,
                 warnings: Vec::new(),
                 prefix_kv_cache: None,
+                pag: None,
             },
         )
     }

@@ -13,6 +13,9 @@ pub use gen_core::moss_image::MossImageAdvancedGenerator;
 pub use gen_core::moss_image::{
     moss_image_asset, verify_moss_image_asset, MossImageAssetIdentity, MOSS_IMAGE_ASSETS,
 };
+pub use gen_core::moss_image::{
+    moss_image_pag_capability, MOSS_IMAGE_DEFAULT_PAG_LAYERS, MOSS_IMAGE_NUM_BLOCKS,
+};
 pub use gen_core::moss_image::{moss_image_schedule, SNAPSHOT_FILES};
 pub use gen_core::moss_image::{
     MossDmdPrecision, MossImageAcceleration, MossImageAdvancedInputs, MossImageAdvancedOutput,

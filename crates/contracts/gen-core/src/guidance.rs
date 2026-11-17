@@ -136,6 +136,49 @@ pub fn cfg<G: GuidanceOps>(
 }
 
 // =================================================================================================
+// Perturbed-Attention Guidance (PAG) combine (SW-7173).
+// =================================================================================================
+
+/// Perturbed-Attention Guidance (PAG) tensor-neutral combine:
+/// `eps_base + pag_scale · (eps_cond − eps_perturbed)`.
+///
+/// - **2-pass (guidance-distilled / CFG=1 / DMD):** pass `eps_base = eps_cond`, yielding
+///   `eps_cond + pag_scale · (eps_cond − eps_perturbed)`.
+/// - **3-pass (CFG + PAG):** pass `eps_base = eps_cfg`, yielding
+///   `eps_cfg + pag_scale · (eps_cond − eps_perturbed)`.
+/// - **Zero-scale identity:** `pag_scale == 0.0` returns `eps_base.clone()` directly.
+pub fn pag_apply<L: LatentOps>(
+    ops: &L,
+    eps_base: &L::Latent,
+    eps_cond: &L::Latent,
+    eps_perturbed: &L::Latent,
+    pag_scale: f32,
+) -> Result<L::Latent> {
+    if !pag_scale.is_finite() || pag_scale < 0.0 {
+        return Err(crate::Error::Msg(format!(
+            "pag_apply: pag_scale must be finite and >= 0 (got {pag_scale})"
+        )));
+    }
+    if pag_scale == 0.0 {
+        return Ok(eps_base.clone());
+    }
+    let diff = ops.sub(eps_cond, eps_perturbed)?;
+    ops.axpy(1.0, eps_base, pag_scale, &diff)
+}
+
+/// Pure FP32 slice Perturbed-Attention Guidance combine:
+/// `eps_base + pag_scale · (eps_cond − eps_perturbed)`.
+pub fn pag_apply_slice(
+    eps_base: &[f32],
+    eps_cond: &[f32],
+    eps_perturbed: &[f32],
+    pag_scale: f32,
+) -> Result<Vec<f32>> {
+    gen_core_pag_policy::pag_apply_slice(eps_base, eps_cond, eps_perturbed, pag_scale)
+        .map_err(|e| crate::Error::Msg(e.to_string()))
+}
+
+// =================================================================================================
 // cfg_rescale — Lin et al. norm-rescaled CFG (port of mlx-gen-lens/src/schedule.rs:58-74).
 // =================================================================================================
 
@@ -613,5 +656,53 @@ mod tests {
             .map(|i| uncond[i] + 2.0 * (p0[i] - uncond[i]) + 1.5 * (p1[i] - p0[i]))
             .collect();
         assert!(max_abs(&got, &want) < 1e-4, "chain != sequential terms");
+    }
+
+    #[test]
+    fn pag_apply_two_pass_three_pass_and_zero_scale_identity() {
+        let cond = ramp(8, 1);
+        let uncond = ramp(8, 2);
+        let perturbed = ramp(8, 5);
+
+        // 2-pass (CFG=1 / distilled / DMD): eps_base == eps_cond
+        let two_pass = pag_apply(&OPS, &cond, &cond, &perturbed, 2.5).unwrap();
+        let want_two_pass: Vec<f32> = cond
+            .iter()
+            .zip(&perturbed)
+            .map(|(&c, &p)| c + 2.5 * (c - p))
+            .collect();
+        assert!(max_abs(&two_pass, &want_two_pass) < 1e-6);
+        assert_eq!(
+            pag_apply_slice(&cond, &cond, &perturbed, 2.5).unwrap(),
+            want_two_pass
+        );
+
+        // 3-pass (CFG + PAG): eps_base == eps_cfg
+        let eps_cfg = cfg(&OPS, &cond, &uncond, 4.0).unwrap();
+        let three_pass = pag_apply(&OPS, &eps_cfg, &cond, &perturbed, 1.75).unwrap();
+        let want_three_pass: Vec<f32> = (0..8)
+            .map(|i| eps_cfg[i] + 1.75 * (cond[i] - perturbed[i]))
+            .collect();
+        assert!(max_abs(&three_pass, &want_three_pass) < 1e-6);
+        assert_eq!(
+            pag_apply_slice(&eps_cfg, &cond, &perturbed, 1.75).unwrap(),
+            want_three_pass
+        );
+
+        // pag_scale == 0.0 is an exact identity on eps_base
+        assert_eq!(
+            pag_apply(&OPS, &eps_cfg, &cond, &perturbed, 0.0).unwrap(),
+            eps_cfg
+        );
+        assert_eq!(
+            pag_apply_slice(&eps_cfg, &cond, &perturbed, 0.0).unwrap(),
+            eps_cfg
+        );
+
+        // Negative / non-finite pag_scale is rejected
+        for bad in [-0.1_f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(pag_apply(&OPS, &eps_cfg, &cond, &perturbed, bad).is_err());
+            assert!(pag_apply_slice(&eps_cfg, &cond, &perturbed, bad).is_err());
+        }
     }
 }

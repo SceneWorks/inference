@@ -564,6 +564,7 @@ impl MossImageGenerator {
             output_kind: inputs.output,
             component_dtypes: component_dtypes(r.acceleration, self.device.is_cpu()),
             adapter_reports,
+            pag: None,
         })?;
         transformer::check_cancel(&req.cancel)?;
         if let (Some(edit), Some(assets), Some((_, references))) =
@@ -582,6 +583,7 @@ impl MossImageGenerator {
                 references,
                 reference_max_edge: edit.reference_max_edge,
                 use_kv_cache: edit.use_kv_cache,
+                pag: None,
             };
             receipt.validate()?;
             transformer::check_cancel(&req.cancel)?;

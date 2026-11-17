@@ -281,6 +281,11 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
     // value for every image/video provider and every single-file audio model) is trivially
     // conformant.
     check_name_list(&mut errs, &ctx, "required_component", d.required_components);
+    if let Some(pag) = &caps.pag {
+        if let Err(err) = pag.validate_definition() {
+            errs.push(format!("{ctx}: {err}"));
+        }
+    }
     errs
 }
 

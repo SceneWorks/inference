@@ -136,17 +136,31 @@ pub fn completed_identity(
                 reason: "MOSS native kernels do not attest bit-exact replay across executions; preserve runtime, device and sealed input bytes for regeneration".into(),
             },
             geometry: ExecutionFact::resolved(json!({"latent_shape":data.latent_shape, "pixel_height":data.latent_shape[2]*16, "pixel_width":data.latent_shape[3]*16})),
-            quality_policy: ExecutionFact::resolved(json!({
-                "variant":r.variant, "acceleration":r.acceleration,
-                "guidance":ExecutionFact::f32_bits(r.guidance)?,
-                "shift":ExecutionFact::f32_bits(r.shift)?,
-                "training_shift":ExecutionFact::f32_bits(r.training_shift)?,
-                "max_sequence_length":r.max_sequence_length,
-                "uncond_skip_layers":r.uncond_skip_layers,
-                "slg":r.slg.as_ref().map(|slg| Ok::<_,gen_core::Error>(json!({"layers":slg.layers, "scale":ExecutionFact::f32_bits(slg.scale)?, "start":ExecutionFact::f32_bits(slg.start)?, "stop":ExecutionFact::f32_bits(slg.stop)?}))).transpose()?,
-                "component_dtypes":data.component_dtypes,
-                "adapters":data.adapter_reports.iter().map(|a| json!({"applied":a.applied,"skipped":a.skipped})).collect::<Vec<_>>(),
-            })),
+            quality_policy: {
+                let mut quality = json!({
+                    "variant":r.variant, "acceleration":r.acceleration,
+                    "guidance":ExecutionFact::f32_bits(r.guidance)?,
+                    "shift":ExecutionFact::f32_bits(r.shift)?,
+                    "training_shift":ExecutionFact::f32_bits(r.training_shift)?,
+                    "max_sequence_length":r.max_sequence_length,
+                    "uncond_skip_layers":r.uncond_skip_layers,
+                    "slg":r.slg.as_ref().map(|slg| Ok::<_,gen_core::Error>(json!({"layers":slg.layers, "scale":ExecutionFact::f32_bits(slg.scale)?, "start":ExecutionFact::f32_bits(slg.start)?, "stop":ExecutionFact::f32_bits(slg.stop)?}))).transpose()?,
+                    "component_dtypes":data.component_dtypes,
+                    "adapters":data.adapter_reports.iter().map(|a| json!({"applied":a.applied,"skipped":a.skipped})).collect::<Vec<_>>(),
+                });
+                if let Some(pag) = edit.and_then(|e| e.pag.as_ref()).or(data.pag.as_ref()) {
+                    quality["pag"] = json!({
+                        "layers": pag.layers,
+                        "active_steps": pag.active_steps,
+                        "total_steps": pag.total_steps,
+                        "scale": ExecutionFact::f32_bits(pag.scale)?,
+                        "adaptive_scale": ExecutionFact::f32_bits(pag.adaptive_scale)?,
+                        "start": ExecutionFact::f32_bits(pag.start)?,
+                        "stop": ExecutionFact::f32_bits(pag.stop)?,
+                    });
+                }
+                ExecutionFact::resolved(quality)
+            },
             output_policy: ExecutionFact::resolved(json!({"kind":data.output_kind, "images":"rgb8", "latents":"NCHW-f32"})),
             provider_choices: choices,
             output_units: data.samples.len(),
@@ -360,6 +374,7 @@ mod tests {
             output_kind: MossImageOutputKind::Images,
             component_dtypes,
             adapter_reports,
+            pag: None,
         })
         .unwrap()
     }
@@ -539,6 +554,7 @@ mod tests {
                     }],
                     reference_max_edge: 512,
                     use_kv_cache: cache,
+                    pag: None,
                 };
                 let shared = completed_identity(None, Some(&edit), &descriptor("mlx")).unwrap();
                 let id = shared.resolved().unwrap();

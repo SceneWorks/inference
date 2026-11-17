@@ -64,6 +64,9 @@ pub struct GenerationRequest {
     /// does not advertise it refuses a `Some` on the shared floor rather than ignoring it. Both
     /// bounds join the finiteness floor and must satisfy `lo < hi`.
     pub cfg_interval: Option<(f32, f32)>,
+    /// Perturbed-Attention Guidance (PAG) controls (SW-7173). `None` (or `scale == 0.0`) is a
+    /// strict zero-pass no-op. Gated per model by [`Capabilities::pag`].
+    pub pag: Option<crate::PagConfig>,
     /// A **prompt batch** (epic sc-25678): when non-empty, these prompts are rendered together as one
     /// batched denoise (upstream `generate(prompts=[…])`), one image per prompt, repeated `count`
     /// times — `prompt_batch.len() × count` images in prompt-minor order. `prompt` must then be empty
@@ -410,6 +413,7 @@ impl Default for GenerationRequest {
             guidance_momentum: None,
             guidance_norm_threshold: None,
             cfg_interval: None,
+            pag: None,
             prompt_batch: Vec::new(),
             caption_overflow: None,
             conditioning: Vec::new(),
@@ -581,6 +585,8 @@ impl GenerationRequest {
             flux3_layout: _,
             flux3_layout_bindings: _,
             cfg_interval,
+            // PAG sub-block floats join the floor through its exhaustive helper below.
+            pag,
             conditioning,
             frames: _,
             fps: _,
@@ -649,6 +655,9 @@ impl GenerationRequest {
             return Some(nonfinite);
         }
         if let Some(nonfinite) = h3_image_sampler.and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
+        if let Some(nonfinite) = pag.as_ref().and_then(|v| v.first_nonfinite_float()) {
             return Some(nonfinite);
         }
         let floats: [(&'static str, Option<f32>); 16] = [

@@ -1,13 +1,34 @@
 //! Portable MOSS-Image option resolution. This crate owns the native and browser policy rules;
 //! it has no generator, tensor, filesystem, or host dependencies.
 
+use std::borrow::Cow;
+
+pub use gen_core_pag_policy::{
+    PagCapability, PagConfig, PagExecutionReport, PagResolved, DEFAULT_PAG_MAX_SCALE,
+};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MossPolicyError(&'static str);
+pub const MOSS_IMAGE_NUM_BLOCKS: u32 = 42;
+pub const MOSS_IMAGE_DEFAULT_PAG_LAYERS: &[u32] = &[20];
+
+/// Published MOSS-Image PAG capability (42 DiT blocks `0..42`, curated default `[20]`).
+pub fn moss_image_pag_capability() -> PagCapability {
+    PagCapability {
+        num_blocks: MOSS_IMAGE_NUM_BLOCKS,
+        block_domain: Cow::Borrowed("layers"),
+        default_layers: MOSS_IMAGE_DEFAULT_PAG_LAYERS.to_vec(),
+        default_start: 0.0,
+        default_stop: 1.0,
+        recommended_scale: 2.5,
+        max_scale: DEFAULT_PAG_MAX_SCALE,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MossPolicyError(Cow<'static, str>);
 impl MossPolicyError {
-    pub fn message(self) -> &'static str {
-        self.0
+    pub fn message(&self) -> &str {
+        &self.0
     }
 }
 impl std::fmt::Display for MossPolicyError {
@@ -22,7 +43,21 @@ fn require(condition: bool, message: &'static str) -> Result<()> {
     if condition {
         Ok(())
     } else {
-        Err(MossPolicyError(message))
+        Err(MossPolicyError(Cow::Borrowed(message)))
+    }
+}
+
+fn effective_pag_config<'a>(
+    request_pag: Option<&'a PagConfig>,
+    options_pag: Option<&'a PagConfig>,
+) -> Result<Option<&'a PagConfig>> {
+    match (request_pag, options_pag) {
+        (None, None) => Ok(None),
+        (Some(p), None) | (None, Some(p)) => Ok(Some(p)),
+        (Some(a), Some(b)) if a == b => Ok(Some(a)),
+        (Some(_), Some(_)) => Err(MossPolicyError(Cow::Borrowed(
+            "conflicting top-level pag and moss_image.pag controls",
+        ))),
     }
 }
 
@@ -168,6 +203,7 @@ pub struct MossImageOptions {
     pub max_sequence_length: u32,
     pub uncond_skip_layers: Option<Vec<u32>>,
     pub slg: Option<MossSkipLayerGuidance>,
+    pub pag: Option<PagConfig>,
     pub training_shift: Option<f32>,
 }
 impl Default for MossImageOptions {
@@ -177,6 +213,7 @@ impl Default for MossImageOptions {
             max_sequence_length: 4096,
             uncond_skip_layers: None,
             slg: None,
+            pag: None,
             training_shift: None,
         }
     }
@@ -197,6 +234,27 @@ impl MossImageOptions {
                 }
             }
         }
+        if let Some(pag) = &self.pag {
+            let PagConfig {
+                scale,
+                layers: _,
+                start,
+                stop,
+                adaptive_scale,
+            } = pag;
+            if !scale.is_finite() {
+                return Some(("moss_image.pag.scale", *scale));
+            }
+            if let Some(x) = start.filter(|x| !x.is_finite()) {
+                return Some(("moss_image.pag.start", x));
+            }
+            if let Some(x) = stop.filter(|x| !x.is_finite()) {
+                return Some(("moss_image.pag.stop", x));
+            }
+            if let Some(x) = adaptive_scale.filter(|x| !x.is_finite()) {
+                return Some(("moss_image.pag.adaptive_scale", x));
+            }
+        }
         None
     }
     pub fn validate(&self) -> Result<()> {
@@ -213,6 +271,11 @@ impl MossImageOptions {
         }
         if let Some(slg) = &self.slg {
             slg.validate()?;
+        }
+        if let Some(pag) = &self.pag {
+            moss_image_pag_capability()
+                .resolve(Some(pag))
+                .map_err(|e| MossPolicyError(Cow::Owned(e.to_string())))?;
         }
         Ok(())
     }
@@ -236,6 +299,8 @@ impl Serialize for MossImageOptions {
             max_sequence_length: u32,
             uncond_skip_layers: &'a Option<Vec<u32>>,
             slg: &'a Option<MossSkipLayerGuidance>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pag: &'a Option<PagConfig>,
             training_shift: Option<f32>,
         }
         Wire {
@@ -243,6 +308,7 @@ impl Serialize for MossImageOptions {
             max_sequence_length: self.max_sequence_length,
             uncond_skip_layers: &self.uncond_skip_layers,
             slg: &self.slg,
+            pag: &self.pag,
             training_shift: self.training_shift,
         }
         .serialize(serializer)
@@ -267,6 +333,8 @@ impl<'de> Deserialize<'de> for MossImageOptions {
             #[serde(default)]
             slg: Option<MossSkipLayerGuidance>,
             #[serde(default)]
+            pag: Option<PagConfig>,
+            #[serde(default)]
             training_shift: Option<f32>,
         }
         let wire = Wire::deserialize(deserializer)?;
@@ -275,6 +343,7 @@ impl<'de> Deserialize<'de> for MossImageOptions {
             max_sequence_length: wire.max_sequence_length,
             uncond_skip_layers: wire.uncond_skip_layers,
             slg: wire.slg,
+            pag: wire.pag,
             training_shift: wire.training_shift,
         };
         MossImageResolved::resolve(
@@ -312,6 +381,8 @@ pub struct MossPolicyRequest {
     pub phases_present: bool,
     pub conditioning_present: bool,
     pub negative_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pag: Option<PagConfig>,
     pub moss_image: Option<MossImageOptions>,
 }
 impl Default for MossPolicyRequest {
@@ -335,6 +406,7 @@ impl Default for MossPolicyRequest {
             phases_present: false,
             conditioning_present: false,
             negative_prompt: None,
+            pag: None,
             moss_image: None,
         }
     }
@@ -354,6 +426,11 @@ impl MossPolicyRequest {
         .into_iter()
         .flatten()
         .any(|v| !v.is_finite())
+            || self
+                .pag
+                .as_ref()
+                .and_then(PagConfig::first_nonfinite_float)
+                .is_some()
     }
 }
 
@@ -368,6 +445,7 @@ pub struct MossImageResolved {
     pub max_sequence_length: u32,
     pub uncond_skip_layers: Vec<u32>,
     pub slg: Option<MossSkipLayerGuidance>,
+    pub pag: Option<PagResolved>,
 }
 impl MossImageResolved {
     pub fn resolve(variant: MossImageVariant, request: &MossPolicyRequest) -> Result<Self> {
@@ -468,6 +546,15 @@ impl MossImageResolved {
                 "DMD uses fixed step codes, no Euler, layer skipping or SLG",
             )?;
         }
+        let pag = match effective_pag_config(request.pag.as_ref(), options.pag.as_ref())? {
+            Some(cfg) => {
+                let resolved = moss_image_pag_capability()
+                    .resolve(Some(cfg))
+                    .map_err(|e| MossPolicyError(Cow::Owned(e.to_string())))?;
+                (resolved.scale > 0.0).then_some(resolved)
+            }
+            None => None,
+        };
         Ok(Self {
             variant,
             acceleration: options.acceleration,
@@ -482,6 +569,7 @@ impl MossImageResolved {
                 options.uncond_skip_layers.unwrap_or_else(|| vec![22])
             },
             slg: options.slg,
+            pag,
         })
     }
 
@@ -493,11 +581,13 @@ impl MossImageResolved {
                 steps: Some(self.steps),
                 guidance: Some(self.guidance),
                 scheduler_shift: ordinary.then_some(self.shift),
+                pag: self.pag.as_ref().map(PagResolved::to_config),
                 moss_image: Some(MossImageOptions {
                     acceleration: self.acceleration,
                     max_sequence_length: self.max_sequence_length,
                     uncond_skip_layers: ordinary.then(|| self.uncond_skip_layers.clone()),
                     slg: self.slg.clone(),
+                    pag: None,
                     training_shift: ordinary.then_some(self.training_shift),
                 }),
                 ..Default::default()
@@ -521,6 +611,12 @@ impl MossImageResolved {
         let fraction = step as f32 / actual_steps as f32;
         start <= fraction && fraction < stop
     }
+
+    pub fn pag_step_scale(&self, step: usize, actual_steps: usize) -> f32 {
+        self.pag
+            .as_ref()
+            .map_or(0.0, |pag| pag.step_scale(step, actual_steps))
+    }
 }
 impl Serialize for MossImageResolved {
     fn serialize<S: serde::Serializer>(
@@ -539,6 +635,8 @@ impl Serialize for MossImageResolved {
             max_sequence_length: u32,
             uncond_skip_layers: &'a [u32],
             slg: &'a Option<MossSkipLayerGuidance>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pag: &'a Option<PagResolved>,
         }
         Wire {
             variant: self.variant,
@@ -550,6 +648,7 @@ impl Serialize for MossImageResolved {
             max_sequence_length: self.max_sequence_length,
             uncond_skip_layers: &self.uncond_skip_layers,
             slg: &self.slg,
+            pag: &self.pag,
         }
         .serialize(serializer)
     }
@@ -570,6 +669,8 @@ impl<'de> Deserialize<'de> for MossImageResolved {
             max_sequence_length: u32,
             uncond_skip_layers: Vec<u32>,
             slg: Option<MossSkipLayerGuidance>,
+            #[serde(default)]
+            pag: Option<PagResolved>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let value = Self {
@@ -582,6 +683,7 @@ impl<'de> Deserialize<'de> for MossImageResolved {
             max_sequence_length: wire.max_sequence_length,
             uncond_skip_layers: wire.uncond_skip_layers,
             slg: wire.slg,
+            pag: wire.pag,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -596,8 +698,8 @@ fn validate_layers(layers: &[u32]) -> Result<()> {
 }
 
 /// Apply the author's edit defaults to a copy of the request. Other request fields remain intact.
-pub fn apply_edit_defaults(request: &MossPolicyRequest) -> Result<MossPolicyRequest> {
-    let mut request = request.clone();
+pub fn apply_edit_defaults(input: &MossPolicyRequest) -> Result<MossPolicyRequest> {
+    let mut request = input.clone();
     let options = request.moss_image.get_or_insert_with(Default::default);
     require(
         options.acceleration == MossImageAcceleration::Off
@@ -609,9 +711,14 @@ pub fn apply_edit_defaults(request: &MossPolicyRequest) -> Result<MossPolicyRequ
         "MOSS edit requires ordinary Base/SFT, full-layer CFG, and no SLG; edit+DMD is unvalidated",
     )?;
     require(
-        !request.conditioning_present,
+        !input.conditioning_present,
         "MOSS edit references must be supplied once through typed edit inputs",
     )?;
+    if let Some(cfg) = effective_pag_config(input.pag.as_ref(), options.pag.as_ref())? {
+        moss_image_pag_capability()
+            .resolve(Some(cfg))
+            .map_err(|e| MossPolicyError(Cow::Owned(e.to_string())))?;
+    }
     options.uncond_skip_layers = Some(vec![]);
     request.steps.get_or_insert(30);
     request.guidance.get_or_insert(4.0);

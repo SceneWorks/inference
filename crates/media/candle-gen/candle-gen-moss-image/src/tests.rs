@@ -444,6 +444,7 @@ fn synthetic_report() -> MossImageExecutionReport {
         output_kind: MossImageOutputKind::Images,
         component_dtypes: component_dtypes(MossImageAcceleration::Off, true),
         adapter_reports: vec![],
+        pag: None,
     })
     .unwrap()
 }
@@ -1092,6 +1093,7 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
         references: vec![],
         reference_max_edge: 512,
         use_kv_cache: true,
+        pag: None,
     };
     {
         let mut state = candle_gen::lock_recover(&generator.state);
@@ -1175,6 +1177,7 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
         references: vec![],
         reference_max_edge: 512,
         use_kv_cache: true,
+        pag: None,
     };
     let slot = |dimensions, digest: char| MossImageEditReferenceReceipt {
         original_dimensions: dimensions,

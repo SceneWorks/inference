@@ -445,6 +445,10 @@ pub struct Capabilities {
     /// `false` for every provider until the terminal measurement campaign defines a
     /// characterization artifact family.
     pub approximation: ApproximationSurface,
+    /// Perturbed-Attention Guidance (PAG) capability descriptor (SW-7173). `None` (the `Default`)
+    /// means this model/backend does not support PAG, and the shared request floor rejects any
+    /// `Some` [`GenerationRequest::pag`] as [`Error::Unsupported`].
+    pub pag: Option<crate::PagCapability>,
 }
 
 /// The one typed refusal for an **adapter-bearing** request against a descriptor whose advertised
@@ -659,6 +663,25 @@ impl Capabilities {
         self.approximation.resolve(id, req.approximation.as_ref())
     }
 
+    /// Resolve [`GenerationRequest::pag`] against [`Capabilities::pag`] (SW-7173).
+    ///
+    /// Returns `Ok(None)` when `req.pag` is `None` or resolves to `scale == 0.0` (strict zero-pass
+    /// no-op). Returns [`Error::Unsupported`] when `self.pag` is `None` and `req.pag` is `Some`,
+    /// or [`Error::Msg`] when any PAG parameter is non-finite, out of range, or names a block
+    /// index outside `0..num_blocks`.
+    pub fn resolve_pag(
+        &self,
+        id: &str,
+        req: &GenerationRequest,
+    ) -> Result<Option<crate::PagResolved>> {
+        crate::resolve_pag(self.pag.as_ref(), id, req.pag.as_ref()).map_err(|err| {
+            match err.kind() {
+                crate::PagPolicyErrorKind::Unsupported => Error::Unsupported(err.to_string()),
+                crate::PagPolicyErrorKind::Invalid => Error::Msg(format!("{id}: {err}")),
+            }
+        })
+    }
+
     /// Shared implementation of the floor. `check_size` gates only the size-range check so the
     /// auto-size path ([`validate_request_skip_size`](Self::validate_request_skip_size)) still runs
     /// every other check; the public [`validate_request`](Self::validate_request) passes `true`.
@@ -714,6 +737,11 @@ impl Capabilities {
         if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
             return Err(Error::Unsupported(format!(
                 "{id}: Veda attention requires MiniMax-H3"
+            )));
+        }
+        if req.pag.is_some() && self.pag.is_none() {
+            return Err(Error::Unsupported(format!(
+                "{id}: Perturbed-Attention Guidance (PAG) is not supported by this model"
             )));
         }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
@@ -1240,6 +1268,10 @@ impl Capabilities {
             }
         }
         req.ensure_finite_floats()?;
+        if let (Some(cap), Some(pag)) = (&self.pag, &req.pag) {
+            cap.resolve(Some(pag))
+                .map_err(|err| Error::Msg(format!("{id}: {err}")))?;
+        }
         if req.scheduler_shift.is_some_and(|shift| shift <= 0.0) {
             return Err(Error::Msg(format!("{id}: scheduler_shift must be > 0")));
         }

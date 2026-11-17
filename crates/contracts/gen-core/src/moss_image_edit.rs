@@ -82,6 +82,8 @@ pub struct MossImageEditExecutionReport {
     pub references: Vec<MossImageEditReferenceReceipt>,
     pub reference_max_edge: u32,
     pub use_kv_cache: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pag: Option<crate::PagExecutionReport>,
 }
 impl MossImageEditExecutionReport {
     pub fn validate(&self) -> Result<()> {
@@ -106,6 +108,33 @@ impl MossImageEditExecutionReport {
             return Err(Error::Unsupported(
                 "invalid MOSS edit execution identity or policy".into(),
             ));
+        }
+        if let Some(pag) = &self.pag {
+            pag.validate_with_capability(&crate::moss_image::moss_image_pag_capability())
+                .map_err(|e| Error::Unsupported(format!("MOSS-Image: {e}")))?;
+            let actual_steps = match &self.base.data().sampling {
+                crate::moss_image::MossImageSamplingReceipt::Euler { sigmas } => {
+                    sigmas.len().saturating_sub(1) as u32
+                }
+                crate::moss_image::MossImageSamplingReceipt::Dmd { step_codes, .. } => {
+                    step_codes.len() as u32
+                }
+            };
+            if pag.total_steps != actual_steps
+                || self
+                    .base
+                    .data()
+                    .pag
+                    .as_ref()
+                    .is_some_and(|base_pag| base_pag != pag)
+                || r.pag
+                    .as_ref()
+                    .is_some_and(|resolved_pag| *pag != resolved_pag.execution_report(actual_steps))
+            {
+                return Err(Error::Unsupported(
+                    "invalid MOSS edit PAG execution report".into(),
+                ));
+            }
         }
         for reference in &self.references {
             if reference.encoded_dimensions
@@ -144,6 +173,8 @@ impl<'de> Deserialize<'de> for MossImageEditExecutionReport {
             references: Vec<MossImageEditReferenceReceipt>,
             reference_max_edge: u32,
             use_kv_cache: bool,
+            #[serde(default)]
+            pag: Option<crate::PagExecutionReport>,
         }
         let w = Wire::deserialize(deserializer)?;
         let report = Self {
@@ -158,6 +189,7 @@ impl<'de> Deserialize<'de> for MossImageEditExecutionReport {
             references: w.references,
             reference_max_edge: w.reference_max_edge,
             use_kv_cache: w.use_kv_cache,
+            pag: w.pag,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)

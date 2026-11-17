@@ -587,6 +587,7 @@ impl MossImage {
             output_kind: inputs.output,
             component_dtypes: dtypes,
             adapter_reports,
+            pag: None,
         })?;
         check(&request.cancel)?;
         if let (Some(edit), Some(assets), Some((_, references))) =
@@ -978,6 +979,7 @@ fn publish_edit_report(
         references,
         reference_max_edge: edit.reference_max_edge,
         use_kv_cache: edit.use_kv_cache,
+        pag: None,
     });
     receipt.validate()?;
     apply_reports.push(gen_core::AdapterApplyReport {

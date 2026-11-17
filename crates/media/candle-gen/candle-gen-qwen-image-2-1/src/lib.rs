@@ -915,6 +915,7 @@ impl QwenImage21 {
             artifacts: None,
             warnings,
             prefix_kv_cache: ran,
+            pag: None,
         })
     }
 }
