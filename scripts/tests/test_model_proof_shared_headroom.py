@@ -43,7 +43,7 @@ class SharedHeadroom(unittest.TestCase):
                      'free_mib': 92891, 'utilization_percent': utilization}, **changes)
 
     def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None,
-              original_deadline_monotonic=None):
+              original_deadline_monotonic=None, require_owned_completion=True):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': UUID}
@@ -59,7 +59,8 @@ class SharedHeadroom(unittest.TestCase):
                     patch.object(guard.time, 'sleep', side_effect=clock.sleep if clock else None):
                 with resources.execution_claim('candle-cuda', policy, output, environment,
                                                constraints=self.configured,
-                                               original_deadline_monotonic=original_deadline_monotonic) as receipt:
+                                               original_deadline_monotonic=original_deadline_monotonic,
+                                               require_owned_completion=require_owned_completion) as receipt:
                     self.assertFalse(receipt['post_execution_verified'])
                     if owned_completion:
                         receipt['owned_execution_completion'] = {
@@ -84,8 +85,8 @@ class SharedHeadroom(unittest.TestCase):
 
     def test_shared_headroom_waits_before_body_and_restarts_five_samples_without_other_veto(self):
         policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20})
-        busy = self.card(100, used_mib=20875, free_mib=76564)
-        ready = self.card(100, used_mib=2186, free_mib=95253)
+        busy = self.card(10, used_mib=20875, free_mib=76564)
+        ready = self.card(10, used_mib=2186, free_mib=95253)
         observations = [([busy], [])]*2 + [([ready], [])]*11
         seen=[]
         receipt, count = self.claim(observations, policy=policy, clock=FakeClock(), body=lambda r:seen.append(r))
@@ -115,9 +116,10 @@ class SharedHeadroom(unittest.TestCase):
         with self.assertRaises(resources.CudaClaimRejected):
             self.claim([([busy], []),TimeoutError('MOCK primary query failed')],clock=FakeClock())
 
-    def test_shared_activity_and_changing_foreign_contexts_are_diagnostic_in_both_phases(self):
+    def test_changing_foreign_contexts_are_diagnostic_and_release_activity_is_not_judged(self):
         # CI_IMPACT: synthetic claim + five admission + five release snapshots, no real processes.
-        utilization = [3, 4, 6, 100, 3, 6, 99, 5, 4, 3, 100]
+        # Admission needs a quiet window (<= 30%, spread <= 15); release only checks identity/counters.
+        utilization = [3, 4, 6, 18, 3, 6, 99, 5, 4, 3, 100]
         snapshots = [([self.card(value)], [[UUID, str(100 + index), 'MOCK', kind]])
                      for index, (value, kind) in enumerate(zip(utilization, ['C', 'C+G', 'G', 'C', 'unknown',
                                                                              'C', 'G', 'C+G', 'C', 'G', 'C']))]
@@ -151,7 +153,7 @@ class SharedHeadroom(unittest.TestCase):
         def driver(args, deadline):
             if '--id=' + UUID not in args or '-x' in args or any('query-compute-apps' in arg for arg in args):
                 raise TimeoutError('MOCK optional host census exhausted sampling deadline')
-            return f'1, {UUID}, MOCK, 596.36, 97887, 5247, 92192, 100'
+            return f'1, {UUID}, MOCK, 596.36, 97887, 5247, 92192, 10'
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             fake_os = SimpleNamespace(name='nt', fstat=os.fstat)
@@ -166,7 +168,7 @@ class SharedHeadroom(unittest.TestCase):
                         'root_returncode': 0, 'waited_returncode': 0, 'job_member_pids': [], 'owned_pids': []}
                 self.assertTrue(receipt['post_execution_verified'])
                 self.assertEqual(probe.call_count, 11)
-                self.assertEqual(receipt['admission_utilization_percent'], [100] * 5)
+                self.assertEqual(receipt['admission_utilization_percent'], [10] * 5)
                 self.assertIsNone(receipt['admission_background_activity']['samples'][0]['selected_process_count'])
 
     def test_primary_timeout_preserves_refusal_details_and_never_enters_body(self):
@@ -257,6 +259,31 @@ class SharedHeadroom(unittest.TestCase):
                 receipt['owned_execution_completion'][key] = value
             with self.subTest(key=key), self.assertRaises(resources.CudaReleaseRejected):
                 self.claim([valid] * 6, body=pending)
+
+    def test_callers_without_owned_job_record_seal_on_release_metadata_alone(self):
+        # Comparison/allocator drivers reap their own supervised trees before the claim exits.
+        record, _ = self.claim([([self.card()], [])] * 11, owned_completion=False, require_owned_completion=False)
+        self.assertTrue(record['post_execution_verified'])
+        self.assertTrue(record['lease_released'])
+
+    def test_every_single_uuid_cuda_row_requires_the_headroom_release_seal(self):
+        record, _ = self.claim([([self.card()], [])] * 11)
+        body = {'argv': ['cargo', 'test'], 'supervision': {
+            'pid': 1234, 'returncode': 0, 'owned_completion': record['owned_execution_completion'],
+            'admission': {'originalClaimDeadlineMonotonic': record['claim_deadline_monotonic']}}}
+        # A row that declares no profile and pins no device still gets the same seal check.
+        plain = {'backend': 'candle-cuda', 'package': 'any', 'fqn': 'any::case'}
+        resources.validate_shared_release_record(record, [body], plain)
+        for mutation in (lambda r: r.update(activity_profile=resources.STRICT_CUDA_ACTIVITY),
+                         lambda r: r.update(lease_released=False),
+                         lambda r: r.pop('owned_execution_completion')):
+            invalid = copy.deepcopy(record)
+            mutation(invalid)
+            with self.assertRaises(ValueError):
+                resources.validate_shared_release_record(invalid, [body], plain)
+        # Multi-UUID rows carry their own lease record and are not joined here.
+        self.assertIsNone(resources.validate_shared_release_record(
+            {'approved_uuid_roles': [], 'post_execution_verified': True}, [], {**plain, 'required_cuda_ordinals': [0, 1]}))
 
     def test_shared_release_metadata_deadline_and_unlock_failures_never_seal(self):
         valid = ([self.card()], [])

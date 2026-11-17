@@ -1335,18 +1335,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn(guard, owned)
         self.assertNotIn('catch', owned)
         device = source.split("function Check-Device(", 1)[1].split("function Evidence-Files(", 1)[0]
-        self.assertIn('Pid-Subset $pids @($allowed+$baseline+@($owned.Keys))', device)
-        self.assertIn('Owned-Gpu-Identity ([int]$_) $owned', device)
-        self.assertIn('$g[0].owned_pids.Count -eq 0 -and', device)
-        self.assertIn('$script:deviceIdleConfirmed=$false', device)
-        self.assertIn('$script:deviceIdleConfirmed=$true; return $g', device)
+        self.assertIn('$owners=@($mine | ForEach-Object { Owned-Gpu-Identity ([int]$_) $owned })', device)
+        self.assertIn('if ($g[0].owned_pids.Count -eq 0) {', device)
+        self.assertIn('$script:ownedReleaseConfirmed=$false', device)
+        self.assertIn('$script:ownedReleaseConfirmed=$true; return $g', device)
         run = source.split('function Owned-Run(', 1)[1].split('function Check-Device(', 1)[0]
         self.assertIn('& $drain $owned', run)
         self.assertLess(run.index('Stop-Owned $owned'), run.index('& $drain $owned'))
         self.assertLess(run.index('& $drain $owned'), run.index('$p.Dispose()'))
         self.assertIn('Test-Device-Exit-Fixture $temp', source)
-        self.assertEqual(source.count('} {param($owned) Wait-DeviceIdle $owned | Out-Null}'), 2)
-        self.assertIn('if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)', source)
+        self.assertEqual(source.count('} {param($owned) Wait-OwnedRelease $owned | Out-Null}'), 2)
+        self.assertIn('if ($script:ownedReleaseConfirmed -and (Test-Path -LiteralPath $leasePath)', source)
 
     def test_moss_exit_drain_guards_and_omission_mutants(self) -> None:
         source = (WORKFLOW.parents[2] / 'scripts/ci/moss-native-terminal.ps1').read_text(encoding='utf-8')
@@ -1359,16 +1358,69 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             'if ($entry.process.HasExited)',
             '$age -ge 0 -and $age -le 30',
             'Require ($null -ne $row)',
-            '$g[0].owned_pids.Count -eq 0 -and',
+            'if ($g[0].owned_pids.Count -eq 0) {',
             '& $drain $owned',
             'Test-Device-Exit-Fixture $temp',
-            '} {param($owned) Wait-DeviceIdle $owned | Out-Null}',
-            'if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)',
+            '} {param($owned) Wait-OwnedRelease $owned | Out-Null}',
+            'if ($script:ownedReleaseConfirmed -and (Test-Path -LiteralPath $leasePath)',
         ):
             with self.subTest(omitted=guard), self.assertRaises(AssertionError):
                 self.assert_moss_exit_drain_guards(source.replace(guard, ''))
         with self.assertRaises(AssertionError):
             self.assert_moss_exit_drain_guards(source.replace('-ErrorAction Stop', '-ErrorAction SilentlyContinue', 1))
+
+    def assert_moss_shared_admission(self, source: str) -> None:
+        # Default CUDA admission: free memory plus the quiet-window thresholds of the Python
+        # guard, under the host-global UUID lock. Other GPU0 processes never refuse.
+        from scripts.release import veda_cuda_guard as guard
+        for name, value in (("StableMaxUsedSpreadMib", guard.STABLE_MAX_USED_SPREAD_MIB),
+                            ("StableMaxUsedGrowthMib", guard.STABLE_MAX_USED_GROWTH_MIB),
+                            ("StableMaxUtilizationPercent", guard.STABLE_MAX_UTILIZATION_PERCENT),
+                            ("StableMaxUtilizationSpread", guard.STABLE_MAX_UTILIZATION_SPREAD),
+                            ("AdmissionSamples", guard.BASELINE_SAMPLES)):
+            self.assertIn(f"$script:{name}={value}\n", source)
+        device = source.split("function Check-Device(", 1)[1].split("function Wait-OwnedRelease(", 1)[0]
+        self.assertIn("$foreign=@($pids | Where-Object { -not ($owned.ContainsKey($_) -or $allowed -contains $_) })", device)
+        self.assertNotIn("Require", device.split("$pids=@()", 1)[1].split("$owners=", 1)[0].replace(
+            "Require ($row.pid.Trim() -cmatch '^[0-9]+$') 'Unresolved GPU process'", ""))
+        self.assertNotIn("Foreign GPU0 PID $id", source)
+        self.assertNotIn("desktop_baseline", source)
+        self.assertIn("Join-Path $env:PUBLIC 'SceneWorks\\gpu-locks'", source)
+        self.assertIn("$path=Join-Path $directory ($script:control.gpu_uuid+'.lock')", source)
+        self.assertIn('Write-Host "CUDA admission waiting: $reason"', source)
+        main = source.split("$fields=@('campaign'", 1)[1]
+        # required_free_mib is optional: present -> validated field, absent -> the derived default.
+        self.assertNotIn("'required_free_mib'", main.split("\n", 1)[0])
+        self.assertIn("$hasRequiredFree=$c.PSObject.Properties.Name -ccontains 'required_free_mib'", main)
+        self.assertIn("if ($hasRequiredFree) { $fields+='required_free_mib' }", main)
+        default = ("if (-not $hasRequiredFree) { $c | Add-Member -NotePropertyName required_free_mib "
+                   "-NotePropertyValue $script:DefaultRequiredFreeMib }")
+        self.assertIn(default, main)
+        # The default is inserted only after the supplied fields pass Exact-Fields; inserting
+        # it first would make every control that omits the field fail as "Unexpected control fields".
+        self.assertLess(main.index("Exact-Fields $c $fields"), main.index(default))
+        self.assertIn("$script:DefaultRequiredFreeMib=36864\n", source)
+        self.assertIn("Require ((Integer $c.required_free_mib) -and $c.required_free_mib -gt 0)", main)
+        order = ("$status.before=@(Wait-DeviceAdmissible $true)", "'native' $c.timeout_seconds",
+                 "Wait-DeviceAdmissible $false | Out-Null", "'product-native' $c.timeout_seconds")
+        for needle in order:
+            self.assertIn(needle, main)
+        self.assertLess(main.index("$status.before=@(Wait-DeviceAdmissible $true)"), main.index("'native' $c.timeout_seconds"))
+        self.assertLess(main.index("'native' $c.timeout_seconds"), main.index("Wait-DeviceAdmissible $false | Out-Null"))
+        self.assertLess(main.index("Wait-DeviceAdmissible $false | Out-Null"), main.index("'product-native' $c.timeout_seconds"))
+        self.assertIn("try { Unlock-Uuid } catch", main.split("} finally {")[-1])
+
+    def test_moss_admission_is_free_memory_and_quiet_window_not_idle(self) -> None:
+        source = (WORKFLOW.parents[2] / 'scripts/ci/moss-native-terminal.ps1').read_text(encoding='utf-8')
+        self.assert_moss_shared_admission(source)
+        for mutant in (
+            source.replace("$script:StableMaxUsedGrowthMib=128", "$script:StableMaxUsedGrowthMib=512"),
+            source.replace("$status.before=@(Wait-DeviceAdmissible $true)", "$status.before=@(Check-Device)"),
+            source.replace('Write-Host "CUDA admission waiting: $reason"', ''),
+            source.replace("    try { Unlock-Uuid } catch", "    try { } catch"),
+        ):
+            with self.assertRaises(AssertionError):
+                self.assert_moss_shared_admission(mutant)
 
     def assert_moss_positive_transport_budget(self, source: str) -> None:
         self.assertIn("[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60", source)
@@ -1398,7 +1450,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ):
             self.assertIn(invariant, source)
         # Only SelfTest owns this budget. Product compile/campaign deadlines remain untouched.
-        product = source.split("Exact-Fields $c @('campaign'", 1)[1]
+        product = source.split("$fields=@('campaign'", 1)[1]
         self.assertNotIn("SelfTestPositiveTimeoutSeconds", product)
         self.assertIn("'build' 10800", product)
 

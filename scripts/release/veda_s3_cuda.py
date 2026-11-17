@@ -20,6 +20,8 @@ KERNEL = "cuda-veda-sage-int8-tiled-v2"
 # v2 (sc-25777): one scoring pass per same-shape head batch (`predictor_score_batches`, was
 # per-head `predictor_score_calls`), plus the exact scorer/mask and tiled-vs-pointer-v1 checks.
 SCHEMA = "sc-25777-actual-cuda-kernel-v2"
+# Weights-free kernel fixtures (head dims 16/128) need far less; 4 GiB free leaves margin.
+REQUIRED_FREE_MIB = 4096
 
 
 def hash_file(path: Path) -> str:
@@ -125,13 +127,11 @@ def main() -> int:
             raise RuntimeError("checkout identity/cleanliness mismatch")
         receipt["kernel_source_sha256"] = hash_file(Path("crates/kernels/candle-quant-kernels/src/veda_int8.cu"))
         receipt["rustc"] = guard.command(["rustc", "--version"])
-        device, lock, baseline = guard.claim_device(out)
+        device, lock, baseline = guard.claim_device(out, REQUIRED_FREE_MIB)
         receipt["device"] = device
-        receipt["graphics_baseline_policy"] = dict(max_baseline_mib=guard.MAX_GRAPHICS_BASELINE_MIB,
-            max_utilization_percent=guard.MAX_BASELINE_UTILIZATION_PERCENT, sample_count=guard.BASELINE_SAMPLES,
+        receipt["admission_policy"] = dict(required_free_mib=REQUIRED_FREE_MIB, sample_count=guard.BASELINE_SAMPLES,
             max_sampling_seconds=guard.MAX_SAMPLING_SECONDS, baseline=baseline,
-            admitted_process_types=["G", "C+G"], refused_process_types=["C", "unknown"],
-            type_authority="nvidia-smi -q -x driver XML; no executable-name inference")
+            foreign_contexts_and_utilization="recorded in samples; never refuse admission")
         receipt["device_lock_directory"] = str(Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks")
         os.environ["CUDA_VISIBLE_DEVICES"] = device["uuid"]
         receipt["cuda_visible_devices"] = device["uuid"]
@@ -139,7 +139,7 @@ def main() -> int:
         guard.persist_receipt(out, receipt)
         from scripts.media_campaign_windows import WindowsJob
         for phase in ("build", "lint"):
-            guard.verify_idle(device, out, phase, baseline)
+            guard.verify_headroom(device, out, phase, baseline, REQUIRED_FREE_MIB)
             result = append_result(receipt, out, phase, batch_command(phase), deadline, WindowsJob)
             if result["timeout"] or result["returncode"] != 0:
                 receipt["status"] = f"{phase}_failed"
@@ -149,7 +149,7 @@ def main() -> int:
         receipt["binary_sha256"] = hash_file(binary)
         argv = [str(binary), TEST, "--exact", "--ignored", "--nocapture"]
         for phase, absent in (("absent_device", True), ("actual_device", False)):
-            guard.verify_idle(device, out, phase, baseline)
+            guard.verify_headroom(device, out, phase, baseline, REQUIRED_FREE_MIB)
             os.environ["CUDA_VISIBLE_DEVICES"] = "-1" if absent else device["uuid"]
             before = hash_file(binary)
             if before != receipt["binary_sha256"]:

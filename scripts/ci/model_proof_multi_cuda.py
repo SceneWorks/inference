@@ -167,8 +167,11 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
     guard.time = SimpleNamespace(monotonic=time.monotonic, sleep=bounded_sleep)
     devices = []; handles = []; baselines = {}; record = None; body_error = None
     try:
+        # Admission = each policy's reserve + child cap free, stable under the lock; foreign tenants allowed.
+        required = {policy.cuda_device_uuid: policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes
+                    for policy in policies}
         devices, handles, baselines, waited = primitives.claim_uuids(
-            uuids, guard, output, deadline, public, locker, sleep=bounded_sleep)
+            uuids, guard, output, deadline, public, locker, required, sleep=bounded_sleep)
         # Fresh context-free driver mapping in EXACT actual child visibility/order, after both leases.
         metadata_helper = Path(__file__).with_name('windows_cuda_metadata.py')
         if hashlib.sha256(metadata_helper.read_bytes()).hexdigest() != '0eaa7a4f32a0c0d686544b9736505584875a6d2f8c9319a5e9c37b4881a235cd':
@@ -176,6 +179,7 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
         binding = primitives.resolve_binding(guard, output, deadline, env, cuda_ordinals='0,1')
         validate_driver_binding(binding, uuids, env)
         record = {'mechanism': 'existing PUBLIC UUID leases; sorted lock order, preserved CUDA source role order',
+                  'admission_policy': 'per-UUID reserve plus child cap free across stable samples; foreign contexts/utilization diagnostic',
                   'approved_uuid_roles': list(uuids), 'lock_order': [device['uuid'] for device in devices],
                   'actual_ordinal_binding': binding, 'admission_baselines': baselines,
                   'wait_seconds': waited, 'post_execution_verified': False, 'post_idle_devices': []}
@@ -192,7 +196,10 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
         # Even when one post-census fails, attempt EVERY approved UUID. No complete/accepted seal otherwise.
         for device in devices:
             try:
-                guard.verify_idle(device, output, 'model-proof-release-' + device['uuid'], baselines[device['uuid']])
+                # The owned Job has exited; check identity and counters only. Foreign tenants may have grown.
+                guard.sample_baseline(device, output, 'model-proof-release-' + device['uuid'], baselines[device['uuid']],
+                                      idle_check=lambda current, _rows: guard.counters_valid(current),
+                                      permit_bounded_growth=True, require_stable_contexts=False)
                 if record is not None:
                     record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': True})
             except BaseException as error:

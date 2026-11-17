@@ -186,16 +186,86 @@ class VedaCudaGuardTests(unittest.TestCase):
                 s0.sample_baseline(device, Path(out), "random", baseline)
 
     def test_claim_holds_host_global_uuid_lock_during_sampling(self):
-        device = dict(index=1, uuid="GPU-test", used_mib=1164, utilization_percent=0)
+        device = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=1164, free_mib=96723, utilization_percent=0)
         row = [["GPU-test", "1", "opaque", "C+G"]]
+        for kwargs in (dict(required_free_mib=4096), dict(strict=True)):
+            fake_lock = Mock()
+            with self.subTest(**kwargs), tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
+                    patch.dict(sys.modules, {"msvcrt": fake_lock}), patch.object(s0, "inventory", return_value=([device], row)), \
+                    patch.object(s0.time, "sleep"):
+                admitted, handle, baseline = s0.claim_device(Path(out), **kwargs)
+                self.assertEqual(admitted["uuid"], device["uuid"])
+                self.assertEqual(baseline["reserved_baseline_mib"], 1164)
+                self.assertEqual(fake_lock.locking.call_count, 1)
+                self.assertFalse(handle.closed)
+                handle.close()
+
+    def test_default_claim_admits_on_headroom_despite_foreign_compute_display_and_resident_model(self):
+        # The owner's desktop app holds a CUDA context and a loaded model; the card drives a display.
+        quiet = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=40000, free_mib=57887, utilization_percent=12)
+        rows = [["GPU-test", "7", "desktop-app", "C"], ["GPU-test", "8", "dwm", "C+G"], ["GPU-test", "9", "x", "unknown"]]
+        self.assertFalse(s0.idle(quiet, rows))
+        self.assertTrue(s0.has_headroom(quiet, 4096))
+        jitter = [dict(quiet, used_mib=40000 + delta, free_mib=57887 - delta, utilization_percent=util)
+                  for delta, util in ((0, 12), (200, 25), (40, 10), (120, 20), (100, 15))]
         fake_lock = Mock()
-        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), patch.dict(sys.modules, {"msvcrt": fake_lock}), patch.object(s0, "inventory", return_value=([device], row)), patch.object(s0.time, "sleep"):
-            admitted, handle, baseline = s0.claim_device(Path(out))
-            self.assertEqual(admitted["uuid"], device["uuid"])
-            self.assertEqual(baseline["reserved_baseline_mib"], 1164)
-            self.assertEqual(fake_lock.locking.call_count, 1)
-            self.assertFalse(handle.closed)
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
+                patch.dict(sys.modules, {"msvcrt": fake_lock}), \
+                patch.object(s0, "inventory", side_effect=[([quiet], rows)] + [([card], rows) for card in jitter]), \
+                patch.object(s0.time, "sleep"):
+            admitted, handle, _ = s0.claim_device(Path(out), 4096)
+            self.assertEqual(admitted["uuid"], "GPU-test")
             handle.close()
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
+                patch.dict(sys.modules, {"msvcrt": Mock()}), patch.object(s0, "inventory", return_value=([quiet], rows)):
+            with self.assertRaisesRegex(RuntimeError, "no unclaimed idle"):
+                s0.claim_device(Path(out), strict=True)
+
+    def test_default_claim_requires_a_quiet_stable_window(self):
+        card = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=20000, free_mib=77887, utilization_percent=5)
+        cases = {
+            "utilization 31%": [dict(card, utilization_percent=31)],
+            "utilization moved 16 points": [dict(card, utilization_percent=5), dict(card, utilization_percent=21)],
+            "memory.used moved 257 MiB": [card, dict(card, used_mib=20257, free_mib=77630)],
+            "memory.used grew 129 MiB": [card] * 4 + [dict(card, used_mib=20129, free_mib=77758)],
+        }
+        for reason, window in cases.items():
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as out, \
+                    patch.dict(os.environ, {"PUBLIC": out}), patch.dict(sys.modules, {"msvcrt": Mock()}), \
+                    patch.object(s0, "inventory", side_effect=[([card], [])] + [([item], []) for item in window]), \
+                    patch.object(s0.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    s0.claim_device(Path(out), 4096)
+
+    def test_default_claim_refuses_only_insufficient_or_unstable_headroom_with_reason(self):
+        card = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=1164, free_mib=96723, utilization_percent=0)
+        short = dict(card, used_mib=95000, free_mib=2887)
+        for value in (short, dict(card, free_mib=None), dict(card, used_mib=99999)):
+            self.assertFalse(s0.has_headroom(value, 4096))
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
+                patch.dict(sys.modules, {"msvcrt": Mock()}), patch.object(s0, "inventory", return_value=([short], [])):
+            with self.assertRaisesRegex(RuntimeError, "2887 MiB free < 4096 MiB required"):
+                s0.claim_device(Path(out), 4096)
+        # Headroom lost during the five locked samples releases the lock and refuses.
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}), \
+                patch.dict(sys.modules, {"msvcrt": Mock()}), \
+                patch.object(s0, "inventory", side_effect=[([card], []), ([card], []), ([short], [])]), \
+                patch.object(s0.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "no unclaimed physical CUDA device with stable headroom"):
+                s0.claim_device(Path(out), 4096)
+        with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, {"PUBLIC": out}):
+            with self.assertRaisesRegex(ValueError, "required_free_mib"):
+                s0.claim_device(Path(out))
+
+    def test_in_session_headroom_recheck_tolerates_foreign_growth_activity_and_context_changes(self):
+        card = dict(index=1, uuid="GPU-test", total_mib=97887, used_mib=1164, free_mib=96723, utilization_percent=0)
+        grown = dict(card, used_mib=30000, free_mib=67887, utilization_percent=90)
+        baseline = dict(uuid="GPU-test", reserved_baseline_mib=1164, process_identities=[])
+        snapshots = [([card], []), ([grown], [["GPU-test", "5", "app", "C"]])] * 3
+        with tempfile.TemporaryDirectory() as out, patch.object(s0, "inventory", side_effect=snapshots[:5]), \
+                patch.object(s0.time, "sleep"):
+            s0.verify_headroom(card, Path(out), "phase", baseline, 4096)
+            self.assertEqual(len(json.loads((Path(out) / "phase-samples.json").read_text(encoding="utf-8"))), 5)
 
     def test_owned_child_preserves_failure_returncode(self):
         job = Mock()

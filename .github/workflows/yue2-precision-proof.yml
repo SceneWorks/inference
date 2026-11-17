@@ -16,7 +16,7 @@ on:
         required: false
         default: shared-host
         options: [shared-host, shared-gpu1, owner-gpu0, owner-gpu0-mac-anchor, gpu0-with-reviewed-gpu1]
-        description: shared-gpu1 serializes YuE2 on physical GPU1 while observing external workloads; legacy shared-host remains strict
+        description: shared-host (default) and shared-gpu1 both admit physical GPU1 under its host-global UUID lock on 16 GiB free plus a quiet stable window, recording foreign workloads; shared-gpu1 also uses its own serialized group
       expected_engine_sha:
         type: string
         required: true

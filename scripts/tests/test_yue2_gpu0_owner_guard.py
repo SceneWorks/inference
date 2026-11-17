@@ -678,6 +678,7 @@ class OwnerGuardTests(unittest.TestCase):
                  patch.object(control, "sha256", return_value=control.REFERENCE_SHA256), \
                  patch.object(control, "verify_revisions"), patch.object(control.subprocess, "run", return_value=Mock(stdout="")), \
                  patch.object(existing.IDLE, "check_shared_gpu1_dispatch") as dispatch, \
+                 patch.object(existing.IDLE, "SharedGpu1Lock", existing.FakeGpuLock), \
                  patch.object(existing.IDLE, "require_remaining_window", return_value=({}, root)) as receipt, \
                  patch.object(control, "retain_reviewed_baseline", return_value=[]), \
                  patch.object(control, "retain_cuda_physical_evidence", return_value=[]), \
