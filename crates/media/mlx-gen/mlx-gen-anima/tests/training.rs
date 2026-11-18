@@ -657,8 +657,9 @@ fn trainable_surface_is_508_dit_plus_conditioner() {
 ///       `sample_every` within `[1, steps]`), `sample_prompts.len()` per cadence, 1-based `index`.
 ///   (2) NON-DEGENERATE — every preview is a correctly-sized RGB bitmap with real pixel variance (a
 ///       genuine denoise+decode, not an empty stub).
-///   (3) REFLECTS ADAPTER STATE — prompt[0]'s final-cadence preview is more magenta than its first, and
-///       more magenta than a base-model generation of the same prompt. That can only happen if the
+///   (3) REFLECTS ADAPTER STATE — prompt[0]'s first- and final-cadence previews are both more magenta
+///       than a base-model generation of the same prompt, and the preview changes between those
+///       cadences. That can only happen if the
 ///       preview samples the LIVE in-training adapter (the DiT AND the conditioner adapters, sc-10522);
 ///       a preview that reused a cached/base conditioner output could not track the overfit.
 #[test]
@@ -756,7 +757,7 @@ fn train_emits_in_training_previews() {
         );
     }
 
-    // (3) REFLECTS ADAPTER STATE — prompt[0]'s magenta tilt grows first→last cadence, and the final
+    // (3) REFLECTS ADAPTER STATE — prompt[0]'s previews sit past the base model and keep moving, and the final
     // preview is more magenta than a base-model generation (the overfit target the LoRA is learning).
     let first_step = *expected_steps.first().unwrap();
     let last_step = *expected_steps.last().unwrap();
@@ -786,10 +787,21 @@ fn train_emits_in_training_previews() {
         samples.len(),
         expected_steps.len()
     );
+    // The 2:3 full-canvas fixture (SW-7172) saturates the overfit by the FIRST cadence (the step-50
+    // preview already reproduces the training image), so magenta need not keep rising first→last.
+    // What proves the preview samples the live adapter: the first cadence is already far past the
+    // base model, and the preview keeps moving as the adapter keeps training.
+    let moved = mean_abs_diff(first, last);
+    eprintln!("[sc-10641] prompt0 first→last mean|Δpixel|={moved:.2}");
     assert!(
-        ml > mf,
-        "previews must track the in-training adapter: prompt0 should tilt toward the overfit magenta \
-         from the first cadence ({mf:.1}) to the last ({ml:.1})"
+        mf > mb,
+        "the first-cadence preview must already reflect the in-training adapter (more magenta than \
+         the base model: base {mb:.1} vs first preview {mf:.1})"
+    );
+    assert!(
+        moved > 1.0,
+        "previews must track the in-training adapter: prompt0's preview did not change between the \
+         first cadence (step {first_step}) and the last (step {last_step}) (mean|Δpixel| {moved:.2})"
     );
     assert!(
         ml > mb,
