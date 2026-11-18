@@ -98,18 +98,31 @@ fn identity_stage<T>(cancel: &CancelFlag, work: impl FnOnce() -> Result<T>) -> R
     Ok(output)
 }
 
+#[cfg(test)]
 fn complete_pulid_image(
     cancel: &CancelFlag,
     route: &'static str,
     run: impl FnOnce() -> Result<Image>,
 ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-    candle_gen::execution::capture_direct(&PulidFlux::execution_descriptor(), cancel, || {
+    complete_pulid_image_with_pag(cancel, route, || Ok((run()?, None)))
+}
+
+fn complete_pulid_image_with_pag(
+    cancel: &CancelFlag,
+    route: &'static str,
+    run: impl FnOnce() -> Result<(Image, Option<candle_gen::gen_core::PagExecutionReport>)>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_direct_report(&PulidFlux::execution_descriptor(), cancel, || {
         candle_gen::execution::policy("direct_route", route.into());
         candle_gen::execution::unavailable(
             "candle-gen-pulid/src/pulid_flux.rs: face analysis, identity injection, and loaded decoder have no complete execution receipt",
         );
-        let image = run().map_err(candle_gen::gen_core::Error::from)?;
-        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        let (image, pag) = run().map_err(candle_gen::gen_core::Error::from)?;
+        let mut report = candle_gen::gen_core::GenerationReport::from_output(
+            candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+        );
+        report.pag = pag;
+        Ok(report)
     })
 }
 
@@ -157,6 +170,44 @@ mod direct_completion_tests {
             Ok(image(8))
         });
         assert!(matches!(result, Err(candle_gen::gen_core::Error::Canceled)));
+    }
+
+    #[test]
+    fn pulid_pag_resolution_and_report_preserve_flux1_dev_contract() {
+        let req = PulidFluxRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: 4,
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_pulid_pag(&req).unwrap().expect("active pag");
+        let pag_report = resolved.execution_report(4);
+        assert_eq!(pag_report.layers, vec![28]);
+        assert_eq!(pag_report.active_steps, 4);
+        assert_eq!(pag_report.total_steps, 4);
+
+        let completed = complete_pulid_image_with_pag(
+            &CancelFlag::default(),
+            "pulid/pulid_flux/generate",
+            || Ok((image(2), Some(pag_report.clone()))),
+        )
+        .unwrap();
+        assert_eq!(completed.generation.pag, Some(pag_report));
+
+        let bad = PulidFluxRequest {
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                layers: Some(vec![57]),
+                ..Default::default()
+            }),
+            ..req
+        };
+        assert!(resolve_pulid_pag(&bad).is_err());
     }
 }
 
@@ -218,6 +269,8 @@ pub struct PulidFluxRequest {
     /// is injected inside the DiT forward and never joins it (see [`crate::preview`]). Default is
     /// inert, and an inert sink makes a seeded render byte-identical to one with no preview at all.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance configuration for PuLID-FLUX.
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -237,6 +290,7 @@ impl Default for PulidFluxRequest {
             seed: 0,
             use_pid: false,
             preview: PreviewSink::default(),
+            pag: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -370,6 +424,7 @@ fn typed_pulid_request(
         }],
         use_pid: req.use_pid,
         preview: req.preview.clone(),
+        pag: req.pag.clone(),
         cancel: req.cancel.clone(),
         ..Default::default()
     })
@@ -631,10 +686,12 @@ impl PulidFlux {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let pag = resolve_pulid_pag_report(req, plan)?;
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        complete_pulid_image(&req.cancel, "pulid/pulid_flux/generate", || {
-            self.generate_planned(req, reference, plan, &mut report_progress)
+        complete_pulid_image_with_pag(&req.cancel, "pulid/pulid_flux/generate", || {
+            let image = self.generate_planned(req, reference, plan, &mut report_progress)?;
+            Ok((image, pag))
         })
     }
 
@@ -667,19 +724,21 @@ impl PulidFlux {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let pag = resolve_pulid_pag_report(req, plan)?;
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        complete_pulid_image(
+        complete_pulid_image_with_pag(
             &req.cancel,
             "pulid/pulid_flux/generate_with_memory_context",
             || {
-                self.generate_with_memory_context_planned(
+                let image = self.generate_with_memory_context_planned(
                     context,
                     req,
                     reference,
                     plan,
                     &mut report_progress,
-                )
+                )?;
+                Ok((image, pag))
             },
         )
     }
@@ -772,6 +831,7 @@ impl PulidFlux {
             return Err(CandleError::Canceled);
         }
         reject_below_floor(req)?;
+        let pag = resolve_pulid_pag(req).map_err(|e| CandleError::Msg(e.to_string()))?;
         self.backbone
             .validate_native_vae_request(req.use_pid, &req.cancel)?;
 
@@ -830,6 +890,7 @@ impl PulidFlux {
                     run,
                     &pulid_ca,
                     heavy.as_ref(),
+                    pag.as_ref(),
                     seed,
                     &preview,
                     &req.cancel,
@@ -871,11 +932,20 @@ impl PulidFlux {
         run: &RenderRun<'_, '_>,
         injector: &PulidCa,
         heavy: Option<&FluxRefHeavy>,
+        pag: Option<&candle_gen::gen_core::PagResolved>,
         seed: u64,
         preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        candle_gen::execution::policy(
+            "pulid.pag",
+            serde_json::to_value(pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(render_plan.sampler()));
+        let total_steps = render_plan.denoise_sigmas().len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(render_plan.guidance(), b_sz, &self.device)?;
         candle_gen::run_flow_sampler_spans(
@@ -894,8 +964,16 @@ impl PulidFlux {
                 // The backbone dispatches to the loaded tier's DiT (BFL `IpFlux` or packed
                 // `PackedFluxDit`) `forward_injected`; the PuLID CA identity injection lives inside this
                 // closure so a multi-eval solver re-runs the whole step.
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let step_pag = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                self.backbone.forward_injected_with_memory(
+                let pos = self.backbone.forward_injected_with_memory_pag(
                     heavy,
                     img,
                     &state.img_ids,
@@ -906,10 +984,50 @@ impl PulidFlux {
                     Some(&guidance_t),
                     Some(injector as &dyn DitImageInjector),
                     cancel,
-                )
+                    None,
+                )?;
+                if step_pag > 0.0 {
+                    let layers = pag.map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                    let pert = self.backbone.forward_injected_with_memory_pag(
+                        heavy,
+                        img,
+                        &state.img_ids,
+                        &state.txt,
+                        &state.txt_ids,
+                        &t_vec,
+                        &state.vec,
+                        Some(&guidance_t),
+                        Some(injector as &dyn DitImageInjector),
+                        cancel,
+                        Some(layers),
+                    )?;
+                    candle_gen_flux::apply_pag_blend(&pos, &pert, step_pag)
+                } else {
+                    Ok(pos)
+                }
             },
         )
     }
+}
+
+fn resolve_pulid_pag(
+    req: &PulidFluxRequest,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagResolved>> {
+    let descriptor = plan_descriptor();
+    let pag_req = GenerationRequest {
+        pag: req.pag.clone(),
+        ..Default::default()
+    };
+    descriptor.capabilities.resolve_pag(descriptor.id, &pag_req)
+}
+
+fn resolve_pulid_pag_report(
+    req: &PulidFluxRequest,
+    plan: &RenderPlan,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagExecutionReport>> {
+    let total_steps = u32::try_from(plan.denoise_sigmas().len().saturating_sub(1))
+        .map_err(|_| candle_gen::gen_core::Error::Unsupported("step count overflow".into()))?;
+    Ok(resolve_pulid_pag(req)?.map(|pag| pag.execution_report(total_steps)))
 }
 
 fn validate_request_geometry(

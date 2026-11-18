@@ -873,6 +873,7 @@ impl Flux1 {
                     .descriptor
                     .capabilities
                     .resolve_pag(self.descriptor.id, req)?;
+                mlx_gen::image_execution::policy_debug("flux.pag", &pag);
                 let total_steps = run.plan().denoise_sigmas().len().saturating_sub(1);
                 self.run_denoise_with(
                     run,
@@ -1123,6 +1124,7 @@ impl Flux1 {
                     .descriptor
                     .capabilities
                     .resolve_pag(self.descriptor.id, req)?;
+                mlx_gen::image_execution::policy_debug("flux.pag", &pag);
                 let total_steps = run.plan().denoise_sigmas().len().saturating_sub(1);
                 self.run_denoise_with(
                     run,
@@ -1272,6 +1274,10 @@ impl Flux1 {
                 // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
                 // `run_flow_sampler`.
                 let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                let canonical_solver =
+                    mlx_gen::gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
+                let total_steps = denoise_sigmas.len().saturating_sub(1);
+                let mut eval_idx = 0usize;
                 run_flow_sampler_with_latent_hook_spans(
                     SamplerRun {
                         sampler_name: Some(sampler_name),
@@ -1296,14 +1302,13 @@ impl Flux1 {
                         );
                     },
                     |x_in, timestep| {
-                        // The curated samplers expose no step index, but the CFG/PAG-scheduling
-                        // consumers need one — locate the interval `(denoise_sigmas[i+1], denoise_sigmas[i]]`
-                        // containing `timestep` (exact for both grid nodes and multi-eval midpoints).
-                        let total_steps = denoise_sigmas.len().saturating_sub(1);
-                        let step_idx = denoise_sigmas
-                            .get(1..=total_steps)
-                            .and_then(|tail| tail.iter().position(|&s_next| timestep > s_next))
-                            .unwrap_or_else(|| total_steps.saturating_sub(1));
+                        let current_eval = eval_idx;
+                        eval_idx += 1;
+                        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        );
                         let _ = sigmas;
                         velocity_fn(x_in, step_idx, timestep, guidance)
                     },

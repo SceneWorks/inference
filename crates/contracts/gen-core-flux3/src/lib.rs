@@ -127,6 +127,23 @@ pub fn flux3_pag_capability(flow_map: bool) -> gen_core::PagCapability {
     }
 }
 
+/// Whether `flux3_klein_base` must encode the negative prompt for CFG.
+/// Since `u + g * (c - u)` equals `c` ONLY at `g == 1.0`, the negative branch may be
+/// skipped only when PAG is active AND `g == 1.0` (while `0.0 <= g < 1.0` still interpolates
+/// with `u`, and `pag.is_none()` preserves the non-PAG `u`/`c` CFG path).
+pub fn base_requires_negative_prompt(
+    guidance: Option<f32>,
+    pag: Option<&gen_core::PagResolved>,
+) -> bool {
+    guidance.is_some_and(|g| pag.is_none() || g != 1.0)
+}
+
+/// Whether `flux3_klein_base` can skip the unconditioned CFG pass and evaluate only `cond` +
+/// `pert` during denoise: true strictly when PAG is active and `guidance == 1.0`.
+pub fn base_cfg_off_with_pag(guidance: f32, pag: Option<&gen_core::PagResolved>) -> bool {
+    pag.is_some() && guidance == 1.0
+}
+
 /// `LoadSpec::components` key carrying the text-encoder directory. Optional: when absent the
 /// package's own `text_encoder/` (`config.json` `text_encoder.path`) is read.
 pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";

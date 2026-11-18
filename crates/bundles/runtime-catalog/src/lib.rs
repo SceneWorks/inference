@@ -551,7 +551,7 @@ impl RuntimeCatalog {
 /// This is deliberately derived from [`ModelDescriptor`] every time the runtime snapshot is built.
 /// Release tooling can therefore compare MLX and Candle catalogs without maintaining a second
 /// hand-written capability table, and any descriptor change is visible in the serialized snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GeneratorCapabilitySnapshot {
     pub id: String,
     pub family: String,
@@ -566,6 +566,7 @@ pub struct GeneratorCapabilitySnapshot {
     pub samplers: Vec<String>,
     pub schedulers: Vec<String>,
     pub supported_guidance_methods: Vec<String>,
+    pub pag: Option<gen_core::PagCapability>,
 }
 
 impl GeneratorCapabilitySnapshot {
@@ -613,11 +614,12 @@ impl GeneratorCapabilitySnapshot {
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect(),
+            pag: descriptor.capabilities.pag.clone(),
         }
     }
 
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut object = serde_json::json!({
             "id": self.id,
             "family": self.family,
             "backend": self.backend,
@@ -631,7 +633,11 @@ impl GeneratorCapabilitySnapshot {
             "samplers": self.samplers,
             "schedulers": self.schedulers,
             "supported_guidance_methods": self.supported_guidance_methods,
-        })
+        });
+        if let Some(pag) = &self.pag {
+            object["pag"] = serde_json::to_value(pag).expect("PagCapability serializes");
+        }
+        object
     }
 }
 
@@ -775,7 +781,7 @@ impl TrainerCapabilitySnapshot {
 }
 
 /// Stable, machine-readable provider inventory for release and product compatibility checks.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeCatalogSnapshot {
     /// The bundle's platform label (`"macos"` / `"ios"` / `"cuda"` / `"cpu"`).
     pub platform: String,
@@ -990,6 +996,10 @@ mod tests {
         assert_eq!(json["supports_lokr"], true);
         assert_eq!(json["supports_preview"], true);
         assert_eq!(json["supports_prompt_enhancement"], true);
+        assert!(
+            json.get("pag").is_none(),
+            "non-PAG descriptors omit `pag` from the JSON snapshot"
+        );
 
         let mut mutated = descriptor.clone();
         mutated.capabilities.supports_preview = false;
@@ -1004,6 +1014,26 @@ mod tests {
             GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
             GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
             "prompt-enhancement support must be anti-restamp protected"
+        );
+        let pag_cap = gen_core::PagCapability {
+            num_blocks: 57,
+            block_domain: std::borrow::Cow::Borrowed("flux_blocks"),
+            default_layers: vec![28],
+            default_start: 0.0,
+            default_stop: 1.0,
+            recommended_scale: 1.5,
+            max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
+        };
+        mutated = descriptor.clone();
+        mutated.capabilities.pag = Some(pag_cap.clone());
+        let pag_json = GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json();
+        assert_ne!(
+            json, pag_json,
+            "mutating `capabilities.pag` must change the machine-readable snapshot"
+        );
+        assert_eq!(
+            pag_json["pag"],
+            serde_json::to_value(&pag_cap).expect("PagCapability serializes")
         );
     }
 

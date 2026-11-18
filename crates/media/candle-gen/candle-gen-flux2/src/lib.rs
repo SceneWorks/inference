@@ -1191,10 +1191,17 @@ impl Pipeline {
         let pag = descriptor(self.variant)
             .capabilities
             .resolve_pag(self.variant.id(), req)?;
+        candle_gen::execution::policy(
+            "flux2.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
         let total_steps = sigmas.len().saturating_sub(1);
         let target_seq = lat_h * lat_w;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let mut eval_idx = 0usize;
             let latents =
                 pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
 
@@ -1219,7 +1226,13 @@ impl Pipeline {
                 Some(&preview),
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
-                    let step_idx = step_index_for_sigma(&sigmas, sigma);
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
                     let step_pag = pag
                         .as_ref()
                         .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
@@ -1392,16 +1405,9 @@ fn observe_consumed_guidance(guidance: f32, embedded: bool, negative: bool) {
     candle_gen::execution::f32_policy("flux2.guidance", guidance);
 }
 
-pub(crate) fn step_index_for_sigma(sigmas: &[f32], sigma: f32) -> usize {
-    let total_steps = sigmas.len().saturating_sub(1);
-    sigmas
-        .get(1..=total_steps)
-        .and_then(|tail| tail.iter().position(|&s_next| sigma > s_next))
-        .unwrap_or_else(|| total_steps.saturating_sub(1))
-}
-
 /// Complete a direct FLUX.2 image only after its legacy execution and device fence succeed.
 /// `missing_fact` names a route-local observation gap rather than filling it from submitted knobs.
+#[cfg(test)]
 pub(crate) fn complete_bespoke_image(
     descriptor: &ModelDescriptor,
     cancel: &gen_core::CancelFlag,

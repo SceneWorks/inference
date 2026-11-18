@@ -383,6 +383,9 @@ impl Flux1DevControl {
                     .descriptor
                     .capabilities
                     .resolve_pag(FLUX1_DEV_CONTROL_ID, req)?;
+                mlx_gen::image_execution::policy_debug("flux.pag", &pag);
+                let canonical_solver =
+                    mlx_gen::gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
                 let total_steps = sigmas.len().saturating_sub(1);
 
                 let images = run.images_with_denoise_phases(
@@ -390,6 +393,7 @@ impl Flux1DevControl {
                     |seed| create_noise(seed, req.width, req.height),
                     |seed, latents, on_progress| {
                         let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+                        let mut eval_idx = 0usize;
                         run_flow_sampler_with_latent_hook_spans(
                             SamplerRun {
                                 sampler_name: Some(sampler_name),
@@ -414,12 +418,13 @@ impl Flux1DevControl {
                                 );
                             },
                             |x_in, timestep| {
-                                let step_idx = sigmas
-                                    .get(1..=total_steps)
-                                    .and_then(|tail| {
-                                        tail.iter().position(|&s_next| timestep > s_next)
-                                    })
-                                    .unwrap_or_else(|| total_steps.saturating_sub(1));
+                                let current_eval = eval_idx;
+                                eval_idx += 1;
+                                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                                    canonical_solver,
+                                    current_eval,
+                                    total_steps,
+                                );
                                 let step_pag = pag
                                     .as_ref()
                                     .map_or(0.0, |p| p.step_scale(step_idx, total_steps));

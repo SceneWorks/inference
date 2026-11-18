@@ -766,12 +766,18 @@ impl Pipeline {
             .capabilities
             .resolve_pag(self.variant.model_id(), req)
             .map_err(|e| CandleError::Msg(e.to_string()))?;
-        let denoise_sigmas = plan.denoise_sigmas();
-        let total_steps = denoise_sigmas.len().saturating_sub(1);
+        candle_gen::execution::policy(
+            "flux.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(plan.sampler()));
+        let total_steps = plan.denoise_sigmas().len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         candle_gen::run_flow_sampler_spans(
             Some(plan.sampler()),
             TimestepConvention::Sigma,
-            denoise_sigmas,
+            plan.denoise_sigmas(),
             &plan.denoise_spans(),
             Some(run),
             true,
@@ -781,6 +787,13 @@ impl Pipeline {
             on_progress,
             Some(preview),
             |img, t| -> Result<Tensor> {
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
                 // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
                 let t_vec = Tensor::full(t, b_sz, dev)?;
@@ -840,10 +853,6 @@ impl Pipeline {
                     }
                 };
                 let out = forward_one(None)?;
-                let step_idx = denoise_sigmas
-                    .get(1..=total_steps)
-                    .and_then(|tail| tail.iter().position(|&s_next| t > s_next))
-                    .unwrap_or_else(|| total_steps.saturating_sub(1));
                 let step_pag = pag
                     .as_ref()
                     .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
@@ -852,11 +861,7 @@ impl Pipeline {
                         .as_ref()
                         .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
                     let pert = forward_one(Some(layers))?;
-                    let out_dtype = out.dtype();
-                    let out_f32 = out.to_dtype(DType::F32)?;
-                    let pert_f32 = pert.to_dtype(DType::F32)?;
-                    let diff = (&out_f32 - &pert_f32)?.affine(step_pag as f64, 0.0)?;
-                    Ok((&out_f32 + &diff)?.to_dtype(out_dtype)?)
+                    crate::apply_pag_blend(&out, &pert, step_pag)
                 } else {
                     Ok(out)
                 }
@@ -1005,7 +1010,7 @@ impl Pipeline {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_ip_residency(
+    pub(crate) fn forward_ip_residency_pag(
         &self,
         heavy: &SeqHeavy,
         img: &Tensor,
@@ -1020,10 +1025,11 @@ impl Pipeline {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
     ) -> Result<Tensor> {
         match (heavy.dit.as_ref(), prepared) {
             (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                .forward_prepared_with_memory(
+                .forward_prepared_with_memory_pag(
                     img,
                     img_ids,
                     txt,
@@ -1038,9 +1044,10 @@ impl Pipeline {
                     attention_plan,
                     transformer_window,
                     cancel,
+                    pag_layers,
                 ),
             (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                .forward_prepared_with_memory(
+                .forward_prepared_with_memory_pag(
                     img,
                     img_ids,
                     txt,
@@ -1055,6 +1062,7 @@ impl Pipeline {
                     attention_plan,
                     transformer_window,
                     cancel,
+                    pag_layers,
                 ),
             _ => Err(CandleError::Msg(
                 "flux: prepared conditioning belongs to another DiT variant".into(),
@@ -1063,7 +1071,7 @@ impl Pipeline {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_control_residency(
+    pub(crate) fn forward_control_residency_pag(
         &self,
         heavy: &SeqHeavy,
         img: &Tensor,
@@ -1079,10 +1087,11 @@ impl Pipeline {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
     ) -> Result<Tensor> {
         match (heavy.dit.as_ref(), prepared) {
             (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                .forward_prepared_with_memory(
+                .forward_prepared_with_memory_pag(
                     img,
                     img_ids,
                     txt,
@@ -1097,9 +1106,10 @@ impl Pipeline {
                     attention_plan,
                     transformer_window,
                     cancel,
+                    pag_layers,
                 ),
             (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                .forward_prepared_with_memory(
+                .forward_prepared_with_memory_pag(
                     img,
                     img_ids,
                     txt,
@@ -1114,6 +1124,7 @@ impl Pipeline {
                     attention_plan,
                     transformer_window,
                     cancel,
+                    pag_layers,
                 ),
             _ => Err(CandleError::Msg(
                 "flux: prepared conditioning belongs to another DiT variant".into(),

@@ -1342,6 +1342,7 @@ impl Flux2 {
             .descriptor
             .capabilities
             .resolve_pag(self.descriptor.id, req)?;
+        mlx_gen::image_execution::policy_debug("flux2.pag", &pag);
         let cond = self.prepare_conditioning(vae, req, request.steps)?;
         let mem = self.memory_config(&prompt_embeds, &cond, req);
         mlx_gen::image_execution::policy_debug("flux2.resolved_memory", &mem);
@@ -1688,14 +1689,6 @@ struct Flux2Render<'a> {
     pag: Option<&'a mlx_gen::gen_core::PagResolved>,
 }
 
-pub(crate) fn step_index_for_sigma(denoise_sigmas: &[f32], sigma: f32) -> usize {
-    let total_steps = denoise_sigmas.len().saturating_sub(1);
-    denoise_sigmas
-        .get(1..=total_steps)
-        .and_then(|tail| tail.iter().position(|&s_next| sigma > s_next))
-        .unwrap_or_else(|| total_steps.saturating_sub(1))
-}
-
 impl Flux2Render<'_> {
     /// For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only on a
     /// cached KV step); its output keeps the image stream, of which we take the leading
@@ -1788,9 +1781,18 @@ impl Flux2Render<'_> {
         // ref]` pass); later forwards run `[txt, target]` and splice that branch's cached ref K/V
         // back in. A multi-eval solver still extracts once. FLUX.2 feeds `sigma · 1000` as the
         // transformer timestep (Sigma convention).
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             let ts = sigma * 1000.0;
-            let step_idx = step_index_for_sigma(denoise_sigmas, sigma);
+            let current_eval = eval_idx;
+            eval_idx += 1;
+            let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                canonical_solver,
+                current_eval,
+                total_steps,
+            );
             let step_pag = self
                 .pag
                 .map_or(0.0, |p| p.step_scale(step_idx, total_steps));

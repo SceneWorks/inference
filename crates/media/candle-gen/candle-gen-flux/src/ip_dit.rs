@@ -938,6 +938,7 @@ impl IpFlux {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_prepared_with_memory(
         &self,

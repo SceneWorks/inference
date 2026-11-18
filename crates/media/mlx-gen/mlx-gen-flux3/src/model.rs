@@ -518,7 +518,7 @@ impl Flux3Klein {
             |progress|self.effective_params(req,progress),
             |te:&Flux3TextEncoder,params:GenerationParams| ->Result<(TextConditioning,Option<TextConditioning>,GenerationParams)> {
                 let text=te.encode(&params.prompt)?;
-                let encode_neg=params.guidance.is_some_and(|g|params.pag.is_none()||g>1.0);
+                let encode_neg=gen_core_flux3::base_requires_negative_prompt(params.guidance,params.pag.as_ref());
                 let negative=if encode_neg{Some(te.encode(&params.negative_prompt)?)}else{None};
                 Ok((text,negative,params))
             },
@@ -659,7 +659,10 @@ impl Flux3Klein {
              params: GenerationParams|
              -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
                 let text = te.encode(&params.prompt)?;
-                let encode_neg = params.guidance.is_some_and(|g| params.pag.is_none() || g > 1.0);
+                let encode_neg = gen_core_flux3::base_requires_negative_prompt(
+                    params.guidance,
+                    params.pag.as_ref(),
+                );
                 let negative = if encode_neg {
                     Some(te.encode(&params.negative_prompt)?)
                 } else {

@@ -815,7 +815,14 @@ impl Flux2Edit {
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let pag = resolve_edit_pag(req, self.variant)?;
+        candle_gen::execution::policy(
+            "flux2.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
         let total_steps = sigmas.len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         // The driver does cancel + progress + the integrator step. The joint `[target, refs]` concat,
         // the transformer forward, the target-slice, and the guidance>1 CFG blend all live inside the
         // predict closure so a multi-eval solver re-runs them. FLUX.2 uses the Sigma convention but the
@@ -831,7 +838,13 @@ impl Flux2Edit {
             Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
-                let step_idx = crate::step_index_for_sigma(&sigmas, sigma);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
                 let step_pag = pag
                     .as_ref()
                     .map_or(0.0, |p| p.step_scale(step_idx, total_steps));

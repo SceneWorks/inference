@@ -108,6 +108,20 @@ pub use ip_dit::{Config as FluxConfig, DitImageInjector, IpFlux};
 pub use pipeline::{
     ae_config, clip_config, decode_latents, encode_text, flux_config, FluxTokenizers,
 };
+
+/// Combine unperturbed (`out`) and attention-perturbed (`pert`) FLUX velocity predictions in f32:
+/// `out + step_pag * (out - pert)`, cast back to `out.dtype()`.
+pub fn apply_pag_blend(
+    out: &candle_core::Tensor,
+    pert: &candle_core::Tensor,
+    step_pag: f32,
+) -> candle_gen::Result<candle_core::Tensor> {
+    let out_dtype = out.dtype();
+    let out_f32 = out.to_dtype(candle_core::DType::F32)?;
+    let pert_f32 = pert.to_dtype(candle_core::DType::F32)?;
+    let diff = (&out_f32 - &pert_f32)?.affine(step_pag as f64, 0.0)?;
+    Ok((&out_f32 + &diff)?.to_dtype(out_dtype)?)
+}
 // The FLUX dev flow-match time-shift constants + `flow_mu` linear map — one home (sc-11249 / F-140).
 // The PuLID reference stream (`candle-gen-pulid`) shares these exact parity-critical schedule pieces
 // rather than maintaining a third copy; the IP-Adapter provider reaches them in-crate.

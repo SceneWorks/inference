@@ -397,6 +397,7 @@ impl Flux2DevControl {
             .descriptor
             .capabilities
             .resolve_pag(FLUX2_DEV_CONTROL_ID, req)?;
+        mlx_gen::image_execution::policy_debug("flux2.pag", &pag);
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -506,8 +507,18 @@ impl Flux2DevControl {
                     let mem = MemoryConfig::with_request(MemoryConfig::OFF, req.memory.as_ref());
                     let denoise_sigmas = &sched.sigmas[start_step..];
                     let total_steps = denoise_sigmas.len().saturating_sub(1);
+                    let canonical_solver =
+                        mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+                    let mut eval_idx = 0usize;
                     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
                         let ts = sigma * 1000.0;
+                        let current_eval = eval_idx;
+                        eval_idx += 1;
+                        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        );
                         let pos = heavy.transformer.forward_with_mem_pag(
                             latents,
                             &prompt_embeds,
@@ -520,7 +531,6 @@ impl Flux2DevControl {
                             &mem,
                             None,
                         )?;
-                        let step_idx = crate::model::step_index_for_sigma(denoise_sigmas, sigma);
                         let step_pag = pag
                             .as_ref()
                             .map_or(0.0, |p| p.step_scale(step_idx, total_steps));

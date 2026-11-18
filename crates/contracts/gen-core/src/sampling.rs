@@ -55,6 +55,27 @@ pub use solvers::{
 };
 pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler, SolverRunState};
 
+/// Resolve the canonical solver for `sampler_name`, falling back to `Solver::Euler` (the
+/// curated driver's N3 fallback for `None` or native aliases such as `flow_match`).
+pub fn canonical_solver_or_euler(sampler_name: Option<&str>) -> Solver {
+    sampler_name
+        .and_then(Solver::from_name)
+        .unwrap_or(Solver::Euler)
+}
+
+/// Map a per-trajectory model-evaluation counter `eval_idx` (0-based, reset per sample)
+/// to the outer schedule step index in `0..total_steps`. Two-stage solvers (`Heun`,
+/// `DpmppSde`) evaluate the model twice per non-terminal step, so both substeps map to
+/// outer step `eval_idx / 2`.
+pub fn step_index_for_eval(canonical_solver: Solver, eval_idx: usize, total_steps: usize) -> usize {
+    if matches!(canonical_solver, Solver::Heun | Solver::DpmppSde) {
+        eval_idx / 2
+    } else {
+        eval_idx
+    }
+    .min(total_steps.saturating_sub(1))
+}
+
 #[cfg(test)]
 mod split_tests;
 
@@ -1330,5 +1351,42 @@ mod tests {
         // step 0: 0.3 + 0.7·(0.75−1.0) = 0.125.
         let c0 = policy.coeffs(0);
         assert!((0.3 + 0.7 * c0.a_out - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn step_index_for_eval_maps_two_stage_and_single_stage_solvers() {
+        let total_steps = 4;
+        for solver in [Solver::Heun, Solver::DpmppSde] {
+            // 2 evals per non-terminal step (0..3), 1 eval on terminal step (3)
+            let mapped: Vec<usize> = (0..7)
+                .map(|eval_idx| step_index_for_eval(solver, eval_idx, total_steps))
+                .collect();
+            assert_eq!(mapped, vec![0, 0, 1, 1, 2, 2, 3], "{solver:?}");
+            assert_eq!(step_index_for_eval(solver, 99, total_steps), 3);
+        }
+        for solver in [
+            Solver::Euler,
+            Solver::EulerAncestral,
+            Solver::Dpmpp2m,
+            Solver::Dpmpp2mSde,
+            Solver::UniPc,
+            Solver::ErSde,
+            Solver::Lcm,
+            Solver::Ddim,
+        ] {
+            let mapped: Vec<usize> = (0..4)
+                .map(|eval_idx| step_index_for_eval(solver, eval_idx, total_steps))
+                .collect();
+            assert_eq!(mapped, vec![0, 1, 2, 3], "{solver:?}");
+            assert_eq!(step_index_for_eval(solver, 10, total_steps), 3);
+        }
+        assert_eq!(step_index_for_eval(Solver::Heun, 0, 0), 0);
+        assert_eq!(canonical_solver_or_euler(None), Solver::Euler);
+        assert_eq!(canonical_solver_or_euler(Some("flow_match")), Solver::Euler);
+        assert_eq!(canonical_solver_or_euler(Some("heun")), Solver::Heun);
+        assert_eq!(
+            canonical_solver_or_euler(Some("dpmpp_sde")),
+            Solver::DpmppSde
+        );
     }
 }

@@ -91,6 +91,8 @@ pub struct IpAdapterFluxRequest {
     /// registered descriptor. Default is inert, and an inert sink makes a seeded render byte-identical
     /// to one with no preview at all.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance configuration for IP-conditioned FLUX.1.
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -110,6 +112,7 @@ impl Default for IpAdapterFluxRequest {
             seed: 0,
             memory: GenerationMemory::default(),
             preview: PreviewSink::default(),
+            pag: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -288,6 +291,7 @@ fn typed_ip_request(
         }],
         memory: Some(req.memory),
         preview: req.preview.clone(),
+        pag: req.pag.clone(),
         cancel: req.cancel.clone(),
         ..Default::default()
     })
@@ -441,11 +445,15 @@ impl IpAdapterFlux {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let pag = resolve_ip_pag_report(self.variant, req, plan)?;
         self.complete_ip_image(
             &req.cancel,
             "flux/ip_provider/generate",
             on_progress,
-            |progress| self.generate_planned(req, reference, plan, progress),
+            |progress| {
+                let image = self.generate_planned(req, reference, plan, progress)?;
+                Ok((image, pag))
+            },
         )
     }
 
@@ -459,12 +467,16 @@ impl IpAdapterFlux {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let pag = resolve_ip_pag_report(self.variant, req, plan)?;
         self.complete_ip_image(
             &req.cancel,
             "flux/ip_provider/generate_with_memory_context",
             on_progress,
             |progress| {
-                self.generate_with_memory_context_planned(context, req, reference, plan, progress)
+                let image = self.generate_with_memory_context_planned(
+                    context, req, reference, plan, progress,
+                )?;
+                Ok((image, pag))
             },
         )
     }
@@ -474,15 +486,26 @@ impl IpAdapterFlux {
         cancel: &CancelFlag,
         route: &'static str,
         on_progress: &mut dyn FnMut(Progress),
-        run: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Image>,
+        run: impl FnOnce(
+            &mut dyn FnMut(Progress),
+        ) -> Result<(Image, Option<candle_gen::gen_core::PagExecutionReport>)>,
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor_for(self.variant), cancel, || {
-            candle_gen::execution::policy("direct_route", route.into());
-            let image = run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
-        })
+        candle_gen::execution::capture_direct_report(
+            &crate::descriptor_for(self.variant),
+            cancel,
+            || {
+                candle_gen::execution::policy("direct_route", route.into());
+                let (image, pag) =
+                    run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
+                let mut report = candle_gen::gen_core::GenerationReport::from_output(
+                    candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+                );
+                report.pag = pag;
+                Ok(report)
+            },
+        )
     }
 
     /// Reference-image T2I from the trajectory [`compile_ip_plan`] froze before load: condition the
@@ -578,6 +601,7 @@ impl IpAdapterFlux {
             return Err(CandleError::Canceled);
         }
         validate_request(req)?;
+        resolve_ip_pag(self.variant, req).map_err(|e| CandleError::Msg(e.to_string()))?;
 
         // Conditioning: text (T5 seq + CLIP pooled) and the reference image tokens (computed once).
         self.backbone
@@ -673,7 +697,7 @@ impl IpAdapterFlux {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        _req: &IpAdapterFluxRequest,
+        req: &IpAdapterFluxRequest,
         state: &State,
         render_plan: &RenderPlan,
         run: &RenderRun<'_, '_>,
@@ -685,6 +709,15 @@ impl IpAdapterFlux {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         candle_gen::check_cancel(cancel)?;
+        let pag = resolve_ip_pag(self.variant, req).map_err(|e| CandleError::Msg(e.to_string()))?;
+        candle_gen::execution::policy(
+            "flux.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(render_plan.sampler()));
+        let total_steps = render_plan.denoise_sigmas().len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(render_plan.guidance(), b_sz, &self.device)?;
         let prepared = self.backbone.prepare_conditioning(
@@ -709,8 +742,18 @@ impl IpAdapterFlux {
             |img, t| -> Result<Tensor> {
                 // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
                 // driver's `CandleError`. The XLabs IP residual injection lives inside this closure.
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let step_pag = pag
+                    .as_ref()
+                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                self.backbone.forward_ip_prepared_with_memory(
+                let pos = self.backbone.forward_ip_prepared_with_memory_pag(
                     heavy,
                     img,
                     &state.img_ids,
@@ -722,10 +765,55 @@ impl IpAdapterFlux {
                     injector,
                     &prepared,
                     cancel,
-                )
+                    None,
+                )?;
+                if step_pag > 0.0 {
+                    let layers = pag
+                        .as_ref()
+                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                    let pert = self.backbone.forward_ip_prepared_with_memory_pag(
+                        heavy,
+                        img,
+                        &state.img_ids,
+                        &state.txt,
+                        &state.txt_ids,
+                        &t_vec,
+                        &state.vec,
+                        Some(&guidance_t),
+                        injector,
+                        &prepared,
+                        cancel,
+                        Some(layers),
+                    )?;
+                    crate::apply_pag_blend(&pos, &pert, step_pag)
+                } else {
+                    Ok(pos)
+                }
             },
         )
     }
+}
+
+fn resolve_ip_pag(
+    variant: Variant,
+    req: &IpAdapterFluxRequest,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagResolved>> {
+    let descriptor = ip_descriptor(variant);
+    let pag_req = GenerationRequest {
+        pag: req.pag.clone(),
+        ..Default::default()
+    };
+    descriptor.capabilities.resolve_pag(descriptor.id, &pag_req)
+}
+
+fn resolve_ip_pag_report(
+    variant: Variant,
+    req: &IpAdapterFluxRequest,
+    plan: &RenderPlan,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagExecutionReport>> {
+    let total_steps = u32::try_from(plan.denoise_sigmas().len().saturating_sub(1))
+        .map_err(|_| candle_gen::gen_core::Error::Unsupported("step count overflow".into()))?;
+    Ok(resolve_ip_pag(variant, req)?.map(|pag| pag.execution_report(total_steps)))
 }
 
 /// Validate the seed-independent request knobs before any tensor work. The empty-prompt guard
@@ -931,7 +1019,45 @@ mod tests {
         assert_eq!(r.steps, 25);
         assert_eq!(r.guidance, 3.5);
         assert_eq!(r.ip_adapter_scale, DEFAULT_IP_SCALE);
+        assert_eq!(r.pag, None);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn ip_pag_resolution_and_validation_match_flux1_variants() {
+        let req = IpAdapterFluxRequest {
+            prompt: "a portrait".into(),
+            steps: 4,
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dev = resolve_ip_pag(Variant::Dev, &req)
+            .unwrap()
+            .expect("dev pag")
+            .execution_report(4);
+        assert_eq!((dev.layers, dev.active_steps, dev.total_steps), (vec![28], 4, 4));
+
+        let schnell = resolve_ip_pag(Variant::Schnell, &req)
+            .unwrap()
+            .expect("schnell pag")
+            .execution_report(4);
+        assert_eq!(
+            (schnell.layers, schnell.active_steps, schnell.total_steps),
+            (vec![28], 3, 4)
+        );
+
+        let bad = IpAdapterFluxRequest {
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 1.2,
+                layers: Some(vec![57]),
+                ..Default::default()
+            }),
+            ..req
+        };
+        assert!(resolve_ip_pag(Variant::Dev, &bad).is_err());
     }
 
     /// `resolve_image_encoder`: a directory resolves `model.safetensors`; a missing dir errors loudly;

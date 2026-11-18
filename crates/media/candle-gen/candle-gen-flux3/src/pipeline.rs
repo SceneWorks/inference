@@ -233,7 +233,7 @@ fn denoise_base_with_references_pag(
     }
     let compute = dit.compute_dtype();
     let total_steps = schedule.len() - 1;
-    let cfg_off_with_pag = pag.is_some() && guidance <= 1.0;
+    let cfg_off_with_pag = gen_core_flux3::base_cfg_off_with_pag(guidance, pag);
     let mut x = noise.to_device(dit.device())?.to_dtype(DType::F32)?;
     let text_tokens = text.tokens.to_device(dit.device())?;
     let neg_tokens = negative
@@ -426,6 +426,10 @@ pub fn denoise_one_with_references(
         "flux3.reference_tokens",
         serde_json::json!(references.is_some()),
     );
+    candle_gen::execution::policy(
+        "flux3.pag",
+        serde_json::to_value(&params.pag).unwrap_or(serde_json::Value::Null),
+    );
     if let Some(guidance) = params.guidance {
         candle_gen::execution::f32_policy("flux3.guidance", guidance);
     }
@@ -548,5 +552,38 @@ mod tests {
         assert_eq!(rgb.pixels[7], 255);
         assert_eq!(rgb.pixels[10], 127);
         assert!(float_image_to_rgb8(&image.reshape((1, 2, 2, 3)).unwrap()).is_err());
+    }
+
+    #[test]
+    fn base_cfg_off_shortcut_only_skips_negative_at_exact_guidance_one() {
+        let cap = gen_core_flux3::flux3_pag_capability(false);
+        let resolved = cap
+            .resolve(Some(&candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }))
+            .unwrap();
+        for (guidance, expect_neg, expect_cfg_off) in [
+            (0.0_f32, true, false),
+            (0.5, true, false),
+            (1.0, false, true),
+            (3.5, true, false),
+        ] {
+            assert_eq!(
+                gen_core_flux3::base_requires_negative_prompt(Some(guidance), Some(&resolved)),
+                expect_neg,
+                "guidance={guidance}"
+            );
+            assert_eq!(
+                gen_core_flux3::base_cfg_off_with_pag(guidance, Some(&resolved)),
+                expect_cfg_off,
+                "guidance={guidance}"
+            );
+            assert!(
+                gen_core_flux3::base_requires_negative_prompt(Some(guidance), None),
+                "without PAG, base always encodes negative at guidance={guidance}"
+            );
+            assert!(!gen_core_flux3::base_cfg_off_with_pag(guidance, None));
+        }
     }
 }
