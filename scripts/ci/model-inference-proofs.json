@@ -61826,8 +61826,8 @@
     "package": "candle-gen-minimax-h3",
     "target": "candle_gen_minimax_h3",
     "target_kind": "lib",
-    "fqn": "dit::model::veda_controls_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
-    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs",
+    "fqn": "dit::model::pag_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/pag_tests.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_minimax_h3",
       "kind": [
@@ -61845,8 +61845,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "Deterministic synthetic 2-block 6-PDD-head H3-Image DiT across dense/Q8/Q4, LoRA/LoKr, AdaLN eviction, and streamed rung-4 CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
-    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
+    "fixture_identity": "Deterministic synthetic 2-block 6-PDD-head H3-Image DiT across dense/Q8/Q4, LoRA/LoKr, AdaLN eviction, and streamed rung-4 CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/pag_tests.rs::dit::model::pag_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/pag_tests.rs::dit::model::pag_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -61854,7 +61854,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/pag_tests.rs::dit::model::pag_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -61872,7 +61872,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/pag_tests.rs::dit::model::pag_tests::image_dit_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream",
       "requirements": []
     }
   },
