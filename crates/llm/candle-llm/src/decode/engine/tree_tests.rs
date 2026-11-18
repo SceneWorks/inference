@@ -544,6 +544,48 @@ impl Proposer for NoisyTree {
     }
 }
 
+/// [`NoisyTree`]'s branching tree on every third pass and no drafts on the two passes after it,
+/// so a tree run also takes 1-token linear verify steps — the steps a CUDA graph serves. Each
+/// capture phase of that shape (warm-up, capture, first-replay check, replay) then follows a tree
+/// step, so the run shows a tree step leaves the runner's graphs usable.
+struct TreeThenLinear {
+    noisy: NoisyTree,
+    passes: usize,
+}
+
+impl Proposer for TreeThenLinear {
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::PromptLookup
+    }
+    fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
+        Ok(())
+    }
+    fn propose(
+        &mut self,
+        _: &ProposeContext<'_>,
+        _: &mut DraftSampler<'_, '_>,
+    ) -> Result<Proposal> {
+        unreachable!("a tree run asks for a tree")
+    }
+    fn propose_tree(
+        &mut self,
+        ctx: &ProposeContext<'_>,
+        sampler: &mut DraftSampler<'_, '_>,
+    ) -> Result<Option<DraftTree>> {
+        let pass = self.passes;
+        self.passes += 1;
+        if pass.is_multiple_of(3) {
+            self.noisy.propose_tree(ctx, sampler)
+        } else {
+            // An empty tree is a chain: the engine verifies `[cur]` alone on the linear path.
+            Ok(Some(DraftTree::new()))
+        }
+    }
+    fn commit(&mut self, _: i32, _: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        Ok(())
+    }
+}
+
 struct Forbid(Vec<bool>, Vec<i32>);
 
 impl ConstraintMask for Forbid {
@@ -1054,15 +1096,19 @@ fn check_graphs<M: StepModel>(name: &str, model: &M, vocab: i32) {
     assert_eq!(step.fallback_reason, Some(REASON_TREE_VERIFY), "{name}");
     cache.abort_tree(base).unwrap();
 
-    // A whole greedy tree run through the runner: the plain loop's tokens; every tree pass is
-    // one of the eager steps, and on CUDA the linear and plain steps still replay their graphs.
+    // A whole greedy tree run through the runner that mixes branching passes with 1-token linear
+    // verify steps: the plain loop's tokens; every tree pass is one of the eager steps, and on
+    // CUDA the linear steps between the tree passes still capture and replay their graph.
     let config = greedy(24);
     let expected = plain(model, &config, None);
     let run = tree_run(
         &runner,
-        &mut NoisyTree {
-            rng: SplitMix64::new(0x7e3e),
-            vocab,
+        &mut TreeThenLinear {
+            noisy: NoisyTree {
+                rng: SplitMix64::new(0x7e3e),
+                vocab,
+            },
+            passes: 0,
         },
         &config,
         16,
@@ -1072,6 +1118,14 @@ fn check_graphs<M: StepModel>(name: &str, model: &M, vocab: i32) {
     let tree = run.record.tree_verify.expect("a tree run reports its tree");
     let graphs = run.record.cuda_graphs;
     assert!(tree.tree_passes > 0, "{name}");
+    // At least four linear steps of one shape: a graph's warm-up, capture, first-replay check
+    // and a replay.
+    assert!(
+        run.stats.verify_steps as u64 >= tree.tree_passes + 4,
+        "{name}: {} verify steps for {} tree passes",
+        run.stats.verify_steps,
+        tree.tree_passes
+    );
     assert!(
         graphs.eager >= tree.tree_passes,
         "{name}: {} for {} tree passes",
@@ -1081,6 +1135,11 @@ fn check_graphs<M: StepModel>(name: &str, model: &M, vocab: i32) {
     if model.device().is_cuda() {
         assert!(graphs.replayed > 0, "{name}: {}", graphs.describe());
         assert!(graphs.captured > 0, "{name}: {}", graphs.describe());
+        assert_eq!(
+            runner.refusal(),
+            None,
+            "{name}: a tree step refuses nothing"
+        );
     } else {
         // Nothing captures off CUDA: no step claims a replay.
         assert_eq!(graphs.replayed, 0, "{name}: {}", graphs.describe());
