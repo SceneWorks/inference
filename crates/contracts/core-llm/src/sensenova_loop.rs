@@ -2,12 +2,14 @@
 //! backends bind weights by physical layer and cache slots by visit order.
 use serde_json::Value;
 
+mod weights;
+pub use weights::{target_tensors, TARGET_SHARDS};
+
 pub const MODEL_REVISION: &str = "3e1ba6e8ac98090f9f7c03a55f26269eb3850fb6";
 
 /// Original sidecars shared byte-for-byte by BF16 and both published native tiers.
 /// Derived snapshots append provenance separately from these model inputs.
 pub fn validate_sidecars(root: &std::path::Path) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
     for (name, expected) in [
         (
             "tokenizer.json",
@@ -35,15 +37,29 @@ pub fn validate_sidecars(root: &std::path::Path) -> Result<(), String> {
         ),
     ] {
         let path = root.join(name);
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| format!("SenseNova-Loop-9B: cannot open {}: {e}", path.display()))?;
-        let mut digest = Sha256::new();
-        std::io::copy(&mut file, &mut digest)
-            .map_err(|e| format!("SenseNova-Loop-9B: cannot hash {}: {e}", path.display()))?;
-        let actual = format!("{:x}", digest.finalize());
-        if actual != expected {
-            return Err(format!("SenseNova-Loop-9B: {name} SHA-256 {actual} differs from release {MODEL_REVISION} ({expected})"));
-        }
+        verify_digest(&path, expected)?;
+    }
+    Ok(())
+}
+
+/// Verify the 11 source shards before assigning the frozen revision to a derived tier.
+pub fn validate_source_shards(root: &std::path::Path) -> Result<(), String> {
+    for &(name, expected) in TARGET_SHARDS {
+        verify_digest(&root.join(name), expected)?;
+    }
+    Ok(())
+}
+
+fn verify_digest(path: &std::path::Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("SenseNova-Loop-9B: cannot open {}: {e}", path.display()))?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)
+        .map_err(|e| format!("SenseNova-Loop-9B: cannot hash {}: {e}", path.display()))?;
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected {
+        return Err(format!("SenseNova-Loop-9B: {} SHA-256 {actual} differs from release {MODEL_REVISION} ({expected})", path.display()));
     }
     Ok(())
 }
