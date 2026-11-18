@@ -8,6 +8,9 @@ if exist "%PUBLISH_REPORTS%" rmdir /s /q "%PUBLISH_REPORTS%"
 mkdir "%PUBLISH_REPORTS%" || exit /b 1
 >>"%GITHUB_ENV%" echo PUBLISH_REPORTS=%PUBLISH_REPORTS%
 if not exist "%PUBLISH_SCRATCH%" mkdir "%PUBLISH_SCRATCH%" || exit /b 1
-rem The bf16 intermediate (54.7 GB) plus Q8 and Q4, and at least 100 GB left free beyond that.
-"%REVIEWED_PYTHON%" -c "import shutil, sys; free = shutil.disk_usage(sys.argv[1]).free // 10**9; need = 105 + 100; print(free, 'GB free,', need, 'GB needed'); sys.exit(0 if free >= need else 1)" "%PUBLISH_SCRATCH%" || (echo ::error::not enough free disk for the PE tiers & exit /b 1)
+rem The bf16 tier (54.7 GB), plus Q8 (31.9 GB) and Q4 (19.8 GB) unless PUBLISH_PE_QUANT is false,
+rem and at least 100 GB left free beyond that.
+set "PE_WRITE_GB=107"
+if /i "%PUBLISH_PE_QUANT%"=="false" set "PE_WRITE_GB=55"
+"%REVIEWED_PYTHON%" -c "import shutil, sys; free = shutil.disk_usage(sys.argv[1]).free // 10**9; need = int(sys.argv[2]) + 100; print(free, 'GB free,', need, 'GB needed'); sys.exit(0 if free >= need else 1)" "%PUBLISH_SCRATCH%" "%PE_WRITE_GB%" || (echo ::error::not enough free disk for the PE tiers & exit /b 1)
 exit /b 0

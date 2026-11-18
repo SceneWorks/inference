@@ -463,9 +463,12 @@ jobs:
   # * macOS: the DiT tiers (mlx-gen-minimax-h3's converter; the MLX affine pack both backends load)
   #   to SceneWorks/minimax-h3-image-mlx `q8/`, `q4/`, and the PE MLX affine tiers to
   #   SceneWorks/minimax-h3-image-pe `q8/`, `q4/`.
-  # * Windows: the PE Candle GGML tiers to SceneWorks/minimax-h3-image-pe `candle-q8/`, `candle-q4/`.
-  #   Candle's qwen3_5 loader reads GGML block storage and MLX reads affine packs, so the PE tiers
-  #   differ per backend. Conversion is CPU-only here.
+  # * Windows: the PE Candle GGML tiers to SceneWorks/minimax-h3-image-pe `candle-q8/`, `candle-q4/`,
+  #   and the dense PE bf16 tier to `bf16/`. Candle's qwen3_5 loader reads GGML block storage and MLX
+  #   reads affine packs, so the quantized PE tiers differ per backend; the bf16 tier is the one
+  #   `convert_snapshot_to_bf16` snapshot both backends load (SW-7099 scored it on each), so it is
+  #   published once, from here. `minimax-h3-image-publish-candle-bf16` converts and publishes only
+  #   bf16, leaving the published q8/q4 untouched. Conversion is CPU-only here.
   mlx-minimax-h3-image-publish:
     name: Publish the H3-Image DiT and PE MLX tiers
     if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-mlx' || inputs.profile == 'minimax-h3-image-publish-mlx-pe' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos-pe')
@@ -533,11 +536,14 @@ jobs:
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/remove-this-runs-scratch.sh
 
   candle-minimax-h3-image-pe-publish:
-    name: Publish the H3-Image PE Candle tiers
-    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-candle')
+    name: Publish the H3-Image PE Candle and bf16 tiers
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-candle' || inputs.profile == 'minimax-h3-image-publish-candle-bf16')
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 720
     env:
+      # `true` also converts and publishes candle-q8/ and candle-q4/; the `-candle-bf16` profile
+      # publishes bf16/ alone.
+      PUBLISH_PE_QUANT: ${{ inputs.profile != 'minimax-h3-image-publish-candle-bf16' }}
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       MINIMAX_PE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--MiniMaxAI--MiniMax-H3-Image-PE\snapshots\35603d4b63949afa12cb098227fffefedf081afa
       PUBLISH_SCRATCH: D:\sceneworks-terminal\weights\sw-7104-publish-${{ github.run_id }}-${{ github.run_attempt }}
