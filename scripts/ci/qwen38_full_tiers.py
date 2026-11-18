@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Convert and publish the fully quantized Qwen3.8-27B tiers (SW-7202, feature SW-F374).
 
-Run only by the dispatch-only `.github/workflows/qwen38-full-tiers.yml`, one model and one backend
-per job:
+Run only by the reusable `.github/workflows/qwen38-full-tiers.yml`, which the dispatch-only
+`qwen38-full-tiers-*` profiles of `.github/workflows/real-weights.yml` call, one model and one
+backend per job:
 
 * `describer` — `huihui-ai/Huihui-Qwen3.8-27B-abliterated` (bf16) to
   `SceneWorks/qwen3.8-27b-abliterated-mlx` (MLX affine) or `SceneWorks/qwen3.8-27b-abliterated-candle`

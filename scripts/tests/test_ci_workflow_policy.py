@@ -317,6 +317,15 @@ def evaluate_policy(
     return evaluate_condition(expression, values)
 
 
+# SW-7202: every dispatch-only route into the reusable qwen38-full-tiers.yml.
+QWEN38_FULL_TIERS_PROFILES = tuple(
+    f"qwen38-full-tiers-{model}-{target}{suffix}"
+    for suffix in ("", "-convert-only")
+    for model in ("describer", "expander")
+    for target in ("mlx-nax-macos", "mlx-nax-macos-2", "candle")
+)
+
+
 def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
     """Exercise the real group expression across both hosts and dispatch boundaries."""
     concurrency = workflow["concurrency"]
@@ -336,6 +345,9 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
                     "moss-edit-cuda", "moss-edit-metal", "moss-cpu-fixture",
                     "moss-metal-fixture", "llm-decoder-fixture", "moss-cuda-unit"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
+                # SW-7202: the full-tier conversions serialize per backend, outside the shared group.
+                if event == "workflow_dispatch" and profile in QWEN38_FULL_TIERS_PROFILES:
+                    expected = "inference-qwen38-full-tiers-" + ("candle" if "-candle" in profile else "mlx")
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
                             ("3", "c" * 40, "imports"), ("4", "d" * 40, "full"),
@@ -5022,6 +5034,90 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 mutated["jobs"]["qwen38-bonsai-candle"]["if"] = unsafe_condition
                 with self.assertRaises(AssertionError):
                     self.assert_qwen38_candle_requires_successful_mlx(mutated)
+
+    def test_qwen38_full_tiers_route_through_the_main_resident_dispatch(self) -> None:
+        """SW-7202: GitHub dispatches only workflows on the default branch, so the full-tier
+        conversion is a reusable workflow reached through real-weights.yml profiles."""
+        caller = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        callee_path = REAL_WEIGHTS_WORKFLOW.with_name("qwen38-full-tiers.yml")
+        callee = yaml.safe_load(callee_path.read_text(encoding="utf-8"))
+        options = caller[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        for profile in QWEN38_FULL_TIERS_PROFILES:
+            self.assertEqual(options.count(profile), 1, profile)
+        self.assertEqual(
+            sorted(option for option in options if option.startswith("qwen38-full-tiers")),
+            sorted(QWEN38_FULL_TIERS_PROFILES),
+        )
+        # GitHub caps workflow_dispatch at 25 inputs: routes are profile values, never new inputs.
+        self.assertLessEqual(len(caller[True]["workflow_dispatch"]["inputs"]), 25)
+
+        job = caller["jobs"]["qwen38-full-tiers"]
+        self.assertEqual(job["needs"], "validate-selection")
+        self.assertEqual(job["uses"], "./.github/workflows/qwen38-full-tiers.yml")
+        self.assertEqual(
+            job["if"],
+            "github.event_name == 'workflow_dispatch' && ("
+            + " || ".join(f"inputs.profile == '{profile}'" for profile in QWEN38_FULL_TIERS_PROFILES)
+            + ")",
+        )
+
+        def render(expression: str, profile: str):
+            body = expression.removeprefix("${{").removesuffix("}}").strip()
+            body = re.sub(r"contains\(inputs\.profile, ('[^']*')\)", r"(\1 in profile)", body)
+            body = re.sub(r"!endsWith\(inputs\.profile, ('[^']*')\)", r"(not profile.endswith(\1))", body)
+            body = body.replace("&&", " and ").replace("||", " or ")
+            return eval(body, {"__builtins__": {}}, {"profile": profile})
+
+        for profile in QWEN38_FULL_TIERS_PROFILES:
+            with self.subTest(profile=profile):
+                rendered = {key: render(value, profile) for key, value in job["with"].items()}
+                self.assertEqual(
+                    rendered,
+                    {
+                        "model": "expander" if "-expander-" in profile else "describer",
+                        "backend": "candle" if "-candle" in profile else "mlx",
+                        "mac_runner": "nax-macos-2" if "-mlx-nax-macos-2" in profile else "nax-macos",
+                        "publish": not profile.endswith("-convert-only"),
+                    },
+                )
+
+        events = callee[True]
+        self.assertEqual(set(events), {"workflow_call"})
+        self.assertEqual(set(events["workflow_call"]["inputs"]), {"model", "backend", "mac_runner", "publish"})
+        self.assertNotIn("concurrency", callee)
+        jobs = callee["jobs"]
+        self.assertEqual(set(jobs), {"mlx", "candle"})
+        for name, job in jobs.items():
+            self.assertNotIn("concurrency", job)
+            self.assertEqual(
+                job["if"],
+                f"github.event_name == 'workflow_dispatch' && inputs.backend == '{name}'",
+            )
+        mlx = jobs["mlx"]
+        self.assertEqual(
+            mlx["runs-on"],
+            ["self-hosted", "macOS", "ARM64",
+             "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"],
+        )
+        refuse = mlx["steps"][1]
+        self.assertEqual(refuse["name"], "Refuse any runner but the selected Mac")
+        self.assertIn('[[ "$RUNNER_NAME" == "$MAC_RUNNER" ]] ||', refuse["run"])
+        self.assertEqual(mlx["env"]["MAC_RUNNER"], "${{ inputs.mac_runner }}")
+        for runner, selected, succeeds in (
+            ("nax-macos", "nax-macos", True),
+            ("nax-macos-2", "nax-macos-2", True),
+            ("nax-macos-2", "nax-macos", False),
+            ("nax-macos", "nax-macos-2", False),
+            ("nax-macos", "", False),
+        ):
+            with self.subTest(runner=runner, selected=selected):
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-c", refuse["run"]],
+                    env={"PATH": os.environ["PATH"], "RUNNER_NAME": runner, "MAC_RUNNER": selected},
+                    capture_output=True, text=True, encoding="utf-8", check=False,
+                )
+                self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+        self.assertEqual(jobs["candle"]["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
 
     def test_qwen38_bonsai_terminal_profile_is_accelerator_only_and_sealed(self) -> None:
         workflow = yaml.safe_load(real_weights_inline_text())

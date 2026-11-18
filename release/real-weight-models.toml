@@ -3571,7 +3571,8 @@ expected_files = [
 ]
 
 # SW-7202 (feature SW-F374): the full-precision source of the Qwen3.8-27B describer's fully
-# quantized tiers. `qwen38-full-tiers.yml` materializes it on nax-macos-2 (MLX) and on the CUDA
+# quantized tiers. `qwen38-full-tiers.yml` (dispatched through the `qwen38-full-tiers-describer-*`
+# profiles of `real-weights.yml`) materializes it on the selected Mac (MLX) and on the CUDA
 # real-weights box (Candle) and converts it with `prepare_snapshot ... q8-full` / `q4-full`
 # before publishing the tiers to SceneWorks/qwen3.8-27b-abliterated-{mlx,candle}.
 [[models]]
