@@ -121983,7 +121983,43 @@
       "fixture_kind": "source-defined",
       "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_fully_quantized_tiers_decode_like_the_plain_tier",
       "requirements": []
-    }
+    },
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_fully_quantized_tiers_decode_like_the_plain_tier/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_fully_quantized_tiers_decode_like_the_plain_tier/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "cfg(feature = \"cuda\") selects Device::new_cuda(0): both tiers load and decode on CUDA, including the Q8 embedding row gather over its U8 blocks.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only"
   },
   {
     "package": "candle-llm",
@@ -125002,7 +125038,20 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "hub_snapshots": [
+      {
+        "environment": "QWEN38_FULL_TIER_SNAPSHOT",
+        "request_bound": true
+      },
+      {
+        "environment": "QWEN38_PLAIN_TIER_SNAPSHOT",
+        "choices": [
+          "SceneWorks/qwen3.8-27b-abliterated-candle@accaccc109912b9b194f7d5a47f2123fdc70672e/q8",
+          "SceneWorks/qwen3.8-27b-abliterated-candle@accaccc109912b9b194f7d5a47f2123fdc70672e/q4"
+        ]
+      }
+    ]
   },
   {
     "package": "candle-llm",
@@ -273088,7 +273137,7 @@
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
-    "fixture_identity": "caller-provided fully quantized and plain Qwen3.8-27B MLX tiers (QWEN38_FULL_TIER_SNAPSHOT, QWEN38_PLAIN_TIER_SNAPSHOT)",
+    "fixture_identity": "product-pinned Qwen3.8-27B MLX tiers staged into the runner Hub cache: request-bound fully quantized tier (QWEN38_FULL_TIER_SNAPSHOT) and the plain tier of the same bits (QWEN38_PLAIN_TIER_SNAPSHOT)",
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
@@ -273146,6 +273195,19 @@
     "required_environment": [
       "QWEN38_FULL_TIER_SNAPSHOT",
       "QWEN38_PLAIN_TIER_SNAPSHOT"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "QWEN38_FULL_TIER_SNAPSHOT",
+        "request_bound": true
+      },
+      {
+        "environment": "QWEN38_PLAIN_TIER_SNAPSHOT",
+        "choices": [
+          "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q8",
+          "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4"
+        ]
+      }
     ]
   },
   {

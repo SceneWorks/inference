@@ -193,6 +193,34 @@ class ModelWorkflowRoutes(unittest.TestCase):
                     resolved = subprocess.run(['/bin/bash', '-c', 'command -v cargo; command -v rustc; command -v rustup'], env=env, capture_output=True, text=True, check=True, encoding="utf-8")
                     self.assertEqual(resolved.stdout.splitlines(), [str(rustup_bin / tool) for tool in ('cargo', 'rustc', 'rustup')])
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX shell mock; Windows selector is source-checked')
+    def test_hosted_macos_selects_the_homebrew_rustup_proxies(self):
+        steps = document('model-inference-proofs.yml')['jobs']['prove']['steps']
+        command = next(step['run'] for step in steps if step.get('name') == 'Select Rustup proxies on Linux and macOS')
+        for environment, selected in (('github-hosted', True), ('self-hosted', False)):
+            with self.subTest(environment=environment), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                brew_rustup = root / 'homebrew' / 'opt' / 'rustup'
+                (brew_rustup / 'bin').mkdir(parents=True)
+                tools = root / 'tools'
+                tools.mkdir()
+                (tools / 'brew').write_text(f'#!/bin/sh\n[ "$*" = "--prefix rustup" ] && printf "%s\\n" "{brew_rustup}"\n', encoding='utf-8')
+                (tools / 'brew').chmod(0o755)
+                for tool in ('cargo', 'rustc', 'rustup'):
+                    (brew_rustup / 'bin' / tool).write_text('#!/bin/sh\n', encoding='utf-8')
+                    (brew_rustup / 'bin' / tool).chmod(0o755)
+                destination = root / 'github-path'
+                env = dict(os.environ, HOME=str(root / 'home'), PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                           GITHUB_PATH=str(destination), RUNNER_OS='macOS', MODEL_PROOF_RUNNER_ENVIRONMENT=environment)
+                env.pop('CARGO_HOME', None)
+                result = subprocess.run(['/bin/bash', '-eo', 'pipefail', '-c', command], env=env, capture_output=True, text=True, encoding='utf-8')
+                if selected:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(destination.read_text(encoding='utf-8'), str(brew_rustup / 'bin') + '\n')
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(destination.exists())
+
     def test_kv_gpu_boundaries_retain_frozen_targets_and_include_controller_lease(self):
         workflow = document('kv-poc-campaign.yml')
         seen = set()
