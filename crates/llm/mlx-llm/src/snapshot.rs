@@ -82,10 +82,22 @@ fn create_stage_dir(out_dir: &Path) -> Result<PathBuf> {
 pub(crate) fn write_streaming_snapshot(
     out_dir: &Path,
     keys: &[String],
+    config: Value,
+    tokenizer: &SnapshotTokenizer,
+    quantize: Option<QuantSpec>,
+    load: impl FnMut(&str) -> Result<Array>,
+) -> Result<SnapshotReport> {
+    write_streaming_snapshot_with_sidecars(out_dir, keys, config, tokenizer, quantize, load, None)
+}
+
+fn write_streaming_snapshot_with_sidecars(
+    out_dir: &Path,
+    keys: &[String],
     mut config: Value,
     tokenizer: &SnapshotTokenizer,
     quantize: Option<QuantSpec>,
     mut load: impl FnMut(&str) -> Result<Array>,
+    sidecars: Option<&Path>,
 ) -> Result<SnapshotReport> {
     if out_dir.exists() {
         if out_dir.is_dir() && std::fs::read_dir(out_dir)?.next().is_none() {
@@ -112,7 +124,12 @@ pub(crate) fn write_streaming_snapshot(
         let mut staged = BTreeMap::new();
         let mut quantized_projections = 0;
         for (index, key) in keys.iter().enumerate() {
-            let arr = load(key)?.as_dtype(STORE_DTYPE)?;
+            let arr = load(key)?;
+            let arr = if config.get("sensenova_mlx").is_some() {
+                arr
+            } else {
+                arr.as_dtype(STORE_DTYPE)?
+            };
             let outputs = if let Some(spec) = quantize.filter(|_| is_projection(key)) {
                 let base = key.strip_suffix(".weight").unwrap();
                 let q = QuantizedLinear::quantize(&arr, spec.group_size, spec.bits, None)?;
@@ -174,6 +191,9 @@ pub(crate) fn write_streaming_snapshot(
         for tensor in staged.values() {
             std::fs::remove_file(&tensor.path)?;
         }
+        if let Some(source) = sidecars {
+            copy_snapshot_sidecars(source, &stage)?;
+        }
         std::fs::rename(&stage, out_dir)?;
         Ok(SnapshotReport {
             num_tensors: staged.len(),
@@ -195,6 +215,14 @@ fn array_payload(array: &Array) -> Result<(&'static str, Vec<u8>)> {
                 .as_slice::<bf16>()
                 .iter()
                 .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        )),
+        Dtype::Float32 => Ok((
+            "F32",
+            array
+                .as_slice::<f32>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
                 .collect(),
         )),
         Dtype::Uint32 => Ok((
@@ -733,6 +761,37 @@ ArtifactInput,
         tokenizer_config_json: read_to_string_if_exists(&source.join("tokenizer_config.json"))?,
     };
 
+    if core_llm::sensenova_loop::SenseNovaLoop::from_config(&config)
+        .map_err(Error::Config)?
+        .is_some()
+    {
+        if config.get("quantization").is_some() || drop_native_mtp {
+            return Err(Error::Config(
+                "SenseNova-Loop-9B preparation requires the original BF16 target".into(),
+            ));
+        }
+        if let Some(spec) = quantize {
+            let weights = Weights::from_configured_dir(source, &config)?;
+            core_llm::sensenova_loop::validate_source_shards(source).map_err(Error::Config)?;
+            config["sensenova_mlx"] = crate::sensenova_snapshot::manifest(spec.bits);
+            let mut inputs = weights.into_map();
+            let mut keys: Vec<_> = inputs.keys().cloned().collect();
+            keys.sort();
+            return write_streaming_snapshot_with_sidecars(
+                out_dir,
+                &keys,
+                config,
+                &tokenizer,
+                quantize,
+                |key| {
+                    inputs
+                        .remove(key)
+                        .ok_or_else(|| Error::MissingTensor(key.into()))
+                },
+                Some(source),
+            );
+        }
+    }
     let mut tensors = Weights::from_dir(source)?.into_map();
     if drop_native_mtp {
         tensors.retain(|key, _| !key.starts_with("mtp."));
@@ -747,10 +806,12 @@ ArtifactInput,
 /// set ([`crate::provider::eos_token_ids`] — Qwen3.6's `<|im_end|>` lives only there),
 /// `chat_template.jinja` the sidecar template that wins over the tokenizer config's, and
 /// `processor_config.json` the Gemma 4 multimodal front-end's geometry.
-pub const SNAPSHOT_SIDECARS: [&str; 3] = [
+pub const SNAPSHOT_SIDECARS: [&str; 5] = [
     "generation_config.json",
     "chat_template.jinja",
     "processor_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
 ];
 
 /// Copy every [`SNAPSHOT_SIDECARS`] file `source` has into `out_dir`, byte for byte, so a written
