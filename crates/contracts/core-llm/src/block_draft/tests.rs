@@ -70,7 +70,14 @@ fn the_published_dspine_config_parses_to_its_inference_contract() {
     assert_eq!(cfg.head_topk, 16);
     assert_eq!(cfg.max_depth(), 15, "block 16 = anchor + 15 drafts");
     assert_eq!(cfg.tap_width(), 5 * 5120);
-    assert_eq!((cfg.code_size, cfg.bridge_rank), (1024, 512));
+    assert!(matches!(
+        cfg.head,
+        BlockDraftHead::DSpine {
+            code_size: 1024,
+            bridge_rank: 512,
+            ..
+        }
+    ));
     assert!(cfg.mismatches(&qwen38_27b()).is_empty());
 }
 
@@ -319,4 +326,274 @@ fn the_advertisement_is_bounded_by_the_verify_depth_and_the_trained_block() {
     assert_eq!((cap.max_depth, cap.recommended_depth), (8, 4));
     let shallow = block_draft_capabilities(8, 2, &depths);
     assert_eq!((shallow.max_depth, shallow.recommended_depth), (2, 2));
+}
+
+// ---- DFlash2 (SW-7194). ----
+
+/// `incoai/Qwen3.8-27B-DFlash2`'s published `config.json` (Apache-2.0; the SceneWorks re-host
+/// `SceneWorks/qwen3.8-27b-dflash2` @ `9030fabf` carries the same bytes), verbatim.
+fn dflash2_27b() -> Value {
+    serde_json::json!({
+        "architectures": ["DFlash2DraftModel"],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": null,
+        "is_causal": false,
+        "dflash_config": {
+            "block_size": 8,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "mask_token_id": 248070,
+            "selector_rank": 256,
+            "selector_top_k": 16,
+            "target_layer_ids": [5, 19, 33, 47, 61]
+        },
+        "dtype": "bfloat16",
+        "eos_token_id": 248044,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 5120,
+        "initializer_range": 0.02,
+        "intermediate_size": 17408,
+        "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention"],
+        "max_position_embeddings": 262144,
+        "max_window_layers": 5,
+        "model_type": "qwen3",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 5,
+        "num_key_value_heads": 8,
+        "num_target_layers": 64,
+        "pad_token_id": 248044,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
+        "sliding_window": 2048,
+        "tie_word_embeddings": false,
+        "transformers_version": "5.15.0",
+        "use_cache": true,
+        "use_sliding_window": true,
+        "vocab_size": 248320
+    })
+}
+
+#[test]
+fn the_published_dflash2_config_parses_to_its_inference_contract() {
+    let cfg = BlockDraftConfig::from_json(&dflash2_27b()).unwrap();
+    assert_eq!(cfg.format, BlockDraftFormat::DFlash2);
+    assert_eq!(cfg.format.label(), "dflash2");
+    assert_eq!(cfg.target_layer_ids, [5, 19, 33, 47, 61]);
+    assert_eq!(cfg.mask_token_id, 248070);
+    assert_eq!(cfg.sliding_window, Some(2048));
+    assert_eq!(cfg.context_rows(), Some(2047), "E5: the 2,048-token window");
+    assert_eq!(cfg.max_depth(), 7, "block 8 = anchor + 7 drafts");
+    assert_eq!(cfg.head_topk, 16, "selector_top_k");
+    assert_eq!(cfg.rope_theta, 1e7);
+    assert_eq!(
+        cfg.head,
+        BlockDraftHead::DFlash2 {
+            conv_kernel_size: 2,
+            conv_group_size: 16,
+            selector_rank: 256,
+            causal: false,
+            input_embedding_scale: 1.0,
+            output_multiplier: 1.0,
+            final_logit_softcapping: None,
+        }
+    );
+    assert!(cfg.mismatches(&qwen38_27b()).is_empty());
+}
+
+/// AC2: the format is the checkpoint's `architectures`, and a DFlash2 draft trained for another
+/// target is refused with every typed reason.
+#[test]
+fn architectures_select_dflash2_and_a_draft_for_another_target_is_refused_by_type() {
+    assert_eq!(
+        BlockDraftFormat::from_config(&dflash2_27b()),
+        Some(BlockDraftFormat::DFlash2)
+    );
+    assert_eq!(
+        BlockDraftFormat::from_config(&dspine_b16()),
+        Some(BlockDraftFormat::DSpine)
+    );
+    let cfg = BlockDraftConfig::from_json(&dflash2_27b()).unwrap();
+    // Qwen3.6-35B-A3B: 2048 wide, 40 layers, the same vocabulary.
+    let other = BlockDraftTarget {
+        hidden_size: 2048,
+        num_layers: 40,
+        ..qwen38_27b()
+    };
+    let refusals = cfg.mismatches(&other);
+    assert_eq!(
+        refusals
+            .iter()
+            .map(BlockDraftRefusal::kind)
+            .collect::<Vec<_>>(),
+        ["hidden_size", "target_layers"]
+    );
+    assert_eq!(
+        block_draft_refusal_reason(&refusals),
+        "block draft: hidden_size: hidden_size 5120 != target 2048; block draft: target_layers: \
+         target_layer_ids [5, 19, 33, 47, 61] (built for 64 target layers) do not fit a 40-layer \
+         target"
+    );
+    // A Qwen3 (151k vocabulary) target: the head and the mask token do not fit either.
+    let qwen3 = BlockDraftTarget {
+        vocab_size: 151_936,
+        tokenizer_vocab: 151_669,
+        ..qwen38_27b()
+    };
+    assert_eq!(
+        cfg.mismatches(&qwen3)
+            .iter()
+            .map(BlockDraftRefusal::kind)
+            .collect::<Vec<_>>(),
+        ["vocabulary", "mask_token"]
+    );
+}
+
+#[test]
+fn a_config_outside_the_dflash2_contract_is_refused_by_name() {
+    let refused = |edit: &dyn Fn(&mut Value)| {
+        let mut raw = dflash2_27b();
+        edit(&mut raw);
+        let err = BlockDraftConfig::from_json(&raw).unwrap_err();
+        assert_eq!(err.kind(), "format");
+        err.to_string()
+    };
+    assert!(
+        refused(&|v| v["dflash_config"]["selected_prefix_code_bridge"] =
+            serde_json::json!({"code_size": 8}))
+        .contains("a head a DFlash2 draft does not have")
+    );
+    assert!(
+        refused(&|v| v["dflash_config"]["conv_group_size"] = 48.into())
+            .contains("convolution groups")
+    );
+    assert!(refused(&|v| {
+        v["dflash_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("selector_rank");
+    })
+    .contains("`selector_rank`"));
+    assert!(refused(&|v| v["is_causal"] = "no".into()).contains("`is_causal`"));
+    assert!(
+        refused(&|v| v["layer_types"][2] = "full_attention".into()).contains("one sliding window")
+    );
+    assert!(
+        refused(&|v| v["rope_parameters"]["rope_type"] = "yarn".into()).contains("default RoPE")
+    );
+    assert!(
+        refused(&|v| v["dflash_config"]["selector_top_k"] = 300_000.into())
+            .contains("exceeds the 248320-token vocabulary")
+    );
+    // `is_causal` unset follows the layer type (sliding layers are causal), as the reference.
+    let mut raw = dflash2_27b();
+    raw.as_object_mut().unwrap().remove("is_causal");
+    let cfg = BlockDraftConfig::from_json(&raw).unwrap();
+    assert!(matches!(
+        cfg.head,
+        BlockDraftHead::DFlash2 { causal: true, .. }
+    ));
+    // A DSpine config naming DFlash2's heads stays refused under its own contract.
+    let mut dspine = dspine_b16();
+    dspine["dflash_config"]["selector_rank"] = 256.into();
+    assert!(BlockDraftConfig::from_json(&dspine)
+        .unwrap_err()
+        .to_string()
+        .contains("a head a DSpine draft does not have"));
+}
+
+/// The published checkpoint's 81 tensors: 6 top-level, 15 per layer × 5, at the shapes its
+/// header declares.
+#[test]
+fn the_dflash2_tensor_list_is_the_published_checkpoints() {
+    let cfg = BlockDraftConfig::from_json(&dflash2_27b()).unwrap();
+    let tensors = cfg.tensors();
+    assert_eq!(tensors.len(), 6 + 15 * 5);
+    let shape_of = |n: &str| tensors.iter().find(|(m, _)| m == n).map(|(_, s)| s.clone());
+    for (name, shape) in [
+        ("fc.weight", vec![5120, 25600]),
+        (
+            "candidate_selector.hidden_projection.weight",
+            vec![256, 5120],
+        ),
+        ("candidate_selector.predecessor_codebook", vec![248320, 256]),
+        ("candidate_selector.successor_codebook", vec![248320, 256]),
+        ("layers.4.attention_conv.base_kernel", vec![2, 2, 5120]),
+        (
+            "layers.4.attention_conv.kernel_projection.weight",
+            vec![1280, 5120],
+        ),
+        ("layers.0.mlp_conv.base_kernel", vec![2, 2, 5120]),
+        (
+            "layers.0.mlp_conv.kernel_projection.weight",
+            vec![1280, 5120],
+        ),
+        ("layers.2.self_attn.o_proj.weight", vec![5120, 4096]),
+    ] {
+        assert_eq!(shape_of(name), Some(shape), "{name}");
+    }
+    let names: Vec<&str> = tensors.iter().map(|(n, _)| n.as_str()).collect();
+    cfg.check_tensors(shape_of, names.iter().copied()).unwrap();
+    // A DSpine marker in a DFlash2 checkpoint is an unused tensor.
+    let err = cfg
+        .check_tensors(shape_of, names.iter().copied().chain(["mask_embedding"]))
+        .unwrap_err();
+    assert!(err.to_string().contains("unused tensors mask_embedding"));
+    let bf16: u64 = tensors
+        .iter()
+        .map(|(_, s)| s.iter().map(|&d| d as u64).product::<u64>() * 2)
+        .sum();
+    // The published `model.safetensors` is 3,848,817,896 bytes: this payload plus its header.
+    assert_eq!(bf16, 3_848_808_960);
+}
+
+/// E8: DFlash2 quantizes `fc`, every layer projection, both convolutions' kernel projections and
+/// the selector's hidden projection; it loads layer by layer (no checks group), and is priced as
+/// its resident arrays plus two of the largest group's windows (a layer's nine BF16 matrices).
+#[test]
+fn the_dflash2_load_is_priced_by_the_groups_it_materializes() {
+    let cfg = BlockDraftConfig::from_json(&dflash2_27b()).unwrap();
+    let quantized = cfg.quantized_matrices();
+    assert_eq!(quantized.len(), 1 + 9 * 5 + 1);
+    assert!(quantized.contains(&"layers.3.mlp_conv.kernel_projection.weight".to_string()));
+    assert!(quantized.contains(&"candidate_selector.hidden_projection.weight".to_string()));
+    assert!(!quantized
+        .iter()
+        .any(|q| q.contains("codebook") || q.contains("base_kernel")));
+    let groups = cfg.load_groups();
+    assert_eq!(groups.len(), cfg.num_hidden_layers + 1);
+    let mut read: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.tensors.iter().map(String::as_str))
+        .collect();
+    read.sort_unstable();
+    let mut stored: Vec<String> = cfg.tensors().into_iter().map(|(n, _)| n).collect();
+    stored.sort_unstable();
+    assert_eq!(read, stored, "every tensor in exactly one group");
+    assert!(groups[..cfg.num_hidden_layers]
+        .iter()
+        .enumerate()
+        .all(|(i, g)| g.tensors.len() == 15
+            && g.tensors
+                .iter()
+                .all(|t| t.starts_with(&format!("layers.{i}.")))));
+    let largest = groups.iter().map(|g| g.window).max().unwrap();
+    assert_eq!(largest, 665_845_760, "a layer's nine BF16 matrices");
+    assert_eq!(cfg.resident_bytes(BlockDraftPrecision::Q8), 2_164_124_160);
+    assert_eq!(cfg.resident_bytes(BlockDraftPrecision::Q4), 1_265_625_600);
+    for precision in [BlockDraftPrecision::Q8, BlockDraftPrecision::Q4] {
+        assert_eq!(
+            cfg.load_bytes(precision),
+            cfg.resident_bytes(precision) + 2 * largest
+        );
+    }
+    let at = |prompt: usize| cfg.request_bytes(prompt, 256, 7).unwrap();
+    assert!(at(100) < at(1_500));
+    assert_eq!(
+        at(5_000),
+        at(50_000),
+        "E5: the 2,048-token window caps every term"
+    );
 }

@@ -98,8 +98,8 @@ pub mod vision_preprocess;
 
 pub use block_draft::{
     block_draft_capabilities, block_draft_refusal_reason, BlockDraftConfig, BlockDraftFormat,
-    BlockDraftLoadGroup, BlockDraftPrecision, BlockDraftRefusal, BlockDraftTarget,
-    BLOCK_DRAFT_GROUP_SIZE, BLOCK_DRAFT_RECOMMENDED_DEPTH,
+    BlockDraftHead, BlockDraftLoadGroup, BlockDraftPrecision, BlockDraftRefusal, BlockDraftTarget,
+    BLOCK_DRAFT_GROUP_SIZE, BLOCK_DRAFT_RECOMMENDED_DEPTH, DFLASH2_CONVS,
 };
 pub use cancel::CancelFlag;
 pub use capabilities::{

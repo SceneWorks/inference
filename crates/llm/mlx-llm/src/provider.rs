@@ -1074,14 +1074,14 @@ struct ResidentDraft {
 
 /// A block draft resident beside its Qwen35 target (SW-F360).
 struct ResidentBlockDraft {
-    model: crate::models::DSpineDraft,
+    model: crate::models::BlockDraft,
     /// What the decode report names it by (E8).
     report: core_llm::DecodeDraft,
 }
 
 /// A named draft's load bytes: a block draft (its `architectures`, SW-F360) priced by the shared
 /// [`core_llm::BlockDraftConfig::load_bytes`] at its requested precision — its group-by-group
-/// load ([`crate::models::DSpineDraft::load`]) plus that load's pacing slack — any other draft by
+/// load ([`crate::models::BlockDraft::load`]) plus that load's pacing slack — any other draft by
 /// the ordinary load estimate.
 fn draft_required_bytes(spec: &LoadSpec) -> CoreResult<u64> {
     let dir = Path::new(&spec.source);
@@ -1954,7 +1954,9 @@ impl LlamaProvider {
                 )
                 .to_string());
             };
-            if target.is_prism() {
+            // DSpine's refinement scores candidates against the LM head's dense rows; DFlash2's
+            // selector reads only the head's logits, which a Prism head computes as any other.
+            if target.is_prism() && format == core_llm::BlockDraftFormat::DSpine {
                 return Err(core_llm::BlockDraftRefusal::TargetFamily(
                     "a Prism target's packed LM head has no dense rows for the refinement".into(),
                 )
@@ -1973,13 +1975,14 @@ impl LlamaProvider {
             if !mismatches.is_empty() {
                 return Err(core_llm::block_draft_refusal_reason(&mismatches));
             }
-            let model = crate::models::DSpineDraft::load(Path::new(&source), cfg, precision)
+            let label = cfg.format.label();
+            let model = crate::models::BlockDraft::load(Path::new(&source), cfg, precision)
                 .map_err(refused)?;
             Ok(ResidentBlockDraft {
                 model,
                 report: core_llm::DecodeDraft {
                     source: source.clone(),
-                    format: format.label().into(),
+                    format: label.into(),
                     precision: precision.label().into(),
                 },
             })

@@ -1,7 +1,8 @@
-//! The block-draft proposer (epic SW-F360, story SW-7193): a DSpine draft
-//! ([`DSpineDraft`]) proposing a whole block per step from the Qwen35 target's hidden rows at
-//! its `target_layer_ids`, verified by the engine's ordinary linear verifier and rolled back
-//! through the hybrid's checkpoint ring ([`CheckpointRingRollback`]).
+//! The block-draft proposer (epic SW-F360, stories SW-7193 and SW-7194): a block draft
+//! ([`BlockDraft`] — DSpine or DFlash2, as the checkpoint's `architectures` name it) proposing a
+//! whole block per step from the Qwen35 target's hidden rows at its `target_layer_ids`, verified
+//! by the engine's ordinary linear verifier and rolled back through the hybrid's checkpoint ring
+//! ([`CheckpointRingRollback`]).
 //!
 //! The target side is [`TappedQwen35`]: the Qwen35 hybrid whose hidden rows, when a proposer asks
 //! for them, are the **tapped** layer outputs rather than the final-normalized rows — so the
@@ -19,7 +20,7 @@ use crate::decode::engine::{
     SpeculativeTarget, TargetOutput,
 };
 use crate::error::{Error, Result};
-use crate::models::{DSpineContext, DSpineDraft, Qwen35Cache, Qwen35Model};
+use crate::models::{BlockDraft, BlockDraftContext, Qwen35Cache, Qwen35Model};
 use crate::primitives::input_ids;
 
 /// The Qwen35 hybrid as a block draft's target: its hidden rows are the outputs of `layers`
@@ -36,7 +37,7 @@ pub struct TappedQwen35<'m> {
 
 impl<'m> TappedQwen35<'m> {
     /// `model` tapped for `draft`.
-    pub fn for_draft(model: &'m Qwen35Model, draft: &DSpineDraft) -> Self {
+    pub fn for_draft(model: &'m Qwen35Model, draft: &BlockDraft) -> Self {
         Self {
             model,
             layers: draft.config().target_layer_ids.clone(),
@@ -97,17 +98,19 @@ impl SpeculativeTarget for TappedQwen35<'_> {
     }
 }
 
-/// A DSpine block draft as the engine's proposer over a [`TappedQwen35`] target.
+/// A block draft as the engine's proposer over a [`TappedQwen35`] target, whichever its format:
+/// both yield per-row candidates and a predecessor-conditioned score table
+/// ([`BlockDraft::propose`]) the proposer walks into the linear proposal.
 ///
-/// Its only state is the draft's context ([`DSpineContext`]): the target-confirmed rows, never a
+/// Its only state is the draft's context ([`BlockDraftContext`]): the target-confirmed rows, never a
 /// draft row. A proposal reads it; a commit appends the target's rows for `[cur, accepted…]` — the
 /// rows the verify forward computed for the committed tokens — so a rejection needs no rollback
 /// and a rebuild is never needed: overwritten history never entered the context (E2).
 pub struct BlockDraftProposer<'d> {
-    draft: &'d DSpineDraft,
-    context: Option<DSpineContext>,
-    /// The last proposal's per-row candidates (top-`K` ids of each draft row, ascending) — what a
-    /// tree verifier takes in place of the single chain (SW-7196).
+    draft: &'d BlockDraft,
+    context: Option<BlockDraftContext>,
+    /// The last proposal's per-row candidates (top-`K` ids of each draft row, ascending; DFlash2's
+    /// selector candidates) — what a tree verifier takes in place of the single chain (SW-7196).
     candidates: Vec<Vec<i32>>,
     /// Draft block forwards issued.
     pub draft_forwards: u64,
@@ -115,7 +118,7 @@ pub struct BlockDraftProposer<'d> {
 
 impl<'d> BlockDraftProposer<'d> {
     /// A proposer over `draft`.
-    pub fn new(draft: &'d DSpineDraft) -> Self {
+    pub fn new(draft: &'d BlockDraft) -> Self {
         Self {
             draft,
             context: None,
@@ -130,11 +133,11 @@ impl<'d> BlockDraftProposer<'d> {
     }
 
     /// The draft's context (`None` before the warm-up).
-    pub fn context(&self) -> Option<&DSpineContext> {
+    pub fn context(&self) -> Option<&BlockDraftContext> {
         self.context.as_ref()
     }
 
-    fn context_mut(&mut self) -> Result<&mut DSpineContext> {
+    fn context_mut(&mut self) -> Result<&mut BlockDraftContext> {
         self.context
             .as_mut()
             .ok_or_else(|| Error::Msg("BlockDraftProposer: used before warm".into()))
@@ -193,10 +196,13 @@ impl Proposer<TappedQwen35<'_>> for BlockDraftProposer<'_> {
             .context
             .as_ref()
             .ok_or_else(|| Error::Msg("BlockDraftProposer: propose before warm".into()))?;
-        let out = draft.block(context, &embeds, ctx.cur)?;
-        let (cand, table) = draft.table(&out, ctx.cur, &|rows| model.lm_head(rows), &|ids| {
-            model.lm_head_rows(ids)
-        })?;
+        let (cand, table) = draft.propose(
+            context,
+            &embeds,
+            ctx.cur,
+            &|rows| model.lm_head(rows),
+            &|ids| model.lm_head_rows(ids),
+        )?;
         eval([&cand, &table])?;
         self.draft_forwards += 1;
         let k = cand.shape()[1] as usize;

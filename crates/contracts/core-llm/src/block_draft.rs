@@ -7,9 +7,9 @@
 //! tokens, one draft forward. The checkpoint's `architectures` selects the format
 //! ([`BlockDraftFormat`]) — a load names it through the ordinary
 //! [`LoadSpec::draft_source`](crate::LoadSpec::draft_source), and a provider that sees a block
-//! draft there advertises `block_draft` instead of `draft_model`. A second format (DFlash2)
-//! plugs in as another [`BlockDraftFormat`] arm with its own [`BlockDraftConfig::from_json`]
-//! contract and tensor list.
+//! draft there advertises `block_draft` instead of `draft_model`. Each format (DSpine, DFlash2) is
+//! a [`BlockDraftFormat`] arm with its own [`BlockDraftConfig::from_json`] contract, its own
+//! [`BlockDraftHead`] and its own tensor list (SW-7193, SW-7194).
 //!
 //! Both backends read the config through [`BlockDraftConfig::read`], check it against the target
 //! with [`BlockDraftConfig::mismatches`] and the stored tensors with
@@ -40,20 +40,9 @@ pub struct BlockDraftLoadGroup {
     pub window: u64,
 }
 
-/// A draft layer's stored tensors (after `layers.{i}.`).
-const DRAFT_LAYER_TENSORS: [&str; 11] = [
-    "input_layernorm.weight",
-    "post_attention_layernorm.weight",
-    "self_attn.q_proj.weight",
-    "self_attn.k_proj.weight",
-    "self_attn.v_proj.weight",
-    "self_attn.o_proj.weight",
-    "self_attn.q_norm.weight",
-    "self_attn.k_norm.weight",
-    "mlp.gate_proj.weight",
-    "mlp.up_proj.weight",
-    "mlp.down_proj.weight",
-];
+/// A DFlash2 layer's two grouped dynamic convolutions (after `layers.{i}.`): around the
+/// attention and around the MLP.
+pub const DFLASH2_CONVS: [&str; 2] = ["attention_conv", "mlp_conv"];
 
 /// The code bridge's tensors the built draft reads (after `selected_prefix_bridge.`).
 const BRIDGE_TENSORS: [&str; 8] = [
@@ -81,16 +70,21 @@ pub enum BlockDraftFormat {
     /// Tencent DSpine (`DSpineDraftModel`, e.g. `tencent/Qwen3.8-27B-DSpine-b16`): a DFlash-style
     /// block draft whose every layer carries a code-bridge write, refined serially per row.
     DSpine,
+    /// Inco DFlash2 (`DFlash2DraftModel`, e.g. `incoai/Qwen3.8-27B-DFlash2`): a parallel block
+    /// draft whose layers carry two-tap dynamic convolutions, with a candidate-path selector that
+    /// rescores each row's top-`K` candidates against its predecessor.
+    DFlash2,
 }
 
 impl BlockDraftFormat {
     /// Every supported format.
-    pub const ALL: [BlockDraftFormat; 1] = [BlockDraftFormat::DSpine];
+    pub const ALL: [BlockDraftFormat; 2] = [BlockDraftFormat::DSpine, BlockDraftFormat::DFlash2];
 
-    /// The stable lower-case label (`dspine`).
+    /// The stable lower-case label (`dspine`, `dflash2`).
     pub const fn label(self) -> &'static str {
         match self {
             BlockDraftFormat::DSpine => "dspine",
+            BlockDraftFormat::DFlash2 => "dflash2",
         }
     }
 
@@ -98,6 +92,7 @@ impl BlockDraftFormat {
     pub const fn architecture(self) -> &'static str {
         match self {
             BlockDraftFormat::DSpine => "DSpineDraftModel",
+            BlockDraftFormat::DFlash2 => "DFlash2DraftModel",
         }
     }
 
@@ -121,7 +116,8 @@ impl BlockDraftFormat {
 }
 
 /// The load-time precision of a block draft's projections (E8): 8-bit by default, 4-bit on
-/// request. The code bridge and the norms stay BF16 — the refinement depends on their rounding.
+/// request. The norms and the scoring tables (DSpine's code bridge, DFlash2's selector codebooks
+/// and convolution base kernels) stay BF16 — the candidate scores depend on their rounding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockDraftPrecision {
     /// 8-bit group-wise affine (the default).
@@ -321,14 +317,45 @@ pub struct BlockDraftConfig {
     pub num_target_layers: usize,
     /// One sliding window over every draft layer (`None`: full attention).
     pub sliding_window: Option<usize>,
-    /// Code-bridge code width.
-    pub code_size: usize,
-    /// Code-bridge rank.
-    pub bridge_rank: usize,
-    /// Code-bridge epsilon.
-    pub bridge_eps: f32,
-    /// Candidates per row the refinement scores (top-k of the draft row's logits).
+    /// Candidates per row the format's head scores (top-k of the draft row's logits): DSpine's
+    /// refinement width, DFlash2's `selector_top_k`.
     pub head_topk: usize,
+    /// The format's own head.
+    pub head: BlockDraftHead,
+}
+
+/// The format-specific part of a [`BlockDraftConfig`]: how a format turns a block's rows into
+/// per-row candidates and their predecessor-conditioned scores.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlockDraftHead {
+    /// DSpine's code bridge (a write after every layer, refined per candidate sender).
+    DSpine {
+        /// Code-bridge code width.
+        code_size: usize,
+        /// Code-bridge rank.
+        bridge_rank: usize,
+        /// Code-bridge epsilon.
+        bridge_eps: f32,
+    },
+    /// DFlash2's two-tap dynamic convolutions around each layer's attention and MLP, and its
+    /// candidate-path selector.
+    DFlash2 {
+        /// Taps of each grouped dynamic causal convolution (2 in the published drafts).
+        conv_kernel_size: usize,
+        /// Channels per convolution group (the hidden size is a whole number of groups).
+        conv_group_size: usize,
+        /// Width of the selector's predecessor/successor codebooks and hidden projection.
+        selector_rank: usize,
+        /// Whether a block row attends only to the block rows before it (`is_causal`; the
+        /// published drafts are non-causal: every block row sees the whole block).
+        causal: bool,
+        /// Factor on the block's input embeddings.
+        input_embedding_scale: f32,
+        /// Factor on the draft's logits.
+        output_multiplier: f32,
+        /// `tanh` soft cap on the draft's logits (`None`: none).
+        final_logit_softcapping: Option<f32>,
+    },
 }
 
 fn need(cond: bool, why: impl FnOnce() -> String) -> std::result::Result<(), BlockDraftRefusal> {
@@ -337,6 +364,13 @@ fn need(cond: bool, why: impl FnOnce() -> String) -> std::result::Result<(), Blo
     } else {
         Err(BlockDraftRefusal::Format(why()))
     }
+}
+
+/// The `dflash_config` object both formats nest their block-draft keys in.
+fn dflash_config(raw: &Value) -> std::result::Result<&Value, BlockDraftRefusal> {
+    raw.get("dflash_config")
+        .filter(|d| d.is_object())
+        .ok_or_else(|| BlockDraftRefusal::Format("missing `dflash_config`".into()))
 }
 
 fn uint(v: &Value, key: &str) -> std::result::Result<usize, BlockDraftRefusal> {
@@ -368,6 +402,7 @@ impl BlockDraftConfig {
     pub fn from_json(raw: &Value) -> std::result::Result<Self, BlockDraftRefusal> {
         match BlockDraftFormat::from_config(raw) {
             Some(BlockDraftFormat::DSpine) => Self::dspine(raw),
+            Some(BlockDraftFormat::DFlash2) => Self::dflash2(raw),
             None => Err(BlockDraftRefusal::Format(format!(
                 "`architectures` names no block-draft format ({})",
                 BlockDraftFormat::ALL
@@ -381,10 +416,7 @@ impl BlockDraftConfig {
     /// layer carries an independent bridge write, serial block decoding, no grouped convolution,
     /// the exact-sender last-write refinement, default RoPE and at most one sliding window.
     fn dspine(raw: &Value) -> std::result::Result<Self, BlockDraftRefusal> {
-        let d = raw
-            .get("dflash_config")
-            .filter(|d| d.is_object())
-            .ok_or_else(|| BlockDraftRefusal::Format("missing `dflash_config`".into()))?;
+        let d = dflash_config(raw)?;
         let truthy = |key: &str| {
             d.get(key)
                 .is_some_and(|v| !(v.is_null() || v == &Value::Bool(false) || v == &Value::from(0)))
@@ -463,14 +495,143 @@ impl BlockDraftConfig {
             head_topk.is_power_of_two() && (2..=64).contains(&head_topk),
             || format!("head_topk {head_topk} must be a power of two in 2..=64"),
         )?;
+        need(
+            raw.get("tie_word_embeddings")
+                .is_none_or(|v| v == &Value::Bool(false)),
+            || "DSpine requires `tie_word_embeddings` = false".into(),
+        )?;
+        let head = BlockDraftHead::DSpine {
+            code_size: uint(bridge, "code_size")?,
+            bridge_rank: uint(bridge, "rank")?,
+            bridge_eps: float(bridge, "eps")?,
+        };
+        Self::common(
+            raw,
+            d,
+            BlockDraftFormat::DSpine,
+            uint(raw, "block_size")?,
+            head_topk,
+            head,
+        )
+    }
+
+    /// The DFlash2 inference contract (the z-lab reference's `load_draft` for a
+    /// `DFlash2DraftModel`): a grouped dynamic causal convolution pair around every layer's
+    /// attention and MLP, a candidate-path selector over the top `selector_top_k` candidates of
+    /// each row, default RoPE and at most one sliding window. DSpine's code-bridge heads are
+    /// refused by name.
+    fn dflash2(raw: &Value) -> std::result::Result<Self, BlockDraftRefusal> {
+        let d = dflash_config(raw)?;
+        for key in [
+            "selected_prefix_code_bridge",
+            "selected_prefix_feature_writes",
+            "selected_prefix_last_write_refine",
+            "projector_type",
+            "attention_sink_bias",
+            "attention_value_scale",
+        ] {
+            need(d.get(key).is_none_or(Value::is_null), || {
+                format!("`{key}` is a head a DFlash2 draft does not have")
+            })?;
+        }
+        need(raw.get("code_bridge_second_pass").is_none(), || {
+            "`code_bridge_second_pass` is a head a DFlash2 draft does not have".into()
+        })?;
+        let hidden = uint(raw, "hidden_size")?;
+        let conv_kernel_size = uint(d, "conv_kernel_size")?;
+        let conv_group_size = uint(d, "conv_group_size")?;
+        need(conv_kernel_size > 0, || "`conv_kernel_size` is 0".into())?;
+        need(conv_group_size > 0 && hidden % conv_group_size == 0, || {
+            format!("hidden_size {hidden} is not a whole number of {conv_group_size}-channel convolution groups")
+        })?;
+        let selector_rank = uint(d, "selector_rank")?;
+        let head_topk = uint(d, "selector_top_k")?;
+        need(selector_rank > 0 && head_topk > 0, || {
+            "the candidate selector needs a positive `selector_rank` and `selector_top_k`".into()
+        })?;
+        let sliding = raw
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .is_some_and(|t| t.iter().any(|x| x.as_str() == Some("sliding_attention")));
+        let causal = match raw.get("is_causal") {
+            None | Some(Value::Null) => sliding,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => {
+                return Err(BlockDraftRefusal::Format(format!(
+                    "`is_causal` = {other} is not a boolean"
+                )))
+            }
+        };
+        let factor = |key: &str| -> std::result::Result<f32, BlockDraftRefusal> {
+            match d.get(key) {
+                None | Some(Value::Null) => Ok(1.0),
+                Some(v) => v
+                    .as_f64()
+                    .map(|x| x as f32)
+                    .ok_or_else(|| BlockDraftRefusal::Format(format!("`{key}` is not a number"))),
+            }
+        };
+        let softcap = d
+            .get("final_logit_softcapping")
+            .or_else(|| raw.get("final_logit_softcapping"))
+            .and_then(Value::as_f64)
+            .map(|x| x as f32)
+            .filter(|&x| x > 0.0);
+        // The reference reads `dflash_config.block_size`, then the top level, then 16.
+        let block_size = if d.get("block_size").is_some() {
+            uint(d, "block_size")?
+        } else if raw.get("block_size").is_some() {
+            uint(raw, "block_size")?
+        } else {
+            16
+        };
+        let head = BlockDraftHead::DFlash2 {
+            conv_kernel_size,
+            conv_group_size,
+            selector_rank,
+            causal,
+            input_embedding_scale: factor("input_embedding_scale")?,
+            output_multiplier: factor("output_multiplier")?,
+            final_logit_softcapping: softcap,
+        };
+        let cfg = Self::common(
+            raw,
+            d,
+            BlockDraftFormat::DFlash2,
+            block_size,
+            head_topk,
+            head,
+        )?;
+        need(head_topk <= cfg.vocab_size, || {
+            format!(
+                "selector_top_k {head_topk} exceeds the {}-token vocabulary",
+                cfg.vocab_size
+            )
+        })?;
+        Ok(cfg)
+    }
+
+    /// What every block-draft format shares: a Qwen3 decoder body over the target's tapped rows,
+    /// default RoPE, at most one sliding window, a mask token and the target layers it reads.
+    fn common(
+        raw: &Value,
+        d: &Value,
+        format: BlockDraftFormat,
+        block_size: usize,
+        head_topk: usize,
+        head: BlockDraftHead,
+    ) -> std::result::Result<Self, BlockDraftRefusal> {
+        let name = match format {
+            BlockDraftFormat::DSpine => "DSpine",
+            BlockDraftFormat::DFlash2 => "DFlash2",
+        };
         for (key, want) in [
             ("model_type", Value::from("qwen3")),
             ("hidden_act", Value::from("silu")),
             ("attention_bias", Value::Bool(false)),
-            ("tie_word_embeddings", Value::Bool(false)),
         ] {
             need(raw.get(key).is_none_or(|v| v == &want), || {
-                format!("DSpine requires `{key}` = {want}")
+                format!("{name} requires `{key}` = {want}")
             })?;
         }
         let rope_type = raw
@@ -494,6 +655,7 @@ impl BlockDraftConfig {
                 format!("draft_vocab_size {dv} != vocab_size {vocab_size}")
             })?;
         }
+        let num_hidden_layers = uint(raw, "num_hidden_layers")?;
         let sliding_window = sliding_window(raw, num_hidden_layers)?;
         let target_layer_ids = d
             .get("target_layer_ids")
@@ -509,10 +671,9 @@ impl BlockDraftConfig {
             .get("mask_token_id")
             .and_then(Value::as_i64)
             .ok_or_else(|| BlockDraftRefusal::Format("missing `mask_token_id`".into()))?;
-        let block_size = uint(raw, "block_size")?;
         need(block_size >= 2, || format!("block_size {block_size} < 2"))?;
         Ok(Self {
-            format: BlockDraftFormat::DSpine,
+            format,
             hidden_size: uint(raw, "hidden_size")?,
             num_hidden_layers,
             intermediate_size: uint(raw, "intermediate_size")?,
@@ -527,10 +688,8 @@ impl BlockDraftConfig {
             target_layer_ids,
             num_target_layers: uint(raw, "num_target_layers")?,
             sliding_window,
-            code_size: uint(bridge, "code_size")?,
-            bridge_rank: uint(bridge, "rank")?,
-            bridge_eps: float(bridge, "eps")?,
             head_topk,
+            head,
         })
     }
 
@@ -632,14 +791,16 @@ impl BlockDraftConfig {
             self.head_dim,
             self.intermediate_size,
         );
-        let (c, r, v) = (self.code_size, self.bridge_rank, self.vocab_size);
+        let v = self.vocab_size;
         let mut out: Vec<(String, Vec<usize>)> = vec![
             ("fc.weight".into(), vec![h, self.tap_width()]),
             ("hidden_norm.weight".into(), vec![h]),
             ("norm.weight".into(), vec![h]),
-            ("draft_block_causal_version".into(), vec![]),
-            ("last_write_refine_version".into(), vec![]),
         ];
+        if self.format == BlockDraftFormat::DSpine {
+            out.push(("draft_block_causal_version".into(), vec![]));
+            out.push(("last_write_refine_version".into(), vec![]));
+        }
         for layer in 0..l {
             let p = format!("layers.{layer}.");
             for (name, shape) in [
@@ -657,30 +818,66 @@ impl BlockDraftConfig {
             ] {
                 out.push((format!("{p}{name}"), shape));
             }
+            if let BlockDraftHead::DFlash2 {
+                conv_kernel_size: k,
+                conv_group_size: g,
+                ..
+            } = self.head
+            {
+                for conv in DFLASH2_CONVS {
+                    out.push((format!("{p}{conv}.base_kernel"), vec![2, k, h]));
+                    out.push((
+                        format!("{p}{conv}.kernel_projection.weight"),
+                        vec![2 * k * (h / g), h],
+                    ));
+                }
+            }
         }
-        let b = "selected_prefix_bridge.";
-        for (name, shape) in [
-            ("codebook", vec![v, c]),
-            ("read_weight", vec![c, h]),
-            ("early_read_weights", vec![l.saturating_sub(1), c, h]),
-            ("feature_write_weights", vec![l, h, r]),
-            ("gate.weight", vec![r, c]),
-            ("gate.bias", vec![r]),
-            ("predecessor_gate.weight", vec![r, c]),
-            ("prev.weight", vec![r, c]),
-            ("out.weight", vec![c, r]),
-            ("independent_write_version", vec![]),
-            ("terminal_disabled_version", vec![]),
-        ] {
-            out.push((format!("{b}{name}"), shape));
+        match self.head {
+            BlockDraftHead::DSpine {
+                code_size: c,
+                bridge_rank: r,
+                ..
+            } => {
+                let b = "selected_prefix_bridge.";
+                for (name, shape) in [
+                    ("codebook", vec![v, c]),
+                    ("read_weight", vec![c, h]),
+                    ("early_read_weights", vec![l.saturating_sub(1), c, h]),
+                    ("feature_write_weights", vec![l, h, r]),
+                    ("gate.weight", vec![r, c]),
+                    ("gate.bias", vec![r]),
+                    ("predecessor_gate.weight", vec![r, c]),
+                    ("prev.weight", vec![r, c]),
+                    ("out.weight", vec![c, r]),
+                    ("independent_write_version", vec![]),
+                    ("terminal_disabled_version", vec![]),
+                ] {
+                    out.push((format!("{b}{name}"), shape));
+                }
+            }
+            BlockDraftHead::DFlash2 {
+                selector_rank: r, ..
+            } => {
+                let s = "candidate_selector.";
+                for (name, shape) in [
+                    ("hidden_projection.weight", vec![r, h]),
+                    ("predecessor_codebook", vec![v, r]),
+                    ("successor_codebook", vec![v, r]),
+                ] {
+                    out.push((format!("{s}{name}"), shape));
+                }
+            }
         }
         out
     }
 
-    /// The `[out, in]` matrices a backend quantizes at load: `fc` and every layer projection.
-    /// The code bridge stays BF16.
+    /// The `[out, in]` matrices a backend quantizes at load: `fc` and every layer projection, and
+    /// for DFlash2 every convolution's kernel projection and the selector's hidden projection.
+    /// DSpine's code bridge, DFlash2's codebooks and base kernels, and the norms stay BF16.
     pub fn quantized_matrices(&self) -> Vec<String> {
         let mut out = vec!["fc.weight".to_string()];
+        let dflash2 = self.format == BlockDraftFormat::DFlash2;
         for layer in 0..self.num_hidden_layers {
             for name in [
                 "self_attn.q_proj",
@@ -693,6 +890,14 @@ impl BlockDraftConfig {
             ] {
                 out.push(format!("layers.{layer}.{name}.weight"));
             }
+            if dflash2 {
+                for conv in DFLASH2_CONVS {
+                    out.push(format!("layers.{layer}.{conv}.kernel_projection.weight"));
+                }
+            }
+        }
+        if dflash2 {
+            out.push("candidate_selector.hidden_projection.weight".into());
         }
         out
     }
@@ -729,13 +934,15 @@ impl BlockDraftConfig {
         }
     }
 
-    /// The groups a load materializes, in load order (the stored checkpoint is BF16, its version
-    /// markers I64): first the **checks** (the version markers and the disabled terminal
-    /// projection, read and dropped before anything is built), then one group per draft layer,
-    /// then the **head** (`fc`, the two norms outside the stack and the code bridge). Each group's
-    /// sources are read, converted and released before the next group reads its own, so a load
-    /// holds the draft's resident arrays plus one group's [window](BlockDraftLoadGroup::window) —
-    /// never the whole BF16 payload. Every stored tensor falls in exactly one group.
+    /// The groups a load materializes, in load order (the stored checkpoint is BF16, DSpine's
+    /// version markers I64). DSpine first reads its **checks** (the version markers and the
+    /// disabled terminal projection, read and dropped before anything is built); then every
+    /// format loads one group per draft layer, then the **head** (`fc`, the two norms outside the
+    /// stack and the format's scoring tensors: DSpine's code bridge, DFlash2's selector). Each
+    /// group's sources are read, converted and released before the next group reads its own, so a
+    /// load holds the draft's resident arrays plus one group's
+    /// [window](BlockDraftLoadGroup::window) — never the whole BF16 payload. Every stored tensor
+    /// falls in exactly one group.
     pub fn load_groups(&self) -> Vec<BlockDraftLoadGroup> {
         let shapes: std::collections::HashMap<String, Vec<usize>> =
             self.tensors().into_iter().collect();
@@ -746,9 +953,9 @@ impl BlockDraftConfig {
                 .product::<u64>()
                 .max(1)
         };
-        // A source the draft keeps as stored (a BF16 norm, the codebook) shares its buffer with
-        // the draft; one converted into a different array (a quantized matrix, the packed or f32
-        // bridge tensors) is consumed: held beside its conversion, then released.
+        // A source the draft keeps as stored (a BF16 norm, a codebook, a base kernel) shares its
+        // buffer with the draft; one converted into a different array (a quantized matrix, the
+        // packed or f32 bridge tensors) is consumed: held beside its conversion, then released.
         let window = |names: &[String], consumed: &dyn Fn(&str) -> bool| -> u64 {
             names
                 .iter()
@@ -756,28 +963,35 @@ impl BlockDraftConfig {
                 .map(|n| elements(n) * 2)
                 .sum()
         };
+        let quantized = self.quantized_matrices();
+        let is_quantized = |n: &str| quantized.iter().any(|q| q == n);
         let b = "selected_prefix_bridge.";
         let mut groups = Vec::with_capacity(self.num_hidden_layers + 2);
-        let out = format!("{b}out.weight");
-        // Four I64 markers, and the terminal projection beside its `!= 0` mask.
-        let checks_window = 4 * 8 + elements(&out) * 3;
-        groups.push(BlockDraftLoadGroup {
-            tensors: vec![
-                "draft_block_causal_version".into(),
-                "last_write_refine_version".into(),
-                format!("{b}independent_write_version"),
-                format!("{b}terminal_disabled_version"),
-                out,
-            ],
-            window: checks_window,
-        });
-        let quantized = self.quantized_matrices();
+        if self.format == BlockDraftFormat::DSpine {
+            let out = format!("{b}out.weight");
+            // Four I64 markers, and the terminal projection beside its `!= 0` mask.
+            let checks_window = 4 * 8 + elements(&out) * 3;
+            groups.push(BlockDraftLoadGroup {
+                tensors: vec![
+                    "draft_block_causal_version".into(),
+                    "last_write_refine_version".into(),
+                    format!("{b}independent_write_version"),
+                    format!("{b}terminal_disabled_version"),
+                    out,
+                ],
+                window: checks_window,
+            });
+        }
         for layer in 0..self.num_hidden_layers {
-            let tensors: Vec<String> = DRAFT_LAYER_TENSORS
-                .iter()
-                .map(|name| format!("layers.{layer}.{name}"))
+            let prefix = format!("layers.{layer}.");
+            let tensors: Vec<String> = shapes
+                .keys()
+                .filter(|n| n.starts_with(&prefix))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect();
-            let window = window(&tensors, &|n| quantized.iter().any(|q| q == n));
+            let window = window(&tensors, &is_quantized);
             groups.push(BlockDraftLoadGroup { tensors, window });
         }
         let mut tensors: Vec<String> = vec![
@@ -785,24 +999,43 @@ impl BlockDraftConfig {
             "hidden_norm.weight".into(),
             "norm.weight".into(),
         ];
-        tensors.extend(BRIDGE_TENSORS.iter().map(|s| format!("{b}{s}")));
-        let window = window(&tensors, &|n| {
-            n == "fc.weight" || BRIDGE_CONVERTED.iter().any(|c| n == format!("{b}{c}"))
-        });
-        groups.push(BlockDraftLoadGroup { tensors, window });
+        match self.format {
+            BlockDraftFormat::DSpine => {
+                tensors.extend(BRIDGE_TENSORS.iter().map(|s| format!("{b}{s}")));
+                let window = window(&tensors, &|n| {
+                    n == "fc.weight" || BRIDGE_CONVERTED.iter().any(|c| n == format!("{b}{c}"))
+                });
+                groups.push(BlockDraftLoadGroup { tensors, window });
+            }
+            BlockDraftFormat::DFlash2 => {
+                tensors.extend(
+                    [
+                        "hidden_projection.weight",
+                        "predecessor_codebook",
+                        "successor_codebook",
+                    ]
+                    .map(|s| format!("candidate_selector.{s}")),
+                );
+                let window = window(&tensors, &is_quantized);
+                groups.push(BlockDraftLoadGroup { tensors, window });
+            }
+        }
         groups
     }
 
-    /// The draft's arrays once loaded at `precision`: `fc` and every layer projection quantized
-    /// (packed codes plus BF16 scales and biases per [`BLOCK_DRAFT_GROUP_SIZE`] group); the norms,
-    /// codebook, read and write weights as stored (BF16); and the bridge's derived arrays — the
-    /// packed `[gate; predecessor_gate; prev]` matrix (BF16), f32 copies of `predecessor_gate`,
-    /// `prev` and `gate.bias`, and the last layer's write weights in f32. The checks' tensors are
-    /// dropped once read.
+    /// The draft's arrays once loaded at `precision`: every [quantized
+    /// matrix](Self::quantized_matrices) packed (codes plus BF16 scales and biases per
+    /// [`BLOCK_DRAFT_GROUP_SIZE`] group) and every other tensor as stored (BF16). DSpine adds the
+    /// bridge's derived arrays — the packed `[gate; predecessor_gate; prev]` matrix (BF16), f32
+    /// copies of `predecessor_gate`, `prev` and `gate.bias`, and the last layer's write weights in
+    /// f32 — and drops its checks' tensors once read.
     pub fn resident_bytes(&self, precision: BlockDraftPrecision) -> u64 {
         let quantized = self.quantized_matrices();
         let b = "selected_prefix_bridge.";
-        let checks = &self.load_groups()[0].tensors;
+        let checks: Vec<String> = match self.format {
+            BlockDraftFormat::DSpine => self.load_groups()[0].tensors.clone(),
+            BlockDraftFormat::DFlash2 => Vec::new(),
+        };
         let mut resident = 0u64;
         for (name, shape) in self.tensors() {
             let elements: u64 = shape.iter().map(|&d| d as u64).product::<u64>().max(1);
@@ -821,7 +1054,12 @@ impl BlockDraftConfig {
                 elements * 2
             };
         }
-        let last_write = (self.hidden_size * self.bridge_rank) as u64 * 4;
+        let last_write = match self.head {
+            BlockDraftHead::DSpine { bridge_rank, .. } => {
+                (self.hidden_size * bridge_rank) as u64 * 4
+            }
+            BlockDraftHead::DFlash2 { .. } => 0,
+        };
         resident + last_write
     }
 
@@ -843,7 +1081,8 @@ impl BlockDraftConfig {
     /// over a `prompt_tokens + max_new_tokens` run (E8/E11): the target's tapped rows the draft
     /// reads (the prompt's, capped at the window, plus a verify step's), the draft's context
     /// cache (capped at the window, E5), its context projection over the prompt rows, and a
-    /// step's transients (the block's draft logits over the vocabulary and the refinement table).
+    /// step's transients (the block's draft logits over the vocabulary and the format's candidate
+    /// table: DSpine's refinement, DFlash2's selector edges).
     pub fn request_bytes(
         &self,
         prompt_tokens: usize,
@@ -879,9 +1118,18 @@ impl BlockDraftConfig {
         let logits = draft_rows
             .checked_mul(self.vocab_size as u64)?
             .checked_mul(4)?;
-        let table = draft_rows
-            .checked_mul(k)?
-            .checked_mul(h.checked_mul(6)?.checked_add(self.code_size as u64 * 4)?)?;
+        // Per candidate: DSpine refines a hidden row (f32 raw, refined, normalized) and gathers
+        // its codebook row; DFlash2 gathers f32 predecessor and successor rows, their product
+        // with the selector row, and scores a sender row of `K` edges.
+        let per_candidate = match self.head {
+            BlockDraftHead::DSpine { code_size, .. } => {
+                h.checked_mul(6)?.checked_add(code_size as u64 * 4)?
+            }
+            BlockDraftHead::DFlash2 { selector_rank, .. } => (selector_rank as u64)
+                .checked_mul(3 * 4)?
+                .checked_add(k.checked_mul(4)?)?,
+        };
+        let table = draft_rows.checked_mul(k)?.checked_mul(per_candidate)?;
         taps.checked_add(cache)?
             .checked_add(context)?
             .checked_add(logits)?
