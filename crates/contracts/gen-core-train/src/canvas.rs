@@ -36,7 +36,8 @@ pub const MAX_TRAINING_ASPECT: f64 = 4.0;
 /// `edge²`; the aspect drift the floor introduces is under one stride per side. A degenerate (zero)
 /// side falls back to the square `edge` canvas.
 ///
-/// This is the MiniMax-H3-Image trainer's rule (SW-F369), parameterised by the family's stride.
+/// This is the MiniMax-H3-Image trainer's rule (SW-F369), parameterised by the family's stride;
+/// [`crate::h3_image::training_canvas`] delegates here.
 pub fn aspect_canvas((width, height): (u32, u32), edge: u32, stride: u32) -> (u32, u32) {
     let stride_f = f64::from(stride.max(1));
     // The epsilon keeps a side that lands on a stride multiple through a square root from flooring
@@ -201,23 +202,25 @@ mod tests {
     }
 
     #[test]
-    fn the_hoisted_rule_matches_the_h3_trainer() {
-        use crate::h3_image::TRAINING_CANVAS_STRIDE;
+    fn the_h3_trainer_uses_the_shared_rule() {
+        use crate::h3_image::{training_canvas as h3_canvas, TRAINING_CANVAS_STRIDE};
         for dims in [
             (1365, 2048),
             (3000, 2000),
             (640, 480),
             (4096, 4096),
             (10, 4000),
+            (0, 20),
         ] {
-            for edge in [512, 1024, 2048] {
+            for edge in [16, 512, 1000, 1024, 2048] {
                 let (w, h) = aspect_canvas(dims, edge, TRAINING_CANVAS_STRIDE);
+                assert_eq!(h3_canvas(dims, edge), (w, h), "{dims:?} at {edge}");
                 assert_eq!(
                     (w % TRAINING_CANVAS_STRIDE, h % TRAINING_CANVAS_STRIDE),
                     (0, 0)
                 );
                 // Matches the canvas the bounded rule yields for any source within 4:1.
-                if dims.0.max(dims.1) <= 4 * dims.0.min(dims.1) {
+                if dims.0 > 0 && dims.1 > 0 && dims.0.max(dims.1) <= 4 * dims.0.min(dims.1) {
                     let c = training_canvas(dims, edge, TRAINING_CANVAS_STRIDE, None);
                     assert_eq!(c.size(), (w, h));
                     assert_eq!(c.crop, CropBox::full(dims.0, dims.1));
