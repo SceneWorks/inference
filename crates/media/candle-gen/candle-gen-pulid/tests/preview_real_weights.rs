@@ -268,6 +268,7 @@ fn base_request(steps: usize, size: u32, sampler: Option<&str>) -> PulidFluxRequ
         seed: SEED,
         use_pid: false,
         preview: PreviewSink::default(),
+        pag: None,
         cancel: CancelFlag::new(),
     }
 }

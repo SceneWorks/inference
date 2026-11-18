@@ -68,6 +68,22 @@ impl FluxVariant {
         matches!(self, Self::Dev)
     }
 
+    pub fn pag_capability(self) -> mlx_gen::gen_core::PagCapability {
+        let (default_stop, recommended_scale) = match self {
+            Self::Schnell => (0.75, 1.2),
+            Self::Dev => (1.0, 1.5),
+        };
+        mlx_gen::gen_core::PagCapability {
+            num_blocks: 57,
+            block_domain: std::borrow::Cow::Borrowed("flux_blocks"),
+            default_layers: vec![28],
+            default_start: 0.0,
+            default_stop,
+            recommended_scale,
+            max_scale: mlx_gen::gen_core::DEFAULT_PAG_MAX_SCALE,
+        }
+    }
+
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
             encoder_contract: None,
@@ -121,6 +137,7 @@ impl FluxVariant {
                 // memory is bounded to `max(T5+CLIP, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
                 supports_preview: true,
+                pag: Some(self.pag_capability()),
                 ..Default::default()
             },
         }
@@ -155,5 +172,45 @@ impl FluxTokenizerKind {
             // T5's `<pad>` id.
             Self::T5 => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pag_capability_matches_flux1_contract() {
+        let dev = FluxVariant::Dev
+            .descriptor()
+            .capabilities
+            .pag
+            .expect("dev pag");
+        assert_eq!(dev.num_blocks, 57);
+        assert_eq!(dev.block_domain.as_ref(), "flux_blocks");
+        assert_eq!(dev.default_layers, vec![28]);
+        assert_eq!(dev.default_start, 0.0);
+        assert_eq!(dev.default_stop, 1.0);
+        assert_eq!(dev.recommended_scale, 1.5);
+        assert_eq!(dev.max_scale, 15.0);
+        assert_eq!(
+            crate::model_control::descriptor_dev_control()
+                .capabilities
+                .pag,
+            Some(dev)
+        );
+
+        let schnell = FluxVariant::Schnell
+            .descriptor()
+            .capabilities
+            .pag
+            .expect("schnell pag");
+        assert_eq!(schnell.num_blocks, 57);
+        assert_eq!(schnell.block_domain.as_ref(), "flux_blocks");
+        assert_eq!(schnell.default_layers, vec![28]);
+        assert_eq!(schnell.default_start, 0.0);
+        assert_eq!(schnell.default_stop, 0.75);
+        assert_eq!(schnell.recommended_scale, 1.2);
+        assert_eq!(schnell.max_scale, 15.0);
     }
 }

@@ -81,6 +81,44 @@ fn attention(
     Ok(o.transpose(1, 2)?.reshape((b, s, h * d))?)
 }
 
+/// Perturbed-attention guidance over FLUX.2 `[txt, target, ref...]` post-RoPE BHSD tensors:
+/// `Q_txt` (`0..txt_seq`) and `Q_ref` (`txt_seq + target_seq .. q_seq` when present as queries)
+/// run normal SDPA over full `(k, v)`, while `Q_target` (`txt_seq .. txt_seq + target_seq`)
+/// receives `V_target` directly.
+pub(crate) fn pag_joint_attention_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    txt_seq: usize,
+    target_seq: usize,
+    head_dim: usize,
+    plan: AttentionPlan<'_>,
+) -> GenResult<Tensor> {
+    let (b, h, q_seq, d) = q.dims4()?;
+    let scale = (head_dim as f64).powf(-0.5);
+    let q_txt = q.narrow(2, 0, txt_seq)?.contiguous()?;
+    let o_txt = candle_gen::sdpa_planned_bhsd(&q_txt, k, v, scale, None, softmax_last_dim, plan)?
+        .transpose(1, 2)?
+        .reshape((b, txt_seq, h * d))?;
+    let o_target = v
+        .narrow(2, txt_seq, target_seq)?
+        .transpose(1, 2)?
+        .reshape((b, target_seq, h * d))?
+        .to_dtype(o_txt.dtype())?;
+    let target_end = txt_seq + target_seq;
+    if q_seq > target_end {
+        let ref_seq = q_seq - target_end;
+        let q_ref = q.narrow(2, target_end, ref_seq)?.contiguous()?;
+        let o_ref =
+            candle_gen::sdpa_planned_bhsd(&q_ref, k, v, scale, None, softmax_last_dim, plan)?
+                .transpose(1, 2)?
+                .reshape((b, ref_seq, h * d))?;
+        Ok(Tensor::cat(&[&o_txt, &o_target, &o_ref], 1)?)
+    } else {
+        Ok(Tensor::cat(&[&o_txt, &o_target], 1)?)
+    }
+}
+
 /// Reshape `[B,S,inner]` → `[B,H,S,head_dim]`, applying per-head RMSNorm (over head_dim) when `norm`
 /// is given (q/k), none for v.
 fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -> Result<Tensor> {
@@ -338,6 +376,7 @@ impl DoubleAttention {
     }
 
     /// `norm_img` / `norm_txt`: the modulated, normed streams. Returns `(img_out, txt_out)`.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         norm_img: &Tensor,
@@ -345,6 +384,7 @@ impl DoubleAttention {
         cos: &Tensor,
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag_target_seq: Option<usize>,
     ) -> GenResult<(Tensor, Tensor)> {
         let (h, hd) = (self.heads, self.head_dim);
         let txt_seq = norm_txt.dim(1)?;
@@ -379,7 +419,12 @@ impl DoubleAttention {
         // This is a fused joint attention over text, target-image, and reference-image tokens.
         // The observer retains its duration only as non-attributable execution context; it must
         // never be presented as isolated reference-K/V runtime.
-        let o = attention(&q, &k, &v, hd, attention_plan)?; // [B, txt_seq+img_seq, inner]
+        let o = match pag_target_seq {
+            Some(target_seq) => {
+                pag_joint_attention_bhsd(&q, &k, &v, txt_seq, target_seq, hd, attention_plan)?
+            }
+            None => attention(&q, &k, &v, hd, attention_plan)?, // [B, txt_seq+img_seq, inner]
+        };
         crate::sc20686_observer::record_flux_kv_read(campaign_read);
         let txt_out = o.narrow(1, 0, txt_seq)?;
         let img_out = o.narrow(1, txt_seq, o.dim(1)? - txt_seq)?;
@@ -448,6 +493,7 @@ impl DoubleBlock {
         cos: &Tensor,
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag_target_seq: Option<usize>,
     ) -> GenResult<(Tensor, Tensor)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -456,9 +502,14 @@ impl DoubleBlock {
 
         let norm_img = modulate(&layer_norm(img)?, scale_msa, shift_msa)?;
         let norm_txt = modulate(&layer_norm(txt)?, c_scale_msa, c_shift_msa)?;
-        let (img_attn, txt_attn) =
-            self.attn
-                .forward(&norm_img, &norm_txt, cos, sin, attention_plan)?;
+        let (img_attn, txt_attn) = self.attn.forward(
+            &norm_img,
+            &norm_txt,
+            cos,
+            sin,
+            attention_plan,
+            pag_target_seq,
+        )?;
         let mut img = gated(img, gate_msa, &img_attn)?;
         let mut txt = gated(txt, c_gate_msa, &txt_attn)?;
 
@@ -518,6 +569,7 @@ impl SingleBlock {
         cos: &Tensor,
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag: Option<(usize, usize)>,
     ) -> GenResult<Tensor> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden)?, scale, shift)?;
@@ -533,7 +585,18 @@ impl SingleBlock {
         let v = to_heads(&v, self.heads, self.head_dim, None)?;
         let q = Flux2PosEmbed::apply(&q, cos, sin)?;
         let k = Flux2PosEmbed::apply(&k, cos, sin)?;
-        let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?; // [B,S,inner]
+        let attn = match pag {
+            Some((txt_seq, target_seq)) => pag_joint_attention_bhsd(
+                &q,
+                &k,
+                &v,
+                txt_seq,
+                target_seq,
+                self.head_dim,
+                attention_plan,
+            )?,
+            None => attention(&q, &k, &v, self.head_dim, attention_plan)?, // [B,S,inner]
+        };
 
         let mlp = swiglu(&mlp)?; // [B,S,mlp_hidden]
         let cat = Tensor::cat(&[&attn, &mlp], D::Minus1)?;
@@ -882,6 +945,34 @@ impl Flux2Transformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> GenResult<Tensor> {
+        self.forward_with_memory_pag(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory_pag(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag: Option<(&[u32], usize)>,
+    ) -> GenResult<Tensor> {
         self.forward_inner(
             hidden_states,
             encoder_hidden_states,
@@ -893,6 +984,7 @@ impl Flux2Transformer {
             attention_plan,
             transformer_window,
             cancel,
+            pag,
         )
     }
 
@@ -944,6 +1036,37 @@ impl Flux2Transformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> GenResult<Tensor> {
+        self.forward_with_control_memory_pag(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_control_memory_pag(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control: (&Flux2ControlBranch, &Tensor, f32),
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> GenResult<Tensor> {
+        let target_seq = hidden_states.dim(1)?;
         self.forward_inner(
             hidden_states,
             encoder_hidden_states,
@@ -955,6 +1078,7 @@ impl Flux2Transformer {
             attention_plan,
             transformer_window,
             cancel,
+            pag_layers.map(|layers| (layers, target_seq)),
         )
     }
 
@@ -975,6 +1099,7 @@ impl Flux2Transformer {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+        pag: Option<(&[u32], usize)>,
     ) -> GenResult<Tensor> {
         if matches!(self.blocks, Flux2Blocks::Streamed { .. }) {
             return self.forward_streamed_inner(
@@ -988,6 +1113,7 @@ impl Flux2Transformer {
                 attention_plan,
                 transformer_window,
                 cancel,
+                pag,
             );
         }
         let temb = self.time_embed.forward(timestep, guidance, &self.device)?;
@@ -1026,10 +1152,32 @@ impl Flux2Transformer {
                 "flux2 streamed blocks are not yet driven".to_owned(),
             ));
         };
+        let num_double = double.len();
+        let perturbs_double = |idx: usize| -> Option<usize> {
+            pag.and_then(|(layers, target_seq)| {
+                layers.binary_search(&(idx as u32)).ok().map(|_| target_seq)
+            })
+        };
+        let perturbs_single = |idx: usize, txt_seq: usize| -> Option<(usize, usize)> {
+            pag.and_then(|(layers, target_seq)| {
+                layers
+                    .binary_search(&((num_double + idx) as u32))
+                    .ok()
+                    .map(|_| (txt_seq, target_seq))
+            })
+        };
         for (idx, block) in double.iter().enumerate() {
             candle_gen::check_cancel(cancel)?;
-            let (t, i) =
-                block.forward(&img, &txt, &img_mod, &txt_mod, &cos, &sin, attention_plan)?;
+            let (t, i) = block.forward(
+                &img,
+                &txt,
+                &img_mod,
+                &txt_mod,
+                &cos,
+                &sin,
+                attention_plan,
+                perturbs_double(idx),
+            )?;
             txt = t;
             img = i;
             // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
@@ -1044,9 +1192,16 @@ impl Flux2Transformer {
         let txt_seq = txt.dim(1)?;
         let mut hidden = Tensor::cat(&[&txt, &img], 1)?;
         let single_mod = self.mod_single.forward(&temb)?;
-        for block in single {
+        for (idx, block) in single.iter().enumerate() {
             candle_gen::check_cancel(cancel)?;
-            hidden = block.forward(&hidden, &single_mod[0], &cos, &sin, attention_plan)?;
+            hidden = block.forward(
+                &hidden,
+                &single_mod[0],
+                &cos,
+                &sin,
+                attention_plan,
+                perturbs_single(idx, txt_seq),
+            )?;
         }
 
         let img_seq = hidden.dim(1)? - txt_seq;
@@ -1068,6 +1223,7 @@ impl Flux2Transformer {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+        pag: Option<(&[u32], usize)>,
     ) -> GenResult<Tensor> {
         let Flux2Blocks::Streamed {
             weights,
@@ -1100,6 +1256,21 @@ impl Flux2Transformer {
                 attention_plan,
             )?),
             None => None,
+        };
+
+        let num_double = config.num_double_layers;
+        let perturbs_double = |idx: usize| -> Option<usize> {
+            pag.and_then(|(layers, target_seq)| {
+                layers.binary_search(&(idx as u32)).ok().map(|_| target_seq)
+            })
+        };
+        let perturbs_single = |idx: usize, txt_seq: usize| -> Option<(usize, usize)> {
+            pag.and_then(|(layers, target_seq)| {
+                layers
+                    .binary_search(&((num_double + idx) as u32))
+                    .ok()
+                    .map(|_| (txt_seq, target_seq))
+            })
         };
 
         let double_plan = candle_gen::block_window::BlockPlan::new(
@@ -1135,6 +1306,7 @@ impl Flux2Transformer {
                         &cos,
                         &sin,
                         attention_plan,
+                        perturbs_double(*idx),
                     )?;
                     if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
                         if let Some(n) = branch.hint_index(*idx) {
@@ -1169,12 +1341,19 @@ impl Flux2Transformer {
                         if let Some(quant) = quant {
                             block.quantize_onto(*quant, target_device)?;
                         }
-                        Ok::<_, candle_gen::CandleError>(block)
+                        Ok::<_, candle_gen::CandleError>((idx, block))
                     })
                     .collect::<GenResult<Vec<_>>>()?;
-                for block in &blocks {
+                for (idx, block) in &blocks {
                     candle_gen::check_cancel(cancel)?;
-                    hidden = block.forward(&hidden, &single_mod[0], &cos, &sin, attention_plan)?;
+                    hidden = block.forward(
+                        &hidden,
+                        &single_mod[0],
+                        &cos,
+                        &sin,
+                        attention_plan,
+                        perturbs_single(*idx, txt_seq),
+                    )?;
                 }
                 Ok(hidden)
             },
@@ -1342,7 +1521,7 @@ impl Flux2ControlBranch {
             let (new_txt, new_c) =
                 block
                     .base
-                    .forward(&c, &txt, img_mod, txt_mod, cos, sin, attention_plan)?;
+                    .forward(&c, &txt, img_mod, txt_mod, cos, sin, attention_plan, None)?;
             hints.push(block.after_proj.forward(&new_c)?);
             c = new_c;
             txt = new_txt;
@@ -1414,7 +1593,39 @@ impl Flux2ControlTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> GenResult<Tensor> {
-        self.base.forward_with_control_memory(
+        self.forward_with_memory_pag(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            control_context,
+            control_context_scale,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory_pag(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Tensor,
+        control_context_scale: f32,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> GenResult<Tensor> {
+        self.base.forward_with_control_memory_pag(
             hidden_states,
             encoder_hidden_states,
             img_ids,
@@ -1425,6 +1636,7 @@ impl Flux2ControlTransformer {
             attention_plan,
             transformer_window,
             cancel,
+            pag_layers,
         )
     }
 }
@@ -1499,5 +1711,54 @@ mod tests {
         for x in v {
             assert!((x - 2.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn pag_joint_attention_perturbs_middle_target_and_preserves_txt_and_ref() {
+        let dev = Device::Cpu;
+        let (b, h, txt_seq, target_seq, ref_seq, d) =
+            (1usize, 2usize, 3usize, 2usize, 3usize, 4usize);
+        let full_seq = txt_seq + target_seq + ref_seq;
+        let q = Tensor::randn(0f32, 1f32, (b, h, full_seq, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, full_seq, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, full_seq, d), &dev).unwrap();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+
+        let full = attention(&q, &k, &v, d, plan).unwrap();
+        let pag = pag_joint_attention_bhsd(&q, &k, &v, txt_seq, target_seq, d, plan).unwrap();
+        assert_eq!(pag.dims(), &[b, full_seq, h * d]);
+
+        for (start, len) in [(0usize, txt_seq), (txt_seq + target_seq, ref_seq)] {
+            let diff = (&pag.narrow(1, start, len).unwrap() - &full.narrow(1, start, len).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-6,
+                "non-target slice {start}..{} diverged: {diff}",
+                start + len
+            );
+        }
+
+        let want_target = v
+            .narrow(2, txt_seq, target_seq)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((b, target_seq, h * d))
+            .unwrap();
+        assert_eq!(
+            pag.narrow(1, txt_seq, target_seq)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            want_target.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 }

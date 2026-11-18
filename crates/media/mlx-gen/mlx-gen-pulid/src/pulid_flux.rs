@@ -97,6 +97,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: true,
             supports_preview: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            pag: Some(FluxVariant::Dev.pag_capability()),
             ..Default::default()
         },
     }
@@ -399,10 +400,27 @@ impl Generator for PulidFlux {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
         plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?;
+        let total_steps = u32::try_from(plan.denoise_sigmas().len().saturating_sub(1))
+            .map_err(|_| gen_core::Error::Unsupported("PuLID step count exceeds u32".into()))?;
         let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
-        Ok(gen_core::GenerationReport::from_output(
-            self.generate_impl(req, &run, on_progress)?,
-        ))
+        let mut report =
+            gen_core::GenerationReport::from_output(self.generate_impl(req, &run, on_progress)?);
+        report.pag = pag.map(|p| p.execution_report(total_steps));
+        Ok(report)
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -435,8 +453,7 @@ impl Generator for PulidFlux {
                 self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_with_report_observed(req, &mut progress)
             },
         )
     }
@@ -462,11 +479,11 @@ impl Generator for PulidFlux {
 }
 
 impl PulidFlux {
-    fn generate_observed(
+    fn generate_with_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         if self.identity_inventory.is_none() {
             return Err(gen_core::Error::Unsupported(
                 "pulid_flux: a constructor-built model has no load spec to plan against; compile \
@@ -476,7 +493,15 @@ impl PulidFlux {
         }
         let plan = compile_plan(&self.loaded_spec, req)?
             .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))?;
-        self.generate_planned(req, &plan, None, on_progress)?
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report_observed(req, on_progress)?
             .output
             .ok_or_else(|| gen_core::Error::Msg("PuLID render produced no image".into()))
     }
@@ -507,6 +532,11 @@ impl PulidFlux {
         }
         let (image, id_weight) = self.reference_face(req)?;
         mlx_gen::image_execution::scalar("pulid.identity_weight", id_weight);
+        let pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?;
+        mlx_gen::image_execution::policy_debug("pulid.pag", &pag);
         let bounded_attention_selected = req.memory.is_some_and(|memory| memory.chunk_attention);
         // The identity embedding is computed inside the Conditioning phase (below); its route is
         // observed there, once the embedding exists.
@@ -1449,5 +1479,67 @@ mod tests {
 
         assert_eq!(embed_calls, 1, "only the selected face may reach ArcFace");
         assert_eq!(selected, [0.0, 0.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn descriptor_advertises_flux1_dev_pag_and_records_pag_policy() {
+        let desc = descriptor();
+        assert_eq!(
+            desc.capabilities.pag,
+            Some(FluxVariant::Dev.pag_capability())
+        );
+
+        let pag_req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            pag: Some(gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let resolved = desc
+            .capabilities
+            .resolve_pag(desc.id, &pag_req)
+            .unwrap()
+            .expect("active pag");
+        let pag_report = resolved.execution_report(4);
+        assert_eq!(pag_report.layers, vec![28]);
+        assert_eq!(pag_report.active_steps, 4);
+        assert_eq!(pag_report.total_steps, 4);
+
+        let completed = mlx_gen::image_execution::complete_image_report_attempt(
+            &desc,
+            &CancelFlag::new(),
+            || {
+                let pag = Some(resolved.clone());
+                mlx_gen::image_execution::policy_debug("pulid.pag", &pag);
+                mlx_gen::image_execution::sampled_native(
+                    "flow_match",
+                    "sigma",
+                    Dtype::Float32,
+                    &[1.0, 0.0],
+                    42,
+                );
+                let mut report = gen_core::GenerationReport::from_output(
+                    GenerationOutput::Images(vec![img()]),
+                );
+                report.pag = Some(pag_report.clone());
+                Ok(report)
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.generation.pag, Some(pag_report));
+        let policy = match &completed.execution.resolved().unwrap().quality_policy {
+            gen_core::generator::ExecutionFact::Resolved { value } => value,
+            other => panic!("expected resolved quality policy: {other:?}"),
+        };
+        assert!(policy["pulid.pag"].as_str().unwrap().contains("Some("));
     }
 }

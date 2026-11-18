@@ -231,6 +231,36 @@ impl FluxControlTransformer {
         control_scale: f32,
         injector: Option<&dyn crate::transformer::DitImageInjector>,
     ) -> Result<Array> {
+        self.forward_composed_pag(
+            hidden_states,
+            control_cond,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            control_scale,
+            injector,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_composed_pag(
+        &self,
+        hidden_states: &Array,
+        control_cond: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        control_scale: f32,
+        injector: Option<&dyn crate::transformer::DitImageInjector>,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Array> {
         let residuals = self.branch.forward(
             hidden_states,
             control_cond,
@@ -241,7 +271,7 @@ impl FluxControlTransformer {
             width,
             height,
         )?;
-        self.base.forward_control(
+        self.base.forward_control_pag(
             hidden_states,
             prompt_embeds,
             pooled_prompt_embeds,
@@ -251,6 +281,33 @@ impl FluxControlTransformer {
             height,
             injector,
             Some((&residuals, control_scale)),
+            pag_layers,
+        )
+    }
+
+    /// Compute the ControlNet residuals once for a step so multi-pass guidance (PAG) can reuse
+    /// them across conditional and perturbed base DiT passes without re-running the branch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_residuals(
+        &self,
+        hidden_states: &Array,
+        control_cond: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Array>> {
+        self.branch.forward(
+            hidden_states,
+            control_cond,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
         )
     }
 }

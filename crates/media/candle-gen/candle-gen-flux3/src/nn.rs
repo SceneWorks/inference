@@ -963,6 +963,71 @@ fn packed_attention_impl(
     }
 }
 
+/// Perturbed-attention guidance over FLUX 3 packed `[1, H, L, D]` tokens:
+/// for each sample `s` with `bounds[s] = (start, end)` and `image_placements[s] = (start, img_end)`,
+/// `Q_image` (`start..img_end`) receives `V_image` directly, while any `[image_cond, text]` suffix
+/// (`img_end..end`) runs normal SDPA over the full sample `(K[start..end], V[start..end])`.
+pub fn packed_attention_pag(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    bounds: &[(usize, usize)],
+    image_placements: &[(usize, usize)],
+    compute: DType,
+) -> Result<Tensor> {
+    let (_, h, l, d) = q.dims4()?;
+    let kernel = DType::F32;
+    let prep = |a: &Tensor| -> Result<Tensor> { Ok(to(&to(a, compute)?, kernel)?.contiguous()?) };
+    let (q, k, v_f32) = (prep(q)?, prep(k)?, prep(v)?);
+    let v_compute = to(v, compute)?;
+    let scale = 1.0 / (d as f64).sqrt();
+    let slice = |a: &Tensor, a_start: usize, a_end: usize| -> Result<Tensor> {
+        if a_start == 0 && a_end == l {
+            Ok(a.clone())
+        } else {
+            Ok(a.narrow(2, a_start, a_end - a_start)?.contiguous()?)
+        }
+    };
+    let mut chunks = Vec::with_capacity(bounds.len());
+    for (&(start, end), &(img_start, img_end)) in bounds.iter().zip(image_placements) {
+        if end <= start {
+            continue;
+        }
+        debug_assert_eq!(img_start, start);
+        let img_len = img_end - start;
+        let out_img = slice(&v_compute, start, img_end)?
+            .transpose(1, 2)?
+            .reshape((img_len, h * d))?;
+        if end > img_end {
+            let q_suffix = slice(&q, img_end, end)?;
+            let k_sample = slice(&k, start, end)?;
+            let v_sample = slice(&v_f32, start, end)?;
+            let out_suffix = candle_gen::sdpa_budgeted_bhsd(
+                &q_suffix,
+                &k_sample,
+                &v_sample,
+                scale,
+                None,
+                softmax_last_dim,
+                candle_gen::ATTN_SCORES_BUDGET,
+            )?;
+            let out_suffix = to(&out_suffix, compute)?
+                .transpose(1, 2)?
+                .reshape((end - img_end, h * d))?;
+            chunks.push(Tensor::cat(&[&out_img, &out_suffix], 0)?);
+        } else {
+            chunks.push(out_img);
+        }
+    }
+    match chunks.len() {
+        0 => Err(Error::Msg(
+            "flux3: packed attention over no tokens (every sample bound is empty)".into(),
+        )),
+        1 => Ok(chunks.pop().expect("one chunk")),
+        _ => Ok(Tensor::cat(&chunks, 0)?),
+    }
+}
+
 /// Shape check with a named error (checkpoint/config disagreement surfaces at load, by key).
 pub fn expect_shape(name: &str, a: &Tensor, want: &[usize]) -> Result<()> {
     if a.dims() != want {
@@ -1376,5 +1441,58 @@ mod tests {
             packed_attention(&q, &k, &v, &[(1, 1)], DType::F32),
             Err(Error::Msg(_))
         ));
+    }
+
+    #[test]
+    fn packed_attention_pag_perturbs_only_leading_image_tokens_per_sample() {
+        let (h, l, d) = (2usize, 9usize, 4usize);
+        let q = seeded(h * l, d, 0.2).reshape((1, h, l, d)).unwrap();
+        let k = seeded(h * l, d, 0.8).reshape((1, h, l, d)).unwrap();
+        let v = seeded(h * l, d, 1.5).reshape((1, h, l, d)).unwrap();
+        let bounds = [(0, 5), (5, 9)];
+        let placements = [(0, 2), (5, 7)];
+
+        let full = packed_attention(&q, &k, &v, &bounds, DType::F32).unwrap();
+        let pag = packed_attention_pag(&q, &k, &v, &bounds, &placements, DType::F32).unwrap();
+        let v_lhd = v.transpose(1, 2).unwrap().reshape((l, h * d)).unwrap();
+
+        for (start, len) in [(0usize, 2usize), (5, 2)] {
+            assert_eq!(
+                pag.narrow(0, start, len)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                v_lhd
+                    .narrow(0, start, len)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+        }
+        for (start, len) in [(2usize, 3usize), (7, 2)] {
+            let diff = (&pag.narrow(0, start, len).unwrap() - &full.narrow(0, start, len).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-6,
+                "suffix SDPA mismatch at {start}..{}: {diff}",
+                start + len
+            );
+        }
+
+        let early = packed_attention_pag(&q, &k, &v, &bounds, &bounds, DType::F32).unwrap();
+        assert_eq!(
+            early.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            v_lhd.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 }

@@ -375,6 +375,33 @@ impl Flux2Variant {
         self.is_dev()
     }
 
+    /// Unified Perturbed-Attention Guidance capability for this FLUX.2 variant:
+    /// - `dev*`: `56` blocks (`0..8` double + `8..56` single), default `[28]` (single block `20`).
+    /// - `klein_9b*`: `32` blocks (`0..8` double + `8..32` single), default `[20]` (single block `12`).
+    pub fn pag_capability(self) -> mlx_gen::gen_core::PagCapability {
+        if self.is_dev() {
+            mlx_gen::gen_core::PagCapability {
+                num_blocks: 56,
+                block_domain: std::borrow::Cow::Borrowed("flux2_blocks"),
+                default_layers: vec![28],
+                default_start: 0.0,
+                default_stop: 1.0,
+                recommended_scale: 1.5,
+                max_scale: 15.0,
+            }
+        } else {
+            mlx_gen::gen_core::PagCapability {
+                num_blocks: 32,
+                block_domain: std::borrow::Cow::Borrowed("flux2_blocks"),
+                default_layers: vec![20],
+                default_start: 0.0,
+                default_stop: 0.75,
+                recommended_scale: 1.2,
+                max_scale: 15.0,
+            }
+        }
+    }
+
     pub fn descriptor(self) -> ModelDescriptor {
         // Conditioning surface by variant: the edit variant consumes one `Reference` (single image,
         // token concat, sc-2346) or one `MultiReference` (N images, sc-2645); txt2img consumes a
@@ -442,6 +469,7 @@ impl Flux2Variant {
                 // descriptor, because `model.rs`'s denoise threads the request through
                 // `MemoryConfig::with_request` on every route — gated long-sequence edit or not.
                 execution: crate::chunk::EXECUTION_SURFACE,
+                pag: Some(self.pag_capability()),
                 ..Default::default()
             },
         }
@@ -827,5 +855,34 @@ mod tests {
         let caps = kv.descriptor().capabilities;
         assert!(caps.accepts(ConditioningKind::Reference));
         assert!(caps.accepts(ConditioningKind::MultiReference));
+    }
+
+    #[test]
+    fn pag_capabilities_cover_all_flux2_variants() {
+        for dev in [
+            Flux2Variant::Dev.descriptor(),
+            Flux2Variant::DevEdit.descriptor(),
+            crate::model_control::descriptor_dev_control(),
+        ] {
+            let pag = dev.capabilities.pag.expect("dev pag");
+            assert_eq!(pag.num_blocks, 56, "{}", dev.id);
+            assert_eq!(pag.block_domain.as_ref(), "flux2_blocks");
+            assert_eq!(pag.default_layers, vec![28]);
+            assert_eq!((pag.default_start, pag.default_stop), (0.0, 1.0));
+            assert_eq!((pag.recommended_scale, pag.max_scale), (1.5, 15.0));
+        }
+
+        for klein in [
+            Flux2Variant::Klein9b.descriptor(),
+            Flux2Variant::Klein9bEdit.descriptor(),
+            Flux2Variant::Klein9bKvEdit.descriptor(),
+        ] {
+            let pag = klein.capabilities.pag.expect("klein pag");
+            assert_eq!(pag.num_blocks, 32, "{}", klein.id);
+            assert_eq!(pag.block_domain.as_ref(), "flux2_blocks");
+            assert_eq!(pag.default_layers, vec![20]);
+            assert_eq!((pag.default_start, pag.default_stop), (0.0, 0.75));
+            assert_eq!((pag.recommended_scale, pag.max_scale), (1.2, 15.0));
+        }
     }
 }
