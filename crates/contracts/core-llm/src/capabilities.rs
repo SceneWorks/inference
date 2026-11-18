@@ -30,6 +30,17 @@ pub struct ProposerCapabilities {
     pub recommended_depth: u32,
 }
 
+/// Tree verification a loaded model runs (feature SW-F328): the target verifies up to
+/// `max_rows` candidate rows beyond the anchor in one forward, with ancestor-only visibility,
+/// and keeps only the accepted branch's state. Advertised in
+/// [`TextLlmCapabilities::tree_verify`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TreeVerifyCapabilities {
+    /// The most candidate rows per tree verify pass (at most
+    /// [`MAX_TREE_ROWS`](crate::speculative::tree::MAX_TREE_ROWS)).
+    pub max_rows: u32,
+}
+
 /// Upstream-recommended sampling presets for a model whose thinking and non-thinking modes use
 /// different distributions. These are discovery metadata: a client may initialize controls from
 /// the applicable preset, then sends an ordinary explicit [`Sampling`] request.
@@ -95,6 +106,9 @@ pub struct TextLlmCapabilities {
     /// [`proposer`](Self::proposer), all of them with
     /// [`speculative_proposers`](Self::speculative_proposers).
     pub speculative: Vec<ProposerCapabilities>,
+    /// Tree verification this model runs, and its row bound (feature SW-F328). `None`: a
+    /// `tree` request verifies linearly, the reason named in its decode report.
+    pub tree_verify: Option<TreeVerifyCapabilities>,
     /// The output constraint KINDS this provider can enforce (empty = none).
     ///
     /// Kinds, not [`Constraint`] values: a provider cannot know in advance which schema or
@@ -250,6 +264,10 @@ impl TextLlmCapabilities {
             if depth == 0 {
                 return reject(format!("speculative `{proposer}` depth must be >= 1"));
             }
+        }
+
+        if req.speculative_verify == (crate::SpeculativeVerify::Tree { max_rows: 0 }) {
+            return reject("speculative tree verification needs max_rows >= 1".into());
         }
 
         if let Some(c) = &req.constraint {

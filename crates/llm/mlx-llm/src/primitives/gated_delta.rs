@@ -883,13 +883,37 @@ fn causal_depthwise_conv_traced_impl(
     conv_state: &Array,
     accumulate_f32: bool,
 ) -> Result<(Array, ConvTrace)> {
-    let xs = x.shape();
-    let (s, c) = (xs[1], xs[2]);
+    let s = x.shape()[1];
     let kk = weight.shape()[1]; // kernel size K (weight is [C, K])
     let cat = concatenate_axis(&[conv_state, x], 1)?; // [B, S+K-1, C]
+    let out = depthwise_conv_windows(&cat, x.dtype(), weight, accumulate_f32, |j| {
+        slice_seq(&cat, j, j + s) // cat[:, j:j+S, :] → [B,S,C]
+    })?;
+    Ok((
+        out,
+        ConvTrace {
+            cat,
+            tokens: s,
+            tail: kk - 1,
+        },
+    ))
+}
+
+/// The short conv's arithmetic over caller-chosen input windows: `window(j)` is the `[B, S, C]`
+/// input each output row multiplies with tap `j` (`0` the oldest). One body for the linear conv
+/// (contiguous slices) and the tree conv (each row's ancestor rows), so both round identically.
+fn depthwise_conv_windows(
+    cat: &Array,
+    out_dtype: Dtype,
+    weight: &Array,
+    accumulate_f32: bool,
+    window: impl Fn(i32) -> Result<Array>,
+) -> Result<Array> {
+    let c = cat.shape()[2];
+    let kk = weight.shape()[1];
     let mut acc: Option<Array> = None;
     for j in 0..kk {
-        let window = slice_seq(&cat, j, j + s)?; // cat[:, j:j+S, :] → [B,S,C]
+        let window = window(j)?;
         let wj = weight
             .take_axis(Array::from_slice(&[j], &[1]), 1)? // weight[:, j] → [C,1]
             .reshape(&[1, 1, c])?; // → [1,1,C] (broadcast over B,S)
@@ -908,25 +932,113 @@ fn causal_depthwise_conv_traced_impl(
     }
     let acc = acc.expect("conv kernel size must be >= 1");
     let acc = if accumulate_f32 {
-        acc.as_dtype(x.dtype())?
+        acc.as_dtype(out_dtype)?
     } else {
         acc
     };
-    let out = if accumulate_f32 {
+    Ok(if accumulate_f32 {
         // HF's fused SiLU computes from the narrowed Conv1d output in F32.
         // MLX's BF16 sigmoid/multiply expression has an extra sigmoid rounding.
-        silu(&acc.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?
+        silu(&acc.as_dtype(Dtype::Float32)?)?.as_dtype(out_dtype)?
     } else {
         silu(acc)?
-    }; // [B,S,C]
-    Ok((
-        out,
-        ConvTrace {
-            cat,
-            tokens: s,
-            tail: kk - 1,
-        },
-    ))
+    }) // [B,S,C]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tree verification (feature SW-F328, story SW-6914).
+// ---------------------------------------------------------------------------------------------
+
+/// The shape of one tree verify forward as the DeltaNet layers see it: each row's parent row
+/// (`None` for the anchor, row `0`) and its depth below the anchor. Rows are topologically
+/// ordered (a parent precedes its children).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreePlan {
+    /// The parent row of every row; `parents[0]` is `None`.
+    pub parents: Vec<Option<usize>>,
+    /// Every row's depth below the anchor.
+    pub depths: Vec<i32>,
+}
+
+impl TreePlan {
+    /// The plan of a tree whose row `r >= 1` continues `parents[r - 1]`.
+    pub fn new(node_parents: &[usize]) -> Self {
+        let mut parents = vec![None];
+        let mut depths = vec![0];
+        for &p in node_parents {
+            depths.push(depths[p] + 1);
+            parents.push(Some(p));
+        }
+        Self { parents, depths }
+    }
+
+    /// Rows, the anchor included.
+    pub fn rows(&self) -> usize {
+        self.parents.len()
+    }
+
+    /// The short conv's input rows for every tree row: `windows[r][j]` indexes
+    /// `[conv_state ‖ tree rows]` (`K - 1 + rows` rows) with the row tap `j` of row `r` reads —
+    /// the row itself for the newest tap, then its ancestors, then the pre-step conv history once
+    /// the path above the anchor runs out. A chain gives exactly the linear conv's slices.
+    pub fn conv_windows(&self, k: i32) -> Vec<Vec<i32>> {
+        (0..self.rows())
+            .map(|r| {
+                let mut back = Vec::with_capacity(k as usize); // newest first
+                let mut at = Some(r);
+                for m in 0..k {
+                    match at {
+                        Some(row) => {
+                            back.push(k - 1 + row as i32);
+                            at = self.parents[row];
+                        }
+                        None => back.push(k - 1 - (m - self.depths[r])),
+                    }
+                }
+                back.reverse();
+                back
+            })
+            .collect()
+    }
+
+    /// Rows grouped by depth, shallowest first, each group in row order.
+    fn levels(&self) -> Vec<Vec<usize>> {
+        let max = self.depths.iter().copied().max().unwrap_or(0) as usize;
+        let mut levels = vec![Vec::new(); max + 1];
+        for (r, &d) in self.depths.iter().enumerate() {
+            levels[d as usize].push(r);
+        }
+        levels
+    }
+}
+
+/// [`causal_depthwise_conv_traced`] over a verify **tree**: each row convolves its own ancestor
+/// rows (and the pre-step `conv_state` above the anchor) per [`TreePlan::conv_windows`] instead
+/// of the rows packed before it. Returns `(silu(conv) [B, rows, C], [conv_state ‖ x])`.
+pub fn tree_depthwise_conv(
+    x: &Array,
+    weight: &Array,
+    conv_state: &Array,
+    windows: &[Vec<i32>],
+    accumulate_f32: bool,
+) -> Result<(Array, Array)> {
+    let cat = concatenate_axis(&[conv_state, x], 1)?;
+    let out = depthwise_conv_windows(&cat, x.dtype(), weight, accumulate_f32, |j| {
+        let idx: Vec<i32> = windows.iter().map(|w| w[j as usize]).collect();
+        Ok(cat.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?)
+    })?;
+    Ok((out, cat))
+}
+
+/// A tree verify forward's per-row states, held until the engine keeps one branch.
+#[derive(Clone, Debug)]
+struct TreeStates {
+    /// The conv input `[conv_state ‖ tree rows]`.
+    cat: Array,
+    /// Every row's conv taps ([`TreePlan::conv_windows`]).
+    windows: Vec<Vec<i32>>,
+    /// Every row's recurrent state after the row, `[1, Hv, Dv, Dk]`.
+    states: Vec<Array>,
 }
 
 /// Gated RMSNorm (`Qwen3NextRMSNormGated`): `rms_norm(x, weight, eps) · silu(gate)`. Applied to the
@@ -975,6 +1087,10 @@ pub struct DeltaNetCache {
     capture: Option<i32>,
     /// `(position, conv_state, ssm_state)` the last forward captured.
     captured: Option<(i32, Array, Array)>,
+    /// The per-row states of a tree verify forward not yet kept or dropped (feature SW-F328).
+    tree: Option<TreeStates>,
+    /// The tree the next forward verifies ([`arm_tree`](DeltaNetCache::arm_tree)).
+    tree_plan: Option<std::sync::Arc<TreePlan>>,
 }
 
 /// A checkpoint window: the state at `start` and the per-token states of every forward since.
@@ -1156,6 +1272,137 @@ impl DeltaNetCache {
         Ok(y)
     }
 
+    /// Run the recurrence over a verify **tree** (feature SW-F328): every row continues the state
+    /// of its parent row (the live state for the anchor), so each row's state is the one a linear
+    /// decode of its branch reaches. The rows of one depth run as one batched single-token step —
+    /// the decode step's arithmetic — so a tree costs one recurrence dispatch per depth level.
+    /// The live state and the position are untouched until [`commit_tree`](Self::commit_tree)
+    /// keeps one branch ([`abort_tree`](Self::abort_tree) drops them all). `cat` and `windows`
+    /// are the forward's [`tree_depthwise_conv`] input and taps; `q`, `k`, `v`, `g`, `beta` are
+    /// shaped as for [`gated_delta_recurrence`] with `B = 1`, `T = rows`. Returns `y`
+    /// `[1, rows, Hv, Dv]` in row order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_tree(
+        &mut self,
+        cat: Array,
+        windows: Vec<Vec<i32>>,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+    ) -> Result<Array> {
+        let plan = self
+            .tree_plan
+            .take()
+            .ok_or_else(|| Error::Msg("DeltaNetCache::advance_tree: no tree armed".into()))?;
+        let rows = plan.rows();
+        if q.shape()[1] as usize != rows || windows.len() != rows {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance_tree: {} rows for a {rows}-row tree",
+                q.shape()[1]
+            )));
+        }
+        let mut states: Vec<Option<Array>> = vec![None; rows];
+        let mut ys: Vec<Array> = Vec::with_capacity(rows);
+        let mut order: Vec<usize> = Vec::with_capacity(rows);
+        for level in plan.levels() {
+            let m = level.len() as i32;
+            let idx: Vec<i32> = level.iter().map(|&r| r as i32).collect();
+            let idx = Array::from_slice(&idx, &[m]);
+            // [1, m, ...] → [m, 1, ...]: the level's rows are the batch of one decode step.
+            let batch = |x: &Array| -> Result<Array> {
+                let picked = x.take_axis(&idx, 1)?;
+                let mut shape = picked.shape().to_vec();
+                shape[0] = m;
+                shape[1] = 1;
+                Ok(picked.reshape(&shape)?)
+            };
+            let parents: Vec<&Array> = level
+                .iter()
+                .filter_map(|&r| plan.parents[r].and_then(|p| states[p].as_ref()))
+                .collect();
+            let start = if parents.is_empty() {
+                // The anchor level: the live state (a fresh cache starts from zeros).
+                self.ssm_state.clone()
+            } else {
+                Some(concatenate_axis(&parents, 0)?)
+            };
+            let (y, next) = gated_delta_recurrence(
+                &batch(q)?,
+                &batch(k)?,
+                &batch(v)?,
+                &batch(g)?,
+                &batch(beta)?,
+                start.as_ref(),
+            )?;
+            for (i, &r) in level.iter().enumerate() {
+                states[r] = Some(next.take_axis(Array::from_slice(&[i as i32], &[1]), 0)?);
+            }
+            let sh = y.shape(); // [m, 1, Hv, Dv]
+            ys.push(y.reshape(&[1, m, sh[2], sh[3]])?);
+            order.extend(&level);
+        }
+        // Back from level order to row order.
+        let mut inverse = vec![0i32; rows];
+        for (packed, &row) in order.iter().enumerate() {
+            inverse[row] = packed as i32;
+        }
+        let y =
+            concatenate_axis(&ys, 1)?.take_axis(Array::from_slice(&inverse, &[rows as i32]), 1)?;
+        self.tree = Some(TreeStates {
+            cat,
+            windows,
+            states: states
+                .into_iter()
+                .map(|s| s.expect("every row ran"))
+                .collect(),
+        });
+        Ok(y)
+    }
+
+    /// Verify the next forward's rows as `plan`'s tree (feature SW-F328): the layer's forward
+    /// convolves and recurs along each row's branch ([`advance_tree`](Self::advance_tree)).
+    pub fn arm_tree(&mut self, plan: std::sync::Arc<TreePlan>) {
+        self.tree = None;
+        self.tree_plan = Some(plan);
+    }
+
+    /// The tree the next forward verifies, when one is armed.
+    pub fn armed_tree(&self) -> Option<std::sync::Arc<TreePlan>> {
+        self.tree_plan.clone()
+    }
+
+    /// Keep the branch ending at tree `row` (feature SW-F328): its recurrent state and conv
+    /// history become live and the position advances by the branch's `kept` rows (the anchor
+    /// included). Any checkpoint window is dropped.
+    pub fn commit_tree(&mut self, row: usize, kept: i32) -> Result<()> {
+        let tree = self.tree.take().ok_or_else(|| {
+            Error::Msg("DeltaNetCache::commit_tree: no tree forward to keep a branch of".into())
+        })?;
+        let taps = &tree.windows[row];
+        let tail = Array::from_slice(&taps[1..], &[taps.len() as i32 - 1]);
+        self.conv_state = Some(tree.cat.take_axis(&tail, 1)?);
+        self.ssm_state = Some(tree.states[row].clone());
+        self.offset += kept;
+        self.window = None;
+        Ok(())
+    }
+
+    /// Drop a tree forward's per-row states (and an armed tree the forward never reached),
+    /// keeping the live state (feature SW-F328).
+    pub fn abort_tree(&mut self) {
+        self.tree = None;
+        self.tree_plan = None;
+    }
+
+    /// Bytes a pending tree forward holds (its conv input and per-row states).
+    pub fn tree_bytes(&self) -> usize {
+        self.tree.as_ref().map_or(0, |t| {
+            t.cat.nbytes() + t.states.iter().map(Array::nbytes).sum::<usize>()
+        })
+    }
+
     /// Ask the next forward to capture the state after `position` — a boundary strictly inside
     /// that forward, which runs outside a checkpoint window (a prefill) — so the prefix cache can
     /// snapshot the layer there without splitting the prefill into two forwards (sc-24446).
@@ -1289,6 +1536,8 @@ impl DeltaNetCache {
         self.window = None;
         self.capture = None;
         self.captured = None;
+        self.tree = None;
+        self.tree_plan = None;
     }
 }
 

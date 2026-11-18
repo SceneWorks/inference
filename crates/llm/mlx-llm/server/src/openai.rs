@@ -7,7 +7,7 @@
 
 use mlx_llm::core_llm::{
     Constraint, Content, DecodeReport, KvCacheReport, KvCompressionPolicy, Message, Role, Sampling,
-    Speculative, TextLlmRequest,
+    Speculative, SpeculativeVerify, TextLlmRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -51,6 +51,12 @@ pub struct ChatRequest {
     /// 400, never silently decoded as `off`. Omitted ⇒ `off`.
     #[serde(default, alias = "mtp")]
     pub speculative: Option<Speculative>,
+    /// Speculative verify layout (non-OpenAI extension, feature SW-F328): `"linear"` (the
+    /// default) or `{"tree": {"max_rows": N}}` — the contract's explicit tree opt-in. The
+    /// response's `x_decode.tree_verify` reports what the tree did; a model or path that cannot
+    /// run it verifies linearly and names why in `x_decode.fallbacks`.
+    #[serde(default)]
+    pub speculative_verify: Option<SpeculativeVerify>,
     /// Compressed-KV opt-in (non-OpenAI extension, sc-20681): `"off"` (the default) or
     /// `"qualified"` — compressed where the engine's qualification table admits the request, dense
     /// with a reason everywhere else. The response's `kv_cache` object says which ran.
@@ -196,6 +202,7 @@ impl ChatRequest {
             // provider validates it against what the loaded model advertises (sc-24438).
             speculative: self.speculative,
             mtp: None,
+            speculative_verify: self.speculative_verify.unwrap_or_default(),
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
@@ -261,7 +268,7 @@ pub fn final_chunk(
 /// body and of the final SSE chunk before `[DONE]`.
 pub fn x_decode(report: &DecodeReport) -> Value {
     let path = |p: &mlx_llm::core_llm::PathReport| json!({ "path": p.path, "reason": p.reason });
-    json!({
+    let mut v = json!({
         "path": report.path,
         "proposer": report.proposer.label(),
         "draft_tokens": report.draft_tokens,
@@ -295,7 +302,22 @@ pub fn x_decode(report: &DecodeReport) -> Value {
         "prefix_cache": path(&report.prefix_cache),
         "prefix_hit_tokens": report.prefix_hit_tokens,
         "fallbacks": report.fallbacks,
-    })
+    });
+    // Present only on a request whose tree verification ran (feature SW-F328).
+    if let Some(tree) = report.tree_verify {
+        v["tree_verify"] = json!({
+            "max_rows": tree.max_rows,
+            "passes": tree.passes,
+            "tree_passes": tree.tree_passes,
+            "rows_verified": tree.rows_verified,
+            "rows_per_pass": tree.rows_per_pass(),
+            "max_rows_per_pass": tree.max_rows_per_pass,
+            "accepted_tokens": tree.accepted_tokens,
+            "accepted_per_pass": tree.accepted_per_pass(),
+            "peak_workspace_bytes": tree.peak_workspace_bytes,
+        });
+    }
+    v
 }
 
 /// `auto`'s last judged window (sc-24446,
