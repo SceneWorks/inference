@@ -2073,16 +2073,10 @@ impl Qwen35Model {
                     in_proj_a: proj_dense(lp("linear_attn.in_proj_a.weight"))?,
                     in_proj_b: proj_dense(lp("linear_attn.in_proj_b.weight"))?,
                     conv_weight,
-                    a_log: if cfg.sensenova_loop.is_some() {
-                        w.require(&lp("linear_attn.A_log"))?.clone()
-                    } else {
-                        req(lp("linear_attn.A_log"))?
-                    },
-                    dt_bias: if cfg.sensenova_loop.is_some() {
-                        w.require(&lp("linear_attn.dt_bias"))?.clone()
-                    } else {
-                        req(lp("linear_attn.dt_bias"))?
-                    },
+                    // HF's BF16 loader narrows these source FP32 tensors to their
+                    // initialized module dtype. compute_g widens them for the decay.
+                    a_log: req(lp("linear_attn.A_log"))?,
+                    dt_bias: req(lp("linear_attn.dt_bias"))?,
                     norm_weight: req(lp("linear_attn.norm.weight"))?,
                     out_proj: proj_q(lp("linear_attn.out_proj.weight"))?,
                     num_k_heads: cfg.linear_num_key_heads,
