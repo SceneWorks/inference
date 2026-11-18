@@ -17,8 +17,11 @@ name: Qwen3.8-27B full tiers (convert and publish)
 # report (artifact `qwen38-full-tiers-<model>-<backend>`) holds the resulting commit and every file's
 # size and sha256: the SceneWorks manifest pins are filled from it.
 #
-# MLX runs only on nax-macos-2 (`rw-llm`); the job refuses any other runner name before doing any
-# work, so it can never land on nax-macos, Michael's dev Mac. Candle conversion is CPU-only on the
+# MLX runs on the Mac the `mac_runner` input names, and the job refuses any other runner name before
+# doing any work. `nax-macos` (label `rw-starvector`, Michael's dev Mac) is the default ONLY while
+# nax-macos-2's model disk is full: Michael approved that loan for SW-7202 on 2026-11-18. Its
+# task-owned weights root is on /Volumes/Models (~1.4 TB free), never the internal disk. Switch the
+# default back to `nax-macos-2` (`rw-llm`, weights root under $HOME) once its new drive is fitted. Candle conversion is CPU-only on the
 # Windows CUDA real-weights box. Uploads use the runner's own Hugging Face login, as the SW-7104
 # publication lanes do. Each job checks free disk before every write and removes only its own
 # run-scoped scratch. `publish: false` converts and reports sizes without uploading.
@@ -31,10 +34,16 @@ on:
         type: choice
         options: [describer, expander]
       backend:
-        description: mlx (nax-macos-2) or candle (Windows CUDA real-weights box, CPU conversion)
+        description: mlx (the Mac `mac_runner` names) or candle (Windows CUDA real-weights box, CPU conversion)
         required: true
         type: choice
         options: [mlx, candle]
+      mac_runner:
+        description: MLX runner. nax-macos (dev Mac, approved loan while nax-macos-2's disk is full) or nax-macos-2
+        required: true
+        type: choice
+        options: [nax-macos, nax-macos-2]
+        default: nax-macos
       publish:
         description: Upload the converted tiers to the SceneWorks re-host
         required: true
@@ -48,7 +57,7 @@ jobs:
   mlx:
     name: Convert and publish the ${{ inputs.model }} MLX full tiers
     if: inputs.backend == 'mlx'
-    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"]
     timeout-minutes: 720
     # One writer per box: the conversion and the upload share its disk.
     concurrency:
@@ -56,21 +65,28 @@ jobs:
       cancel-in-progress: false
     env:
       QWEN38_FULL_TIERS_MODEL: ${{ inputs.model }}
+      MAC_RUNNER: ${{ inputs.mac_runner }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - name: Refuse any runner but nax-macos-2
+      - name: Refuse any runner but the selected Mac
         run: |
-          echo "runner: $RUNNER_NAME"
-          [[ "$RUNNER_NAME" == "nax-macos-2" ]] || { echo "::error::this lane runs only on nax-macos-2, never on the dev Mac; nothing was started"; exit 1; }
+          echo "runner: $RUNNER_NAME (selected: $MAC_RUNNER)"
+          [[ "$RUNNER_NAME" == "$MAC_RUNNER" ]] || { echo "::error::this run selected $MAC_RUNNER but landed on $RUNNER_NAME; nothing was started"; exit 1; }
       - name: Prepare the run
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           if [[ "${{ inputs.publish }}" == true ]]; then
             PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 -c 'from huggingface_hub import HfApi; n = HfApi().whoami().get("name"); assert n, "no Hugging Face login on this runner"; print("Hugging Face identity:", n)'
           fi
-          lane_root="$HOME/sceneworks-rw-weights"
+          # nax-macos keeps model data on /Volumes/Models; nax-macos-2 under $HOME.
+          if [[ "$MAC_RUNNER" == nax-macos ]]; then
+            [[ -d /Volumes/Models && -w /Volumes/Models ]] || { echo "::error::/Volumes/Models is not a writable volume on $RUNNER_NAME"; exit 1; }
+            lane_root="/Volumes/Models/sceneworks-rw-weights"
+          else
+            lane_root="$HOME/sceneworks-rw-weights"
+          fi
           if [[ -L "$lane_root" ]]; then
             echo "task-owned weights root must be an internal directory: $lane_root" >&2; exit 1
           fi
@@ -82,13 +98,19 @@ jobs:
           df -h "$lane_root"
           {
             echo "LANE_HUB=$lane_root/hub"
+            echo "LANE_ROOT=$lane_root"
             echo "PUBLISH_SCRATCH=$scratch"
             echo "PUBLISH_REPORTS=$RUNNER_TEMP/qwen38-full-tiers-reports"
             echo "PYTHONPATH=$RUNNER_TEMP/huggingface-hub"
             echo "HF_HUB_DISABLE_XET=1"
           } >> "$GITHUB_ENV"
       - name: Set up the MLX build environment
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/set-up-the-mlx-build-environment.sh
+        run: |
+          source scripts/ci/real-weights/mlx-minimax-h3-image-publish/set-up-the-mlx-build-environment.sh
+          # The release target (tens of GB) lives in this run's scratch on the weights volume, not
+          # the runner's internal disk; it is removed with the scratch.
+          mkdir -p "$PUBLISH_SCRATCH/cargo-target"
+          echo "CARGO_TARGET_DIR=$PUBLISH_SCRATCH/cargo-target" >> "$GITHUB_ENV"
       - name: Build the converters
         run: |
           cargo build --locked --release -p mlx-llm --example prepare_snapshot
