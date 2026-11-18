@@ -470,6 +470,9 @@ REAL_WEIGHT_MODULES = {
     ("candle", "h3_image_train_lora_load_real"),
     ("candle", "h3_image_train_real"),
     ("candle", "training::real_tests"),
+    # Synthetic-DiT training-adapter proofs (SW-F369), registered in model-inference-proofs.json
+    # and run only by model-inference-proofs.yml.
+    ("candle", "training::training_adapter_tests"),
     ("candle", "ref2va_checkpoint"),
     ("candle", "veda_ab"),
     ("candle", "vram_probe"),

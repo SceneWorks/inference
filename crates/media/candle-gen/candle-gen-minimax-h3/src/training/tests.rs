@@ -126,15 +126,44 @@ fn adapter_elements_count_what_the_install_trains() {
 #[test]
 fn every_training_step_is_a_render_step() {
     let schedule = gen_core_h3::h3_schedule::SigmaSchedule::h3_image_distilled().unwrap();
-    let sigmas = candle_gen::gen_core::h3_image::sampler_sigmas();
     for (i, &t) in schedule.timesteps().iter().enumerate() {
-        let st = training_step(sigmas[i]);
+        let st = gen_core_train::h3_image::distilled_step(i);
         assert_eq!(st.index, i);
         assert!(
             (st.timestep - t).abs() < 1e-6,
             "step {i}: {} vs {t}",
             st.timestep
         );
+    }
+}
+
+/// The trainer's own timestep draw (`flow_match::sample_unit_timestep` at the per-step seed, the
+/// exact path `micro_step` takes) trains every one of the six heads on a real share of the steps
+/// under each distribution at the balanced bias — the six-step render runs each head once, and the
+/// LoRA in the shared blocks changes all of them. Nearest-σ quantization gave heads 0 and 1 about
+/// 0.002 % and 0.5 % of a sigmoid run. Floors: `linear` is the render's own 1/6 per head;
+/// `sigmoid` puts `P(z > ln 5) ≈ 5.4 %` on each end head; `weighted` (the mean of a uniform and a
+/// sigmoid draw) concentrates on mid noise by design, leaving its end heads ≈ 2.6 % each.
+#[test]
+fn every_head_is_trained_under_every_timestep_distribution() {
+    let steps = 20_000u32;
+    for (kind, floor) in [("sigmoid", 0.045), ("linear", 0.155), ("weighted", 0.02)] {
+        let mut counts = [0u32; 6];
+        for step in 1..=steps {
+            let t = flow_match::sample_unit_timestep(
+                kind,
+                "balanced",
+                flow_match::timestep_seed(42, step),
+            );
+            counts[training_step(t).index] += 1;
+        }
+        for (head, &n) in counts.iter().enumerate() {
+            let share = f64::from(n) / f64::from(steps);
+            assert!(
+                share > floor,
+                "{kind}: head {head} trained {share:.4} of steps, floor {floor} ({counts:?})"
+            );
+        }
     }
 }
 
@@ -209,4 +238,72 @@ fn the_registry_registers_the_trainer() {
     let registry = crate::provider_registry().unwrap();
     let ids: Vec<&str> = registry.trainers().map(|t| (t.descriptor)().id).collect();
     assert_eq!(ids, vec![TRAINER_ID]);
+}
+
+/// The training adapter is a declared technique on candle: the shared floor admits a run naming one
+/// (validate never reads the file), and refuses it on a full fine-tune.
+#[test]
+fn the_training_adapter_is_declared_and_passes_the_floor() {
+    let d = descriptor();
+    assert!(d.techniques.training_adapter);
+    let req = |config: TrainingConfig| TrainingRequest {
+        items: vec![TrainingItem::captioned(
+            "/nonexistent/a.png".into(),
+            "a cat".into(),
+        )],
+        config,
+        output_dir: "/nonexistent".into(),
+        file_name: "x.safetensors".into(),
+        trigger_words: vec![],
+        cancel: Default::default(),
+    };
+    let with_adapter = TrainingConfig {
+        training_adapter: Some("/nonexistent/fizgig.safetensors".into()),
+        ..gen_core_train::h3_image::default_training_config()
+    };
+    gen_core_train::h3_image::validate_floors(&d, &req(with_adapter.clone())).unwrap();
+    let full = TrainingConfig {
+        full_finetune: true,
+        ..with_adapter
+    };
+    assert!(gen_core_train::h3_image::validate_floors(&d, &req(full)).is_err());
+}
+
+/// No adapter configured prices nothing and reads nothing (the path would not exist).
+#[test]
+fn no_training_adapter_prices_nothing() {
+    let bytes = training_adapter::training_adapter_bytes(
+        Path::new("/nonexistent-dit"),
+        &cfg(),
+        &[],
+        None,
+        training_adapter::TRAINING_ADAPTER_STRENGTH,
+    )
+    .unwrap();
+    assert_eq!(
+        bytes,
+        gen_core_train::h3_image::TrainingAdapterBytes::default()
+    );
+}
+
+/// A preview loads the trainer's snapshot with the in-progress factors as its only adapter — the
+/// frozen training adapter never reaches a preview render, so the samples show what the saved
+/// adapter renders on the bare distilled base. Mutation: append the training adapter to the
+/// preview load ⇒ the adapter-list assert fails.
+#[test]
+fn a_preview_loads_only_the_trained_adapter() {
+    let setup = PreviewSetup {
+        spec: LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+            "/nonexistent-minimax-h3-image".into(),
+        )),
+        prompts: vec!["a cat".into()],
+        size: (1024, 1024),
+        references: vec![],
+        adapter_kind: AdapterKind::Lora,
+    };
+    let preview = Path::new("/out/.run-preview.safetensors");
+    let spec = setup.generator_spec(preview);
+    assert_eq!(spec.adapters.len(), 1);
+    assert_eq!(spec.adapters[0].path, preview);
+    assert_eq!(spec.adapters[0].scale, 1.0);
 }

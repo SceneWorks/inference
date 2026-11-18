@@ -315469,5 +315469,204 @@
         }
       ]
     }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::training_adapter_tests::the_adapter_adds_its_mapped_delta_in_every_residency",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed dit_block.safetensors synthetic two-block DiT plus an in-test Fizgig-shaped kohya training adapter, CPU float32; crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::the_adapter_adds_its_mapped_delta_in_every_residency",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::the_adapter_adds_its_mapped_delta_in_every_residency",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::the_adapter_adds_its_mapped_delta_in_every_residency/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::the_adapter_adds_its_mapped_delta_in_every_residency",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::training_adapter_tests::training_runs_through_the_adapter_and_saves_only_the_trainable_keys",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed dit_block.safetensors synthetic two-block DiT plus an in-test Fizgig-shaped kohya training adapter, CPU float32; crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::training_runs_through_the_adapter_and_saves_only_the_trainable_keys",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::training_runs_through_the_adapter_and_saves_only_the_trainable_keys",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::training_runs_through_the_adapter_and_saves_only_the_trainable_keys/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::training_runs_through_the_adapter_and_saves_only_the_trainable_keys",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::training_adapter_tests::a_bad_training_adapter_is_a_named_error",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed dit_block.safetensors synthetic two-block DiT plus an in-test Fizgig-shaped kohya training adapter, CPU float32; crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::a_bad_training_adapter_is_a_named_error",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::a_bad_training_adapter_is_a_named_error",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::a_bad_training_adapter_is_a_named_error/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/training/training_adapter_tests.rs::training::training_adapter_tests::a_bad_training_adapter_is_a_named_error",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::tests::the_frozen_adapter_is_reattached_after_each_trainable_install",
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/tests.rs",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/tests.rs :: source-local explicit arrays/weight construction",
+    "configuration_source": "original body/helper construction preserved verbatim",
+    "output_contract": "original assertions preserved; actual selected-stream readback; late body completion after required work",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "no_default_features": false,
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "required_environment": [],
+    "reachable_helper_trace": [
+      "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/tests.rs:121 the_frozen_adapter_is_reattached_after_each_trainable_install",
+      "src/training/training_adapter.rs::FrozenResiduals::reattach",
+      "mlx-gen src/adapters.rs::AdaptableLinear::forward"
+    ],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/tests.rs::training::tests::the_frozen_adapter_is_reattached_after_each_trainable_install@89e86a629f773f4075f0d41f0b5cbb7523eaa7b86ceb157e19766aa54852381e"
+    }
   }
 ]

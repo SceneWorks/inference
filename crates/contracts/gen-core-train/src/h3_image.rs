@@ -12,9 +12,11 @@
 //!   distilled H3-Image run computes once per request and therefore cannot train;
 //! * the **flow-matching training contract** — [`training_step`] and [`training_mix`], the noise
 //!   level, head and regression target one micro-step trains on;
-//! * the **training canvas** — [`training_canvas`];
+//! * the **training canvas** — [`training_canvas`]: every target keeps its aspect at about the
+//!   bucket edge's area, never upscaled past its own;
 //! * the **training-step memory envelope** — [`train_step_bytes`], the structural count both
-//!   backends price their train phase with.
+//!   backends price their train phase with, and [`TrainingAdapterBytes`], the frozen de-distill
+//!   training adapter's share of it.
 //!
 //! # The flow-matching contract
 //!
@@ -27,8 +29,15 @@
 //! released sampler steps on — through that step's own head and its own AdaLN timestep
 //! `t = 1 − σ`, exactly the forward the render runs at that step. The configured
 //! `timestep_type` / `timestep_bias` distribution is honored by drawing a continuous noise level
-//! from it and training at the nearest published level ([`training_step`]).
+//! from it and training the head whose equal-width slice of `t` the draw falls in
+//! ([`training_step`]): head `i` owns `t ∈ ((5 − i)/6, (6 − i)/6]`, so a uniform draw trains every
+//! head exactly as often as the six-step render runs it, and a biased draw still favours the noisy
+//! (`t → 1`, head 0) or clean (`t → 0`, head 5) end — but never starves a head the way snapping to
+//! the *nearest* published σ did (σ is 1.0, 0.9675, 0.8875, … so a sigmoid draw reached heads 0
+//! and 1 on well under 1 % of the steps, while the shared blocks the LoRA changes still feed them
+//! at every render).
 
+use gen_core::h3_adapter_memory::H3AdapterMemoryProfile;
 use gen_core::h3_image::{sampler_sigmas, FIXED_STEPS, MAX_REFERENCES, SIZE_STRIDE};
 use gen_core::license::components::MINIMAX_H3_IMAGE;
 
@@ -43,8 +52,8 @@ pub const TRAINER_ID: &str = "minimax_h3_image";
 /// The descriptor family (the generator's own).
 pub const FAMILY: &str = "minimax_h3_image";
 
-/// The default square training edge: H3-Image's native 4 MP generation canvas
-/// ([`gen_core::h3_image::MIN_GENERATION_AREA_DEFAULT`] is `2048²`).
+/// The default training edge (a canvas of about `edge²` pixels): H3-Image's native 4 MP
+/// generation canvas ([`gen_core::h3_image::MIN_GENERATION_AREA_DEFAULT`] is `2048²`).
 pub const DEFAULT_TRAINING_RESOLUTION: u32 = 2048;
 
 /// Every training canvas edge is a multiple of this: one VAE cell (16 px) times the DiT's 2×2
@@ -136,9 +145,14 @@ pub fn trainer_descriptor(backend: &'static str) -> TrainerDescriptor {
         // An edit pair carries the generator's own reference cap.
         max_reference_images: MAX_REFERENCES as u32,
         // Weight and gradient noise act at the shared adapter optimizer update; resolution buckets
-        // cache every item once per edge. Every other technique is refused by the shared floor.
+        // cache every item once per edge; the training adapter (a frozen de-distill LoRA such as
+        // `ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter`) is installed on the training
+        // DiT only — previews render through a fresh generator without it, and the saved adapter
+        // holds the trainable factors alone (see [`TrainingAdapterBytes`]). Every other technique
+        // is refused by the shared floor.
         techniques: TrainingTechniques {
             resolution_buckets: true,
+            training_adapter: true,
             ..TrainingTechniques::ADAPTER_NOISE
         },
     }
@@ -316,6 +330,93 @@ pub fn target_block(path: &str) -> Option<usize> {
         .ok()
 }
 
+/// The frozen **training adapter**'s footprint on the training DiT ([`TrainingConfig::training_adapter`]):
+/// H3-Image is a six-step distilled model, and plain flow-matching fine-tuning un-distills it (a
+/// long LoRA samples blurry, with ghosted limbs). A de-distill LoRA applied to the base at strength
+/// 1.0 for every training forward/backward — and absent from previews and the saved adapter — lets
+/// the user's adapter learn the concept instead of undoing the distillation (the Z-Image
+/// precedent, sc-25213).
+///
+/// Both backends install the file through their own **inference** H3-Image adapter install (the
+/// same key mapping a render uses: kohya, ComfyUI fused `qkv_proj`, diffusers/PEFT, LoKr) as a
+/// frozen forward-time residual over the untouched — possibly packed — base. These are the bytes
+/// that install holds, reduced from the inference adapter memory profile
+/// ([`H3AdapterMemoryProfile`], header-only) to what a block-streaming trainer needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrainingAdapterBytes {
+    /// Every installed factor plus its prepared caches.
+    pub resident: u64,
+    /// The share on modules outside the 50 blocks (refiner, I/O projections, heads) — resident
+    /// with the trunk whatever the block residency.
+    pub trunk: u64,
+    /// The largest single block's share — what one streamed block window adds.
+    pub block_max: u64,
+    /// Bytes per sequence row the residuals' forward keeps alive (their intermediates and outputs,
+    /// which autograd retains for the backward): the largest block's, and every block's.
+    pub rows_block_max: u64,
+    pub rows_total: u64,
+}
+
+impl TrainingAdapterBytes {
+    /// Reduce an inference adapter memory profile of the training adapter alone.
+    pub fn from_profile(profile: &H3AdapterMemoryProfile) -> Self {
+        let mut blocks = std::collections::BTreeMap::<usize, (u64, u64)>::new();
+        let mut trunk = 0u64;
+        let mut rows_total = 0u64;
+        for p in &profile.projections {
+            rows_total = rows_total.saturating_add(p.forward_bytes_per_row);
+            match target_block(&p.target.path) {
+                Some(block) => {
+                    let entry = blocks.entry(block).or_default();
+                    entry.0 = entry.0.saturating_add(p.resident_bytes);
+                    entry.1 = entry.1.saturating_add(p.forward_bytes_per_row);
+                }
+                None => trunk = trunk.saturating_add(p.resident_bytes),
+            }
+        }
+        let projected: u64 = profile
+            .projections
+            .iter()
+            .fold(0u64, |t, p| t.saturating_add(p.resident_bytes));
+        Self {
+            // The profile's own total is authoritative; never price below the per-projection sum.
+            resident: profile.resident_bytes.max(projected),
+            trunk,
+            block_max: blocks.values().map(|b| b.0).max().unwrap_or(0),
+            rows_block_max: blocks.values().map(|b| b.1).max().unwrap_or(0),
+            rows_total,
+        }
+    }
+
+    /// The bytes held on the training device: the trunk share plus one block window (`streamed`),
+    /// or everything (resident blocks).
+    pub fn device(&self, streamed: bool) -> u64 {
+        if streamed {
+            self.trunk.saturating_add(self.block_max)
+        } else {
+            self.resident
+        }
+    }
+
+    /// The bytes a streamed run keeps on the host beside its block stack (the blocks' share).
+    pub fn host(&self, streamed: bool) -> u64 {
+        if streamed {
+            self.resident.saturating_sub(self.trunk)
+        } else {
+            0
+        }
+    }
+
+    /// Bytes per sequence row the forward retains: one live block (checkpointed) or every block.
+    pub fn rows(&self, checkpointed: bool) -> u64 {
+        if checkpointed {
+            self.rows_block_max
+        } else {
+            self.rows_total
+        }
+    }
+}
+
 /// The distilled step one micro-step trains: its index (which output head and which AdaLN
 /// timestep), its noise level `σ` and its timestep `t = 1 − σ`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -325,25 +426,31 @@ pub struct TrainingStep {
     pub timestep: f32,
 }
 
-/// The distilled step nearest the drawn noise level `t ∈ [0, 1]` — the configured timestep
-/// distribution, quantized onto the six published levels the heads were distilled at. Ties go to
-/// the noisier step. Pure, so a resumed run draws the same steps as an uninterrupted one.
+/// The distilled step a drawn noise level `t ∈ [0, 1]` trains: the configured timestep
+/// distribution, mapped onto the six heads by **equal quantile slices of `t`** —
+/// `index = min(⌊(1 − t)·6⌋, 5)`, so `t → 1` (noisiest) trains head 0 and `t → 0` head 5. A
+/// uniform draw trains each head exactly 1/6 of the time (the render runs each once); a biased draw
+/// shifts that mass toward one end without ever starving a head. (Snapping to the *nearest*
+/// published σ — the grid is 1.0, 0.9675, 0.8875, 0.75, … — left heads 0 and 1 almost untrained
+/// under a sigmoid draw, while the adapted shared blocks still feed them at every render.) A
+/// non-finite draw trains head 0. Pure, so a resumed run draws the same steps as an uninterrupted
+/// one.
 pub fn training_step(t: f32) -> TrainingStep {
-    let sigmas = sampler_sigmas();
     let steps = FIXED_STEPS as usize;
     let t = if t.is_finite() {
-        t.clamp(0.0, 1.0)
+        f64::from(t.clamp(0.0, 1.0))
     } else {
         1.0
     };
-    let index = (0..steps)
-        .min_by(|&a, &b| {
-            (sigmas[a] - t)
-                .abs()
-                .total_cmp(&(sigmas[b] - t).abs())
-                .then(a.cmp(&b))
-        })
-        .unwrap_or(0);
+    let index = (((1.0 - t) * steps as f64).floor() as usize).min(steps - 1);
+    distilled_step(index)
+}
+
+/// Distilled step `index` (`0..6`, clamped): its head, its published noise level `σ` and its
+/// AdaLN timestep `t = 1 − σ`.
+pub fn distilled_step(index: usize) -> TrainingStep {
+    let sigmas = sampler_sigmas();
+    let index = index.min(FIXED_STEPS as usize - 1);
     let sigma = sigmas[index];
     TrainingStep {
         index,
@@ -359,23 +466,34 @@ pub fn training_mix(sigma: f32) -> (f32, f32) {
     (1.0 - sigma, sigma)
 }
 
-/// The square-or-aspect training canvas of one target at `edge`: a captioned item trains on its
-/// centre square at `edge²`; an edit target keeps its aspect at about `edge²` pixels, so it stays
-/// aligned with its references. Both sides floor to [`TRAINING_CANVAS_STRIDE`] (at least one
-/// stride).
-pub fn training_canvas(edit: bool, (width, height): (u32, u32), edge: u32) -> (u32, u32) {
-    let snap = |v: f64| {
-        let s = f64::from(TRAINING_CANVAS_STRIDE);
-        ((v / s).floor() * s).max(s) as u32
-    };
-    if !edit || width == 0 || height == 0 {
+/// The training canvas `(width, height)` of one target whose source is `width × height`, at bucket
+/// edge `edge` — one rule for captioned items and edit targets alike: the target keeps its own
+/// aspect at about `edge²` pixels, and is never upscaled past its source (a source smaller than
+/// `edge²` trains at its own area). Both sides floor to [`TRAINING_CANVAS_STRIDE`] (at least one
+/// stride), so the canvas never exceeds the source's area nor `edge²`.
+///
+/// The whole image is trained, resized (never cropped) onto the canvas — the aspect drift the
+/// stride floor introduces is under one stride per side. An edit's references are conditioned at
+/// their own sizes by the render's conditioning phase, independently of the target's canvas, and
+/// the target keeps its aspect either way, so capping its area keeps references and target
+/// aligned exactly as before. A degenerate (zero) side falls back to the square `edge` canvas.
+pub fn training_canvas((width, height): (u32, u32), edge: u32) -> (u32, u32) {
+    let stride = f64::from(TRAINING_CANVAS_STRIDE);
+    // The epsilon keeps a side that lands on a stride multiple through a square root from flooring
+    // a whole stride down on rounding error.
+    let snap = |v: f64| ((v / stride + 1e-9).floor() * stride).max(stride) as u32;
+    if width == 0 || height == 0 {
         let e = snap(f64::from(edge));
         return (e, e);
     }
+    let (w, h) = (f64::from(width), f64::from(height));
     let area = f64::from(edge) * f64::from(edge);
-    let aspect = f64::from(width) / f64::from(height);
-    let h = (area / aspect).sqrt();
-    (snap(h * aspect), snap(h))
+    if w * h <= area {
+        // Never upscale: a source at or below the edge's area trains at its own size.
+        return (snap(w), snap(h));
+    }
+    let scale = (area / (w * h)).sqrt();
+    (snap(w * scale), snap(h * scale))
 }
 
 // ── the training-step memory envelope ───────────────────────────────────────────────────────────
@@ -482,9 +600,14 @@ pub struct TrainStepShape {
     /// LoKr dense-delta elements: the largest block's (streamed) and all blocks' (resident).
     pub lokr_delta_block_max: u64,
     pub lokr_delta_total: u64,
-    /// `true`: the blocks stream one at a time and the backward recomputes each from its saved
-    /// input; `false`: the whole DiT is resident and every block's activations are retained.
+    /// `true`: the backward recomputes each block from its saved input, so only the block inputs
+    /// are retained; `false`: the whole DiT is resident and every block's activations are retained.
     pub checkpointed: bool,
+    /// Under `checkpointed`: `true` keeps every block body resident on the device (no per-step
+    /// weight transfer), `false` streams the blocks through a one-block device window. The AdaLN
+    /// precompute runs streamed either way (one `adaln_proj` at a time), and the bodies move to the
+    /// device after it. Ignored when `checkpointed` is `false` (that run is always resident).
+    pub resident_blocks: bool,
     /// Heads one attention chunk covers (`heads` when attention is not chunked). Chunked training
     /// attention recomputes each chunk in the backward, so no call ever holds more than one chunk's
     /// scores (E20).
@@ -501,7 +624,7 @@ impl TrainStepShape {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrainStepBytes {
     /// DiT weights live at the peak: the trunk, the modulation tables and one block (streamed) or
-    /// every block (resident) — or the precompute's one AdaLN projection, when that is larger.
+    /// every block body (resident, checkpointed or not).
     pub weights: u64,
     /// Factors, gradients, accumulation and optimizer state, f32.
     pub adapter_state: u64,
@@ -571,8 +694,15 @@ pub fn train_step_bytes(
         (SCORE_ARRAYS_PER_ATTENTION_VJP * chunk_scores, chunk_scores)
     };
     let (weights_bytes, precompute) = if shape.checkpointed {
+        // The precompute streams one `adaln_proj` at a time in both checkpointed modes; resident
+        // bodies move to the device only after it, so they are never co-resident with it.
+        let bodies = if shape.resident_blocks {
+            sum(&weights.block_body)
+        } else {
+            max(&weights.block_body)
+        };
         (
-            weights.trunk + weights.modulation_tables + max(&weights.block_body),
+            weights.trunk + weights.modulation_tables + bodies,
             weights.trunk + weights.modulation_tables + max(&weights.block_adaln),
         )
     } else {
@@ -662,7 +792,7 @@ mod tests {
         let sigmas = sampler_sigmas();
         let (x0, eps) = (0.37f32, -1.21f32);
         for i in 0..FIXED_STEPS as usize {
-            let step = training_step(sigmas[i]);
+            let step = distilled_step(i);
             assert_eq!(step.index, i);
             assert_eq!(step.sigma, sigmas[i]);
             assert_eq!(step.timestep, 1.0 - sigmas[i]);
@@ -678,28 +808,77 @@ mod tests {
         }
     }
 
+    /// Equal quantile slices of `t`, noisiest first: head `i` owns `((5 − i)/6, (6 − i)/6]`.
     #[test]
-    fn a_drawn_level_trains_at_the_nearest_published_step() {
+    fn a_drawn_level_trains_the_head_whose_slice_of_t_it_falls_in() {
         assert_eq!(training_step(1.0).index, 0);
+        assert_eq!(training_step(0.999).index, 0);
         assert_eq!(training_step(0.0).index, 5);
-        assert_eq!(training_step(0.76).index, 3);
-        assert_eq!(training_step(0.4).index, 4);
+        assert_eq!(training_step(0.001).index, 5);
+        assert_eq!(training_step(0.5).index, 3);
         assert_eq!(training_step(f32::NAN).index, 0);
-        // The midpoint between two levels goes to the noisier one.
-        let s = sampler_sigmas();
-        assert_eq!(training_step((s[3] + s[4]) / 2.0).index, 3);
+        assert_eq!(training_step(f32::INFINITY).index, 0);
+        assert_eq!(training_step(-0.5).index, 5);
+        assert_eq!(training_step(1.5).index, 0);
+        for k in 1..FIXED_STEPS as usize {
+            // Boundary `t = (6 − k)/6`: just above trains head k − 1, just below head k.
+            let b = (FIXED_STEPS as usize - k) as f32 / FIXED_STEPS as f32;
+            assert_eq!(training_step(b + 1e-4).index, k - 1, "above boundary {k}");
+            assert_eq!(training_step(b - 1e-4).index, k, "below boundary {k}");
+        }
+        // The step carries the head's own published σ and timestep.
+        let st = training_step(0.95);
+        assert_eq!(st, distilled_step(0));
+        assert_eq!(st.sigma, sampler_sigmas()[0]);
+        assert_eq!(distilled_step(99), distilled_step(5));
+    }
+
+    /// A uniform draw trains every head exactly as often as the six-step render runs it.
+    #[test]
+    fn a_uniform_draw_trains_every_head_equally() {
+        let n = 6000u32;
+        let mut counts = [0u32; FIXED_STEPS as usize];
+        for i in 0..n {
+            // Cell midpoints of a uniform grid over (0, 1).
+            counts[training_step((i as f32 + 0.5) / n as f32).index] += 1;
+        }
+        assert_eq!(counts, [n / 6; FIXED_STEPS as usize]);
     }
 
     #[test]
-    fn the_training_canvas_is_square_for_captions_and_keeps_an_edits_aspect() {
-        assert_eq!(training_canvas(false, (3000, 2000), 2048), (2048, 2048));
-        assert_eq!(training_canvas(false, (3000, 2000), 1000), (992, 992));
-        let (w, h) = training_canvas(true, (3000, 2000), 2048);
+    fn the_training_canvas_keeps_the_aspect_at_the_edge_area_and_never_upscales() {
+        // Larger than edge²: scaled down at its aspect, stride-floored, area within edge².
+        let (w, h) = training_canvas((3000, 2000), 2048);
         assert_eq!((w % 32, h % 32), (0, 0));
         assert!((f64::from(w) / f64::from(h) - 1.5).abs() < 0.05);
         assert!(u64::from(w) * u64::from(h) <= 2048 * 2048);
-        let (w, h) = training_canvas(true, (10, 4000), 16);
-        assert_eq!((w, h % 32), (32, 0));
+        // A square source at edge²: the square canvas; a larger square scales down.
+        assert_eq!(training_canvas((2048, 2048), 2048), (2048, 2048));
+        assert_eq!(training_canvas((4096, 4096), 1000), (992, 992));
+        // A 1365×2048 portrait at 2048: never upscaled, kept whole at its own area (width floored
+        // to the stride) — not centre-cropped to a square and upscaled to 2048².
+        assert_eq!(training_canvas((1365, 2048), 2048), (1344, 2048));
+        // The same portrait at a smaller edge: scaled down, height stays the long side.
+        let (w, h) = training_canvas((1365, 2048), 1024);
+        assert!(h > w && u64::from(w) * u64::from(h) <= 1024 * 1024);
+        assert!((f64::from(w) / f64::from(h) - 1365.0 / 2048.0).abs() < 0.03);
+        // Landscape keeps width as the long side: the pair is (width, height).
+        assert_eq!(training_canvas((2048, 1365), 2048), (2048, 1344));
+        // A tiny source keeps one stride; a degenerate one falls back to the square edge.
+        assert_eq!(training_canvas((10, 4000), 16), (32, 320));
+        assert_eq!(training_canvas((10, 20), 2048), (32, 32));
+        assert_eq!(training_canvas((0, 20), 1000), (992, 992));
+        // Never larger than the source's area (once it holds a stride on each side).
+        for (sw, sh) in [
+            (1365, 2048),
+            (640, 480),
+            (5000, 300),
+            (1024, 1024),
+            (3000, 2000),
+        ] {
+            let (w, h) = training_canvas((sw, sh), 2048);
+            assert!(u64::from(w) * u64::from(h) <= u64::from(sw) * u64::from(sh));
+        }
     }
 
     #[test]
@@ -709,6 +888,7 @@ mod tests {
         assert_eq!(d.max_reference_images, 16);
         assert!(d.techniques.resolution_buckets && d.techniques.weight_noise);
         assert!(!d.techniques.subject_mask_loss && !d.supports_control);
+        assert!(d.techniques.training_adapter);
         let c = default_training_config();
         assert_eq!(c.resolution, 2048);
         assert!(c.gradient_checkpointing);
@@ -756,6 +936,7 @@ mod tests {
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
             checkpointed,
+            resident_blocks: false,
             attention_heads_per_chunk: 56,
         }
     }
@@ -798,5 +979,100 @@ mod tests {
             },
         );
         assert!(wide.total() > streamed.total());
+    }
+
+    /// Resident + checkpointed: every block body on the device, but only the block inputs retained
+    /// and one block's backward live — the streamed run's activations with the resident run's
+    /// weights, and strictly between the two.
+    #[test]
+    fn resident_checkpointed_holds_every_body_and_only_the_block_inputs() {
+        let g = DitGeometry::SHIPPED;
+        let w = weights();
+        let streamed = train_step_bytes(&g, &w, &shape(true));
+        let resident_ckpt = train_step_bytes(
+            &g,
+            &w,
+            &TrainStepShape {
+                resident_blocks: true,
+                ..shape(true)
+            },
+        );
+        let resident = train_step_bytes(&g, &w, &shape(false));
+        assert_eq!(
+            resident_ckpt.weights,
+            2_000_000_000 + 70_000_000 + 50 * 760_000_000
+        );
+        assert_eq!(resident_ckpt.retained, streamed.retained);
+        assert_eq!(resident_ckpt.block_backward, streamed.block_backward);
+        // The precompute still streams its AdaLN projections one at a time.
+        assert_eq!(resident_ckpt.precompute, streamed.precompute);
+        assert_eq!(resident_ckpt.total() - streamed.total(), 49 * 760_000_000);
+        assert!(resident_ckpt.total() < resident.total());
+        // Ignored when not checkpointed.
+        let ignored = train_step_bytes(
+            &g,
+            &w,
+            &TrainStepShape {
+                resident_blocks: true,
+                ..shape(false)
+            },
+        );
+        assert_eq!(ignored, resident);
+    }
+
+    /// The training adapter's footprint splits the inference profile into the trunk share (always
+    /// resident), the largest block's share (one streamed window) and the forward's per-row bytes.
+    /// Mutations: sum the rows by max ⇒ the totals assert fails; count the refiner as a block ⇒ the
+    /// trunk assert fails; take the smallest block ⇒ the `block_max` assert fails.
+    #[test]
+    fn the_training_adapter_footprint_splits_trunk_and_blocks() {
+        use gen_core::h3_adapter_memory::{H3AdapterProjectionMemory, H3AdapterTarget};
+        use gen_core::h3_memory::RowDomain;
+        let projection = |path: &str, resident: u64, per_row: u64| H3AdapterProjectionMemory {
+            target: H3AdapterTarget {
+                path: path.to_owned(),
+                input: 8,
+                output: 8,
+                packed: false,
+                activation_width: 2,
+                activation_dtype: gen_core::weightsmeta::Dtype::BF16,
+                rows: RowDomain::Packed,
+            },
+            installed_bytes: resident,
+            resident_bytes: resident,
+            forward_fixed_bytes: 0,
+            forward_bytes_per_row: per_row,
+        };
+        let profile = H3AdapterMemoryProfile {
+            resident_bytes: 10 + 20 + 30 + 100,
+            install_peak_bytes: 500,
+            projections: vec![
+                projection("transformer_blocks.0.attn.to_q", 10, 2),
+                projection("transformer_blocks.0.ff.net.2", 20, 3),
+                projection("transformer_blocks.1.attn.to_k", 30, 4),
+                projection("token_refiner.refiner_blocks.0.attn.to_q", 100, 1),
+            ],
+        };
+        let bytes = TrainingAdapterBytes::from_profile(&profile);
+        assert_eq!(
+            bytes,
+            TrainingAdapterBytes {
+                resident: 160,
+                trunk: 100,
+                block_max: 30,
+                rows_block_max: 5,
+                rows_total: 10,
+            }
+        );
+        assert_eq!(bytes.device(true), 130);
+        assert_eq!(bytes.device(false), 160);
+        assert_eq!(bytes.host(true), 60);
+        assert_eq!(bytes.host(false), 0);
+        assert_eq!(bytes.rows(true), 5);
+        assert_eq!(bytes.rows(false), 10);
+        assert_eq!(
+            TrainingAdapterBytes::from_profile(&H3AdapterMemoryProfile::default()),
+            TrainingAdapterBytes::default()
+        );
     }
 }
