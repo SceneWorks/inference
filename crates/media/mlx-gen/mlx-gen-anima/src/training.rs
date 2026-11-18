@@ -54,15 +54,16 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost};
 use mlx_gen::gen_core::{self, BucketSchedule};
+use mlx_gen::train::canvas::{canvas_crop, training_canvas, TrainingCanvas};
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, crop_image, decode_image};
 use mlx_gen::train::lora::{save_lokr, LoraParams, TrainAdapter};
 pub use mlx_gen::train::lora::{LokrTarget, LoraTarget};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::taehv::TaehvConfig;
 use mlx_gen::train::trainer_loop::{
     adapter_optimizer, adapter_stem, build_adapter, largest_edge, mae_loss, render_preview_prompts,
@@ -82,7 +83,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::AnimaAdapterHost;
 use crate::conditioner::AnimaTextConditioner;
-use crate::config::{Variant, SIGMA_SHIFT};
+use crate::config::{Variant, SIGMA_SHIFT, VAE_COMPRESSION};
 use crate::loader::AnimaComponents;
 use crate::pipeline::render_preview;
 use crate::text_encoder::AnimaQwen3;
@@ -428,15 +429,19 @@ impl AnimaTrainer {
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
-        // off). The memory pre-flight and previews size for the largest (epic 2123 E7).
+        // off). Each edge is an area budget: every item trains on its aspect-keeping canvas at
+        // about `edge²` pixels (never upscaled, sides multiples of `CANVAS_STRIDE` — never
+        // centre-cropped to a square). The memory pre-flight prices the largest edge's square
+        // (every canvas is at most that area — the worst case, epic 2123 E7); previews render at
+        // item 0's canvas at that edge.
         let edges = bucket_edges(cfg);
-        let preview_edge = largest_edge(&edges);
+        let max_edge = largest_edge(&edges);
 
         // Anima's base is bf16 on disk (there is no dense-f32 cast path), so training runs bf16
         // mixed-precision: the frozen base + activation stream are bf16, and the trainable factors /
         // loss / grads / optimizer stay f32 (master-weights). This matches the inference dtype.
         let compute_dtype = Dtype::Bfloat16;
-        preflight(req, &edges, preview_edge, compute_dtype)?;
+        preflight(req, &edges, max_edge, compute_dtype)?;
 
         // Epic 2123 depth anchoring (sc-24830): load the frozen TAEW2.1 decoder +
         // Depth-Anything-V2 before the caching pass, so a missing checkpoint fails fast.
@@ -451,6 +456,7 @@ impl AnimaTrainer {
             }
             return Err("anima trainer: no usable dataset items".into());
         }
+        let preview_size = preview_size(&cache, &edges);
         let previews_on = previews_enabled(cfg, req.cancel.is_cancelled());
         let (sample_inputs, uncond_inputs) = self.encode_preview_inputs(cfg, previews_on)?;
 
@@ -471,7 +477,7 @@ impl AnimaTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
 
@@ -521,12 +527,13 @@ impl AnimaTrainer {
             previews_on,
             sample_inputs: &sample_inputs,
             uncond_inputs: uncond_inputs.as_ref(),
-            preview_edge,
+            preview_size,
         };
         run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
 
-    /// Cache the dataset: per item, its VAE latent per bucket edge + its conditioner INPUTS (masked
+    /// Cache the dataset: per item, its VAE latent per bucket edge (on the item's aspect-keeping
+    /// training canvas at that edge, never a centre square) + its conditioner INPUTS (masked
     /// Qwen3 states, T5 ids) and — subject-masked loss, sc-24828 — each bucket's latent loss-weight
     /// map (`None` when the technique is off), item-major: `cache[item * edges.len() + bucket]`
     /// (sc-2127). The conditioner inputs are encoded once per item and shared (refcounted) by every
@@ -548,7 +555,12 @@ impl AnimaTrainer {
                 current: i as u32 + 1,
                 total,
             });
-            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // Decoded once, whole (cut only beyond 4:1 — the box is edge-independent); resized onto
+            // its aspect-keeping canvas per bucket edge. Every micro-step trains one cached entry,
+            // so entries of different shapes never share a batch.
+            let decoded = decode_image(&item.image_path)?;
+            let img = crop_image(&decoded, canvas_crop(decoded.width, decoded.height));
+            let canvases = item_canvases((decoded.width, decoded.height), edges);
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let mask = PreparedSubjectMask::load_if_enabled(
                 "anima trainer",
@@ -557,9 +569,10 @@ impl AnimaTrainer {
             )?;
             let (source, t5_ids) = self.encode_conditioner_inputs(&item.caption)?;
             eval([&source, &t5_ids])?;
-            for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), |edge| {
-                let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
-                self.vae.encode(&nchw) // [1,16,1,edge/8,edge/8], normalized
+            for (x0, mask_weight) in encode_buckets(&canvases, mask.as_ref(), |canvas| {
+                let (w, h) = canvas.size();
+                let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, w, h)?; // [1,3,h,w]
+                self.vae.encode(&nchw) // [1,16,1,h/8,w/8], normalized
             })? {
                 cache.push((x0, source.clone(), t5_ids.clone(), mask_weight));
             }
@@ -655,6 +668,41 @@ impl AnimaTrainer {
 /// `source_hidden`, T5 query-token ids) and the subject-mask loss weight (sc-24828).
 type CacheEntry = (Array, Array, Array, Option<Array>);
 
+/// Every training canvas side is a multiple of this: one Qwen-Image VAE cell (8 px) times the
+/// Cosmos DiT's 2×2 spatial patch.
+const CANVAS_STRIDE: u32 = VAE_COMPRESSION * 2;
+/// The longest canvas side the trainer keeps — the family's render cap ([`crate::model::RES_MAX`],
+/// 1536), inside the Cosmos RoPE `max_size` (120 post-patch positions ≈ 1920 px) `rope.rs`
+/// rejects beyond.
+const CANVAS_MAX_SIDE: Option<u32> = Some(crate::model::RES_MAX);
+
+/// The training canvas of a `width × height` source at each bucket edge (item-major order).
+fn item_canvases((width, height): (u32, u32), edges: &[u32]) -> Vec<TrainingCanvas> {
+    edges
+        .iter()
+        .map(|&edge| training_canvas((width, height), edge, CANVAS_STRIDE, CANVAS_MAX_SIDE))
+        .collect()
+}
+
+/// The preview canvas `(width, height)`: item 0's training canvas at the largest bucket edge — the
+/// shape its cached `[1, 16, 1, h/8, w/8]` latent at that edge was encoded at (item-major cache,
+/// `edges.len()` entries per item), within the `edge²` area the memory preflight prices. The square
+/// largest edge only when nothing was cached.
+fn preview_size(cache: &[CacheEntry], edges: &[u32]) -> (u32, u32) {
+    let largest = edges
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &edge)| edge)
+        .map_or(0, |(bucket, _)| bucket);
+    match cache.get(largest).map(|entry| entry.0.shape()) {
+        Some(&[.., h, w]) => (w as u32 * VAE_COMPRESSION, h as u32 * VAE_COMPRESSION),
+        _ => {
+            let edge = largest_edge(edges);
+            (edge, edge)
+        }
+    }
+}
+
 /// sc-10576 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
 /// materializes the whole DiT forward graph — at 1536² the retained per-block seq² self-attention
 /// (≈9216 image tokens) makes that working set exceed unified memory, and the OS hard-kills the
@@ -665,7 +713,7 @@ type CacheEntry = (Array, Array, Array, Option<Array>);
 fn preflight(
     req: &TrainingRequest,
     edges: &[u32],
-    preview_edge: u32,
+    max_edge: u32,
     compute_dtype: Dtype,
 ) -> Result<()> {
     let cfg = &req.config;
@@ -673,7 +721,7 @@ fn preflight(
         matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
     // Epic 2123 E7 (sc-24830): the aux-loss models (TAEW2.1 + every enabled arm) count
     // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
-    let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
+    let aux_gb = perceptual_footprint_gb(cfg, max_edge, req.items.len() * edges.len());
     if !will_checkpoint || aux_gb > 0.0 {
         preflight_memory_guard(
             cfg,
@@ -741,7 +789,8 @@ struct AnimaLoop<'a> {
     previews_on: bool,
     sample_inputs: &'a [(String, Array, Array)],
     uncond_inputs: Option<&'a (Array, Array)>,
-    preview_edge: u32,
+    /// The preview canvas `(width, height)` ([`preview_size`]).
+    preview_size: (u32, u32),
 }
 
 fn preview_prompt(input: &(String, Array, Array)) -> &str {
@@ -890,7 +939,7 @@ impl TrainLoopFamily for AnimaLoop<'_> {
                     self.uncond_inputs,
                     cfg.sample_steps.max(1) as usize,
                     guidance,
-                    self.preview_edge,
+                    self.preview_size,
                     sample_seed,
                     self.compute_dtype,
                     &self.req.cancel,
@@ -1419,23 +1468,24 @@ fn compute_step_loss_grads(
     Ok((losses, grads))
 }
 
-/// sc-2127 × sc-24828: one item's clean latent per bucket edge (`encode(edge)`, item-major
-/// order), each paired with its subject-mask loss weight — the item's already-loaded mask cropped
-/// with the center square `center_crop_square` cuts, area-averaged onto THAT bucket's latent grid
-/// and laid out like that latent. `None` weights when masked loss is off.
+/// sc-2127 × sc-24828: one item's clean latent per bucket edge's training canvas
+/// (`encode(canvas)`, item-major order), each paired with its subject-mask loss weight — the
+/// item's already-loaded mask (same dimensions as its image) cut to the image's own canvas source
+/// box, area-averaged onto THAT entry's latent grid and laid out like that latent. `None` weights
+/// when masked loss is off.
 fn encode_buckets(
-    edges: &[u32],
+    canvases: &[TrainingCanvas],
     mask: Option<&PreparedSubjectMask>,
-    mut encode: impl FnMut(u32) -> Result<Array>,
+    mut encode: impl FnMut(&TrainingCanvas) -> Result<Array>,
 ) -> Result<Vec<(Array, Option<Array>)>> {
-    edges
+    canvases
         .iter()
-        .map(|&edge| {
-            let x0 = encode(edge)?;
+        .map(|canvas| {
+            let x0 = encode(canvas)?;
             let mask_weight = prepared_subject_mask_weight(
                 "anima trainer",
                 mask,
-                CropBox::center_square,
+                |_, _| canvas.crop,
                 x0.shape(),
             )?;
             eval([&x0])?;
@@ -1452,18 +1502,19 @@ mod tests {
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
 
-    /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
-    /// bucket's latent shape, and the background (right half of the center-square crop, with
-    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is
-    /// x ∈ [8, 40); the subject is x < 24 — the crop's left half.
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each entry's weight map has THAT
+    /// entry's latent shape on the item's own (non-square) canvas — the whole frame, not a centre
+    /// square — and the background (the frame's right half, with `background_weight` 0) is zero at
+    /// both grids. The 64×32 image keeps its whole frame at edge 64 (latent 4×8) and scales to
+    /// 32×16 at edge 32 (latent 2×4).
     #[test]
     fn subject_mask_weight_is_computed_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();
-        let (iw, ih) = (48u32, 32u32);
+        let (iw, ih) = (64u32, 32u32);
         let image_path = tmp.path().join("a.png");
         image::RgbImage::new(iw, ih).save(&image_path).unwrap();
         let mask_path = tmp.path().join("a_mask.png");
-        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 32 { 255 } else { 0 }]))
             .save(&mask_path)
             .unwrap();
         let item = gen_core::TrainingItem {
@@ -1478,32 +1529,59 @@ mod tests {
         };
         let mask =
             mlx_gen::train::subject_mask::PreparedSubjectMask::load("t", &item, &mask_cfg).unwrap();
-        let entries = encode_buckets(&[32, 48], Some(&mask), |edge| {
-            let g = (edge / 8) as i32;
-            Ok(Array::zeros::<f32>(&[1, 16, 1, g, g])?)
+        let canvases = item_canvases((iw, ih), &[64, 32]);
+        let entries = encode_buckets(&canvases, Some(&mask), |canvas| {
+            let (w, h) = canvas.size();
+            Ok(Array::zeros::<f32>(&[
+                1,
+                16,
+                1,
+                (h / VAE_COMPRESSION) as i32,
+                (w / VAE_COMPRESSION) as i32,
+            ])?)
         })
         .unwrap();
         assert_eq!(entries.len(), 2);
-        for ((x0, w), g) in entries.iter().zip([4usize, 6]) {
+        for ((x0, w), (gh, gw)) in entries.iter().zip([(4usize, 8usize), (2, 4)]) {
             let w = w.as_ref().expect("mask loss on ⇒ a weight map");
             assert_eq!(
                 w.shape(),
                 x0.shape(),
                 "weight must match its own bucket's latent"
             );
+            assert_eq!(x0.shape(), &[1, 16, 1, gh as i32, gw as i32]);
             let dense = mlx_rs::ops::multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
             let v = dense.as_slice::<f32>();
-            for y in 0..g {
-                for x in 0..g {
-                    let val = v[y * g + x];
-                    if x < g / 2 {
-                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+            for y in 0..gh {
+                for x in 0..gw {
+                    let val = v[y * gw + x];
+                    if x < gw / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {gh}x{gw} = {val}");
                     } else {
-                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {gh}x{gw}");
                     }
                 }
             }
         }
+    }
+
+    /// A portrait keeps its aspect on the DiT's 16 px grid (no square crop, no upscale, within
+    /// `edge²` and the 1536 render cap), and the preview renders at item 0's canvas at the largest
+    /// edge, read back from its cached latent's own `h × w`.
+    #[test]
+    fn a_portrait_caches_and_previews_on_its_own_aspect_canvas() {
+        let canvases = item_canvases((1365, 2048), &[1024, 1536]);
+        for (c, edge) in canvases.iter().zip([1024u64, 1536]) {
+            assert_eq!((c.width % 16, c.height % 16), (0, 0));
+            assert!(c.height > c.width && c.area() <= edge * edge);
+            assert!(c.height <= crate::model::RES_MAX);
+        }
+        let z = |h: i32, w: i32| Array::zeros::<f32>(&[1, 16, 1, h, w]).unwrap();
+        let entry = |h, w| (z(h, w), z(1, 1), z(1, 1), None);
+        // Item 0's entries at edges [512, 1024]: the preview takes the 1024 entry's canvas.
+        let cache = vec![entry(64, 42), entry(128, 84)];
+        assert_eq!(preview_size(&cache, &[512, 1024]), (672, 1024));
+        assert_eq!(preview_size(&[], &[512, 1024]), (1024, 1024));
     }
 
     fn request(items: usize, steps: u32, rank: u32) -> TrainingRequest {

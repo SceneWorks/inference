@@ -1,6 +1,12 @@
 //! Dense Candle training for the SD3.5 Large and Medium MMDiTs. Caption conditioning and VAE
 //! latents are cached first; the frozen encoders are then dropped before the dense transformer and
 //! its trainable forward-time LoRA/LoKr residuals are loaded.
+//!
+//! Each captioned image is decoded whole and resized onto its aspect-keeping canvas at every bucket
+//! edge ([`training_canvas`]: about `edge²` pixels, never upscaled, sides multiples of
+//! `CANVAS_STRIDE`, scaled down at its aspect where the long side would pass the positional cap
+//! `canvas_max_side`) — never centre-cropped to a square; the MMDiT crops its learned positional
+//! table to each latent's own `(h, w)` patch grid.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +19,7 @@ use candle_gen::gen_core::{
     self, BucketSchedule, LoadSpec, Modality, NetworkType, Precision, WeightsSource,
 };
 use candle_gen::quant::AdaptLinear;
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, step_sample, step_terms,
     weighted_velocity_loss, AuxDriver, AuxStep, StepLosses, StepSample,
@@ -25,15 +31,28 @@ use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::canvas::{canvas_crop, training_canvas};
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use crate::conditioning::{aggregate, Sd3Conditioning};
+use crate::config::Sd3Config;
 use crate::pipeline::{Pipeline, Variant};
 use crate::transformer::Sd3Transformer;
-use crate::vae::encode_mean;
+use crate::vae::{encode_mean, SPATIAL_SCALE};
 use crate::{MODEL_ID, MODEL_ID_MEDIUM};
 
 const LABEL: &str = "sd3 trainer";
+/// Every training canvas side is a multiple of this: one VAE cell (8 px) times the MMDiT's 2×2
+/// patch, so the latent tiles the patch grid exactly.
+const CANVAS_STRIDE: u32 = SPATIAL_SCALE * 2;
+
+/// The longest canvas side (pixels) the MMDiT can position-encode: its learned positional table is
+/// `pos_embed_max_size²` patches and is centre-cropped to each latent's patch grid, so a side past
+/// `pos_embed_max_size · patch_size · 8` has no table rows (Large 192 → 3072 px, Medium 384 → 6144).
+fn canvas_max_side(cfg: &Sd3Config) -> u32 {
+    (cfg.pos_embed_max_size * cfg.patch_size) as u32 * SPATIAL_SCALE
+}
+
 const DEFAULT_TARGETS: [&str; 8] = [
     "to_q",
     "to_k",
@@ -504,6 +523,7 @@ impl Sd3Trainer {
         let model_cfg = self.variant.config();
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
         let edges = bucket_edges(cfg);
+        let max_side = canvas_max_side(&model_cfg);
         let total = req.items.len() as u32;
         // Item-major: `cache[item * edges.len() + bucket]` (sc-2127) of `(x0, conditioning,
         // subject-mask loss weight)`; the weight (broadcast to that bucket's latent shape) is `None`
@@ -523,15 +543,18 @@ impl Sd3Trainer {
             // onto that bucket's latent grid (`None` when masked loss is off).
             let mask =
                 PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Every
+            // micro-step trains one cached entry, so entries of different shapes never share a batch.
+            let rgb = decode_rgb(&item.image_path)?;
             for &edge in &edges {
-                let image = square_image_tensor(&square, edge, device)?;
-                let x0 = encode_mean(&vae_encoder, &image, DType::F32)?;
-                // `decode_square` centre-crops to a square, so the mask takes the same crop.
+                let canvas = training_canvas(rgb.dimensions(), edge, CANVAS_STRIDE, Some(max_side));
+                let image = canvas_image_tensor(&rgb, &canvas, device)?;
+                let x0 = encode_mean(&vae_encoder, &image, DType::F32)?; // (1, 16, h/8, w/8)
+                                                                         // The mask (same dimensions as the image) takes the image's own source box.
                 let mask_weight = prepared_subject_mask_weight(
                     LABEL,
                     mask.as_ref(),
-                    CropBox::center_square,
+                    |_, _| canvas.crop,
                     x0.dims(),
                     device,
                 )?;
@@ -619,7 +642,7 @@ impl Sd3Trainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         let mut aux_driver = match perceptual {
@@ -806,6 +829,33 @@ mod tests {
             timestep_channels: 16,
             dual_attention_layers: vec![0],
         }
+    }
+
+    /// A portrait keeps its aspect on the MMDiT's 16 px grid (no square crop, no upscale), and the
+    /// canvas long side never passes the positional table the variant can crop (Large 3072 px).
+    #[test]
+    fn a_portrait_trains_on_its_own_aspect_canvas_within_the_pos_embed() {
+        let large = canvas_max_side(&Variant::Large.config());
+        assert_eq!(large, 3072);
+        assert_eq!(canvas_max_side(&Variant::Medium.config()), 6144);
+        let c = training_canvas((1365, 2048), 1024, CANVAS_STRIDE, Some(large));
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        assert_eq!(c.crop, canvas_crop(1365, 2048));
+        // Never upscaled past the source.
+        let c = training_canvas((1365, 2048), 2048, CANVAS_STRIDE, Some(large));
+        assert_eq!(c.size(), (1360, 2048));
+        // A 4:1 strip at a 2048 edge would be 4096 long: scaled down at its aspect to the
+        // positional cap, keeping the edge-independent 4:1 crop.
+        let c = training_canvas((8000, 2000), 2048, CANVAS_STRIDE, Some(large));
+        assert!(c.width <= large && c.width.is_multiple_of(16) && c.height.is_multiple_of(16));
+        assert!(c.width > 3 * c.height);
+        assert_eq!(c.crop, canvas_crop(8000, 2000));
+        // The latent the MMDiT patchifies: an (h/8, w/8) grid that tiles the 2×2 patch exactly
+        // and fits the 192-patch positional table on both axes.
+        let (lh, lw) = (c.height / SPATIAL_SCALE, c.width / SPATIAL_SCALE);
+        assert_eq!((lh % 2, lw % 2), (0, 0));
+        assert!(lw / 2 <= 192 && lh / 2 <= 192);
     }
 
     #[test]

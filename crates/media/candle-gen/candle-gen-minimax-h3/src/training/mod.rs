@@ -25,11 +25,14 @@
 //! 4. **Train** — the DiT loads in runtime format on the **host**; only its trunk (I/O
 //!    projections, the six heads, the token refiner) moves to the device. The AdaLN modulation of
 //!    the six published timesteps is projected once, one block's projection at a time, and every
-//!    projection is evicted. The 50 blocks then stream into a one-block device window, forward and
-//!    again in reverse for the backward (the private `step` module), so gradient checkpointing is structural: each
-//!    block's input is all the forward keeps. `gradient_checkpointing = false` is honored as the
-//!    resident alternative (whole DiT on the device, every activation retained), and the preflight
-//!    refuses it unless the device holds it.
+//!    projection is evicted. Each block is then one checkpointed segment (the private `step`
+//!    module): the forward keeps only each block's input, and the backward recomputes one block at
+//!    a time. Where the 50 block bodies live is the preflight's residency choice
+//!    ([`memory::plan_block_residency`], SW-F369): **resident** — moved to the device once, after
+//!    the precompute — when the whole run fits the device's training budget, else **streamed**
+//!    through a one-block device window, forward and again in reverse for the backward.
+//!    `gradient_checkpointing = false` is honored as the fully resident alternative (every
+//!    activation retained), and the preflight refuses it unless the device holds it.
 //!
 //! # Where this differs from the MLX twin
 //!
@@ -44,6 +47,16 @@
 //!   whole heads, through the shared envelope.
 //! * The trainable factors are installed once on the host blocks; a window copy carries them as
 //!   the same `Var` leaves, so no per-step re-install exists.
+//!
+//! # The training adapter
+//!
+//! `TrainingConfig::training_adapter` names a frozen de-distill LoRA (the shipped one is
+//! `ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter`): H3-Image is six-step distilled, and a
+//! plain flow-matching fine-tune un-distills it. The adapter is installed on the training DiT
+//! through the inference install as a frozen residual at strength 1.0, before the trainable factors
+//! — so every training forward and backward, in every block residency, runs on base + adapter —
+//! while previews render through a fresh generator without it and the saved adapter holds the
+//! trainable factors alone ([`training_adapter`]).
 //!
 //! # The saved adapter
 //!
@@ -61,6 +74,7 @@
 
 pub mod memory;
 mod step;
+pub mod training_adapter;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -80,7 +94,7 @@ use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{
     checkpoint_filename, file_stem, find_latest_resume, load_resume, save_resume,
 };
-use candle_gen::train::dataset::{bucket_edges, decode_square};
+use candle_gen::train::dataset::bucket_edges;
 use candle_gen::train::flow_match::{
     self, apply_update, create_output_dir, effective_weight_decay, item_major_schedule,
     request_fingerprint, sample_seed, save_adapter, validate_flow_match_request,
@@ -109,8 +123,8 @@ use crate::pipeline::patchify_video_latents;
 use crate::text_encoder::MiniMaxH3Tokenizer;
 
 use memory::{
-    admit_training, budget_of, contract_and_tier, estimate_training, TrainingItemShape,
-    TrainingRunShape,
+    admit_training, budget_of, contract_and_tier, plan_block_residency, BlockResidency,
+    TrainingItemShape, TrainingRunShape,
 };
 use step::{loss_and_grads, noised_rows, StepInputs};
 
@@ -132,6 +146,9 @@ pub struct MiniMaxH3ImageTrainer {
     facts: ImageMemoryFacts,
     /// Test seam: replaces the device's training budget (bytes).
     memory_budget_override: Option<u64>,
+    /// The strength the configured training adapter is applied at
+    /// ([`training_adapter::TRAINING_ADAPTER_STRENGTH`]); a bench/experiment seam.
+    training_adapter_strength: f32,
 }
 
 /// Construct the trainer from a `MiniMaxAI/MiniMax-H3-Image` snapshot (the staged DiT tier as the
@@ -188,12 +205,20 @@ impl MiniMaxH3ImageTrainer {
             dit_cfg,
             facts,
             memory_budget_override: None,
+            training_adapter_strength: training_adapter::TRAINING_ADAPTER_STRENGTH,
         })
     }
 
     /// Replace the device budget the preflight compares against (bytes). A test seam.
     pub fn set_memory_budget_override(&mut self, bytes: Option<u64>) {
         self.memory_budget_override = bytes;
+    }
+
+    /// Apply a configured `TrainingConfig::training_adapter` at `strength` instead of the
+    /// production [`training_adapter::TRAINING_ADAPTER_STRENGTH`] (1.0). An experiment seam (the
+    /// throughput bench's A/B knob); it changes nothing when no adapter is configured.
+    pub fn set_training_adapter_strength(&mut self, strength: f32) {
+        self.training_adapter_strength = strength;
     }
 }
 
@@ -491,17 +516,18 @@ impl PreviewSetup {
         if plan.sample_prompts.is_empty() {
             return Ok(None);
         }
+        // Item 0's own training canvas in both modes — the shape the preflight prices a preview
+        // at — and, for an edit, its references.
         let first = &plan.req.items[0];
-        let (size, references) = if plan.edit {
-            let dims = image_dimensions(&first.image_path)?;
-            let refs = first
+        let size = training_canvas(image_dimensions(&first.image_path)?, plan.edge);
+        let references = if plan.edit {
+            first
                 .reference_image_paths
                 .iter()
                 .map(|p| decode_image(p))
-                .collect::<Result<Vec<_>>>()?;
-            (training_canvas(true, dims, plan.edge), refs)
+                .collect::<Result<Vec<_>>>()?
         } else {
-            ((plan.edge, plan.edge), Vec::new())
+            Vec::new()
         };
         Ok(Some(Self {
             spec: trainer.spec.clone(),
@@ -515,6 +541,19 @@ impl PreviewSetup {
         }))
     }
 
+    /// The load a preview renders with: the trainer's own snapshot with the in-progress factors at
+    /// `adapter` as its **only** adapter — never the run's frozen training adapter, so a preview
+    /// shows the bare distilled base plus the user's adapter, what the saved file renders.
+    fn generator_spec(&self, adapter: &Path) -> LoadSpec {
+        let mut spec = self.spec.clone();
+        spec.adapters = vec![AdapterSpec::new(
+            adapter.to_path_buf(),
+            1.0,
+            self.adapter_kind,
+        )];
+        spec
+    }
+
     /// Render `prompt` at `seed` through the registered generator with the adapter at `adapter`.
     fn render(
         &self,
@@ -523,13 +562,7 @@ impl PreviewSetup {
         seed: u64,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let mut spec = self.spec.clone();
-        spec.adapters = vec![AdapterSpec::new(
-            adapter.to_path_buf(),
-            1.0,
-            self.adapter_kind,
-        )];
-        let generator = crate::image_model::load_image(&spec)?;
+        let generator = crate::image_model::load_image(&self.generator_spec(adapter))?;
         let req = preview_request(prompt, seed, self.size, &self.references, cancel.clone());
         generator.validate(&req)?;
         match generator.generate(&req, &mut |_| {})? {
@@ -594,7 +627,7 @@ impl MiniMaxH3ImageTrainer {
                 .map(|p| image_dimensions(p))
                 .collect::<Result<Vec<_>>>()?;
             items.push(TrainingItemShape {
-                canvas: training_canvas(item.is_edit_pair(), dims, plan.edge),
+                canvas: training_canvas(dims, plan.edge),
                 caption_tokens: tokens(&item.caption)?,
                 references,
             });
@@ -626,24 +659,56 @@ impl MiniMaxH3ImageTrainer {
             lokr_rows_total: total,
             packed_base: crate::tier::MiniMaxH3TierPaths::staged_bits(self.generator.dit_dir())?
                 .is_some(),
+            training_adapter: training_adapter::training_adapter_bytes(
+                self.generator.dit_dir(),
+                &self.dit_cfg,
+                &self.facts.task.projections,
+                cfg.training_adapter.as_deref(),
+                self.training_adapter_strength,
+            )?,
             checkpointed: plan.checkpointed,
+            // Chosen by the preflight's residency plan.
+            resident_blocks: false,
             chunked_attention: true,
             preview,
         })
     }
 
-    fn preflight(&self, plan: &RunPlan<'_>) -> Result<()> {
+    /// Price the run, choose where its block bodies live, and admit it — before any weight is
+    /// read. Returns the chosen residency.
+    fn preflight(&self, plan: &RunPlan<'_>) -> Result<BlockResidency> {
         let run = self.run_shape(plan)?;
         let (contract, tier) = contract_and_tier(&self.spec)?;
-        let estimate = estimate_training(&contract, &self.facts, tier, &run)?;
-        let budget = self.memory_budget_override.unwrap_or_else(|| {
+        let budget = budget_of(self.memory_budget_override.unwrap_or_else(|| {
             flow_match::device_training_budget_bytes(
                 self.generator.device(),
                 &format!("{TRAINER_ID} trainer"),
             )
-        });
-        admit_training(&estimate, budget_of(budget), &run, plan.edge)?;
-        Ok(())
+        }));
+        let (residency, run, estimate) =
+            plan_block_residency(&contract, &self.facts, tier, &run, budget)?;
+        admit_training(&estimate, budget, &run, plan.edge)?;
+        let gb = crate::image_memory_strategy::admission::decimal_gb;
+        tracing::info!(
+            event = "h3_image_training_residency",
+            residency = residency.name(),
+            checkpointed = plan.checkpointed,
+            peak_device_gb = gb(estimate.peak_device()),
+            train_device_gb = gb(estimate.train.device),
+            budget_gb = gb(budget.effective_bytes()),
+            "{TRAINER_ID} trainer: block residency chosen"
+        );
+        eprintln!(
+            "[SW-F369] {TRAINER_ID} trainer: DiT blocks {} (checkpointed: {}); derived peak \
+             ~{:.1} GB in {} (train step ~{:.1} GB) against a ~{:.1} GB training budget",
+            residency.name(),
+            plan.checkpointed,
+            gb(estimate.peak_device()),
+            estimate.binding_phase(),
+            gb(estimate.train.device),
+            gb(budget.effective_bytes()),
+        );
+        Ok(residency)
     }
 
     /// Every caption (and an edit's references) through the generator's own conditioning phase,
@@ -716,19 +781,12 @@ impl MiniMaxH3ImageTrainer {
                 current: count + index as u32 + 1,
                 total,
             });
-            let target = if item.is_edit_pair() {
-                decode_image(&item.image_path)?
-            } else {
-                let square = decode_square(&item.image_path)?;
-                Image {
-                    width: square.width(),
-                    height: square.height(),
-                    pixels: square.into_raw(),
-                }
-            };
+            // The whole target, captioned or edit: resized (never cropped, never upscaled past its
+            // own area) onto its aspect-keeping canvas at each bucket edge. Every micro-step
+            // trains one cached entry, so entries of different shapes never share a batch.
+            let target = decode_image(&item.image_path)?;
             for &edge in &plan.edges {
-                let canvas =
-                    training_canvas(item.is_edit_pair(), (target.width, target.height), edge);
+                let canvas = training_canvas((target.width, target.height), edge);
                 let image = resize_reference(&target, canvas)?;
                 let posterior = encoder.encode(&reference_vae_pixels(&image, device)?)?;
                 // The posterior mode: the sample at zero noise, normalized like a reference.
@@ -770,12 +828,15 @@ impl MiniMaxH3ImageTrainer {
         Ok(Cache { entries, text })
     }
 
-    /// The DiT: on the host with its trunk on the device (streamed, checkpointed), or resident;
-    /// the run's factors installed; the six timesteps' modulation projected and `adaln_proj`
-    /// evicted.
+    /// The DiT: loaded on the host with its trunk on the device (checkpointed) or whole on the
+    /// device; the frozen training adapter (when configured) and the run's factors installed; the
+    /// six timesteps' modulation projected and
+    /// `adaln_proj` evicted; and — checkpointed with [`BlockResidency::Resident`] — the block
+    /// bodies then moved to the device once, so no step transfers a weight.
     fn build_dit(
         &self,
         plan: &RunPlan<'_>,
+        residency: BlockResidency,
         device: &Device,
     ) -> Result<(MiniMaxH3Dit, ImageModulation, LoraSet)> {
         let cfg = &plan.req.config;
@@ -785,6 +846,22 @@ impl MiniMaxH3ImageTrainer {
             device
         };
         let mut dit = self.generator.load_dit(load_device, plan.compute_dtype)?;
+        // The frozen de-distill residual first, where the generator installs a render's adapters:
+        // on the host blocks a streamed window copies (and the resident promotion moves), or on
+        // the device for a non-checkpointed load — so every residency runs on base + adapter.
+        if let Some(file) = &cfg.training_adapter {
+            let applied = training_adapter::install_training_adapter(
+                &mut dit,
+                file,
+                self.training_adapter_strength,
+            )?;
+            eprintln!(
+                "[SW-F369] {TRAINER_ID} trainer: training adapter {} applied to {applied} \
+                 projections at strength {} (frozen; previews and the saved adapter exclude it)",
+                file.display(),
+                self.training_adapter_strength
+            );
+        }
         let set = install_adapters(&mut dit, &plan.target_paths, cfg, device)?;
         let schedule = gen_core_h3::h3_schedule::SigmaSchedule::h3_image_distilled()
             .map_err(|e| Error::Msg(e.to_string()))?;
@@ -793,6 +870,20 @@ impl MiniMaxH3ImageTrainer {
         }
         let modulation =
             image_modulation(&mut dit, schedule.timesteps(), plan.edit, &plan.req.cancel)?;
+        if plan.checkpointed && residency == BlockResidency::Resident {
+            if plan.req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let started = std::time::Instant::now();
+            let moved = dit.promote_streamed_blocks()?;
+            eprintln!(
+                "[SW-F369] {TRAINER_ID} trainer: moved {} block bodies ({:.1} GB) to the device \
+                 in {:.1} s; training checkpointed with resident blocks",
+                dit.num_layers(),
+                crate::image_memory_strategy::admission::decimal_gb(moved as u64),
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok((dit, modulation, set))
     }
 
@@ -806,7 +897,7 @@ impl MiniMaxH3ImageTrainer {
         let cfg = &req.config;
         let device = self.generator.device().clone();
         on_progress(TrainingProgress::Preparing);
-        self.preflight(&plan)?;
+        let residency = self.preflight(&plan)?;
         let stem = file_stem(&req.file_name).to_string();
         let fingerprint = request_fingerprint(req)?;
         // The run's mode against the snapshot's, from its metadata alone, before any model loads.
@@ -827,7 +918,7 @@ impl MiniMaxH3ImageTrainer {
 
         on_progress(TrainingProgress::LoadingModel);
         let mut cache = self.cache(&plan, on_progress)?;
-        let (dit, modulation, set) = self.build_dit(&plan, &device)?;
+        let (dit, modulation, set) = self.build_dit(&plan, residency, &device)?;
         // The caption rows are constants of every step: refine each item's once.
         for text in &mut cache.text {
             *text = dit.embed_context(text)?;
@@ -886,6 +977,7 @@ impl MiniMaxH3ImageTrainer {
                 entry,
                 &cache.text[entry.item],
                 mae,
+                plan.checkpointed,
                 &device,
             )?;
             last_loss = loss;
@@ -895,17 +987,19 @@ impl MiniMaxH3ImageTrainer {
             // The last step closes its window too, so the final step's preview and the saved
             // adapter see the same factors (a sub-`accum` tail is a true mean of what it holds).
             if step.is_multiple_of(accum) || step == cfg.steps {
-                apply_update(
-                    &mut opt,
-                    &mut accumulated,
-                    &set,
-                    pending,
-                    cfg,
-                    update_idx,
-                    total_updates,
-                    warmup_updates,
-                    cfg.seed,
-                )?;
+                candle_gen::train::profile::span("optimizer_step", &device, || {
+                    Ok(apply_update(
+                        &mut opt,
+                        &mut accumulated,
+                        &set,
+                        pending,
+                        cfg,
+                        update_idx,
+                        total_updates,
+                        warmup_updates,
+                        cfg.seed,
+                    ))
+                })??;
                 pending = 0;
                 update_idx += 1;
             }
@@ -1030,6 +1124,7 @@ fn micro_step(
     entry: &CachedItem,
     text_rows: &Tensor,
     mae: bool,
+    checkpointed: bool,
     device: &Device,
 ) -> Result<(f32, GradStore)> {
     let t = flow_match::sample_unit_timestep(
@@ -1070,6 +1165,7 @@ fn micro_step(
             step: st,
         },
         mae,
+        checkpointed,
     )
 }
 
@@ -1159,3 +1255,5 @@ impl Trainer for MiniMaxH3ImageTrainer {
 mod real_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod training_adapter_tests;

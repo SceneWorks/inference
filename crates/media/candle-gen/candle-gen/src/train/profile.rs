@@ -14,6 +14,44 @@ thread_local! {
     static SEGMENT: Cell<usize> = const { Cell::new(0) };
     static ATTRIBUTION: Cell<bool> = const { Cell::new(false) };
     static TIMES: RefCell<Vec<(String,f64)>> = const { RefCell::new(Vec::new()) };
+    static SPAN_PROFILE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A manual bench's span profile (SW-F369): inside `f`, every [`span`] on this thread is
+/// synchronized and recorded (every step, not only a first warmup), and
+/// [`take_span_totals`] drains what was recorded so far. The synchronization perturbs the
+/// timing it measures, so a bench reports these beside, never as, its unprofiled step times.
+/// Mutually exclusive with the bounded Krea profile; state is reset on exit, panics included.
+#[cfg(feature = "model-inference-proof")]
+pub fn with_span_profile<T>(f: impl FnOnce() -> T) -> T {
+    assert!(
+        !active() && !SPAN_PROFILE.replace(true),
+        "nested training span profile"
+    );
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SPAN_PROFILE.set(false);
+            TIMES.with(|t| t.borrow_mut().clear());
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
+/// The spans recorded since the last call inside [`with_span_profile`]: `name → (calls,
+/// inclusive synchronized seconds)`. Nested spans are each counted inclusively.
+#[cfg(feature = "model-inference-proof")]
+pub fn take_span_totals() -> std::collections::BTreeMap<String, (usize, f64)> {
+    let mut sums = std::collections::BTreeMap::<String, (usize, f64)>::new();
+    TIMES.with(|t| {
+        for (name, sec) in t.borrow_mut().drain(..) {
+            let v = sums.entry(name).or_default();
+            v.0 += 1;
+            v.1 += sec;
+        }
+    });
+    sums
 }
 
 /// Original arithmetic selected by a measured job profile or existing proof scope.
@@ -270,7 +308,7 @@ pub fn span<T>(
     f: impl FnOnce() -> candle_core::Result<T>,
 ) -> candle_core::Result<T> {
     #[cfg(feature = "model-inference-proof")]
-    if active() && ATTRIBUTION.get() {
+    if (active() && ATTRIBUTION.get()) || SPAN_PROFILE.get() {
         device.synchronize()?;
         let start = std::time::Instant::now();
         let result = f()?;

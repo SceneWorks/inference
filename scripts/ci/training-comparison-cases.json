@@ -1204,7 +1204,7 @@
           "slot": "mage-generated-source-training-png",
           "role": "reference",
           "readers": [
-            "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_square::image::open@2345"
+            "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_rgb::image::open@2345"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -1213,7 +1213,7 @@
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
             "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
-            "writer": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance: RgbImage::from_pixel(...).save(&input) -> TrainingItem::captioned(input) -> production trainer cache_samples -> observed decode_square/item image reader"
+            "writer": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance: RgbImage::from_pixel(...).save(&input) -> TrainingItem::captioned(input) -> production trainer cache_samples -> observed decode_rgb/item image reader"
           }
         }
       ],

@@ -12,6 +12,8 @@ use std::path::Path;
 use candle_core::{Device, Tensor};
 use image::imageops::FilterType;
 
+use gen_core_train::canvas::{training_canvas, TrainingCanvas};
+
 use crate::{CandleError, Result};
 
 /// Floor `resolution` to a multiple of 32 (the training bucket). `0` → the `512` default; otherwise
@@ -65,9 +67,58 @@ pub fn decode_square(path: &Path) -> Result<SquareImage> {
 /// of [`load_image_tensor`].
 pub fn square_image_tensor(square: &SquareImage, edge: u32, device: &Device) -> Result<Tensor> {
     let resized = image::imageops::resize(square, edge, edge, FilterType::Lanczos3);
-    let (ew, eh) = (edge as usize, edge as usize);
+    rgb_to_tensor(&resized, device)
+}
+
+/// Decode `path` whole (RGB8) — the per-item half of the aspect-preserving canvas path: decoded
+/// once, then cut and resized onto each bucket edge's [`TrainingCanvas`] by [`canvas_image_tensor`].
+pub fn decode_rgb(path: &Path) -> Result<image::RgbImage> {
+    Ok(gen_core::__model_input_reader!(
+        image::open(path),
+        "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_rgb::image::open@2345",
+        Reference,
+        path,
+        |__model_input_path| image::open(__model_input_path)
+    )
+    .map_err(|e| CandleError::Msg(format!("open image {}: {e}", path.display())))?
+    .to_rgb8())
+}
+
+/// The training canvas of a decoded `image` at bucket `edge` for a family whose canvas sides are
+/// multiples of `stride` and at most `max_side` ([`gen_core_train::canvas::training_canvas`]).
+pub fn image_canvas(
+    image: &image::RgbImage,
+    edge: u32,
+    stride: u32,
+    max_side: Option<u32>,
+) -> TrainingCanvas {
+    training_canvas(image.dimensions(), edge, stride, max_side)
+}
+
+/// Cut `image` to `canvas.crop`, resize it to the canvas (Lanczos) and return the VAE-input tensor
+/// `[1, 3, height, width]` (RGB, channel-first) normalized to `[-1, 1]` on `device` — the per-edge
+/// half of the aspect-preserving canvas path (the whole frame, never centre-cropped to a square).
+pub fn canvas_image_tensor(
+    image: &image::RgbImage,
+    canvas: &TrainingCanvas,
+    device: &Device,
+) -> Result<Tensor> {
+    let c = canvas.crop;
+    let full = (c.x, c.y, c.width, c.height) == (0, 0, image.width(), image.height());
+    let resized = if full {
+        image::imageops::resize(image, canvas.width, canvas.height, FilterType::Lanczos3)
+    } else {
+        let cut = image::imageops::crop_imm(image, c.x, c.y, c.width, c.height).to_image();
+        image::imageops::resize(&cut, canvas.width, canvas.height, FilterType::Lanczos3)
+    };
+    rgb_to_tensor(&resized, device)
+}
+
+/// An RGB8 image → `[1, 3, H, W]` channel-first `[-1, 1]` on `device`.
+fn rgb_to_tensor(img: &image::RgbImage, device: &Device) -> Result<Tensor> {
+    let (ew, eh) = (img.width() as usize, img.height() as usize);
     let mut data = vec![0f32; 3 * eh * ew];
-    for (x, y, px) in resized.enumerate_pixels() {
+    for (x, y, px) in img.enumerate_pixels() {
         let (x, y) = (x as usize, y as usize);
         for c in 0..3 {
             // channel-first [3, H, W]; RGB; [-1, 1].
@@ -112,6 +163,34 @@ mod tests {
             let b: Vec<f32> = once.flatten_all().unwrap().to_vec1().unwrap();
             assert_eq!(a, b, "edge {edge}");
         }
+    }
+
+    #[test]
+    fn a_portrait_trains_whole_at_its_own_aspect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.png");
+        let img = image::RgbImage::from_fn(60, 90, |x, y| image::Rgb([x as u8, y as u8, 7]));
+        img.save(&path).unwrap();
+        let rgb = decode_rgb(&path).unwrap();
+        assert_eq!(rgb.dimensions(), (60, 90));
+        // Edge 64 (area 4096 < 5400): scaled to ~52×78 at 2:3, stride-floored to 48×64.
+        let canvas = image_canvas(&rgb, 64, 16, None);
+        assert_eq!(
+            canvas.crop,
+            gen_core_train::subject_mask::CropBox::full(60, 90)
+        );
+        assert_eq!(canvas.size(), (48, 64));
+        let t = canvas_image_tensor(&rgb, &canvas, &Device::Cpu).unwrap();
+        assert_eq!(t.dims(), &[1, 3, 64, 48]);
+        // A strip beyond 4:1 is centre-cropped first; the tensor follows the crop's canvas.
+        let strip = image::RgbImage::from_fn(200, 20, |x, _| image::Rgb([x as u8, 0, 0]));
+        let canvas = image_canvas(&strip, 64, 16, None);
+        assert_eq!((canvas.crop.x, canvas.crop.width), (60, 80));
+        let t = canvas_image_tensor(&strip, &canvas, &Device::Cpu).unwrap();
+        assert_eq!(
+            t.dims(),
+            &[1, 3, canvas.height as usize, canvas.width as usize]
+        );
     }
 
     #[test]

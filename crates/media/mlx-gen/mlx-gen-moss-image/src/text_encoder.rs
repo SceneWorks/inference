@@ -10,8 +10,8 @@ use mlx_llm::models::qwen35::{Qwen35Config, Qwen35Model};
 use mlx_rs::Array;
 use sha2::{Digest, Sha256};
 fn tokenizer(s: &Sources) -> Result<TextTokenizer> {
-    let json = String::from_utf8(s.find("tokenizer/tokenizer.json")?.bytes()?)
-        .map_err(|e| Error::Msg(e.to_string()))?;
+    let asset = s.find("tokenizer/tokenizer.json")?;
+    let json = String::from_utf8(asset.bytes()?).map_err(|e| Error::Msg(e.to_string()))?;
     let tokenizer = TextTokenizer::from_json_str(
         &json,
         TokenizerConfig {
@@ -21,6 +21,12 @@ fn tokenizer(s: &Sources) -> Result<TextTokenizer> {
             pad_to_max_length: false,
         },
     )?;
+    #[cfg(feature = "model-inference-proof")]
+    mlx_gen::gen_core::model_input_proof::record_reader_paths(
+        "mlx-gen-moss-image::text_encoder::tokenizer",
+        mlx_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+        &[asset.pin.canonical_target_path()],
+    );
     Ok(tokenizer)
 }
 pub(crate) fn token_bound(

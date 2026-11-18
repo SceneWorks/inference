@@ -1404,8 +1404,10 @@ pub(crate) fn decode_batch(
 /// on `transformer`: seed → noise → flow-match denoise → VAE decode → [`Image`]. A stripped txt2img
 /// of [`render_batch`] (no count loop, no img2img blend, no `GenerationRequest`) for the trainer's
 /// periodic preview. `cap` is the (already dtype-matched) caption conditioning for the sample prompt;
-/// `dtype` is the trainer's compute dtype (bf16/f32) so the noise enters the loop at the same
-/// precision as the cast DiT weights. No progress/cancel plumbing — the caller drives the cadence.
+/// `(width, height)` is the preview canvas (item 0's training canvas at the largest bucket edge,
+/// not necessarily square); `dtype` is the trainer's compute dtype (bf16/f32) so the noise enters
+/// the loop at the same precision as the cast DiT weights. No progress/cancel plumbing — the
+/// caller drives the cadence.
 #[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
@@ -1414,12 +1416,12 @@ pub(crate) fn render_sample(
     scheduler: &FlowMatchEuler,
     cap: &Array,
     seed: u64,
-    edge: u32,
+    (width, height): (u32, u32),
     dtype: Dtype,
     cancel: &CancelFlag,
 ) -> Result<Image> {
     let _compile_glue = crate::CompileGlueGuard::enable();
-    let noise = create_noise(seed, edge, edge)?.as_dtype(dtype)?;
+    let noise = create_noise(seed, width, height)?.as_dtype(dtype)?;
     // F-117: thread the training cancel flag through the preview denoise (was a throwaway
     // `CancelFlag::default()` via the bare `denoise`), so a cancel during a preview's multi-step
     // denoise is honored at the next step boundary rather than only between previews.

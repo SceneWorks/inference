@@ -11,6 +11,7 @@ pub use gen_core::train::*;
 pub mod aspect_ratio;
 pub mod aux_schedule;
 pub mod body;
+pub mod canvas;
 pub mod face_loss;
 pub mod h3_image;
 pub mod resume;

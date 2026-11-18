@@ -843,6 +843,10 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
     }
     let width = compute_width(c)?;
     let mut canvases: Vec<(u64, u64)> = if c.aspect_ratio_buckets.is_empty() {
+        // The default path trains each item on an aspect-preserving canvas of at most edge²
+        // pixels (32-multiple sides, so every 8/16-pixel grid below floors to at most the
+        // square's); every term priced here grows with canvas area, so the square edge² canvas
+        // is the per-sample worst case. The exact cached token total comes from the plan.
         r.edges.iter().map(|&edge| (edge, edge)).collect()
     } else {
         c.aspect_ratio_buckets

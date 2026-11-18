@@ -45,8 +45,9 @@ use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::BucketSchedule;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::train::canvas::canvas_crop;
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -56,7 +57,7 @@ use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, AuxLossSchedule, Parameterization, PerceptualPath, StepPlan,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::taehv::TaehvConfig;
 use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::train::vocab::sample_timestep;
@@ -91,6 +92,18 @@ const LOKR_DTYPE: Dtype = Dtype::Float32;
 /// The reference attention LoRA targets `to_q/to_k/to_v/to_out.0` in Wan's **native** naming: the
 /// self/cross-attention `q/k/v/o`. Suffix-matched against the per-block adaptable surface.
 const DEFAULT_TARGET_SUFFIXES: [&str; 4] = ["q", "k", "v", "o"];
+
+/// The longest training-canvas side the trainer keeps: `None` — Wan's 3D RoPE spans 1024 patch
+/// positions per axis (16 384 px at the 14B's 16 px token stride), far past any bucket edge, so only
+/// the shared 4:1 source crop ([`canvas_crop`]) bounds the canvas.
+const CANVAS_MAX_SIDE: Option<u32> = None;
+
+/// Every training-canvas side of `cfg`'s family is a multiple of this: the VAE's spatial downscale
+/// times the DiT's spatial patch — 8 × 2 = 16 for the z16 14B experts, 16 × 2 = 32 for the TI2V-5B's
+/// z48 VAE (the inference `SIZE_MULTIPLE_14B` / `SIZE_MULTIPLE` grids).
+fn canvas_stride(cfg: &WanModelConfig) -> u32 {
+    (cfg.vae_stride.2 * cfg.patch_size.2) as u32
+}
 
 /// Render one preview frame (sc-5637) from the **in-progress training adapters** already installed on
 /// `experts`: a single-frame (`F=1`) seeded denoise reusing the family's own inference loop — the
@@ -184,21 +197,23 @@ enum WanTrainVae {
 }
 
 impl WanTrainVae {
-    /// Encode a center-cropped square still image → the normalized channels-first clean latent
-    /// `[z, 1, h, w]`, exactly as each model's inference encode: the z16 video encode squeezed to
-    /// one frame; the z48 channels-last image encode transposed channels-first (`model.rs`'s TI2V
-    /// conditioning, `transpose([3,0,1,2])`).
-    fn encode_clean(&self, img: &Image, edge: u32) -> Result<Array> {
+    /// Encode a still image resized onto its `(width, height)` training canvas → the normalized
+    /// channels-first clean latent `[z, 1, h, w]`, exactly as each model's inference encode: the z16
+    /// video encode squeezed to one frame; the z48 channels-last image encode transposed
+    /// channels-first (`model.rs`'s TI2V conditioning, `transpose([3,0,1,2])`). `img` is the canvas
+    /// source ([`canvas_source`]), whose aspect is the canvas's to within one stride, so the
+    /// preprocessors' cover-fit trims at most that sliver.
+    fn encode_clean(&self, img: &Image, (width, height): (u32, u32)) -> Result<Array> {
         match self {
             WanTrainVae::Z16(vae) => {
-                let chw = preprocess_i2v_image(img, edge, edge)?; // [3, H, W] in [-1,1]
-                let nct_hw = chw.reshape(&[1, 3, 1, edge as i32, edge as i32])?; // [1,3,1,H,W]
+                let chw = preprocess_i2v_image(img, width, height)?; // [3, H, W] in [-1,1]
+                let nct_hw = chw.reshape(&[1, 3, 1, height as i32, width as i32])?; // [1,3,1,H,W]
                 let latent = vae.encode(&nct_hw)?; // [1,16,1,h,w] normalized
                 let s = latent.shape();
                 Ok(latent.reshape(&[s[1], s[2], s[3], s[4]])?) // [16,1,h,w]
             }
             WanTrainVae::Z48(vae) => {
-                let thwc = preprocess_ti2v_image(img, edge, edge)?; // [1,1,H,W,3] channels-last
+                let thwc = preprocess_ti2v_image(img, width, height)?; // [1,1,H,W,3] channels-last
                 let latent = vae.encode(&thwc)?; // [1,1,h,w,48] channels-last normalized
                                                  // [1,1,h,w,48] → [1,h,w,48] → [48,1,h,w] (channels-first, the latent convention).
                 Ok(latent
@@ -509,6 +524,7 @@ impl WanMoeTrainer {
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
         // off). The memory guard sizes for the largest (epic 2123 E7).
         let edges = bucket_edges(cfg);
+        let stride = canvas_stride(&self.cfg);
 
         // sc-4942 — fail-fast pre-flight memory guard (the sc-4874 mechanism). The dense (non-block-
         // checkpointed) first step materializes the whole forward graph in one MLX `eval`; at high
@@ -568,7 +584,11 @@ impl WanMoeTrainer {
                     current: i as u32 + 1,
                     total,
                 });
-                let img = center_crop_square(&decode_image(&item.image_path)?);
+                // Decoded once, whole; cut + resized onto its aspect-keeping canvas per bucket edge
+                // (about `edge²` px, never upscaled, sides multiples of the family stride — never
+                // centre-cropped to a square). Each micro-step trains ONE cached entry, so entries
+                // of different shapes never share a batch.
+                let img = decode_image(&item.image_path)?;
                 // sc-24828: the item's mask is read and checked once, resampled per bucket below.
                 let label = format!("{id} trainer");
                 let mask = PreparedSubjectMask::load_if_enabled(
@@ -589,7 +609,10 @@ impl WanMoeTrainer {
                 // contexts are shared (refcounted).
                 for (clean, mask_weight) in encode_bucket_latents(
                     &edges,
-                    |edge| self.vae.encode_clean(&img, edge),
+                    |edge| {
+                        let (canvas, source) = canvas_source(&img, edge, stride, CANVAS_MAX_SIDE);
+                        self.vae.encode_clean(&source, canvas.size())
+                    },
                     |shape| still_subject_weight(&label, mask.as_ref(), shape),
                 )? {
                     cache.push((clean, ctxs.clone(), mask_weight));
@@ -625,13 +648,13 @@ impl WanMoeTrainer {
         // before the loop.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image and resampled onto its decoded size.
+            // cropped like the image (its canvas source box) and resampled onto its decoded size.
             path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
                 "wan trainer",
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         // Free the UMT5 encoder + tokenizer (~11 GB) before training (the reference frees it post-cache).
@@ -641,7 +664,8 @@ impl WanMoeTrainer {
         // sc-5637 — preview-sample geometry: a cached clean latent's exact `[z, 1, h, w]` shape (so the
         // preview's init noise matches the VAE's latent geometry without re-deriving the per-family
         // spatial stride). Cache is non-empty here (checked above). sc-2127: previews render at the
-        // largest bucket edge — item 0's entry for that bucket.
+        // largest bucket edge — item 0's entry for that bucket, i.e. item 0's own aspect canvas
+        // (within the `edge²` area the memory guard prices).
         let sampling_enabled = !sample_ctxs.is_empty();
         let sample_latent_shape: Vec<i32> = cache[largest_bucket(&edges)].0.shape().to_vec();
 
@@ -1658,23 +1682,23 @@ fn encode_bucket_latents(
         .collect()
 }
 
-/// The subject-masked loss weight (sc-24828) of one cached still latent `[z, 1, h, w]`: the image
-/// went through `center_crop_square`, so the mask's crop is [`CropBox::center_square`],
-/// area-averaged onto the latent's `(h, w)` grid and broadcast over every channel of the one
-/// frame — the latent's exact shape. `None` when off.
+/// The subject-masked loss weight (sc-24828) of one cached still latent `[z, 1, h, w]`: the mask
+/// (same dimensions as the image) takes the image's canvas source box ([`canvas_crop`], the whole
+/// frame within 4:1 — edge-independent), area-averaged onto the latent's `(h, w)` grid and
+/// broadcast over every channel of the one frame — the latent's exact shape. `None` when off.
 fn still_subject_weight(
     label: &str,
     mask: Option<&PreparedSubjectMask>,
     clean_shape: &[i32],
 ) -> Result<Option<Array>> {
-    prepared_subject_mask_weight(label, mask, CropBox::center_square, clean_shape)
+    prepared_subject_mask_weight(label, mask, canvas_crop, clean_shape)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        accum_window, descriptor_i2v_14b, descriptor_t2v_14b, descriptor_ti2v_5b, expert_index,
-        expert_item_index, largest_bucket, preflight_projection,
+        accum_window, canvas_stride, descriptor_i2v_14b, descriptor_t2v_14b, descriptor_ti2v_5b,
+        expert_index, expert_item_index, largest_bucket, preflight_projection, CANVAS_MAX_SIDE,
     };
     use crate::config::WanModelConfig;
     use mlx_gen::gen_core::{BucketSchedule, ResolutionBucket, TrainingConfig};
@@ -1690,6 +1714,24 @@ mod tests {
             }],
             7,
         )
+    }
+
+    /// The aspect canvas on each family's token grid (VAE × 2×2 patch: 16 for the z16 14B, 32 for
+    /// the z48 TI2V-5B): a 1365×2048 portrait keeps its aspect within `edge²` (no square crop, no
+    /// upscale) and its source box is the whole frame.
+    #[test]
+    fn a_portrait_trains_on_its_own_aspect_canvas() {
+        use mlx_gen::train::canvas::{canvas_crop, training_canvas};
+        assert_eq!(canvas_stride(&WanModelConfig::wan22_t2v_14b()), 16);
+        assert_eq!(canvas_stride(&WanModelConfig::wan22_i2v_14b()), 16);
+        assert_eq!(canvas_stride(&WanModelConfig::wan22_ti2v_5b()), 32);
+        for stride in [16, 32] {
+            let c = training_canvas((1365, 2048), 1024, stride, CANVAS_MAX_SIDE);
+            assert_eq!((c.width % stride, c.height % stride), (0, 0));
+            assert!(c.height > c.width && c.area() <= 1024 * 1024, "{c:?}");
+            assert_eq!(c.crop, canvas_crop(1365, 2048));
+            assert_eq!((c.crop.width, c.crop.height), (1365, 2048));
+        }
     }
 
     /// F-082 lockstep with candle-gen: on the dual MoE **every expert sweeps the whole dataset** —
@@ -2024,9 +2066,7 @@ mod first_step_repro {
         checkpoint: bool,
         tag: &str,
     ) -> Result<(f32, f64)> {
-        let clean = trainer
-            .vae
-            .encode_clean(&center_crop_square(&swatch(edge)), edge)?;
+        let clean = trainer.vae.encode_clean(&swatch(edge), (edge, edge))?;
         eval([&clean])?;
         let noise = random::normal::<f32>(clean.shape(), None, None, Some(&random::key(1)?))?;
         eval([&noise])?;
@@ -2081,7 +2121,7 @@ mod first_step_repro {
     ) -> LoraParams {
         let clean = trainer
             .vae
-            .encode_clean(&center_crop_square(&swatch(edge)), edge)
+            .encode_clean(&swatch(edge), (edge, edge))
             .unwrap();
         let noise =
             random::normal::<f32>(clean.shape(), None, None, Some(&random::key(1).unwrap()))
@@ -2374,17 +2414,16 @@ mod subject_mask_tests {
     }
 
     /// sc-24828 × sc-2127: with subject-masked loss on and two buckets, each bucket's cached weight
-    /// is the item's mask resampled onto **that bucket's** `[z, 1, h, w]` latent (centre-square
-    /// crop of a non-square image) — the latent's exact shape — with the masked-out
-    /// (right-half-of-crop) cells zero and the subject cells at the subject weight.
+    /// is the item's mask resampled onto **that bucket's** `[z, 1, h, w]` latent (the whole frame
+    /// of a non-square image — its canvas source box) — the latent's exact shape — with the
+    /// masked-out (right-half) cells zero and the subject cells at the subject weight.
     ///
     /// *Mutation that reds this:* `encode_bucket_latents` resampling the mask once at the first
     /// bucket's latent shape and reusing it for every bucket.
     #[test]
     fn subject_mask_weight_is_resampled_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();
-        // 96×64 image: the centre square is x ∈ [16, 80); the subject is x < 48 — exactly the
-        // crop's left half.
+        // 96×64 image, kept whole; the subject is x < 48 — exactly the frame's left half.
         let image_path = tmp.path().join("a.png");
         image::RgbImage::from_pixel(96, 64, image::Rgb([90, 120, 150]))
             .save(&image_path)
@@ -2406,8 +2445,9 @@ mod subject_mask_tests {
         let entries = encode_bucket_latents(
             &edges,
             |edge| {
-                let side = (edge / 16) as i32;
-                Ok(mlx_rs::ops::zeros::<f32>(&[z, 1, side, side])?)
+                // A 3:2 still latent (the 96×64 frame's own aspect canvas): `[z, 1, 2k, 3k]`.
+                let k = (edge / 64) as i32;
+                Ok(mlx_rs::ops::zeros::<f32>(&[z, 1, 2 * k, 3 * k])?)
             },
             |shape| still_subject_weight("wan", mask.as_ref(), shape),
         )

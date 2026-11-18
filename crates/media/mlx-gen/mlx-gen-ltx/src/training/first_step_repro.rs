@@ -111,7 +111,7 @@ fn one_step(
     tag: &str,
 ) -> Result<(f32, f64, Vec<i32>)> {
     let le = (edge / SPATIAL_SCALE as u32).max(1) as usize;
-    let img = center_crop_square(&swatch(edge));
+    let img = swatch(edge);
     let prep = preprocess_conditioning_image(&img, edge, edge)?;
     let latent = trainer.vae.encode(&prep)?;
     let clean = flatten_latent(&latent)?;
@@ -184,7 +184,7 @@ fn grads_of(
     dtype: Dtype,
 ) -> LoraParams {
     let le = (edge / SPATIAL_SCALE as u32).max(1) as usize;
-    let img = center_crop_square(&swatch(edge));
+    let img = swatch(edge);
     let prep = preprocess_conditioning_image(&img, edge, edge).unwrap();
     let latent = trainer.vae.encode(&prep).unwrap();
     let clean = flatten_latent(&latent).unwrap();

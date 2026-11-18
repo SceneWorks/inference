@@ -14,11 +14,10 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::h3_image::sampler_sigmas;
 use candle_gen::gen_core::train::TrainingConfig;
 use candle_gen::gen_core::CancelFlag;
 
-use gen_core_train::h3_image::training_step;
+use gen_core_train::h3_image::distilled_step;
 
 use super::step::{diagnostics, loss_and_grads, noised_rows, StepInputs};
 use super::{install_adapters, LoraSet};
@@ -125,7 +124,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
     let layout = ImageLayout::text_to_image(16, 32, 32, patch).unwrap();
     let rows = layout.num_packed_image_rows();
     let context = normal(&[1, 16, 5120], 1, 1.0, &device);
-    let step = training_step(sampler_sigmas()[2]);
+    let step = distilled_step(2);
     let x0 = normal(&[1, rows, 96], 2, 1.0, &device);
     let noise = normal(&[1, rows, 96], 3, 1.0, &device);
     let (packed, target) = noised_rows(&x0, &noise, step).unwrap();
@@ -152,6 +151,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         &set_s.vars,
         &inputs(&text_s, &layout, &packed, &target, step),
         false,
+        true,
     )
     .unwrap();
     assert!(loss_s.is_finite());
@@ -178,6 +178,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
             &set.vars,
             &inputs(&text_s, &layout, &packed, &target, step),
             false,
+            true,
         )
         .unwrap()
         .0
@@ -325,6 +326,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         &modulation_r,
         &set_r.vars,
         &inputs(&text_r, &layout, &packed, &target, step),
+        false,
         false,
     )
     .unwrap();

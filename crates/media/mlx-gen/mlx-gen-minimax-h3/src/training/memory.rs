@@ -20,7 +20,8 @@ use mlx_gen::gen_core::{
 };
 
 use gen_core_train::h3_image::{
-    train_step_bytes, DitGeometry, DitWeightBytes, TrainStepBytes, TrainStepShape, TRAINER_ID,
+    train_step_bytes, DitGeometry, DitWeightBytes, TrainStepBytes, TrainStepShape,
+    TrainingAdapterBytes, TRAINER_ID,
 };
 
 use crate::h3_image::admission::{
@@ -82,6 +83,9 @@ pub struct TrainingRunShape {
     pub optimizer_state_per_element: u64,
     pub lokr_delta_block_max: u64,
     pub lokr_delta_total: u64,
+    /// The frozen training adapter's footprint (zero when none is configured): unified memory
+    /// holds every factor for the whole run.
+    pub training_adapter: TrainingAdapterBytes,
     pub checkpointed: bool,
     /// Training attention chunked on whole heads, each chunk recomputed in the backward (E20) —
     /// the trainer always runs this; `false` prices the unchunked call.
@@ -242,6 +246,8 @@ pub fn estimate_training(
             lokr_delta_block_max: run.lokr_delta_block_max,
             lokr_delta_total: run.lokr_delta_total,
             checkpointed: run.checkpointed,
+            // The MLX trainer streams its checkpointed blocks.
+            resident_blocks: false,
             attention_heads_per_chunk: if run.chunked_attention {
                 training_attention_heads_per_chunk(text_rows + reference_rows + image_rows)
             } else {
@@ -256,7 +262,10 @@ pub fn estimate_training(
         let pipelined = BUFFER_INPUT_OUTPUTS
             * (MAX_ACTIVE_TASKS + 1)
             * (seq * geometry.ffn * 2 * 4 + METAL_BUFFER_BYTES);
-        let total = bytes.total() + pipelined + EVAL_SLACK_BYTES;
+        // The frozen training adapter's residual intermediates and outputs the backward retains:
+        // one live block's (checkpointed) or every block's.
+        let training_adapter_rows = run.training_adapter.rows(run.checkpointed) * seq;
+        let total = bytes.total() + pipelined + training_adapter_rows + EVAL_SLACK_BYTES;
         if total > train {
             train = total;
             step = bytes;
@@ -264,7 +273,10 @@ pub fn estimate_training(
     }
     let conditioning = conditioning.saturating_add(cache);
     let latents = latents.saturating_add(cache);
-    let train = train.saturating_add(cache);
+    // Every training-adapter factor stays mapped for the run (stream overlay or resident linears).
+    let train = train
+        .saturating_add(cache)
+        .saturating_add(run.training_adapter.resident);
     // Previews run the generator while the training DiT stays loaded and the adapter state live:
     // its trunk and tables when streamed (no block is held between steps), or the whole resident
     // DiT — every block body, and every installed LoKr delta — when not.
@@ -279,6 +291,8 @@ pub fn estimate_training(
             })
             .saturating_add(2 * run.lokr_delta_total)
     };
+    // The training adapter's factors stay mapped on the training DiT through the preview too.
+    let retained = retained.saturating_add(run.training_adapter.resident);
     let preview = match &run.preview {
         Some(item) => estimate(contract, facts, &request_shape(item), &selection)?
             .peak_bytes()
@@ -407,6 +421,7 @@ mod tests {
             optimizer_state_per_element: 2,
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
+            training_adapter: TrainingAdapterBytes::default(),
             checkpointed,
             chunked_attention: true,
             preview: None,
@@ -552,5 +567,44 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
         let c = crate::h3_image::memory::weights_free_contract(&spec).unwrap();
         assert!(streamed_selection(&c, tier(Some(Quant::Q4))).is_err());
+    }
+
+    /// The frozen training adapter is priced for the whole run: every factor in unified memory
+    /// (train and preview, the training DiT stays loaded through a preview), plus its retained
+    /// forward rows — one live block's checkpointed, every block's resident. Mutations: drop the
+    /// resident term ⇒ the train assert fails; take every block's rows checkpointed ⇒ the
+    /// checkpointed train assert fails; drop it from the preview ⇒ the preview assert fails.
+    #[test]
+    fn the_training_adapter_is_priced_for_the_whole_run() {
+        let c = contract();
+        let facts = ImageMemoryFacts::derived(Some(4));
+        let t = tier(Some(Quant::Q4));
+        let ta = TrainingAdapterBytes {
+            resident: 150_000_000,
+            trunk: 0,
+            block_max: 3_000_000,
+            rows_block_max: 1_000,
+            rows_total: 50_000,
+        };
+        let (text, reference, image) = train_rows(&run(true).items[0]).unwrap();
+        let seq = text + reference + image;
+        for (checkpointed, rows) in [(true, ta.rows_block_max), (false, ta.rows_total)] {
+            let base = TrainingRunShape {
+                preview: Some(item(vec![])),
+                ..run(checkpointed)
+            };
+            let adapted = TrainingRunShape {
+                training_adapter: ta,
+                ..base.clone()
+            };
+            let bare = estimate_training(&c, &facts, &facts, t, &base).unwrap();
+            let with = estimate_training(&c, &facts, &facts, t, &adapted).unwrap();
+            assert_eq!(
+                with.train,
+                bare.train + ta.resident + rows * seq,
+                "{checkpointed}"
+            );
+            assert_eq!(with.preview, bare.preview + ta.resident, "{checkpointed}");
+        }
     }
 }

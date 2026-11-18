@@ -31,6 +31,9 @@ candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 sceneworks-gen-core-tokenizer = { workspace = true }
 sceneworks-gen-core-train = { workspace = true }
 sceneworks-gen-core-memory-wan = { workspace = true }
+# The trainer's decoded dataset still (`candle_gen::train::dataset::decode_rgb`), resized onto its
+# aspect-keeping training canvas per bucket edge.
+image = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

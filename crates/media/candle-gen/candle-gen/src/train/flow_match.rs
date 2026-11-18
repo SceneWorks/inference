@@ -1162,7 +1162,8 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             &req.items,
             cfg,
             schedule.n_buckets(),
-            gen_core_train::subject_mask::CropBox::center_square,
+            // Every harness trainer cuts its images to the aspect-preserving canvas's source box.
+            gen_core_train::canvas::canvas_crop,
         )?);
     }
     let mut aux_driver = match perceptual {

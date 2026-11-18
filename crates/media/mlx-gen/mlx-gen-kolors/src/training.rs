@@ -19,8 +19,10 @@
 //!   * **Micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)`.** Kolors inference feeds the real
 //!     resolution (`crate::model::kolors_time_ids`, the diffusers `_get_add_time_ids`), unlike the
 //!     SDXL engine which hardcodes `[512,512,0,0,512,512]`. Training feeds the **same** real-resolution
-//!     ids at the bucketed training edge so the LoRA learns under the conditioning inference applies it
-//!     under.
+//!     ids at each entry's aspect-keeping training canvas (the whole frame resized to about `edge²`,
+//!     never centre-cropped to a square — so original == target == canvas, crop `(0, 0)`, exactly
+//!     what inference names at that render size) so the LoRA learns under the conditioning inference
+//!     applies it under.
 //!   * **Noise / objective — discrete DDPM over the Kolors `scaled_linear` schedule with
 //!     `num_train_timesteps = 1100`.** The diffusers Kolors LoRA script noises with a `DDPMScheduler`:
 //!     `noisy = √ᾱ_t·x0 + √(1−ᾱ_t)·noise` at a uniform integer `t ∈ [0, 1100)`, regressing the U-Net's
@@ -123,9 +125,9 @@ impl SdxlFamilyHooks for KolorsHooks {
         self.chatglm = None;
     }
 
-    /// Kolors micro-conditioning `time_ids = (H, W, 0, 0, H, W)` at the real (bucketed) `edge`.
-    fn time_ids(&self, batch: i32, edge: u32) -> Array {
-        kolors_train_time_ids(batch, edge)
+    /// Kolors micro-conditioning `time_ids = (H, W, 0, 0, H, W)` at the real training canvas.
+    fn time_ids(&self, batch: i32, width: u32, height: u32) -> Array {
+        kolors_train_time_ids(batch, width, height)
     }
 
     /// Sample a **uniform integer** DDPM timestep over `[0, num_train_timesteps)` — diffusers'
@@ -188,12 +190,12 @@ impl SdxlFamilyHooks for KolorsHooks {
         pooled: &Array,
         guidance: f32,
         seed: u64,
-        edge: u32,
+        size: (u32, u32),
         steps: usize,
         dtype: Dtype,
     ) -> Result<Image> {
         render_sample(
-            unet, vae, context, pooled, guidance, seed, edge, steps, dtype,
+            unet, vae, context, pooled, guidance, seed, size, steps, dtype,
         )
     }
 }
@@ -395,11 +397,11 @@ impl Trainer for KolorsTrainer {
     }
 }
 
-/// The training micro-conditioning `time_ids` for a square bucket `edge`: the inference
-/// [`kolors_time_ids`] `(H, W, 0, 0, H, W)` at `H = W = edge`. The shared backbone builds one per
-/// resolution bucket (sc-2127), so each cached latent trains under its own size's ids.
-fn kolors_train_time_ids(batch: i32, edge: u32) -> Array {
-    kolors_time_ids(batch, edge as i32, edge as i32)
+/// The training micro-conditioning `time_ids` for a `width × height` training canvas: the
+/// inference [`kolors_time_ids`] `(H, W, 0, 0, H, W)` — height first. The shared backbone builds
+/// one per cache entry (sc-2127), so each cached latent trains under its own canvas's ids.
+fn kolors_train_time_ids(batch: i32, width: u32, height: u32) -> Array {
+    kolors_time_ids(batch, height as i32, width as i32)
 }
 
 /// Discrete DDPM `add_noise` at integer timestep `t`: `√ᾱ_t·x0 + √(1−ᾱ_t)·noise` (diffusers
@@ -501,15 +503,21 @@ mod preflight_tests {
     }
 
     /// sc-2127: the Kolors trainer declares multi-resolution bucket support, and its
-    /// micro-conditioning `time_ids` follow the bucket edge (`(H, W, 0, 0, H, W)` at that edge).
+    /// micro-conditioning `time_ids` follow the training canvas (`(H, W, 0, 0, H, W)` — height
+    /// first, so a portrait canvas names its tall side first).
     #[test]
-    fn descriptor_declares_resolution_buckets_and_time_ids_follow_the_edge() {
+    fn descriptor_declares_resolution_buckets_and_time_ids_follow_the_canvas() {
         assert!(super::trainer_descriptor().techniques.resolution_buckets);
         for edge in [512u32, 768, 1024] {
-            let ids = super::kolors_train_time_ids(1, edge);
+            let ids = super::kolors_train_time_ids(1, edge, edge);
             let e = edge as f32;
             assert_eq!(ids.as_slice::<f32>(), &[e, e, 0.0, 0.0, e, e]);
         }
+        let ids = super::kolors_train_time_ids(1, 832, 1248);
+        assert_eq!(
+            ids.as_slice::<f32>(),
+            &[1248.0, 832.0, 0.0, 0.0, 1248.0, 832.0]
+        );
     }
 }
 
@@ -1059,7 +1067,7 @@ mod depth_anchoring_tests {
             let x0 = rnd(&[1, 6, 4, 4], 100);
             let cond = rnd(&[1, 7, TINY_CONTEXT_DIM], 200);
             let pooled = rnd(&[1, TINY_POOLED_DIM], 300);
-            let ids = kolors_train_time_ids(1, 32);
+            let ids = kolors_train_time_ids(1, 32, 32);
             let noise = rnd(&[1, 6, 4, 4], 400);
             let mut p = path();
             p.ensure_reference(0, &x0.transpose_axes(&[0, 3, 1, 2]).unwrap())

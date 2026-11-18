@@ -763,6 +763,35 @@ impl MiniMaxH3Dit {
         self.stream_window.is_some()
     }
 
+    /// Promote a streamed DiT's host block stack to the device, one block at a time, ending the
+    /// stream: every later [`Self::window_block`] borrows the resident block. Each host block is
+    /// released as its device copy replaces it, so the host stack drains as the device fills. Runs
+    /// after the streamed AdaLN precompute (the copies carry no `adaln_proj`); an installed adapter's
+    /// factors keep their identity, exactly as a window copy carries them. The trainer's resident +
+    /// checkpointed mode (SW-F369): one host→device transfer per run instead of two per step.
+    /// Returns the body bytes moved. A no-op on a DiT that is already resident.
+    pub(crate) fn promote_streamed_blocks(&mut self) -> Result<usize> {
+        if self.stream_window.is_none() {
+            return Ok(0);
+        }
+        let mut moved = 0usize;
+        for block in &mut self.blocks {
+            let resident = block.copy_to_device(&self.device)?;
+            moved += resident.body_nbytes();
+            *block = resident;
+        }
+        self.stream_window = None;
+        tracing::info!(
+            event = "h3_transformer_blocks_promoted",
+            component = "dit",
+            blocks = self.blocks.len(),
+            body_bytes = moved,
+            device = ?self.device.location(),
+            "Promoted host-resident DiT blocks to the device"
+        );
+        Ok(moved)
+    }
+
     /// The image transformer's stack input: `proj_in` over the packed image rows, cast to the text
     /// stream's dtype, scattered with the refined text rows into one `[1, seq_len, hidden]`
     /// sequence — the first stage of [`Self::forward_image`], shared with the trainer (SW-7098).
@@ -1086,11 +1115,147 @@ pub struct JointDit {
     resident_timestep_indices: Option<Tensor>,
     /// Bytes of `adaln_proj` weight released by the eviction, 0 when resident.
     released_bytes: usize,
+    /// The run's schedule, kept so [`Self::into_prepared`] can key the warm modulation on it.
+    schedule: TimestepSchedule,
     forwards: usize,
     veda: Option<crate::veda::VedaRuntime>,
     /// The request's cancel flag, observed between layers and inside the attention
     /// ([`Self::set_cancel`], sc-26691). `None` keeps the step-boundary check only.
     cancel: Option<CancelFlag>,
+}
+
+/// The request-independent half of a [`JointDit`]: the DiT after the AdaLN precompute-and-evict,
+/// with the whole schedule's modulation and `norm_out` table. The modulation depends only on the
+/// run's [`TimestepSchedule`] (step count and the two sigma shifts), so a resident generator keeps
+/// one of these warm between requests ([`JointDit::from_prepared`], [`JointDit::into_prepared`])
+/// instead of re-reading the DiT and re-projecting the 26 GB `adaln_proj` stack every render.
+pub struct PreparedJointDit {
+    dit: MiniMaxH3Dit,
+    cache: Box<AdaLnCache>,
+    norm_out: NormOutModulation,
+    released_bytes: usize,
+    schedule: TimestepSchedule,
+}
+
+/// The joint loop's row classes are fixed; a schedule declaring another count would address the
+/// wrong table rows.
+fn check_row_classes(schedule: &TimestepSchedule) -> Result<()> {
+    if schedule.num_row_classes() != crate::denoise::NUM_ROW_CLASSES {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 dit: the schedule declares {} row classes, expected {}",
+            schedule.num_row_classes(),
+            crate::denoise::NUM_ROW_CLASSES
+        )));
+    }
+    Ok(())
+}
+
+impl PreparedJointDit {
+    /// Project the whole `schedule`'s modulation and evict `adaln_proj` — resident, by the
+    /// precompute-and-evict lever; streamed (rung 4), one host block at a time through the device
+    /// window; on a modulation-pruned (sc-26684) checkpoint, by interpolating its curve, which
+    /// releases nothing. Consumes the model because the eviction mutates it irreversibly.
+    pub fn prepare(mut dit: MiniMaxH3Dit, schedule: TimestepSchedule) -> Result<Self> {
+        check_row_classes(&schedule)?;
+        let device = dit.device.clone();
+        let (cache, norm_out, released_bytes) = if let Some(window) = dit.stream_window {
+            let policy = crate::block_stream::current().ok_or_else(|| {
+                CandleError::Msg("streamed AdaLN requires an active request".into())
+            })?;
+            let input = if let Some(curve) = &dit.curve {
+                curve.coordinates(schedule.distinct_timesteps(), &device)?
+            } else {
+                dit.embed_timesteps(schedule.distinct_timesteps())?
+            };
+            let norm_out = if let Some(curve) = &dit.curve {
+                curve.norm_out_modulation(&input)?
+            } else {
+                dit.projections.norm_out.modulation(&input)?
+            };
+            let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+            let layers = candle_gen::block_window::run_windowed(
+                &device,
+                &plan,
+                &policy.cancel,
+                Vec::with_capacity(dit.blocks.len()),
+                || Ok(()),
+                |mut layers, _, range| {
+                    for layer in range {
+                        if policy.cancel.is_cancelled() {
+                            return Err(CandleError::Canceled);
+                        }
+                        layers.push(dit.blocks[layer].modulation_for_window(&input, &device)?);
+                    }
+                    Ok(layers)
+                },
+            )?;
+            let cache = AdaLnCache::assemble(schedule.clone(), layers, dit.pruning_identity())?;
+            for block in &mut dit.blocks {
+                block.evict_adaln();
+            }
+            // Host projections were dropped; no GPU eviction saving is claimed.
+            (cache, norm_out, 0)
+        } else if let Some(curve) = &dit.curve {
+            // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands are
+            // ~175 MB of F32 compute buffers — so the precompute releases zero and touches no
+            // timestep MLP (there is none to call).
+            let (cache, norm_out) = curve.precompute(&dit.blocks, &schedule)?;
+            (cache, norm_out, 0)
+        } else {
+            // The timestep embedding is captured out of the closure so `norm_out`'s own table is
+            // projected from the SAME `temb` the block stack's was — a second `embed_timesteps`
+            // call would be a second chance to bind the wrong timesteps.
+            let mut captured: Option<Tensor> = None;
+            let embedder = dit.projections.time_embedder.clone();
+            let embed_device = device.clone();
+            let (cache, released) = AdaLnCache::precompute_and_evict(
+                &mut dit.blocks,
+                schedule.clone(),
+                AdaLnResidency::PrecomputeAndEvict,
+                &device,
+                |timesteps| {
+                    let temb = embedder
+                        .as_ref()
+                        .ok_or_else(|| {
+                            CandleError::Msg(
+                                "minimax-h3 dit: the AdaLN precompute had no timestep embedding \
+                                 to evaluate"
+                                    .into(),
+                            )
+                        })?
+                        .forward(timesteps, &embed_device)?;
+                    captured = Some(temb.clone());
+                    Ok(temb)
+                },
+            )?;
+            let temb = captured.ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3 dit: the AdaLN precompute did not evaluate the timestep embedding"
+                        .into(),
+                )
+            })?;
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            (cache, norm_out, released)
+        };
+        Ok(Self {
+            dit,
+            cache: Box::new(cache),
+            norm_out,
+            released_bytes,
+            schedule,
+        })
+    }
+
+    /// The evicted DiT.
+    pub fn dit(&self) -> &MiniMaxH3Dit {
+        &self.dit
+    }
+
+    /// Whether this modulation serves a run with `schedule` — the only request input it was
+    /// projected from.
+    pub fn serves(&self, schedule: &TimestepSchedule) -> bool {
+        &self.schedule == schedule
+    }
 }
 
 impl JointDit {
@@ -1104,19 +1269,61 @@ impl JointDit {
     ///
     /// Consumes the model because the eviction mutates it irreversibly.
     pub fn new(
-        mut dit: MiniMaxH3Dit,
+        dit: MiniMaxH3Dit,
         layout: PackedLayout,
         context: &Tensor,
         schedule: TimestepSchedule,
         residency: AdaLnResidency,
     ) -> Result<Self> {
-        if schedule.num_row_classes() != crate::denoise::NUM_ROW_CLASSES {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3 dit: the schedule declares {} row classes, expected {}",
-                schedule.num_row_classes(),
-                crate::denoise::NUM_ROW_CLASSES
-            )));
+        match residency {
+            AdaLnResidency::PrecomputeAndEvict => {
+                Self::from_prepared(PreparedJointDit::prepare(dit, schedule)?, layout, context)
+            }
+            AdaLnResidency::Resident => Self::resident(dit, layout, context, schedule),
         }
+    }
+
+    /// [`AdaLnResidency::Resident`]: keep `adaln_proj` and project the four row-class timesteps
+    /// per step. A streamed DiT has no resident projections, so it always precomputes.
+    fn resident(
+        dit: MiniMaxH3Dit,
+        layout: PackedLayout,
+        context: &Tensor,
+        schedule: TimestepSchedule,
+    ) -> Result<Self> {
+        if dit.stream_window.is_some() {
+            return Self::from_prepared(PreparedJointDit::prepare(dit, schedule)?, layout, context);
+        }
+        check_row_classes(&schedule)?;
+        let (text_rows, tables) = Self::request_rows(&dit, &layout, context)?;
+        // One temb row per ROW CLASS, rebuilt per step; the index tensors are therefore the local
+        // `row_class · MODALITY_NUM + tag`, which is constant across steps because neither the
+        // class nor the tag of a row ever moves. The pruned (sc-26684) path re-interpolates its
+        // curve per step the same way.
+        let (local, classes) = resident_local_indices(&layout, &dit.device)?;
+        Ok(Self {
+            dit,
+            layout,
+            tables,
+            text_rows,
+            modulation: Modulation::Resident,
+            norm_out_modulation: None,
+            resident_adaln_indices: Some(local),
+            resident_timestep_indices: Some(classes),
+            released_bytes: 0,
+            schedule,
+            forwards: 0,
+            veda: None,
+            cancel: None,
+        })
+    }
+
+    /// The request's refined text rows and rotary tables, checked against `layout`.
+    fn request_rows(
+        dit: &MiniMaxH3Dit,
+        layout: &PackedLayout,
+        context: &Tensor,
+    ) -> Result<(Tensor, MmRopeTables)> {
         let text_rows = dit.embed_context(context)?;
         if text_rows.dims()[1] != layout.num_text_tokens() {
             return Err(CandleError::Msg(format!(
@@ -1126,141 +1333,55 @@ impl JointDit {
             )));
         }
         let tables = dit.rope.tables(layout.position_ids())?;
-        let device = dit.device.clone();
+        Ok((text_rows, tables))
+    }
 
-        let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =
-            if let Some(window) = dit.stream_window {
-                let policy = crate::block_stream::current().ok_or_else(|| {
-                    CandleError::Msg("streamed AdaLN requires an active request".into())
-                })?;
-                let input = if let Some(curve) = &dit.curve {
-                    curve.coordinates(schedule.distinct_timesteps(), &device)?
-                } else {
-                    dit.embed_timesteps(schedule.distinct_timesteps())?
-                };
-                let norm_out = if let Some(curve) = &dit.curve {
-                    curve.norm_out_modulation(&input)?
-                } else {
-                    dit.projections.norm_out.modulation(&input)?
-                };
-                let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
-                let layers = candle_gen::block_window::run_windowed(
-                    &device,
-                    &plan,
-                    &policy.cancel,
-                    Vec::with_capacity(dit.blocks.len()),
-                    || Ok(()),
-                    |mut layers, _, range| {
-                        for layer in range {
-                            if policy.cancel.is_cancelled() {
-                                return Err(CandleError::Canceled);
-                            }
-                            layers.push(dit.blocks[layer].modulation_for_window(&input, &device)?);
-                        }
-                        Ok(layers)
-                    },
-                )?;
-                let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
-                for block in &mut dit.blocks {
-                    block.evict_adaln();
-                }
-                // Host projections were dropped; no GPU eviction saving is claimed.
-                (
-                    Modulation::Cached(Box::new(cache)),
-                    Some(norm_out),
-                    None,
-                    None,
-                    0,
-                )
-            } else if let Some(curve) = &dit.curve {
-                // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands
-                // are ~175 MB of F32 compute buffers — so PrecomputeAndEvict releases zero and
-                // Resident simply re-interpolates the table per step; both residencies are
-                // legal, and neither touches a timestep MLP (there is none to call).
-                match residency {
-                    AdaLnResidency::PrecomputeAndEvict => {
-                        let (cache, norm_out) = curve.precompute(&dit.blocks, &schedule)?;
-                        (
-                            Modulation::Cached(Box::new(cache)),
-                            Some(norm_out),
-                            None,
-                            None,
-                            0,
-                        )
-                    }
-                    AdaLnResidency::Resident => {
-                        let local = resident_local_indices(&layout, &device)?;
-                        (Modulation::Resident, None, Some(local.0), Some(local.1), 0)
-                    }
-                }
-            } else {
-                match residency {
-                    AdaLnResidency::PrecomputeAndEvict => {
-                        // The timestep embedding is captured out of the closure so `norm_out`'s own
-                        // table is projected from the SAME `temb` the block stack's was — a second
-                        // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
-                        let mut captured: Option<Tensor> = None;
-                        let embedder = dit.projections.time_embedder.clone();
-                        let embed_device = device.clone();
-                        let (cache, released) = AdaLnCache::precompute_and_evict(
-                            &mut dit.blocks,
-                            schedule,
-                            residency,
-                            &device,
-                            |timesteps| {
-                                let temb = embedder
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        CandleError::Msg(
-                                            "minimax-h3 dit: the AdaLN precompute had no \
-                                             timestep embedding to evaluate"
-                                                .into(),
-                                        )
-                                    })?
-                                    .forward(timesteps, &embed_device)?;
-                                captured = Some(temb.clone());
-                                Ok(temb)
-                            },
-                        )?;
-                        let temb = captured.ok_or_else(|| {
-                            CandleError::Msg(
-                                "minimax-h3 dit: the AdaLN precompute did not evaluate the \
-                                 timestep embedding"
-                                    .into(),
-                            )
-                        })?;
-                        let norm_out = dit.projections.norm_out.modulation(&temb)?;
-                        (
-                            Modulation::Cached(Box::new(cache)),
-                            Some(norm_out),
-                            None,
-                            None,
-                            released,
-                        )
-                    }
-                    AdaLnResidency::Resident => {
-                        // One temb row per ROW CLASS, rebuilt per step; the index tensors are
-                        // therefore the local `row_class · MODALITY_NUM + tag`, which is constant
-                        // across steps because neither the class nor the tag of a row ever moves.
-                        let (local, classes) = resident_local_indices(&layout, &device)?;
-                        (Modulation::Resident, None, Some(local), Some(classes), 0)
-                    }
-                }
-            };
-
+    /// Build the velocity model for one request from a DiT whose whole-schedule modulation is
+    /// already projected ([`PreparedJointDit::prepare`]) — freshly, or kept warm from an earlier
+    /// request with the same schedule.
+    pub fn from_prepared(
+        prepared: PreparedJointDit,
+        layout: PackedLayout,
+        context: &Tensor,
+    ) -> Result<Self> {
+        let PreparedJointDit {
+            dit,
+            cache,
+            norm_out,
+            released_bytes,
+            schedule,
+        } = prepared;
+        let (text_rows, tables) = Self::request_rows(&dit, &layout, context)?;
         Ok(Self {
             dit,
             layout,
             tables,
             text_rows,
-            modulation,
-            norm_out_modulation,
-            resident_adaln_indices: resident_adaln,
-            resident_timestep_indices: resident_ts,
+            modulation: Modulation::Cached(cache),
+            norm_out_modulation: Some(norm_out),
+            resident_adaln_indices: None,
+            resident_timestep_indices: None,
             released_bytes,
+            schedule,
             forwards: 0,
             veda: None,
             cancel: None,
+        })
+    }
+
+    /// Release this request's rows, tables, sparse-attention state and cancel flag and return the
+    /// prepared DiT for the next request with the same schedule. `None` under
+    /// [`AdaLnResidency::Resident`], which has no precomputed modulation to keep.
+    pub fn into_prepared(self) -> Option<PreparedJointDit> {
+        let Modulation::Cached(cache) = self.modulation else {
+            return None;
+        };
+        Some(PreparedJointDit {
+            dit: self.dit,
+            cache,
+            norm_out: self.norm_out_modulation?,
+            released_bytes: self.released_bytes,
+            schedule: self.schedule,
         })
     }
 

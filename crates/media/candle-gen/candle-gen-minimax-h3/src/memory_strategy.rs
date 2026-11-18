@@ -9,6 +9,7 @@ mod conditioning;
 mod execution;
 mod routes;
 mod streaming;
+mod warm_estimate;
 
 pub use execution::begin_request;
 pub(crate) use execution::{activate as activate_request_scope, active_context};
@@ -18,6 +19,7 @@ pub(crate) use streaming::proof_dit_inventory;
 #[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
 pub(crate) use streaming::proof_text_encoder_inventory;
 pub use streaming::{host_peak_bytes, streaming_host_peak_bytes};
+pub use warm_estimate::{video_warm_estimate, VideoWarmEstimate, VideoWarmWeights};
 // Shared with the MiniMax-H3-Image contract (SW-7095): the same block stack, loaders and adapter
 // install, priced by the same header-only inventory.
 pub(crate) use adapters::profile_for as adapter_profile_for;

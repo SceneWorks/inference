@@ -20,7 +20,7 @@ use gen_core_moss_image::{moss_image::*, moss_image_training as contract};
 use mlx_gen::gen_core::{self};
 use mlx_gen::train::{
     checkpoint,
-    dataset::center_crop_square,
+    dataset::crop_image,
     lora::{accumulate_grads, build_lokr_targets, build_lora_targets, LoraParams, TrainAdapter},
     schedule::{lr_multiplier, schedule_updates},
 };
@@ -544,8 +544,13 @@ pub(crate) fn pack_mean(mean: &Array) -> Result<Array> {
         .transpose_axes(&[0, 5, 2, 4, 1, 3])?
         .reshape(&[s[0], 128, s[1] / 2, s[2] / 2])?)
 }
-fn encode_image(vae: &Flux2Vae, image: &mlx_gen::media::Image, edge: u32) -> Result<Array> {
-    let pixels = mlx_gen::img2img::preprocess_init_image(image, edge, edge)?
+fn encode_image(
+    vae: &Flux2Vae,
+    image: &mlx_gen::media::Image,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
+    let pixels = mlx_gen::img2img::preprocess_init_image(image, width, height)?
         .transpose_axes(&[0, 2, 3, 1])?;
     vae.bn_normalize_nchw(&pack_mean(&vae.encode_mean(&pixels)?)?)
 }
@@ -746,12 +751,17 @@ fn encode_entry(
     crate::pipeline::check(&req.cancel)?;
     let source = plan.decode_rgb(geometry.item, host_budget)?;
     let latent = if req.config.aspect_ratio_buckets.is_empty() {
-        let image = center_crop_square(&mlx_gen::media::Image {
-            width: source.width(),
-            height: source.height(),
-            pixels: source.into_raw(),
-        });
-        encode_image(vae, &image, geometry.width)?
+        // Default path: cut the plan's aspect-preserving source box and resize it onto the
+        // plan's (non-square) canvas.
+        let image = crop_image(
+            &mlx_gen::media::Image {
+                width: source.width(),
+                height: source.height(),
+                pixels: source.into_raw(),
+            },
+            geometry.crop_box(),
+        );
+        encode_image(vae, &image, geometry.width, geometry.height)?
     } else {
         let row = gen_core::AspectRatioBucket {
             width: geometry.width,
@@ -960,6 +970,15 @@ impl LoadedTrainer {
         } else {
             Some(encoder.encode("", 4096, &req.cancel)?.0)
         };
+        // Previews render at item 0's training canvas at the largest bucket edge (SW-7172): a shape
+        // the run trains at, its own aspect — never a square at the bucket edge.
+        let preview_size = plan
+            .entries
+            .iter()
+            .filter(|geometry| geometry.item == 0)
+            .max_by_key(|geometry| u64::from(geometry.width) * u64::from(geometry.height))
+            .map(|geometry| (geometry.width, geometry.height))
+            .ok_or_else(|| Error::Msg("MOSS plan has no entry for item 0".into()))?;
         #[cfg(feature = "test-support")]
         if let Some(probe) = &probe {
             probe.frozen(
@@ -1239,6 +1258,7 @@ impl LoadedTrainer {
                 self.previews(
                     c,
                     step,
+                    preview_size,
                     &previews,
                     negative.as_ref().expect("preview conditioning"),
                     &req.cancel,
@@ -1338,21 +1358,22 @@ impl LoadedTrainer {
             final_loss,
         })
     }
+    #[allow(clippy::too_many_arguments)] // the preview canvas joins the established preview inputs
     fn previews(
         &self,
         c: &TrainingConfig,
         step: u32,
+        (width, height): (u32, u32),
         prompts: &[(String, Array)],
         negative: &Array,
         cancel: &CancelFlag,
         progress: &mut dyn FnMut(TrainingProgress),
     ) -> Result<()> {
         for (i, (prompt, context)) in prompts.iter().enumerate() {
-            let edge = mlx_gen::train::dataset::bucket_resolution(c.resolution);
             let request = mlx_gen::GenerationRequest {
                 prompt: prompt.clone(),
-                width: edge,
-                height: edge,
+                width,
+                height,
                 steps: Some(c.sample_steps),
                 guidance: Some(c.sample_guidance_scale),
                 moss_image: Some(MossImageOptions {
@@ -1362,12 +1383,12 @@ impl LoadedTrainer {
                 ..Default::default()
             };
             let resolved = MossImageResolved::resolve(self.variant, &request)?;
+            let (latent_w, latent_h) = (width / 16, height / 16);
             let values = crate::pipeline::normal(
                 c.seed.wrapping_add(i as u64),
-                128 * (edge as usize / 16).pow(2),
+                128 * latent_w as usize * latent_h as usize,
             );
-            let noise =
-                Array::from_slice(&values, &[1, 128, (edge / 16) as i32, (edge / 16) as i32]);
+            let noise = Array::from_slice(&values, &[1, 128, latent_h as i32, latent_w as i32]);
             let latent = crate::pipeline::Sampling {
                 transformer: &self.transformer,
                 resolved: &resolved,

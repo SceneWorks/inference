@@ -834,11 +834,15 @@ pub(crate) fn read_weights<'a>(
     cancel: &CancelFlag,
 ) -> Result<Weights> {
     let mut tensors = HashMap::new();
+    #[cfg(feature = "model-inference-proof")]
+    let mut read_paths = Vec::new();
     for asset in assets {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
         let bytes = asset.weight_bytes()?;
+        #[cfg(feature = "model-inference-proof")]
+        read_paths.push(asset.pin.canonical_target_path().to_path_buf());
         let meta = CheckpointMeta::from_bytes(bytes)?;
         let expected = match asset.role {
             MossImageAssetRole::DmdLora => Some(dmd_lora_shapes()),
@@ -895,6 +899,12 @@ pub(crate) fn read_weights<'a>(
             }
         }
     }
+    #[cfg(feature = "model-inference-proof")]
+    mlx_gen::gen_core::model_input_proof::record_reader_paths(
+        "mlx-gen-moss-image::loader::read_weights",
+        mlx_gen::gen_core::model_input_proof::InputRole::ModelWeights,
+        &read_paths,
+    );
     Ok(Weights::from_map(tensors))
 }
 pub(crate) fn fp32_map(w: &Weights) -> Result<BTreeMap<String, Vec<f32>>> {

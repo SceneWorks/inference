@@ -22,6 +22,8 @@ sha2 = { workspace = true }
 [features]
 default = []
 test-support = ["dep:sceneworks-gen-core-testkit", "mlx-gen-flux2/test-support"]
+# The explicit model-proof workflow's input/device witnesses (SW-7172 bounded training proof).
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-flux2/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

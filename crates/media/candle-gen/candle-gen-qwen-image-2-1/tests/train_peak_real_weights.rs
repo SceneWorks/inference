@@ -105,20 +105,24 @@ fn snapshot() -> PathBuf {
     PathBuf::from(p)
 }
 
-/// A 768² RGB PNG at `path`: a flat ground with `seed`-placed bars, so items differ. Pixel content
-/// does not move the footprint; the geometry and the captions do.
-fn write_image(path: &Path, seed: u32, ground: [u8; 3]) {
-    let mut img = image::RgbImage::from_pixel(768, 768, image::Rgb(ground));
+/// A `side`² RGB PNG at `path`: a flat ground with `seed`-placed bars, so items differ. Pixel content
+/// does not move the footprint; the geometry and the captions do. At the historical `side` 768 the
+/// bars are exactly the original 150-px squares; a larger side scales the layout proportionally. A
+/// run's `side` must be at least its resolution: the aspect canvas never upscales a source
+/// (SW-7172), so a smaller fixture would silently train (and measure) a smaller canvas.
+fn write_image(path: &Path, seed: u32, ground: [u8; 3], side: u32) {
+    let mut img = image::RgbImage::from_pixel(side, side, image::Rgb(ground));
+    let scale = |v: u32| v * side / 768;
     for k in 0..6u32 {
-        let x0 = (seed * 97 + k * 131) % 600;
-        let y0 = (seed * 53 + k * 71) % 600;
+        let x0 = scale((seed * 97 + k * 131) % 600);
+        let y0 = scale((seed * 53 + k * 71) % 600);
         let colour = image::Rgb([
             (k * 40) as u8,
             (255 - k * 30) as u8,
             (seed * 29 % 256) as u8,
         ]);
-        for y in y0..y0 + 150 {
-            for x in x0..x0 + 150 {
+        for y in y0..y0 + scale(150) {
+            for x in x0..x0 + scale(150) {
                 img.put_pixel(x, y, colour);
             }
         }
@@ -127,16 +131,17 @@ fn write_image(path: &Path, seed: u32, ground: [u8; 3]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-/// sc-24163's A1 datasets: eight captioned style images, or six one-reference edit pairs.
-fn dataset(dir: &Path, edit: bool) -> Vec<TrainingItem> {
+/// sc-24163's A1 datasets: eight captioned style images, or six one-reference edit pairs, each
+/// `side`² (768 for every cell at or below 768, the cell's own edge above it).
+fn dataset(dir: &Path, edit: bool, side: u32) -> Vec<TrainingItem> {
     std::fs::create_dir_all(dir).unwrap();
     if edit {
         (0..6u32)
             .map(|i| {
                 let target = dir.join(format!("tgt_{i}.png"));
                 let source = dir.join(format!("src_{i}.png"));
-                write_image(&target, 2000 + i, [40, 40, 40]);
-                write_image(&source, 3000 + i, [200, 200, 200]);
+                write_image(&target, 2000 + i, [40, 40, 40], side);
+                write_image(&source, 3000 + i, [200, 200, 200], side);
                 TrainingItem::edit_pair(target, EDIT_INSTRUCTION.into(), vec![source])
             })
             .collect()
@@ -146,7 +151,7 @@ fn dataset(dir: &Path, edit: bool) -> Vec<TrainingItem> {
             .enumerate()
             .map(|(i, subject)| {
                 let path = dir.join(format!("style_{i}.png"));
-                write_image(&path, 1000 + i as u32, [250, 220, 30]);
+                write_image(&path, 1000 + i as u32, [250, 220, 30], side);
                 TrainingItem::captioned(
                     path,
                     format!(
@@ -165,7 +170,7 @@ fn request(cell: &Cell, root: &Path) -> TrainingRequest {
         "zxq style, a lighthouse made of concentric teal and orange rings on yellow"
     };
     TrainingRequest {
-        items: dataset(&root.join("data"), cell.edit),
+        items: dataset(&root.join("data"), cell.edit, cell.resolution.max(768)),
         config: TrainingConfig {
             rank: 16,
             alpha: 16.0,
@@ -302,12 +307,29 @@ fn qwen21_bounded_acceleration_acceptance() {
     let data = root.join("data");
     std::fs::create_dir(&data).unwrap();
     let target = data.join("target.png");
-    write_image(&target, 7, [250, 220, 30]);
+    write_image(&target, 7, [250, 220, 30], 768);
+    // A 768×1152 portrait (2:3, above both the 64² and the 512² comparison area) of three distinct
+    // bands with a centred figure, so the run also trains a non-square aspect canvas over its whole
+    // frame (SW-7172) and a human can tell from its latents that no centre square was cut.
+    let portrait = data.join("portrait.png");
+    let (pw, ph) = (768u32, 1152u32);
+    image::RgbImage::from_fn(pw, ph, |x, y| {
+        if x.abs_diff(pw / 2) <= pw / 8 && y.abs_diff(ph / 2) <= ph / 4 {
+            image::Rgb([20, 150, 160])
+        } else {
+            image::Rgb([[250, 220, 30], [240, 120, 40], [60, 60, 200]][(y * 3 / ph) as usize])
+        }
+    })
+    .save(&portrait)
+    .unwrap();
     let req = TrainingRequest {
-        items: vec![TrainingItem::captioned(
-            target,
-            "zxq style, teal and orange rings".into(),
-        )],
+        items: vec![
+            TrainingItem::captioned(target, "zxq style, teal and orange rings".into()),
+            TrainingItem::captioned(
+                portrait,
+                "zxq style, a teal figure on yellow, orange and blue bands".into(),
+            ),
+        ],
         config: TrainingConfig {
             rank: 4,
             alpha: 4.,

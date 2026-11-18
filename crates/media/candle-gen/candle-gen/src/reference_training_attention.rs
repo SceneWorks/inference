@@ -5,6 +5,11 @@
 //! per query chunk; it never retains a BHSS tape across transformer layers. This is
 //! not the streaming candidate and does not change block checkpointing policy.
 //! Arbitrary caller softmax closures must continue through the composable API.
+//!
+//! Both passes take the fused last-axis softmax ([`reference_softmax`]): nothing inside the
+//! owner records a tape (its operands are detached), so the composable five-kernel chain bought
+//! no differentiability here. The fused kernel accumulates in float32 on CUDA (half inputs
+//! included), so it is at least as accurate as the composable chain it replaces (SW-F369).
 
 use candle_core::{CpuStorage, CustomOp3, DType, Layout, Shape, Storage, Tensor, D};
 use gen_core::attention_budget::{AttentionBudget, AttentionPlan};
@@ -26,6 +31,12 @@ fn reference_plan(plan: AttentionPlan<'_>) -> AttentionPlan<'_> {
         ),
         cancel: plan.cancel,
     }
+}
+
+/// The owner's softmax over the last axis of one score tile, in both the forward and the
+/// backward recompute (so the gradient differentiates exactly the probabilities the forward used).
+fn reference_softmax(scores: &Tensor) -> candle_core::Result<Tensor> {
+    candle_nn::ops::softmax_last_dim(&scores.contiguous()?)
 }
 
 fn eligible(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> bool {
@@ -82,7 +93,7 @@ pub(crate) fn try_forward(
         &v.detach(),
         scale,
         None,
-        |s| candle_nn::ops::softmax(s, D::Minus1),
+        reference_softmax,
         plan,
     )?
     .contiguous()?;
@@ -471,7 +482,7 @@ impl CustomOp3 for Reference {
             let len = rows.max(1).min(sq - start);
             let qc = q.narrow(2, start, len)?.contiguous()?;
             let gc = grad.narrow(2, start, len)?.contiguous()?;
-            let p = candle_nn::ops::softmax(&(qc.matmul(&kt)? * self.scale)?, D::Minus1)?;
+            let p = reference_softmax(&(qc.matmul(&kt)? * self.scale)?)?;
             let vc = p.transpose(2, 3)?.contiguous()?.matmul(&gc)?;
             dv = Some(match dv {
                 Some(old) => (old + vc)?,
@@ -495,5 +506,81 @@ impl CustomOp3 for Reference {
             });
         }
         Ok((Some(Tensor::cat(&dq, 2)?), dk, dv))
+    }
+}
+
+/// Raw SDPA arithmetic on the CPU (no learned module): the owner's fused-softmax forward and its
+/// recomputed backward against the composable-softmax legacy SDPA's autograd, at the CUDA proof's
+/// tolerances.
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+    use candle_core::{Device, Var};
+
+    #[test]
+    fn the_fused_softmax_owner_matches_the_composable_reference_on_cpu() -> crate::Result<()> {
+        let dev = Device::Cpu;
+        let values = |n: usize, offset: usize| {
+            (0..n)
+                .map(|i| (((i + offset) * 17 % 97) as f32 - 48.) / 64.)
+                .collect::<Vec<_>>()
+        };
+        // candle's CPU backend has no bf16 matmul; f16 covers the half-precision branch.
+        for dtype in [DType::F32, DType::F16] {
+            for (b, h, sq, sk, d, budget) in [(1, 2, 7, 11, 32, usize::MAX), (2, 3, 5, 9, 16, 24)] {
+                let make = |seq: usize, offset| -> candle_core::Result<Var> {
+                    Var::from_tensor(
+                        &Tensor::from_vec(values(b * h * seq * d, offset), (b, h, seq, d), &dev)?
+                            .to_dtype(dtype)?,
+                    )
+                };
+                let (q, k, v) = (make(sq, 0)?, make(sk, 1)?, make(sk, 2)?);
+                let scale = 1. / (d as f64).sqrt();
+                let plan =
+                    AttentionPlan::budgeted(crate::attention::attention_budget_from_usize(budget));
+                // The owner path is the one under test.
+                assert!(try_forward(&q, &k, &v, scale, None, plan)?.is_some());
+                let actual = crate::fused_attention::training_sdpa_standard_bhsd(
+                    &q, &k, &v, scale, None, plan,
+                )?;
+                let reference = crate::attention::sdpa_budgeted_bhsd(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    None,
+                    |s| candle_nn::ops::softmax(s, D::Minus1),
+                    budget,
+                )?;
+                assert_eq!(actual.dtype(), dtype);
+                let cotangent = Tensor::from_vec(values(b * h * sq * d, 3), (b, h, sq, d), &dev)?;
+                let ga = actual
+                    .to_dtype(DType::F32)?
+                    .mul(&cotangent)?
+                    .sum_all()?
+                    .backward()?;
+                let gr = reference
+                    .to_dtype(DType::F32)?
+                    .mul(&cotangent)?
+                    .sum_all()?
+                    .backward()?;
+                let tolerance = if dtype == DType::F32 { 2e-5 } else { 0.003 };
+                for (label, a, r) in [
+                    ("output", &actual, &reference),
+                    ("dq", ga.get(&q).unwrap(), gr.get(&q).unwrap()),
+                    ("dk", ga.get(&k).unwrap(), gr.get(&k).unwrap()),
+                    ("dv", ga.get(&v).unwrap(), gr.get(&v).unwrap()),
+                ] {
+                    let af = a.to_dtype(DType::F32)?;
+                    assert!(af.abs()?.sum_all()?.to_scalar::<f32>()? > 0., "{label}");
+                    let max = (af - r.to_dtype(DType::F32)?)?
+                        .abs()?
+                        .max_all()?
+                        .to_scalar::<f32>()?;
+                    assert!(max < tolerance, "{label} {dtype:?}: {max} >= {tolerance}");
+                }
+            }
+        }
+        Ok(())
     }
 }

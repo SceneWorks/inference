@@ -443,20 +443,19 @@ fn ltx_decode_budget_error(
 /// [`STAGE1_SIGMAS`] schedule, no CFG) → VAE decode → the first frame as an [`Image`]. A single-stage
 /// stripped [`generate_t2v_latents`] for the trainer's periodic preview (the 2× upsample + stage-2 are
 /// a quality refinement skipped here to keep the per-cadence cost low). `context` is the pre-encoded
-/// prompt embedding `(1, L, 4096)`; `positions` is the `(1, 1, le, le)` grid; `dtype` is the trainer
-/// compute dtype. No progress/cancel plumbing — the caller drives the cadence.
+/// prompt embedding `(1, L, 4096)`; `positions` is the single-frame grid of the `(latent_h, latent_w)`
+/// preview latent (a training canvas, so `h ≠ w` in general); `dtype` is the trainer compute dtype. No progress/cancel plumbing — the caller drives the cadence.
 pub(crate) fn render_sample(
     dit: &LtxDiT,
     vae: &LtxVideoVae,
     context: &Array,
     positions: &Array,
     seed: u64,
-    latent_edge: usize,
+    (latent_h, latent_w): (usize, usize),
     dtype: Dtype,
 ) -> Result<Image> {
-    let le = latent_edge as i32;
     let init = mlx_rs::random::normal::<f32>(
-        &[1, 128, 1, le, le],
+        &[1, 128, 1, latent_h as i32, latent_w as i32],
         None,
         None,
         Some(&mlx_rs::random::key(seed)?),

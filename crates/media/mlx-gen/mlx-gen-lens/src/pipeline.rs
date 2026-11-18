@@ -1166,6 +1166,8 @@ impl LensHeavy {
 /// empty-negative) when [`needs_joint_cfg`], and cond-only (`[1, …]`) when not. The trainer's
 /// `sample_caps` pre-encode applies the same gate over the same `cfg.sample_guidance_scale`, so this
 /// lane consumes the batch as given and never re-narrows.
+/// `size` is the preview canvas `(width, height)` (the trainer's first item's training canvas at its
+/// largest bucket edge — non-square for a non-square source; both sides multiples of 16).
 /// `dtype` is the trainer compute dtype. `cancel` is the training request's flag (F-077): a cancel
 /// during a preview burst interrupts this render's own denoise mid-loop, not just between prompts.
 #[allow(clippy::too_many_arguments)]
@@ -1175,15 +1177,17 @@ pub(crate) fn render_sample(
     encoder_features: &[Array],
     encoder_mask: &Array,
     seed: u64,
-    edge: u32,
+    (width, height): (u32, u32),
     num_steps: usize,
     guidance_scale: f32,
     dtype: Dtype,
     cancel: &CancelFlag,
 ) -> Result<Image> {
-    let latent = (edge / VAE_SCALE_FACTOR) as usize;
-    let seq_len = (latent * latent) as i32;
-    let schedule = lens_schedule(num_steps.max(1), latent, latent);
+    let latent_h = (height / VAE_SCALE_FACTOR) as usize;
+    let latent_w = (width / VAE_SCALE_FACTOR) as usize;
+    let seq_len = (latent_h * latent_w) as i32;
+    // The empirical-mu shift is fit from the token count `latent_h · latent_w`.
+    let schedule = lens_schedule(num_steps.max(1), latent_h, latent_w);
     let timesteps = schedule::timesteps(&schedule);
     mlx_rs::random::seed(seed)?;
     let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
@@ -1211,8 +1215,8 @@ pub(crate) fn render_sample(
                 text_valid,
                 &timestep,
                 1,
-                latent,
-                latent,
+                latent_h,
+                latent_w,
             )?;
             let parts = split(&noise, 2, 0)?;
             cfg_rescale(&parts[0], &parts[1], guidance_scale)?
@@ -1224,15 +1228,15 @@ pub(crate) fn render_sample(
                 text_valid,
                 &timestep,
                 1,
-                latent,
-                latent,
+                latent_h,
+                latent_w,
             )?;
             cfg_rescale(&cond, &cond, guidance_scale)?
         };
         latents = schedule.step(&latents, &noise_pred, i)?;
         latents.eval()?;
     }
-    let decoded = vae::decode(vae, &latents, latent, latent, None)?; // training preview: native VAE
+    let decoded = vae::decode(vae, &latents, latent_h, latent_w, None)?; // training preview: native VAE
     decoded_to_image(&decoded)
 }
 
