@@ -1358,6 +1358,7 @@ impl LoadedTrainer {
             final_loss,
         })
     }
+    #[allow(clippy::too_many_arguments)] // the preview canvas joins the established preview inputs
     fn previews(
         &self,
         c: &TrainingConfig,

@@ -153,7 +153,8 @@ class MlxTrainingAssets(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             plan = Path(directory) / "plan.json"
             plan.write_text(json.dumps({"backend": "mlx", "selected": 1, "bindings": [identity],
-                                        "request": {"runner": "nax"}, "asset_setup": "mlx-training"}))
+                                        "request": {"runner": "nax"}, "asset_setup": "mlx-training"}),
+                            encoding="utf-8")
             github_env = Path(directory) / "env"
             env = {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-1", "GITHUB_ENV": str(github_env)}
             with patch.dict("os.environ", env, clear=True), patch("sys.argv", ["x", "--plan", str(plan)]):
