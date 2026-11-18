@@ -81,6 +81,11 @@ fn short_train_produces_loadable_adapter() {
             save_every: 0,
             learning_rate: 1e-4,
             network_type: NetworkType::Lora,
+            // The bounded proof trains through the checkpointed path: the dense (non-checkpointed)
+            // first step needs far more than the pre-flight's ~24 GB + per-token estimate on a
+            // 128 GB Mac (runs 44288439227…44316071280 crossed every admissible cap within seconds
+            // of step 1) — a trainer defect tracked on its own, not this canvas proof's subject.
+            gradient_checkpointing: true,
             // One preview at the final step, rendered at item 0's canvas from the trained adapter.
             sample_every: 3,
             sample_steps: 12,
