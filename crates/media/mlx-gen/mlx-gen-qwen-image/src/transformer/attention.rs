@@ -5,13 +5,14 @@
 //! [`AdaptableLinear`] (Q8-quantizable); the q/k RMSNorm weights stay dense.
 
 use mlx_rs::fast::rms_norm;
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{concatenate_axis, split, split_sections};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use super::{join, linear_from};
 
@@ -145,6 +146,28 @@ impl QwenJointAttention {
         mask: Option<&Array>,
         plan: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
+        self.forward_budgeted_pag(
+            img, txt, img_cos, img_sin, txt_cos, txt_sin, mask, plan, None,
+        )
+    }
+
+    /// Joint attention with optional PAG perturbation (`perturb_target_tokens = Some(n)`):
+    /// `txt` and any Edit `ref` tokens (`img[n..]`) run normal SDPA over full `[txt, img]` keys
+    /// and values, while the target noise tokens (`img[..n]`) bypass spatial self-attention and
+    /// receive `V_noise` directly before `to_out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_budgeted_pag(
+        &self,
+        img: &Array,
+        txt: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        plan: AttentionPlan<'_>,
+        perturb_target_tokens: Option<usize>,
+    ) -> Result<(Array, Array)> {
         let (b, img_seq) = (img.shape()[0], img.shape()[1]);
         let txt_seq = txt.shape()[1];
         let (h, hd) = (self.num_heads, self.head_dim);
@@ -152,7 +175,6 @@ impl QwenJointAttention {
             Ok(lin.forward(x)?.reshape(&[b, seq, h, hd])?)
         };
 
-        let img_q = rms_norm(&to_heads(&self.to_q, img, img_seq)?, &self.norm_q, RMS_EPS)?;
         let img_k = rms_norm(&to_heads(&self.to_k, img, img_seq)?, &self.norm_k, RMS_EPS)?;
         let img_v = to_heads(&self.to_v, img, img_seq)?;
         let txt_q = rms_norm(
@@ -167,10 +189,56 @@ impl QwenJointAttention {
         )?;
         let txt_v = to_heads(&self.add_v, txt, txt_seq)?;
 
-        let img_q = apply_rope_qwen(&img_q, img_cos, img_sin)?;
         let img_k = apply_rope_qwen(&img_k, img_cos, img_sin)?;
         let txt_q = apply_rope_qwen(&txt_q, txt_cos, txt_sin)?;
         let txt_k = apply_rope_qwen(&txt_k, txt_cos, txt_sin)?;
+
+        if let Some(target_tokens) = perturb_target_tokens {
+            let layout = pag_joint_segments(txt_seq as usize, img_seq as usize, target_tokens)?;
+            let target_len = layout.noise_len as i32;
+            let ref_len = layout.ref_len as i32;
+
+            let k_all = concatenate_axis(&[&txt_k, &img_k], 1)?.transpose_axes(&[0, 2, 1, 3])?;
+            let v_all = concatenate_axis(&[&txt_v, &img_v], 1)?.transpose_axes(&[0, 2, 1, 3])?;
+
+            let txt_q_bhsd = txt_q.transpose_axes(&[0, 2, 1, 3])?;
+            let txt_o = sdpa_budgeted_bhsd(&txt_q_bhsd, &k_all, &v_all, self.scale, mask, plan)?
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, txt_seq, h * hd])?;
+
+            let noise_v = if ref_len == 0 {
+                img_v
+            } else {
+                split_sections(&img_v, &[target_len], 1)?.swap_remove(0)
+            };
+            let noise_o = noise_v.reshape(&[b, target_len, h * hd])?;
+            let img_o = if ref_len > 0 {
+                let ref_img = split_sections(img, &[target_len], 1)?.swap_remove(1);
+                let ref_cos = img_cos.index((target_len..img_seq, ..));
+                let ref_sin = img_sin.index((target_len..img_seq, ..));
+                let ref_q = rms_norm(
+                    &to_heads(&self.to_q, &ref_img, ref_len)?,
+                    &self.norm_q,
+                    RMS_EPS,
+                )?;
+                let ref_q = apply_rope_qwen(&ref_q, &ref_cos, &ref_sin)?;
+                let ref_q_bhsd = ref_q.transpose_axes(&[0, 2, 1, 3])?;
+                let ref_o =
+                    sdpa_budgeted_bhsd(&ref_q_bhsd, &k_all, &v_all, self.scale, mask, plan)?
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[b, ref_len, h * hd])?;
+                concatenate_axis(&[&noise_o, &ref_o], 1)?
+            } else {
+                noise_o
+            };
+
+            let txt_attn = self.to_add_out.forward(&txt_o)?;
+            let img_attn = self.to_out.forward(&img_o)?;
+            return Ok((img_attn, txt_attn));
+        }
+
+        let img_q = rms_norm(&to_heads(&self.to_q, img, img_seq)?, &self.norm_q, RMS_EPS)?;
+        let img_q = apply_rope_qwen(&img_q, img_cos, img_sin)?;
 
         // joint [txt, img] over the sequence axis, then to [B, heads, seq, head_dim] for SDPA.
         let q = concatenate_axis(&[&txt_q, &img_q], 1)?.transpose_axes(&[0, 2, 1, 3])?;
@@ -190,6 +258,31 @@ impl QwenJointAttention {
         let img_attn = self.to_out.forward(&parts[1])?;
         Ok((img_attn, txt_attn))
     }
+}
+
+/// Pure segment lengths for Qwen-Image 1.0 / Edit `[txt, noise, ref0, ...]` PAG perturbation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PagJointSegments {
+    pub(crate) txt_len: usize,
+    pub(crate) noise_len: usize,
+    pub(crate) ref_len: usize,
+}
+
+pub(crate) fn pag_joint_segments(
+    txt_seq: usize,
+    img_seq: usize,
+    target_tokens: usize,
+) -> Result<PagJointSegments> {
+    if target_tokens == 0 || target_tokens > img_seq {
+        return Err(Error::Msg(format!(
+            "qwen-image PAG: target_tokens ({target_tokens}) must lie in 1..={img_seq}"
+        )));
+    }
+    Ok(PagJointSegments {
+        txt_len: txt_seq,
+        noise_len: target_tokens,
+        ref_len: img_seq - target_tokens,
+    })
 }
 
 /// Interleaved complex RoPE: pairs `(x_2i, x_2i+1)` rotated by `(cos_i, sin_i)`. `x`:
@@ -234,5 +327,22 @@ mod sc2963 {
         set_compile_glue(false);
         assert_eq!(max_abs_diff(&cr, &er), 0.0, "rope_rotate real");
         assert_eq!(max_abs_diff(&ci, &ei), 0.0, "rope_rotate imag");
+    }
+
+    #[test]
+    fn pag_joint_segments_handles_t2i_and_edit_layouts() {
+        let t2i = super::pag_joint_segments(12, 64, 64).unwrap();
+        assert_eq!(t2i.txt_len, 12);
+        assert_eq!(t2i.noise_len, 64);
+        assert_eq!(t2i.ref_len, 0);
+
+        // Edit layout places target noise tokens between txt and trailing reference latents.
+        let edit = super::pag_joint_segments(12, 100, 64).unwrap();
+        assert_eq!(edit.txt_len, 12);
+        assert_eq!(edit.noise_len, 64);
+        assert_eq!(edit.ref_len, 36);
+
+        assert!(super::pag_joint_segments(12, 64, 0).is_err());
+        assert!(super::pag_joint_segments(12, 64, 65).is_err());
     }
 }

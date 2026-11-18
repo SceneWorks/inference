@@ -22,9 +22,10 @@ use std::path::Path;
 
 use crate::loader;
 use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress_windowed,
-    encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, qwen_samplers,
-    qwen_schedulers, resolve_run_params, LIGHTNING_SAMPLER, PID_BACKBONE,
+    add_noise_by_interpolation, create_noise, decode_and_collect,
+    denoise_with_progress_windowed_pag, encode_init_latents, encode_prompt, init_time_step,
+    negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params, LIGHTNING_SAMPLER,
+    PID_BACKBONE,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -38,6 +39,20 @@ pub const MODEL_ID: &str = "qwen_image";
 /// Qwen-Image image bucket to (sc-12612), shared by the base T2I, Edit-2511, and control lanes.
 /// `validate_request` enforces exactly this value, so the const cannot drift from the check.
 pub const SIZE_MULTIPLE: u32 = 16;
+
+/// Shared PAG capability advertised by Qwen-Image 1.0 / Edit 2511 / Control (60 blocks,
+/// default block `[30]`).
+pub fn pag_capability() -> gen_core::PagCapability {
+    gen_core::PagCapability {
+        num_blocks: 60,
+        block_domain: std::borrow::Cow::Borrowed("blocks"),
+        default_layers: vec![30],
+        default_start: 0.0,
+        default_stop: 1.0,
+        recommended_scale: 1.5,
+        max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
+    }
+}
 
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
 /// introspection). This is the **T2I** variant (`qwen_image`), which also accepts a single init
@@ -82,6 +97,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            pag: Some(pag_capability()),
             ..Default::default()
         },
     }
@@ -346,6 +362,16 @@ impl Generator for QwenImage {
         )
     }
 
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
@@ -367,8 +393,7 @@ impl Generator for QwenImage {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_with_report_observed(req, &mut progress)
             },
         )
     }
@@ -380,6 +405,18 @@ impl QwenImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report_observed(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: the render produced no output"))
+            })
+    }
+
+    fn generate_with_report_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -397,8 +434,10 @@ impl QwenImage {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
+        mlx_gen::image_execution::policy_debug("qwen-image.pag", &resolved_pag);
         let crate::pipeline::RequestRungs {
             block_window,
             attention_budget,
@@ -426,12 +465,13 @@ impl QwenImage {
             ));
         }
 
+        let mut actual_steps = 0u32;
         // Phase A: prompt → embeds (epic 10834 Phase 1, sc-11000; sc-11125). Under `Sequential` the
         // shared seam loads the Qwen2.5-VL encoder, encodes pos+neg, materializes, then DROPS it +
         // `clear_cache()` so its ~15 GB frees before the DiT/VAE load below — the peak-bounding win.
         // Under `Resident` it borrows the warm encoder. Positive conditioning (bf16) always; the
         // negative branch is built only for true CFG (`neg` is `None` under Lightning, CFG-distilled).
-        self.residency.run(
+        let output = self.residency.run(
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -493,6 +533,10 @@ impl QwenImage {
                     capture_sigma,
                 )?;
                 let denoise_sigmas = &params.sigmas[..keep];
+                actual_steps = denoise_sigmas
+                    [start_step.min(denoise_sigmas.len().saturating_sub(1))..]
+                    .len()
+                    .saturating_sub(1) as u32;
                 mlx_gen::diagnostics::record_phase_boundary(
                     mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
                 );
@@ -528,7 +572,7 @@ impl QwenImage {
                             }
                             None => noise,
                         };
-                        let latents = denoise_with_progress_windowed(
+                        let latents = denoise_with_progress_windowed_pag(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
                             denoise_sigmas,
@@ -542,6 +586,7 @@ impl QwenImage {
                             start_step,
                             attention_budget,
                             block_window,
+                            resolved_pag.as_ref(),
                             &req.cancel,
                             &req.preview,
                             progress,
@@ -556,7 +601,13 @@ impl QwenImage {
                 )?;
                 Ok(GenerationOutput::Images(images))
             },
-        )
+        )?;
+        Ok(gen_core::GenerationReport {
+            pag: resolved_pag
+                .as_ref()
+                .map(|p| p.execution_report(actual_steps)),
+            ..gen_core::GenerationReport::from_output(output)
+        })
     }
 }
 
@@ -983,5 +1034,73 @@ mod tests {
             .expect("Resident must eagerly invoke the production text loader")
             .to_string();
         assert!(error.contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    fn descriptors_advertise_aligned_60_block_pag_and_validate_bounds() {
+        let base = descriptor();
+        let edit = crate::model_edit::descriptor();
+        let control = crate::model_control::descriptor();
+        for desc in [&base, &edit, &control] {
+            let pag = desc
+                .capabilities
+                .pag
+                .as_ref()
+                .expect("Qwen-Image descriptor must advertise PagCapability");
+            assert_eq!(pag.num_blocks, 60);
+            assert_eq!(pag.block_domain, "blocks");
+            assert_eq!(pag.default_layers, vec![30]);
+            assert_eq!(pag.default_start, 0.0);
+            assert_eq!(pag.default_stop, 1.0);
+            assert_eq!(pag.recommended_scale, 1.5);
+            assert_eq!(pag.max_scale, 15.0);
+            pag.validate_definition().unwrap();
+        }
+
+        // Zero-scale PAG is a strict no-op, while out-of-range layers remain rejected.
+        let caps = &base.capabilities;
+        let zero_req = GenerationRequest {
+            prompt: "a fox".into(),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![30]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(MODEL_ID, caps, &zero_req).is_ok());
+        assert!(mlx_gen::gen_core::resolve_pag(
+            caps.pag.as_ref(),
+            MODEL_ID,
+            zero_req.effective_pag().unwrap()
+        )
+        .unwrap()
+        .is_none());
+
+        let oob_req = GenerationRequest {
+            prompt: "a fox".into(),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![60]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(MODEL_ID, caps, &oob_req).is_err());
+
+        let active = mlx_gen::gen_core::resolve_pag(
+            caps.pag.as_ref(),
+            MODEL_ID,
+            Some(&mlx_gen::gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        active
+            .execution_report(20)
+            .validate_with_capability(caps.pag.as_ref().unwrap())
+            .unwrap();
     }
 }

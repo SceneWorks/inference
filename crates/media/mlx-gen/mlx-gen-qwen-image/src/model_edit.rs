@@ -34,9 +34,9 @@ use std::path::Path;
 
 use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
-use crate::model::validate_request;
+use crate::model::{pag_capability, validate_request};
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_edit_with_progress_windowed, qwen_samplers,
+    create_noise, decode_and_collect, denoise_edit_with_progress_windowed_pag, qwen_samplers,
     qwen_schedulers, resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::vision::grid::Grid;
@@ -88,6 +88,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            pag: Some(pag_capability()),
             ..Default::default()
         },
     }
@@ -411,6 +412,16 @@ impl Generator for QwenImageEdit {
         )
     }
 
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
@@ -432,8 +443,7 @@ impl Generator for QwenImageEdit {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_with_report_observed(req, &mut progress)
             },
         )
     }
@@ -445,6 +455,18 @@ impl QwenImageEdit {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report_observed(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: the render produced no output"))
+            })
+    }
+
+    fn generate_with_report_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -457,8 +479,10 @@ impl QwenImageEdit {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
+        mlx_gen::image_execution::policy_debug("qwen-image.pag", &resolved_pag);
         let crate::pipeline::RequestRungs {
             block_window,
             attention_budget,
@@ -472,12 +496,13 @@ impl QwenImageEdit {
         let params = resolve_run_params(req, out_w, out_h)?;
         mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
         mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
+        let mut actual_steps = 0u32;
         // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
         // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
         // the reference + the LM over pos/neg, materializes, then DROPS it + `clear_cache()` so its
         // ~16 GB frees before the DiT/VAE load below. Under `Resident` it borrows the warm encoder. The
         // encode carries no RNG, so ordering it before the dual-latent VAE-encode is byte-identical.
-        self.residency.run(
+        let output = self.residency.run(
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -546,6 +571,7 @@ impl QwenImageEdit {
                     capture_sigma,
                 )?;
                 let denoise_sigmas = &params.sigmas[..keep];
+                actual_steps = denoise_sigmas.len().saturating_sub(1) as u32;
                 let decoder = pid_decoder
                     .as_ref()
                     .map(|decoder| decoder as &dyn LatentDecoder)
@@ -567,7 +593,7 @@ impl QwenImageEdit {
                     on_progress,
                     |seed, progress| {
                         let noise = create_noise(seed, out_w, out_h)?;
-                        let latents = denoise_edit_with_progress_windowed(
+                        let latents = denoise_edit_with_progress_windowed_pag(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
                             denoise_sigmas,
@@ -582,6 +608,7 @@ impl QwenImageEdit {
                             out_h,
                             attention_budget,
                             block_window,
+                            resolved_pag.as_ref(),
                             &req.cancel,
                             &req.preview,
                             progress,
@@ -596,7 +623,13 @@ impl QwenImageEdit {
                 )?;
                 Ok(GenerationOutput::Images(images))
             },
-        )
+        )?;
+        Ok(gen_core::GenerationReport {
+            pag: resolved_pag
+                .as_ref()
+                .map(|p| p.execution_report(actual_steps)),
+            ..gen_core::GenerationReport::from_output(output)
+        })
     }
 }
 

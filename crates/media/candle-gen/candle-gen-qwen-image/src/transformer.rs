@@ -308,7 +308,7 @@ impl JointAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    fn forward_pag(
         &self,
         img: &Tensor,
         txt: &Tensor,
@@ -317,15 +317,12 @@ impl JointAttention {
         txt_cos: &Tensor,
         txt_sin: &Tensor,
         plan: AttentionPlan<'_>,
+        perturb_target_tokens: Option<usize>,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         let (h, hd) = (self.heads, self.head_dim);
+        let (b, img_seq, _) = img.dims3()?;
         let txt_seq = txt.dim(1)?;
 
-        let iq = apply_rope(
-            &to_heads(&self.to_q.forward(img)?, h, hd, Some(&self.norm_q))?,
-            img_cos,
-            img_sin,
-        )?;
         let ik = apply_rope(
             &to_heads(&self.to_k.forward(img)?, h, hd, Some(&self.norm_k))?,
             img_cos,
@@ -343,6 +340,50 @@ impl JointAttention {
             txt_sin,
         )?;
         let tv = to_heads(&self.add_v.forward(txt)?, h, hd, None)?;
+
+        if let Some(target_tokens) = perturb_target_tokens {
+            let layout = pag_joint_segments(txt_seq, img_seq, target_tokens)?;
+            let k_all = Tensor::cat(&[&tk, &ik], 2)?;
+            let v_all = Tensor::cat(&[&tv, &iv], 2)?;
+
+            let txt_o = attention(&tq, &k_all, &v_all, hd, plan)?;
+            let noise_v = if layout.ref_len == 0 {
+                iv
+            } else {
+                iv.narrow(2, 0, layout.noise_len)?
+            };
+            let noise_o =
+                noise_v
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, layout.noise_len, h * hd))?;
+            let img_o = if layout.ref_len > 0 {
+                let ref_img = img
+                    .narrow(1, layout.noise_len, layout.ref_len)?
+                    .contiguous()?;
+                let ref_cos = img_cos.narrow(0, layout.noise_len, layout.ref_len)?;
+                let ref_sin = img_sin.narrow(0, layout.noise_len, layout.ref_len)?;
+                let rq = apply_rope(
+                    &to_heads(&self.to_q.forward(&ref_img)?, h, hd, Some(&self.norm_q))?,
+                    &ref_cos,
+                    &ref_sin,
+                )?;
+                let ref_o = attention(&rq, &k_all, &v_all, hd, plan)?;
+                Tensor::cat(&[&noise_o, &ref_o], 1)?
+            } else {
+                noise_o
+            };
+            return Ok((
+                self.to_out.forward(&img_o)?,
+                self.to_add_out.forward(&txt_o)?,
+            ));
+        }
+
+        let iq = apply_rope(
+            &to_heads(&self.to_q.forward(img)?, h, hd, Some(&self.norm_q))?,
+            img_cos,
+            img_sin,
+        )?;
 
         // Joint over the sequence, text first.
         let q = Tensor::cat(&[&tq, &iq], 2)?;
@@ -480,6 +521,34 @@ impl Block {
         modulate_index: Option<&Tensor>,
         plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
+        self.forward_pag(
+            hidden,
+            encoder,
+            temb,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            modulate_index,
+            plan,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_pag(
+        &self,
+        hidden: &Tensor,
+        encoder: &Tensor,
+        temb: &Tensor,
+        img_cos: &Tensor,
+        img_sin: &Tensor,
+        txt_cos: &Tensor,
+        txt_sin: &Tensor,
+        modulate_index: Option<&Tensor>,
+        plan: AttentionPlan<'_>,
+        perturb_target_tokens: Option<usize>,
+    ) -> candle_gen::Result<(Tensor, Tensor)> {
         let act = temb.silu()?; // [1, inner] (or [2, inner] under zero_cond_t)
         let img_mod = self.img_mod.forward(&act)?; // [1 or 2, 6·inner]
                                                    // The text stream always uses the real-timestep modulation (row 0 under zero_cond_t).
@@ -501,9 +570,16 @@ impl Block {
         // attention path
         let (img_n, img_g1) = modulate_sel(&layer_norm(hidden)?, &im0, modulate_index)?;
         let (txt_n, txt_g1) = modulate(&layer_norm(encoder)?, &tm0)?;
-        let (img_attn, txt_attn) = self
-            .attn
-            .forward(&img_n, &txt_n, img_cos, img_sin, txt_cos, txt_sin, plan)?;
+        let (img_attn, txt_attn) = self.attn.forward_pag(
+            &img_n,
+            &txt_n,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            plan,
+            perturb_target_tokens,
+        )?;
         let hidden = gated(hidden, &img_g1, &img_attn)?;
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
@@ -744,12 +820,31 @@ impl QwenTransformer {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+        pag_perturb: Option<(&[bool], usize)>,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
+        let block_count = self.block_count();
+        if let Some((mask, _)) = pag_perturb {
+            if mask.len() != block_count {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "qwen-image PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    block_count
+                )));
+            }
+        }
+        let perturb_for_block = |i: usize| -> Option<usize> {
+            pag_perturb.and_then(|(mask, target_tokens)| {
+                mask.get(i)
+                    .copied()
+                    .filter(|&perturb| perturb)
+                    .map(|_| target_tokens)
+            })
+        };
         match &self.blocks {
             TransformerBlocks::Resident(blocks) => {
                 let (mut hidden, mut encoder) = (hidden, encoder);
-                for block in blocks {
-                    let (next_encoder, next_hidden) = block.forward(
+                for (i, block) in blocks.iter().enumerate() {
+                    let (next_encoder, next_hidden) = block.forward_pag(
                         &hidden,
                         &encoder,
                         temb,
@@ -759,6 +854,7 @@ impl QwenTransformer {
                         txt_sin,
                         modulate_index,
                         attention_plan,
+                        perturb_for_block(i),
                     )?;
                     encoder = next_encoder;
                     hidden = next_hidden;
@@ -780,6 +876,7 @@ impl QwenTransformer {
                     (encoder, hidden),
                     || Ok(weights.clone()),
                     |(mut encoder, mut hidden), view, range| {
+                        let start_idx = range.start;
                         let blocks = range
                             .map(|index| {
                                 match sidecars.as_deref() {
@@ -799,9 +896,9 @@ impl QwenTransformer {
                                 .map_err(candle_gen::CandleError::from)
                             })
                             .collect::<candle_gen::Result<Vec<_>>>()?;
-                        for block in &blocks {
+                        for (offset, block) in blocks.iter().enumerate() {
                             candle_gen::check_cancel(cancel)?;
-                            let (next_encoder, next_hidden) = block.forward(
+                            let (next_encoder, next_hidden) = block.forward_pag(
                                 &hidden,
                                 &encoder,
                                 temb,
@@ -811,6 +908,7 @@ impl QwenTransformer {
                                 txt_sin,
                                 modulate_index,
                                 attention_plan,
+                                perturb_for_block(start_idx + offset),
                             )?;
                             encoder = next_encoder;
                             hidden = next_hidden;
@@ -846,7 +944,7 @@ impl QwenTransformer {
         ))
     }
 
-    fn block_count(&self) -> usize {
+    pub(crate) fn block_count(&self) -> usize {
         match &self.blocks {
             TransformerBlocks::Resident(blocks) => blocks.len(),
             TransformerBlocks::Streamed { count, .. } => *count,
@@ -865,6 +963,32 @@ impl QwenTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_memory_pag(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            lat_h,
+            lat_w,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory_pag(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_perturb: Option<&[bool]>,
+    ) -> candle_gen::Result<Tensor> {
         crate::observe_component_precision("dit", &self.device, self.dtype);
         let temb = self
             .time_embed
@@ -876,6 +1000,7 @@ impl QwenTransformer {
         let (img_cos, img_sin, txt_cos, txt_sin) =
             self.rope_cache
                 .tables(&self.rope, &[(lat_h, lat_w)], txt_seq, &self.device)?;
+        let pag_arg = pag_perturb.map(|mask| (mask, lat_h * lat_w));
         let (_encoder, hidden) = self.run_blocks(
             hidden,
             encoder,
@@ -888,6 +1013,7 @@ impl QwenTransformer {
             attention_plan,
             transformer_window,
             cancel,
+            pag_arg,
         )?;
         let hidden = self.norm_out.forward(&hidden, &temb)?;
         Ok(self.proj_out.forward(&hidden)?)
@@ -1012,6 +1138,36 @@ impl QwenTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_edit_with_memory_pag(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            lat_h,
+            lat_w,
+            cond_grids,
+            zero_cond_t,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_edit_with_memory_pag(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        cond_grids: &[(usize, usize)],
+        zero_cond_t: bool,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_perturb: Option<&[bool]>,
+    ) -> candle_gen::Result<Tensor> {
         crate::observe_component_precision("dit", &self.device, self.dtype);
         let img_seq = hidden_states.dim(1)?;
         let hidden = self.img_in.forward(hidden_states)?;
@@ -1042,6 +1198,7 @@ impl QwenTransformer {
             (temb_real.clone(), None)
         };
 
+        let pag_arg = pag_perturb.map(|mask| (mask, lat_h * lat_w));
         let (_encoder, hidden) = self.run_blocks(
             hidden,
             encoder,
@@ -1054,6 +1211,7 @@ impl QwenTransformer {
             attention_plan,
             transformer_window,
             cancel,
+            pag_arg,
         )?;
 
         // norm_out uses only the real-timestep embedding (the fork's temb[:B]).
@@ -1245,6 +1403,30 @@ impl QwenTransformer {
         control: Option<(&QwenFunControlBranch, &Tensor)>,
         control_scale: f32,
     ) -> Result<Tensor> {
+        self.forward_fun_control_pag(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            lat_h,
+            lat_w,
+            control,
+            control_scale,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fun_control_pag(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: f32,
+        lat_h: usize,
+        lat_w: usize,
+        control: Option<(&QwenFunControlBranch, &Tensor)>,
+        control_scale: f32,
+        pag_perturb: Option<&[bool]>,
+    ) -> Result<Tensor> {
         crate::observe_component_precision("dit", &self.device, self.dtype);
         let temb = self
             .time_embed
@@ -1281,8 +1463,23 @@ impl QwenTransformer {
             None => None,
         };
 
-        for (i, block) in self.resident_blocks()?.iter().enumerate() {
-            let (e, h) = into_candle_core(block.forward(
+        let blocks = self.resident_blocks()?;
+        if let Some(mask) = pag_perturb {
+            if mask.len() != blocks.len() {
+                candle_gen::candle_core::bail!(
+                    "qwen-image PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    blocks.len()
+                );
+            }
+        }
+        let target_tokens = lat_h * lat_w;
+        for (i, block) in blocks.iter().enumerate() {
+            let perturb = pag_perturb
+                .and_then(|mask| mask.get(i).copied())
+                .filter(|&p| p)
+                .map(|_| target_tokens);
+            let (e, h) = into_candle_core(block.forward_pag(
                 &hidden,
                 &encoder,
                 &temb,
@@ -1292,6 +1489,7 @@ impl QwenTransformer {
                 &txt_sin,
                 None,
                 plan_from_budget(candle_gen::ATTN_SCORES_BUDGET),
+                perturb,
             ))?;
             encoder = e;
             // After base block `i`, add the pre-scaled hint for this block (if `i` is a control layer) —
@@ -1308,6 +1506,31 @@ impl QwenTransformer {
         let hidden = self.norm_out.forward(&hidden, &temb)?;
         self.proj_out.forward(&hidden)
     }
+}
+
+/// Pure segment lengths for Qwen-Image 1.0 / Edit `[txt, noise, ref0, ...]` PAG perturbation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PagJointSegments {
+    pub(crate) txt_len: usize,
+    pub(crate) noise_len: usize,
+    pub(crate) ref_len: usize,
+}
+
+pub(crate) fn pag_joint_segments(
+    txt_seq: usize,
+    img_seq: usize,
+    target_tokens: usize,
+) -> candle_gen::Result<PagJointSegments> {
+    if target_tokens == 0 || target_tokens > img_seq {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "qwen-image PAG: target_tokens ({target_tokens}) must lie in 1..={img_seq}"
+        )));
+    }
+    Ok(PagJointSegments {
+        txt_len: txt_seq,
+        noise_len: target_tokens,
+        ref_len: img_seq - target_tokens,
+    })
 }
 
 #[cfg(test)]
@@ -1781,5 +2004,32 @@ mod tests {
         assert_eq!(branch.hint_index(2), Some(1));
         assert_eq!(branch.hint_index(1), None);
         assert_eq!(branch.hint_index(3), None);
+    }
+
+    #[test]
+    fn pag_joint_segments_and_target_value_layout_preserve_edit_streams() {
+        let t2i = super::pag_joint_segments(10, 64, 64).unwrap();
+        assert_eq!((t2i.txt_len, t2i.noise_len, t2i.ref_len), (10, 64, 0));
+
+        let edit = super::pag_joint_segments(10, 100, 64).unwrap();
+        assert_eq!((edit.txt_len, edit.noise_len, edit.ref_len), (10, 64, 36));
+        assert!(super::pag_joint_segments(10, 64, 0).is_err());
+        assert!(super::pag_joint_segments(10, 64, 65).is_err());
+
+        // Verify `[B, H, target, D] -> transpose(1, 2) -> reshape((B, target, H*D))` preserves
+        // exact target-token head channels without mixing tokens or heads.
+        let dev = Device::Cpu;
+        let (b, h, target, hd) = (1usize, 2usize, 3usize, 4usize);
+        let vals: Vec<f32> = (0..(b * h * target * hd)).map(|i| i as f32).collect();
+        let v_bhtd = Tensor::from_vec(vals, (b, h, target, hd), &dev).unwrap();
+        let out = v_bhtd
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((b, target, h * hd))
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        // Token 1 should hold head 0 `[4,5,6,7]` followed by head 1 `[16,17,18,19]`.
+        assert_eq!(out[0][1], vec![4.0, 5.0, 6.0, 7.0, 16.0, 17.0, 18.0, 19.0]);
     }
 }

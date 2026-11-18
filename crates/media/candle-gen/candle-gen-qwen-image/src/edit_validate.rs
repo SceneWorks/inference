@@ -77,6 +77,7 @@ fn real_weight_edit() {
         memory: None,
         cancel: CancelFlag::new(),
         preview: PreviewSink::default(),
+        pag: None,
     };
 
     let mut noop = |_p: Progress| {};
@@ -206,6 +207,7 @@ fn high_res_edit_avoids_i32_overflow() {
         memory: None,
         cancel: CancelFlag::new(),
         preview: PreviewSink::default(),
+        pag: None,
     };
     let mut noop = |_p: Progress| {};
 
@@ -275,6 +277,7 @@ fn lightning_edit_4steps() {
         memory: None,
         cancel: CancelFlag::new(),
         preview: PreviewSink::default(),
+        pag: None,
     };
     let mut noop = |_p: Progress| {};
 

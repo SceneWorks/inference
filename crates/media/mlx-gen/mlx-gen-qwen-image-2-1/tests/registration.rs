@@ -34,10 +34,13 @@ fn qwen_image_2_1_turbo_is_registered_next_to_the_base_id_without_a_trainer() {
     let d = (turbo.descriptor)();
     assert_eq!(d.family, base.family);
     assert_eq!(d.backend, "mlx");
+    let mut expected_turbo_caps = base.capabilities.clone();
+    expected_turbo_caps.pag =
+        Some(gen_core_family::qwen_image_2_1::pag::qwen_image_2_1_turbo_pag_capability());
     assert_eq!(
         format!("{:?}", d.capabilities),
-        format!("{:?}", base.capabilities),
-        "the Turbo descriptor mirrors the base surface"
+        format!("{:?}", expected_turbo_caps),
+        "the Turbo descriptor mirrors the base surface except for Turbo PAG defaults"
     );
 
     // A training request that names the Turbo id fails cleanly at the registry, before any
