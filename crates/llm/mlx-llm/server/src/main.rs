@@ -1270,6 +1270,7 @@ mod tests {
                             reason: Some("why".into()),
                         },
                         fallbacks: vec!["speculative: x".into()],
+                        tree_verify: None,
                     }),
                     ..Default::default()
                 })

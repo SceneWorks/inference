@@ -427,6 +427,7 @@ impl DecodeRecord {
                 reason: self.prefix_cache_reason.map(str::to_string),
             },
             fallbacks: Vec::new(),
+            tree_verify: None,
         }
     }
 }

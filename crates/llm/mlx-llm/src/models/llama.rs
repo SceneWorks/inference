@@ -968,6 +968,40 @@ impl CausalLm {
         self.project_logits(&h) // [batch, seq, vocab]
     }
 
+    /// Verify a candidate tree in one forward (feature SW-F328): `input_ids` `[1, rows]` are the
+    /// anchor then the candidates in row order, `positions` each row's RoPE position (the
+    /// anchor's plus its depth) and `mask` the additive ancestor-only mask over
+    /// `[cache ‖ rows]` (`[1, 1, rows, offset + rows]`). Every row is appended to `cache`; the
+    /// caller keeps the accepted branch with [`KvCache::compact_tail`]. Returns every row's
+    /// logits `[1, rows, vocab]`. A model [`tree_unsupported`](Self::tree_unsupported) names is
+    /// refused.
+    pub fn decode_logits_tree(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        positions: &[i32],
+        mask: &Array,
+    ) -> Result<Array> {
+        if let Some(why) = self.tree_unsupported() {
+            return Err(Error::Unsupported(why.into()));
+        }
+        let embeds = self.embed(input_ids)?;
+        let s = embeds.shape()[1];
+        let ropes = self.stack_rope_at(positions, 1, s)?;
+        let h = self.run_decoder_stack(&embeds, cache, &ropes, AttnMask::Additive(mask))?;
+        self.project_logits(&h)
+    }
+
+    /// Why this decoder cannot verify a candidate tree, or `None` when it can (feature SW-F328).
+    /// Gemma 4's sliding-window layers bound their keys by packing offset, not by a row's depth
+    /// on its branch, and its KV-sharing tail layers read another layer's whole cache — neither
+    /// keeps ancestor-only visibility exact.
+    pub fn tree_unsupported(&self) -> Option<&'static str> {
+        self.cfg.gemma4.is_some().then_some(
+            "Gemma 4's sliding-window and KV-sharing layers cannot verify a tree exactly",
+        )
+    }
+
     /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE positions
     /// and an explicit additive attention mask — the dynamic-batch scheduler decode primitive.
     ///
