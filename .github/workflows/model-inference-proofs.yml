@@ -146,10 +146,7 @@ jobs:
       - name: Select Rustup proxies on Linux and macOS
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          RUSTUP_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
-          for tool in cargo rustc rustup; do test -x "$RUSTUP_BIN/$tool"; done
-          printf '%s\n' "$RUSTUP_BIN" >> "$GITHUB_PATH"
+        run: source scripts/ci/real-weights/model-proof-execute/posix-rust.sh
       - name: Select real pinned Rust toolchain on Windows
         if: runner.os == 'Windows'
         shell: powershell
@@ -235,6 +232,24 @@ jobs:
         if: matrix.asset_setup == 'cohort-training' && runner.os == 'Windows'
         shell: cmd
         run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_cohort_training_proof_assets.py'
+      - name: Stage and bind declared pinned Hub snapshots (Linux/macOS)
+        if: matrix.asset_setup == 'hub-snapshots' && runner.os != 'Windows'
+        shell: bash
+        env:
+          MODEL_PROOF_HUB_ROOT: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
+          "$PYTHON" -I scripts/ci/model_inference_proofs.py --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
+          "$PYTHON" -I scripts/ci/stage_pinned_hub_snapshots.py --plan "$RUNNER_TEMP/model-proof-plan.json"
+      - name: Stage and bind declared pinned Hub snapshots (Windows)
+        if: matrix.asset_setup == 'hub-snapshots' && runner.os == 'Windows'
+        shell: cmd
+        env:
+          MODEL_PROOF_HUB_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+        run: |
+          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          "%REVIEWED_PYTHON%" -I scripts\ci\stage_pinned_hub_snapshots.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
