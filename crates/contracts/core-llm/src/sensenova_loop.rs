@@ -28,6 +28,10 @@ pub fn validate_sidecars(root: &std::path::Path) -> Result<(), String> {
             "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
         ),
         (
+            "video_preprocessor_config.json",
+            "bd96830cce1312679aa1f2ea43ed17da20e8ebbcea2398cfa64e2d275a96fdd7",
+        ),
+        (
             "processor_config.json",
             "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
         ),
