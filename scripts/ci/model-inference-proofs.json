@@ -280665,7 +280665,7 @@
     "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry@2a7d7ea9c8c088c30191a056806d6e1d819f741e44f6b4fa71648abdb433c091",
       "requirements": []
     }
   },
@@ -282014,6 +282014,36 @@
     "package": "mlx-llm",
     "target": "mlx_llm",
     "target_kind": "lib",
+    "fqn": "models::dspine::tests::a_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/models/dspine/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/models/dspine/tests.rs::models::dspine::tests::a_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build@e0776c76b08741323b2d9b586eda09430586294ad5220901add182d10de10903",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
     "fqn": "provider::tests::a_resident_block_draft_runs_block_draft_and_is_named",
     "execution_role": "direct",
     "backend": "mlx",
@@ -282048,15 +282078,16 @@
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
-    "fixture_identity": "env-gated: MLX_LLM_BLOCK_DRAFT_TARGET,MLX_LLM_BLOCK_DRAFT_SOURCE",
+    "fixture_identity": "pinned Hub snapshots under MLX_GEN_MODELS_ROOT (SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4, SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d); MLX_LLM_BLOCK_DRAFT_TARGET,MLX_LLM_BLOCK_DRAFT_SOURCE override",
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
       "model-inference-proof"
     ],
     "route_metadata": {
-      "ignore_reason": "needs the Qwen3.8-27B target and its DSpine draft via MLX_LLM_BLOCK_DRAFT_TARGET/SOURCE",
+      "ignore_reason": "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT",
       "env_gates": [
+        "MLX_GEN_MODELS_ROOT",
         "MLX_LLM_BLOCK_DRAFT_TARGET",
         "MLX_LLM_BLOCK_DRAFT_SOURCE",
         "MLX_LLM_BLOCK_DRAFT_PRECISION"
@@ -282075,7 +282106,7 @@
     "source": "crates/llm/mlx-llm/tests/block_draft.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@906b17d9e2fb898f87493e4c7d3de5e05c52b7b894d1eb2da2da52715804d6d3",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@c84cce4039c791b85d07e646a063475ae85218198c8bc421e4aa2cf0ff919e12",
       "requirements": [
         {
           "slot": "model-weight-collections",

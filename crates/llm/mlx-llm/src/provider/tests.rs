@@ -2731,16 +2731,25 @@ fn every_proposer_is_greedy_exact_on_the_vector_kernel_geometry() {
         "a max-depth ({deepest}) verify in one vector-kernel call"
     );
 
-    // And that max is the geometry's: every proposer advertises it, the table covers it.
+    // And that max is the geometry's: every proposer the fixture loads advertises it — all but
+    // the block draft, which the fixture names none of — and the table covers it.
     let max = speculative_max_depth([geometry]);
     assert_eq!(max, 4, "the vector kernel's 5 rows, not the 8-row ceiling");
     assert_eq!(deepest, max);
-    for proposer in SpeculativeProposer::ALL {
-        assert_eq!(
-            caps.proposer(proposer).unwrap().max_depth,
-            max,
-            "{proposer:?}"
-        );
+    let advertised = caps.speculative_proposers();
+    assert_eq!(
+        advertised
+            .iter()
+            .map(|c| c.proposer)
+            .collect::<std::collections::HashSet<_>>(),
+        SpeculativeProposer::ALL
+            .into_iter()
+            .filter(|&p| p != SpeculativeProposer::BlockDraft)
+            .collect::<std::collections::HashSet<_>>(),
+        "every proposer but the block draft"
+    );
+    for c in advertised {
+        assert_eq!(c.max_depth, max, "{:?}", c.proposer);
     }
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry");
@@ -6928,15 +6937,16 @@ fn a_block_draft_load_is_priced_at_its_precision() {
     let dir = block_draft_dir(&tiny_config_json());
     let cfg = tiny_config();
     let mut spec = LoadSpec::dense(dir.path().to_string_lossy());
+    let slack = crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES;
     assert_eq!(
         draft_required_bytes(&spec).unwrap(),
-        cfg.load_bytes(core_llm::BlockDraftPrecision::Q8),
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q8) + slack,
         "8-bit by default"
     );
     spec.draft_quantize = Some(Quantize::Q4);
     assert_eq!(
         draft_required_bytes(&spec).unwrap(),
-        cfg.load_bytes(core_llm::BlockDraftPrecision::Q4)
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q4) + slack
     );
     assert!(
         cfg.load_bytes(core_llm::BlockDraftPrecision::Q4)

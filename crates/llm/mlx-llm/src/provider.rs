@@ -1080,8 +1080,9 @@ struct ResidentBlockDraft {
 }
 
 /// A named draft's load bytes: a block draft (its `architectures`, SW-F360) priced by the shared
-/// [`core_llm::BlockDraftConfig::load_bytes`] at its requested precision, any other draft by the
-/// ordinary load estimate.
+/// [`core_llm::BlockDraftConfig::load_bytes`] at its requested precision — its group-by-group
+/// load ([`crate::models::DSpineDraft::load`]) plus that load's pacing slack — any other draft by
+/// the ordinary load estimate.
 fn draft_required_bytes(spec: &LoadSpec) -> CoreResult<u64> {
     let dir = Path::new(&spec.source);
     if core_llm::BlockDraftFormat::of_dir(dir).is_none() {
@@ -1091,7 +1092,7 @@ fn draft_required_bytes(spec: &LoadSpec) -> CoreResult<u64> {
     let cfg = core_llm::BlockDraftConfig::read(dir).map_err(refused)?;
     let precision =
         core_llm::BlockDraftPrecision::from_request(spec.draft_quantize).map_err(refused)?;
-    Ok(cfg.load_bytes(precision))
+    Ok(cfg.load_bytes(precision) + crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES)
 }
 
 /// What a load does with its named draft model (sc-24436), decided before any weight is read.

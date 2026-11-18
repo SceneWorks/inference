@@ -30,6 +30,51 @@ pub const BLOCK_DRAFT_RECOMMENDED_DEPTH: u32 = 4;
 /// The quantization group size a block draft's projections are quantized with at load.
 pub const BLOCK_DRAFT_GROUP_SIZE: usize = 64;
 
+/// One group of a block draft's load ([`BlockDraftConfig::load_groups`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockDraftLoadGroup {
+    /// The stored tensors the group reads.
+    pub tensors: Vec<String>,
+    /// The bytes the group holds beyond the draft's resident arrays while it converts: the
+    /// sources it consumes into different arrays, which it then releases.
+    pub window: u64,
+}
+
+/// A draft layer's stored tensors (after `layers.{i}.`).
+const DRAFT_LAYER_TENSORS: [&str; 11] = [
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+];
+
+/// The code bridge's tensors the built draft reads (after `selected_prefix_bridge.`).
+const BRIDGE_TENSORS: [&str; 8] = [
+    "codebook",
+    "read_weight",
+    "early_read_weights",
+    "feature_write_weights",
+    "gate.weight",
+    "gate.bias",
+    "predecessor_gate.weight",
+    "prev.weight",
+];
+
+/// The bridge tensors a load converts into different arrays (packed, f32) and releases.
+const BRIDGE_CONVERTED: [&str; 4] = [
+    "gate.weight",
+    "gate.bias",
+    "predecessor_gate.weight",
+    "prev.weight",
+];
+
 /// A block-draft checkpoint format, selected by the config's `architectures`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockDraftFormat {
@@ -684,27 +729,114 @@ impl BlockDraftConfig {
         }
     }
 
-    /// Resident bytes after a load at `precision`, plus the largest BF16 matrix the load holds
-    /// while quantizing it (one matrix is materialized and quantized at a time).
-    pub fn load_bytes(&self, precision: BlockDraftPrecision) -> u64 {
+    /// The groups a load materializes, in load order (the stored checkpoint is BF16, its version
+    /// markers I64): first the **checks** (the version markers and the disabled terminal
+    /// projection, read and dropped before anything is built), then one group per draft layer,
+    /// then the **head** (`fc`, the two norms outside the stack and the code bridge). Each group's
+    /// sources are read, converted and released before the next group reads its own, so a load
+    /// holds the draft's resident arrays plus one group's [window](BlockDraftLoadGroup::window) —
+    /// never the whole BF16 payload. Every stored tensor falls in exactly one group.
+    pub fn load_groups(&self) -> Vec<BlockDraftLoadGroup> {
+        let shapes: std::collections::HashMap<String, Vec<usize>> =
+            self.tensors().into_iter().collect();
+        let elements = |name: &str| -> u64 {
+            shapes[name]
+                .iter()
+                .map(|&d| d as u64)
+                .product::<u64>()
+                .max(1)
+        };
+        // A source the draft keeps as stored (a BF16 norm, the codebook) shares its buffer with
+        // the draft; one converted into a different array (a quantized matrix, the packed or f32
+        // bridge tensors) is consumed: held beside its conversion, then released.
+        let window = |names: &[String], consumed: &dyn Fn(&str) -> bool| -> u64 {
+            names
+                .iter()
+                .filter(|n| consumed(n))
+                .map(|n| elements(n) * 2)
+                .sum()
+        };
+        let b = "selected_prefix_bridge.";
+        let mut groups = Vec::with_capacity(self.num_hidden_layers + 2);
+        let out = format!("{b}out.weight");
+        // Four I64 markers, and the terminal projection beside its `!= 0` mask.
+        let checks_window = 4 * 8 + elements(&out) * 3;
+        groups.push(BlockDraftLoadGroup {
+            tensors: vec![
+                "draft_block_causal_version".into(),
+                "last_write_refine_version".into(),
+                format!("{b}independent_write_version"),
+                format!("{b}terminal_disabled_version"),
+                out,
+            ],
+            window: checks_window,
+        });
         let quantized = self.quantized_matrices();
+        for layer in 0..self.num_hidden_layers {
+            let tensors: Vec<String> = DRAFT_LAYER_TENSORS
+                .iter()
+                .map(|name| format!("layers.{layer}.{name}"))
+                .collect();
+            let window = window(&tensors, &|n| quantized.iter().any(|q| q == n));
+            groups.push(BlockDraftLoadGroup { tensors, window });
+        }
+        let mut tensors: Vec<String> = vec![
+            "fc.weight".into(),
+            "hidden_norm.weight".into(),
+            "norm.weight".into(),
+        ];
+        tensors.extend(BRIDGE_TENSORS.iter().map(|s| format!("{b}{s}")));
+        let window = window(&tensors, &|n| {
+            n == "fc.weight" || BRIDGE_CONVERTED.iter().any(|c| n == format!("{b}{c}"))
+        });
+        groups.push(BlockDraftLoadGroup { tensors, window });
+        groups
+    }
+
+    /// The draft's arrays once loaded at `precision`: `fc` and every layer projection quantized
+    /// (packed codes plus BF16 scales and biases per [`BLOCK_DRAFT_GROUP_SIZE`] group); the norms,
+    /// codebook, read and write weights as stored (BF16); and the bridge's derived arrays — the
+    /// packed `[gate; predecessor_gate; prev]` matrix (BF16), f32 copies of `predecessor_gate`,
+    /// `prev` and `gate.bias`, and the last layer's write weights in f32. The checks' tensors are
+    /// dropped once read.
+    pub fn resident_bytes(&self, precision: BlockDraftPrecision) -> u64 {
+        let quantized = self.quantized_matrices();
+        let b = "selected_prefix_bridge.";
+        let checks = &self.load_groups()[0].tensors;
         let mut resident = 0u64;
-        let mut transient = 0u64;
         for (name, shape) in self.tensors() {
             let elements: u64 = shape.iter().map(|&d| d as u64).product::<u64>().max(1);
-            if quantized.contains(&name) {
+            let bridge = name.strip_prefix(b);
+            resident += if quantized.contains(&name) {
                 let (out, inp) = (shape[0] as u64, shape[1] as u64);
                 let groups = out * inp.div_ceil(BLOCK_DRAFT_GROUP_SIZE as u64);
-                // Packed codes, then BF16 scales and biases per group.
-                resident += elements * u64::from(precision.bits()) / 8 + groups * 4;
-                transient = transient.max(elements * 2);
-            } else if shape.is_empty() {
-                resident += 8;
+                elements * u64::from(precision.bits()) / 8 + groups * 4
+            } else if checks.contains(&name) {
+                0
+            } else if bridge == Some("gate.bias") {
+                elements * 4
+            } else if matches!(bridge, Some("predecessor_gate.weight" | "prev.weight")) {
+                elements * (2 + 4)
             } else {
-                resident += elements * 2;
-            }
+                elements * 2
+            };
         }
-        resident + transient
+        let last_write = (self.hidden_size * self.bridge_rank) as u64 * 4;
+        resident + last_write
+    }
+
+    /// The bytes a load at `precision` holds at its peak: the draft's
+    /// [resident arrays](Self::resident_bytes), the largest [load group](Self::load_groups)'s
+    /// window while it converts, and — because the Metal driver returns a released buffer
+    /// asynchronously — one more such window of released sources still outstanding.
+    pub fn load_bytes(&self, precision: BlockDraftPrecision) -> u64 {
+        let window = self
+            .load_groups()
+            .iter()
+            .map(|g| g.window)
+            .max()
+            .unwrap_or(0);
+        self.resident_bytes(precision) + 2 * window
     }
 
     /// The bytes one request holds for the draft beside the target, at `width` drafts per step

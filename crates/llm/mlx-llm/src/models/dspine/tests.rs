@@ -122,7 +122,7 @@ pub(crate) fn tiny_draft_with(
     cfg: BlockDraftConfig,
     precision: Option<BlockDraftPrecision>,
 ) -> DSpineDraft {
-    DSpineDraft::from_weights(&Weights::from_map(tiny_tensors(&cfg)), cfg, precision).unwrap()
+    DSpineDraft::from_weights(&mut Weights::from_map(tiny_tensors(&cfg)), cfg, precision).unwrap()
 }
 
 /// The tiny draft fits the tiny target by the shared check.
@@ -158,6 +158,84 @@ fn a_build_quantizes_the_backbone_only() {
     assert!(!dense.fc.is_quantized());
 }
 
+/// The draft is built from the groups its load is priced by
+/// ([`BlockDraftConfig::load_groups`]): one materialization group per layer plus the head, each
+/// reading only its own group's tensors, and together every tensor but the checks' (read and
+/// dropped first). A build that reads outside its group is refused by name. Lazy: nothing is
+/// evaluated.
+#[test]
+fn the_draft_builds_from_the_load_groups_its_load_is_priced_by() {
+    let cfg = tiny_config();
+    let groups = cfg.load_groups();
+    let w = Weights::from_map(tiny_tensors(&cfg));
+    let q8 = Some(BlockDraftPrecision::Q8);
+    let draft = DSpineDraft::build(&w, cfg.clone(), q8, &groups[1..]).unwrap();
+    assert_eq!(draft.param_groups().len(), groups.len() - 1);
+    let mut unread = w.unused_keys();
+    unread.sort_unstable();
+    let mut checks: Vec<&str> = groups[0].tensors.iter().map(String::as_str).collect();
+    checks.sort_unstable();
+    assert_eq!(
+        unread, checks,
+        "the build reads every tensor but the checks'"
+    );
+    let mut short = groups[1..].to_vec();
+    short[0].tensors.retain(|t| !t.ends_with("q_proj.weight"));
+    let why = DSpineDraft::build(&w, cfg, q8, &short)
+        .unwrap_err()
+        .to_string();
+    assert!(why.contains("outside its priced load group"), "{why}");
+}
+
+/// A draft loaded from a BF16 checkpoint on disk — lazy safetensors loads, the production path —
+/// releases every source as its group materializes and builds, at each precision, exactly the
+/// arrays the resident build of the same weights does.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn a_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build() {
+    let cfg = tiny_config();
+    let dir = tempfile::tempdir().unwrap();
+    let stored: Vec<(String, Array)> = tiny_tensors(&cfg)
+        .into_iter()
+        .map(|(name, a)| {
+            let a = if a.dtype() == Dtype::Float32 {
+                a.as_dtype(Dtype::Bfloat16).unwrap()
+            } else {
+                a
+            };
+            (name, a)
+        })
+        .collect();
+    let refs: Vec<_> = stored.iter().map(|(n, a)| (n.as_str(), a)).collect();
+    Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+    for precision in [BlockDraftPrecision::Q8, BlockDraftPrecision::Q4] {
+        let mut w = Weights::from_dir(dir.path()).unwrap();
+        let loaded = DSpineDraft::from_weights(&mut w, cfg.clone(), Some(precision)).unwrap();
+        assert_eq!(w.len(), stored.len(), "released keys stay contained");
+        assert!(
+            w.into_map().is_empty(),
+            "{precision:?}: every source released"
+        );
+        let resident = tiny_draft(Some(precision));
+        let (got, want) = (loaded.param_groups(), resident.param_groups());
+        assert_eq!(got.len(), want.len());
+        for (g, (got, want)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(got.len(), want.len());
+            for (i, (a, b)) in got.iter().zip(want).enumerate() {
+                assert_eq!(a.dtype(), b.dtype(), "{precision:?} group {g} array {i}");
+                assert!(
+                    a.array_eq(b, None).unwrap().item::<bool>(),
+                    "{precision:?} group {g} array {i}"
+                );
+            }
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED models::dspine::tests::a_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build"
+    );
+}
+
 /// A checkpoint whose version markers, terminal projection or tensors break the DSpine contract
 /// is refused by name before anything is built.
 #[test]
@@ -166,7 +244,7 @@ fn a_checkpoint_outside_the_contract_is_refused_by_name() {
     let refuse = |edit: &dyn Fn(&mut HashMap<String, Array>)| {
         let mut tensors = tiny_tensors(&cfg);
         edit(&mut tensors);
-        DSpineDraft::from_weights(&Weights::from_map(tensors), cfg.clone(), None)
+        DSpineDraft::from_weights(&mut Weights::from_map(tensors), cfg.clone(), None)
             .unwrap_err()
             .to_string()
     };

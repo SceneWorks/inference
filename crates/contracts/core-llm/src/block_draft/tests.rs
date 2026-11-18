@@ -254,8 +254,51 @@ fn precision_defaults_to_eight_bit_and_prices_below_the_bf16_payload() {
     );
     assert!(q4 < q8 && q8 < bf16, "q4 {q4} < q8 {q8} < bf16 {bf16}");
     // 8-bit: ~1.73 G quantized weights at 1 byte + 1/16 byte of scales/biases, ~0.6 GB of BF16
-    // bridge and norms, and the 262 MB `fc` matrix held while it is quantized.
-    assert!((2_500_000_000..2_800_000_000).contains(&q8), "{q8}");
+    // bridge and norms, plus a layer's 640 MB of BF16 projections converting and the previous
+    // layer's still on their way back from the driver.
+    assert!((3_600_000_000..3_800_000_000).contains(&q8), "{q8}");
+}
+
+/// The load is priced by the groups it materializes: every stored tensor read by exactly one
+/// group (the checks, each layer, the head), and the peak is the resident draft plus two of the
+/// largest group's windows (one converting, one released and outstanding) — for the published
+/// draft a layer's seven BF16 projections, not the whole 3.46 GB of them.
+#[test]
+fn the_load_is_priced_by_the_groups_it_materializes() {
+    let cfg = BlockDraftConfig::from_json(&dspine_b16()).unwrap();
+    let groups = cfg.load_groups();
+    assert_eq!(groups.len(), cfg.num_hidden_layers + 2);
+    let mut read: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.tensors.iter().map(String::as_str))
+        .collect();
+    read.sort_unstable();
+    let mut stored: Vec<String> = cfg.tensors().into_iter().map(|(n, _)| n).collect();
+    stored.sort_unstable();
+    assert_eq!(read, stored, "every tensor in exactly one group");
+    assert!(groups[0].tensors.iter().any(|t| t.ends_with("out.weight")));
+    assert!(groups[1..=cfg.num_hidden_layers]
+        .iter()
+        .enumerate()
+        .all(|(i, g)| g
+            .tensors
+            .iter()
+            .all(|t| t.starts_with(&format!("layers.{i}.")))));
+    let layer_projections: u64 = cfg
+        .tensors()
+        .iter()
+        .filter(|(n, _)| n.starts_with("layers.0.") && cfg.quantized_matrices().contains(n))
+        .map(|(_, s)| s.iter().map(|&d| d as u64).product::<u64>() * 2)
+        .sum();
+    let largest = groups.iter().map(|g| g.window).max().unwrap();
+    assert_eq!(largest, layer_projections);
+    assert!((630_000_000..650_000_000).contains(&largest), "{largest}");
+    for precision in [BlockDraftPrecision::Q8, BlockDraftPrecision::Q4] {
+        assert_eq!(
+            cfg.load_bytes(precision),
+            cfg.resident_bytes(precision) + 2 * largest
+        );
+    }
 }
 
 #[test]

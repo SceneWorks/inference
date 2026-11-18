@@ -136,6 +136,24 @@ fn rows_from(a: &Array, start: i32, axis: i32) -> Result<Array> {
     Ok(a.take_axis(&idx, axis)?)
 }
 
+/// One load group's view of the weights ([`BlockDraftConfig::load_groups`]): a read outside the
+/// group's tensors is an error, so the draft converts exactly what the group was priced for.
+struct GroupReader<'a> {
+    w: &'a Weights,
+    tensors: &'a [String],
+}
+
+impl GroupReader<'_> {
+    fn require(&self, name: &str) -> Result<&Array> {
+        if !self.tensors.iter().any(|t| t == name) {
+            return Err(Error::Msg(format!(
+                "`{name}` is read outside its priced load group"
+            )));
+        }
+        self.w.require(name)
+    }
+}
+
 impl DSpineDraft {
     /// Load the DSpine draft in `dir` at `precision` after checking its config and every stored
     /// tensor ([`BlockDraftConfig::check_tensors`]), its version markers and its disabled terminal
@@ -145,15 +163,22 @@ impl DSpineDraft {
         cfg: BlockDraftConfig,
         precision: BlockDraftPrecision,
     ) -> std::result::Result<Self, BlockDraftRefusal> {
-        let w = Weights::from_dir(dir)
+        let mut w = Weights::from_dir(dir)
             .map_err(|e| BlockDraftRefusal::Tensors(format!("read the weights: {e}")))?;
-        Self::from_weights(&w, cfg, Some(precision))
+        Self::from_weights(&mut w, cfg, Some(precision))
     }
 
     /// Build from `w` — quantized at `precision`, or dense BF16 for `None` (the reference the
     /// quantized tiers are compared with).
+    ///
+    /// The load runs group by group ([`BlockDraftConfig::load_groups`], the structure
+    /// [`BlockDraftConfig::load_bytes`] prices) through [`Weights::materialize_groups`]: the
+    /// checks' tensors are read, verified (sc-22414) and dropped before anything is built, then
+    /// each layer and the head read their sources on the CPU stream, verify them, convert and
+    /// release them before the next group reads its own — no GPU op waits on the disk (sc-24245)
+    /// and the BF16 payload is never resident beside the converted draft.
     pub fn from_weights(
-        w: &Weights,
+        w: &mut Weights,
         cfg: BlockDraftConfig,
         precision: Option<BlockDraftPrecision>,
     ) -> std::result::Result<Self, BlockDraftRefusal> {
@@ -161,76 +186,106 @@ impl DSpineDraft {
         let stored: Vec<String> = w.keys().map(str::to_string).collect();
         cfg.check_tensors(
             |name| {
-                w.get(name)
-                    .map(|a| a.shape().iter().map(|&d| d.max(0) as usize).collect())
+                w.shape(name)
+                    .map(|s| s.iter().map(|&d| d.max(0) as usize).collect())
             },
             stored.iter().map(String::as_str),
         )?;
-        for marker in [
-            "draft_block_causal_version",
-            "last_write_refine_version",
-            "selected_prefix_bridge.independent_write_version",
-            "selected_prefix_bridge.terminal_disabled_version",
-        ] {
-            let version = w
-                .require(marker)
-                .and_then(|a| Ok(a.as_dtype(Dtype::Int64)?.reshape(&[-1])?))
-                .map_err(tensors)?;
+        let groups = cfg.load_groups();
+        let (checks, built) = groups.split_first().expect("a load has a checks group");
+        let (markers, out) = checks.tensors.split_at(checks.tensors.len() - 1);
+        let reader = GroupReader {
+            w,
+            tensors: &checks.tensors,
+        };
+        let versions = markers
+            .iter()
+            .map(|marker| {
+                Ok(reader
+                    .require(marker)?
+                    .as_dtype(Dtype::Int64)?
+                    .reshape(&[-1])?)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(tensors)?;
+        let nonzero = (|| -> Result<Array> {
+            let out = reader.require(&out[0])?;
+            Ok(mlx_rs::ops::any(&out.ne(Array::from_f32(0.0))?, None)?)
+        })()
+        .map_err(tensors)?;
+        let mut check_group = versions.clone();
+        check_group.push(nonzero.clone());
+        w.materialize_groups(&[check_group]).map_err(tensors)?;
+        for (marker, version) in markers.iter().zip(&versions) {
             if version.as_slice::<i64>() != [1] {
                 return Err(BlockDraftRefusal::Tensors(format!(
                     "`{marker}` is not version 1"
                 )));
             }
         }
-        let out = w
-            .require("selected_prefix_bridge.out.weight")
-            .map_err(tensors)?;
-        let nonzero = mlx_rs::ops::any(
-            &out.ne(Array::from_f32(0.0))
-                .map_err(Error::from)
-                .map_err(tensors)?,
-            None,
-        )
-        .map_err(Error::from)
-        .map_err(tensors)?;
         if nonzero.item::<bool>() {
             return Err(BlockDraftRefusal::Tensors(
                 "the terminal-disabled checkpoint has a nonzero terminal projection".into(),
             ));
         }
-        Self::build(w, cfg, precision).map_err(tensors)
+        let draft = Self::build(w, cfg, precision, built).map_err(tensors)?;
+        w.materialize_groups(&draft.param_groups())
+            .map_err(tensors)?;
+        Ok(draft)
     }
 
+    /// The draft over `w`, built lazily from `groups` — one per layer, then the head — each
+    /// group's arrays read only from its own tensors. Nothing is evaluated.
     fn build(
         w: &Weights,
         cfg: BlockDraftConfig,
         precision: Option<BlockDraftPrecision>,
+        groups: &[core_llm::BlockDraftLoadGroup],
     ) -> Result<Self> {
+        let layer_count = cfg.num_hidden_layers;
+        if groups.len() != layer_count + 1 {
+            return Err(Error::Msg(format!(
+                "{} load groups for {layer_count} layers and the head",
+                groups.len()
+            )));
+        }
         let quant = precision.map(|p| QuantSpec {
             group_size: core_llm::BLOCK_DRAFT_GROUP_SIZE as i32,
             bits: p.bits() as i32,
             grid: QuantGrid::Computed,
         });
-        let proj = |name: &str| Projection::load(bf16(w.require(name)?)?, quant);
-        let vec = |name: &str| bf16(w.require(name)?);
-        let layers = (0..cfg.num_hidden_layers)
-            .map(|i| {
-                let p = |s: &str| format!("layers.{i}.{s}");
+        let layers = groups[..layer_count]
+            .iter()
+            .enumerate()
+            .map(|(i, group)| {
+                let r = GroupReader {
+                    w,
+                    tensors: &group.tensors,
+                };
+                let proj = |s: &str| {
+                    Projection::load(bf16(r.require(&format!("layers.{i}.{s}"))?)?, quant)
+                };
+                let vec = |s: &str| bf16(r.require(&format!("layers.{i}.{s}"))?);
                 Ok(DraftLayer {
-                    q_proj: proj(&p("self_attn.q_proj.weight"))?,
-                    k_proj: proj(&p("self_attn.k_proj.weight"))?,
-                    v_proj: proj(&p("self_attn.v_proj.weight"))?,
-                    o_proj: proj(&p("self_attn.o_proj.weight"))?,
-                    q_norm: vec(&p("self_attn.q_norm.weight"))?,
-                    k_norm: vec(&p("self_attn.k_norm.weight"))?,
-                    gate_proj: proj(&p("mlp.gate_proj.weight"))?,
-                    up_proj: proj(&p("mlp.up_proj.weight"))?,
-                    down_proj: proj(&p("mlp.down_proj.weight"))?,
-                    input_layernorm: vec(&p("input_layernorm.weight"))?,
-                    post_attention_layernorm: vec(&p("post_attention_layernorm.weight"))?,
+                    q_proj: proj("self_attn.q_proj.weight")?,
+                    k_proj: proj("self_attn.k_proj.weight")?,
+                    v_proj: proj("self_attn.v_proj.weight")?,
+                    o_proj: proj("self_attn.o_proj.weight")?,
+                    q_norm: vec("self_attn.q_norm.weight")?,
+                    k_norm: vec("self_attn.k_norm.weight")?,
+                    gate_proj: proj("mlp.gate_proj.weight")?,
+                    up_proj: proj("mlp.up_proj.weight")?,
+                    down_proj: proj("mlp.down_proj.weight")?,
+                    input_layernorm: vec("input_layernorm.weight")?,
+                    post_attention_layernorm: vec("post_attention_layernorm.weight")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let r = GroupReader {
+            w,
+            tensors: &groups[layer_count].tensors,
+        };
+        let vec = |name: &str| bf16(r.require(name)?);
         let b = |s: &str| vec(&format!("selected_prefix_bridge.{s}"));
         let (gate, predecessor, prev) = (
             b("gate.weight")?,
@@ -238,7 +293,7 @@ impl DSpineDraft {
             b("prev.weight")?,
         );
         let feature_write_weights = b("feature_write_weights")?;
-        let last = cfg.num_hidden_layers as i32 - 1;
+        let last = layer_count as i32 - 1;
         let bridge = Bridge {
             read_weight: b("read_weight")?,
             early_read_weights: b("early_read_weights")?,
@@ -250,8 +305,8 @@ impl DSpineDraft {
             last_write_f32: f32(&feature_write_weights.try_index(last)?)?,
             feature_write_weights,
         };
-        let draft = Self {
-            fc: proj("fc.weight")?,
+        Ok(Self {
+            fc: Projection::load(vec("fc.weight")?, quant)?,
             hidden_norm: vec("hidden_norm.weight")?,
             norm: vec("norm.weight")?,
             rope: Rope::standard(cfg.head_dim as i32, cfg.rope_theta),
@@ -259,36 +314,42 @@ impl DSpineDraft {
             bridge,
             precision,
             cfg,
-        };
-        crate::primitives::weights::eval_groups(&[draft.arrays()])?;
-        Ok(draft)
+        })
     }
 
-    fn arrays(&self) -> Vec<Array> {
-        let mut out = Vec::new();
-        self.fc.push_arrays(&mut out);
-        out.extend([self.hidden_norm.clone(), self.norm.clone()]);
-        for l in &self.layers {
-            for p in [
-                &l.q_proj,
-                &l.k_proj,
-                &l.v_proj,
-                &l.o_proj,
-                &l.gate_proj,
-                &l.up_proj,
-                &l.down_proj,
-            ] {
-                p.push_arrays(&mut out);
-            }
-            out.extend([
-                l.q_norm.clone(),
-                l.k_norm.clone(),
-                l.input_layernorm.clone(),
-                l.post_attention_layernorm.clone(),
-            ]);
-        }
+    /// The draft's arrays in load order ([`BlockDraftConfig::load_groups`] after the checks): one
+    /// group per layer, then the head (`fc`, the outer norms and the bridge).
+    fn param_groups(&self) -> Vec<Vec<Array>> {
+        let mut groups: Vec<Vec<Array>> = self
+            .layers
+            .iter()
+            .map(|l| {
+                let mut out = Vec::new();
+                for p in [
+                    &l.q_proj,
+                    &l.k_proj,
+                    &l.v_proj,
+                    &l.o_proj,
+                    &l.gate_proj,
+                    &l.up_proj,
+                    &l.down_proj,
+                ] {
+                    p.push_arrays(&mut out);
+                }
+                out.extend([
+                    l.q_norm.clone(),
+                    l.k_norm.clone(),
+                    l.input_layernorm.clone(),
+                    l.post_attention_layernorm.clone(),
+                ]);
+                out
+            })
+            .collect();
+        let mut head = Vec::new();
+        self.fc.push_arrays(&mut head);
+        head.extend([self.hidden_norm.clone(), self.norm.clone()]);
         let b = &self.bridge;
-        out.extend(
+        head.extend(
             [
                 &b.read_weight,
                 &b.early_read_weights,
@@ -302,7 +363,8 @@ impl DSpineDraft {
             ]
             .map(Array::clone),
         );
-        out
+        groups.push(head);
+        groups
     }
 
     /// The parsed config.
