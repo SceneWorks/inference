@@ -713,6 +713,9 @@ impl ZImageTurbo {
             "encoder_window",
             &encoder_window.map(|scope| scope.window),
         );
+        if let Some(pag) = resolved_pag.as_ref() {
+            mlx_gen::image_execution::policy_debug("pag", pag);
+        }
         let images = self.residency.run_staged_request_scoped(
             stage_residency,
             streamable,

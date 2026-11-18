@@ -1125,4 +1125,58 @@ mod tests {
         assert_ne!(values[0]["value"], values[1]["value"]);
         assert_ne!(values[1]["value"], values[2]["value"]);
     }
+
+    #[test]
+    fn capture_direct_report_preserves_pag_and_warnings_and_fails_closed_without_output() {
+        let pag_report = gen_core::PagExecutionReport {
+            layers: vec![15],
+            active_steps: 3,
+            total_steps: 4,
+            scale: 1.2,
+            adaptive_scale: 0.0,
+            start: 0.0,
+            stop: 0.75,
+        };
+        let warning = gen_core::GenerationWarning {
+            code: "fixture_warning".into(),
+            message: "warning preserved".into(),
+        };
+        let completed =
+            capture_direct_report(&DESCRIPTOR, &gen_core::CancelFlag::default(), || {
+                rng_scheme("fixture");
+                draw("noise", 7, 0);
+                schedule("euler", &[1.0, 0.0], "flow");
+                runtime(&Device::Cpu, DType::BF16);
+                let mut report =
+                    gen_core::GenerationReport::from_output(GenerationOutput::Images(vec![
+                        Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![0; 3],
+                        },
+                    ]));
+                report.pag = Some(pag_report.clone());
+                report.warnings.push(warning.clone());
+                Ok(report)
+            })
+            .unwrap();
+        assert_eq!(completed.generation.pag.as_ref(), Some(&pag_report));
+        assert_eq!(completed.generation.warnings, vec![warning]);
+
+        let missing_output =
+            capture_direct_report(&DESCRIPTOR, &gen_core::CancelFlag::default(), || {
+                Ok(gen_core::GenerationReport {
+                    output: None,
+                    artifacts: None,
+                    warnings: vec![],
+                    prefix_kv_cache: None,
+                    pag: Some(pag_report.clone()),
+                })
+            });
+        assert!(matches!(
+            missing_output,
+            Err(gen_core::Error::Msg(ref msg)) if msg.contains("produced no output")
+        ));
+        assert!(ATTEMPTS.with_borrow(|stack| stack.is_empty()));
+    }
 }

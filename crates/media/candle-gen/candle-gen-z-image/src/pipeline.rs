@@ -1487,6 +1487,7 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1602,6 +1603,7 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
@@ -1733,6 +1735,7 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1920,6 +1923,7 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;

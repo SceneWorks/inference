@@ -499,6 +499,30 @@ pub(crate) mod tests {
             Some(RefusalKind::Mode),
             "{refused:?}"
         );
+        let IosWork::Generate(req) = &mut candidate.work else {
+            unreachable!()
+        };
+        req.use_pid = false;
+        req.pag = Some(mlx_gen::gen_core::PagConfig {
+            scale: 0.0,
+            ..Default::default()
+        });
+        crate::ios_admission::validate_actual(&registry, &candidate)
+            .expect("zero-scale PAG no-op must be accepted");
+        let IosWork::Generate(req) = &mut candidate.work else {
+            unreachable!()
+        };
+        req.pag = Some(mlx_gen::gen_core::PagConfig {
+            scale: 1.2,
+            ..Default::default()
+        });
+        let pag_refused = crate::ios_admission::validate_actual(&registry, &candidate)
+            .expect_err("active PAG must be refused");
+        assert_eq!(
+            pag_refused.refusal_kind(),
+            Some(RefusalKind::Mode),
+            "{pag_refused:?}"
+        );
     }
 
     struct Probe(

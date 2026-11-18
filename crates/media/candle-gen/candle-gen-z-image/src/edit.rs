@@ -368,6 +368,7 @@ impl ZImageEdit {
             "z-image-edit",
             format!("start={start};sigma_start_bits={}", sigma_start.to_bits()).into(),
         );
+        common::observe_pag_policy(resolved_pag.as_ref());
         for step_i in start..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -402,6 +403,7 @@ impl ZImageEdit {
                         &dit_prepared,
                         Some(pag_ctx),
                     )?;
+                    common::observe_component_output("dit", &perturbed_raw);
                     let v_perturbed = perturbed_raw.neg()?;
                     candle_gen::gen_core::guidance::pag_apply(
                         &candle_gen::CandleLatentOps,

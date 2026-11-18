@@ -273,9 +273,8 @@ pub(crate) fn pag_step_index(sigmas: &[f32], timestep: f32) -> usize {
     }
     sigmas[..total_steps]
         .iter()
-        .filter(|&&s| (1.0f32 - s) < timestep)
-        .count()
-        .min(total_steps - 1)
+        .rposition(|&s| (1.0f32 - s) <= timestep)
+        .unwrap_or(0)
 }
 
 fn finalize_cfg_and_pag<F>(
@@ -1767,6 +1766,11 @@ mod tests {
         assert_eq!(pag_step_index(&sigmas, 1.0 - sigmas[0]), 0);
         assert_eq!(pag_step_index(&sigmas, 1.0 - sigmas[1]), 1);
         assert_eq!(pag_step_index(&sigmas, 1.0 - sigmas[2]), 2);
+        // Multi-stage solver substeps (`1 - sigmas[i] < t < 1 - sigmas[i + 1]`) stay at step `i`.
+        for i in 0..3 {
+            let midpoint = 0.5 * ((1.0 - sigmas[i]) + (1.0 - sigmas[i + 1]));
+            assert_eq!(pag_step_index(&sigmas, midpoint), i);
+        }
 
         let cap = crate::model::turbo_pag_capability();
         let resolved = mlx_gen::gen_core::resolve_pag(

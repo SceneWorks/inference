@@ -667,6 +667,18 @@ pub fn validate_actual(
                     format!("{provider}: a PiD decode (`use_pid`) is not served on iOS"),
                 ));
             }
+            if req
+                .effective_pag()
+                .map_err(|err| Error::Msg(format!("{provider}: {err}")))?
+                .is_some_and(|cfg| cfg.scale > 0.0)
+            {
+                return Err(AdmissionError::refused(
+                    RefusalKind::Mode,
+                    format!(
+                        "{provider}: Perturbed-Attention Guidance (`pag`) is not served on iOS"
+                    ),
+                ));
+            }
             if req.memory.unwrap_or_default() != candidate.execution {
                 return Err(mismatch("request execution"));
             }

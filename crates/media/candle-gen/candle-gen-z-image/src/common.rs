@@ -91,6 +91,16 @@ pub(crate) fn observe_component_output(component: &str, output: &Tensor) {
     );
 }
 
+/// Record the active PAG policy in the current [`ExecutionIdentity`] attempt when PAG is enabled.
+pub(crate) fn observe_pag_policy(pag: Option<&candle_gen::gen_core::PagResolved>) {
+    if let Some(pag) = pag {
+        candle_gen::execution::policy(
+            "z-image/pag",
+            serde_json::to_value(pag).unwrap_or(serde_json::Value::Null),
+        );
+    }
+}
+
 /// Img2img start step — the Z-Image "structure-preservation" convention (the fork's
 /// `init_time_step`, mirrored from `mlx-gen`'s shared `img2img::init_time_step`): for a reference
 /// with `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img,
@@ -447,9 +457,8 @@ pub(crate) fn pag_step_index(sigmas: &[f32], timestep: f32) -> usize {
     }
     sigmas[..total_steps]
         .iter()
-        .filter(|&&s| (1.0f32 - s) < timestep)
-        .count()
-        .min(total_steps - 1)
+        .rposition(|&s| (1.0f32 - s) <= timestep)
+        .unwrap_or(0)
 }
 
 /// Apply Z-Image PAG attention perturbation on `[B, H, seq_len, D]` BHSD tensors when
@@ -868,6 +877,11 @@ mod tests {
         let non_dyadic = [1.0f32, 2.0 / 3.0, 1.0 / 3.0, 0.0];
         for (i, &s) in non_dyadic[..3].iter().enumerate() {
             assert_eq!(pag_step_index(&non_dyadic, 1.0 - s), i);
+        }
+        // Multi-stage solver substeps (`1 - sigmas[i] < t < 1 - sigmas[i + 1]`) stay at step `i`.
+        for i in 0..3 {
+            let midpoint = 0.5 * ((1.0 - non_dyadic[i]) + (1.0 - non_dyadic[i + 1]));
+            assert_eq!(pag_step_index(&non_dyadic, midpoint), i);
         }
 
         let resolved = candle_gen::gen_core::PagResolved {
