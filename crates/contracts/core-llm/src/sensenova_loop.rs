@@ -1,8 +1,52 @@
 //! Execution metadata for the released SenseNova-Loop-9B checkpoint. Both
 //! backends bind weights by physical layer and cache slots by visit order.
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub const MODEL_REVISION: &str = "3e1ba6e8ac98090f9f7c03a55f26269eb3850fb6";
+
+/// Original sidecars shared byte-for-byte by BF16 and both published native tiers.
+/// Derived snapshots append provenance separately from these model inputs.
+pub fn validate_sidecars(root: &std::path::Path) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    for (name, expected) in [
+        (
+            "tokenizer.json",
+            "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+        ),
+        (
+            "tokenizer_config.json",
+            "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b",
+        ),
+        (
+            "generation_config.json",
+            "f288bb4281580138395c6acc7b3adb62f45c21530bc0708cb2cf9edf093f6a4f",
+        ),
+        (
+            "chat_template.jinja",
+            "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+        ),
+        (
+            "processor_config.json",
+            "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+        ),
+        (
+            "preprocessor_config.json",
+            "3a159dfec9978a186a72ba085e0ad6a050f3968d8b364218d7bd13f5c89381f2",
+        ),
+    ] {
+        let path = root.join(name);
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| format!("SenseNova-Loop-9B: cannot open {}: {e}", path.display()))?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)
+            .map_err(|e| format!("SenseNova-Loop-9B: cannot hash {}: {e}", path.display()))?;
+        let actual = format!("{:x}", digest.finalize());
+        if actual != expected {
+            return Err(format!("SenseNova-Loop-9B: {name} SHA-256 {actual} differs from release {MODEL_REVISION} ({expected})"));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SenseNovaLoop(());
@@ -86,39 +130,14 @@ fn validate_fields(actual: &Value, expected: &Value, path: &str) -> Result<(), S
 }
 
 fn release_config() -> Value {
-    let layer_types: Vec<_> = (1..=32)
-        .map(|i| {
-            if i % 4 == 0 {
-                "full_attention"
-            } else {
-                "linear_attention"
-            }
-        })
-        .collect();
-    json!({
-        "model_type": "sensenova_loop", "architectures": ["SenseNovaLoopForConditionalGeneration"],
-        "loop_settings": {"counts":[2],"start":4,"end":28,"eval_count":2},
-        "mhc":{"start":4,"end":28,"streams":2,"iterations":20,"fixed_identity":false,"pre_scale":1.0},
-        "dtype":"bfloat16", "tie_word_embeddings":false,
-        "eos_token_id":248046,"pad_token_id":248044,"image_token_id":248056,"video_token_id":248057,
-        "vision_start_token_id":248053,"vision_end_token_id":248054,"patch_conv3d":true,
-        "text_config":{
-            "model_type":"qwen3_5_text","num_hidden_layers":32,"hidden_size":4096,"num_attention_heads":16,"num_key_value_heads":4,"head_dim":256,"intermediate_size":12288,
-            "dtype":"bfloat16","attention_bias":false,"attn_output_gate":true,"hidden_act":"silu","layer_types":layer_types,"full_attention_interval":4,
-            "linear_conv_kernel_dim":4,"linear_key_head_dim":128,"linear_num_key_heads":16,"linear_num_value_heads":32,"linear_value_head_dim":128,"mamba_ssm_dtype":"float32",
-            "max_position_embeddings":524288,"partial_rotary_factor":0.25,"rms_norm_eps":1e-6,"tie_word_embeddings":false,"vocab_size":248320,
-            "rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"partial_rotary_factor":0.25,"rope_theta":10000000,"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144}
-        },
-        "vision_config":{
-            "model_type":"qwen3_5_vision","depth":27,"hidden_act":"gelu_pytorch_tanh","hidden_size":1152,"in_channels":3,"intermediate_size":4304,"num_heads":16,"num_position_embeddings":2304,"out_hidden_size":4096,
-            "patch_size":16,"spatial_merge_size":2,"temporal_patch_size":2,"deepstack_visual_indexes":[]
-        }
-    })
+    serde_json::from_str(include_str!("sensenova_loop.json"))
+        .expect("release geometry is valid JSON")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn release_visits_and_yarn() {
