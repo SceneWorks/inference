@@ -1038,7 +1038,10 @@ mod tests {
             .unwrap()
             .expect("dev pag")
             .execution_report(4);
-        assert_eq!((dev.layers, dev.active_steps, dev.total_steps), (vec![28], 4, 4));
+        assert_eq!(
+            (dev.layers, dev.active_steps, dev.total_steps),
+            (vec![28], 4, 4)
+        );
 
         let schnell = resolve_ip_pag(Variant::Schnell, &req)
             .unwrap()

@@ -1527,9 +1527,8 @@ mod tests {
                     &[1.0, 0.0],
                     42,
                 );
-                let mut report = gen_core::GenerationReport::from_output(
-                    GenerationOutput::Images(vec![img()]),
-                );
+                let mut report =
+                    gen_core::GenerationReport::from_output(GenerationOutput::Images(vec![img()]));
                 report.pag = Some(pag_report.clone());
                 Ok(report)
             },

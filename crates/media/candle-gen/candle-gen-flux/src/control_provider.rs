@@ -538,13 +538,8 @@ impl Flux1DevControl {
             "flux/control_provider/generate",
             on_progress,
             |progress| {
-                let image = self.generate_with_injector_planned(
-                    req,
-                    control_image,
-                    None,
-                    plan,
-                    progress,
-                )?;
+                let image =
+                    self.generate_with_injector_planned(req, control_image, None, plan, progress)?;
                 Ok((image, pag))
             },
         )
