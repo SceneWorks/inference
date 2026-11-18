@@ -720,12 +720,37 @@ impl Krea2Transformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_memory_and_pag(
+            latent,
+            timestep,
+            context,
+            &[],
+            attention_scores_budget,
+            transformer_window,
+            cancel,
+        )
+    }
+
+    /// [`Self::forward_with_memory`] with optional PAG block perturbation (`perturbed_layers` must
+    /// be sorted ascending; empty runs the unperturbed baseline, SW-7176).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_memory_and_pag(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        perturbed_layers: &[u32],
+        attention_scores_budget: usize,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         let (_, _, h, w) = latent.dims4()?;
         let prepared = self.prepare_conditioning(context, (w * 8) as u32, (h * 8) as u32)?;
-        self.forward_prepared_with_memory(
+        self.forward_prepared_with_memory_and_pag(
             latent,
             timestep,
             &prepared,
+            perturbed_layers,
             attention_scores_budget,
             transformer_window,
             cancel,
@@ -743,10 +768,38 @@ impl Krea2Transformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_prepared_with_memory_and_pag(
+            latent,
+            timestep,
+            prepared,
+            &[],
+            attention_scores_budget,
+            transformer_window,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory_and_pag(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedConditioning,
+        perturbed_layers: &[u32],
+        attention_scores_budget: usize,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         self.validate_prepared(latent, prepared)?;
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let attention_plan = request_attention_plan(attention_scores_budget, cancel);
+        let perturb = |index: usize| {
+            perturbed_layers
+                .binary_search(&(index as u32))
+                .is_ok()
+                .then_some(prepared.cap_len)
+        };
 
         // Image patch embed + changing timestep front-end; text projection/RoPE are request-owned.
         let img = self.embed_image(latent)?; // [b, img_len, hidden]
@@ -757,14 +810,15 @@ impl Krea2Transformer {
         let mut combined = Tensor::cat(&[&prepared.context, &img], 1)?; // [b, cap+img_len, hidden]
         match &self.blocks {
             TransformerBlocks::Resident(blocks) => {
-                for blk in blocks {
+                for (index, blk) in blocks.iter().enumerate() {
                     candle_gen::check_cancel(cancel)?;
-                    combined = blk.forward_with_attention_plan(
+                    combined = blk.forward_with_attention_plan_and_pag(
                         &combined,
                         &tvec,
                         &prepared.rcos,
                         &prepared.rsin,
                         attention_plan,
+                        perturb(index),
                     )?;
                 }
             }
@@ -787,6 +841,7 @@ impl Krea2Transformer {
                         Ok(std::sync::Arc::clone(weights))
                     },
                     |mut state, view, range| {
+                        let window_start = range.start;
                         let blocks = view.read_source_unchanged(|| {
                             let blocks = materialize_window(view, cfg, &dit_plan, range)?;
                             // Candle's CUDA copies are asynchronous. Drain them before the pin's
@@ -795,18 +850,19 @@ impl Krea2Transformer {
                             view.device().synchronize()?;
                             Ok(blocks)
                         })?;
-                        for block in &blocks {
+                        for (offset, block) in blocks.iter().enumerate() {
                             // Finer than the driver's per-window gate, deliberately (sc-16003): one
                             // block is ~2 s at 2048², and a cancel unread until the window ends is
                             // grace the worker's bounded wind-down does not have. At the shipped
                             // window of 1 the two coincide; this keeps that true if it ever widens.
                             candle_gen::check_cancel(cancel)?;
-                            state = block.forward_with_attention_plan(
+                            state = block.forward_with_attention_plan_and_pag(
                                 &state,
                                 &tvec,
                                 &prepared.rcos,
                                 &prepared.rsin,
                                 attention_plan,
+                                perturb(window_start + offset),
                             )?;
                         }
                         Ok(state)
@@ -908,10 +964,30 @@ impl Krea2Transformer {
         attention_scores_budget: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_edit_prepared_with_memory_and_pag(
+            latent,
+            timestep,
+            prepared,
+            &[],
+            attention_scores_budget,
+            cancel,
+        )
+    }
+
+    pub(crate) fn forward_edit_prepared_with_memory_and_pag(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedConditioning,
+        perturbed_layers: &[u32],
+        attention_scores_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
         self.validate_prepared(latent, prepared)?;
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let attention_plan = request_attention_plan(attention_scores_budget, cancel);
+        let target_offset = prepared.cap_len + prepared.refs.len() * prepared.img_len;
 
         // Target image tokens change per denoise step; text/reference tokens were prepared once.
         let img = self.embed_image(latent)?;
@@ -931,18 +1007,22 @@ impl Krea2Transformer {
             ));
         };
         combined = fold_block_sequence(blocks.len(), cancel, combined, |i, combined| {
-            blocks[i].forward_with_attention_plan(
+            let perturb = perturbed_layers
+                .binary_search(&(i as u32))
+                .is_ok()
+                .then_some(target_offset);
+            blocks[i].forward_with_attention_plan_and_pag(
                 &combined,
                 &tvec,
                 &prepared.rcos,
                 &prepared.rsin,
                 attention_plan,
+                perturb,
             )
         })?;
 
         // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
         let out = self.final_layer(&combined, &t)?;
-        let target_offset = prepared.cap_len + prepared.refs.len() * prepared.img_len;
         let img_out = out.narrow(1, target_offset, prepared.img_len)?;
         Ok(unpatchify(
             &img_out,

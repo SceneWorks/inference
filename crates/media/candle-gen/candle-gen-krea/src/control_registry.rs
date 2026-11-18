@@ -13,6 +13,7 @@ pub(crate) fn descriptor() -> ModelDescriptor {
         ControlKind::Pose,
     ]));
     descriptor.capabilities.supported_quants = &[Quant::Q4, Quant::Q8];
+    descriptor.capabilities.pag = None;
     descriptor
 }
 

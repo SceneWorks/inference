@@ -841,7 +841,7 @@ impl Generator for KreaGenerator {
         }
         self.descriptor.capabilities.validate_request(id, req)?;
         if id.starts_with("krea_2_turbo")
-            && req.guidance.unwrap_or(0.0) == 0.0
+            && !pipeline::krea_uses_cfg(req.guidance.unwrap_or(0.0))
             && req
                 .negative_prompt
                 .as_ref()
@@ -877,6 +877,18 @@ impl Generator for KreaGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress).map(|report| {
+            report
+                .output
+                .expect("Krea image generation always produces GenerationOutput")
+        })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
         if let Some(memory) = req.memory {
             validate_memory_parameters(self.descriptor.id, memory)?;
@@ -895,6 +907,11 @@ impl Generator for KreaGenerator {
         // Loud-reject a multi-phase request on a diff-patch model (sc-13887): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        let resolved_pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?;
+        candle_gen::execution::policy("krea/pipeline/pag", format!("{resolved_pag:?}").into());
 
         let raw = self.descriptor.id == KREA_2_RAW_ID;
         let turbo_edit = self.descriptor.id == KREA_2_TURBO_EDIT_ID;
@@ -979,7 +996,18 @@ impl Generator for KreaGenerator {
                     },
                 )
             })?;
-            return Ok(GenerationOutput::Images(images));
+            let pag_report = match &resolved_pag {
+                Some(pag) => {
+                    let executed_steps =
+                        pipeline::executed_steps_for_request(false, None, None, req)?;
+                    Some(pag.execution_report(executed_steps))
+                }
+                None => None,
+            };
+            let mut report =
+                gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+            report.pag = pag_report;
+            return Ok(report);
         }
 
         // Multi-phase denoise (epic 13879, sc-13887): resolve the phase list ONCE up-front so both the
@@ -1003,7 +1031,7 @@ impl Generator for KreaGenerator {
         // The negative (unconditional) context is encoded once iff ANY phase uses CFG.
         let mp_need_neg = mp_resolved
             .as_ref()
-            .map(|r| multiphase::any_phase_uses_cfg(r))
+            .map(|r| r.iter().any(|p| pipeline::krea_uses_cfg(p.guidance)))
             .unwrap_or(false);
 
         let stage_residency = req
@@ -1184,7 +1212,55 @@ impl Generator for KreaGenerator {
                 _ => unreachable!("residency phase variants are constructed in matching pairs"),
             },
         )?;
-        Ok(GenerationOutput::Images(images))
+        let pag_report = match &resolved_pag {
+            Some(pag) => {
+                let raw_schedule = raw || (edit && !turbo_edit);
+                let img2img_strength = if edit {
+                    None
+                } else {
+                    reference.map(|(_, strength)| strength)
+                };
+                let executed_steps = pipeline::executed_steps_for_request(
+                    raw_schedule,
+                    img2img_strength,
+                    mp_resolved.as_deref(),
+                    req,
+                )?;
+                Some(pag.execution_report(executed_steps))
+            }
+            None => None,
+        };
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = pag_report;
+        Ok(report)
+    }
+}
+
+/// Curated Perturbed-Attention Guidance capability for 8-step CFG-free Krea 2 Turbo / Turbo Edit
+/// (`num_blocks = 28`, mid-stack single-stream block `[14]`, gentle `[0.0, 0.75)` window, SW-7176).
+pub fn turbo_pag_capability() -> gen_core::PagCapability {
+    gen_core::PagCapability {
+        num_blocks: 28,
+        block_domain: std::borrow::Cow::Borrowed("single_stream_blocks"),
+        default_layers: vec![14],
+        default_start: 0.0,
+        default_stop: 0.75,
+        recommended_scale: 1.2,
+        max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
+    }
+}
+
+/// Curated Perturbed-Attention Guidance capability for undistilled Krea 2 Raw / Raw Edit
+/// (`num_blocks = 28`, mid-stack single-stream block `[14]`, full `[0.0, 1.0]` window, SW-7176).
+pub fn raw_pag_capability() -> gen_core::PagCapability {
+    gen_core::PagCapability {
+        num_blocks: 28,
+        block_domain: std::borrow::Cow::Borrowed("single_stream_blocks"),
+        default_layers: vec![14],
+        default_start: 0.0,
+        default_stop: 1.0,
+        recommended_scale: 1.5,
+        max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
     }
 }
 
@@ -1253,6 +1329,7 @@ pub fn descriptor() -> ModelDescriptor {
             // direction. The trainer's periodic sample render is deliberately outside that set: it
             // renders from a synthetic request that carries no sink.
             supports_preview: true,
+            pag: Some(turbo_pag_capability()),
             ..Default::default()
         },
     }
@@ -1272,6 +1349,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
+    d.capabilities.pag = Some(raw_pag_capability());
     // Raw img2img reference-guided latent-init (sc-10226, epic 8588): keep the single
     // `ConditioningKind::Reference` inherited from `descriptor` (Turbo). Raw serves it through the
     // undistilled full-CFG `pipeline::render_base_img2img` (the CFG sibling of Turbo's `render_img2img`),
@@ -1310,6 +1388,7 @@ pub fn turbo_edit_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = false;
     d.capabilities.supports_guidance = false;
     d.capabilities.supports_true_cfg = false;
+    d.capabilities.pag = Some(turbo_pag_capability());
     d
 }
 
@@ -7801,5 +7880,250 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             .load(KREA_2_RAW_ID, &spec)
             .unwrap();
         assert!(g.validate(&single).is_ok());
+    }
+
+    #[test]
+    fn pag_capabilities_advertised_on_all_four_krea_variants_and_cleared_on_control() {
+        for desc in [
+            descriptor(),
+            turbo_edit_descriptor(),
+            raw_descriptor(),
+            edit_descriptor(),
+            crate::control_registry::descriptor(),
+        ] {
+            assert!(
+                gen_core::registry::model_descriptor_errors(&desc).is_empty(),
+                "{}: {:?}",
+                desc.id,
+                gen_core::registry::model_descriptor_errors(&desc)
+            );
+        }
+
+        for desc in [descriptor(), turbo_edit_descriptor()] {
+            let pag = desc
+                .capabilities
+                .pag
+                .as_ref()
+                .expect("Turbo PAG advertised");
+            assert_eq!(pag.num_blocks, 28);
+            assert_eq!(pag.block_domain, "single_stream_blocks");
+            assert_eq!(pag.default_layers, vec![14]);
+            assert_eq!(pag.default_start, 0.0);
+            assert_eq!(pag.default_stop, 0.75);
+            assert_eq!(pag.recommended_scale, 1.2);
+            assert_eq!(pag.max_scale, 15.0);
+        }
+
+        for desc in [raw_descriptor(), edit_descriptor()] {
+            let pag = desc.capabilities.pag.as_ref().expect("Raw PAG advertised");
+            assert_eq!(pag.num_blocks, 28);
+            assert_eq!(pag.block_domain, "single_stream_blocks");
+            assert_eq!(pag.default_layers, vec![14]);
+            assert_eq!(pag.default_start, 0.0);
+            assert_eq!(pag.default_stop, 1.0);
+            assert_eq!(pag.recommended_scale, 1.5);
+            assert_eq!(pag.max_scale, 15.0);
+        }
+
+        let ctrl = crate::control_registry::descriptor();
+        assert!(ctrl.capabilities.pag.is_none());
+        let ctrl_req = GenerationRequest {
+            prompt: "a pose".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::Control {
+                image: ref_image(1024, 1024),
+                kind: gen_core::ControlKind::Pose,
+                scale: Some(1.0),
+            }],
+            pag: Some(gen_core::PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ctrl.capabilities.validate_request(ctrl.id, &ctrl_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn pag_request_validation_enforces_block_range_zero_scale_noop_and_executed_steps() {
+        use gen_core::PagConfig;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
+        let registry = crate::provider_registry().unwrap();
+
+        for id in [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+        ] {
+            let g = registry.load(id, &spec).unwrap();
+            let mut base = GenerationRequest {
+                prompt: "a lighthouse".into(),
+                width: 1024,
+                height: 1024,
+                ..Default::default()
+            };
+            if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                base.conditioning = vec![Conditioning::Reference {
+                    image: ref_image(64, 64),
+                    strength: None,
+                }];
+            }
+
+            let mut ok_default = base.clone();
+            ok_default.pag = Some(PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            });
+            assert!(g.validate(&ok_default).is_ok());
+            assert_eq!(
+                g.descriptor()
+                    .capabilities
+                    .resolve_pag(id, &ok_default)
+                    .unwrap()
+                    .unwrap()
+                    .layers,
+                vec![14]
+            );
+
+            let mut ok_bounds = base.clone();
+            ok_bounds.pag = Some(PagConfig {
+                scale: 1.5,
+                layers: Some(vec![27, 0, 14, 0]),
+                ..Default::default()
+            });
+            assert!(g.validate(&ok_bounds).is_ok());
+            assert_eq!(
+                g.descriptor()
+                    .capabilities
+                    .resolve_pag(id, &ok_bounds)
+                    .unwrap()
+                    .unwrap()
+                    .layers,
+                vec![0, 14, 27]
+            );
+
+            // scale == 0.0 resolves to None (strict zero-pass no-op), while still rejecting block >= 28.
+            let mut zero_noop = base.clone();
+            zero_noop.pag = Some(PagConfig {
+                scale: 0.0,
+                layers: Some(vec![14]),
+                ..Default::default()
+            });
+            assert!(g.validate(&zero_noop).is_ok());
+            assert_eq!(
+                g.descriptor()
+                    .capabilities
+                    .resolve_pag(id, &zero_noop)
+                    .unwrap(),
+                None
+            );
+
+            let mut bad_zero_layer = base.clone();
+            bad_zero_layer.pag = Some(PagConfig {
+                scale: 0.0,
+                layers: Some(vec![28]),
+                ..Default::default()
+            });
+            assert!(g.validate(&bad_zero_layer).is_err());
+
+            for bad in [
+                PagConfig {
+                    scale: 1.5,
+                    layers: Some(vec![28]),
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: -0.1,
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: 15.1,
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: f32::NAN,
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: 1.5,
+                    start: Some(0.8),
+                    stop: Some(0.2),
+                    ..Default::default()
+                },
+            ] {
+                let mut invalid = base.clone();
+                invalid.pag = Some(bad);
+                assert!(g.validate(&invalid).is_err());
+            }
+        }
+
+        // Low-guidance Raw / Edit (`guidance == 1.0`) with PAG and no negative prompt validates
+        // cleanly and treats CFG as inactive (`!pipeline::krea_uses_cfg(1.0)`).
+        for id in [KREA_2_RAW_ID, KREA_2_EDIT_ID] {
+            let g = registry.load(id, &spec).unwrap();
+            let mut r = GenerationRequest {
+                prompt: "a portrait".into(),
+                width: 1024,
+                height: 1024,
+                guidance: Some(1.0),
+                negative_prompt: None,
+                pag: Some(PagConfig {
+                    scale: 1.5,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if id == KREA_2_EDIT_ID {
+                r.conditioning = vec![Conditioning::MultiReference {
+                    images: vec![ref_image(64, 64), ref_image(64, 64)],
+                }];
+            }
+            assert!(g.validate(&r).is_ok());
+        }
+        assert!(!pipeline::krea_uses_cfg(1.0));
+        assert!(!pipeline::krea_uses_cfg(0.0));
+        assert!(pipeline::krea_uses_cfg(3.5));
+
+        // Executed step accounting for PagExecutionReport across T2I, Img2Img, and Multiphase.
+        let t2i_req = GenerationRequest {
+            prompt: "x".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        assert_eq!(
+            pipeline::executed_steps_for_request(false, None, None, &t2i_req).unwrap(),
+            8
+        );
+        assert_eq!(
+            pipeline::executed_steps_for_request(true, None, None, &t2i_req).unwrap(),
+            52
+        );
+        assert_eq!(
+            pipeline::executed_steps_for_request(false, Some(Some(0.5)), None, &t2i_req).unwrap(),
+            4
+        );
+        assert_eq!(
+            pipeline::executed_steps_for_request(false, Some(Some(1.0)), None, &t2i_req).unwrap(),
+            0
+        );
+        let mp = multiphase::resolve_phases(
+            &[phase(20, Some(3.5)), phase(8, Some(1.0))],
+            3.5,
+            0,
+            KREA_2_RAW_ID,
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline::executed_steps_for_request(true, None, Some(&mp), &t2i_req).unwrap(),
+            28
+        );
     }
 }

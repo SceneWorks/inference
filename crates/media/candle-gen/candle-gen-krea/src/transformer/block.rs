@@ -276,6 +276,23 @@ impl GatedAttention {
         rope: Option<(&Tensor, &Tensor)>,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_attention_plan_and_pag(x, rope, attention_plan, None)
+    }
+
+    /// Request-scoped attention forward with optional Perturbed-Attention Guidance (PAG, SW-7176).
+    ///
+    /// When `perturb_after_prefix` is `Some(prefix_len)`, prefix queries `0..prefix_len` (`[ctx]`
+    /// in T2I/img2img or `[ctx ; ref_latents…]` in Kontext edit) execute normal GQA attention over
+    /// the full `[0..s]` key/value sequence, while target image tokens `prefix_len..s` replace
+    /// their self-attention output with their own GQA-expanded value vectors `V_target` prior to
+    /// `sigmoid(to_gate)` and `to_out`. When `None`, executes the unperturbed baseline unchanged.
+    pub fn forward_with_attention_plan_and_pag(
+        &self,
+        x: &Tensor,
+        rope: Option<(&Tensor, &Tensor)>,
+        attention_plan: AttentionPlan<'_>,
+        perturb_after_prefix: Option<usize>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
@@ -301,7 +318,12 @@ impl GatedAttention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        let o = sdpa_planned(&q, &k, &v, self.scale, attention_plan)?;
+        let o = match perturb_after_prefix {
+            Some(prefix_len) => {
+                pag_attention_bhsd(&q, &k, &v, self.scale, prefix_len, attention_plan)?
+            }
+            None => sdpa_planned(&q, &k, &v, self.scale, attention_plan)?,
+        };
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
         // Sigmoid gate the attention output, then the shared output projection.
@@ -545,6 +567,35 @@ pub struct SingleStreamBlock {
     mlp: SwiGlu,
 }
 
+/// Perturbed-Attention Guidance (PAG) over already GQA-expanded `[B, H, S, D]` tensors (SW-7176).
+///
+/// Prefix queries `0..prefix_len` (`[ctx]` or `[ctx ; ref_latents…]`) execute normal planned SDPA
+/// (preserving head/query chunking and CUDA FlashAttention contiguity) against all keys and values
+/// `0..S`; target image tokens `prefix_len..S` bypass `softmax(Q Kᵀ)` and receive identity
+/// self-attention `V_target = v[:, :, prefix_len.., :]`.
+pub(crate) fn pag_attention_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    prefix_len: usize,
+    attention_plan: AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
+    let s = q.dim(2)?;
+    if prefix_len >= s {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "krea PAG: prefix_len {prefix_len} out of bounds for sequence length {s} (target slice must be non-empty)"
+        )));
+    }
+    if prefix_len == 0 {
+        return Ok(v.clone());
+    }
+    let q_prefix = q.narrow(2, 0, prefix_len)?.contiguous()?;
+    let o_prefix = sdpa_planned(&q_prefix, k, v, scale, attention_plan)?;
+    let v_target = v.narrow(2, prefix_len, s - prefix_len)?;
+    Ok(Tensor::cat(&[&o_prefix, &v_target], 2)?)
+}
+
 impl SingleStreamBlock {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
@@ -658,6 +709,19 @@ impl SingleStreamBlock {
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_attention_plan_and_pag(x, tvec, cos, sin, attention_plan, None)
+    }
+
+    /// Request-scoped variant with optional PAG target-token perturbation (SW-7176).
+    pub fn forward_with_attention_plan_and_pag(
+        &self,
+        x: &Tensor,
+        tvec: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+        perturb_after_prefix: Option<usize>,
+    ) -> candle_gen::Result<Tensor> {
         let m = tvec.broadcast_add(&self.scale_shift_table)?; // [b, 1, 6·hidden]
         let chunks = m.chunk(6, D::Minus1)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&chunks[0], &chunks[1], &chunks[2]);
@@ -668,9 +732,12 @@ impl SingleStreamBlock {
             .forward(x)?
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
-        let attn = self
-            .attn
-            .forward_with_attention_plan(&pre, Some((cos, sin)), attention_plan)?;
+        let attn = self.attn.forward_with_attention_plan_and_pag(
+            &pre,
+            Some((cos, sin)),
+            attention_plan,
+            perturb_after_prefix,
+        )?;
         let x = (x + attn.broadcast_mul(pregate)?)?;
 
         let post = self
@@ -987,5 +1054,123 @@ mod tests {
         let one_head = budget.head_chunks(1, 1, 7, 7);
         assert!(!one_head.chunks_heads());
         assert_eq!(one_head.heads_per_chunk(), 1);
+    }
+
+    #[test]
+    fn pag_attention_preserves_prefix_and_refs_while_replacing_target_with_expanded_v() {
+        let device = Device::Cpu;
+        // Krea 2's exact 48Q / 12KV GQA ratio (groups = 4), across T2I (0 refs) and 1–2 ref
+        // Kontext edit.
+        let (b, nh, nkv, hd) = (1usize, 48usize, 12usize, 4usize);
+        let groups = nh / nkv;
+        let cap_len = 3usize;
+        let img_len = 4usize;
+
+        for n_refs in [0usize, 1, 2] {
+            let prefix_len = cap_len + n_refs * img_len;
+            let s = prefix_len + img_len;
+            let q = Tensor::randn(0f32, 1f32, (b, s, nh, hd), &device)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let k_raw = Tensor::randn(0f32, 1f32, (b, s, nkv, hd), &device).unwrap();
+            let mut v_vals = Vec::with_capacity(b * s * nkv * hd);
+            for t in 0..s {
+                for g in 0..nkv {
+                    for d in 0..hd {
+                        v_vals.push(100.0 * (t as f32) + 1.0 * (g as f32) + 0.1 * (d as f32));
+                    }
+                }
+            }
+            let v_raw = Tensor::from_vec(v_vals, (b, s, nkv, hd), &device).unwrap();
+            let k = repeat_kv_bshd(&k_raw, groups)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let v = repeat_kv_bshd(&v_raw, groups)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+
+            let full = sdpa(&q, &k, &v, 0.5, usize::MAX).unwrap();
+            let perturbed =
+                pag_attention_bhsd(&q, &k, &v, 0.5, prefix_len, AttentionPlan::UNBOUNDED).unwrap();
+            // Also exercise under a bounded head-chunking plan.
+            let bounded = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                (8 * prefix_len * s) as u64,
+                false,
+            ));
+            let perturbed_chunked =
+                pag_attention_bhsd(&q, &k, &v, 0.5, prefix_len, bounded).unwrap();
+            approx_eq(&perturbed, &perturbed_chunked);
+
+            // Scramble Q_target and confirm output is invariant to Q_target.
+            let q_prefix = q.narrow(2, 0, prefix_len).unwrap();
+            let q_target_alt = Tensor::from_vec(
+                vec![77.0f32; b * nh * img_len * hd],
+                (b, nh, img_len, hd),
+                &device,
+            )
+            .unwrap();
+            let q_alt = Tensor::cat(&[&q_prefix, &q_target_alt], 2).unwrap();
+            let perturbed_alt =
+                pag_attention_bhsd(&q_alt, &k, &v, 0.5, prefix_len, AttentionPlan::UNBOUNDED)
+                    .unwrap();
+            assert_eq!(
+                perturbed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                perturbed_alt
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+
+            // 1) Prefix ([ctx] and [ref_latents...]) matches unperturbed SDPA.
+            approx_eq(
+                &perturbed.narrow(2, 0, prefix_len).unwrap(),
+                &full.narrow(2, 0, prefix_len).unwrap(),
+            );
+
+            // 2) Target tokens equal expanded V_target with head h reading kv head h / 4.
+            let pert_target = perturbed.narrow(2, prefix_len, img_len).unwrap();
+            let expected_v_target = v.narrow(2, prefix_len, img_len).unwrap();
+            assert_eq!(
+                pert_target.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                expected_v_target
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+            let target_bshd = pert_target
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for t_rel in 0..img_len {
+                let t_abs = prefix_len + t_rel;
+                for h in 0..nh {
+                    let expected_kv_head = h / groups;
+                    for d in 0..hd {
+                        let idx = (t_rel * nh + h) * hd + d;
+                        let want = 100.0 * (t_abs as f32)
+                            + 1.0 * (expected_kv_head as f32)
+                            + 0.1 * (d as f32);
+                        assert!(
+                            (target_bshd[idx] - want).abs() < 1e-5,
+                            "head {h} must read kv head {expected_kv_head}: got {}, want {want}",
+                            target_bshd[idx]
+                        );
+                    }
+                }
+            }
+
+            // Out-of-bounds prefix_len >= s must fail closed.
+            assert!(pag_attention_bhsd(&q, &k, &v, 0.5, s, AttentionPlan::UNBOUNDED).is_err());
+        }
     }
 }

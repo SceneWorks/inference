@@ -1330,6 +1330,7 @@ pub(crate) fn render_three_stage_with_native(
         "krea/pipeline/transformer_window",
         format!("{transformer_window:?}").into(),
     );
+    let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let preview = crate::preview::hook(&req.preview);
@@ -1344,7 +1345,8 @@ pub(crate) fn render_three_stage_with_native(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = dit.forward_with_memory(
+                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                let cond = dit.forward_with_memory(
                     x,
                     &t,
                     &context.positive,
@@ -1352,7 +1354,7 @@ pub(crate) fn render_three_stage_with_native(
                     transformer_window,
                     &req.cancel,
                 )?;
-                let v = if let Some(negative) = &context.negative {
+                let v_base = if let Some(negative) = &context.negative {
                     let negative = dit.forward_with_memory(
                         x,
                         &t,
@@ -1361,9 +1363,24 @@ pub(crate) fn render_three_stage_with_native(
                         transformer_window,
                         &req.cancel,
                     )?;
-                    krea_cfg_combine(&v, &negative, req.guidance.unwrap_or(0.0))?
+                    krea_cfg_combine(&cond, &negative, req.guidance.unwrap_or(0.0))?
                 } else {
-                    v
+                    cond.clone()
+                };
+                let v = match pag_step {
+                    Some(pag_step) => {
+                        let perturbed = dit.forward_with_memory_and_pag(
+                            x,
+                            &t,
+                            &context.positive,
+                            pag_step.layers,
+                            attention_budget,
+                            transformer_window,
+                            &req.cancel,
+                        )?;
+                        krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                    }
+                    None => v_base,
                 };
                 Ok(v.to_dtype(DType::F32)?)
             },
@@ -1606,6 +1623,7 @@ fn render_from_context(
         base_seed,
         crate::KREA_2_TURBO_ID,
     )?;
+    let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -1621,7 +1639,8 @@ fn render_from_context(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = comps.dit.forward_prepared_with_memory(
+                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                let cond = comps.dit.forward_prepared_with_memory(
                     x,
                     &t,
                     &prepared,
@@ -1629,7 +1648,7 @@ fn render_from_context(
                     crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                     &req.cancel,
                 )?;
-                let v = if let Some(negative) = &prepared_neg {
+                let v_base = if let Some(negative) = &prepared_neg {
                     let negative = comps.dit.forward_prepared_with_memory(
                         x,
                         &t,
@@ -1638,9 +1657,24 @@ fn render_from_context(
                         crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                         &req.cancel,
                     )?;
-                    krea_cfg_combine(&v, &negative, req.guidance.unwrap_or(0.0))?
+                    krea_cfg_combine(&cond, &negative, req.guidance.unwrap_or(0.0))?
                 } else {
-                    v
+                    cond.clone()
+                };
+                let v = match pag_step {
+                    Some(pag_step) => {
+                        let perturbed = comps.dit.forward_prepared_with_memory_and_pag(
+                            x,
+                            &t,
+                            &prepared,
+                            pag_step.layers,
+                            candle_gen::ATTN_SCORES_BUDGET,
+                            crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                            &req.cancel,
+                        )?;
+                        krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                    }
+                    None => v_base,
                 };
 
                 Ok(v.to_dtype(DType::F32)?)
@@ -1763,6 +1797,7 @@ fn render_img2img_from_context(
         base_seed,
         crate::KREA_2_TURBO_ID,
     )?;
+    let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -1787,7 +1822,8 @@ fn render_img2img_from_context(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let v = comps.dit.forward_prepared_with_memory(
+                    let pag_step = PagStep::for_sigma(pag.as_ref(), sub, timestep);
+                    let cond = comps.dit.forward_prepared_with_memory(
                         x,
                         &t,
                         &prepared,
@@ -1795,7 +1831,7 @@ fn render_img2img_from_context(
                         crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                         &req.cancel,
                     )?;
-                    let v = if let Some(negative) = &prepared_neg {
+                    let v_base = if let Some(negative) = &prepared_neg {
                         let negative = comps.dit.forward_prepared_with_memory(
                             x,
                             &t,
@@ -1804,9 +1840,24 @@ fn render_img2img_from_context(
                             crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                             &req.cancel,
                         )?;
-                        krea_cfg_combine(&v, &negative, req.guidance.unwrap_or(0.0))?
+                        krea_cfg_combine(&cond, &negative, req.guidance.unwrap_or(0.0))?
                     } else {
-                        v
+                        cond.clone()
+                    };
+                    let v = match pag_step {
+                        Some(pag_step) => {
+                            let perturbed = comps.dit.forward_prepared_with_memory_and_pag(
+                                x,
+                                &t,
+                                &prepared,
+                                pag_step.layers,
+                                candle_gen::ATTN_SCORES_BUDGET,
+                                crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                                &req.cancel,
+                            )?;
+                            krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                        }
+                        None => v_base,
                     };
 
                     Ok(v.to_dtype(DType::F32)?)
@@ -1876,7 +1927,7 @@ fn encode_base_contexts(
     // layers → the DiT's text_fusion context [1, n_tok, 12, 2560].
     let context = encode_prompt_context(text, req)?;
 
-    let neg_context = if guidance != 0.0 {
+    let neg_context = if krea_uses_cfg(guidance) {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
         Some(encode_negative_context(text, negative)?)
     } else {
@@ -1938,6 +1989,7 @@ fn render_base_from_contexts(
         base_seed,
         crate::KREA_2_RAW_ID,
     )?;
+    let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -1955,6 +2007,7 @@ fn render_base_from_contexts(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
                 let cond = comps.dit.forward_prepared_with_memory(
                     x,
                     &t,
@@ -1963,9 +2016,9 @@ fn render_base_from_contexts(
                     crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                     &req.cancel,
                 )?;
-                // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
+                // Two-forward CFG when a negative context was prepared; else the bare
                 // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`).
-                let v = match neg_context {
+                let v_base = match neg_context {
                     Some(_) => {
                         let uncond = comps.dit.forward_prepared_with_memory(
                             x,
@@ -1979,7 +2032,22 @@ fn render_base_from_contexts(
                         )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
-                    None => cond,
+                    None => cond.clone(),
+                };
+                let v = match pag_step {
+                    Some(pag_step) => {
+                        let perturbed = comps.dit.forward_prepared_with_memory_and_pag(
+                            x,
+                            &t,
+                            &prepared,
+                            pag_step.layers,
+                            candle_gen::ATTN_SCORES_BUDGET,
+                            crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                            &req.cancel,
+                        )?;
+                        krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                    }
+                    None => v_base,
                 };
                 Ok(v.to_dtype(DType::F32)?)
             },
@@ -2169,14 +2237,15 @@ fn render_multiphase_driver<T>(
     // then retain the tensors while the per-seed loop re-applies the same adapter stack to the mutable
     // job-local DiT. The prepared state is value-owned, so it remains correct when the next phase swaps
     // adapters; this avoids repeating text fusion for every image in a multi-phase request.
+    let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
     let mut phase_prepared = Vec::with_capacity(resolved.len());
     for (phase, specs) in resolved.iter().zip(&phase_specs) {
         materialize_multiphase_adapter_set(&mut dit, specs)?;
         let positive = dit.prepare_conditioning(context, req.width, req.height)?;
-        let negative = if phase.guidance != 0.0 {
+        let negative = if krea_uses_cfg(phase.guidance) {
             let context = neg_context.ok_or_else(|| {
                 CandleError::Msg(
-                    "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                    "krea_2 multi-phase: a CFG phase requires the \
                      unconditional context, but none was encoded"
                         .into(),
                 )
@@ -2224,6 +2293,7 @@ fn render_multiphase_driver<T>(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
                     let cond = dit.forward_prepared_with_memory(
                         x,
                         &t,
@@ -2233,11 +2303,11 @@ fn render_multiphase_driver<T>(
                         &req.cancel,
                     )?;
                     // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
-                    // guidance > 0; else the bare conditional velocity (single forward).
-                    let v = if guidance != 0.0 {
+                    // CFG is active; else the bare conditional velocity (single forward).
+                    let v_base = if krea_uses_cfg(guidance) {
                         let negative = negative.as_ref().ok_or_else(|| {
                             CandleError::Msg(
-                                "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                                "krea_2 multi-phase: a CFG phase requires the \
                                  unconditional context, but none was encoded"
                                     .into(),
                             )
@@ -2252,7 +2322,22 @@ fn render_multiphase_driver<T>(
                         )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     } else {
-                        cond
+                        cond.clone()
+                    };
+                    let v = match pag_step {
+                        Some(pag_step) => {
+                            let perturbed = dit.forward_prepared_with_memory_and_pag(
+                                x,
+                                &t,
+                                positive,
+                                pag_step.layers,
+                                candle_gen::ATTN_SCORES_BUDGET,
+                                crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                                &req.cancel,
+                            )?;
+                            krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                        }
+                        None => v_base,
                     };
                     Ok(v.to_dtype(DType::F32)?)
                 },
@@ -2448,6 +2533,7 @@ fn render_base_img2img_from_contexts(
         base_seed,
         crate::KREA_2_RAW_ID,
     )?;
+    let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -2472,6 +2558,7 @@ fn render_base_img2img_from_contexts(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let pag_step = PagStep::for_sigma(pag.as_ref(), sub, timestep);
                     let cond = comps.dit.forward_prepared_with_memory(
                         x,
                         &t,
@@ -2480,10 +2567,10 @@ fn render_base_img2img_from_contexts(
                         crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                         &req.cancel,
                     )?;
-                    // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
+                    // Two-forward CFG when a negative context was prepared; else the bare
                     // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`),
                     // exactly as `render_base`.
-                    let v = match neg_context {
+                    let v_base = match neg_context {
                         Some(_) => {
                             let uncond = comps.dit.forward_prepared_with_memory(
                                 x,
@@ -2497,7 +2584,22 @@ fn render_base_img2img_from_contexts(
                             )?;
                             krea_cfg_combine(&cond, &uncond, guidance)?
                         }
-                        None => cond,
+                        None => cond.clone(),
+                    };
+                    let v = match pag_step {
+                        Some(pag_step) => {
+                            let perturbed = comps.dit.forward_prepared_with_memory_and_pag(
+                                x,
+                                &t,
+                                &prepared,
+                                pag_step.layers,
+                                candle_gen::ATTN_SCORES_BUDGET,
+                                crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                                &req.cancel,
+                            )?;
+                            krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                        }
+                        None => v_base,
                     };
                     Ok(v.to_dtype(DType::F32)?)
                 },
@@ -2619,7 +2721,7 @@ pub(crate) fn encode_edit_context(
         grounding.condition(&text.tok, &text.te, &req.prompt)?,
         req.text_style_gain,
     )?;
-    let neg_context = if guidance != 0.0 {
+    let neg_context = if krea_uses_cfg(guidance) {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
         Some(grounding.condition(&text.tok, &text.te, negative)?)
     } else {
@@ -2719,12 +2821,10 @@ fn render_edit_from_context(
     // else `None` → the native QwenVae decode. The edit id honors `use_pid` exactly like its `render` /
     // `render_base` txt2img siblings — an edit generator loaded with a PiD engine (`spec.pid`) is no
     // longer a dead wire. `model_id` names the surface for the error message (Raw vs distilled Turbo edit).
-    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-        heavy.pid.as_deref(),
-        req,
-        base_seed,
-        edit_pid_model_id(distilled),
-    )?;
+    let model_id = edit_pid_model_id(distilled);
+    let pid_decoder =
+        candle_gen_pid::resolve_pid_decoder(heavy.pid.as_deref(), req, base_seed, model_id)?;
+    let pag = resolve_pag_for_id(model_id, req)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -2743,25 +2843,35 @@ fn render_edit_from_context(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
                 // Thread the request's cancel flag into the block loop (sc-16003): an edit step at
                 // 2048² is ~45 s (a ~37k-token joint sequence), far too long for the sampler's
                 // between-steps poll to be the only checkpoint. Both CFG legs honor it.
-                let forward_edit = |prepared: &crate::transformer::PreparedConditioning| {
-                    heavy.dit.forward_edit_prepared_with_memory(
+                let forward_edit = |prepared: &crate::transformer::PreparedConditioning,
+                                    layers: &[u32]| {
+                    heavy.dit.forward_edit_prepared_with_memory_and_pag(
                         x,
                         &t,
                         prepared,
+                        layers,
                         candle_gen::ATTN_SCORES_BUDGET,
                         &req.cancel,
                     )
                 };
-                let cond = forward_edit(&prepared)?;
-                let v = match &prepared_neg {
+                let cond = forward_edit(&prepared, &[])?;
+                let v_base = match &prepared_neg {
                     Some(negative) => {
-                        let uncond = forward_edit(negative)?;
+                        let uncond = forward_edit(negative, &[])?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
-                    None => cond,
+                    None => cond.clone(),
+                };
+                let v = match pag_step {
+                    Some(pag_step) => {
+                        let perturbed = forward_edit(&prepared, pag_step.layers)?;
+                        krea_pag_combine(&v_base, &cond, &perturbed, pag_step.scale)?
+                    }
+                    None => v_base,
                 };
                 Ok(v.to_dtype(DType::F32)?)
             },
@@ -2955,6 +3065,121 @@ fn edit_pid_model_id(distilled: bool) -> &'static str {
 /// truth so the Raw inference path (sc-9994) and the trainer preview (`training::render_sample`) can
 /// never drift again (mirrors the mlx-gen sc-10009 dedupe). The caller runs this only for
 /// `guidance > 0` (a single conditional forward otherwise, matching `cfg = guidance > 0`).
+/// Whether classifier-free guidance (an unconditional branch) is active for Krea 2 (SW-7176).
+///
+/// Both `0.0` (Krea's offset-by-one CFG-free sentinel) and `1.0` (the unified SceneWorks CFG-off
+/// guidance value) disable the unconditional pass so CFG-free Turbo and low-guidance Raw/Edit
+/// (`guidance = 1.0`) run single-pass baseline or 2-pass (`cond + perturbed`) PAG without needing a
+/// negative prompt.
+pub fn krea_uses_cfg(guidance: f32) -> bool {
+    guidance != 0.0 && guidance != 1.0
+}
+
+/// Active per-step Perturbed-Attention Guidance parameters resolved against the executed schedule
+/// (SW-7176). `None` outside `[start, stop)` or when `pag` is unset / `scale == 0.0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PagStep<'a> {
+    pub(crate) scale: f32,
+    pub(crate) layers: &'a [u32],
+}
+
+impl<'a> PagStep<'a> {
+    pub(crate) fn for_sigma(
+        pag: Option<&'a gen_core::PagResolved>,
+        schedule_sigmas: &[f32],
+        timestep: f32,
+    ) -> Option<Self> {
+        let pag = pag?;
+        let total_steps = schedule_sigmas.len().saturating_sub(1);
+        if total_steps == 0 {
+            return None;
+        }
+        let step_index = schedule_sigmas[..total_steps]
+            .iter()
+            .rposition(|&s| s >= timestep)
+            .unwrap_or(0);
+        let scale = pag.step_scale(step_index, total_steps);
+        if scale <= 0.0 {
+            return None;
+        }
+        let layers = pag.step_layers(step_index, total_steps);
+        if layers.is_empty() {
+            return None;
+        }
+        Some(Self { scale, layers })
+    }
+}
+
+pub(crate) fn resolve_pag_for_id(
+    id: &str,
+    req: &GenerationRequest,
+) -> Result<Option<gen_core::PagResolved>> {
+    let cap = match id {
+        crate::KREA_2_RAW_ID | crate::KREA_2_EDIT_ID => Some(crate::raw_pag_capability()),
+        crate::KREA_2_TURBO_ID | crate::KREA_2_TURBO_EDIT_ID => Some(crate::turbo_pag_capability()),
+        _ => None,
+    };
+    let effective = req
+        .effective_pag()
+        .map_err(|err| CandleError::Msg(format!("{id}: {err}")))?;
+    gen_core::resolve_pag(cap.as_ref(), id, effective).map_err(|err| match err.kind() {
+        gen_core::PagPolicyErrorKind::Unsupported => CandleError::Unsupported(err.to_string()),
+        gen_core::PagPolicyErrorKind::Invalid => CandleError::Msg(format!("{id}: {err}")),
+    })
+}
+
+/// Executed step count for `req` across Krea's T2I, Edit, Img2Img, and Multi-phase schedules,
+/// feeding [`gen_core::PagResolved::execution_report`] (SW-7176).
+pub(crate) fn executed_steps_for_request(
+    raw_schedule: bool,
+    img2img_strength: Option<Option<f32>>,
+    multiphase: Option<&[crate::multiphase::ResolvedPhase]>,
+    req: &GenerationRequest,
+) -> Result<u32> {
+    if let Some(resolved) = multiphase {
+        let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
+        let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+            total,
+            &native,
+        )?;
+        return Ok(sigmas.len().saturating_sub(1) as u32);
+    }
+    let default_steps = if raw_schedule { RAW_STEPS } else { TURBO_STEPS };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
+    let sigmas = if raw_schedule {
+        let native = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+        candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+            steps,
+            &native,
+        )?
+    } else {
+        let native = turbo_sigmas(steps);
+        candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            TURBO_MU as f32,
+            steps,
+            &native,
+        )?
+    };
+    if let Some(strength) = img2img_strength {
+        let start = init_time_step(steps, strength).min(sigmas.len().saturating_sub(1));
+        let sub = &sigmas[start..];
+        if sub.len() < 2 {
+            return Ok(0);
+        }
+        return Ok((sub.len() - 1) as u32);
+    }
+    Ok(sigmas.len().saturating_sub(1) as u32)
+}
+
 pub(crate) fn krea_cfg_combine(
     v_cond: &Tensor,
     v_uncond: &Tensor,
@@ -2962,6 +3187,24 @@ pub(crate) fn krea_cfg_combine(
 ) -> Result<Tensor> {
     let guided = ((v_cond - v_uncond)? * guidance as f64)?;
     Ok((v_cond + guided)?)
+}
+
+/// Perturbed-Attention Guidance velocity combine (`v_base + pag_scale · (v_cond − v_perturbed)`,
+/// SW-7176), delegating to [`gen_core::guidance::pag_apply`].
+pub(crate) fn krea_pag_combine(
+    v_base: &Tensor,
+    v_cond: &Tensor,
+    v_perturbed: &Tensor,
+    pag_scale: f32,
+) -> Result<Tensor> {
+    gen_core::guidance::pag_apply(
+        &candle_gen::sampler::CandleLatentOps,
+        v_base,
+        v_cond,
+        v_perturbed,
+        pag_scale,
+    )
+    .map_err(CandleError::from)
 }
 
 /// Resolve the img2img start step — the candle port of `mlx_gen::img2img::init_time_step` (the fork's
@@ -4355,6 +4598,79 @@ mod tests {
             pixels: vec![0u8; 10],
         };
         assert!(preprocess_img2img_init(&bad, 4, 4, &Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn pag_step_window_and_combine_cover_noop_2pass_3pass_and_multiphase() {
+        use candle_gen::gen_core::PagConfig;
+
+        // 8-step Turbo schedule with default window [0.0, 0.75): steps 0..6 active (2-pass),
+        // steps 6..8 inactive (1-pass).
+        let turbo_cap = crate::turbo_pag_capability();
+        let turbo_pag = turbo_cap
+            .resolve(Some(&PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }))
+            .unwrap();
+        let turbo_sig = turbo_sigmas(8);
+        assert_eq!(turbo_sig.len(), 9);
+        let active_turbo: Vec<usize> = (0..8)
+            .filter(|&i| PagStep::for_sigma(Some(&turbo_pag), &turbo_sig, turbo_sig[i]).is_some())
+            .collect();
+        assert_eq!(active_turbo, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(PagStep::for_sigma(None, &turbo_sig, turbo_sig[0]), None);
+        let turbo_report = turbo_pag.execution_report(8);
+        assert_eq!(turbo_report.active_steps, 6);
+        assert_eq!(turbo_report.total_steps, 8);
+        assert_eq!(turbo_report.layers, vec![14]);
+
+        // 2-pass (`cond + scale * (cond - perturbed)`) vs 3-pass (`cfg + scale * (cond - perturbed)`).
+        let cond = Tensor::from_vec(vec![3.0f32, -1.0], (2,), &Device::Cpu).unwrap();
+        let uncond = Tensor::from_vec(vec![1.0f32, 0.5], (2,), &Device::Cpu).unwrap();
+        let perturbed = Tensor::from_vec(vec![2.0f32, -2.0], (2,), &Device::Cpu).unwrap();
+        let two_pass = krea_pag_combine(&cond, &cond, &perturbed, 1.5)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(two_pass, vec![4.5, 0.5]);
+
+        let cfg = krea_cfg_combine(&cond, &uncond, 3.5).unwrap();
+        let three_pass = krea_pag_combine(&cfg, &cond, &perturbed, 1.5)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(three_pass, vec![11.5, -4.75]);
+
+        let noop = krea_pag_combine(&cfg, &cond, &perturbed, 0.0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(noop, cfg.to_vec1::<f32>().unwrap());
+
+        // Multiphase global schedule [4 + 4 = 8 steps] with PAG window [0.25, 0.75):
+        // phase 0 runs steps 0..4 (active at 2, 3), phase 1 runs steps 4..8 (active at 4, 5).
+        let raw_cap = crate::raw_pag_capability();
+        let mp_pag = raw_cap
+            .resolve(Some(&PagConfig {
+                scale: 1.5,
+                start: Some(0.25),
+                stop: Some(0.75),
+                ..Default::default()
+            }))
+            .unwrap();
+        let full = base_schedule(8, 1024, 1024, None);
+        let phase0 = &full[0..=4];
+        let phase1 = &full[4..=8];
+        let p0_active: Vec<usize> = (0..4)
+            .filter(|&i| PagStep::for_sigma(Some(&mp_pag), &full, phase0[i]).is_some())
+            .collect();
+        let p1_active: Vec<usize> = (0..4)
+            .filter(|&i| PagStep::for_sigma(Some(&mp_pag), &full, phase1[i]).is_some())
+            .collect();
+        assert_eq!(p0_active, vec![2, 3]);
+        assert_eq!(p1_active, vec![0, 1]);
+        assert_eq!(mp_pag.execution_report(8).active_steps, 4);
     }
 }
 

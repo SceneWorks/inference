@@ -315,6 +315,34 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 /// `krea_2_edit` disambiguates edit from img2img.
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 
+/// Curated Perturbed-Attention Guidance capability for 8-step CFG-free Krea 2 Turbo / Turbo Edit
+/// (`num_blocks = 28`, mid-stack single-stream block `[14]`, gentle `[0.0, 0.75)` window, SW-7176).
+pub fn turbo_pag_capability() -> mlx_gen::gen_core::PagCapability {
+    mlx_gen::gen_core::PagCapability {
+        num_blocks: 28,
+        block_domain: std::borrow::Cow::Borrowed("single_stream_blocks"),
+        default_layers: vec![14],
+        default_start: 0.0,
+        default_stop: 0.75,
+        recommended_scale: 1.2,
+        max_scale: mlx_gen::gen_core::DEFAULT_PAG_MAX_SCALE,
+    }
+}
+
+/// Curated Perturbed-Attention Guidance capability for undistilled Krea 2 Raw / Raw Edit
+/// (`num_blocks = 28`, mid-stack single-stream block `[14]`, full `[0.0, 1.0]` window, SW-7176).
+pub fn raw_pag_capability() -> mlx_gen::gen_core::PagCapability {
+    mlx_gen::gen_core::PagCapability {
+        num_blocks: 28,
+        block_domain: std::borrow::Cow::Borrowed("single_stream_blocks"),
+        default_layers: vec![14],
+        default_start: 0.0,
+        default_stop: 1.0,
+        recommended_scale: 1.5,
+        max_scale: mlx_gen::gen_core::DEFAULT_PAG_MAX_SCALE,
+    }
+}
+
 /// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
 /// distillation baked the guided velocity into the weights, so no unconditional branch / `guidance`),
@@ -360,6 +388,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            pag: Some(turbo_pag_capability()),
             ..Default::default()
         },
     }
@@ -380,6 +409,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
+    d.capabilities.pag = Some(raw_pag_capability());
     // img2img reference latent-init (epic 8588 slice A, sc-10224): Raw advertises `Reference` just like
     // Turbo, but routes to the CFG entrypoint `generate_base_img2img_with_progress` (honoring guidance +
     // negative prompt), NOT the CFG-free Turbo one. Inherited from `descriptor()` — same single-Reference
@@ -1197,7 +1227,24 @@ impl Generator for Krea {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_report_observed(req, on_progress)
+                .map(|report| {
+                    report
+                        .output
+                        .expect("Krea image generation always produces GenerationOutput")
+                })
+        })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_report_observed(req, on_progress)
+        })
     }
 
     fn generate_with_execution_report(
@@ -1221,19 +1268,18 @@ impl Generator for Krea {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_report_observed(req, &mut progress)
             },
         )
     }
 }
 
 impl Krea {
-    fn generate_observed(
+    fn generate_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -1245,16 +1291,14 @@ impl Krea {
     /// `Sequential` loads the text phase, encodes, then the seam materializes + DROPS it + `clear_cache()`
     /// so its ~4 GB frees before the DiT/VAE load. `is_edit` uses the Qwen3-VL grounded encode over the
     /// source image; `is_raw`/Turbo the plain text encode. The unconditional context is built only when
-    /// `guidance > 0` (reference `cfg = guidance > 0`; Turbo is CFG-free → always `None`). Called by the
-    /// shared residency seam's encode closure with the phase-A `text` component.
+    /// `encode_neg` is true (`krea_uses_cfg(guidance)`); CFG-free Turbo and `guidance == 1.0` skip it.
     #[allow(clippy::too_many_arguments)]
     fn encode_contexts(
         &self,
         text: &KreaText,
         req: &GenerationRequest,
-        is_raw: bool,
         is_edit: bool,
-        guidance: f32,
+        encode_neg: bool,
         negative: &str,
         edit_sources: &[&Image],
     ) -> Result<KreaContexts> {
@@ -1277,29 +1321,23 @@ impl Krea {
                 text.encode_grounded_from_vision(&gv, &req.prompt)?,
                 req.text_style_gain,
             )?;
-            let neg = if guidance != 0.0 {
+            let neg = if encode_neg {
                 Some(text.encode_grounded_from_vision(&gv, negative)?)
             } else {
                 None
             };
             Ok(KreaContexts { pos, neg })
-        } else if is_raw || guidance != 0.0 {
+        } else {
             // POSITIVE context carries the Krea "text style" tap-reweight gain (sc-11878); the
             // CFG-negative context is encoded WITHOUT it so the knob steers only the conditional
             // prediction (mirrors candle-gen-krea `encode_prompt_context`). `None`/g≈1 is a no-op.
             let pos = maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
-            let neg = if guidance != 0.0 {
+            let neg = if encode_neg {
                 Some(text.encode(negative)?)
             } else {
                 None
             };
             Ok(KreaContexts { pos, neg })
-        } else {
-            // Turbo (CFG-free) t2i/img2img: single conditional context, gain applied (no negative).
-            Ok(KreaContexts {
-                pos: maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?,
-                neg: None,
-            })
         }
     }
 
@@ -1312,18 +1350,19 @@ impl Krea {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<mlx_gen::gen_core::GenerationReport> {
         validate_request(&self.descriptor, req)?;
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
         let request = self.resolve_request(req)?;
+        let pag_report = request.pag_execution_report();
 
         // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
         // the Qwen3-VL-4B text phase, encodes, materializes, then DROPS it + `clear_cache()` so its
         // ~4 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows
         // the warm text phase. Edit grounds on ALL source images (scene + person), F-071.
-        self.residency.run(
+        let output = self.residency.run(
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -1343,7 +1382,10 @@ impl Krea {
             |heavy_owned, ctx, on_progress| {
                 self.render_phase(heavy_owned.as_ref(), &ctx, &request, on_progress)
             },
-        )
+        )?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.pag = pag_report;
+        Ok(report)
     }
 
     /// Everything the request resolves before the residency lifecycle: the variant's render path,
@@ -1441,8 +1483,13 @@ impl Krea {
             .unwrap_or(if is_raw { DEFAULT_RAW_GUIDANCE } else { 0.0 });
         let negative = req.negative_prompt.clone().unwrap_or_default();
         let multiphase = self.resolve_multiphase(req, guidance)?;
+        let pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?;
         mlx_gen::image_execution::scalar("krea.guidance", guidance);
         mlx_gen::image_execution::policy_debug("krea.resolved_phases", &multiphase.phases);
+        mlx_gen::image_execution::policy_debug("krea.pag", &pag);
         Ok(KreaRequest {
             req,
             transformer_window_size,
@@ -1459,6 +1506,7 @@ impl Krea {
             guidance,
             negative,
             multiphase,
+            pag,
         })
     }
 
@@ -1471,10 +1519,8 @@ impl Krea {
     /// phases' steps); every phase runs a contiguous slice of it — the crux that keeps the sigma
     /// trajectory continuous across boundaries (no per-phase recompute / reset).
     ///
-    /// The returned guidance gates the text encode's unconditional context: built iff ANY phase
-    /// runs CFG (guidance > 0). A single positive value suffices for `encode_contexts`' neg-gate (it
-    /// consults `guidance` only as `guidance > 0`, never in the combine — the per-phase guidance
-    /// drives the actual CFG combine). `None` phases ⇒ the ordinary single-phase render.
+    /// `encode_neg` gates the text encode's unconditional context: built iff ANY phase runs CFG
+    /// (`crate::pipeline::krea_uses_cfg`). `None` phases ⇒ the ordinary single-phase render.
     fn resolve_multiphase(&self, req: &GenerationRequest, guidance: f32) -> Result<KreaMultiphase> {
         let resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
             Some(list) if !list.is_empty() => {
@@ -1502,14 +1548,15 @@ impl Krea {
                 )?)
             })
             .transpose()?;
-        let encode_guidance = match &resolved {
-            Some(resolved) if multiphase::any_phase_uses_cfg(resolved) => 1.0,
-            Some(_) => 0.0,
-            None => guidance,
+        let encode_neg = match &resolved {
+            Some(resolved) => resolved
+                .iter()
+                .any(|p| crate::pipeline::krea_uses_cfg(p.guidance)),
+            None => crate::pipeline::krea_uses_cfg(guidance),
         };
         Ok(KreaMultiphase {
             phases: resolved.zip(sigmas),
-            encode_guidance,
+            encode_neg,
         })
     }
 
@@ -1519,9 +1566,8 @@ impl Krea {
         let ctx = self.encode_contexts(
             text,
             req,
-            request.is_raw,
             request.is_edit,
-            request.multiphase.encode_guidance,
+            request.multiphase.encode_neg,
             &request.negative,
             &request.edit_sources,
         )?;
@@ -1592,13 +1638,16 @@ impl Krea {
             KreaRenderPlan::Turbo(plan) | KreaRenderPlan::BaseCfg(plan) => {
                 plan.guidance = request.guidance;
                 plan.sigmas = Some(request.sigmas.clone());
+                plan.pag = request.pag.clone();
             }
             KreaRenderPlan::Img2ImgRaw { plan, .. } | KreaRenderPlan::Img2ImgTurbo { plan, .. } => {
                 plan.guidance = request.guidance;
                 plan.sigmas = Some(request.sigmas.clone());
+                plan.pag = request.pag.clone();
             }
             KreaRenderPlan::Edit(plan) => {
                 plan.sigmas = Some(request.sigmas.clone());
+                plan.pag = request.pag.clone();
             }
         }
         let mut images = Vec::with_capacity(req.count as usize);
@@ -1637,7 +1686,7 @@ impl Krea {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let req = request.req;
-        let plans = self.file_pin_spec.read_files_unchanged(
+        let mut plans = self.file_pin_spec.read_files_unchanged(
             self.adapters.iter().map(|adapter| &adapter.path),
             || {
                 heavy.heavy.prepare_multiphase(
@@ -1650,6 +1699,9 @@ impl Krea {
                 )
             },
         )?;
+        for phase_plan in &mut plans {
+            phase_plan.plan.pag = request.pag.clone();
+        }
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let opts = self.turbo_options(request, full.len().saturating_sub(1), n);
@@ -1777,13 +1829,39 @@ struct KreaRequest<'r> {
     guidance: f32,
     negative: String,
     multiphase: KreaMultiphase,
+    pag: Option<mlx_gen::gen_core::PagResolved>,
 }
 
-/// The multi-phase plan (epic 13879): the resolved phases with their one global schedule, and the
-/// guidance that gates the text encode's unconditional context.
+impl KreaRequest<'_> {
+    /// Executed step count across all Krea routes (single-phase, PiD-truncated, img2img-sliced,
+    /// and multi-phase global schedule), feeding [`mlx_gen::gen_core::PagResolved::execution_report`].
+    fn executed_steps(&self) -> u32 {
+        let steps = if let Some((_, full)) = &self.multiphase.phases {
+            full.len().saturating_sub(1)
+        } else if let Some((_, strength)) = self.img2img {
+            let start =
+                init_time_step(self.steps, Some(strength)).min(self.sigmas.len().saturating_sub(1));
+            let end = self.keep.min(self.sigmas.len());
+            end.saturating_sub(start).saturating_sub(1)
+        } else {
+            let end = self.keep.min(self.sigmas.len());
+            end.saturating_sub(1)
+        };
+        steps as u32
+    }
+
+    fn pag_execution_report(&self) -> Option<mlx_gen::gen_core::PagExecutionReport> {
+        self.pag
+            .as_ref()
+            .map(|pag| pag.execution_report(self.executed_steps()))
+    }
+}
+
+/// The multi-phase plan (epic 13879): the resolved phases with their one global schedule, and
+/// whether any phase requires an unconditional CFG context.
 struct KreaMultiphase {
     phases: Option<(Vec<ResolvedPhase>, Vec<f32>)>,
-    encode_guidance: f32,
+    encode_neg: bool,
 }
 
 /// One image through the single-phase plan's render body.
@@ -1885,7 +1963,7 @@ pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Resu
     }
     desc.capabilities.validate_request(id, req)?;
     if id.starts_with("krea_2_turbo")
-        && req.guidance.unwrap_or(0.0) == 0.0
+        && !crate::pipeline::krea_uses_cfg(req.guidance.unwrap_or(0.0))
         && req
             .negative_prompt
             .as_ref()
@@ -4159,5 +4237,189 @@ mod tests {
     fn single_phase_request_is_unaffected() {
         assert!(validate_request(&raw_descriptor(), &req(1024, 1024)).is_ok());
         assert_eq!(req(1024, 1024).phases, None);
+    }
+
+    #[test]
+    fn pag_capabilities_advertised_on_all_four_krea_variants_and_cleared_on_control() {
+        for desc in [
+            descriptor(),
+            turbo_edit_descriptor(),
+            raw_descriptor(),
+            edit_descriptor(),
+            crate::model_control::descriptor(),
+        ] {
+            assert!(
+                mlx_gen::gen_core::registry::model_descriptor_errors(&desc).is_empty(),
+                "{}: {:?}",
+                desc.id,
+                mlx_gen::gen_core::registry::model_descriptor_errors(&desc)
+            );
+        }
+
+        for desc in [descriptor(), turbo_edit_descriptor()] {
+            let pag = desc
+                .capabilities
+                .pag
+                .as_ref()
+                .expect("Turbo PAG advertised");
+            assert_eq!(pag.num_blocks, 28);
+            assert_eq!(pag.block_domain, "single_stream_blocks");
+            assert_eq!(pag.default_layers, vec![14]);
+            assert_eq!(pag.default_start, 0.0);
+            assert_eq!(pag.default_stop, 0.75);
+            assert_eq!(pag.recommended_scale, 1.2);
+            assert_eq!(pag.max_scale, 15.0);
+        }
+
+        for desc in [raw_descriptor(), edit_descriptor()] {
+            let pag = desc.capabilities.pag.as_ref().expect("Raw PAG advertised");
+            assert_eq!(pag.num_blocks, 28);
+            assert_eq!(pag.block_domain, "single_stream_blocks");
+            assert_eq!(pag.default_layers, vec![14]);
+            assert_eq!(pag.default_start, 0.0);
+            assert_eq!(pag.default_stop, 1.0);
+            assert_eq!(pag.recommended_scale, 1.5);
+            assert_eq!(pag.max_scale, 15.0);
+        }
+
+        let ctrl = crate::model_control::descriptor();
+        assert!(ctrl.capabilities.pag.is_none());
+        let mut ctrl_req = req(1024, 1024);
+        ctrl_req.conditioning = vec![Conditioning::Control {
+            image: tiny_image(),
+            kind: mlx_gen::ControlKind::Pose,
+            scale: Some(1.0),
+        }];
+        ctrl_req.pag = Some(mlx_gen::gen_core::PagConfig {
+            scale: 1.2,
+            ..Default::default()
+        });
+        assert!(matches!(
+            ctrl.capabilities.validate_request(ctrl.id, &ctrl_req),
+            Err(mlx_gen::gen_core::Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn pag_request_validation_enforces_block_range_and_zero_scale_noop() {
+        use mlx_gen::gen_core::PagConfig;
+
+        for desc in [
+            descriptor(),
+            raw_descriptor(),
+            edit_descriptor(),
+            turbo_edit_descriptor(),
+        ] {
+            let mut base = req(1024, 1024);
+            if desc.id == KREA_2_EDIT_ID || desc.id == KREA_2_TURBO_EDIT_ID {
+                base.conditioning = vec![Conditioning::Reference {
+                    image: tiny_image(),
+                    strength: None,
+                }];
+            }
+
+            // Valid curated default + explicit boundary blocks 0..28.
+            let mut ok_default = base.clone();
+            ok_default.pag = Some(PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            });
+            assert!(validate_request(&desc, &ok_default).is_ok());
+            let resolved = desc
+                .capabilities
+                .resolve_pag(desc.id, &ok_default)
+                .unwrap()
+                .expect("active PAG resolves");
+            assert_eq!(resolved.layers, vec![14]);
+
+            let mut ok_bounds = base.clone();
+            ok_bounds.pag = Some(PagConfig {
+                scale: 1.5,
+                layers: Some(vec![27, 0, 14, 0]),
+                ..Default::default()
+            });
+            assert!(validate_request(&desc, &ok_bounds).is_ok());
+            assert_eq!(
+                desc.capabilities
+                    .resolve_pag(desc.id, &ok_bounds)
+                    .unwrap()
+                    .unwrap()
+                    .layers,
+                vec![0, 14, 27]
+            );
+
+            // scale == 0.0 is a strict zero-pass no-op (`resolve_pag` -> None), while still
+            // validating block indices `0..28`.
+            let mut zero_noop = base.clone();
+            zero_noop.pag = Some(PagConfig {
+                scale: 0.0,
+                layers: Some(vec![14]),
+                ..Default::default()
+            });
+            assert!(validate_request(&desc, &zero_noop).is_ok());
+            assert_eq!(
+                desc.capabilities.resolve_pag(desc.id, &zero_noop).unwrap(),
+                None
+            );
+
+            let mut bad_zero_layer = base.clone();
+            bad_zero_layer.pag = Some(PagConfig {
+                scale: 0.0,
+                layers: Some(vec![28]),
+                ..Default::default()
+            });
+            assert!(validate_request(&desc, &bad_zero_layer).is_err());
+
+            for bad in [
+                PagConfig {
+                    scale: 1.5,
+                    layers: Some(vec![28]),
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: -0.1,
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: 15.1,
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: f32::NAN,
+                    ..Default::default()
+                },
+                PagConfig {
+                    scale: 1.5,
+                    start: Some(0.8),
+                    stop: Some(0.2),
+                    ..Default::default()
+                },
+            ] {
+                let mut invalid = base.clone();
+                invalid.pag = Some(bad);
+                assert!(validate_request(&desc, &invalid).is_err());
+            }
+        }
+
+        // Low-guidance Raw / Edit (`guidance == 1.0`) with PAG and no negative prompt validates
+        // cleanly and treats CFG as inactive (`!krea_uses_cfg(1.0)`).
+        for desc in [raw_descriptor(), edit_descriptor()] {
+            let mut r = req(1024, 1024);
+            r.guidance = Some(1.0);
+            r.negative_prompt = None;
+            r.pag = Some(PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            });
+            if desc.id == KREA_2_EDIT_ID {
+                r.conditioning = vec![Conditioning::MultiReference {
+                    images: vec![tiny_image(), tiny_image()],
+                }];
+            }
+            assert!(validate_request(&desc, &r).is_ok());
+            assert!(!crate::pipeline::krea_uses_cfg(1.0));
+            assert!(!crate::pipeline::krea_uses_cfg(0.0));
+            assert!(crate::pipeline::krea_uses_cfg(3.5));
+        }
     }
 }
