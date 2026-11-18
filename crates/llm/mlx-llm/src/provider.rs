@@ -4045,6 +4045,12 @@ impl LlamaProvider {
             KvPlan::Unreported | KvPlan::Dense(_) => None,
         };
 
+        // A compressed cache verifies linearly, so admission prices no tree for it and the report
+        // names why (SW-F328, E5/E6).
+        let (tree_rows, tree_kv_fallback) =
+            tree_rows_for_kv_plan(tree_rows, compressed_format.is_some());
+        fallbacks.extend(tree_kv_fallback.map(str::to_string));
+
         // The cross-turn prefix cache (sc-24437) keys on token ids, which cannot tell two images
         // (or clips) behind the same placeholder ids apart — a multimodal prompt neither reads nor
         // feeds it, and the report says so. The hybrid decoder snapshots at the end of the
@@ -4956,6 +4962,22 @@ fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
 /// Why a multimodal request's tree verification ran linearly (feature SW-F328).
 const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not available on the \
      multimodal decode path (its prompt is prefilled from spliced embeddings); verified linearly";
+
+/// Why a compressed-KV request's tree verification ran linearly (feature SW-F328): a compressed
+/// cache cannot keep an arbitrary accepted branch ([`KvCache::supports_tree_verify`]).
+const TREE_COMPRESSED_KV_LINEAR: &str = "speculative: tree verification is not available on a \
+     compressed KV cache (it cannot keep an arbitrary accepted branch); verified linearly";
+
+/// The tree rows a request runs and prices, and the fallback naming why they dropped (feature
+/// SW-F328, E5/E6). A request on a compressed KV plan verifies linearly, so admission prices no
+/// tree workspace for it; every other request keeps `tree_rows`.
+fn tree_rows_for_kv_plan(tree_rows: usize, compressed: bool) -> (usize, Option<&'static str>) {
+    if compressed && tree_rows > 0 {
+        (0, Some(TREE_COMPRESSED_KV_LINEAR))
+    } else {
+        (tree_rows, None)
+    }
+}
 
 /// The tree advertisement a loaded decoder carries (feature SW-F328): every Causal decoder but
 /// Gemma 4 ([`CausalLm::tree_unsupported`]) and the Qwen35 hybrid verify up to
@@ -6241,6 +6263,23 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod tree_admission_tests {
+    use super::*;
+
+    /// A compressed-KV request drops its tree rows (so admission prices none) and names why;
+    /// a dense request keeps them unchanged; no tree request carries no reason.
+    #[test]
+    fn compressed_kv_drops_tree_rows_with_a_reason() {
+        assert_eq!(
+            tree_rows_for_kv_plan(16, true),
+            (0, Some(TREE_COMPRESSED_KV_LINEAR))
+        );
+        assert_eq!(tree_rows_for_kv_plan(16, false), (16, None));
+        assert_eq!(tree_rows_for_kv_plan(0, true), (0, None));
+    }
+}
 
 #[cfg(test)]
 mod numeric_policy_tests {

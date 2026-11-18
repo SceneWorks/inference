@@ -265,6 +265,18 @@ impl DecodeReport {
         self
     }
 
+    /// Name why a captioner or SVG decoder verifies a requested tree linearly (feature SW-F328,
+    /// E5): it advertises no tree verification and runs no proposer, so the shared
+    /// [`resolve_tree_verify_with`](crate::resolve_tree_verify_with) names the reason. A request
+    /// that did not ask for a tree adds nothing. Call after
+    /// [`with_captioner_reasons`](Self::with_captioner_reasons), which replaces `fallbacks`.
+    pub fn with_captioner_tree_reason(mut self, verify: crate::SpeculativeVerify) -> Self {
+        self.fallbacks.extend(
+            crate::resolve_tree_verify_with(verify, crate::SpeculativePlan::Off, None).fallback,
+        );
+        self
+    }
+
     /// The realized mean accepted length: draft tokens accepted per verification pass
     /// (`accepted_tokens / verify_steps`), or `None` when no proposer ran or no verify step did.
     /// Each verify step also commits one target-chosen token, so tokens per verify step is this
@@ -482,6 +494,20 @@ mod tests {
             graphs.starts_with("cuda_graphs: ") && graphs.contains("mlx"),
             "{graphs}"
         );
+    }
+
+    /// E5: a captioner's report names why a requested tree verified linearly, and adds nothing for
+    /// a linear request.
+    #[test]
+    fn a_captioner_report_names_the_tree_fallback_only_when_asked() {
+        let base = DecodeReport::default().with_captioner_reasons(crate::Speculative::Off);
+        let tree = base
+            .clone()
+            .with_captioner_tree_reason(crate::SpeculativeVerify::Tree { max_rows: 8 });
+        assert_eq!(tree.fallbacks.len(), 1, "{:?}", tree.fallbacks);
+        assert!(tree.fallbacks[0].contains("tree verification"));
+        let linear = base.with_captioner_tree_reason(crate::SpeculativeVerify::Linear);
+        assert!(linear.fallbacks.is_empty());
     }
 
     /// E2/E8: a captioner's report names its speculative fallback (none for `off`) and why its

@@ -1574,9 +1574,11 @@ where
     // plain loop's per-step check does.
     if cancel.is_cancelled() {
         finish = FinishReason::Cancelled;
-        return Ok(finished(
+        let mut run = finished(
             generated, finish, stats, sampler, timer, start_len, on_event,
-        ));
+        );
+        run.report.fallbacks.extend(tree_fallback);
+        return Ok(run);
     }
 
     // ---- First token: an ordinary draw from the prefill logits. ----
@@ -1616,9 +1618,11 @@ where
             cancel,
             on_event,
         )?;
-        return Ok(finished(
+        let mut run = finished(
             generated, finish, stats, sampler, timer, start_len, on_event,
-        ));
+        );
+        run.report.fallbacks.extend(tree_fallback);
+        return Ok(run);
     }
     // The next forward consumes the draw as drawn (device-resident or not); the host id serves
     // the stop check, the history, the constraint and the event.
@@ -1638,9 +1642,11 @@ where
     let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
-        return Ok(finished(
+        let mut run = finished(
             generated, finish, stats, sampler, timer, start_len, on_event,
-        ));
+        );
+        run.report.fallbacks.extend(tree_fallback);
+        return Ok(run);
     }
     if let Some(c) = constraint.as_mut() {
         c.accept(first);

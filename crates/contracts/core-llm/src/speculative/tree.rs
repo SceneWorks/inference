@@ -460,6 +460,16 @@ pub fn resolve_tree_verify(
     plan: super::SpeculativePlan,
     capabilities: &crate::TextLlmCapabilities,
 ) -> TreeResolution {
+    resolve_tree_verify_with(verify, plan, capabilities.tree_verify)
+}
+
+/// [`resolve_tree_verify`] over the advertisement alone — for a provider (a captioner) that has
+/// no tree advertisement and no proposer, so the fallback naming why is the shared one.
+pub fn resolve_tree_verify_with(
+    verify: crate::SpeculativeVerify,
+    plan: super::SpeculativePlan,
+    tree_verify: Option<crate::TreeVerifyCapabilities>,
+) -> TreeResolution {
     let crate::SpeculativeVerify::Tree { max_rows } = verify else {
         return TreeResolution::default();
     };
@@ -472,7 +482,7 @@ pub fn resolve_tree_verify(
             "speculative: tree verification needs a proposer and none runs for this request".into(),
         );
     }
-    let Some(cap) = capabilities.tree_verify else {
+    let Some(cap) = tree_verify else {
         return linear(format!("speculative: {TREE_VERIFY_NOT_ADVERTISED}"));
     };
     let bound = cap.max_rows.min(MAX_TREE_ROWS);

@@ -655,7 +655,9 @@ pub fn svg_text_output(
         },
         mtp: None,
         decode: report.map(|report| {
-            report.with_captioner_reasons(request.speculative_or(speculative_default))
+            report
+                .with_captioner_reasons(request.speculative_or(speculative_default))
+                .with_captioner_tree_reason(request.speculative_verify)
         }),
         finish_reason: Some(svg_finish_reason(output.finish_reason)),
         // A StarVector decoder has no compressed-KV table family: the dense KV-cache report for
