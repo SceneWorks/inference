@@ -3,7 +3,9 @@
 import json
 import unittest
 
-from scripts.ci.sensenova_loop_seal import TIERS, verify_oracle_marker, verify_semantic_margins
+from scripts.ci.sensenova_loop_seal import (
+    TIERS, verify_memory_endpoints, verify_oracle_marker, verify_semantic_margins,
+)
 
 
 class SenseNovaProofProtocolTests(unittest.TestCase):
@@ -41,6 +43,33 @@ class SenseNovaProofProtocolTests(unittest.TestCase):
         step["semantic_score"]["source_positive_margin"] = 2.0
         with self.assertRaises(ValueError):
             verify_semantic_margins(oracle, ["\n".join(receipts)])
+
+
+    def test_measured_endpoints_are_required_per_backend_and_anchor(self):
+        mlx = {
+            "product": {
+                "tier": "BF16", "image": [1536, 1024], "prefill_tokens": 1560, "generated_tokens": 1,
+                "load_metal_peak_bytes": 20, "request_metal_peak_bytes": 30, "loaded_process_bytes": 15,
+            },
+            "sampled_process_peak_bytes": 40,
+        }
+        cuda = {
+            "tier": "BF16", "width": 1536, "height": 1024, "prompt_tokens": 1560, "generated_tokens": 1,
+            "after_request": {"pool_reserved_peak_bytes": 30, "pool_used_peak_bytes": 20},
+            "device": "candle-cuda", "memory_scope": "per-tier",
+        }
+        for backend, marker, bf16, q4 in (
+            ("mlx", "SENSENOVA_LOOP_MEMORY", mlx, {**mlx, "product": {**mlx["product"], "tier": "Q4"}}),
+            ("candle-cuda", "SENSENOVA_LOOP_MEMORY_ENDPOINT", cuda, {**cuda, "tier": "Q4"}),
+        ):
+            def log(*records):
+                return ["\n".join(marker + " " + json.dumps(record) for record in records)]
+
+            self.assertEqual(set(verify_memory_endpoints(backend, log(bf16, q4))), {"BF16", "Q4"})
+            zero_peak = [log(bf16, q4)[0].replace(": 30", ": 0")]
+            for invalid in (log(bf16), log(bf16, q4, q4), zero_peak):
+                with self.subTest(backend=backend), self.assertRaises(ValueError):
+                    verify_memory_endpoints(backend, invalid)
 
 
 if __name__ == "__main__":

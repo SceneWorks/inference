@@ -67,6 +67,33 @@ def verify_semantic_margins(oracle, logs):
 
 
 
+def verify_memory_endpoints(backend, logs):
+    mlx = backend == "mlx"
+    marker = "SENSENOVA_LOOP_MEMORY" if mlx else "SENSENOVA_LOOP_MEMORY_ENDPOINT"
+    endpoints = {}
+    for payload in observed(logs, marker):
+        record = json.loads(payload)
+        endpoint = record["product"] if mlx else record
+        tier = endpoint["tier"]
+        dimensions = endpoint["image"] if mlx else [endpoint["width"], endpoint["height"]]
+        prompt = endpoint["prefill_tokens" if mlx else "prompt_tokens"]
+        required = ("load_metal_peak_bytes", "request_metal_peak_bytes", "loaded_process_bytes")
+        peaks = ([endpoint[key] for key in required] + [record["sampled_process_peak_bytes"]]
+                 if mlx else [endpoint["after_request"]["pool_reserved_peak_bytes"],
+                              endpoint["after_request"]["pool_used_peak_bytes"]])
+        if (tier not in ("BF16", "Q4") or tier in endpoints or dimensions != [1536, 1024]
+                or type(prompt) is not int or prompt <= 1536
+                or type(endpoint["generated_tokens"]) is not int or endpoint["generated_tokens"] != 1
+                or any(type(value) is not int or value <= 0 for value in peaks)):
+            raise ValueError(f"missing, duplicate or incomplete measured {backend} memory endpoint")
+        if not mlx and (endpoint["device"] != "candle-cuda" or not endpoint["memory_scope"]):
+            raise ValueError("Candle memory endpoint has no actual device/scope")
+        endpoints[tier] = record
+    if set(endpoints) != {"BF16", "Q4"}:
+        raise ValueError(f"{backend} proof lacks separate measured BF16 and q4 memory endpoints")
+    return endpoints
+
+
 def main() -> None:
     env = os.environ
     backend = env["MODEL_PROOF_BACKEND"]
@@ -103,6 +130,7 @@ def main() -> None:
         raise ValueError("Candle test did not attest to the exact oracle path")
 
     semantic = verify_semantic_margins(json.loads(oracle.read_bytes()), logs)
+    memory = verify_memory_endpoints(backend, logs)
     tiers = {}
     for tier in TIERS:
         directory = Path(env[f"SENSENOVA_LOOP_{tier.upper()}_SNAPSHOT"])
@@ -121,7 +149,7 @@ def main() -> None:
         "source_sha": expected_sha, "hf_revision": source["revision"], "backend": backend,
         "source_manifest_sha256": digest(SOURCE), "oracle_sha256": oracle_sha,
         "native_proof_receipt_sha256": digest(evidence / "receipt.json"), "tiers": tiers,
-        "semantic_margins": semantic,
+        "semantic_margins": semantic, "memory_endpoints": memory,
         "claim": "Exact pre/post byte inventories and separately witnessed successful reader paths",
     })
 
