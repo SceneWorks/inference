@@ -599,7 +599,24 @@ impl Generator for Flux1 {
         } else {
             self.run_with_injector(req, None, &run, false, on_progress)?
         };
-        Ok(gen_core::GenerationReport::from_output(output))
+        let pag_report = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?
+            .map(|p| p.execution_report(plan.denoise_sigmas().len().saturating_sub(1) as u32));
+        let mut report = gen_core::GenerationReport::from_output(output);
+        report.pag = pag_report;
+        Ok(report)
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -651,8 +668,7 @@ impl Generator for Flux1 {
                 self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_with_report_observed(req, &mut progress)
             },
         )
     }
@@ -678,16 +694,24 @@ impl Generator for Flux1 {
 }
 
 impl Flux1 {
+    fn generate_with_report_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        // The plan freezes the trajectory before any reference or prompt encode; every encode then
+        // runs inside the plan's Conditioning phase.
+        self.validate(req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
     fn generate_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // The plan freezes the trajectory before any reference or prompt encode; every encode then
-        // runs inside the plan's Conditioning phase.
-        self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
-        self.generate_planned(req, &plan, None, on_progress)?
+        self.generate_with_report_observed(req, on_progress)?
             .output
             .ok_or_else(|| gen_core::Error::Msg("FLUX.1 render produced no images".into()))
     }
@@ -845,14 +869,20 @@ impl Flux1 {
                 } else {
                     mlx_gen::attention::AttentionPlan::UNBOUNDED
                 };
+                let pag = self
+                    .descriptor
+                    .capabilities
+                    .resolve_pag(self.descriptor.id, req)?;
+                mlx_gen::image_execution::policy_debug("flux.pag", &pag);
+                let total_steps = run.plan().denoise_sigmas().len().saturating_sub(1);
                 self.run_denoise_with(
                     run,
                     req,
                     &heavy.vae,
                     pid_decoder,
                     on_progress,
-                    |x_in, _t, timestep, guidance| {
-                        transformer.forward_injected_memory_windowed(
+                    |x_in, step_idx, timestep, guidance| {
+                        let pos = transformer.forward_injected_memory_windowed_pag(
                             x_in,
                             &prompt_embeds,
                             &pooled_prompt_embeds,
@@ -863,7 +893,36 @@ impl Flux1 {
                             injector,
                             attention,
                             block_window,
-                        )
+                            None,
+                        )?;
+                        let step_pag = pag
+                            .as_ref()
+                            .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                        if step_pag > 0.0 {
+                            mlx_rs::transforms::eval([&pos])?;
+                            let layers = pag
+                                .as_ref()
+                                .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                            let pert = transformer.forward_injected_memory_windowed_pag(
+                                x_in,
+                                &prompt_embeds,
+                                &pooled_prompt_embeds,
+                                timestep,
+                                guidance,
+                                req.width,
+                                req.height,
+                                injector,
+                                attention,
+                                block_window,
+                                Some(layers),
+                            )?;
+                            Ok(add(
+                                &pos,
+                                &multiply(&subtract(&pos, &pert)?, scalar(step_pag))?,
+                            )?)
+                        } else {
+                            Ok(pos)
+                        }
                     },
                 )
             },
@@ -1061,6 +1120,12 @@ impl Flux1 {
                 } else {
                     mlx_gen::attention::AttentionPlan::UNBOUNDED
                 };
+                let pag = self
+                    .descriptor
+                    .capabilities
+                    .resolve_pag(self.descriptor.id, req)?;
+                mlx_gen::image_execution::policy_debug("flux.pag", &pag);
+                let total_steps = run.plan().denoise_sigmas().len().saturating_sub(1);
                 self.run_denoise_with(
                     run,
                     req,
@@ -1068,7 +1133,7 @@ impl Flux1 {
                     pid_decoder,
                     on_progress,
                     |x_in, t, timestep, guidance| {
-                        let pos = transformer.forward_injected_memory_windowed(
+                        let pos = transformer.forward_injected_memory_windowed_pag(
                             x_in,
                             &pos_embeds,
                             &pos_pooled,
@@ -1079,9 +1144,12 @@ impl Flux1 {
                             Some(pos_injector),
                             attention,
                             block_window,
+                            None,
                         )?;
-                        if t >= timestep_to_start_cfg {
-                            let neg = transformer.forward_injected_memory_windowed(
+                        let step_pag = pag.as_ref().map_or(0.0, |p| p.step_scale(t, total_steps));
+                        let base = if t >= timestep_to_start_cfg {
+                            mlx_rs::transforms::eval([&pos])?;
+                            let neg = transformer.forward_injected_memory_windowed_pag(
                                 x_in,
                                 &neg_embeds,
                                 &neg_pooled,
@@ -1092,14 +1160,37 @@ impl Flux1 {
                                 Some(neg_injector),
                                 attention,
                                 block_window,
+                                None,
                             )?;
                             // neg + true_cfg · (pos − neg)
+                            add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?)?
+                        } else {
+                            pos.clone()
+                        };
+                        if step_pag > 0.0 {
+                            mlx_rs::transforms::eval([&base, &pos])?;
+                            let layers = pag
+                                .as_ref()
+                                .map_or(&[][..], |p| p.step_layers(t, total_steps));
+                            let pert = transformer.forward_injected_memory_windowed_pag(
+                                x_in,
+                                &pos_embeds,
+                                &pos_pooled,
+                                timestep,
+                                guidance,
+                                req.width,
+                                req.height,
+                                Some(pos_injector),
+                                attention,
+                                block_window,
+                                Some(layers),
+                            )?;
                             Ok(add(
-                                &neg,
-                                &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?,
+                                &base,
+                                &multiply(&subtract(&pos, &pert)?, scalar(step_pag))?,
                             )?)
                         } else {
-                            Ok(pos)
+                            Ok(base)
                         }
                     },
                 )
@@ -1183,6 +1274,10 @@ impl Flux1 {
                 // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
                 // `run_flow_sampler`.
                 let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                let canonical_solver =
+                    mlx_gen::gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
+                let total_steps = denoise_sigmas.len().saturating_sub(1);
+                let mut eval_idx = 0usize;
                 run_flow_sampler_with_latent_hook_spans(
                     SamplerRun {
                         sampler_name: Some(sampler_name),
@@ -1207,10 +1302,14 @@ impl Flux1 {
                         );
                     },
                     |x_in, timestep| {
-                        // The curated samplers expose no step index, but the CFG-scheduling consumers
-                        // (`timestep_to_start_cfg`) need one — derive it as the count of schedule nodes
-                        // already descended past (exact for the single-eval default sampler).
-                        let step_idx = sigmas.iter().filter(|&&s| s > timestep).count();
+                        let current_eval = eval_idx;
+                        eval_idx += 1;
+                        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        );
+                        let _ = sigmas;
                         velocity_fn(x_in, step_idx, timestep, guidance)
                     },
                 )
@@ -1479,6 +1578,7 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             desc.id
         )));
     }
+    caps.resolve_pag(desc.id, req)?;
     Ok(())
 }
 

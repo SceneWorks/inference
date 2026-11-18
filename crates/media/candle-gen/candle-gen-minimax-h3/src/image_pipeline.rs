@@ -169,6 +169,11 @@ impl ImageLayout {
             .sum()
     }
 
+    /// Leading packed-sequence conditioning rows (`text + references`), unperturbed under PAG.
+    pub fn num_conditioning_rows(&self) -> usize {
+        self.num_text_tokens + self.num_reference_rows()
+    }
+
     /// Per sequence row, its AdaLN row class: `1` for a reference row (held at
     /// `REFERENCE_NOISE_AUG`), `0` for every text and generated row (the step's timestep).
     pub fn row_classes(&self) -> Vec<u32> {
@@ -247,6 +252,8 @@ pub fn initial_image_rows(
     seed: u64,
     device: &Device,
 ) -> Result<Tensor> {
+    candle_gen::execution::draw("h3_image_initial_latents", seed, 0);
+    candle_gen::execution::runtime(device, DType::F32);
     let shape = (1usize, LATENT_CHANNELS, 1usize, latent_height, latent_width);
     let n = LATENT_CHANNELS * latent_height * latent_width;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -297,6 +304,7 @@ pub fn reference_noise(
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(stream.wrapping_mul(1 << 32))
         .wrapping_add(index as u64 + 1);
+    candle_gen::execution::stream("h3_image_reference_noise", seed);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let n = shape.iter().product();
     Ok(Tensor::from_vec(
@@ -366,6 +374,21 @@ pub fn unpack_image_rows(rows: &Tensor, layout: &ImageLayout) -> Result<Tensor> 
 pub trait ImageVelocity {
     /// Evaluate the model at sampling step `step` (which selects the output head).
     fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor>;
+
+    /// Evaluate the second conditional PAG pass at sampling step `step` (selecting the same
+    /// `pdd_proj_out.{step}` output head while perturbing only target-image self-attention on
+    /// `perturbed_layers`).
+    fn forward_perturbed(
+        &mut self,
+        _step: usize,
+        _image_rows: &Tensor,
+        _perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        Err(CandleError::Unsupported(
+            "minimax-h3-image: ImageVelocity implementation does not support PAG perturbation"
+                .into(),
+        ))
+    }
 }
 
 /// **The six-step loop**: one forward per step, then gen-core's shared
@@ -393,6 +416,39 @@ pub fn denoise_image(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Tensor> {
+    denoise_image_with_pag(
+        model,
+        schedule,
+        sampler,
+        image_seed,
+        initial_rows,
+        num_reference_rows,
+        device,
+        cancel,
+        None,
+        on_step,
+    )
+}
+
+/// [`denoise_image`] with optional Perturbed-Attention Guidance (`pag`, SW-7175).
+///
+/// When `pag` is active at step `i` (`pag.scale_at_step(i, num_steps) > 0.0`), executes two
+/// conditional passes (`cond` then `perturbed`) through the identical step `i` `pdd_proj_out.{i}`
+/// head, combines generated velocities via `pag_apply` (`v_cond + pag_scale * (v_cond - v_pert)`),
+/// and invokes [`sampler_step`] once so stochastic LCM RNG consumption stays one draw per step.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_image_with_pag(
+    model: &mut dyn ImageVelocity,
+    schedule: &SigmaSchedule,
+    sampler: &H3ImageSampler,
+    image_seed: u64,
+    initial_rows: &Tensor,
+    num_reference_rows: usize,
+    device: &Device,
+    cancel: &CancelFlag,
+    pag: Option<&candle_gen::gen_core::PagResolved>,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Tensor> {
     let total = initial_rows.dims()[1];
     if num_reference_rows >= total {
         return Err(CandleError::Msg(format!(
@@ -407,6 +463,36 @@ pub fn denoise_image(
         .narrow(1, num_reference_rows, total - num_reference_rows)?
         .to_dtype(DType::F32)?;
     let num_steps = schedule.num_evals();
+    candle_gen::execution::schedule(sampler.name(), schedule.sigmas(), "velocity");
+    candle_gen::execution::policy(
+        "h3_image_sampler",
+        match *sampler {
+            H3ImageSampler::Euler => serde_json::json!({ "solver": "euler" }),
+            H3ImageSampler::Lcm {
+                s_noise,
+                s_noise_end,
+                noise_clip_std,
+            } => serde_json::json!({
+                "solver": "lcm",
+                "s_noise_bits": s_noise.to_bits(),
+                "s_noise_end_bits": s_noise_end.to_bits(),
+                "noise_clip_std_bits": noise_clip_std.to_bits(),
+            }),
+        },
+    );
+    if let Some(pag) = pag {
+        candle_gen::execution::policy(
+            "h3_image_pag",
+            serde_json::json!({
+                "scale_bits": pag.scale.to_bits(),
+                "adaptive_scale_bits": pag.adaptive_scale.to_bits(),
+                "layers": &pag.layers,
+                "start_bits": pag.start.to_bits(),
+                "stop_bits": pag.stop.to_bits(),
+                "active_steps": pag.active_steps(num_steps as u32),
+            }),
+        );
+    }
     let mut ops = CandleStepOps { device };
     for step in 0..num_steps {
         if cancel.is_cancelled() {
@@ -421,17 +507,43 @@ pub fn denoise_image(
         } else {
             Tensor::cat(&[&condition, &x], 1)?
         };
-        let velocity = model.forward(step, &packed)?;
-        if velocity.dims() != packed.dims() {
+        let velocity_cond = model.forward(step, &packed)?;
+        if velocity_cond.dims() != packed.dims() {
             return Err(CandleError::Msg(format!(
                 "minimax-h3-image denoise: step {step} returned a {:?} velocity for {:?} rows",
-                velocity.dims(),
+                velocity_cond.dims(),
                 packed.dims()
             )));
         }
-        let velocity = velocity
+        let v_cond_gen = velocity_cond
             .narrow(1, num_reference_rows, x.dims()[1])?
             .to_dtype(DType::F32)?;
+        let step_pag_scale = pag.map_or(0.0, |p| p.step_scale(step, num_steps));
+        let velocity = if step_pag_scale > 0.0 {
+            let layers = pag.map_or(&[][..], |p| p.step_layers(step, num_steps));
+            let velocity_pert = model.forward_perturbed(step, &packed, layers)?;
+            if velocity_pert.dims() != packed.dims() {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3-image denoise: step {step} perturbed pass returned a {:?} \
+                     velocity for {:?} rows",
+                    velocity_pert.dims(),
+                    packed.dims()
+                )));
+            }
+            let v_pert_gen = velocity_pert
+                .narrow(1, num_reference_rows, x.dims()[1])?
+                .to_dtype(DType::F32)?;
+            candle_gen::gen_core::pag_apply(
+                &candle_gen::CandleLatentOps,
+                &v_cond_gen,
+                &v_cond_gen,
+                &v_pert_gen,
+                step_pag_scale,
+            )
+            .map_err(|e| CandleError::Msg(e.to_string()))?
+        } else {
+            v_cond_gen
+        };
         let sigmas = schedule.sigmas();
         x = sampler_step(
             &mut ops,
@@ -522,6 +634,7 @@ mod tests {
     fn the_text_to_image_layout_is_text_then_one_image_frame() {
         let l = ImageLayout::text_to_image(3, 4, 8, [1, 2, 2]).unwrap();
         assert_eq!(l.num_text_tokens(), 3);
+        assert_eq!(l.num_conditioning_rows(), 3);
         assert_eq!(l.num_image_rows(), 2 * 4);
         assert_eq!(l.seq_len(), 11);
         assert_eq!(l.text_indices(), &[0, 1, 2]);
@@ -662,6 +775,7 @@ mod tests {
     fn the_edit_layout_packs_references_between_text_and_image() {
         let l = ImageLayout::edit(&[1, 0, 0, 1], &[(4, 4), (2, 4)], 4, 4, [1, 2, 2]).unwrap();
         assert_eq!(l.num_reference_rows(), 6);
+        assert_eq!(l.num_conditioning_rows(), 10);
         assert_eq!(l.num_image_rows(), 4);
         assert_eq!(l.num_packed_image_rows(), 10);
         assert_eq!(l.seq_len(), 14);
@@ -837,5 +951,301 @@ mod tests {
             resize_reference(&img, (20, 18)).unwrap().pixels.len(),
             20 * 18 * 3
         );
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct PagCall {
+        step: usize,
+        perturbed: Option<Vec<u32>>,
+        reference_rows: Vec<f32>,
+    }
+
+    struct PagRecorder {
+        refs: usize,
+        cond_val: f32,
+        pert_val: f32,
+        calls: Vec<PagCall>,
+    }
+
+    impl ImageVelocity for PagRecorder {
+        fn forward(&mut self, step: usize, rows: &Tensor) -> Result<Tensor> {
+            let reference_rows = if self.refs == 0 {
+                Vec::new()
+            } else {
+                rows.narrow(1, 0, self.refs)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+            };
+            self.calls.push(PagCall {
+                step,
+                perturbed: None,
+                reference_rows,
+            });
+            Ok(Tensor::full(
+                self.cond_val + step as f32 * 0.25,
+                rows.dims(),
+                rows.device(),
+            )?)
+        }
+
+        fn forward_perturbed(
+            &mut self,
+            step: usize,
+            rows: &Tensor,
+            perturbed_layers: &[u32],
+        ) -> Result<Tensor> {
+            let reference_rows = if self.refs == 0 {
+                Vec::new()
+            } else {
+                rows.narrow(1, 0, self.refs)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+            };
+            self.calls.push(PagCall {
+                step,
+                perturbed: Some(perturbed_layers.to_vec()),
+                reference_rows,
+            });
+            Ok(Tensor::full(
+                self.pert_val + step as f32 * 0.25,
+                rows.dims(),
+                rows.device(),
+            )?)
+        }
+    }
+
+    #[test]
+    fn denoise_image_with_pag_runs_two_passes_on_active_steps_with_same_head_and_single_lcm_draw() {
+        use candle_gen::gen_core::generator::{ExecutionIdentity, ExecutionRandomness};
+        use candle_gen::gen_core::h3_image::minimax_h3_image_pag_capability;
+        use candle_gen::gen_core::{GenerationOutput, PagConfig};
+
+        let d = Device::Cpu;
+        let schedule = SigmaSchedule::h3_image_distilled().unwrap();
+        let cap = minimax_h3_image_pag_capability();
+
+        // 1. scale == 0.0 runs 1 pass/step (6 total, 0 perturbed) identically to pag == None.
+        let zero_pag = cap
+            .resolve(Some(&PagConfig {
+                scale: 0.0,
+                layers: Some(vec![25]),
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eq!(zero_pag.active_steps(6), 0);
+        let x0_t2i = initial_image_rows(4, 4, [1, 2, 2], 42, &d).unwrap();
+        let lcm = H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 0.0,
+        };
+        let mut base_rec = PagRecorder {
+            refs: 0,
+            cond_val: 1.5,
+            pert_val: 0.5,
+            calls: Vec::new(),
+        };
+        let out_none = denoise_image_with_pag(
+            &mut base_rec,
+            &schedule,
+            &lcm,
+            42,
+            &x0_t2i,
+            0,
+            &d,
+            &CancelFlag::default(),
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        let mut zero_rec = PagRecorder {
+            refs: 0,
+            cond_val: 1.5,
+            pert_val: 0.5,
+            calls: Vec::new(),
+        };
+        let out_zero = denoise_image_with_pag(
+            &mut zero_rec,
+            &schedule,
+            &lcm,
+            42,
+            &x0_t2i,
+            0,
+            &d,
+            &CancelFlag::default(),
+            Some(&zero_pag),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(base_rec.calls.len(), 6);
+        assert_eq!(zero_rec.calls, base_rec.calls);
+        assert_eq!(
+            out_none.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            out_zero.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        // 2. Curated H3-Image PAG defaults (`scale = 1.2`, `layers = [25]`, `[0.0, 0.66)`) on a
+        // 16-reference edit: steps 0..4 each run `(step, cond)` + `(step, pert, [25])` (same step
+        // head `i`!), steps 4..6 run `(step, cond)` only (10 passes total), and all 16 reference
+        // rows stay frozen throughout.
+        let active_pag = cap
+            .resolve(Some(&PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eq!(active_pag.active_steps(6), 4);
+        let edit_layout = ImageLayout::edit(&[1, 0, 1], &[(2, 2); 16], 4, 4, [1, 2, 2]).unwrap();
+        assert_eq!(edit_layout.num_reference_rows(), 16);
+        assert_eq!(edit_layout.num_conditioning_rows(), 19);
+        let x0_edit = Tensor::arange(0f32, 20.0 * 96.0, &d)
+            .unwrap()
+            .reshape((1, 20, 96))
+            .unwrap();
+        let expected_ref = x0_edit
+            .narrow(1, 0, 16)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut edit_rec = PagRecorder {
+            refs: 16,
+            cond_val: 2.0,
+            pert_val: 1.0,
+            calls: Vec::new(),
+        };
+        let out_edit = denoise_image_with_pag(
+            &mut edit_rec,
+            &schedule,
+            &H3ImageSampler::Euler,
+            7,
+            &x0_edit,
+            16,
+            &d,
+            &CancelFlag::default(),
+            Some(&active_pag),
+            &mut |_| {},
+        )
+        .unwrap();
+        let observed_steps: Vec<(usize, Option<Vec<u32>>)> = edit_rec
+            .calls
+            .iter()
+            .map(|c| (c.step, c.perturbed.clone()))
+            .collect();
+        assert_eq!(
+            observed_steps,
+            vec![
+                (0, None),
+                (0, Some(vec![25])),
+                (1, None),
+                (1, Some(vec![25])),
+                (2, None),
+                (2, Some(vec![25])),
+                (3, None),
+                (3, Some(vec![25])),
+                (4, None),
+                (5, None),
+            ]
+        );
+        assert!(edit_rec
+            .calls
+            .iter()
+            .all(|c| c.reference_rows == expected_ref));
+        // Under Euler, step i adds Δσ_i * v_guided_i where (v_cond - v_pert) == 1.0 on every step:
+        // guided steps 0..4 add Δσ_i * ((2.0 + 0.25*i) + 1.2 * 1.0), steps 4..6 add Δσ_i * (2.0 + 0.25*i).
+        let total_increment: f32 = (0..6)
+            .map(|i| {
+                let d_sigma = schedule.velocity_delta(i).unwrap();
+                let base_v = 2.0 + 0.25 * i as f32;
+                let guided_v = if i < 4 { base_v + 1.2 } else { base_v };
+                d_sigma * guided_v
+            })
+            .sum();
+        let init_gen = x0_edit
+            .narrow(1, 16, 4)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let got_gen = out_edit.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (got, init) in got_gen.iter().zip(&init_gen) {
+            assert!(
+                (got - (init + total_increment)).abs() < 1e-4,
+                "{got} vs {}",
+                init + total_increment
+            );
+        }
+
+        // 3. LCM RNG draw invariance + ExecutionIdentity capture: when v_pert == v_cond across all
+        // 6 steps (`stop = 1.0`, 12 passes), LCM output and recorded RNG draws are bit-identical to
+        // `pag = None` (6 passes).
+        let full_pag = cap
+            .resolve(Some(&PagConfig {
+                scale: 2.5,
+                layers: Some(vec![0, 25, 49]),
+                start: Some(0.0),
+                stop: Some(1.0),
+                adaptive_scale: None,
+            }))
+            .unwrap();
+        assert_eq!(full_pag.active_steps(6), 6);
+        let dummy_out = GenerationOutput::Images(vec![Image {
+            width: 64,
+            height: 64,
+            pixels: vec![0; 64 * 64 * 3],
+        }]);
+        let run_lcm_attempt = |pag: Option<&candle_gen::gen_core::PagResolved>| {
+            let attempt = candle_gen::execution::Attempt::begin();
+            let init = initial_image_rows(4, 4, [1, 2, 2], 99, &d).unwrap();
+            let mut rec = PagRecorder {
+                refs: 0,
+                cond_val: 1.25,
+                pert_val: 1.25,
+                calls: Vec::new(),
+            };
+            let out = denoise_image_with_pag(
+                &mut rec,
+                &schedule,
+                &lcm,
+                99,
+                &init,
+                0,
+                &d,
+                &CancelFlag::default(),
+                pag,
+                &mut |_| {},
+            )
+            .unwrap();
+            let identity = attempt.finish_image(&crate::image_descriptor(), &dummy_out);
+            (
+                rec.calls.len(),
+                out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                identity,
+            )
+        };
+        let (calls_1pass, vals_1pass, id_1pass) = run_lcm_attempt(None);
+        let (calls_2pass, vals_2pass, id_2pass) = run_lcm_attempt(Some(&full_pag));
+        assert_eq!(calls_1pass, 6);
+        assert_eq!(calls_2pass, 12);
+        assert_eq!(vals_1pass, vals_2pass);
+        let draws_1 = match id_1pass {
+            ExecutionIdentity::Resolved { identity } => match identity.randomness {
+                ExecutionRandomness::Draws { draws, .. } => draws,
+                other => panic!("expected Draws, got {other:?}"),
+            },
+            other => panic!("expected Resolved, got {other:?}"),
+        };
+        let draws_2 = match id_2pass {
+            ExecutionIdentity::Resolved { identity } => match identity.randomness {
+                ExecutionRandomness::Draws { draws, .. } => draws,
+                other => panic!("expected Draws, got {other:?}"),
+            },
+            other => panic!("expected Resolved, got {other:?}"),
+        };
+        // 1 initial latent draw + 5 non-terminal LCM re-noise draws (step 5 has sigma_next == 0).
+        assert_eq!(draws_1.len(), 1 + 5);
+        assert_eq!(draws_1, draws_2);
     }
 }

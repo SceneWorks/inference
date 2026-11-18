@@ -236,6 +236,25 @@ impl Flux2KvCfgCaches {
         guidance: f32,
         mut run: impl FnMut(CfgBranch, bool, &Flux2KvCache) -> Result<Array>,
     ) -> Result<Array> {
+        self.velocity_with_pag(guidance, 0.0, &[], |branch, include_ref, cache, _| {
+            run(branch, include_ref, cache)
+        })
+    }
+
+    /// Guided velocity with optional Perturbed-Attention Guidance (`step_pag_scale > 0`).
+    ///
+    /// On step 0 (`Extract`), unperturbed `Positive` (and `Negative` when CFG is active) runs
+    /// FIRST with `include_ref = true` to populate the reference-K/V cache slots and materializes
+    /// those slots. When `step_pag_scale > 0`, the perturbed `Positive` pass then runs with
+    /// `include_ref = false` and `self.positive` configured in read-only [`CacheMode::Cached`]
+    /// mode — reusing the just-extracted reference K/V without overwriting any cache slot.
+    pub fn velocity_with_pag(
+        &mut self,
+        guidance: f32,
+        step_pag_scale: f32,
+        pag_layers: &[u32],
+        mut run: impl FnMut(CfgBranch, bool, &Flux2KvCache, Option<&[u32]>) -> Result<Array>,
+    ) -> Result<Array> {
         let extract = !self.extracted;
         let mode = if extract {
             CacheMode::Extract
@@ -247,10 +266,13 @@ impl Flux2KvCfgCaches {
             negative.configure(mode, self.num_ref);
         }
         self.extracted = true;
-        let v = run(CfgBranch::Positive, extract, &self.positive)?;
+        let v = run(CfgBranch::Positive, extract, &self.positive, None)?;
         let out = match &self.negative {
             Some(negative) => {
-                let vn = run(CfgBranch::Negative, extract, negative)?;
+                if step_pag_scale > 0.0 && !extract {
+                    mlx_rs::transforms::eval([&v])?;
+                }
+                let vn = run(CfgBranch::Negative, extract, negative, None)?;
                 mlx_rs::ops::add(
                     &vn,
                     &mlx_rs::ops::multiply(
@@ -259,17 +281,35 @@ impl Flux2KvCfgCaches {
                     )?,
                 )?
             }
-            None => v,
+            None => v.clone(),
         };
         if extract {
             let mut to_eval = vec![out.clone()];
+            if step_pag_scale > 0.0 {
+                to_eval.push(v.clone());
+            }
             to_eval.extend(self.positive.slot_arrays());
             if let Some(negative) = &self.negative {
                 to_eval.extend(negative.slot_arrays());
             }
             mlx_rs::transforms::eval(to_eval.iter())?;
         }
-        Ok(out)
+        if step_pag_scale > 0.0 {
+            if !extract {
+                mlx_rs::transforms::eval([&out, &v])?;
+            }
+            self.positive.configure(CacheMode::Cached, self.num_ref);
+            let v_pert = run(CfgBranch::Positive, false, &self.positive, Some(pag_layers))?;
+            Ok(mlx_rs::ops::add(
+                &out,
+                &mlx_rs::ops::multiply(
+                    &mlx_rs::ops::subtract(&v, &v_pert)?,
+                    mlx_gen::array::scalar(step_pag_scale),
+                )?,
+            )?)
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -387,5 +427,107 @@ mod tests {
             .item::<bool>());
         // Nothing stored.
         assert!(cache.slots(Stream::Double).borrow()[0].is_none());
+    }
+
+    #[test]
+    fn velocity_with_pag_reuses_step0_extracted_kv_read_only_without_corruption() {
+        let mut caches = Flux2KvCfgCaches::new(1, 1, true, 2);
+        type CallRecord = (CfgBranch, bool, Option<CacheMode>, Option<Vec<u32>>);
+        let mut calls: Vec<CallRecord> = Vec::new();
+
+        // Step 0: Extract + CFG + PAG active.
+        let step0 = caches
+            .velocity_with_pag(2.0, 1.5, &[20], |branch, include_ref, cache, pag_layers| {
+                calls.push((
+                    branch,
+                    include_ref,
+                    cache.mode.get(),
+                    pag_layers.map(|l| l.to_vec()),
+                ));
+                match (branch, pag_layers) {
+                    (CfgBranch::Positive, None) => {
+                        assert!(include_ref);
+                        assert_eq!(cache.mode.get(), Some(CacheMode::Extract));
+                        cache
+                            .apply(Stream::Double, 0, arr(5, 100.0), arr(5, 200.0))
+                            .unwrap();
+                        cache
+                            .apply(Stream::Single, 0, arr(5, 300.0), arr(5, 400.0))
+                            .unwrap();
+                        Ok(Array::from_slice(&[10.0f32], &[1]))
+                    }
+                    (CfgBranch::Negative, None) => {
+                        assert!(include_ref);
+                        assert_eq!(cache.mode.get(), Some(CacheMode::Extract));
+                        cache
+                            .apply(Stream::Double, 0, arr(5, 500.0), arr(5, 600.0))
+                            .unwrap();
+                        cache
+                            .apply(Stream::Single, 0, arr(5, 700.0), arr(5, 800.0))
+                            .unwrap();
+                        Ok(Array::from_slice(&[4.0f32], &[1]))
+                    }
+                    (CfgBranch::Positive, Some(layers)) => {
+                        // Perturbed pass on step 0 MUST run in read-only Cached mode with
+                        // include_ref = false and read the step-0 positive slots (103, 104).
+                        assert!(!include_ref);
+                        assert_eq!(cache.mode.get(), Some(CacheMode::Cached));
+                        assert_eq!(layers, &[20]);
+                        let (ok, _) = cache
+                            .apply(Stream::Double, 0, arr(3, 999.0), arr(3, 999.0))
+                            .unwrap();
+                        assert_eq!(ok.shape(), &[1, 1, 5, 2]);
+                        let tail = trailing(&ok, 2).unwrap();
+                        let want = trailing(&arr(5, 100.0), 2).unwrap();
+                        assert!(mlx_rs::ops::array_eq(&tail, &want, false)
+                            .unwrap()
+                            .item::<bool>());
+                        Ok(Array::from_slice(&[8.0f32], &[1]))
+                    }
+                    other => panic!("unexpected call {other:?}"),
+                }
+            })
+            .unwrap();
+        // cfg = 4 + 2*(10 - 4) = 16; pag = 16 + 1.5*(10 - 8) = 19.
+        assert!((step0.item::<f32>() - 19.0).abs() < 1e-5);
+        assert_eq!(
+            calls,
+            vec![
+                (CfgBranch::Positive, true, Some(CacheMode::Extract), None),
+                (CfgBranch::Negative, true, Some(CacheMode::Extract), None),
+                (
+                    CfgBranch::Positive,
+                    false,
+                    Some(CacheMode::Cached),
+                    Some(vec![20])
+                ),
+            ]
+        );
+
+        // Step 1: Cached + CFG + PAG active — positive and negative slots remain uncorrupted!
+        let step1 = caches
+            .velocity_with_pag(2.0, 1.5, &[20], |branch, include_ref, cache, pag_layers| {
+                assert!(!include_ref);
+                assert_eq!(cache.mode.get(), Some(CacheMode::Cached));
+                let (ok, _) = cache
+                    .apply(Stream::Double, 0, arr(3, 1.0), arr(3, 2.0))
+                    .unwrap();
+                let tail = trailing(&ok, 2).unwrap();
+                let expected_fill = match branch {
+                    CfgBranch::Positive => 100.0,
+                    CfgBranch::Negative => 500.0,
+                };
+                let want = trailing(&arr(5, expected_fill), 2).unwrap();
+                assert!(mlx_rs::ops::array_eq(&tail, &want, false)
+                    .unwrap()
+                    .item::<bool>());
+                Ok(Array::from_slice(
+                    &[if pag_layers.is_some() { 5.0 } else { 7.0 }],
+                    &[1],
+                ))
+            })
+            .unwrap();
+        // cfg = 7 + 2*(7 - 7) = 7; pag = 7 + 1.5*(7 - 5) = 10.
+        assert!((step1.item::<f32>() - 10.0).abs() < 1e-5);
     }
 }

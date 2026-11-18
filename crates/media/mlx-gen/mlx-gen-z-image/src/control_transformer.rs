@@ -559,9 +559,33 @@ impl ZImageControlTransformer {
         x: &Array,
         timestep: f32,
         control_context_scale: f32,
+        cap: Option<&mut Vec<(&'static str, Array)>>,
+        plan: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<Array> {
+        self.forward_with_control_rungs_with_pag(
+            prep,
+            x,
+            timestep,
+            control_context_scale,
+            cap,
+            plan,
+            window,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_control_rungs_with_pag(
+        &self,
+        prep: &ControlPrepared,
+        x: &Array,
+        timestep: f32,
+        control_context_scale: f32,
         mut cap: Option<&mut Vec<(&'static str, Array)>>,
         plan: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
+        pag: Option<crate::attention::PagStepContext<'_>>,
     ) -> Result<Array> {
         macro_rules! record {
             ($name:expr, $a:expr) => {
@@ -680,11 +704,13 @@ impl ZImageControlTransformer {
             None => {
                 for (i, layer) in self.base.layers.iter().enumerate() {
                     let hint = hint_index(&CONTROL_LAYERS_PLACES, i);
-                    unified = layer.forward_quantum(
+                    let pag_x_len = pag.and_then(|ctx| ctx.layer_x_len(i, x_len));
+                    unified = layer.forward_quantum_with_pag(
                         &unified,
                         &prep.unified_freqs,
                         &t_emb,
                         plan,
+                        pag_x_len,
                         hint.map_or(0, |_| add_hint_bytes(&unified)),
                         |out| match hint {
                             Some(n) => add_hint(&out, &main_hints[n], control_context_scale),
@@ -694,11 +720,13 @@ impl ZImageControlTransformer {
                 }
             }
             Some(window) => {
-                unified = self.base.run_windowed_layers_with_hints(
+                unified = self.base.run_windowed_layers_with_hints_and_pag(
                     unified,
                     &prep.unified_freqs,
                     &t_emb,
+                    x_len,
                     plan,
+                    pag,
                     window,
                     &|i: usize, state: &Array| {
                         hint_index(&CONTROL_LAYERS_PLACES, i).map_or(0, |_| add_hint_bytes(state))

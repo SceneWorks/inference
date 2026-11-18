@@ -58,18 +58,56 @@ fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
 
 /// Run one control entry as a single reported attempt. The consumer's progress callback stays
 /// outside it; observations from every phase of the planned body bind to the returned image.
+#[cfg(test)]
 fn complete_control_image(
     cancel: &CancelFlag,
     route: &'static str,
     on_progress: &mut dyn FnMut(Progress),
     run: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Image>,
 ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-    let mut report_progress = |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-    candle_gen::execution::capture_direct(&control_report_descriptor(), cancel, || {
-        candle_gen::execution::policy("direct_route", route.into());
-        let image = run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
-        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+    complete_control_image_with_pag(cancel, route, on_progress, |progress| {
+        Ok((run(progress)?, None))
     })
+}
+
+fn complete_control_image_with_pag(
+    cancel: &CancelFlag,
+    route: &'static str,
+    on_progress: &mut dyn FnMut(Progress),
+    run: impl FnOnce(
+        &mut dyn FnMut(Progress),
+    ) -> Result<(Image, Option<candle_gen::gen_core::PagExecutionReport>)>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    let mut report_progress = |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+    candle_gen::execution::capture_direct_report(&control_report_descriptor(), cancel, || {
+        candle_gen::execution::policy("direct_route", route.into());
+        let (image, pag) = run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
+        let mut report = candle_gen::gen_core::GenerationReport::from_output(
+            candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+        );
+        report.pag = pag;
+        Ok(report)
+    })
+}
+
+fn resolve_control_pag(
+    req: &Flux1ControlRequest,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagResolved>> {
+    let descriptor = control_descriptor();
+    let pag_req = GenerationRequest {
+        pag: req.pag.clone(),
+        ..Default::default()
+    };
+    descriptor.capabilities.resolve_pag(descriptor.id, &pag_req)
+}
+
+fn resolve_control_pag_report(
+    req: &Flux1ControlRequest,
+    plan: &RenderPlan,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::PagExecutionReport>> {
+    let total_steps = u32::try_from(plan.denoise_sigmas().len().saturating_sub(1))
+        .map_err(|_| candle_gen::gen_core::Error::Unsupported("step count overflow".into()))?;
+    Ok(resolve_control_pag(req)?.map(|pag| pag.execution_report(total_steps)))
 }
 
 #[cfg(test)]
@@ -156,6 +194,8 @@ pub struct Flux1ControlRequest {
     /// registered descriptor. Default is inert, and an inert sink makes a seeded render byte-identical
     /// to one with no preview at all.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance configuration for control-conditioned FLUX.1-dev.
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -176,6 +216,7 @@ impl Default for Flux1ControlRequest {
             seed: 0,
             memory: GenerationMemory::default(),
             preview: PreviewSink::default(),
+            pag: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -348,6 +389,7 @@ fn typed_control_request(
         }],
         memory: Some(req.memory),
         preview: req.preview.clone(),
+        pag: req.pag.clone(),
         cancel: req.cancel.clone(),
         ..Default::default()
     })
@@ -490,12 +532,15 @@ impl Flux1DevControl {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        complete_control_image(
+        let pag = resolve_control_pag_report(req, plan)?;
+        complete_control_image_with_pag(
             &req.cancel,
             "flux/control_provider/generate",
             on_progress,
             |progress| {
-                self.generate_with_injector_planned(req, control_image, None, plan, progress)
+                let image =
+                    self.generate_with_injector_planned(req, control_image, None, plan, progress)?;
+                Ok((image, pag))
             },
         )
     }
@@ -510,12 +555,20 @@ impl Flux1DevControl {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        complete_control_image(
+        let pag = resolve_control_pag_report(req, plan)?;
+        complete_control_image_with_pag(
             &req.cancel,
             "flux/control_provider/generate_with_injector",
             on_progress,
             |progress| {
-                self.generate_with_injector_planned(req, control_image, injector, plan, progress)
+                let image = self.generate_with_injector_planned(
+                    req,
+                    control_image,
+                    injector,
+                    plan,
+                    progress,
+                )?;
+                Ok((image, pag))
             },
         )
     }
@@ -530,19 +583,21 @@ impl Flux1DevControl {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        complete_control_image(
+        let pag = resolve_control_pag_report(req, plan)?;
+        complete_control_image_with_pag(
             &req.cancel,
             "flux/control_provider/generate_with_memory_context",
             on_progress,
             |progress| {
-                self.generate_with_injector_memory_context_planned(
+                let image = self.generate_with_injector_memory_context_planned(
                     context,
                     req,
                     control_image,
                     None,
                     plan,
                     progress,
-                )
+                )?;
+                Ok((image, pag))
             },
         )
     }
@@ -558,19 +613,21 @@ impl Flux1DevControl {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        complete_control_image(
+        let pag = resolve_control_pag_report(req, plan)?;
+        complete_control_image_with_pag(
             &req.cancel,
             "flux/control_provider/generate_with_injector_memory_context",
             on_progress,
             |progress| {
-                self.generate_with_injector_memory_context_planned(
+                let image = self.generate_with_injector_memory_context_planned(
                     context,
                     req,
                     control_image,
                     injector,
                     plan,
                     progress,
-                )
+                )?;
+                Ok((image, pag))
             },
         )
     }
@@ -722,6 +779,7 @@ impl Flux1DevControl {
         if req.steps == 0 {
             return Err(CandleError::Msg("flux1 control: steps must be >= 1".into()));
         }
+        resolve_control_pag(req).map_err(|e| CandleError::Msg(e.to_string()))?;
         // sc-9024 (F-040): distinguish "absent" from an explicit 0.0. Only an ABSENT scale (`None`) falls
         // back to the Shakker default; an explicit `Some(x)` is honored verbatim — including `Some(0.0)`,
         // which the engine proves is byte-identical to the base forward ("control off"). The old code
@@ -847,7 +905,7 @@ impl Flux1DevControl {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        _req: &Flux1ControlRequest,
+        req: &Flux1ControlRequest,
         state: &State,
         control_latent: &Tensor,
         render_plan: &RenderPlan,
@@ -861,6 +919,15 @@ impl Flux1DevControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         candle_gen::check_cancel(cancel)?;
+        let pag = resolve_control_pag(req).map_err(|e| CandleError::Msg(e.to_string()))?;
+        candle_gen::execution::policy(
+            "flux.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(render_plan.sampler()));
+        let total_steps = render_plan.denoise_sigmas().len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(render_plan.guidance(), b_sz, &self.device)?;
         let prepared = self.backbone.prepare_conditioning(
@@ -884,6 +951,16 @@ impl Flux1DevControl {
             Some(preview),
             |img, t| -> Result<Tensor> {
                 candle_gen::check_cancel(cancel)?;
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let step_pag = pag
+                    .as_ref()
+                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
                 let budget = if self.memory.chunk_attention {
                     self.memory
@@ -909,7 +986,7 @@ impl Flux1DevControl {
                     plan,
                     cancel,
                 )?;
-                self.backbone.forward_control_prepared_with_memory(
+                let pos = self.backbone.forward_control_prepared_with_memory_pag(
                     heavy,
                     img,
                     &state.img_ids,
@@ -922,7 +999,31 @@ impl Flux1DevControl {
                     Some((&residuals, control_scale)),
                     &prepared,
                     cancel,
-                )
+                    None,
+                )?;
+                if step_pag > 0.0 {
+                    let layers = pag
+                        .as_ref()
+                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                    let pert = self.backbone.forward_control_prepared_with_memory_pag(
+                        heavy,
+                        img,
+                        &state.img_ids,
+                        &state.txt,
+                        &state.txt_ids,
+                        &t_vec,
+                        &state.vec,
+                        Some(&guidance_t),
+                        injector,
+                        Some((&residuals, control_scale)),
+                        &prepared,
+                        cancel,
+                        Some(layers),
+                    )?;
+                    crate::apply_pag_blend(&pos, &pert, step_pag)
+                } else {
+                    Ok(pos)
+                }
             },
         )
     }
@@ -1079,6 +1180,63 @@ mod tests {
         assert!(operations.get("flux/control_guidance").is_some());
         assert!(operations.get("flux/control_injector").is_some());
         assert!(operations.get("consumer/callback").is_none());
+
+        let pag_req = Flux1ControlRequest {
+            prompt: "a fox".into(),
+            steps: 4,
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let paths = Flux1ControlPaths {
+            flux_base: "/missing/flux-dev".into(),
+            control: "/missing/control.safetensors".into(),
+            adapters: Vec::new(),
+        };
+        let spec = control_load_spec(&paths);
+        let plan = compile_control_plan(
+            &paths,
+            &spec,
+            &pag_req,
+            &Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            },
+        )
+        .unwrap();
+        let pag_report = resolve_control_pag_report(&pag_req, &plan)
+            .unwrap()
+            .expect("active pag report");
+        let pag_completed = complete_control_image_with_pag(
+            &cancel,
+            "flux/control_provider/generate",
+            &mut |_| {},
+            |_| {
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                candle_gen::execution::rng_scheme("fixture-metadata-v1");
+                candle_gen::execution::draw("fixture", 7, 0);
+                candle_gen::execution::schedule("euler", &[1.0, 0.0], "Flow");
+                candle_gen::execution::policy(
+                    "flux.pag",
+                    serde_json::to_value(resolve_control_pag(&pag_req).unwrap())
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                Ok((
+                    Image {
+                        width: 2,
+                        height: 1,
+                        pixels: vec![0; 6],
+                    },
+                    Some(pag_report.clone()),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(pag_completed.generation.pag, Some(pag_report));
+
         assert!(complete_control_image(
             &cancel,
             "flux/control_provider/generate",

@@ -76,7 +76,8 @@ impl Sampling<'_> {
                 .ok_or_else(|| Error::Unsupported("MOSS DMD dataspace missing".into()))?;
             let mut clean = multiply(noise, scalar(0.0))?;
             let shape = noise.shape();
-            for (i, code) in codes.iter().take(r.steps as usize).enumerate() {
+            let total_steps = r.steps as usize;
+            for (i, code) in codes.iter().take(total_steps).enumerate() {
                 check(cancel)?;
                 let flat = clean
                     .transpose_axes(&[0, 2, 3, 1])?
@@ -85,10 +86,27 @@ impl Sampling<'_> {
                     .reshape(&[shape[0], shape[2], shape[3], shape[1]])?
                     .transpose_axes(&[0, 3, 1, 2])?;
                 let input = add(noise, mixed)?;
-                let velocity = self
+                let cond = self
                     .transformer
                     .forward(&input, &[*code], self.positive, &[], cancel)?
                     .as_dtype(Dtype::Float32)?;
+                let pag_scale = r.pag_step_scale(i, total_steps);
+                let velocity = if pag_scale > 0.0 {
+                    let pag_layers = r
+                        .pag
+                        .as_ref()
+                        .map_or(&[][..], |pag| pag.step_layers(i, total_steps));
+                    let perturbed = self
+                        .transformer
+                        .forward_with_pag(&input, &[*code], self.positive, &[], pag_layers, cancel)?
+                        .as_dtype(Dtype::Float32)?;
+                    add(
+                        &cond,
+                        multiply(subtract(&cond, &perturbed)?, scalar(pag_scale))?,
+                    )?
+                } else {
+                    cond
+                };
                 clean = subtract(noise, velocity)?;
                 mlx_rs::transforms::eval([&clean])?;
                 check(cancel)?;
@@ -142,6 +160,21 @@ impl Sampling<'_> {
                 prediction = add(
                     prediction,
                     multiply(subtract(&conditional, &skipped)?, scalar(slg.scale))?,
+                )?;
+            }
+            let pag_scale = r.pag_step_scale(step, actual);
+            if pag_scale > 0.0 {
+                let pag_layers = r
+                    .pag
+                    .as_ref()
+                    .map_or(&[][..], |pag| pag.step_layers(step, actual));
+                let perturbed = self
+                    .transformer
+                    .forward_with_pag(&latent, &time, self.positive, &[], pag_layers, cancel)?
+                    .as_dtype(Dtype::Float32)?;
+                prediction = add(
+                    prediction,
+                    multiply(subtract(&conditional, &perturbed)?, scalar(pag_scale))?,
                 )?;
             }
             latent = add(

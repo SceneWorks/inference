@@ -100,6 +100,50 @@ pub const BASE_DEFAULT_GUIDANCE: f32 = 3.5;
 /// Descriptor family shared by every FLUX 3 Image Klein route and backend.
 pub const FAMILY: &str = "flux3";
 
+/// Unified Perturbed-Attention Guidance capability for FLUX 3 Image Klein (`33` blocks:
+/// `0..5` early modality-specific `image_blocks` + `5..33` shared `single_blocks`, default
+/// `[19]` = single block `14`).
+pub fn flux3_pag_capability(flow_map: bool) -> gen_core::PagCapability {
+    if flow_map {
+        gen_core::PagCapability {
+            num_blocks: 33,
+            block_domain: std::borrow::Cow::Borrowed("flux3_blocks"),
+            default_layers: vec![19],
+            default_start: 0.0,
+            default_stop: 0.75,
+            recommended_scale: 1.2,
+            max_scale: 15.0,
+        }
+    } else {
+        gen_core::PagCapability {
+            num_blocks: 33,
+            block_domain: std::borrow::Cow::Borrowed("flux3_blocks"),
+            default_layers: vec![19],
+            default_start: 0.0,
+            default_stop: 1.0,
+            recommended_scale: 1.5,
+            max_scale: 15.0,
+        }
+    }
+}
+
+/// Whether `flux3_klein_base` must encode the negative prompt for CFG.
+/// Since `u + g * (c - u)` equals `c` ONLY at `g == 1.0`, the negative branch may be
+/// skipped only when PAG is active AND `g == 1.0` (while `0.0 <= g < 1.0` still interpolates
+/// with `u`, and `pag.is_none()` preserves the non-PAG `u`/`c` CFG path).
+pub fn base_requires_negative_prompt(
+    guidance: Option<f32>,
+    pag: Option<&gen_core::PagResolved>,
+) -> bool {
+    guidance.is_some_and(|g| pag.is_none() || g != 1.0)
+}
+
+/// Whether `flux3_klein_base` can skip the unconditioned CFG pass and evaluate only `cond` +
+/// `pert` during denoise: true strictly when PAG is active and `guidance == 1.0`.
+pub fn base_cfg_off_with_pag(guidance: f32, pag: Option<&gen_core::PagResolved>) -> bool {
+    pag.is_some() && guidance == 1.0
+}
+
 /// `LoadSpec::components` key carrying the text-encoder directory. Optional: when absent the
 /// package's own `text_encoder/` (`config.json` `text_encoder.path`) is read.
 pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
@@ -1103,6 +1147,8 @@ pub struct GenerationParams {
     pub seed: u64,
     pub width: u32,
     pub height: u32,
+    /// Resolved Perturbed-Attention Guidance trajectory (`None` when unset or `scale == 0.0`).
+    pub pag: Option<gen_core::PagResolved>,
 }
 
 /// Upstream `generate.py`'s seed for a request that carries none:
@@ -1208,6 +1254,21 @@ impl GenerationParams {
             .map(|plan| plan.output.canvas)
             .unwrap_or((req.width, req.height));
         latent_shape(width, height)?;
+        let pag_cap = flux3_pag_capability(config.dit.flow_map);
+        let model_id = if config.dit.flow_map {
+            DISTILLED_MODEL_ID
+        } else {
+            BASE_MODEL_ID
+        };
+        let effective_pag = req
+            .effective_pag()
+            .map_err(|err| Error::Msg(err.to_string()))?;
+        let pag = gen_core::resolve_pag(Some(&pag_cap), model_id, effective_pag).map_err(
+            |err| match err.kind() {
+                gen_core::PagPolicyErrorKind::Unsupported => Error::Unsupported(err.to_string()),
+                gen_core::PagPolicyErrorKind::Invalid => Error::Msg(err.to_string()),
+            },
+        )?;
         Ok(Self {
             prompt: req.prompt.clone(),
             guidance,
@@ -1217,6 +1278,7 @@ impl GenerationParams {
             seed: req.seed.unwrap_or(default_seed),
             width,
             height,
+            pag,
         })
     }
 
@@ -1777,5 +1839,68 @@ mod tests {
         assert!(GenerationResources::from_spec(&bad, &config, DISTILLED_MODEL_ID).is_err());
         let file = LoadSpec::new(WeightsSource::File(dir.join(DIT_WEIGHTS_FILE)));
         assert!(GenerationResources::from_spec(&file, &config, DISTILLED_MODEL_ID).is_err());
+    }
+
+    #[test]
+    fn pag_capability_and_params_resolution_match_flux3_contract() {
+        let distilled_cap = flux3_pag_capability(true);
+        assert_eq!(distilled_cap.num_blocks, 33);
+        assert_eq!(distilled_cap.block_domain.as_ref(), "flux3_blocks");
+        assert_eq!(distilled_cap.default_layers, vec![19]);
+        assert_eq!(distilled_cap.default_start, 0.0);
+        assert_eq!(distilled_cap.default_stop, 0.75);
+        assert_eq!(distilled_cap.recommended_scale, 1.2);
+        assert_eq!(distilled_cap.max_scale, 15.0);
+
+        let base_cap = flux3_pag_capability(false);
+        assert_eq!(base_cap.num_blocks, 33);
+        assert_eq!(base_cap.block_domain.as_ref(), "flux3_blocks");
+        assert_eq!(base_cap.default_layers, vec![19]);
+        assert_eq!(base_cap.default_start, 0.0);
+        assert_eq!(base_cap.default_stop, 1.0);
+        assert_eq!(base_cap.recommended_scale, 1.5);
+        assert_eq!(base_cap.max_scale, 15.0);
+
+        let cfg = release();
+        let active_req = GenerationRequest {
+            pag: Some(gen_core::PagConfig {
+                scale: 1.2,
+                layers: Some(vec![32, 0, 19, 19]),
+                ..Default::default()
+            }),
+            ..request()
+        };
+        let params =
+            GenerationParams::resolve_caption(&active_req, "upsampled fox".into(), &cfg).unwrap();
+        let resolved = params.pag.expect("active PAG");
+        assert_eq!(resolved.layers, vec![0, 19, 32]);
+        assert_eq!(resolved.start, 0.0);
+        assert_eq!(resolved.stop, 0.75);
+        assert_eq!(resolved.active_steps(16), 12);
+
+        let noop_req = GenerationRequest {
+            pag: Some(gen_core::PagConfig {
+                scale: 0.0,
+                ..Default::default()
+            }),
+            ..request()
+        };
+        assert_eq!(
+            GenerationParams::resolve(&noop_req, 0, &cfg).unwrap().pag,
+            None
+        );
+
+        let oob_req = GenerationRequest {
+            pag: Some(gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![33]),
+                ..Default::default()
+            }),
+            ..request()
+        };
+        assert!(matches!(
+            validate_generation_request("flux3_klein", &oob_req, &cfg),
+            Err(Error::Msg(_))
+        ));
     }
 }

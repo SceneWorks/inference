@@ -555,8 +555,9 @@ impl Pipeline {
         phase: &HeavyPhase,
         req: &GenerationRequest,
         encoded: (Tensor, Option<Tensor>, f32),
+        resolved_pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<Vec<Image>> {
+    ) -> CResult<(Vec<Image>, u32)> {
         let (pos, neg, guidance) = encoded;
         let (transformer, vae, pid) = match phase {
             HeavyPhase::Resident(comps) => (
@@ -574,6 +575,7 @@ impl Pipeline {
             &pos,
             neg.as_ref(),
             guidance,
+            resolved_pag,
             on_progress,
         )
     }
@@ -593,11 +595,13 @@ impl Pipeline {
         pos_embeds: &Tensor,
         neg_embeds: Option<&Tensor>,
         guidance: f32,
+        resolved_pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<Vec<Image>> {
+    ) -> CResult<(Vec<Image>, u32)> {
         let steps = resolve_steps(req.steps);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
+        let num_blocks = transformer.block_count();
         let memory = req.memory.unwrap_or_default();
         let attention_budget = if memory.chunk_attention {
             gen_core::attention_budget::AttentionBudget::CONSTRAINED
@@ -630,6 +634,9 @@ impl Pipeline {
             steps,
             &native,
         )?;
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
 
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
@@ -637,7 +644,8 @@ impl Pipeline {
         // (same prompt), mirroring the MLX `decode_and_collect` seam.
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, MODEL_ID)?;
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let mut eval_idx = 0usize;
             let latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
                 .to_dtype(DIT_DTYPE)?;
 
@@ -668,7 +676,7 @@ impl Pipeline {
                         transformer_window,
                         &req.cancel,
                     )?;
-                    match neg_embeds {
+                    let guided = match neg_embeds {
                         Some(neg) => {
                             let neg = transformer.forward_with_memory(
                                 latents,
@@ -680,10 +688,43 @@ impl Pipeline {
                                 transformer_window,
                                 &req.cancel,
                             )?;
-                            Ok(pipeline::compute_guided_noise(&pos, &neg, guidance)?)
+                            pipeline::compute_guided_noise(&pos, &neg, guidance)?
                         }
-                        None => Ok(pos),
+                        None => pos.clone(),
+                    };
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    let pag_scale =
+                        resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                    if pag_scale > 0.0 {
+                        if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(
+                            resolved_pag,
+                            num_blocks,
+                            step_idx,
+                            total_steps,
+                        ) {
+                            let perturbed = transformer.forward_with_memory_pag(
+                                latents,
+                                pos_embeds,
+                                sigma,
+                                lat_h,
+                                lat_w,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                                Some(&perturb_mask),
+                            )?;
+                            return Ok(pipeline::combine_pag_guidance(
+                                &guided, &pos, &perturbed, pag_scale,
+                            )?);
+                        }
                     }
+                    Ok(guided)
                 },
             )?;
 
@@ -703,7 +744,8 @@ impl Pipeline {
                 &req.cancel,
             )?;
             control_common::to_image(&decoded)
-        })
+        })?;
+        Ok((images, total_steps as u32))
     }
 
     /// Load ONLY the Qwen2.5-VL text encoder + its tokenizer for the sequential-residency path (epic
@@ -975,6 +1017,16 @@ pub struct QwenImageGenerator {
     memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
+pub(crate) fn record_pag_policy(
+    key: &str,
+    resolved_pag: Option<&candle_gen::gen_core::PagResolved>,
+) {
+    candle_gen::execution::policy(
+        key,
+        serde_json::to_value(resolved_pag).unwrap_or(serde_json::Value::Null),
+    );
+}
+
 impl Generator for QwenImageGenerator {
     fn generate_with_execution_report(
         &self,
@@ -1055,7 +1107,21 @@ impl Generator for QwenImageGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: the render produced no output"))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
+        crate::record_pag_policy("qwen_image/pag", resolved_pag.as_ref());
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
         let stage_residency = req
@@ -1091,7 +1157,7 @@ impl Generator for QwenImageGenerator {
                     .into(),
             ));
         }
-        let images = self.residency.run_request_scoped(
+        let (images, actual_steps) = self.residency.run_request_scoped(
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
@@ -1100,11 +1166,18 @@ impl Generator for QwenImageGenerator {
             |text| self.pipe.encode_phase(text, req),
             |_| Ok(self.pipe.device.synchronize()?),
             |heavy, encoded, on_progress| {
-                let result = self.pipe.render_phase(heavy, req, encoded, on_progress);
+                let result =
+                    self.pipe
+                        .render_phase(heavy, req, encoded, resolved_pag.as_ref(), on_progress);
                 candle_gen::synchronize_result(&self.pipe.device, result)
             },
         )?;
-        Ok(GenerationOutput::Images(images))
+        Ok(gen_core::GenerationReport {
+            pag: resolved_pag
+                .as_ref()
+                .map(|p| p.execution_report(actual_steps)),
+            ..gen_core::GenerationReport::from_output(GenerationOutput::Images(images))
+        })
     }
 }
 
@@ -1116,6 +1189,20 @@ fn resolve_steps(requested: Option<u32>) -> usize {
     requested
         .map(|s| s as usize)
         .unwrap_or(DEFAULT_STEPS as usize)
+}
+
+/// Shared PAG capability advertised by Qwen-Image 1.0 / Edit 2511 / Control (60 blocks,
+/// default block `[30]`).
+pub fn pag_capability() -> gen_core::PagCapability {
+    gen_core::PagCapability {
+        num_blocks: 60,
+        block_domain: std::borrow::Cow::Borrowed("blocks"),
+        default_layers: vec![30],
+        default_start: 0.0,
+        default_stop: 1.0,
+        recommended_scale: 1.5,
+        max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
+    }
 }
 
 /// Qwen-Image txt2img descriptor — the surface sc-3696 wires: true-CFG txt2img with a negative
@@ -1150,6 +1237,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
             // bidirectional guard sc-16951 added to `candle-gen-catalog`.
             supports_preview: true,
+            pag: Some(pag_capability()),
             ..Default::default()
         },
     }
@@ -2275,5 +2363,113 @@ mod execution_policy_tests {
         assert_eq!(report(None), report(Some(DEFAULT_GUIDANCE)));
         assert_ne!(report(None), report(Some(1.0)));
         assert_ne!(report(None), report(Some(DEFAULT_GUIDANCE + 1.0)));
+    }
+
+    #[test]
+    fn descriptor_advertises_60_block_pag_and_validates_bounds() {
+        let desc = descriptor();
+        let pag = desc
+            .capabilities
+            .pag
+            .as_ref()
+            .expect("Candle Qwen-Image descriptor must advertise PagCapability");
+        assert_eq!(pag.num_blocks, 60);
+        assert_eq!(pag.block_domain, "blocks");
+        assert_eq!(pag.default_layers, vec![30]);
+        assert_eq!(pag.default_start, 0.0);
+        assert_eq!(pag.default_stop, 1.0);
+        assert_eq!(pag.recommended_scale, 1.5);
+        assert_eq!(pag.max_scale, 15.0);
+        pag.validate_definition().unwrap();
+
+        let zero_req = GenerationRequest {
+            prompt: "a fox".into(),
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![30]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(desc
+            .capabilities
+            .validate_request(MODEL_ID, &zero_req)
+            .is_ok());
+        assert!(candle_gen::gen_core::resolve_pag(
+            Some(pag),
+            MODEL_ID,
+            zero_req.effective_pag().unwrap()
+        )
+        .unwrap()
+        .is_none());
+
+        let oob_req = GenerationRequest {
+            prompt: "a fox".into(),
+            pag: Some(candle_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![60]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(desc
+            .capabilities
+            .validate_request(MODEL_ID, &oob_req)
+            .is_err());
+
+        let resolved = candle_gen::gen_core::resolve_pag(
+            Some(pag),
+            MODEL_ID,
+            Some(&candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        resolved
+            .execution_report(20)
+            .validate_with_capability(pag)
+            .unwrap();
+    }
+
+    #[test]
+    fn execution_pag_policy_captures_full_resolved_config() {
+        let cap = descriptor().capabilities.pag.unwrap();
+        let resolve = |cfg| {
+            candle_gen::gen_core::resolve_pag(Some(&cap), MODEL_ID, Some(&cfg))
+                .unwrap()
+                .unwrap()
+        };
+        let a = resolve(candle_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![30]),
+            start: Some(0.1),
+            stop: Some(0.8),
+            adaptive_scale: Some(0.2),
+        });
+        let b = resolve(candle_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![31]),
+            start: Some(0.2),
+            stop: Some(0.9),
+            adaptive_scale: Some(0.4),
+        });
+        let record = |p: Option<&candle_gen::gen_core::PagResolved>| {
+            candle_gen::testkit::execution_policy(|| {
+                crate::record_pag_policy("qwen_image/pag", p);
+            })
+        };
+        let policy_a = record(Some(&a));
+        let policy_b = record(Some(&b));
+        assert_ne!(policy_a, policy_b);
+        assert_ne!(policy_a, record(None));
+        let gen_core::generator::ExecutionFact::Resolved { value } =
+            &policy_a.resolved().unwrap().quality_policy
+        else {
+            panic!("resolved PAG policy fact expected");
+        };
+        let recorded = &value["operations"]["qwen_image/pag"][0]["value"];
+        assert_eq!(recorded, &serde_json::to_value(&a).unwrap());
     }
 }

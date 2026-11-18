@@ -586,6 +586,7 @@ impl Iris3b {
                 })
                 .collect(),
             prefix_kv_cache: None,
+            pag: None,
         })
     }
 

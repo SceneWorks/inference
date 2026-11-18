@@ -36,8 +36,9 @@ use std::sync::Arc;
 
 use crate::ip_adapter::FluxIpInjector;
 use crate::ip_dit::{
-    apply_rope, control_residual_interval, scaled_dot_product_attention_planned,
-    timestep_embedding, Config, DitImageInjector, EmbedNd, PreparedConditioning,
+    apply_rope, control_residual_interval, pag_joint_attention_post_rope,
+    scaled_dot_product_attention_planned, timestep_embedding, Config, DitImageInjector, EmbedNd,
+    PreparedConditioning,
 };
 use crate::quant::QLinear;
 
@@ -249,6 +250,7 @@ impl JointAttention {
         pe: &Tensor,
         ip: Option<(&FluxIpInjector<'_>, usize)>,
         attention_plan: AttentionPlan<'_>,
+        perturb_img: bool,
     ) -> candle_gen::Result<(Tensor, Tensor, Option<Tensor>)> {
         let (q, k, v) = self.qkv(
             hidden,
@@ -277,12 +279,18 @@ impl JointAttention {
         let v = Tensor::cat(&[&ev, &v], 2)?;
         let q = apply_rope(&q, pe)?.contiguous()?;
         let k = apply_rope(&k, pe)?.contiguous()?;
-        let out = scaled_dot_product_attention_planned(&q, &k, &v, attention_plan)?;
-        let out = out.transpose(1, 2)?.flatten_from(2)?;
         let txt_seq = encoder.dim(1)?;
         let img_seq = hidden.dim(1)?;
-        let attn_txt = self.to_add_out.forward(&out.narrow(1, 0, txt_seq)?)?;
-        let attn_img = self.to_out.forward(&out.narrow(1, txt_seq, img_seq)?)?;
+        let (out_txt, out_img) = if perturb_img {
+            pag_joint_attention_post_rope(&q, &k, &v, txt_seq, attention_plan)?
+        } else {
+            let out = scaled_dot_product_attention_planned(&q, &k, &v, attention_plan)?
+                .transpose(1, 2)?
+                .flatten_from(2)?;
+            (out.narrow(1, 0, txt_seq)?, out.narrow(1, txt_seq, img_seq)?)
+        };
+        let attn_txt = self.to_add_out.forward(&out_txt)?;
+        let attn_img = self.to_out.forward(&out_img)?;
         Ok((attn_img, attn_txt, ip_residual))
     }
 }
@@ -393,6 +401,7 @@ impl JointBlock {
     }
 
     /// `(hidden, encoder)` → `(hidden', encoder')`.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         hidden: &Tensor,
@@ -401,14 +410,20 @@ impl JointBlock {
         pe: &Tensor,
         ip: Option<(&FluxIpInjector<'_>, usize)>,
         attention_plan: AttentionPlan<'_>,
+        perturb_img: bool,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         let (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.norm1.forward_six(hidden, emb)?;
         let (norm_encoder, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp) =
             self.norm1_context.forward_six(encoder, emb)?;
-        let (attn_img, attn_txt, ip_residual) =
-            self.attn
-                .forward(&norm_hidden, &norm_encoder, pe, ip, attention_plan)?;
+        let (attn_img, attn_txt, ip_residual) = self.attn.forward(
+            &norm_hidden,
+            &norm_encoder,
+            pe,
+            ip,
+            attention_plan,
+            perturb_img,
+        )?;
         let mut hidden = apply_norm_ff(
             hidden,
             &attn_img,
@@ -573,6 +588,7 @@ impl SingleBlock {
         emb: &Tensor,
         pe: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag_txt_seq: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
         let (norm_hidden, gate) = self.norm.forward_three(hidden, emb)?;
         let (b, s, _) = norm_hidden.dims3()?;
@@ -586,8 +602,16 @@ impl SingleBlock {
         let v = to_heads(self.to_v.forward(&norm_hidden)?)?;
         let q = apply_rope(&q, pe)?.contiguous()?;
         let k = apply_rope(&k, pe)?.contiguous()?;
-        let attn = scaled_dot_product_attention_planned(&q, &k, &v, attention_plan)?;
-        let attn = attn.transpose(1, 2)?.flatten_from(2)?; // [b, s, hidden]
+        let attn = match pag_txt_seq {
+            Some(txt_seq) => {
+                let (out_txt, out_img) =
+                    pag_joint_attention_post_rope(&q, &k, &v, txt_seq, attention_plan)?;
+                Tensor::cat(&[&out_txt, &out_img], 1)?
+            }
+            None => scaled_dot_product_attention_planned(&q, &k, &v, attention_plan)?
+                .transpose(1, 2)?
+                .flatten_from(2)?,
+        }; // [b, s, hidden]
         let mlp = self.proj_mlp.forward(&norm_hidden)?.gelu()?;
         let out = self
             .proj_out
@@ -1000,6 +1024,7 @@ impl PackedFluxDit {
             usize::MAX,
             &candle_gen::gen_core::CancelFlag::default(),
             None,
+            None,
         )
         .map_err(|error| match error {
             candle_gen::CandleError::Candle(error) => error,
@@ -1007,6 +1032,7 @@ impl PackedFluxDit {
         })
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_injected_with_memory(
         &self,
@@ -1021,6 +1047,38 @@ impl PackedFluxDit {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_injected_with_memory_pag(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            pooled,
+            guidance,
+            injector,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_with_memory_pag(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
     ) -> candle_gen::Result<Tensor> {
         self.forward_core(
             img,
@@ -1037,6 +1095,7 @@ impl PackedFluxDit {
             transformer_window,
             cancel,
             None,
+            pag_layers,
         )
     }
 
@@ -1073,6 +1132,7 @@ impl PackedFluxDit {
             transformer_window,
             cancel,
             None,
+            None,
         )
     }
 
@@ -1094,6 +1154,40 @@ impl PackedFluxDit {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_control_with_memory_pag(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            pooled,
+            guidance,
+            injector,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_control_with_memory_pag(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> candle_gen::Result<Tensor> {
         self.forward_core(
             img,
             img_ids,
@@ -1109,6 +1203,7 @@ impl PackedFluxDit {
             transformer_window,
             cancel,
             None,
+            pag_layers,
         )
     }
 
@@ -1142,9 +1237,11 @@ impl PackedFluxDit {
             transformer_window,
             cancel,
             None,
+            None,
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_prepared_with_memory(
         &self,
@@ -1163,6 +1260,44 @@ impl PackedFluxDit {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_prepared_with_memory_pag(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            pooled,
+            guidance,
+            ip,
+            injector,
+            control,
+            prepared,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory_pag(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector<'_>>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> candle_gen::Result<Tensor> {
         self.forward_core(
             img,
             img_ids,
@@ -1178,6 +1313,7 @@ impl PackedFluxDit {
             transformer_window,
             cancel,
             Some(prepared),
+            pag_layers,
         )
     }
 
@@ -1198,6 +1334,7 @@ impl PackedFluxDit {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
         prepared: Option<&PreparedConditioning>,
+        pag_layers: Option<&[u32]>,
     ) -> candle_gen::Result<Tensor> {
         let mut hidden = self.x_embedder.forward(img)?;
         let mut encoder = self.context_embedder.forward(txt)?;
@@ -1256,6 +1393,8 @@ impl PackedFluxDit {
                         .collect::<candle_gen::Result<Vec<_>>>()?;
                     for (index, block) in &blocks {
                         candle_gen::check_cancel(cancel)?;
+                        let perturb_img = pag_layers
+                            .is_some_and(|layers| layers.binary_search(&(*index as u32)).is_ok());
                         (hidden, encoder) = block.forward(
                             &hidden,
                             &encoder,
@@ -1263,6 +1402,7 @@ impl PackedFluxDit {
                             &pe,
                             ip.map(|injector| (injector, *index)),
                             attention_plan,
+                            perturb_img,
                         )?;
                         if let Some(inj) = injector {
                             if let Some(r) = inj.after_double(*index, &hidden)? {
@@ -1302,7 +1442,11 @@ impl PackedFluxDit {
                         .collect::<candle_gen::Result<Vec<_>>>()?;
                     for (index, block) in &blocks {
                         candle_gen::check_cancel(cancel)?;
-                        joint = block.forward(&joint, &emb, &pe, attention_plan)?;
+                        let global = (*num_double + *index) as u32;
+                        let pag_txt_seq = pag_layers
+                            .is_some_and(|layers| layers.binary_search(&global).is_ok())
+                            .then_some(txt_seq);
+                        joint = block.forward(&joint, &emb, &pe, attention_plan, pag_txt_seq)?;
                         if let Some(inj) = injector {
                             if inj.injects_after_single(*index) {
                                 let seq = joint.dim(1)?;
@@ -1325,8 +1469,11 @@ impl PackedFluxDit {
             unreachable!("streamed FLUX packed blocks returned above")
         };
 
+        let num_double = double.len();
         for (i, block) in double.iter().enumerate() {
             candle_gen::check_cancel(cancel)?;
+            let perturb_img =
+                pag_layers.is_some_and(|layers| layers.binary_search(&(i as u32)).is_ok());
             let (h, e) = block.forward(
                 &hidden,
                 &encoder,
@@ -1334,6 +1481,7 @@ impl PackedFluxDit {
                 &pe,
                 ip.map(|injector| (injector, i)),
                 attention_plan,
+                perturb_img,
             )?;
             hidden = h;
             encoder = e;
@@ -1358,7 +1506,11 @@ impl PackedFluxDit {
         let mut joint = Tensor::cat(&[&encoder, &hidden], 1)?;
         for (i, block) in single.iter().enumerate() {
             candle_gen::check_cancel(cancel)?;
-            joint = block.forward(&joint, &emb, &pe, attention_plan)?;
+            let global = (num_double + i) as u32;
+            let pag_txt_seq = pag_layers
+                .is_some_and(|layers| layers.binary_search(&global).is_ok())
+                .then_some(txt_seq);
+            joint = block.forward(&joint, &emb, &pe, attention_plan, pag_txt_seq)?;
             if let Some(inj) = injector {
                 if inj.injects_after_single(i) {
                     let seq = joint.dim(1)?;

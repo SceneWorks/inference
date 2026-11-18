@@ -204,6 +204,35 @@ fn l2_over_channels(x: &Tensor) -> Result<Tensor> {
     ((xf.sqr()?.sum_keepdim(D::Minus1)? + 1e-12)?.sqrt()?).to_dtype(dtype)
 }
 
+/// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this
+/// step (`step_scale > 0.0`), or `None` when inactive.
+pub(crate) fn pag_perturb_block_flags(
+    pag: Option<&candle_gen::gen_core::PagResolved>,
+    num_blocks: usize,
+    step_index: usize,
+    total_steps: usize,
+) -> Option<Vec<bool>> {
+    let pag = pag?;
+    if pag.step_scale(step_index, total_steps) <= 0.0 {
+        return None;
+    }
+    Some(
+        (0..num_blocks)
+            .map(|idx| pag.perturbs_block(idx as u32, step_index, total_steps))
+            .collect(),
+    )
+}
+
+/// Combine True-CFG (or raw cond) velocity with PAG: `guided + step_pag_scale * (cond - perturbed)`.
+pub(crate) fn combine_pag_guidance(
+    guided: &Tensor,
+    cond: &Tensor,
+    perturbed: &Tensor,
+    pag_scale: f32,
+) -> Result<Tensor> {
+    guided + ((cond - perturbed)? * pag_scale as f64)?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +335,48 @@ mod tests {
         for z in ov {
             assert!((z - 2.0).abs() < 1e-4, "got {z}");
         }
+    }
+
+    #[test]
+    fn pag_schedule_masks_and_combine_formula() {
+        let cap = crate::pag_capability();
+        let resolved = candle_gen::gen_core::resolve_pag(
+            Some(&cap),
+            crate::MODEL_ID,
+            Some(&candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                start: Some(0.0),
+                stop: Some(0.5),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        use candle_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+        let euler = canonical_solver_or_euler(None);
+        assert_eq!(step_index_for_eval(euler, 0, 4), 0);
+        assert_eq!(step_index_for_eval(euler, 2, 4), 2);
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            let steps: Vec<usize> = (0..8)
+                .map(|eval_idx| step_index_for_eval(solver, eval_idx, 4))
+                .collect();
+            assert_eq!(steps, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        }
+        let flags = pag_perturb_block_flags(Some(&resolved), 60, 1, 4).unwrap();
+        assert!(flags[30] && !flags[29]);
+        assert!(pag_perturb_block_flags(Some(&resolved), 60, 2, 4).is_none());
+
+        let dev = Device::Cpu;
+        let guided = Tensor::from_vec(vec![2.0f32, 4.0], (1, 2), &dev).unwrap();
+        let cond = Tensor::from_vec(vec![3.0f32, 6.0], (1, 2), &dev).unwrap();
+        let perturbed = Tensor::from_vec(vec![1.0f32, 2.0], (1, 2), &dev).unwrap();
+        let out = combine_pag_guidance(&guided, &cond, &perturbed, 1.5)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(out, vec![5.0, 10.0]);
     }
 }

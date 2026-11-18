@@ -1,0 +1,20 @@
+[package]
+name = "sceneworks-gen-core-pag-policy"
+version = "0.1.0"
+edition = "2021"
+description = "Portable serde-only Perturbed-Attention Guidance (PAG) policy and step-window contract."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[lib]
+name = "gen_core_pag_policy"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[example]]
+name = "pag_wasm_corpus"
+crate-type = ["cdylib"]

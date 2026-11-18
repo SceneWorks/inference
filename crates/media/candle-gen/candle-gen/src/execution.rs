@@ -303,17 +303,31 @@ pub fn capture_direct(
     cancel: &gen_core::CancelFlag,
     body: impl FnOnce() -> gen_core::Result<GenerationOutput>,
 ) -> gen_core::Result<CompletedGeneration> {
+    capture_direct_report(descriptor, cancel, || {
+        body().map(gen_core::GenerationReport::from_output)
+    })
+}
+
+/// Run a standalone image provider entry point returning a full [`gen_core::GenerationReport`]
+/// (preserving `pag`, `warnings`, `prefix_kv_cache`, `artifacts`, etc.) under the same attempt-local contract.
+pub fn capture_direct_report(
+    descriptor: &gen_core::ModelDescriptor,
+    cancel: &gen_core::CancelFlag,
+    body: impl FnOnce() -> gen_core::Result<gen_core::GenerationReport>,
+) -> gen_core::Result<CompletedGeneration> {
     let attempt = Attempt::begin();
-    let output = body()?;
+    let generation = body()?;
     if cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
     }
-    let execution = attempt.finish_image(descriptor, &output);
-    CompletedGeneration::new(
-        gen_core::GenerationReport::from_output(output),
-        execution,
-        descriptor,
-    )
+    let output = generation.output.as_ref().ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "{}: standalone image route produced no output",
+            descriptor.id
+        ))
+    })?;
+    let execution = attempt.finish_image(descriptor, output);
+    CompletedGeneration::new(generation, execution, descriptor)
 }
 
 /// Run one provider attempt and bind only observations from that invocation to its output.
@@ -1112,5 +1126,59 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert_ne!(values[0]["value"], values[1]["value"]);
         assert_ne!(values[1]["value"], values[2]["value"]);
+    }
+
+    #[test]
+    fn capture_direct_report_preserves_pag_and_warnings_and_fails_closed_without_output() {
+        let pag_report = gen_core::PagExecutionReport {
+            layers: vec![15],
+            active_steps: 3,
+            total_steps: 4,
+            scale: 1.2,
+            adaptive_scale: 0.0,
+            start: 0.0,
+            stop: 0.75,
+        };
+        let warning = gen_core::GenerationWarning {
+            code: "fixture_warning".into(),
+            message: "warning preserved".into(),
+        };
+        let completed =
+            capture_direct_report(&DESCRIPTOR, &gen_core::CancelFlag::default(), || {
+                rng_scheme("fixture");
+                draw("noise", 7, 0);
+                schedule("euler", &[1.0, 0.0], "flow");
+                runtime(&Device::Cpu, DType::BF16);
+                let mut report =
+                    gen_core::GenerationReport::from_output(GenerationOutput::Images(vec![
+                        Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![0; 3],
+                        },
+                    ]));
+                report.pag = Some(pag_report.clone());
+                report.warnings.push(warning.clone());
+                Ok(report)
+            })
+            .unwrap();
+        assert_eq!(completed.generation.pag.as_ref(), Some(&pag_report));
+        assert_eq!(completed.generation.warnings, vec![warning]);
+
+        let missing_output =
+            capture_direct_report(&DESCRIPTOR, &gen_core::CancelFlag::default(), || {
+                Ok(gen_core::GenerationReport {
+                    output: None,
+                    artifacts: None,
+                    warnings: vec![],
+                    prefix_kv_cache: None,
+                    pag: Some(pag_report.clone()),
+                })
+            });
+        assert!(matches!(
+            missing_output,
+            Err(gen_core::Error::Msg(ref msg)) if msg.contains("produced no output")
+        ));
+        assert!(ATTEMPTS.with_borrow(|stack| stack.is_empty()));
     }
 }

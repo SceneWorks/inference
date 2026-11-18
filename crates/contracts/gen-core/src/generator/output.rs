@@ -140,6 +140,10 @@ pub struct GenerationReport {
     /// [`ExecutionSurface::prefix_kv_cache`](crate::ExecutionSurface::prefix_kv_cache) domain;
     /// `Some` for one that does, on every render, whatever the request selected.
     pub prefix_kv_cache: Option<PrefixKvCacheReport>,
+    /// Executed Perturbed-Attention Guidance (PAG) parameters (`layers`, `active_steps`,
+    /// `total_steps`, `scale`, `adaptive_scale`, `start`, `stop`), when PAG ran or was reported
+    /// (SW-7173). `None` for non-PAG renders and providers without PAG reporting.
+    pub pag: Option<crate::PagExecutionReport>,
 }
 
 impl GenerationReport {
@@ -151,6 +155,7 @@ impl GenerationReport {
             artifacts: None,
             warnings: Vec::new(),
             prefix_kv_cache: None,
+            pag: None,
         }
     }
 }

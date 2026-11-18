@@ -489,6 +489,18 @@ impl ZImageTransformer {
         plan: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        self.forward_with_rungs_with_pag(prep, x, timestep, plan, window, None)
+    }
+
+    pub(crate) fn forward_with_rungs_with_pag(
+        &self,
+        prep: &Prepared,
+        x: &Array,
+        timestep: f32,
+        plan: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        pag: Option<crate::attention::PagStepContext<'_>>,
+    ) -> Result<Array> {
         // iOS: every stage below is one bounded quantum (checked against live headroom before its
         // graph is built, materialized before the next); off device each guard is a pass-through,
         // so the op sequence is exactly the historical forward.
@@ -512,19 +524,23 @@ impl ZImageTransformer {
         let unified = match window {
             None => {
                 let mut unified = unified;
-                for layer in &self.layers {
-                    unified = layer.forward_quantum(
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let pag_x_len = pag.and_then(|ctx| ctx.layer_x_len(i, x_len));
+                    unified = layer.forward_quantum_with_pag(
                         &unified,
                         &prep.unified_freqs,
                         &t_emb,
                         plan,
+                        pag_x_len,
                         0,
                         Ok,
                     )?;
                 }
                 unified
             }
-            Some(window) => self.run_windowed_layers(unified, prep, &t_emb, plan, window)?,
+            Some(window) => {
+                self.run_windowed_layers_with_pag(unified, prep, &t_emb, x_len, plan, pag, window)?
+            }
         };
 
         // Final layer + unpatchify (only the real image tokens survive).
@@ -751,39 +767,39 @@ impl ZImageTransformer {
     /// that hand-rolling the drop-before-eval order frees *nothing* while still producing correct
     /// images (238.4 MiB vs 8.0 MiB at window = 1), so a family-local copy of this loop is a silent
     /// failure waiting to happen.
-    fn run_windowed_layers(
+    #[allow(clippy::too_many_arguments)]
+    fn run_windowed_layers_with_pag(
         &self,
         unified: Array,
         prep: &Prepared,
         t_emb: &Array,
+        x_len: i32,
         plan: AttentionPlan<'_>,
+        pag: Option<crate::attention::PagStepContext<'_>>,
         window: crate::block_stream::BlockWindow<'_>,
     ) -> Result<Array> {
-        self.run_windowed_layers_with_hints(
+        self.run_windowed_layers_with_hints_and_pag(
             unified,
             &prep.unified_freqs,
             t_emb,
+            x_len,
             plan,
+            pag,
             window,
             &|_: usize, _: &Array| 0,
             &mut |state: &Array, _i: usize| Ok(state.clone()),
         )
     }
 
-    /// [`run_windowed_layers`](Self::run_windowed_layers) with a post-block hook, so the ControlNet
-    /// variant can inject its per-place hint between blocks exactly where the resident loop does.
-    ///
-    /// `after_block(state, i)` runs immediately after unified block `i`, inside the window — the same
-    /// position as the resident `add_hint` call — so the value carried into block `i+1` is identical
-    /// whether or not the stack is windowed. It returns the (possibly unchanged) state rather than
-    /// mutating, mirroring the resident loop's `unified = add_hint(&unified, …)`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_windowed_layers_with_hints(
+    pub(crate) fn run_windowed_layers_with_hints_and_pag(
         &self,
         unified: Array,
         unified_freqs: &Array,
         t_emb: &Array,
+        x_len: i32,
         plan: AttentionPlan<'_>,
+        pag: Option<crate::attention::PagStepContext<'_>>,
         window: crate::block_stream::BlockWindow<'_>,
         after_bytes: &dyn Fn(usize, &Array) -> u64,
         after_block: &mut dyn FnMut(&Array, usize) -> Result<Array>,
@@ -819,10 +835,16 @@ impl ZImageTransformer {
                     // any replayed packing) are read INSIDE its quantum, which is priced with them.
                     let (block, read_bytes) = stream.materialize_counted(view, i)?;
                     let extra = read_bytes.saturating_add(after_bytes(i, &cur));
-                    cur =
-                        block.forward_quantum(&cur, unified_freqs, t_emb, plan, extra, |out| {
-                            after_block(&out, i)
-                        })?;
+                    let pag_x_len = pag.and_then(|ctx| ctx.layer_x_len(i, x_len));
+                    cur = block.forward_quantum_with_pag(
+                        &cur,
+                        unified_freqs,
+                        t_emb,
+                        plan,
+                        pag_x_len,
+                        extra,
+                        |out| after_block(&out, i),
+                    )?;
                 }
                 Ok(cur)
             },

@@ -40,9 +40,13 @@ fn outcome(case: &Case) -> Value {
             apply_edit_defaults(&request)
                 .map_err(|error| error.to_string())
                 .map(|value| {
-                    json!({"width":value.width,"height":value.height,"count":value.count,
+                    let mut out = json!({"width":value.width,"height":value.height,"count":value.count,
                         "steps":value.steps,"guidance":value.guidance,
-                        "scheduler_shift":value.scheduler_shift,"moss_image":value.moss_image})
+                        "scheduler_shift":value.scheduler_shift,"moss_image":value.moss_image});
+                    if let Some(pag) = value.pag {
+                        out["pag"] = serde_json::to_value(pag).unwrap();
+                    }
+                    out
                 })
         }),
         "deserialize_slg" => serde_json::from_value::<MossSkipLayerGuidance>(case.input.clone())

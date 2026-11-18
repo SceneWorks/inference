@@ -179,6 +179,37 @@ impl QwenTransformerBlock {
         modulate_index: Option<&Array>,
         attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
+        self.forward_budgeted_pag(
+            hidden_states,
+            encoder_hidden_states,
+            text_embeddings,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            mask,
+            modulate_index,
+            attention,
+            None,
+        )
+    }
+
+    /// [`Self::forward_budgeted`] with optional PAG perturbation over `Some(target_tokens)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_budgeted_pag(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        text_embeddings: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        modulate_index: Option<&Array>,
+        attention: AttentionPlan<'_>,
+        perturb_target_tokens: Option<usize>,
+    ) -> Result<(Array, Array)> {
         // SiLU'd timestep embedding. Under zero_cond_t this is [2B, dim]; the image modulation uses
         // the whole thing, the text modulation only the real-timestep half. SiLU is elementwise, so
         // `act[:B] == silu(temb[:B])` — slicing here is bit-identical to slicing the temb first.
@@ -202,7 +233,7 @@ impl QwenTransformerBlock {
             &txt_mod[0],
         )?;
 
-        let (img_attn, txt_attn) = self.attn.forward_budgeted(
+        let (img_attn, txt_attn) = self.attn.forward_budgeted_pag(
             &img_modulated,
             &txt_modulated,
             img_cos,
@@ -211,6 +242,7 @@ impl QwenTransformerBlock {
             txt_sin,
             mask,
             attention,
+            perturb_target_tokens,
         )?;
 
         let hidden_states = gated(hidden_states, &img_gate1, &img_attn)?;

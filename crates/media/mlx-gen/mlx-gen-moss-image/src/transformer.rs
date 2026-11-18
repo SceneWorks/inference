@@ -305,7 +305,7 @@ fn rotate(x: &Array, rope: &Array) -> Result<Array> {
     Ok(add(multiply(x, cos)?, multiply(rotated, sin)?)?)
 }
 #[allow(clippy::too_many_arguments)]
-fn attention(
+pub(crate) fn attention(
     q: &Array,
     k: &Array,
     v: &Array,
@@ -314,6 +314,7 @@ fn attention(
     cancel: &CancelFlag,
     training: bool,
     edit: bool,
+    perturbed_video_len: Option<i32>,
 ) -> Result<Array> {
     let shape = [q.shape()[0], q.shape()[1], g.heads, g.dim / g.heads];
     let q = rotate(&q.reshape(&shape)?, rope)?
@@ -331,27 +332,50 @@ fn attention(
     // inference fast path below is deliberately unchanged.
     let cpu_bf16 =
         value_dtype == Dtype::Bfloat16 && mlx_rs::Device::try_default()? == mlx_rs::Device::cpu();
-    let out = if edit {
-        edit_attention(&q, &k, &v, g, cancel)?
-    } else if training || cpu_bf16 {
-        // Explicit differentiable SDPA: no evaluation of traced adapter activations.
-        let q = q.as_dtype(Dtype::Float32)?;
-        let k = k.as_dtype(Dtype::Float32)?;
-        let v = v.as_dtype(Dtype::Float32)?;
-        let scores = k
-            .expand_dims(2)?
-            .matmul(&self::scale(&q, scale)?.expand_dims(-1)?)?
-            .squeeze_axes(&[-1])?;
-        let p = mlx_rs::ops::softmax_axis(&scores, -1, true)?;
-        v.transpose_axes(&[0, 1, 3, 2])?
-            .expand_dims(2)?
-            .matmul(&p.expand_dims(-1)?)?
-            .squeeze_axes(&[-1])?
-            .as_dtype(value_dtype)?
-    } else if v.dtype() == Dtype::Float32 {
-        attention_fp32(&q, &k, &v, scale, cancel)?
+    let sdpa = |query: &Array| -> Result<Array> {
+        if edit {
+            edit_attention(query, &k, &v, g, cancel)
+        } else if training || cpu_bf16 {
+            // Explicit differentiable SDPA: no evaluation of traced adapter activations.
+            let q = query.as_dtype(Dtype::Float32)?;
+            let k = k.as_dtype(Dtype::Float32)?;
+            let v = v.as_dtype(Dtype::Float32)?;
+            let scores = k
+                .expand_dims(2)?
+                .matmul(&self::scale(&q, scale)?.expand_dims(-1)?)?
+                .squeeze_axes(&[-1])?;
+            let p = mlx_rs::ops::softmax_axis(&scores, -1, true)?;
+            Ok(v.transpose_axes(&[0, 1, 3, 2])?
+                .expand_dims(2)?
+                .matmul(&p.expand_dims(-1)?)?
+                .squeeze_axes(&[-1])?
+                .as_dtype(value_dtype)?)
+        } else if v.dtype() == Dtype::Float32 {
+            attention_fp32(query, &k, &v, scale, cancel)
+        } else {
+            Ok(mlx_rs::fast::scaled_dot_product_attention(
+                query, &k, &v, scale, None, None,
+            )?)
+        }
+    };
+    let out = if let Some(video_len) = perturbed_video_len {
+        let seq_len = shape[1];
+        if video_len < 0 || video_len > seq_len {
+            return Err(Error::Msg(
+                "MOSS PAG video token length out of bounds".into(),
+            ));
+        }
+        let v_video = slice_axis(&v, 2, 0, video_len)?;
+        let text_len = seq_len - video_len;
+        if text_len == 0 {
+            v_video
+        } else {
+            let q_text = slice_axis(&q, 2, video_len, text_len)?;
+            let attn_text = sdpa(&q_text)?;
+            concatenate_axis(&[&v_video, &attn_text], 2)?
+        }
     } else {
-        mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None, None)?
+        sdpa(&q)?
     };
     Ok(out
         .transpose_axes(&[0, 2, 1, 3])?
@@ -407,6 +431,7 @@ impl TextBlock {
                 cancel,
                 training,
                 self.edit_precision,
+                None,
             )?)?,
         )?;
         let y = self.n2.forward(&x)?;
@@ -518,7 +543,7 @@ impl Block {
                 ));
             }
             Ok(vec![block
-                .forward(&arrays[0], &arrays[1], &arrays[2], g, cancel, true)
+                .forward(&arrays[0], &arrays[1], &arrays[2], g, cancel, true, None)
                 .map_err(|e| {
                     mlx_rs::error::Exception::custom(e.to_string())
                 })?])
@@ -531,6 +556,7 @@ impl Block {
         }
         Ok(output.remove(0))
     }
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: &Array,
@@ -539,6 +565,7 @@ impl Block {
         g: &Geometry,
         cancel: &CancelFlag,
         training: bool,
+        perturbed_video_len: Option<i32>,
     ) -> Result<Array> {
         #[cfg(test)]
         if training {
@@ -557,8 +584,17 @@ impl Block {
         let q = qk_norm(&self.projections[0].forward(&y)?, &self.qn, g)?;
         let k = qk_norm(&self.projections[1].forward(&y)?, &self.kn, g)?;
         let v = self.projections[2].forward(&y)?;
-        let a = self.projections[3]
-            .forward(&attention(&q, &k, &v, rope, g, cancel, training, false)?)?;
+        let a = self.projections[3].forward(&attention(
+            &q,
+            &k,
+            &v,
+            rope,
+            g,
+            cancel,
+            training,
+            false,
+            perturbed_video_len,
+        )?)?;
         let x = add(x, multiply(a, m(2)?)?)?;
         let y = add(
             multiply(
@@ -896,6 +932,17 @@ impl Transformer {
         skip: &[u32],
         cancel: &CancelFlag,
     ) -> Result<Array> {
+        self.forward_with_pag(latents, times, contexts, skip, &[], cancel)
+    }
+    pub(crate) fn forward_with_pag(
+        &self,
+        latents: &Array,
+        times: &[f32],
+        contexts: &[Array],
+        skip: &[u32],
+        pag_layers: &[u32],
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
         check(cancel)?;
         let g = &self.g;
         let shape = latents.shape();
@@ -904,10 +951,12 @@ impl Transformer {
             || contexts.len() != shape[0] as usize
             || !(times.len() == 1 || times.len() == contexts.len())
             || skip.iter().any(|i| *i as usize >= g.layers)
+            || pag_layers.iter().any(|i| *i as usize >= g.layers)
         {
             return Err(Error::Msg("MOSS forward shape/time/skip mismatch".into()));
         }
         let (h, w) = (shape[2], shape[3]);
+        let video_len = h * w;
         let mut outputs = Vec::new();
         for (index, context) in contexts.iter().enumerate() {
             check(cancel)?;
@@ -940,11 +989,11 @@ impl Transformer {
             let head = self.head.forward(&time)?.reshape(&[1, 2, g.dim])?;
             let video = slice_axis(latents, 0, index as i32, 1)?
                 .transpose_axes(&[0, 2, 3, 1])?
-                .reshape(&[1, h * w, g.channels])?;
+                .reshape(&[1, video_len, g.channels])?;
             let video = self.video.forward(&video)?;
             let context_len = context.shape()[1];
             let rope = rope(h, w, context_len, g.dim / g.heads)?.as_dtype(video.dtype())?;
-            let text_rope = slice_axis(&rope, 1, h * w, context_len)?;
+            let text_rope = slice_axis(&rope, 1, video_len, context_len)?;
             let mut text = self.text.forward(context)?;
             for block in &self.text_blocks {
                 check(cancel)?;
@@ -958,10 +1007,19 @@ impl Transformer {
             for (i, block) in self.blocks.iter().enumerate() {
                 check(cancel)?;
                 if !skip.contains(&(i as u32)) {
-                    x = if self.training_checkpoint {
+                    let perturbed = pag_layers.contains(&(i as u32)).then_some(video_len);
+                    x = if self.training_checkpoint && perturbed.is_none() {
                         block.forward_checkpointed(&x, &rope, &modulation, g, cancel)?
                     } else {
-                        block.forward(&x, &rope, &modulation, g, cancel, self.training)?
+                        block.forward(
+                            &x,
+                            &rope,
+                            &modulation,
+                            g,
+                            cancel,
+                            self.training,
+                            perturbed,
+                        )?
                     };
                     if !self.training {
                         eval([&x])?;
@@ -970,7 +1028,7 @@ impl Transformer {
             }
             let x = self
                 .norm
-                .forward(&slice_axis(&x, 1, 0, h * w)?.as_dtype(self.norm.weight.dtype())?)?;
+                .forward(&slice_axis(&x, 1, 0, video_len)?.as_dtype(self.norm.weight.dtype())?)?;
             let scale_head = slice_axis(&head, 1, 1, 1)?;
             let shift_head = slice_axis(&head, 1, 0, 1)?;
             let x = add(
@@ -1026,6 +1084,47 @@ struct EditBodyInput<'a> {
     modulation: &'a Array,
     geometry: &'a Geometry,
     text: i32,
+    perturb_video: bool,
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn edit_body_attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    reference: &EditKeyValue,
+    text: i32,
+    perturb_video: bool,
+    g: &Geometry,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let video_len = v.shape()[2] - text;
+    if text < 0 || video_len < 0 {
+        return Err(Error::Msg(
+            "MOSS edit body text/video length mismatch".into(),
+        ));
+    }
+    let insert = |body: &Array, ref_part: &Array| -> Result<Array> {
+        Ok(concatenate_axis(
+            &[
+                &slice_axis(body, 2, 0, text)?,
+                ref_part,
+                &slice_axis(body, 2, text, body.shape()[2] - text)?,
+            ],
+            2,
+        )?)
+    };
+    let k_all = insert(k, &reference.0)?;
+    let v_all = insert(v, &reference.1)?;
+    if !perturb_video {
+        return edit_attention(q, &k_all, &v_all, g, cancel);
+    }
+    let v_video = slice_axis(v, 2, text, video_len)?;
+    if text == 0 {
+        return Ok(v_video);
+    }
+    let q_text = slice_axis(q, 2, 0, text)?;
+    let attn_text = edit_attention(&q_text, &k_all, &v_all, g, cancel)?;
+    Ok(concatenate_axis(&[&attn_text, &v_video], 2)?)
 }
 impl Block {
     fn edit_qkv(
@@ -1127,26 +1226,11 @@ impl Block {
             modulation,
             geometry: g,
             text,
+            perturb_video,
         } = input;
         check(cancel)?;
         let (q, k, v) = self.edit_qkv(x, rope, modulation, g)?;
-        let insert = |body: &Array, reference: &Array| -> Result<Array> {
-            Ok(concatenate_axis(
-                &[
-                    &slice_axis(body, 2, 0, text)?,
-                    reference,
-                    &slice_axis(body, 2, text, body.shape()[2] - text)?,
-                ],
-                2,
-            )?)
-        };
-        let output = edit_attention(
-            &q,
-            &insert(&k, &reference.0)?,
-            &insert(&v, &reference.1)?,
-            g,
-            cancel,
-        )?;
+        let output = edit_body_attention(&q, &k, &v, reference, text, perturb_video, g, cancel)?;
         let next = self.edit_finish(x, &output, modulation, g)?;
         eval([&next])?;
         check(cancel)?;
@@ -1380,11 +1464,22 @@ impl Transformer {
         }
         Ok(EditCache { keys_values })
     }
+    #[cfg(test)]
     pub(crate) fn forward_edit(
         &self,
         latent: &Array,
         time: f32,
         conditioning: EditConditioning<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        self.forward_edit_with_pag(latent, time, conditioning, &[], cancel)
+    }
+    pub(crate) fn forward_edit_with_pag(
+        &self,
+        latent: &Array,
+        time: f32,
+        conditioning: EditConditioning<'_>,
+        pag_layers: &[u32],
         cancel: &CancelFlag,
     ) -> Result<Array> {
         let EditConditioning {
@@ -1402,6 +1497,7 @@ impl Transformer {
             || context.shape()[0] != 1
             || context.shape()[1] < 1
             || context.shape()[2] != g.text
+            || pag_layers.iter().any(|i| *i as usize >= self.blocks.len())
         {
             return Err(Error::Unsupported(
                 "MOSS edit latent/context shape mismatch".into(),
@@ -1458,6 +1554,7 @@ impl Transformer {
                     modulation: &modulation,
                     geometry: g,
                     text: text_len,
+                    perturb_video: pag_layers.contains(&(index as u32)),
                 },
                 cancel,
             )?;

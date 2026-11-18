@@ -11,8 +11,8 @@ use candle_gen::{CandleError, Result};
 use gen_core_flux3::{
     pup,
     pup::{
-        run_text_llm, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsampleOutcome,
-        UpsamplePackage, UpsamplePlan, UpsamplerInput, UPSAMPLER_COMPONENT,
+        run_text_llm_with_execution_report, PromptUpsampler, UpsampleMode, UpsampleOptions,
+        UpsampleOutcome, UpsamplePackage, UpsamplePlan, UpsamplerInput, UPSAMPLER_COMPONENT,
     },
 };
 
@@ -94,7 +94,15 @@ impl PromptUpsampler for Flux3PromptUpsampler {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<String> {
-        run_text_llm(self.llm.as_ref(), plan, options, cancel, on_progress)
+        let (text, execution) = run_text_llm_with_execution_report(
+            self.llm.as_ref(),
+            plan,
+            options,
+            cancel,
+            on_progress,
+        )?;
+        observe_enhancement_execution(execution);
+        Ok(text)
     }
 }
 
@@ -139,7 +147,7 @@ pub fn effective_prompt(
         &req.cancel,
         on_progress,
     )?;
-    req.prompt_enhancement.emit(outcome.report.clone());
+    candle_gen::execution::emit_prompt_enhancement(&req.prompt_enhancement, outcome.report.clone());
     Ok(outcome)
 }
 
@@ -251,5 +259,79 @@ mod tests {
         assert!(
             matches!(error, CandleError::Unsupported(ref detail) if detail.contains(UPSAMPLER_COMPONENT))
         );
+    }
+}
+
+fn observe_enhancement_execution(execution: core_llm::ExecutionIdentity) {
+    match execution {
+        core_llm::ExecutionIdentity::Resolved { identity } => {
+            candle_gen::execution::policy(
+                "flux3.prompt_enhancement_execution",
+                serde_json::json!(identity),
+            );
+        }
+        core_llm::ExecutionIdentity::Unavailable { reason } => {
+            candle_gen::execution::unavailable(&format!(
+                "flux3_prompt_enhancement_unobserved: The executed prompt upsampler did not supply an identity: {}",
+                reason.code
+            ));
+        }
+    }
+}
+
+pub(crate) fn observe_enhancement_outcome(outcome: &UpsampleOutcome) {
+    use sha2::{Digest, Sha256};
+    candle_gen::execution::policy(
+        "flux3.prompt_enhancement_outcome",
+        serde_json::json!({
+            "outcome": format!("{:?}", outcome.report.outcome),
+            "fallback_reason": outcome.report.fallback_reason,
+            "mode": outcome.report.mode,
+            "effective_caption_sha256": format!("{:x}", Sha256::digest(outcome.caption.as_bytes())),
+        }),
+    );
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model::descriptor();
+        candle_gen::execution::capture_direct(&descriptor, &CancelFlag::new(), || {
+            candle_gen::execution::runtime(
+                &candle_gen::candle_core::Device::Cpu,
+                candle_gen::candle_core::DType::F32,
+            );
+            candle_gen::execution::schedule("test-metadata", &[1.0, 0.5, 0.0], "resolved-sigmas");
+            candle_gen::execution::rng_scheme("test-rng");
+            candle_gen::execution::draw("noise", 17, 0);
+            observe();
+            Ok(gen_core::GenerationOutput::Images(vec![gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0],
+            }]))
+        })
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_missing_auxiliary_report_is_unavailable_and_does_not_leak_to_retry() {
+        use gen_core::generator::ExecutionIdentity;
+        let missing = capture(|| {
+            candle_gen::execution::policy("enhancement", serde_json::json!("executed"));
+            observe_enhancement_execution(ExecutionIdentity::provider_default());
+        });
+        assert!(matches!(
+            missing,
+            ExecutionIdentity::Unavailable { reason }
+                if reason.missing_facts.iter().any(|f| f.contains("flux3_prompt_enhancement_unobserved"))
+        ));
+        let retry = capture(|| {
+            candle_gen::execution::policy("enhancement", serde_json::json!("absent"));
+        });
+        assert!(retry.resolved().is_some());
     }
 }

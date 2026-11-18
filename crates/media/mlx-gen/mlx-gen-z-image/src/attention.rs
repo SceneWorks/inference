@@ -10,15 +10,83 @@
 
 use mlx_rs::{
     fast::{rms_norm, scaled_dot_product_attention},
-    ops::{split, stack_axis},
+    ops::{concatenate_axis, split, stack_axis},
     transforms::checkpoint,
     Array, Dtype,
 };
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
+use mlx_gen::attention::{sdpa_budgeted_bhsd, slice_axis, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+/// Split lengths for a Z-Image unified `[x_emb ; cap_emb]` sequence under PAG perturbation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PagAttentionSplit {
+    pub(crate) x_len: i32,
+    pub(crate) cap_len: i32,
+}
+
+impl PagAttentionSplit {
+    /// Validate `x_len` against `total_len` and derive the trailing `cap_len`.
+    pub(crate) fn from_total(x_len: i32, total_len: i32) -> Result<Self> {
+        if x_len <= 0 || x_len > total_len {
+            return Err(Error::Msg(format!(
+                "z-image PAG split invalid: x_len={x_len}, total_len={total_len}"
+            )));
+        }
+        Ok(Self {
+            x_len,
+            cap_len: total_len - x_len,
+        })
+    }
+}
+
+/// Step-level PAG routing context threaded into an MLX transformer forward pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PagStepContext<'a> {
+    pub(crate) resolved: &'a mlx_gen::gen_core::PagResolved,
+    pub(crate) step_idx: usize,
+    pub(crate) total_steps: usize,
+}
+
+impl<'a> PagStepContext<'a> {
+    /// Return `Some(x_len)` when main layer `layer_idx` should replace `x_emb` self-attention with
+    /// `V_x` at this step while preserving `cap_emb` attention.
+    pub(crate) fn layer_x_len(self, layer_idx: usize, x_len: i32) -> Option<i32> {
+        self.resolved
+            .perturbs_block(layer_idx as u32, self.step_idx, self.total_steps)
+            .then_some(x_len)
+    }
+}
+
+/// Apply Z-Image PAG attention perturbation on `[B, H, seq_len, D]` BHSD arrays when
+/// `pag_x_len` is `Some(x_len)`: image prefix `0..x_len` receives `V_x` directly, while caption
+/// tail `x_len..seq_len` runs `sdpa(&q_cap, k, v)` against the full `[K_x, K_cap]` and
+/// `[V_x, V_cap]`.
+pub(crate) fn apply_attention_with_pag<F>(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    pag_x_len: Option<i32>,
+    sdpa: F,
+) -> Result<Array>
+where
+    F: FnOnce(&Array, &Array, &Array) -> Result<Array>,
+{
+    let Some(x_len) = pag_x_len else {
+        return sdpa(q, k, v);
+    };
+    let total_len = q.shape()[2];
+    let split = PagAttentionSplit::from_total(x_len, total_len)?;
+    let v_x = slice_axis(v, 2, 0, split.x_len)?;
+    if split.cap_len == 0 {
+        return Ok(v_x);
+    }
+    let q_cap = slice_axis(q, 2, split.x_len, split.cap_len)?;
+    let o_cap = sdpa(&q_cap, k, v)?;
+    Ok(concatenate_axis(&[&v_x, &o_cap], 2)?)
+}
 
 #[derive(Clone)]
 pub struct ZImageAttention {
@@ -135,6 +203,18 @@ impl ZImageAttention {
         freqs_cis: &Array,
         plan: AttentionPlan<'_>,
     ) -> Result<Array> {
+        self.forward_budgeted_with_pag(x, freqs_cis, plan, None)
+    }
+
+    /// [`Self::forward_budgeted`] with optional Perturbed-Attention Guidance (PAG) applied to the
+    /// leading `pag_x_len` image tokens while preserving caption attention.
+    pub fn forward_budgeted_with_pag(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+        pag_x_len: Option<i32>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let dim = self.n_heads * self.head_dim;
@@ -172,7 +252,7 @@ impl ZImageAttention {
         // exclusive by construction: the trainer never selects a bounded rung, and `eval` inside a
         // checkpoint segment is not valid under an autograd trace. The `ckpt_sdpa` arm therefore keeps
         // the single unchunked call and is byte-identical to the pre-SC-15615 training path.
-        let o = if self.ckpt_sdpa {
+        let o = if self.ckpt_sdpa && pag_x_len.is_none() {
             // sc-4886: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the
             // QKV projections — and their LoRA — flow through them); only the f32 scale is
             // captured. The backward recomputes the decomposed attention for THIS layer alone,
@@ -188,7 +268,9 @@ impl ZImageAttention {
                 .next()
                 .ok_or_else(|| Error::Msg("z-image: checkpoint SDPA produced no output".into()))?
         } else {
-            sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?
+            apply_attention_with_pag(&q, &k, &v, pag_x_len, |q_in, k_in, v_in| {
+                sdpa_budgeted_bhsd(q_in, k_in, v_in, self.scale, None, plan)
+            })?
         };
         let o = o.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, dim])?;
         self.to_out.forward(&o)
@@ -246,5 +328,57 @@ impl AdaptableHost for ZImageAttention {
             .iter()
             .map(|path| (*path).to_owned())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pag_split_and_attention_prefix_perturbation_preserves_caption_tail() {
+        assert_eq!(
+            PagAttentionSplit::from_total(3, 5).unwrap(),
+            PagAttentionSplit {
+                x_len: 3,
+                cap_len: 2,
+            }
+        );
+        assert!(PagAttentionSplit::from_total(0, 5).is_err());
+        assert!(PagAttentionSplit::from_total(6, 5).is_err());
+
+        let total = 2 * 5 * 4;
+        let q_data: Vec<f32> = (0..total).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let k_data: Vec<f32> = (0..total).map(|i| ((i % 7) as f32) * 0.2).collect();
+        let v_data: Vec<f32> = (0..total).map(|i| (i as f32) * 0.25 + 1.0).collect();
+        let q = Array::from_slice(&q_data, &[1, 2, 5, 4]);
+        let k = Array::from_slice(&k_data, &[1, 2, 5, 4]);
+        let v = Array::from_slice(&v_data, &[1, 2, 5, 4]);
+
+        let scale = (4.0f32).powf(-0.5);
+        let unperturbed = apply_attention_with_pag(&q, &k, &v, None, |q_in, k_in, v_in| {
+            sdpa_budgeted_bhsd(q_in, k_in, v_in, scale, None, AttentionPlan::UNBOUNDED)
+        })
+        .unwrap();
+        let perturbed = apply_attention_with_pag(&q, &k, &v, Some(3), |q_in, k_in, v_in| {
+            sdpa_budgeted_bhsd(q_in, k_in, v_in, scale, None, AttentionPlan::UNBOUNDED)
+        })
+        .unwrap();
+
+        mlx_rs::transforms::eval([&unperturbed, &perturbed]).unwrap();
+        assert_eq!(perturbed.shape(), &[1, 2, 5, 4]);
+
+        let p_x = mlx_gen::array::contiguous(&slice_axis(&perturbed, 2, 0, 3).unwrap()).unwrap();
+        let v_x = mlx_gen::array::contiguous(&slice_axis(&v, 2, 0, 3).unwrap()).unwrap();
+        mlx_rs::transforms::eval([&p_x, &v_x]).unwrap();
+        assert_eq!(p_x.as_slice::<f32>(), v_x.as_slice::<f32>());
+
+        let p_cap = mlx_gen::array::contiguous(&slice_axis(&perturbed, 2, 3, 2).unwrap()).unwrap();
+        let u_cap =
+            mlx_gen::array::contiguous(&slice_axis(&unperturbed, 2, 3, 2).unwrap()).unwrap();
+        mlx_rs::transforms::eval([&p_cap, &u_cap]).unwrap();
+        for (a, b) in p_cap.as_slice::<f32>().iter().zip(u_cap.as_slice::<f32>()) {
+            assert!((a - b).abs() < 1e-5, "caption tail drifted: {a} vs {b}");
+        }
     }
 }

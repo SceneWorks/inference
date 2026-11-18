@@ -533,6 +533,7 @@ NEUTRAL_TEST_PACKAGES = {
     'sceneworks-gen-core-image', 'sceneworks-gen-core-iris',
     'sceneworks-gen-core-ltx', 'sceneworks-gen-core-memory-wan',
     'sceneworks-gen-core-moss-image', 'sceneworks-gen-core-moss-image-policy',
+    'sceneworks-gen-core-pag-policy',
     'sceneworks-gen-core-tokenizer',
     'sceneworks-gen-core-train',
 }

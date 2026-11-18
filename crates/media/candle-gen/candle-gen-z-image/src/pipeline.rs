@@ -161,17 +161,49 @@ impl DiT {
         &self,
         x: &Tensor,
         t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        prepared: &PreparedDiT,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_prepared_with_memory_and_pag(
+            x,
+            t,
+            cap_feats,
+            cap_mask,
+            prepared,
+            attention_plan,
+            transformer_window,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory_and_pag(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
         _cap_feats: &Tensor,
         _cap_mask: &Tensor,
         prepared: &PreparedDiT,
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
+        pag: Option<common::PagStepContext<'_>>,
     ) -> candle_gen::Result<Tensor> {
         let velocity = match (self, prepared) {
-            (Self::Dense(m), PreparedDiT::Dense(prepared)) => m.forward_prepared(x, t, prepared)?,
-            (Self::Packed(m), PreparedDiT::Packed(prepared)) => {
-                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)?
+            (Self::Dense(m), PreparedDiT::Dense(prepared)) => {
+                m.forward_prepared_with_pag(x, t, prepared, pag)?
             }
+            (Self::Packed(m), PreparedDiT::Packed(prepared)) => m
+                .forward_prepared_with_memory_and_pag(
+                    x,
+                    t,
+                    prepared,
+                    attention_plan,
+                    transformer_window,
+                    pag,
+                )?,
             _ => {
                 return Err(candle_gen::CandleError::Msg(
                     "z-image: prepared conditioning belongs to another DiT variant".into(),
@@ -259,11 +291,111 @@ const CONSTRAINED_ATTN_SCORES_BUDGET: usize =
     candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as usize;
 
 fn request_attention_plan(req: &GenerationRequest, max_score_elements: usize) -> AttentionPlan<'_> {
+    request_attention_plan_with_cancel(&req.cancel, max_score_elements)
+}
+
+fn request_attention_plan_with_cancel(
+    cancel: &CancelFlag,
+    max_score_elements: usize,
+) -> AttentionPlan<'_> {
     AttentionPlan::budgeted(AttentionBudget::from_score_elements(
         max_score_elements as u64,
         false,
     ))
-    .with_cancel(&req.cancel)
+    .with_cancel(cancel)
+}
+
+/// Evaluate the Z-Image DiT velocity at timestep `t` (`1 - sigma`) with optional classifier-free
+/// guidance and Perturbed-Attention Guidance (PAG). Keeping this shared between `render`,
+/// `render_base`, and the sequential variants guarantees identical CFG/PAG combination ordering and
+/// zero extra passes when PAG is inactive or zero-scaled at the current step.
+#[allow(clippy::too_many_arguments)]
+fn predict_cfg_and_pag(
+    device: &Device,
+    transformer: &DiT,
+    latents: &Tensor,
+    t: f32,
+    cap_feats: &Tensor,
+    cap_mask: &Tensor,
+    dit_prepared: &PreparedDiT,
+    uncond: Option<&(Tensor, Tensor)>,
+    uncond_prepared: Option<&PreparedDiT>,
+    guidance: f32,
+    pag: Option<&gen_core::PagResolved>,
+    step_idx: usize,
+    total_steps: usize,
+    cancel: &CancelFlag,
+    attention_budget: usize,
+    transformer_window: usize,
+) -> Result<Tensor> {
+    let t_tensor = Tensor::from_vec(vec![t], (1,), device)?;
+    let v_cond = transformer
+        .forward_prepared_with_memory(
+            latents,
+            &t_tensor,
+            cap_feats,
+            cap_mask,
+            dit_prepared,
+            request_attention_plan_with_cancel(cancel, attention_budget),
+            transformer_window,
+        )?
+        .neg()?;
+    let eps_base = match (uncond, uncond_prepared) {
+        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
+            let v_uncond = transformer
+                .forward_prepared_with_memory(
+                    latents,
+                    &t_tensor,
+                    neg_feats,
+                    neg_mask,
+                    neg_prepared,
+                    request_attention_plan_with_cancel(cancel, attention_budget),
+                    transformer_window,
+                )?
+                .neg()?;
+            let delta = (&v_cond - &v_uncond)?;
+            (v_uncond + (delta * guidance as f64)?)?
+        }
+        (None, None) => v_cond.clone(),
+        _ => {
+            return Err(CandleError::Msg(
+                "z-image: CFG conditioning preparation mismatch".into(),
+            ))
+        }
+    };
+
+    let Some(resolved_pag) = pag else {
+        return Ok(eps_base);
+    };
+    let step_pag_scale = resolved_pag.step_scale(step_idx, total_steps);
+    if step_pag_scale <= 0.0 {
+        return Ok(eps_base);
+    }
+
+    let pag_ctx = common::PagStepContext {
+        resolved: resolved_pag,
+        step_idx,
+        total_steps,
+    };
+    let v_perturbed = transformer
+        .forward_prepared_with_memory_and_pag(
+            latents,
+            &t_tensor,
+            cap_feats,
+            cap_mask,
+            dit_prepared,
+            request_attention_plan_with_cancel(cancel, attention_budget),
+            transformer_window,
+            Some(pag_ctx),
+        )?
+        .neg()?;
+    Ok(gen_core::guidance::pag_apply(
+        &candle_gen::CandleLatentOps,
+        &eps_base,
+        &v_cond,
+        &v_perturbed,
+        step_pag_scale,
+    )?)
 }
 
 fn check_decode(cancel: &CancelFlag) -> Result<()> {
@@ -1116,8 +1248,9 @@ impl Pipeline {
     pub(crate) fn render_sequential(
         &self,
         req: &GenerationRequest,
+        pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
+    ) -> Result<(Vec<Image>, u32)> {
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
@@ -1166,6 +1299,7 @@ impl Pipeline {
                     &cap,
                     clean.as_ref(),
                     start_step,
+                    pag,
                     on_progress,
                 )
             },
@@ -1176,8 +1310,8 @@ impl Pipeline {
                     self.load_vae()
                 }
             },
-            |vae, latents, on_progress| {
-                latents
+            |vae, (latents, actual_steps), on_progress| {
+                let images = latents
                     .iter()
                     .enumerate()
                     .map(|(output_index, latent)| {
@@ -1200,7 +1334,8 @@ impl Pipeline {
                             self.decode(vae, None, latent)
                         }
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((images, actual_steps))
             },
         )
     }
@@ -1211,8 +1346,9 @@ impl Pipeline {
     pub(crate) fn render_base_sequential(
         &self,
         req: &GenerationRequest,
+        pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
+    ) -> Result<(Vec<Image>, u32)> {
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
@@ -1277,6 +1413,7 @@ impl Pipeline {
                     neg_cap.as_ref(),
                     clean.as_ref(),
                     start_step,
+                    pag,
                     on_progress,
                 )
             },
@@ -1287,8 +1424,8 @@ impl Pipeline {
                     self.load_vae()
                 }
             },
-            |vae, latents, on_progress| {
-                latents
+            |vae, (latents, actual_steps), on_progress| {
+                let images = latents
                     .iter()
                     .enumerate()
                     .map(|(output_index, latent)| {
@@ -1311,13 +1448,15 @@ impl Pipeline {
                             self.decode(vae, None, latent)
                         }
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((images, actual_steps))
             },
         )
     }
 
     /// Denoise every requested seed while only the DiT and materialized prompt embedding are live.
     /// Final latents are tiny relative to model weights and survive into the VAE phase.
+    #[allow(clippy::too_many_arguments)]
     fn denoise_sequential(
         &self,
         req: &GenerationRequest,
@@ -1325,8 +1464,9 @@ impl Pipeline {
         cap: &Tensor,
         clean: Option<&Tensor>,
         start_step: usize,
+        pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Tensor>> {
+    ) -> Result<(Vec<Tensor>, u32)> {
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
@@ -1346,12 +1486,14 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let mut actual_steps = 0u32;
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             candle_gen::check_cancel(&req.cancel)?;
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
             let image_seq_len =
@@ -1375,6 +1517,8 @@ impl Pipeline {
                 &native,
             )?;
             let start = start_step.min(sigmas.len().saturating_sub(1));
+            let run_sigmas = &sigmas[start..];
+            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
             let x_t = match clean {
                 Some(clean) => {
                     let sigma_start = sigmas[start] as f64;
@@ -1394,31 +1538,49 @@ impl Pipeline {
             // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
             // driver call and must start a fresh trajectory at frame 1. The driver owns the counter.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
-                &sigmas[start..],
+                run_sigmas,
                 prepared.latents,
                 seed,
                 &req.cancel,
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
-                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
-                    Ok(transformer
-                        .forward_prepared_with_memory(
-                            latents,
-                            &t_tensor,
-                            &cap_feats,
-                            &cap_mask,
-                            &dit_prepared,
-                            request_attention_plan(req, attention_budget),
-                            transformer_window,
-                        )?
-                        .neg()?)
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    predict_cfg_and_pag(
+                        &self.device,
+                        transformer,
+                        latents,
+                        t,
+                        &cap_feats,
+                        &cap_mask,
+                        &dit_prepared,
+                        None,
+                        None,
+                        1.0,
+                        pag,
+                        step_idx,
+                        total_steps,
+                        &req.cancel,
+                        attention_budget,
+                        transformer_window,
+                    )
                 },
             )
-        })
+        })?;
+        Ok((latents, actual_steps))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1430,8 +1592,9 @@ impl Pipeline {
         neg_cap: Option<&Tensor>,
         clean: Option<&Tensor>,
         start_step: usize,
+        pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Tensor>> {
+    ) -> Result<(Vec<Tensor>, u32)> {
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
@@ -1451,14 +1614,16 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
         candle_gen::execution::policy("z-image/pipeline/guidance", format!("{guidance:?}").into());
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let mut actual_steps = 0u32;
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             candle_gen::check_cancel(&req.cancel)?;
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
             let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
@@ -1472,6 +1637,8 @@ impl Pipeline {
                 &native,
             )?;
             let start = start_step.min(sigmas.len().saturating_sub(1));
+            let run_sigmas = &sigmas[start..];
+            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
             let x_t = match clean {
                 Some(clean) => {
                     let sigma_start = sigmas[start] as f64;
@@ -1509,53 +1676,49 @@ impl Pipeline {
             // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
             // the predict closure below, so the hook only ever sees the conditional trajectory.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
-                &sigmas[start..],
+                run_sigmas,
                 prepared.latents,
                 seed,
                 &req.cancel,
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
-                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
-                    let plan = request_attention_plan(req, attention_budget);
-                    let v_cond = transformer
-                        .forward_prepared_with_memory(
-                            latents,
-                            &t_tensor,
-                            &cap_feats,
-                            &cap_mask,
-                            &dit_prepared,
-                            plan,
-                            transformer_window,
-                        )?
-                        .neg()?;
-                    match (uncond.as_ref(), uncond_prepared.as_ref()) {
-                        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
-                            let v_uncond = transformer
-                                .forward_prepared_with_memory(
-                                    latents,
-                                    &t_tensor,
-                                    neg_feats,
-                                    neg_mask,
-                                    neg_prepared,
-                                    plan,
-                                    transformer_window,
-                                )?
-                                .neg()?;
-                            let delta = (&v_cond - &v_uncond)?;
-                            Ok((v_uncond + (delta * guidance as f64)?)?)
-                        }
-                        (None, None) => Ok(v_cond),
-                        _ => Err(CandleError::Msg(
-                            "z-image: CFG conditioning preparation mismatch".into(),
-                        )),
-                    }
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    predict_cfg_and_pag(
+                        &self.device,
+                        transformer,
+                        latents,
+                        t,
+                        &cap_feats,
+                        &cap_mask,
+                        &dit_prepared,
+                        uncond.as_ref(),
+                        uncond_prepared.as_ref(),
+                        guidance,
+                        pag,
+                        step_idx,
+                        total_steps,
+                        &req.cancel,
+                        attention_budget,
+                        transformer_window,
+                    )
                 },
             )
-        })
+        })?;
+        Ok((latents, actual_steps))
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -1573,8 +1736,9 @@ impl Pipeline {
         components: &Components,
         clean: Option<&Tensor>,
         start_step: usize,
+        pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
+    ) -> Result<(Vec<Image>, u32)> {
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
@@ -1594,6 +1758,7 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1612,8 +1777,9 @@ impl Pipeline {
             base_seed,
             crate::MODEL_ID,
         )?;
+        let mut actual_steps = 0u32;
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             candle_gen::check_cancel(&req.cancel)?;
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
@@ -1671,6 +1837,7 @@ impl Pipeline {
                 None => noise,
             };
             let run_sigmas = &sigmas[start..];
+            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
 
             // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) and adds the
             // singleton frame axis to the latents → (1, 16, 1, lat_h, lat_w).
@@ -1688,6 +1855,10 @@ impl Pipeline {
             // driver call and must start a fresh trajectory at frame 1. The driver owns the counter,
             // so this route's numbering can only ever key off the schedule it is integrating.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1698,29 +1869,38 @@ impl Pipeline {
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
-                    // `t` is the 1−σ conditioning (OneMinusSigma) the DiT embeds — the same value the
-                    // reference scheduler's `current_timestep_normalized` returns. The embedder upcasts
-                    // to f32 internally, so f32 here is correct regardless of the model dtype.
-                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
-                    let velocity = components
-                        .transformer
-                        .forward_prepared_with_memory(
-                            latents,
-                            &t_tensor,
-                            &cap_feats,
-                            &cap_mask,
-                            &dit_prepared,
-                            request_attention_plan(req, attention_budget),
-                            transformer_window,
-                        )?
-                        .neg()?;
-                    Ok(velocity)
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    predict_cfg_and_pag(
+                        &self.device,
+                        &components.transformer,
+                        latents,
+                        t,
+                        &cap_feats,
+                        &cap_mask,
+                        &dit_prepared,
+                        None,
+                        None,
+                        1.0,
+                        pag,
+                        step_idx,
+                        total_steps,
+                        &req.cancel,
+                        attention_budget,
+                        transformer_window,
+                    )
                 },
             )?;
 
             on_progress(Progress::Decoding);
             self.decode(&components.vae, pid_decoder.as_ref(), &latents)
-        })
+        })?;
+        Ok((images, actual_steps))
     }
 
     /// Render `req` against pre-loaded `components` on the **base** (non-Turbo) path: real
@@ -1756,8 +1936,9 @@ impl Pipeline {
         components: &Components,
         clean: Option<&Tensor>,
         start_step: usize,
+        pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Vec<Image>> {
+    ) -> Result<(Vec<Image>, u32)> {
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
@@ -1777,6 +1958,7 @@ impl Pipeline {
             "z-image/pipeline/transformer_window",
             format!("{transformer_window:?}").into(),
         );
+        common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1820,8 +2002,9 @@ impl Pipeline {
             base_seed,
             crate::MODEL_ID,
         )?;
+        let mut actual_steps = 0u32;
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             candle_gen::check_cancel(&req.cancel)?;
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
@@ -1860,6 +2043,7 @@ impl Pipeline {
                 None => noise,
             };
             let run_sigmas = &sigmas[start..];
+            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
 
             // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) for both the cond and
             // (when CFG is on) the uncond branch, and adds the singleton frame axis to the latents. The
@@ -1895,6 +2079,10 @@ impl Pipeline {
             // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
             // the predict closure below, so the hook only ever sees the conditional trajectory.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1905,54 +2093,38 @@ impl Pipeline {
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
-                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
-                    // Conditional velocity (Z-Image sign convention: the DiT output is negated before
-                    // the flow-match step). The CFG combine is done on the negated velocities, which is
-                    // linear so the result is identical to combining-then-negating.
-                    let v_cond = components
-                        .transformer
-                        .forward_prepared_with_memory(
-                            latents,
-                            &t_tensor,
-                            &cap_feats,
-                            &cap_mask,
-                            &dit_prepared,
-                            request_attention_plan(req, attention_budget),
-                            transformer_window,
-                        )?
-                        .neg()?;
-                    let velocity = match (uncond.as_ref(), uncond_prepared.as_ref()) {
-                        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
-                            let v_uncond = components
-                                .transformer
-                                .forward_prepared_with_memory(
-                                    latents,
-                                    &t_tensor,
-                                    neg_feats,
-                                    neg_mask,
-                                    neg_prepared,
-                                    request_attention_plan(req, attention_budget),
-                                    transformer_window,
-                                )?
-                                .neg()?;
-                            // v = v_uncond + guidance·(v_cond − v_uncond)
-                            let delta = (&v_cond - &v_uncond)?;
-                            (v_uncond + (delta * guidance as f64)?)?
-                        }
-                        (None, None) => v_cond,
-                        _ => {
-                            return Err(CandleError::Msg(
-                                "z-image: CFG conditioning preparation mismatch".into(),
-                            ))
-                        }
-                    };
-                    Ok(velocity)
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    predict_cfg_and_pag(
+                        &self.device,
+                        &components.transformer,
+                        latents,
+                        t,
+                        &cap_feats,
+                        &cap_mask,
+                        &dit_prepared,
+                        uncond.as_ref(),
+                        uncond_prepared.as_ref(),
+                        guidance,
+                        pag,
+                        step_idx,
+                        total_steps,
+                        &req.cancel,
+                        attention_budget,
+                        transformer_window,
+                    )
                 },
             )?;
 
             on_progress(Progress::Decoding);
             self.decode(&components.vae, pid_decoder.as_ref(), &latents)
-        })
+        })?;
+        Ok((images, actual_steps))
     }
 
     /// Decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`] via the shared [`common::decode`].
@@ -2789,6 +2961,25 @@ mod tests {
         assert_eq!(got.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
         let passed = vb.get_unchecked("decoder.conv_in.weight")?;
         assert_eq!(passed.to_vec2::<f32>()?, dense.to_vec2::<f32>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn candle_latent_ops_pag_apply_handles_two_pass_three_pass_and_zero_scale() -> Result<()> {
+        let dev = Device::Cpu;
+        let ops = candle_gen::CandleLatentOps;
+        let cond = Tensor::from_slice(&[2.0f32, 4.0], (1, 2), &dev)?;
+        let eps_cfg = Tensor::from_slice(&[3.0f32, 5.0], (1, 2), &dev)?;
+        let perturbed = Tensor::from_slice(&[1.0f32, 2.0], (1, 2), &dev)?;
+
+        let two_pass = gen_core::guidance::pag_apply(&ops, &cond, &cond, &perturbed, 1.2)?;
+        assert_eq!(two_pass.flatten_all()?.to_vec1::<f32>()?, [3.2f32, 6.4]);
+
+        let three_pass = gen_core::guidance::pag_apply(&ops, &eps_cfg, &cond, &perturbed, 1.2)?;
+        assert_eq!(three_pass.flatten_all()?.to_vec1::<f32>()?, [4.2f32, 7.4]);
+
+        let zero_scale = gen_core::guidance::pag_apply(&ops, &eps_cfg, &cond, &perturbed, 0.0)?;
+        assert_eq!(zero_scale.flatten_all()?.to_vec1::<f32>()?, [3.0f32, 5.0]);
         Ok(())
     }
 }

@@ -9,6 +9,9 @@
 
 use std::path::Path;
 
+use gen_core_family::qwen_image_2_1::pag::{
+    qwen_image_2_1_pag_capability, qwen_image_2_1_turbo_pag_capability,
+};
 use mlx_gen::gen_core::{
     ExecutionSurface, GenerationReport, PrefixKvCacheDomain, PrefixKvCacheMode, PrefixKvCacheReport,
 };
@@ -24,9 +27,9 @@ use crate::config::{
 };
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise_reported, encode_references, joint_branch,
-    prepare_conditioning_references, DenoiseInputs, DenoiseReport, JointBranch, KvCacheMode,
-    KvCachePath, ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise_reported_with_pag, encode_references,
+    joint_branch, prepare_conditioning_references, DenoiseInputs, DenoiseReport, JointBranch,
+    KvCacheMode, KvCachePath, ReferenceConditioning,
 };
 use crate::reference::{collect_references, PreparedReference};
 use crate::scheduler;
@@ -213,10 +216,10 @@ impl Schedule {
 /// fields: the step count is the number of sigmas the snapshot saves ([`Schedule::default_steps`])
 /// and true CFG is off unless asked for ([`DEFAULT_TRUE_CFG`]).
 pub fn descriptor_turbo() -> ModelDescriptor {
-    ModelDescriptor {
-        id: TURBO_MODEL_ID,
-        ..descriptor()
-    }
+    let mut d = descriptor();
+    d.id = TURBO_MODEL_ID;
+    d.capabilities.pag = Some(qwen_image_2_1_turbo_pag_capability());
+    d
 }
 
 /// Qwen-Image 2.1's identity + capabilities — constructible without loading weights.
@@ -300,6 +303,7 @@ pub fn descriptor() -> ModelDescriptor {
                 ),
                 ..ExecutionSurface::default()
             },
+            pag: Some(qwen_image_2_1_pag_capability()),
             ..Default::default()
         },
     }
@@ -733,7 +737,13 @@ impl QwenImage21 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.variant.id(), req)?;
+        mlx_gen::image_execution::policy_debug("qwen-image-2-1.pag", &resolved_pag);
         let params = resolve_run_params(&self.schedule, req)?;
+        let actual_steps = params.sigmas.len().saturating_sub(1) as u32;
         let tiling = crate::pipeline::decode_tiling(req);
         mlx_gen::image_execution::policy_debug("qwen-image-2-1.tiling", &tiling);
         // sc-24114: request-scoped allocator bounds — cache limit = the derived transient budget
@@ -887,7 +897,7 @@ impl QwenImage21 {
                     let seed = params.base_seed.wrapping_add(i as u64);
                     let latents = create_noise(seed, req.width, req.height, channels)?;
                     let mut report = DenoiseReport::default();
-                    let latents = denoise_reported(
+                    let latents = denoise_reported_with_pag(
                         DenoiseInputs {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
@@ -909,6 +919,7 @@ impl QwenImage21 {
                             // (sc-25905): `Off` is the prefill path, byte-for-byte.
                             kv_cache: loop_mode,
                         },
+                        resolved_pag.as_ref(),
                         &mut report,
                         on_progress,
                     )?;
@@ -963,6 +974,9 @@ impl QwenImage21 {
             artifacts: None,
             warnings,
             prefix_kv_cache: ran,
+            pag: resolved_pag
+                .as_ref()
+                .map(|p| p.execution_report(actual_steps)),
         })
     }
 }
@@ -1476,23 +1490,25 @@ mod tests {
         );
     }
 
-    /// The Turbo descriptor is the base descriptor under its own id — nothing else on the
-    /// advertised surface moves.
+    /// The Turbo descriptor is the base descriptor under its own id with Turbo-tuned PAG
+    /// defaults (`default_stop = 0.75`, `recommended_scale = 1.2`).
     #[test]
     fn turbo_descriptor_mirrors_the_base_descriptor_under_its_own_id() {
         let (base, turbo) = (descriptor(), descriptor_turbo());
         assert_eq!(turbo.id, "qwen_image_2_1_turbo");
         assert_eq!(base.id, "qwen_image_2_1");
         assert_eq!(
-            format!(
-                "{:?}",
-                ModelDescriptor {
-                    id: base.id,
-                    ..turbo
-                }
-            ),
-            format!("{base:?}")
+            base.capabilities.pag,
+            Some(gen_core_family::qwen_image_2_1::pag::qwen_image_2_1_pag_capability())
         );
+        assert_eq!(
+            turbo.capabilities.pag,
+            Some(gen_core_family::qwen_image_2_1::pag::qwen_image_2_1_turbo_pag_capability())
+        );
+        let mut turbo_normalized = turbo;
+        turbo_normalized.id = base.id;
+        turbo_normalized.capabilities.pag = base.capabilities.pag.clone();
+        assert_eq!(format!("{turbo_normalized:?}"), format!("{base:?}"));
         assert!(gen_core::registry::model_descriptor_errors(&descriptor_turbo()).is_empty());
         assert_eq!(Variant::from_id("qwen_image_2_1"), Some(Variant::Base));
         assert_eq!(
@@ -1529,5 +1545,55 @@ mod tests {
             .is_err(),
             "a missing snapshot fails at the tokenizer, for both policies"
         );
+    }
+
+    #[test]
+    fn descriptors_advertise_qwen21_pag_and_validate_bounds() {
+        let base = descriptor();
+        let turbo = descriptor_turbo();
+        let zero = GenerationRequest {
+            prompt: "a red fox".into(),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![16]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(Variant::Base, &base.capabilities, &zero).is_ok());
+        assert!(mlx_gen::gen_core::resolve_pag(
+            base.capabilities.pag.as_ref(),
+            MODEL_ID,
+            zero.effective_pag().unwrap()
+        )
+        .unwrap()
+        .is_none());
+
+        let oob = GenerationRequest {
+            prompt: "a red fox".into(),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(Variant::Turbo, &turbo.capabilities, &oob).is_err());
+
+        let resolved_turbo = mlx_gen::gen_core::resolve_pag(
+            turbo.capabilities.pag.as_ref(),
+            TURBO_MODEL_ID,
+            Some(&mlx_gen::gen_core::PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved_turbo.active_steps(8), 6);
+        resolved_turbo
+            .execution_report(8)
+            .validate_with_capability(turbo.capabilities.pag.as_ref().unwrap())
+            .unwrap();
     }
 }

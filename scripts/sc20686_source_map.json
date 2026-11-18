@@ -19,36 +19,36 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 583
+              "line": 618
             }
           ],
           "creation": [
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "to_k.forward",
-              "line": 354
+              "line": 394
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "to_v.forward",
-              "line": 355
+              "line": 395
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "add_k.forward",
-              "line": 365
+              "line": 405
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "add_v.forward",
-              "line": 370
+              "line": 410
             }
           ],
           "reference_slice": [
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "record_flux_kv_created",
-              "line": 356
+              "line": 396
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
@@ -65,7 +65,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "attention",
-              "line": 382
+              "line": 426
             }
           ],
           "release": [
@@ -318,7 +318,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1120
+              "line": 1143
             }
           ],
           "creation": [
@@ -337,14 +337,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::reference_forward",
-              "line": 1672
+              "line": 1710
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686_joint_read",
-              "line": 400
+              "line": 448
             }
           ],
           "release": [
@@ -379,7 +379,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1120
+              "line": 1143
             }
           ],
           "creation": [
@@ -407,7 +407,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
               "symbol": "sc20686::release_owner",
-              "line": 287
+              "line": 327
             }
           ],
           "current_kernel": "MLX fused SDPA over fresh [txt, target] K/V concatenated with the cached reference K/V; full joint duration is non-attributable context",

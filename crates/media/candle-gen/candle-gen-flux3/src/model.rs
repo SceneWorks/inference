@@ -109,6 +109,7 @@ pub fn descriptor() -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
+            pag: Some(gen_core_flux3::flux3_pag_capability(true)),
             ..Default::default()
         },
     }
@@ -122,6 +123,7 @@ pub fn descriptor_base() -> ModelDescriptor {
     // CFG uses the standard guidance axis; the separate true_cfg control is not consumed.
     descriptor.capabilities.supports_true_cfg = false;
     descriptor.capabilities.supports_negative_prompt = true;
+    descriptor.capabilities.pag = Some(gen_core_flux3::flux3_pag_capability(false));
     descriptor
 }
 
@@ -426,8 +428,9 @@ fn decode_batch<T, Out>(
     mut decode: impl FnMut(&T) -> Result<Out>,
 ) -> Result<Vec<Out>> {
     let mut images = Vec::with_capacity(tokens.len());
-    for token in tokens {
+    for (index, token) in tokens.iter().enumerate() {
         candle_gen::residency::check_cancel(cancel)?;
+        candle_gen::execution::output_index(index);
         images.push(decode(token)?);
     }
     candle_gen::residency::check_cancel(cancel)?;
@@ -478,7 +481,8 @@ impl Flux3Klein {
             |progress|self.effective_params(req,progress),
             |te:&Flux3TextEncoder,params:GenerationParams| ->Result<(TextConditioning,Option<TextConditioning>,GenerationParams)> {
                 let text=te.encode(&params.prompt)?;
-                let negative=if params.guidance.is_some(){Some(te.encode(&params.negative_prompt)?)}else{None};
+                let encode_neg=gen_core_flux3::base_requires_negative_prompt(params.guidance,params.pag.as_ref());
+                let negative=if encode_neg{Some(te.encode(&params.negative_prompt)?)}else{None};
                 Ok((text,negative,params))
             },
             encoder_materialization_boundary(||Ok(self.device.synchronize()?)),
@@ -492,6 +496,7 @@ impl Flux3Klein {
                 for index in 0..req.count {
                     let done=index*params.steps;
                     let seed=candle_gen::image_seed(params.seed,index);
+                    candle_gen::execution::draw("noise",seed,index as usize);
                     tokens.push(denoise_one_with_references(&heavy.dit,&text,negative.as_ref(),reference_tokens.as_ref(),&params,seed,&req.cancel,|step|progress(Progress::Step{current:done+step as u32,total}))?);
                 }
                 Ok((tokens,params))
@@ -532,6 +537,7 @@ impl Flux3Klein {
             || {}, // Candle storage owns deallocation; unlike MLX there is no allocator-drain hook.
             on_progress,
         )?;
+        crate::pup::observe_enhancement_outcome(&outcome);
         Ok(GenerationParams::resolve_caption(
             req,
             outcome.caption,
@@ -589,7 +595,11 @@ impl Flux3Klein {
              params: GenerationParams|
              -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
                 let text = te.encode(&params.prompt)?;
-                let negative = if params.guidance.is_some() {
+                let encode_neg = gen_core_flux3::base_requires_negative_prompt(
+                    params.guidance,
+                    params.pag.as_ref(),
+                );
+                let negative = if encode_neg {
                     Some(te.encode(&params.negative_prompt)?)
                 } else {
                     None
@@ -618,6 +628,7 @@ impl Flux3Klein {
                 for c in 0..req.count {
                     let done = c * params.steps;
                     let seed = candle_gen::image_seed(params.seed, c);
+                    candle_gen::execution::draw("noise", seed, c as usize);
                     tokens.push(denoise_one_with_references(
                         &heavy.dit,
                         &text,
@@ -649,6 +660,16 @@ impl Flux3Klein {
             },
         )?
         };
+        let resolved_steps = req.steps.unwrap_or(if self.config.dit.flow_map {
+            self.config.sampler.steps
+        } else {
+            gen_core_flux3::BASE_DEFAULT_STEPS
+        });
+        let pag_report = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?
+            .map(|p| p.execution_report(resolved_steps));
         checked_completion(
             &req.cancel,
             GenerationReport {
@@ -656,6 +677,7 @@ impl Flux3Klein {
                 artifacts: None,
                 warnings: Vec::new(),
                 prefix_kv_cache: None,
+                pag: pag_report,
             },
         )
     }
@@ -752,6 +774,31 @@ impl Generator for Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy(
+                "loaded/sequential_residency",
+                serde_json::json!(self.residency.is_sequential()),
+            );
+            candle_gen::execution::policy(
+                "loaded/precision",
+                format!("{:?}", self.spec.precision).into(),
+            );
+            candle_gen::execution::policy(
+                "loaded/quantize",
+                format!("{:?}", self.spec.quantize).into(),
+            );
+            candle_gen::execution::unobserved_adapters(
+                self.spec.adapters.len(),
+                "candle-gen-flux3/src/model.rs",
+            );
+        })
     }
 }
 
@@ -1472,5 +1519,28 @@ mod tests {
             Ok(_) => panic!("an empty package must fail"),
         };
         assert!(err.to_string().contains("config.json"), "{err}");
+    }
+
+    #[test]
+    fn descriptors_advertise_flux3_pag_capabilities() {
+        let distilled = descriptor().capabilities.pag.expect("distilled pag");
+        assert_eq!(distilled.num_blocks, 33);
+        assert_eq!(distilled.block_domain.as_ref(), "flux3_blocks");
+        assert_eq!(distilled.default_layers, vec![19]);
+        assert_eq!(
+            (distilled.default_start, distilled.default_stop),
+            (0.0, 0.75)
+        );
+        assert_eq!(
+            (distilled.recommended_scale, distilled.max_scale),
+            (1.2, 15.0)
+        );
+
+        let base = descriptor_base().capabilities.pag.expect("base pag");
+        assert_eq!(base.num_blocks, 33);
+        assert_eq!(base.block_domain.as_ref(), "flux3_blocks");
+        assert_eq!(base.default_layers, vec![19]);
+        assert_eq!((base.default_start, base.default_stop), (0.0, 1.0));
+        assert_eq!((base.recommended_scale, base.max_scale), (1.5, 15.0));
     }
 }
