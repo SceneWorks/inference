@@ -86,6 +86,50 @@ def processor_evidence(image, image_bytes, inputs, patch_size, temporal_size, me
     }
 
 
+def single_token_aliases(tokenizer, answers):
+    ids = set()
+    for answer in answers:
+        for alias in (answer, answer.capitalize(), answer.upper()):
+            for prefix in ("", " "):
+                encoded = tokenizer.encode(prefix + alias, add_special_tokens=False)
+                if len(encoded) == 1:
+                    ids.add(encoded[0])
+    if not ids:
+        raise RuntimeError(f"pinned tokenizer has no one-token aliases for {answers}")
+    return sorted(ids)
+
+
+def semantic_checks(case, answer, tokenizer, chosen, scores):
+    # The release tokenizer encodes "91" as individual 9 and 1 tokens. Score each
+    # digit against all other digits under the same teacher-forced prefix.
+    if case == "text":
+        classes = [(digit, [other for other in "0123456789" if other != digit]) for digit in answer]
+    else:
+        colors = ("red", "blue", "green", "yellow")
+        classes = [(answer, [color for color in colors if color != answer])]
+    checks = {}
+    next_step = 0
+    for positive, negatives in classes:
+        preferred = single_token_aliases(tokenizer, [positive])
+        rejected = single_token_aliases(tokenizer, negatives)
+        if set(preferred) & set(rejected):
+            raise RuntimeError("semantic classes share a token ID")
+        step = next((index for index in range(next_step, len(chosen))
+                     if chosen[index] in preferred), None)
+        if step is None:
+            raise RuntimeError(f"upstream did not emit a one-token {positive!r} decision for {case}")
+        logits = scores[step]
+        margin = float(logits[preferred].max()) - float(logits[rejected].max())
+        if not math.isfinite(margin) or margin <= 0:
+            raise RuntimeError(f"upstream has no positive {positive!r} score margin for {case}")
+        checks[step] = {
+            "positive_token_ids": preferred, "negative_token_ids": rejected,
+            "source_positive_margin": margin,
+        }
+        next_step = step + 1
+    return checks
+
+
 def run_case(model, inputs, torch, *, cached, tokens=None, expected_plan):
     input_ids = inputs["input_ids"]
     common = {key: value for key, value in inputs.items() if key != "input_ids"}
@@ -217,6 +261,7 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
             if model.model.language_model.config._attn_implementation != "sdpa":
                 raise RuntimeError("reference did not activate independent SDPA attention")
             alternate, _ = run_case(model, inputs, torch, cached=True, tokens=chosen, expected_plan=plan)
+            semantic = semantic_checks(name, expected_answer, processor.tokenizer, chosen[:first_end], baseline)
             steps = []
             for index, (logits, token_id) in enumerate(zip(baseline, chosen, strict=True)):
                 deviations = [
@@ -228,15 +273,20 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
                 max_score = max(1.0, float(logits.abs().max()))
                 bf16_spacing = math.ldexp(1.0, math.floor(math.log2(max_score)) - 7)
                 tolerance = max(deviations) + 2 * bf16_spacing
+                check = semantic.get(index)
+                semantic_ids = [] if check is None else check["positive_token_ids"] + check["negative_token_ids"]
                 ids = list(dict.fromkeys([token_id, *logits.topk(32).indices.tolist(),
-                                           *range(0, logits.numel(), 4093)]))
-                steps.append({
+                                           *range(0, logits.numel(), 4093), *semantic_ids]))
+                step = {
                     "token_id": token_id, "token_ids": ids, "logits": logits[ids].tolist(),
                     "max_abs_error": tolerance, "source_cold_max_abs": deviations[0],
                     "source_sdpa_max_abs": deviations[1], "bf16_spacing": bf16_spacing,
                     "log_probability": float(logits.log_softmax(0)[token_id]),
                     "top_1_margin": float(logits.topk(2).values.diff().abs()[0]),
-                })
+                }
+                if check is not None:
+                    step["semantic_score"] = check
+                steps.append(step)
             cases.append({
                 "id": name, "prompt": prompt, "thinking": False, "image": image,
                 "input_ids": inputs["input_ids"][0].tolist(), "steps": steps,

@@ -3,12 +3,68 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
 
-from sensenova_loop_assets import ROOT, SOURCE, digest, inventory, write
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from scripts.ci.sensenova_loop_assets import SOURCE, digest, inventory, write
+
+TIERS = ("bf16", "q8", "q4")
+
+
+def observed(logs, marker):
+    # Libtest writes a status prefix without a newline. Source witnesses must
+    # emit their own newline first, so payloads cannot appear inside unrelated log lines.
+    prefix = marker + " "
+    return [line[len(prefix):] for log in logs for line in log.splitlines() if line.startswith(prefix)]
+
+
+def verify_oracle_marker(logs, oracle_sha):
+    if observed(logs, "SENSENOVA_LOOP_ORACLE_SHA256") != [oracle_sha]:
+        raise ValueError("MLX test did not attest to the exact oracle bytes")
+
+
+def verify_semantic_margins(oracle, logs):
+    obligations = {}
+    for row in oracle["cases"]:
+        for index, step in enumerate(row["steps"]):
+            if "semantic_score" in step:
+                score = step["semantic_score"]
+                logits = dict(zip(step["token_ids"], step["logits"], strict=True))
+                positive = set(score["positive_token_ids"])
+                negative = set(score["negative_token_ids"])
+                if not positive or not negative or positive & negative or not (positive | negative) <= logits.keys():
+                    raise ValueError("oracle semantic aliases must be distinct and present in the compared logits")
+                margin = max(logits[token] for token in positive) - max(logits[token] for token in negative)
+                if not math.isfinite(margin) or margin <= 0 or margin != score["source_positive_margin"]:
+                    raise ValueError("oracle semantic score differs from source-bound logits")
+                obligations[(row["id"], index)] = margin
+    expected_counts = {"text": 2, "red": 1, "blue": 1, "quadrants": 1}
+    counts = {case: sum(case == name for name, _ in obligations) for case in expected_counts}
+    if counts != expected_counts or len(obligations) != sum(expected_counts.values()):
+        raise ValueError("oracle is missing an independent semantic decision")
+    margins = {}
+    for payload in observed(logs, "SENSENOVA_LOOP_SEMANTIC"):
+        record = json.loads(payload)
+        if not isinstance(record, dict) or set(record) != {"tier", "case_id", "step", "margin"}:
+            raise ValueError("invalid native semantic receipt")
+        tier, case, step, margin = (record[key] for key in ("tier", "case_id", "step", "margin"))
+        if (tier not in TIERS or not isinstance(case, str) or type(step) is not int
+                or (case, step) not in obligations or (tier, case, step) in margins
+                or type(margin) not in (int, float) or not math.isfinite(margin) or margin <= 0):
+            raise ValueError("unexpected, duplicate or nonpositive native semantic decision")
+        margins[tier, case, step] = margin
+    if set(margins) != {(tier, case, step) for tier in TIERS for case, step in obligations}:
+        raise ValueError("missing tier-specific semantic decision")
+    return [{"tier": tier, "case_id": case, "step": step, "margin": margins[tier, case, step],
+             "source_positive_margin": obligations[case, step]}
+            for tier, case, step in sorted(margins)]
+
 
 
 def main() -> None:
@@ -39,18 +95,16 @@ def main() -> None:
             Path(item["absolute_lexical_path"]["display"]).resolve()
             for item in observation["items"] if "absolute_lexical_path" in item
         )
+    logs = [(evidence / f"00000/body.{stream}.log").read_text(encoding="utf-8")
+            for stream in ("stdout", "stderr")]
     if backend == "mlx":
-        logs = [(evidence / f"00000/body.{stream}.log").read_text(encoding="utf-8")
-                for stream in ("stdout", "stderr")]
-        matches = [line.split(" ", 1)[1] for log in logs for line in log.splitlines()
-                   if line.startswith("SENSENOVA_LOOP_ORACLE_SHA256 ")]
-        if matches != [oracle_sha]:
-            raise ValueError("MLX test did not attest to the exact oracle bytes")
+        verify_oracle_marker(logs, oracle_sha)
     elif oracle not in consumed.get("reference", set()):
         raise ValueError("Candle test did not attest to the exact oracle path")
 
+    semantic = verify_semantic_margins(json.loads(oracle.read_bytes()), logs)
     tiers = {}
-    for tier in ("bf16", "q8", "q4"):
+    for tier in TIERS:
         directory = Path(env[f"SENSENOVA_LOOP_{tier.upper()}_SNAPSHOT"])
         expectation = source["files"] if tier == "bf16" else native["tiers"][tier]["files"]
         files = [directory / entry["path"] for entry in expectation]
@@ -67,6 +121,7 @@ def main() -> None:
         "source_sha": expected_sha, "hf_revision": source["revision"], "backend": backend,
         "source_manifest_sha256": digest(SOURCE), "oracle_sha256": oracle_sha,
         "native_proof_receipt_sha256": digest(evidence / "receipt.json"), "tiers": tiers,
+        "semantic_margins": semantic,
         "claim": "Exact pre/post byte inventories and separately witnessed successful reader paths",
     })
 
