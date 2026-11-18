@@ -2,17 +2,88 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
 import sys
 
+COLOR_PROMPT = "What is the dominant color of this image? Answer with one word."
+RED = [205, 35, 35]
+BLUE = [35, 70, 200]
 FIXTURES = (
-    ("text", "What is 13 times 7? Answer with just the number.", None),
-    ("red", "What is the dominant color of this image? Answer with one word.", [205, 35, 35]),
-    ("blue", "What is the dominant color of this image? Answer with one word.", [35, 70, 200]),
+    ("text", "What is 13 times 7? Answer with just the number.", None, "91"),
+    ("red", COLOR_PROMPT, {"width": 256, "height": 256, "rgb": RED}, "red"),
+    ("blue", COLOR_PROMPT, {"width": 256, "height": 256, "rgb": BLUE}, "blue"),
+    ("quadrants", "What color covers the upper left of the image? Answer with one word.",
+     {"width": 353, "height": 249, "rgb": RED, "split_x": 209, "split_y": 155,
+      "quadrants": [RED, BLUE, [36, 174, 47], [232, 190, 40]]}, "red"),
 )
 STEPS = 3
+
+
+def fixture_image(image, pil):
+    width, height = image["width"], image["height"]
+    if "quadrants" not in image:
+        return pil.new("RGB", (width, height), tuple(image["rgb"]))
+    colors = [bytes(rgb) for rgb in image["quadrants"]]
+    pixels = b"".join(colors[2 * (y >= image["split_y"]) + (x >= image["split_x"])]
+                      for y in range(height) for x in range(width))
+    return pil.frombytes("RGB", (width, height), pixels)
+
+
+def processor_evidence(image, image_bytes, inputs, patch_size, temporal_size, merge_size):
+    grid = inputs["image_grid_thw"].tolist()
+    rgb = inputs["pixel_values"].float().cpu().contiguous()
+    _, rows, columns = grid[0]
+    height, width = rows * patch_size, columns * patch_size
+    expected = [[1, 16, 22]] if "quadrants" in image else [[1, 16, 16]]
+    if grid != expected or tuple(rgb.shape) != (rows * columns, 3 * temporal_size * patch_size**2):
+        raise RuntimeError(f"unexpected SenseNova processor tensor geometry: {grid}, {rgb.shape}")
+    points = [
+        (1, 1), (patch_size + 1, 1), (1, patch_size + 1), (patch_size + 1, patch_size + 1),
+        (2 * patch_size + 1, 1), (1, 2 * patch_size + 1), (width - 2, 1),
+        (1, height - 2), (width - 2, height - 2),
+    ]
+    corners = {(1, 1): 0, (width - 2, 1): 1, (1, height - 2): 2, (width - 2, height - 2): 3}
+    if "quadrants" in image:
+        # Original input coordinate of the color break projected into the resize.
+        edge_x = round(image["split_x"] * width / image["width"])
+        edge_y = round(image["split_y"] * height / image["height"])
+        points += [(edge_x + delta, height // 4) for delta in (-2, -1, 0, 1, 2)]
+        points += [(width // 4, edge_y + delta) for delta in (-2, -1, 0, 1, 2)]
+    samples = []
+    for x, y in points:
+        patch_row, local_y = divmod(y, patch_size)
+        patch_column, local_x = divmod(x, patch_size)
+        block_y, inner_y = divmod(patch_row, merge_size)
+        block_x, inner_x = divmod(patch_column, merge_size)
+        patch = ((block_y * (columns // merge_size) + block_x) * merge_size**2
+                 + inner_y * merge_size + inner_x)
+        for channel in range(3):
+            for frame in range(temporal_size):
+                offset = ((channel * temporal_size + frame) * patch_size + local_y) * patch_size + local_x
+                value = float(rgb[patch, offset])
+                if (x, y) in corners:
+                    palette = image.get("quadrants", [image["rgb"]] * 4)
+                    want = 2.0 * palette[corners[x, y]][channel] / 255.0 - 1.0
+                    if not math.isclose(value, want, rel_tol=0, abs_tol=1e-6):
+                        raise RuntimeError("reference patch order or normalized corner color differs")
+                samples.append({"patch": patch, "offset": offset, "value": value})
+    # Existing Qwen35 tests compare this native PIL-style resizer to torchvision BICUBIC.
+    sample_abs_tolerance = 0.02 if "quadrants" in image else 1e-5
+    return {
+        "image_grid_thw": grid, "image_processor_samples": samples,
+        "image_processor_sample_abs_tolerance": sample_abs_tolerance,
+        "image_processor_tolerance_source": (
+            "crates/llm/candle-llm/src/image.rs::tests::end_to_end_within_resampler_tolerance"
+            if "quadrants" in image
+            else "crates/llm/candle-llm/src/image.rs::tests::patchify_layout_matches_reference"
+        ),
+        "image_rgb_sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "image_pixel_values_f32_sha256": hashlib.sha256(rgb.numpy().astype("<f4", copy=False).tobytes()).hexdigest(),
+        "image_pixel_values_shape": list(rgb.shape), "image_resized_wh": [width, height],
+    }
 
 
 def run_case(model, inputs, torch, *, cached, tokens=None, expected_plan):
@@ -64,6 +135,7 @@ def run_case(model, inputs, torch, *, cached, tokens=None, expected_plan):
 def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
     import torch
     import transformers
+    import torchvision
     from PIL import Image, __version__ as pillow_version
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -89,22 +161,57 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
         for param in router.parameters()
     ):
         raise RuntimeError("reference did not load expected physical layers and FP32 mHC")
+    image_processor = processor.image_processor
+    patch_size, temporal_size, merge_size = (image_processor.patch_size,
+                                              image_processor.temporal_patch_size,
+                                              image_processor.merge_size)
+    if (patch_size, temporal_size, merge_size) != (16, 2, 2):
+        raise RuntimeError("pinned SenseNova processor patch settings differ")
+    processor_binding = {
+        "processor_class": type(processor).__name__,
+        "image_processor_class": type(image_processor).__name__,
+        "size": dict(image_processor.size),
+        "resample": int(image_processor.resample),
+        "rescale_factor": image_processor.rescale_factor,
+        "image_mean": image_processor.image_mean, "image_std": image_processor.image_std,
+        "patch_size": patch_size, "temporal_patch_size": temporal_size, "merge_size": merge_size,
+        "torchvision": torchvision.__version__,
+    }
+    loaded_parameter_dtypes = {key: str(parameter.dtype).removeprefix("torch.") for key, parameter in {
+        "model.language_model.layers.0.linear_attn.A_log": layers[0].linear_attn.A_log,
+        "model.language_model.layers.0.linear_attn.dt_bias": layers[0].linear_attn.dt_bias,
+        "model.language_model.layers.4.mhc_attn.weight": layers[4].mhc_attn.weight,
+        "model.language_model.layers.4.mhc_attn.bias": layers[4].mhc_attn.bias,
+        "model.language_model.layers.4.mhc_ffn.weight": layers[4].mhc_ffn.weight,
+        "model.language_model.layers.4.mhc_ffn.bias": layers[4].mhc_ffn.bias,
+    }.items()}
     cases = []
     with torch.inference_mode():
-        for name, prompt, color in FIXTURES:
-            image = None if color is None else {"width": 256, "height": 256, "rgb": color}
+        for name, prompt, image, expected_answer in FIXTURES:
             content = [{"type": "text", "text": prompt}]
             processor_kwargs = {}
             if image is not None:
                 content.insert(0, {"type": "image"})
-                processor_kwargs["images"] = [Image.new("RGB", (256, 256), tuple(color))]
+                pil_image = fixture_image(image, Image)
+                processor_kwargs["images"] = [pil_image]
             rendered = processor.apply_chat_template(
                 [{"role": "user", "content": content}], tokenize=False,
                 add_generation_prompt=True, enable_thinking=False,
             )
-            inputs = processor(text=[rendered], return_tensors="pt", **processor_kwargs).to("cuda:0")
+            inputs = processor(text=[rendered], return_tensors="pt", **processor_kwargs)
+            vision = {"image_grid_thw": None, "image_processor_samples": []}
+            if image is not None:
+                vision = processor_evidence(image, pil_image.tobytes(), inputs, patch_size, temporal_size, merge_size)
+            inputs = inputs.to("cuda:0")
             model.set_attn_implementation("eager")
             baseline, chosen = run_case(model, inputs, torch, cached=True, expected_plan=plan)
+            stop_ids = model.generation_config.eos_token_id
+            if isinstance(stop_ids, int):
+                stop_ids = [stop_ids]
+            first_end = next((i for i, token in enumerate(chosen) if token in stop_ids), len(chosen))
+            completion = processor.tokenizer.decode(chosen[:first_end], skip_special_tokens=True)
+            if completion.strip().strip(".!").lower() != expected_answer:
+                raise RuntimeError(f"upstream reference {name} did not produce {expected_answer!r}: {completion!r}")
             cold, _ = run_case(model, inputs, torch, cached=False, tokens=chosen, expected_plan=plan)
             model.set_attn_implementation("sdpa")
             if model.model.language_model.config._attn_implementation != "sdpa":
@@ -133,7 +240,8 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
             cases.append({
                 "id": name, "prompt": prompt, "thinking": False, "image": image,
                 "input_ids": inputs["input_ids"][0].tolist(), "steps": steps,
-                "image_grid_thw": inputs["image_grid_thw"].tolist() if image else None,
+                "expected_answer": expected_answer, "reference_completion": completion,
+                **vision,
                 "thinking_prompt": processor.apply_chat_template(
                     [{"role": "user", "content": content}], tokenize=False,
                     add_generation_prompt=True, enable_thinking=True,
@@ -143,6 +251,7 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
         "schema_version": 1, "hf_revision": snapshot.name,
         "source_inventory_sha256": inventory_sha,
         "comparison": "BF16 PyTorch CUDA eager cached, eager full replay, SDPA cached",
+        "processor_bindings": processor_binding, "loaded_parameter_dtypes": loaded_parameter_dtypes,
         "torch": torch.__version__, "transformers": transformers.__version__,
         "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(), "pillow": pillow_version,
         "cases": cases,
