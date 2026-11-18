@@ -176038,7 +176038,7 @@
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs",
             "case_source_sha256": "d2f611000cd9a99598eb8ae6bd319c22b5788acf1f85d0b91fd86c5ad60ce318",
-            "writer": "trainer_real_weights::short_train_produces_loadable_adapter -> exact root -> write_synth_image(path, 512): 512x768 RGB of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] -> img.save(path) -> TrainingItem.image_path -> KreaRawTrainer::train_impl cache -> decode_image image::open(SAME written PNG path(s))"
+            "writer": "trainer_real_weights::short_train_produces_loadable_adapter -> exact root -> write_synth_image(path, 256): 256x384 RGB of three horizontal bands [40,80,200]/[235,225,200]/[40,160,70] -> img.save(path) -> TrainingItem.image_path -> KreaRawTrainer::train_impl cache -> decode_image image::open(SAME written PNG path(s))"
           },
           "minimum_collections": 1,
           "minimum_items": 1,
