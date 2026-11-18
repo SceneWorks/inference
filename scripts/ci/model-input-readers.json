@@ -448,6 +448,12 @@
         "reader-binding"
       ]
     },
+    "candle-llm::sensenova_loop_proof::read_oracle": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
     "core-llm::template::JinjaChatTemplate::from_tokenizer_config_file/read_to_string": {
       "role": "tokenizer",
       "grades": [

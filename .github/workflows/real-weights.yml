@@ -6423,9 +6423,43 @@ jobs:
           MODEL_PROOF_BINDING: ${{ inputs.ios_pricing_compile_binding }}
         run: source scripts/ci/real-weights/model-proof-plan/plan.sh
 
+  sensenova-loop-reference:
+    name: SenseNova Loop upstream BF16 CUDA reference
+    needs: model-proof-plan
+    if: ${{ fromJSON(needs.model-proof-plan.outputs.matrix).include[0].asset_setup == 'sensenova-loop' }}
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
+    env:
+      MODEL_PROOF_REQUEST: ${{ needs.model-proof-plan.outputs.request }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 on Windows
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      - name: Run the independent pinned CUDA reference
+        shell: cmd
+        env:
+          SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-report-${{ github.run_id }}-${{ github.run_attempt }}
+        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd reference
+      - name: Retain bounded reference evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sensenova-loop-reference-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sensenova-reference-report-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+
   model-proof-execute:
     name: Explicit ${{ needs.model-proof-plan.outputs.backend }} model tests
-    needs: model-proof-plan
+    needs: [model-proof-plan, sensenova-loop-reference]
+    if: ${{ !cancelled() && needs.model-proof-plan.result == 'success' && (needs.sensenova-loop-reference.result == 'success' || needs.sensenova-loop-reference.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
@@ -6507,6 +6541,28 @@ jobs:
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
         run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+      - name: Fetch same-run SenseNova reference receipt
+        if: matrix.asset_setup == 'sensenova-loop'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sensenova-loop-reference-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sensenova-reference-input-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Bind SenseNova BF16 source and prepare native q8/q4 on macOS
+        if: matrix.asset_setup == 'sensenova-loop' && runner.os == 'macOS'
+        shell: bash
+        env:
+          SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-input-${{ github.run_id }}-${{ github.run_attempt }}
+          SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
+          # Published to GITHUB_ENV by the preparation script, then passed to the exact test.
+          SENSENOVA_LOOP_BF16_SNAPSHOT: ''
+        run: source scripts/ci/real-weights/model-proof-execute/sensenova-macos.sh
+      - name: Bind SenseNova BF16 source and prepare native q8/q4 on Windows
+        if: matrix.asset_setup == 'sensenova-loop' && runner.os == 'Windows'
+        shell: cmd
+        env:
+          SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-input-${{ github.run_id }}-${{ github.run_attempt }}
+          SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
+        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd native
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -6526,6 +6582,43 @@ jobs:
         with:
           name: model-proof-${{ github.sha }}-${{ needs.model-proof-plan.outputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.MODEL_PROOF_EVIDENCE }}
+          if-no-files-found: error
+
+      - name: Join SenseNova input hashes to verified native reader evidence
+        if: matrix.asset_setup == 'sensenova-loop'
+        shell: bash
+        env:
+          SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
+        run: source scripts/ci/real-weights/model-proof-execute/sensenova-seal.sh
+      - name: Upload native SenseNova input receipts
+        if: ${{ !cancelled() && matrix.asset_setup == 'sensenova-loop' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sensenova-loop-native-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+      - name: Publish verified native SenseNova tiers on macOS
+        if: matrix.asset_setup == 'sensenova-loop' && runner.os == 'macOS' && fromJSON(needs.model-proof-plan.outputs.request).sensenova_publish == true
+        shell: bash
+        env:
+          SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
+          SENSENOVA_PUBLICATION_REPORT: ${{ runner.temp }}/sensenova-publication-report-${{ github.run_id }}-${{ github.run_attempt }}
+          HF_HUB_OFFLINE: '0'
+        run: source scripts/ci/real-weights/model-proof-execute/sensenova-macos.sh publish
+      - name: Publish verified native SenseNova tiers on Windows
+        if: matrix.asset_setup == 'sensenova-loop' && runner.os == 'Windows' && fromJSON(needs.model-proof-plan.outputs.request).sensenova_publish == true
+        shell: cmd
+        env:
+          SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
+          SENSENOVA_PUBLICATION_REPORT: ${{ runner.temp }}/sensenova-publication-report-${{ github.run_id }}-${{ github.run_attempt }}
+          HF_HUB_OFFLINE: '0'
+        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd publish
+      - name: Upload verified SenseNova publication receipt
+        if: matrix.asset_setup == 'sensenova-loop' && fromJSON(needs.model-proof-plan.outputs.request).sensenova_publish == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sensenova-loop-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sensenova-publication-report-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
 
   # Explicit synthetic model validations, relocated from CI; no schedule/all/automatic route.

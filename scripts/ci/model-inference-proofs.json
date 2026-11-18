@@ -315940,5 +315940,153 @@
       "requirements": [],
       "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/tests.rs::training::tests::the_frozen_adapter_is_reattached_after_each_trainable_install@89e86a629f773f4075f0d41f0b5cbb7523eaa7b86ceb157e19766aa54852381e"
     }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "fqn": "sensenova_loop_real_weights::sensenova_loop_release_proof",
+    "source": "crates/llm/mlx-llm/tests/sensenova_loop_real_weights.rs",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "expected_devices": [
+      "mlx-metal"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Official SenseNova-Loop-9B BF16 and separately prepared native q8/q4 of the same pinned payload; same-run Transformers reference",
+    "configuration_source": "crates/llm/mlx-llm/tests/sensenova_loop_real_weights.rs::sensenova_loop_real_weights::sensenova_loop_release_proof",
+    "output_contract": "One successful exact model test, end-only body marker, actual device witness and source-required tier/feature assertions.",
+    "required_environment": [
+      "SENSENOVA_LOOP_BF16_SNAPSHOT",
+      "SENSENOVA_LOOP_Q8_SNAPSHOT",
+      "SENSENOVA_LOOP_Q4_SNAPSHOT",
+      "SENSENOVA_LOOP_ORACLE"
+    ],
+    "external_asset_environment": [
+      "SENSENOVA_LOOP_BF16_SNAPSHOT",
+      "SENSENOVA_LOOP_Q8_SNAPSHOT",
+      "SENSENOVA_LOOP_Q4_SNAPSHOT",
+      "SENSENOVA_LOOP_ORACLE"
+    ],
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/sensenova_loop_real_weights.rs::sensenova_loop_real_weights::sensenova_loop_release_proof",
+      "requirements": [
+        {
+          "slot": "release-and-prepared-weights",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "tokenizers",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "sensenova_loop_real_weights",
+    "target_kind": "test",
+    "cargo_target_metadata": {
+      "name": "sensenova_loop_real_weights",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "fqn": "sensenova_loop_release_proof",
+    "source": "crates/llm/candle-llm/tests/sensenova_loop_real_weights.rs",
+    "execution_role": "direct",
+    "required_cuda_physical_index": 1,
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Official SenseNova-Loop-9B BF16 and separately prepared native q8/q4 of the same pinned payload; same-run Transformers reference",
+    "configuration_source": "crates/llm/candle-llm/tests/sensenova_loop_real_weights.rs::sensenova_loop_release_proof",
+    "output_contract": "One successful exact model test, end-only body marker, actual device witness and source-required tier/feature assertions.",
+    "required_environment": [
+      "SENSENOVA_LOOP_BF16_SNAPSHOT",
+      "SENSENOVA_LOOP_Q8_SNAPSHOT",
+      "SENSENOVA_LOOP_Q4_SNAPSHOT",
+      "SENSENOVA_LOOP_ORACLE"
+    ],
+    "external_asset_environment": [
+      "SENSENOVA_LOOP_BF16_SNAPSHOT",
+      "SENSENOVA_LOOP_Q8_SNAPSHOT",
+      "SENSENOVA_LOOP_Q4_SNAPSHOT",
+      "SENSENOVA_LOOP_ORACLE"
+    ],
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/candle-llm/tests/sensenova_loop_real_weights.rs::sensenova_loop_release_proof",
+      "requirements": [
+        {
+          "slot": "release-and-prepared-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-llm::primitives::Weights::from_dir",
+            "candle-llm::primitives::Weights::from_dir_sharded"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "tokenizers",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "same-run-upstream-oracle",
+          "role": "reference",
+          "readers": [
+            "candle-llm::sensenova_loop_proof::read_oracle"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
   }
 ]
