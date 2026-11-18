@@ -1,4 +1,4 @@
-"""Publish only exact staged SenseNova tiers that passed the native proof in this job."""
+"""Publish the exact staged native q8/q4 tiers that passed this job's proof."""
 
 from __future__ import annotations
 
@@ -44,26 +44,12 @@ def main() -> None:
     ):
         raise ValueError("staged input receipt does not bind the verified run")
     snapshots = {tier: Path(env[f"SENSENOVA_LOOP_{tier.upper()}_SNAPSHOT"])
-                 for tier in ("bf16", "q8", "q4")}
+                 for tier in ("q8", "q4")}
     output = Path(env["SENSENOVA_PUBLICATION_REPORT"])
     output.mkdir()
-    # Select only release payloads named in the pin, even if the shared cache has extra files.
     staging = snapshots["q4"].parent / "publication"
     staging.mkdir()
-    bf16 = staging / "bf16"
-    bf16.mkdir()
-    release_files = [snapshots["bf16"] / entry["path"] for entry in source["files"]]
-    if inventory(release_files, snapshots["bf16"]) != source["files"]:
-        raise ValueError("BF16 source bytes changed after validation")
-    for path in release_files:
-        dest = bf16 / path.name
-        try:
-            os.link(path.resolve(strict=True), dest)
-        except OSError:
-            shutil.copyfile(path, dest)
-    snapshots["bf16"] = bf16
-    for tier in ("q8", "q4"):
-        directory = snapshots[tier]
+    for tier, directory in snapshots.items():
         if inventory([item for item in directory.rglob("*") if item.is_file()], directory) != native["tiers"][tier]["files"]:
             raise ValueError(f"{tier} bytes changed after validation")
 
@@ -74,9 +60,8 @@ def main() -> None:
         f"# SenseNova Loop-9B for SceneWorks ({backend})\n\n"
         f"Source model: [{source['repository']}](https://huggingface.co/{source['repository']}"
         f"/tree/{source['revision']}) by SenseNova, licensed Apache-2.0.\n\n"
-        "The BF16 directory carries the official base checkpoint bytes and configuration. "
-        "SceneWorks prepared the q8 and q4 directories from those same bytes with its native "
-        "converter. The optional upstream MTP draft is outside these tier payloads.\n\n"
+        "The source link provides the official BF16 checkpoint. SceneWorks prepared the "
+        "q8 and q4 directories from that pinned checkpoint with its native converter.\n\n"
         f"SceneWorks/inference source: `{expected_sha}`.\n",
         encoding="utf-8",
     )
