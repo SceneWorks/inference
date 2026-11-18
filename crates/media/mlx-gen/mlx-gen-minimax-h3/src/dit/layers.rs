@@ -317,6 +317,25 @@ impl DitAttention {
         bounded: BoundedAttention<'_>,
         veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
     ) -> Result<Array> {
+        self.forward_bounded_pag(x, rope, bounded, veda, None)
+    }
+
+    /// [`Self::forward_bounded_veda`] with optional Perturbed-Attention Guidance (PAG, SW-7175).
+    ///
+    /// When `pag_prefix_len` is `Some(prefix_len)`:
+    /// - Leading conditioning rows `0..prefix_len` (Qwen3-VL text/vision tokens and any `1..=16`
+    ///   `<Picture N>` reference latent rows) attend normally against the full `[K_prefix, K_gen]`
+    ///   and `[V_prefix, V_gen]` sequence so conditioning streams stay intact for downstream blocks.
+    /// - Trailing target-image rows `prefix_len..seq` bypass spatial self-attention (identity
+    ///   self-attention perturbation) and receive `V_generated` directly before `to_out`.
+    pub(crate) fn forward_bounded_pag(
+        &self,
+        x: &Array,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+        bounded: BoundedAttention<'_>,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+        pag_prefix_len: Option<i32>,
+    ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
             return Err(Error::Msg(format!(
@@ -326,6 +345,55 @@ impl DitAttention {
         let (b, seq) = (s[0], s[1]);
         let (h, d) = (self.heads, self.head_dim);
         let shape = [b, seq, h, d];
+
+        if let Some(prefix_len) = pag_prefix_len {
+            if prefix_len < 0 || prefix_len > seq {
+                return Err(Error::Msg(format!(
+                    "minimax-h3 dit attention: pag_prefix_len {prefix_len} out of range 0..={seq}"
+                )));
+            }
+            if prefix_len == 0 {
+                let v_flat = self.to_v.forward(x)?;
+                return self.to_out.forward(&v_flat);
+            }
+            if prefix_len < seq {
+                let x_prefix = crate::tensor::slice_axis(x, 1, 0, prefix_len)?;
+                let q_prefix = self
+                    .to_q
+                    .forward(&x_prefix)?
+                    .reshape(&[b, prefix_len, h, d])?;
+                let k = self.to_k.forward(x)?.reshape(&shape)?;
+                let v_flat = self.to_v.forward(x)?;
+                let v = v_flat.reshape(&shape)?;
+
+                let q_prefix = rms_affine(&q_prefix, &self.norm_q, self.qk_norm_eps)?;
+                let k = rms_affine(&k, &self.norm_k, self.qk_norm_eps)?;
+                let (q_prefix, k) = match rope {
+                    Some((rope, tables)) => {
+                        let prefix_tables = MmRopeTables {
+                            cos: crate::tensor::slice_axis(&tables.cos, 0, 0, prefix_len)?,
+                            sin: crate::tensor::slice_axis(&tables.sin, 0, 0, prefix_len)?,
+                        };
+                        (
+                            rope.apply(&q_prefix, &prefix_tables)?,
+                            rope.apply(&k, tables)?,
+                        )
+                    }
+                    None => (q_prefix, k),
+                };
+
+                let qh_prefix = q_prefix.transpose_axes(&[0, 2, 1, 3])?;
+                let kh = k.transpose_axes(&[0, 2, 1, 3])?;
+                let vh = v.transpose_axes(&[0, 2, 1, 3])?;
+                let scale = 1.0 / (d as f32).sqrt();
+                let out_prefix = sdpa_bounded_bhsd(&qh_prefix, &kh, &vh, scale, None, bounded)?
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[b, prefix_len, h * d])?;
+                let v_gen = crate::tensor::slice_axis(&v_flat, 1, prefix_len, seq)?;
+                let out = mlx_rs::ops::concatenate_axis(&[out_prefix, v_gen], 1)?;
+                return self.to_out.forward(&out);
+            }
+        }
 
         // The published checkpoint ships `to_q`/`to_k`/`to_v` already split, so this applies NO
         // fused-QKV transform. See `crate::dit::qkv` for which transform produced them and why

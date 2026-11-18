@@ -207,6 +207,13 @@ impl ImageLayout {
         self.num_text_tokens
     }
 
+    /// Leading conditioning prefix rows (`[text]` on `text2image`, `[text | references]` on
+    /// `edit`) that remain unperturbed under PAG while the trailing [`Self::num_image_rows`]
+    /// target-image rows bypass spatial self-attention.
+    pub fn num_conditioning_rows(&self) -> i32 {
+        self.num_text_tokens + self.num_reference_rows()
+    }
+
     /// Rows of the generated image — the trailing ones.
     pub fn num_image_rows(&self) -> i32 {
         (self.latent_height / self.patch[1]) * (self.latent_width / self.patch[2])
@@ -280,6 +287,7 @@ mod tests {
     #[test]
     fn layout_counts_and_refusals() {
         let layout = ImageLayout::t2i(5, 128, 128, [1, 2, 2]).unwrap();
+        assert_eq!(layout.num_conditioning_rows(), 5);
         assert_eq!(layout.num_image_rows(), 4096);
         assert_eq!(layout.seq_len(), 4101);
         assert_eq!(layout.position_ids().shape(), &[4101, 3]);
@@ -309,6 +317,7 @@ mod tests {
 
         let layout = ImageLayout::edit(&[1, 0, 0, 1], &[(4, 4), (2, 4)], 4, 4, [1, 2, 2]).unwrap();
         assert_eq!(layout.num_reference_rows(), 6);
+        assert_eq!(layout.num_conditioning_rows(), 4 + 6);
         assert_eq!(layout.num_image_rows(), 4);
         assert_eq!(layout.seq_len(), 4 + 6 + 4);
         let tags: Vec<i32> = layout.token_tags().as_slice::<i32>().to_vec();

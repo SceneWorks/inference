@@ -587,6 +587,30 @@ impl DitBlock {
         veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
         cancel: Option<&candle_gen::gen_core::CancelFlag>,
     ) -> Result<Tensor> {
+        self.forward_pag(
+            x,
+            modulation,
+            adaln_indices,
+            rope,
+            tables,
+            veda,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_pag(
+        &self,
+        x: &Tensor,
+        modulation: &AdaLnModulation,
+        adaln_indices: &Tensor,
+        rope: &MmRope,
+        tables: &MmRopeTables,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
+        pag_prefix_len: Option<usize>,
+    ) -> Result<Tensor> {
         let s = x.dims();
         if s.len() != 3 {
             return Err(CandleError::Msg(format!(
@@ -613,9 +637,13 @@ impl DitBlock {
                 &modulation.shift_msa,
                 &idx,
             )?;
-            let attn = self
-                .attn
-                .forward_veda(&normed, Some((rope, tables)), veda, cancel)?;
+            let attn = self.attn.forward_pag(
+                &normed,
+                Some((rope, tables)),
+                veda,
+                cancel,
+                pag_prefix_len,
+            )?;
             let gate = gate_rows(&modulation.gate_msa, &idx, rows, x.dtype())?;
             x.add(&gate.broadcast_mul(&attn)?)?
         };

@@ -58,8 +58,9 @@ use gen_core_h3::h3_schedule::SigmaSchedule;
 
 use crate::dit::{ImageDit, MiniMaxH3Dit, PreparedImageDit};
 use crate::image_pipeline::{
-    decoded_to_image, denoise_image, initial_image_rows, latent_grid, reference_condition_rows,
-    reference_noise, reference_vae_pixels, resize_reference, unpack_image_rows, ImageLayout,
+    decoded_to_image, denoise_image_with_pag, initial_image_rows, latent_grid,
+    reference_condition_rows, reference_noise, reference_vae_pixels, resize_reference,
+    unpack_image_rows, ImageLayout,
 };
 use crate::image_vae::{MiniMaxH3ImageVae, MiniMaxH3ImageVaeEncoder, IMAGE_VAE_COMPONENT};
 use crate::model::{
@@ -122,9 +123,12 @@ pub fn image_descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // Guidance-distilled: no negative prompt, no CFG (`gen_core::h3_image` refuses both).
+            // SW-7175: Perturbed-Attention Guidance (PAG) runs a second conditional pass on active
+            // steps without relaxing the guidance = 1 / no-negative-prompt contract.
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
+            pag: Some(contract::minimax_h3_image_pag_capability()),
             // `edit` (SW-7092): 1..=16 reference images, as single references and/or a
             // multi-reference list, in request order. No reference is `text2image`.
             conditioning: vec![
@@ -562,13 +566,17 @@ impl MiniMaxH3Image {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<candle_gen::gen_core::GenerationReport> {
         // Rung 4 (SW-7095): a request whose admitted selection streams the transformer blocks
         // installs the one-block window policy for this request only; the text encoder
         // (`run_conditioner`) and the DiT load below read it.
         let _stream_request =
             crate::block_stream::RequestGuard::enter(req, self.load_shape, &self.device)?;
         Generator::validate(self, req)?;
+        let resolved_pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(IMAGE_MODEL_ID, req)?;
         // Admission priced the references by count; re-price the admitted selection at their
         // actual sizes before any phase runs (a non-square reference outgrows the count bound).
         if let Some(context) = crate::memory_strategy::active_context() {
@@ -609,6 +617,14 @@ impl MiniMaxH3Image {
         let resident = keeps_components_warm(req, self.spec.offload_policy)
             && crate::block_stream::current().is_none()
             && self.warm_set_fits_now(req, &warm);
+        candle_gen::execution::policy(
+            "h3_image_residency",
+            serde_json::json!({
+                "resident": resident,
+                "streamed": crate::block_stream::current().is_some(),
+                "quantize": self.spec.quantize.map(|q| format!("{q:?}")),
+            }),
+        );
         if !resident && !warm.is_empty() {
             *warm = WarmComponents::default();
             crate::dit::release_device_memory(&self.device)?;
@@ -728,7 +744,7 @@ impl MiniMaxH3Image {
         drop(reference_latents);
         let total = schedule.num_evals() as u32;
         let phase = PhaseLog::start("denoise");
-        let rows = denoise_image(
+        let rows = denoise_image_with_pag(
             &mut model,
             &schedule,
             &sampler,
@@ -737,6 +753,7 @@ impl MiniMaxH3Image {
             layout.num_reference_rows(),
             &self.device,
             &req.cancel,
+            resolved_pag.as_ref(),
             &mut |completed| {
                 on_progress(Progress::Step {
                     current: completed as u32,
@@ -777,12 +794,18 @@ impl MiniMaxH3Image {
             staged_vae = MiniMaxH3ImageVae::load(&self.root, &self.device, DType::F32)?;
             &staged_vae
         };
+        candle_gen::execution::component_runtime("image_vae_decode", latents.device(), DType::F32);
         let decoded = vae.decode(&latents)?;
         drop(latents);
         crate::dit::release_device_memory(&self.device)?;
         let image = decoded_to_image(&decoded, width, height)?;
         phase.done();
-        Ok(GenerationOutput::Images(vec![image]))
+        let mut report =
+            candle_gen::gen_core::GenerationReport::from_output(GenerationOutput::Images(vec![
+                image,
+            ]));
+        report.pag = resolved_pag.as_ref().map(|pag| pag.execution_report(total));
+        Ok(report)
     }
 }
 
@@ -857,6 +880,19 @@ impl Generator for MiniMaxH3Image {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<GenerationOutput> {
+        let report = self.generate_with_report(req, on_progress)?;
+        report.output.ok_or_else(|| {
+            candle_gen::gen_core::Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: the render produced no output"
+            ))
+        })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
         let result = self.generate_impl(req, on_progress);
         if matches!(&result, Err(error) if !matches!(error, CandleError::Canceled)) {
             // A failed render (an out-of-memory load among them) leaves no half-built warm set
@@ -867,6 +903,19 @@ impl Generator for MiniMaxH3Image {
             }
         }
         Ok(result?)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.spec.adapters.len(),
+                "candle-gen-minimax-h3/src/image_model.rs",
+            );
+        })
     }
 }
 
@@ -1476,5 +1525,95 @@ mod tests {
         spec.quantize = Some(Quant::Q8);
         let e = load_image(&spec).err().expect("q4 staged, q8 asked");
         assert!(e.to_string().contains("bits 4"), "{e}");
+    }
+
+    #[test]
+    fn pag_capability_matches_shared_contract_and_preserves_no_cfg_contract() {
+        use candle_gen::gen_core::{PagConfig, PagExecutionReport};
+
+        let d = image_descriptor();
+        assert!(!d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert_eq!(
+            d.capabilities.pag,
+            Some(contract::minimax_h3_image_pag_capability())
+        );
+
+        let mut t2i_pag = request(2048, 2048);
+        t2i_pag.pag = Some(PagConfig {
+            scale: 1.2,
+            ..Default::default()
+        });
+        validate_image_request(&d, &t2i_pag).unwrap();
+        let resolved = d
+            .capabilities
+            .resolve_pag(IMAGE_MODEL_ID, &t2i_pag)
+            .unwrap()
+            .expect("active PAG");
+        assert_eq!(
+            resolved.execution_report(contract::FIXED_STEPS),
+            PagExecutionReport {
+                layers: vec![25],
+                active_steps: 4,
+                total_steps: 6,
+                scale: 1.2,
+                adaptive_scale: 0.0,
+                start: 0.0,
+                stop: 0.66,
+            }
+        );
+
+        let mut edit_16_pag = with_refs(16, 64, 64);
+        edit_16_pag.pag = Some(PagConfig {
+            scale: 2.0,
+            layers: Some(vec![0, 25, 49]),
+            start: Some(0.0),
+            stop: Some(0.5),
+            adaptive_scale: Some(0.25),
+        });
+        validate_image_request(&d, &edit_16_pag).unwrap();
+
+        let mut zero_pag = request(2048, 2048);
+        zero_pag.pag = Some(PagConfig {
+            scale: 0.0,
+            layers: Some(vec![25]),
+            ..Default::default()
+        });
+        validate_image_request(&d, &zero_pag).unwrap();
+        assert!(d
+            .capabilities
+            .resolve_pag(IMAGE_MODEL_ID, &zero_pag)
+            .unwrap()
+            .is_none());
+
+        for bad in [
+            GenerationRequest {
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![50]),
+                    ..Default::default()
+                }),
+                ..request(2048, 2048)
+            },
+            GenerationRequest {
+                pag: Some(PagConfig {
+                    scale: 1.2,
+                    layers: Some(vec![50]),
+                    ..Default::default()
+                }),
+                ..request(2048, 2048)
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..t2i_pag.clone()
+            },
+            GenerationRequest {
+                negative_prompt: Some("low quality".into()),
+                ..t2i_pag
+            },
+        ] {
+            assert!(validate_image_request(&d, &bad).is_err(), "{bad:?}");
+        }
     }
 }
