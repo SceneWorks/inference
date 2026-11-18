@@ -187,6 +187,10 @@ impl QwenTransformer {
         }
     }
 
+    pub(crate) fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Quantize every transformer Linear to Q4/Q8 in place (group_size 64), the mlx-rs equivalent
     /// of the fork's `nn.quantize(transformer, bits=…)`. The text encoder + VAE stay dense (they
     /// have no quantizable Linears in the fork's predicate path).
@@ -251,7 +255,7 @@ impl QwenTransformer {
         attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
-        self.forward_control_windowed(
+        self.forward_control_windowed_pag(
             hidden_states,
             encoder_hidden_states,
             encoder_hidden_states_mask,
@@ -263,6 +267,37 @@ impl QwenTransformer {
             0.0,
             attention,
             window,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_windowed_pag(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        encoder_hidden_states_mask: Option<&Array>,
+        timestep: f32,
+        latent_h: usize,
+        latent_w: usize,
+        cond_grids: &[(usize, usize)],
+        attention: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        pag_perturb: Option<&[bool]>,
+    ) -> Result<Array> {
+        self.forward_control_windowed_pag(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            latent_h,
+            latent_w,
+            cond_grids,
+            None,
+            0.0,
+            attention,
+            window,
+            pag_perturb,
         )
     }
 
@@ -316,6 +351,54 @@ impl QwenTransformer {
         attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        self.forward_control_windowed_pag(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            timestep,
+            latent_h,
+            latent_w,
+            cond_grids,
+            control,
+            control_scale,
+            attention,
+            window,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_control_windowed_pag(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        encoder_hidden_states_mask: Option<&Array>,
+        timestep: f32,
+        latent_h: usize,
+        latent_w: usize,
+        cond_grids: &[(usize, usize)],
+        control: Option<(&QwenFunControlBranch, &Array)>,
+        control_scale: f32,
+        attention: AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        pag_perturb: Option<&[bool]>,
+    ) -> Result<Array> {
+        if let Some(mask) = pag_perturb {
+            if mask.len() != self.blocks.len() {
+                return Err(Error::Msg(format!(
+                    "qwen-image PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    self.blocks.len()
+                )));
+            }
+        }
+        let target_tokens = latent_h * latent_w;
+        let perturb_for_block = |i: usize| -> Option<usize> {
+            pag_perturb
+                .and_then(|mask| mask.get(i).copied())
+                .filter(|&perturb| perturb)
+                .map(|_| target_tokens)
+        };
         let b = hidden_states.shape()[0];
         let img_seq = hidden_states.shape()[1];
         let txt_seq = encoder_hidden_states.shape()[1];
@@ -392,7 +475,7 @@ impl QwenTransformer {
                 let mut encoder = encoder;
                 let mut hidden = hidden;
                 for (i, block) in self.blocks.iter().enumerate() {
-                    let (e, h) = block.forward_budgeted(
+                    let (e, h) = block.forward_budgeted_pag(
                         &hidden,
                         &encoder,
                         &text_emb,
@@ -403,6 +486,7 @@ impl QwenTransformer {
                         mask.as_ref(),
                         modulate_index.as_ref(),
                         attention,
+                        perturb_for_block(i),
                     )?;
                     encoder = e;
                     hidden = apply_hint(h, i)?;
@@ -433,7 +517,7 @@ impl QwenTransformer {
                     |(mut encoder, mut hidden), view, range| {
                         for i in range {
                             let block = stream.materialize(view, i)?;
-                            let (e, h) = block.forward_budgeted(
+                            let (e, h) = block.forward_budgeted_pag(
                                 &hidden,
                                 &encoder,
                                 &text_emb,
@@ -444,6 +528,7 @@ impl QwenTransformer {
                                 mask.as_ref(),
                                 modulate_index.as_ref(),
                                 attention,
+                                perturb_for_block(i),
                             )?;
                             encoder = e;
                             hidden = apply_hint(h, i)?;

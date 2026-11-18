@@ -382,6 +382,7 @@ fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 ///
 /// `softmax` is the score normaliser every call applies: the fused `softmax_last_dim` on the render
 /// path, the composable f32 one on the training path ([`Ops`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn block_causal_attention(
     q: &Tensor,
@@ -393,6 +394,33 @@ fn block_causal_attention(
     softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
     budget: usize,
     training: bool,
+) -> Result<Tensor> {
+    block_causal_attention_pag(
+        q,
+        k,
+        v,
+        scale,
+        prefix_segments,
+        prefix_len,
+        softmax,
+        budget,
+        training,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_causal_attention_pag(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    prefix_segments: &[(usize, usize, bool)],
+    prefix_len: usize,
+    softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
+    budget: usize,
+    training: bool,
+    perturb_target: bool,
 ) -> Result<Tensor> {
     let (_b, _h, s, _d) = q.dims4()?;
     let attention = |q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>| {
@@ -425,8 +453,12 @@ fn block_causal_attention(
         };
         outputs.push(attention(&qs, &ks, &vs, mask.as_ref())?);
     }
-    let qt = q.narrow(2, prefix_len, s - prefix_len)?.contiguous()?;
-    outputs.push(attention(&qt, &k.contiguous()?, &v.contiguous()?, None)?);
+    if perturb_target {
+        outputs.push(v.narrow(2, prefix_len, s - prefix_len)?.contiguous()?);
+    } else {
+        let qt = q.narrow(2, prefix_len, s - prefix_len)?.contiguous()?;
+        outputs.push(attention(&qt, &k.contiguous()?, &v.contiguous()?, None)?);
+    }
     Ok(Tensor::cat(&outputs, 2)?)
 }
 
@@ -509,6 +541,7 @@ impl Attention {
     /// `[B, heads, Sk, head_dim]` through [`block_causal_attention`], then the head merge and
     /// `to_out`. This is the crate's **only** route to an SDPA call and the only place the scores
     /// budget is supplied, so the cached decode cannot leave the budgeted path the prefill is on.
+    #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         q: &Tensor,
@@ -517,6 +550,7 @@ impl Attention {
         prefix_segments: &[(usize, usize, bool)],
         prefix_len: usize,
         ops: Ops,
+        perturb_target: bool,
     ) -> Result<Tensor> {
         let (b, _h, s, _d) = q.dims4()?;
         let (h, hd) = (self.heads, self.head_dim);
@@ -525,7 +559,7 @@ impl Attention {
             Ops::Fused => &softmax_last_dim,
             Ops::Composable => &softmax_f32,
         };
-        let o = block_causal_attention(
+        let o = block_causal_attention_pag(
             q,
             k,
             v,
@@ -535,6 +569,7 @@ impl Attention {
             softmax,
             candle_gen::ATTN_SCORES_BUDGET,
             ops == Ops::Composable,
+            perturb_target,
         )?;
         let o = o.transpose(1, 2)?.reshape((b, s, h * hd))?;
         Ok(self.to_out.forward(&o)?)
@@ -543,11 +578,9 @@ impl Attention {
     /// Block-causal attention over the joint sequence `x` `[B, S, inner]` — the prefill. With
     /// `capture`, the block's prefix `(k, v)` rows (exactly what the target's attention call
     /// consumes for those keys) are written to it as **owned, prefix-sized copies**
-    /// ([`owned_prefix_rows`]): upstream's `kv_cache_mode == "extract"`. The copies are taken here,
-    /// while the block's full K/V are alive anyway, and nothing else of this forward escapes it —
-    /// the full K/V are released when it returns, exactly as without a capture.
+    /// ([`owned_prefix_rows`]): upstream's `kv_cache_mode == "extract"`.
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    fn forward_with_pag(
         &self,
         x: &Tensor,
         cos: &Tensor,
@@ -556,6 +589,7 @@ impl Attention {
         prefix_len: usize,
         ops: Ops,
         capture: Option<&mut Option<(Tensor, Tensor)>>,
+        perturb_target: bool,
     ) -> Result<Tensor> {
         let (q, k, v) = self.project(x, cos, sin, ops)?;
         if let Some(capture) = capture {
@@ -564,16 +598,15 @@ impl Attention {
                 owned_prefix_rows(&v, prefix_len)?,
             ));
         }
-        self.attend(&q, &k, &v, prefix_segments, prefix_len, ops)
+        self.attend(&q, &k, &v, prefix_segments, prefix_len, ops, perturb_target)
     }
 
     /// The cached decode (`kv_cache_mode == "cached"`): `x` is the **target tokens only**
     /// `[B, T, inner]`, `cos`/`sin` their RoPE rows, and the target attends — unmasked, as the
     /// block-causal mask degenerates to for target rows — over `[cached prefix, target]` keys and
-    /// values. With no prefix segments and a zero prefix length, [`block_causal_attention`] makes
-    /// exactly its one target call: the same call, over the same keys, on the same budgeted path
-    /// as the prefill's.
-    fn forward_cached(
+    /// values (or skips attention and passes through `to_out(to_v(x))` when `perturb_target`).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_cached_with_pag(
         &self,
         x: &Tensor,
         cos: &Tensor,
@@ -581,13 +614,17 @@ impl Attention {
         cached_k: &Tensor,
         cached_v: &Tensor,
         ops: Ops,
+        perturb_target: bool,
     ) -> Result<Tensor> {
+        if perturb_target {
+            return Ok(self.to_out.forward(&self.to_v.forward(x)?)?);
+        }
         let (q, k, v) = self.project(x, cos, sin, ops)?;
         // The prefix is never empty: a layout without text does not get through the prefill
         // (`prelude`), so no cache can be extracted for one.
         let k = Tensor::cat(&[cached_k, &k], 2)?;
         let v = Tensor::cat(&[cached_v, &v], 2)?;
-        self.attend(&q, &k, &v, &[], 0, ops)
+        self.attend(&q, &k, &v, &[], 0, ops, false)
     }
 }
 
@@ -631,7 +668,8 @@ impl FeedForward {
 
 /// Optional per-stage capture for the parity tests: every named intermediate, cast to f32, in
 /// forward order. `None` costs nothing on the production path.
-struct Trace<'a>(Option<&'a mut Vec<(String, Tensor)>>);
+#[derive(Default)]
+pub(crate) struct Trace<'a>(Option<&'a mut Vec<(String, Tensor)>>);
 
 impl Trace<'_> {
     fn push(&mut self, name: impl Into<String>, value: &Tensor) -> Result<()> {
@@ -710,9 +748,24 @@ impl Block {
         ops: Ops,
         trace: &mut Trace<'_>,
     ) -> Result<Tensor> {
+        self.forward_with_pag(index, x, m, geometry, attention, ops, false, trace)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_pag(
+        &self,
+        index: usize,
+        x: &Tensor,
+        m: &Modulation,
+        geometry: &JointGeometry,
+        attention: BlockAttention<'_>,
+        ops: Ops,
+        perturb_target: bool,
+        trace: &mut Trace<'_>,
+    ) -> Result<Tensor> {
         let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
         let a = match attention {
-            BlockAttention::Prefill { capture } => self.attn.forward(
+            BlockAttention::Prefill { capture } => self.attn.forward_with_pag(
                 &h,
                 &geometry.cos,
                 &geometry.sin,
@@ -720,11 +773,17 @@ impl Block {
                 geometry.prefix_len,
                 ops,
                 capture,
+                perturb_target,
             )?,
-            BlockAttention::Cached { k, v } => {
-                self.attn
-                    .forward_cached(&h, &geometry.cos, &geometry.sin, k, v, ops)?
-            }
+            BlockAttention::Cached { k, v } => self.attn.forward_cached_with_pag(
+                &h,
+                &geometry.cos,
+                &geometry.sin,
+                k,
+                v,
+                ops,
+                perturb_target,
+            )?,
         };
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = (x + m.gate1.tanh()?.broadcast_mul(&a)?)?;
@@ -988,6 +1047,10 @@ impl QwenImage21Transformer {
         &self.cfg
     }
 
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// The device the weights live on.
     pub fn device(&self) -> &Device {
         &self.device
@@ -1091,15 +1154,50 @@ impl QwenImage21Transformer {
         timestep: f32,
         layout: &JointLayout,
         ops: Ops,
+        trace: Trace<'_>,
+    ) -> Result<Tensor> {
+        self.run_joint_pag(text, images, timestep, layout, ops, None, trace)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_joint_pag(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+        ops: Ops,
+        pag_perturb: Option<&[bool]>,
         mut trace: Trace<'_>,
     ) -> Result<Tensor> {
+        if let Some(mask) = pag_perturb {
+            if mask.len() != self.blocks.len() {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1 PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    self.blocks.len()
+                )));
+            }
+        }
         let prelude = self.prelude(text, images, timestep, layout, &mut trace)?;
         let geometry = &prelude.geometry;
         let m = geometry.modulation(&prelude.modulation)?;
         let out_scale = geometry.select(&prelude.out_rows, 0)?;
         let mut x = prelude.x.clone();
         for (index, block) in self.blocks.iter().enumerate() {
-            x = block.forward(index, &x, &m, geometry, ops, &mut trace)?;
+            let perturb = pag_perturb
+                .and_then(|mask| mask.get(index).copied())
+                .unwrap_or(false);
+            x = block.forward_with_pag(
+                index,
+                &x,
+                &m,
+                geometry,
+                BlockAttention::Prefill { capture: None },
+                ops,
+                perturb,
+                &mut trace,
+            )?;
         }
         self.head(&x, &out_scale, geometry, &mut trace)
     }
@@ -1346,6 +1444,16 @@ impl QwenImage21Transformer {
         self.run_joint_cached(target, timestep, cache, Trace(None))
     }
 
+    pub(crate) fn cached_counted_pag(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+        pag_perturb: Option<&[bool]>,
+    ) -> Result<(Tensor, usize)> {
+        self.run_joint_cached_pag(target, timestep, cache, pag_perturb, Trace(None))
+    }
+
     /// The typed refusal upstream raises for `kv_cache` without `causal_condition`.
     fn require_causal_condition(&self) -> Result<()> {
         if self.cfg.causal_condition {
@@ -1417,9 +1525,29 @@ impl QwenImage21Transformer {
         target: &Tensor,
         timestep: f32,
         cache: &PrefixKvCache,
+        trace: Trace<'_>,
+    ) -> Result<(Tensor, usize)> {
+        self.run_joint_cached_pag(target, timestep, cache, None, trace)
+    }
+
+    fn run_joint_cached_pag(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+        pag_perturb: Option<&[bool]>,
         mut trace: Trace<'_>,
     ) -> Result<(Tensor, usize)> {
         self.require_causal_condition()?;
+        if let Some(mask) = pag_perturb {
+            if mask.len() != self.blocks.len() {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1 PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    self.blocks.len()
+                )));
+            }
+        }
         if cache.layers.len() != self.blocks.len() {
             return Err(Error::Msg(format!(
                 "qwen_image_2_1: a {}-block prefix KV cache was given to a {}-block DiT",
@@ -1444,13 +1572,17 @@ impl QwenImage21Transformer {
         let out_scale = geometry.select(&out_rows, 0)?;
         let mut x = x;
         for (index, (block, (k, v))) in self.blocks.iter().zip(&cache.layers).enumerate() {
-            x = block.forward_with(
+            let perturb = pag_perturb
+                .and_then(|mask| mask.get(index).copied())
+                .unwrap_or(false);
+            x = block.forward_with_pag(
                 index,
                 &x,
                 &m,
                 &geometry,
                 BlockAttention::Cached { k, v },
                 Ops::Fused,
+                perturb,
                 &mut trace,
             )?;
         }
@@ -1657,11 +1789,6 @@ impl QwenImage21Transformer {
                 .iter()
                 .map(|(_, cos, sin)| (cos.elem_count() + sin.elem_count()) * 4)
                 .sum::<usize>()
-    }
-
-    /// Number of transformer blocks.
-    pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
     }
 
     /// The **training** text-to-image forward: [`Self::forward`] with the attention core on its
@@ -2680,5 +2807,85 @@ mod tests {
         // token sits at 4 and the target block freezes its frame axis at 5.
         assert_eq!(ids[6], [4, 4, 4]);
         assert_eq!(ids[7], [5, -1, -1]);
+    }
+
+    #[test]
+    fn block_causal_attention_pag_preserves_prefix_and_uses_v_for_target() {
+        let layout = JointLayout {
+            segments: vec![
+                Segment::Text { len: 3 },
+                Segment::Image {
+                    height: 2,
+                    width: 2,
+                },
+                Segment::Image {
+                    height: 2,
+                    width: 3,
+                },
+            ],
+        };
+        let (s, heads, hd) = (layout.total_len(), 2usize, 4usize);
+        let (prefix, target) = (layout.prefix_len(), layout.target_tokens());
+        let dev = Device::Cpu;
+        let mk = |seed: usize| {
+            let n = heads * s * hd;
+            let vals: Vec<f32> = (0..n)
+                .map(|i| (((i * 29 + seed * 13) % 83) as f32 / 83.0) - 0.5)
+                .collect();
+            Tensor::from_vec(vals, (1, heads, s, hd), &dev).unwrap()
+        };
+        let (q, k, v) = (mk(0), mk(1), mk(2));
+        let scale = (hd as f64).powf(-0.5);
+        let unperturbed = block_causal_attention_pag(
+            &q,
+            &k,
+            &v,
+            scale,
+            &layout.prefix_segments(),
+            prefix,
+            &candle_nn::ops::softmax_last_dim,
+            usize::MAX,
+            false,
+            false,
+        )
+        .unwrap();
+        let perturbed = block_causal_attention_pag(
+            &q,
+            &k,
+            &v,
+            scale,
+            &layout.prefix_segments(),
+            prefix,
+            &candle_nn::ops::softmax_last_dim,
+            usize::MAX,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(perturbed.dims(), unperturbed.dims());
+
+        // Prefix [0..prefix] (Text + RefImage) must stay identical.
+        let p_diff = (&perturbed.narrow(2, 0, prefix).unwrap()
+            - &unperturbed.narrow(2, 0, prefix).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(p_diff, 0.0, "prefix rows must be preserved under PAG");
+
+        // Target [prefix..] must equal raw V_target.
+        let t_diff = (&perturbed.narrow(2, prefix, target).unwrap()
+            - &v.narrow(2, prefix, target).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(t_diff, 0.0, "target rows must equal V_target under PAG");
     }
 }

@@ -276,7 +276,8 @@ impl Attention {
     /// `capture`, the block's prefix `(k, v)` rows (`[B, prefix_len, heads, head_dim]`, exactly what
     /// the target's attention call below consumes for those keys) are pushed onto it: upstream's
     /// `kv_cache_mode == "extract"`. Capturing adds two slices and changes nothing else.
-    fn forward(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_pag(
         &self,
         x: &Array,
         cos: &Array,
@@ -284,6 +285,7 @@ impl Attention {
         prefix_segments: &[(usize, usize, bool)],
         prefix_len: usize,
         capture: Option<&mut Vec<(Array, Array)>>,
+        perturb_target: bool,
     ) -> Result<Array> {
         let shape = x.shape().to_vec();
         let (b, s) = (shape[0], shape[1]);
@@ -315,10 +317,14 @@ impl Attention {
             )?);
         }
         let prefix_len = prefix_len as i32;
-        let qt = q.index((.., .., prefix_len..s, ..));
-        outputs.push(scaled_dot_product_attention(
-            &qt, &k, &v, scale, None, None,
-        )?);
+        if perturb_target {
+            outputs.push(v.index((.., .., prefix_len..s, ..)));
+        } else {
+            let qt = q.index((.., .., prefix_len..s, ..));
+            outputs.push(scaled_dot_product_attention(
+                &qt, &k, &v, scale, None, None,
+            )?);
+        }
         let refs: Vec<&Array> = outputs.iter().collect();
         self.merge(&concatenate_axis(&refs, 2)?, b, s)
     }
@@ -326,15 +332,22 @@ impl Attention {
     /// The cached decode (`kv_cache_mode == "cached"`): `x` is the **target tokens only**
     /// `[B, T, inner]`, `cos`/`sin` their RoPE rows, and the target attends — unmasked, as the
     /// block-causal mask degenerates to for target rows — over `[cached prefix, target]` keys and
-    /// values. The same single attention call the prefill makes for the target, over the same keys.
-    fn forward_cached(
+    /// values (or bypasses SDPA/cache to `to_out(to_v(x))` when `perturb_target`).
+    fn forward_cached_with_pag(
         &self,
         x: &Array,
         cos: &Array,
         sin: &Array,
         cached_k: &Array,
         cached_v: &Array,
+        perturb_target: bool,
     ) -> Result<Array> {
+        if perturb_target {
+            // In cached mode every token in `x` belongs to `TargetImage`, so identity
+            // self-attention perturbation bypasses `to_q`/`to_k`/SDPA and cached prefix K/V
+            // completely and projects `to_out(to_v(x))`.
+            return self.to_out.forward(&self.to_v.forward(x)?);
+        }
         let shape = x.shape().to_vec();
         let (b, s) = (shape[0], shape[1]);
         let (q, k, v) = self.project(x, cos, sin)?;
@@ -521,6 +534,21 @@ impl Block {
         attention: BlockAttention<'_>,
         trace: &mut Trace<'_>,
     ) -> Result<Array> {
+        self.forward_with_pag(index, x, m, cos, sin, attention, false, trace)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_pag(
+        &self,
+        index: usize,
+        x: &Array,
+        m: &Modulation,
+        cos: &Array,
+        sin: &Array,
+        attention: BlockAttention<'_>,
+        perturb_target: bool,
+        trace: &mut Trace<'_>,
+    ) -> Result<Array> {
         let h = scale_residual(&layer_norm(x, None, None, self.eps)?, &m.scale1)?;
         #[cfg(test)]
         if index == 0 && crate::q4_diagnostic::capture_enabled() {
@@ -531,10 +559,19 @@ impl Block {
                 prefix_segments,
                 prefix_len,
                 capture,
-            } => self
-                .attn
-                .forward(&h, cos, sin, prefix_segments, prefix_len, capture)?,
-            BlockAttention::Cached { k, v } => self.attn.forward_cached(&h, cos, sin, k, v)?,
+            } => self.attn.forward_with_pag(
+                &h,
+                cos,
+                sin,
+                prefix_segments,
+                prefix_len,
+                capture,
+                perturb_target,
+            )?,
+            BlockAttention::Cached { k, v } => {
+                self.attn
+                    .forward_cached_with_pag(&h, cos, sin, k, v, perturb_target)?
+            }
         };
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = add(x, &multiply(&tanh(&m.gate1)?, &a)?)?;
@@ -1034,19 +1071,47 @@ impl QwenImage21Transformer {
         images: &[&Array],
         timestep: f32,
         layout: &JointLayout,
+        trace: Trace<'_>,
+    ) -> Result<Array> {
+        self.run_joint_pag(text, images, timestep, layout, None, trace)
+    }
+
+    pub(crate) fn run_joint_pag(
+        &self,
+        text: &Array,
+        images: &[&Array],
+        timestep: f32,
+        layout: &JointLayout,
+        pag_perturb: Option<&[bool]>,
         mut trace: Trace<'_>,
     ) -> Result<Array> {
+        if let Some(mask) = pag_perturb {
+            if mask.len() != self.blocks.len() {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1 PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    self.blocks.len()
+                )));
+            }
+        }
         let j = self.embed_joint(text, images, timestep, layout, &mut trace)?;
         let mut x = j.x.clone();
         for (index, block) in self.blocks.iter().enumerate() {
-            x = block.forward(
+            let perturb = pag_perturb
+                .and_then(|mask| mask.get(index).copied())
+                .unwrap_or(false);
+            x = block.forward_with_pag(
                 index,
                 &x,
                 &j.m,
                 &j.cos,
                 &j.sin,
-                &j.prefix_segments,
-                j.prefix_len,
+                BlockAttention::Prefill {
+                    prefix_segments: &j.prefix_segments,
+                    prefix_len: j.prefix_len,
+                    capture: None,
+                },
+                perturb,
                 &mut trace,
             )?;
         }
@@ -1335,11 +1400,33 @@ impl QwenImage21Transformer {
         target: &Array,
         timestep: f32,
         cache: &PrefixKvCache,
+        trace: Trace<'_>,
+    ) -> Result<(Array, usize)> {
+        self.run_joint_cached_pag(target, timestep, cache, None, trace)
+    }
+
+    /// [`Self::run_joint_cached`] with optional per-block PAG perturbation, reading `cache`
+    /// strictly read-only.
+    pub(crate) fn run_joint_cached_pag(
+        &self,
+        target: &Array,
+        timestep: f32,
+        cache: &PrefixKvCache,
+        pag_perturb: Option<&[bool]>,
         mut trace: Trace<'_>,
     ) -> Result<(Array, usize)> {
         #[cfg(test)]
         crate::q4_diagnostic::assert_owner();
         self.require_causal_condition()?;
+        if let Some(mask) = pag_perturb {
+            if mask.len() != self.blocks.len() {
+                return Err(Error::Msg(format!(
+                    "qwen_image_2_1 PAG: perturb mask length {} does not match {} blocks",
+                    mask.len(),
+                    self.blocks.len()
+                )));
+            }
+        }
         if cache.layers.len() != self.blocks.len() {
             return Err(Error::Msg(format!(
                 "qwen_image_2_1: a {}-block prefix KV cache was given to a {}-block DiT",
@@ -1386,13 +1473,17 @@ impl QwenImage21Transformer {
         };
         let mut x = j.x.clone();
         for (index, (block, (k, v))) in self.blocks.iter().zip(&cache.layers).enumerate() {
-            x = block.forward_with(
+            let perturb = pag_perturb
+                .and_then(|mask| mask.get(index).copied())
+                .unwrap_or(false);
+            x = block.forward_with_pag(
                 index,
                 &x,
                 &j.m,
                 &j.cos,
                 &j.sin,
                 BlockAttention::Cached { k, v },
+                perturb,
                 &mut trace,
             )?;
         }

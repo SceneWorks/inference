@@ -4,5 +4,6 @@
 //! its own `config` / `scheduler` / `reference` paths.
 
 pub mod config;
+pub mod pag;
 pub mod reference;
 pub mod scheduler;
