@@ -6438,7 +6438,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
-          version: '0.12.3'
+          version: "0.12.3"
           enable-cache: false
       - name: Install reviewed CPython 3.12 on Windows
         shell: cmd
@@ -6447,7 +6447,7 @@ jobs:
         shell: cmd
         env:
           SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-report-${{ github.run_id }}-${{ github.run_attempt }}
-        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd reference
+        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows-reference.cmd
       - name: Retain bounded reference evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -6562,7 +6562,7 @@ jobs:
         env:
           SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-input-${{ github.run_id }}-${{ github.run_attempt }}
           SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
-        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd native
+        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows-native.cmd
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -6612,7 +6612,7 @@ jobs:
           SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
           SENSENOVA_PUBLICATION_REPORT: ${{ runner.temp }}/sensenova-publication-report-${{ github.run_id }}-${{ github.run_attempt }}
           HF_HUB_OFFLINE: '0'
-        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd publish
+        run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows-publish.cmd
       - name: Upload verified SenseNova publication receipt
         if: matrix.asset_setup == 'sensenova-loop' && fromJSON(needs.model-proof-plan.outputs.request).sensenova_publish == true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

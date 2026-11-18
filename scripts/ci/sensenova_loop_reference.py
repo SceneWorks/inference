@@ -202,6 +202,8 @@ def main(snapshot: Path, inventory_sha: str, output: Path, expected_uuid: str, c
     from PIL import Image, __version__ as pillow_version
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
+    if sys.version_info[:3] != (3, 12, 10):
+        raise RuntimeError("reference interpreter is not the reviewed CPython 3.12.10")
     if transformers.__version__ != "5.18.0" or torch.__version__ != "2.11.0+cu130":
         raise RuntimeError("official Transformers/PyTorch reference toolchain mismatch")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1 or not torch.cuda.is_bf16_supported():
