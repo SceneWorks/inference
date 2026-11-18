@@ -77,7 +77,45 @@ fn frozen_cfg_euler_is_fp32_and_rejects_narrowed_accumulator() {
                 };
         assert_eq!(output.dtype(), DType::F32);
         assert!((tensor_f32(&output).unwrap()[0] - expected).abs() <= 1e-7);
+        let zero_pag = cfg_pag_euler_step(
+            &current,
+            &conditional,
+            if cfg == 1. { None } else { Some(&negative) },
+            Some(&negative),
+            cfg,
+            0.0,
+            -0.137,
+        )
+        .unwrap();
+        assert_eq!(tensor_f32(&zero_pag).unwrap(), tensor_f32(&output).unwrap());
     }
+    let perturbed = Tensor::new(&[0.25f32], &Device::Cpu).unwrap();
+    let pag_no_cfg = cfg_pag_euler_step(
+        &current,
+        &conditional,
+        None,
+        Some(&perturbed),
+        1.0,
+        2.5,
+        -0.137,
+    )
+    .unwrap();
+    let expected_no_cfg = 0.1234567f32 - 0.137 * (0.6789123 + 2.5 * (0.6789123 - 0.25));
+    assert!((tensor_f32(&pag_no_cfg).unwrap()[0] - expected_no_cfg).abs() <= 1e-6);
+
+    let pag_with_cfg = cfg_pag_euler_step(
+        &current,
+        &conditional,
+        Some(&negative),
+        Some(&perturbed),
+        4.0,
+        1.5,
+        -0.137,
+    )
+    .unwrap();
+    let expected_with_cfg = 0.1234567f32
+        - 0.137 * ((-0.2345678 + 4.0 * (0.6789123 + 0.2345678)) + 1.5 * (0.6789123 - 0.25));
+    assert!((tensor_f32(&pag_with_cfg).unwrap()[0] - expected_with_cfg).abs() <= 1e-6);
 }
 #[test]
 fn edit_peak_prices_reference_context_and_refuses_before_assets() {

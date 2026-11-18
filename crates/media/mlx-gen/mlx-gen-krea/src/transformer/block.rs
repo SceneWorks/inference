@@ -9,7 +9,7 @@
 
 use mlx_rs::error::Result as MlxResult;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, multiply, sigmoid, split};
+use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
@@ -174,6 +174,23 @@ impl GatedAttention {
         rope: Option<(&Array, &Array)>,
         attention: AttentionPlan<'_>,
     ) -> Result<Array> {
+        self.forward_budgeted_with_pag(x, rope, attention, None)
+    }
+
+    /// Inference forward with optional Perturbed-Attention Guidance (PAG, SW-7176).
+    ///
+    /// When `perturb_after_prefix` is `Some(prefix_len)`, prefix tokens `0..prefix_len` (`[ctx]` in
+    /// T2I/img2img or `[ctx ; ref_latents…]` in Kontext edit) execute normal GQA attention over the
+    /// full `[0..s]` key/value sequence, while target image tokens `prefix_len..s` replace their
+    /// self-attention output with their own GQA-expanded value vectors `V_target` prior to
+    /// `sigmoid(to_gate)` and `to_out`. When `None`, executes the unperturbed baseline unchanged.
+    pub fn forward_budgeted_with_pag(
+        &self,
+        x: &Array,
+        rope: Option<(&Array, &Array)>,
+        attention: AttentionPlan<'_>,
+        perturb_after_prefix: Option<i32>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let q = self
@@ -210,7 +227,9 @@ impl GatedAttention {
         // SDPA — optionally inside an `mlx::checkpoint` segment (training memory hardening): the
         // backward recomputes the attention rather than retaining the seq² probability matrix.
         // Numerically identical to the retained path; off in inference.
-        let o = if self.sdpa_checkpoint {
+        let o = if let Some(prefix_len) = perturb_after_prefix {
+            pag_attention_bhsd(&q, &k, &v, self.scale, prefix_len, attention)?
+        } else if self.sdpa_checkpoint {
             let scale = self.scale;
             let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
                 Ok(vec![scaled_dot_product_attention(
@@ -434,6 +453,37 @@ pub struct SingleStreamBlock {
     mlp: SwiGlu,
 }
 
+/// Perturbed-Attention Guidance (PAG) over already GQA-expanded `[b, heads, s, hd]` tensors (SW-7176).
+///
+/// Prefix queries `0..prefix_len` (`[ctx]` or `[ctx ; ref_latents…]`) run full unperturbed SDPA
+/// against all keys and values `0..s`; target image tokens `prefix_len..s` bypass `softmax(Q Kᵀ)`
+/// and receive identity self-attention `V_target = v[:, :, prefix_len.., :]`.
+pub(crate) fn pag_attention_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    prefix_len: i32,
+    attention: AttentionPlan<'_>,
+) -> Result<Array> {
+    let s = q.shape()[2];
+    if prefix_len < 0 || prefix_len >= s {
+        return Err(mlx_gen::Error::Msg(format!(
+            "krea PAG: prefix_len {prefix_len} out of bounds for sequence length {s} (target slice must be non-empty)"
+        )));
+    }
+    if prefix_len == 0 {
+        if attention.is_cancelled() {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        return Ok(v.clone());
+    }
+    let q_prefix = q.split_axis(&[prefix_len], 2)?.swap_remove(0);
+    let v_target = v.split_axis(&[prefix_len], 2)?.swap_remove(1);
+    let o_prefix = sdpa_budgeted_bhsd(&q_prefix, k, v, scale, None, attention)?;
+    Ok(concatenate_axis(&[&o_prefix, &v_target], 2)?)
+}
+
 impl SingleStreamBlock {
     pub fn from_weights(
         w: &Weights,
@@ -479,6 +529,18 @@ impl SingleStreamBlock {
         sin: &Array,
         attention: AttentionPlan<'_>,
     ) -> Result<Array> {
+        self.forward_budgeted_with_pag(x, tvec, cos, sin, attention, None)
+    }
+
+    pub(crate) fn forward_budgeted_with_pag(
+        &self,
+        x: &Array,
+        tvec: &Array,
+        cos: &Array,
+        sin: &Array,
+        attention: AttentionPlan<'_>,
+        perturb_after_prefix: Option<i32>,
+    ) -> Result<Array> {
         let m = add(tvec, &self.scale_shift_table)?; // [b, 1, 6·hidden]
         let m = split(&m, 6, 2)?; // 6 × [b, 1, hidden]
         let (prescale, preshift, pregate) = (&m[0], &m[1], &m[2]);
@@ -488,9 +550,12 @@ impl SingleStreamBlock {
             &multiply(&self.prenorm.forward(x)?, &plus1(prescale)?)?,
             preshift,
         )?;
-        let attn = self
-            .attn
-            .forward_budgeted(&pre, Some((cos, sin)), attention)?;
+        let attn = self.attn.forward_budgeted_with_pag(
+            &pre,
+            Some((cos, sin)),
+            attention,
+            perturb_after_prefix,
+        )?;
         let x = add(x, &multiply(pregate, &attn)?)?;
 
         let post = add(
@@ -793,5 +858,159 @@ mod tests {
 
         // Missing both → the canonical MissingTensor error on the raw key (not a silent `_p1` miss).
         assert!(RmsScale::from_weights(&Weights::empty(), "n.weight", 1e-5).is_err());
+    }
+
+    #[test]
+    fn pag_attention_preserves_prefix_and_refs_while_replacing_target_with_expanded_v() {
+        // Krea 2's exact 48Q / 12KV GQA ratio (groups = 4). Test T2I (prefix = ctx) and 1–2 ref
+        // Kontext edit (prefix = ctx + n_refs * img_len).
+        let (b, nh, nkv, hd) = (1i32, 48i32, 12i32, 4i32);
+        let groups = nh / nkv;
+        let cap_len = 3i32;
+        let img_len = 4i32;
+        for n_refs in [0i32, 1, 2] {
+            let prefix_len = cap_len + n_refs * img_len;
+            let s = prefix_len + img_len;
+            let q_vals: Vec<f32> = (0..(b * s * nh * hd))
+                .map(|i| ((i * 13 + 7) % 97) as f32 * 0.03 - 1.4)
+                .collect();
+            let k_vals: Vec<f32> = (0..(b * s * nkv * hd))
+                .map(|i| ((i * 17 + 3) % 89) as f32 * 0.025 - 1.1)
+                .collect();
+            // Tag each (token t, kv_head g, dim d) distinctly so head-group ordering is exact.
+            let mut v_vals = Vec::with_capacity((b * s * nkv * hd) as usize);
+            for t in 0..s {
+                for g in 0..nkv {
+                    for d in 0..hd {
+                        v_vals.push(100.0 * (t as f32) + 1.0 * (g as f32) + 0.1 * (d as f32));
+                    }
+                }
+            }
+            let q = Array::from_slice(&q_vals, &[b, s, nh, hd])
+                .transpose_axes(&[0, 2, 1, 3])
+                .unwrap();
+            let k = repeat_kv(&Array::from_slice(&k_vals, &[b, s, nkv, hd]), groups)
+                .unwrap()
+                .transpose_axes(&[0, 2, 1, 3])
+                .unwrap();
+            let v = repeat_kv(&Array::from_slice(&v_vals, &[b, s, nkv, hd]), groups)
+                .unwrap()
+                .transpose_axes(&[0, 2, 1, 3])
+                .unwrap();
+
+            let full = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, None, AttentionPlan::UNBOUNDED).unwrap();
+            let perturbed =
+                pag_attention_bhsd(&q, &k, &v, 0.5, prefix_len, AttentionPlan::UNBOUNDED).unwrap();
+
+            // Also exercise under query-row chunking (`AttentionPlan::budgeted`).
+            let bounded = AttentionPlan::budgeted(
+                mlx_gen::attention::AttentionBudget::from_score_elements((nh * s) as u64, false),
+            );
+            let perturbed_chunked =
+                pag_attention_bhsd(&q, &k, &v, 0.5, prefix_len, bounded).unwrap();
+
+            // Scramble Q_target and verify perturbed output is invariant to Q_target!
+            let q_prefix = q.split_axis(&[prefix_len], 2).unwrap().swap_remove(0);
+            let q_target_alt = Array::from_slice(
+                &vec![99.0f32; (b * nh * img_len * hd) as usize],
+                &[b, nh, img_len, hd],
+            );
+            let q_alt = concatenate_axis(&[&q_prefix, &q_target_alt], 2).unwrap();
+            let perturbed_alt =
+                pag_attention_bhsd(&q_alt, &k, &v, 0.5, prefix_len, AttentionPlan::UNBOUNDED)
+                    .unwrap();
+
+            // `split_axis` / `transpose_axes` produce strided views; MLX's `as_slice` reads linear
+            // storage ignoring strides, so materialize contiguous row-major buffers before slicing.
+            let full_prefix = full
+                .split_axis(&[prefix_len], 2)
+                .unwrap()
+                .swap_remove(0)
+                .reshape(&[-1])
+                .unwrap();
+            let pert_parts = perturbed.split_axis(&[prefix_len], 2).unwrap();
+            let pert_prefix = pert_parts[0].reshape(&[-1]).unwrap();
+            let pert_target = pert_parts[1].reshape(&[-1]).unwrap();
+            let expected_v_target = v
+                .split_axis(&[prefix_len], 2)
+                .unwrap()
+                .swap_remove(1)
+                .reshape(&[-1])
+                .unwrap();
+            let pert_flat = perturbed.reshape(&[-1]).unwrap();
+            let pert_alt_flat = perturbed_alt.reshape(&[-1]).unwrap();
+            let pert_chunked_flat = perturbed_chunked.reshape(&[-1]).unwrap();
+            let target_bshd = pert_parts[1]
+                .transpose_axes(&[0, 2, 1, 3])
+                .unwrap()
+                .reshape(&[-1])
+                .unwrap();
+            mlx_rs::transforms::eval([
+                &full_prefix,
+                &pert_prefix,
+                &pert_target,
+                &expected_v_target,
+                &pert_flat,
+                &pert_alt_flat,
+                &pert_chunked_flat,
+                &target_bshd,
+            ])
+            .unwrap();
+
+            // 1) Prefix ([ctx] and [ref_latents...]) matches unperturbed SDPA.
+            for (got, want) in pert_prefix
+                .as_slice::<f32>()
+                .iter()
+                .zip(full_prefix.as_slice::<f32>())
+            {
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "n_refs={n_refs}: prefix mismatch {got} != {want}"
+                );
+            }
+            let peak = pert_flat
+                .as_slice::<f32>()
+                .iter()
+                .fold(0f32, |m, &x| m.max(x.abs()))
+                .max(1e-6);
+            for (got, want) in pert_chunked_flat
+                .as_slice::<f32>()
+                .iter()
+                .zip(pert_flat.as_slice::<f32>())
+            {
+                assert!(
+                    (got - want).abs() / peak < 1e-3,
+                    "n_refs={n_refs}: chunked mismatch {got} != {want} (peak={peak})"
+                );
+            }
+            // 2) Target tokens equal expanded V_target bit-for-bit, with head h reading kv head h/4.
+            assert_eq!(
+                pert_target.as_slice::<f32>(),
+                expected_v_target.as_slice::<f32>()
+            );
+            assert_eq!(pert_flat.as_slice::<f32>(), pert_alt_flat.as_slice::<f32>());
+            let target_slice = target_bshd.as_slice::<f32>();
+            for t_rel in 0..img_len {
+                let t_abs = prefix_len + t_rel;
+                for h in 0..nh {
+                    let expected_kv_head = h / groups;
+                    for d in 0..hd {
+                        let idx = ((t_rel * nh + h) * hd + d) as usize;
+                        let want = 100.0 * (t_abs as f32)
+                            + 1.0 * (expected_kv_head as f32)
+                            + 0.1 * (d as f32);
+                        assert!(
+                            (target_slice[idx] - want).abs() < 1e-5,
+                            "head {h} must read kv head {expected_kv_head}: got {}, want {want}",
+                            target_slice[idx]
+                        );
+                    }
+                }
+            }
+
+            // Out-of-bounds prefix_len >= s must error cleanly.
+            assert!(pag_attention_bhsd(&q, &k, &v, 0.5, s, AttentionPlan::UNBOUNDED).is_err());
+            assert!(pag_attention_bhsd(&q, &k, &v, 0.5, -1, AttentionPlan::UNBOUNDED).is_err());
+        }
     }
 }

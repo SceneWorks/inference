@@ -202,13 +202,14 @@ impl ZImageAttention {
         Ok(())
     }
 
-    pub fn forward_with_attention_plan(
+    pub(crate) fn forward_with_attention_plan_and_pag(
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag_x_len: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
@@ -261,15 +262,17 @@ impl ZImageAttention {
             }
             None => None,
         };
-        let context = candle_gen::fused_attention::training_sdpa_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            mask.as_ref(),
-            |s| candle_nn::ops::softmax(s, D::Minus1),
-            attention_plan,
-        )?;
+        let context = crate::common::apply_attention_with_pag(&q, &k, &v, pag_x_len, |q, k, v| {
+            candle_gen::fused_attention::training_sdpa_bhsd(
+                q,
+                k,
+                v,
+                scale,
+                mask.as_ref(),
+                |s| candle_nn::ops::softmax(s, D::Minus1),
+                attention_plan,
+            )
+        })?;
 
         // (B, n, seq, hd) -> (B, seq, dim)
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
@@ -395,6 +398,28 @@ impl ZImageTransformerBlock {
         adaln_input: Option<&Tensor>,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_attention_plan_and_pag(
+            x,
+            attn_mask,
+            cos,
+            sin,
+            adaln_input,
+            attention_plan,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_attention_plan_and_pag(
+        &self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln_input: Option<&Tensor>,
+        attention_plan: AttentionPlan<'_>,
+        pag_x_len: Option<usize>,
+    ) -> candle_gen::Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
             let modulation = adaln_input.apply(adaln)?.unsqueeze(1)?;
@@ -410,12 +435,13 @@ impl ZImageTransformerBlock {
             // Attention block
             let normed = rms_diff(&self.attention_norm1, x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward_with_attention_plan(
+            let attn_out = self.attention.forward_with_attention_plan_and_pag(
                 &scaled,
                 attn_mask,
                 cos,
                 sin,
                 attention_plan,
+                pag_x_len,
             )?;
             let attn_out = rms_diff(&self.attention_norm2, &attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
@@ -428,12 +454,13 @@ impl ZImageTransformerBlock {
             Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
             let normed = rms_diff(&self.attention_norm1, x)?;
-            let attn_out = self.attention.forward_with_attention_plan(
+            let attn_out = self.attention.forward_with_attention_plan_and_pag(
                 &normed,
                 attn_mask,
                 cos,
                 sin,
                 attention_plan,
+                pag_x_len,
             )?;
             let attn_out = rms_diff(&self.attention_norm2, &attn_out)?;
             let x = (x + attn_out)?;
@@ -766,11 +793,22 @@ impl ZImageTransformer2DModel {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn forward_prepared(
         &self,
         x: &Tensor,
         t: &Tensor,
         prepared: &PreparedConditioning,
+    ) -> Result<Tensor> {
+        self.forward_prepared_with_pag(x, t, prepared, None)
+    }
+
+    pub(crate) fn forward_prepared_with_pag(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedConditioning,
+        pag: Option<crate::common::PagStepContext<'_>>,
     ) -> Result<Tensor> {
         let geometry = x.dims5()?;
         if geometry != prepared.geometry
@@ -795,14 +833,17 @@ impl ZImageTransformer2DModel {
             )?;
         }
         let mut unified = Tensor::cat(&[&x, &prepared.cap], 1)?;
-        for layer in &self.layers {
-            unified = layer.forward(
+        for (i, layer) in self.layers.iter().enumerate() {
+            let pag_x_len = pag.and_then(|ctx| ctx.layer_x_len(i, prepared.img_seq_len));
+            unified = into_candle_core(layer.forward_with_attention_plan_and_pag(
                 &unified,
                 Some(&prepared.unified_attn_mask),
                 &prepared.unified_cos,
                 &prepared.unified_sin,
                 Some(&adaln_input),
-            )?;
+                default_attention_plan(),
+                pag_x_len,
+            ))?;
         }
         let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
         let x_out = __model_proof_output!(self.final_layer.forward(&x_out, &adaln_input))?;

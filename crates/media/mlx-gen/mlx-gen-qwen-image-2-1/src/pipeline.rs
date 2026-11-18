@@ -10,7 +10,9 @@
 //! it ([`KvCacheMode`], sc-25903): the first model evaluation of each prompt branch prefills that
 //! branch's [`PrefixKvCache`], every later one decodes the target tokens against it.
 
+use gen_core_family::qwen_image_2_1::pag::{pag_perturb_block_flags, pag_step_index_for_sigma};
 use mlx_gen::gen_core::sampling::TimestepConvention;
+use mlx_gen::gen_core::PagResolved;
 use mlx_gen::image::{decoded_to_image, decoded_to_rgba_image};
 use mlx_gen::sampler::{run_flow_sampler, SamplerRun};
 use mlx_gen::tiling::TilingConfig;
@@ -356,6 +358,9 @@ pub struct DenoiseReport {
     /// Every transformer forward, in order. A solver that evaluates the model more than once per
     /// step contributes one entry per evaluation and branch.
     pub evaluations: Vec<ModelEvaluation>,
+    /// Perturbed PAG forward passes, recorded separately so `evaluations` retains its exact
+    /// unperturbed `Positive`/`Negative` branch count while proving read-only `Cached` reuse.
+    pub perturbed_evaluations: Vec<ModelEvaluation>,
 }
 
 /// Everything one denoise run needs.
@@ -462,6 +467,78 @@ impl BranchRun<'_> {
         });
         Ok(velocity)
     }
+
+    /// Perturbed PAG evaluation of this branch at `sigma`.
+    ///
+    /// When `cached == true`, `self.evaluate` has already run on this step and populated
+    /// `self.cache`, so the perturbed pass reuses `&PrefixKvCache` strictly read-only without
+    /// recomputing the prefix or mutating the cache.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_perturbed(
+        &self,
+        transformer: &QwenImage21Transformer,
+        cached: bool,
+        latents: &Array,
+        sigma: f32,
+        grid: (usize, usize),
+        perturb_blocks: &[bool],
+        report: &mut DenoiseReport,
+    ) -> Result<Array> {
+        let (h, w) = grid;
+        let (velocity, path, block_tokens) = if !cached {
+            match self.conditioned {
+                Some((reference_latents, layout)) => (
+                    transformer.run_joint_pag(
+                        self.text,
+                        &joint_images(reference_latents, latents),
+                        sigma,
+                        layout,
+                        Some(perturb_blocks),
+                        Trace::none(),
+                    )?,
+                    EvaluationPath::Prefill,
+                    layout.total_len(),
+                ),
+                None => {
+                    let layout = JointLayout::text_to_image(self.text.shape()[1] as usize, h, w);
+                    let total = layout.total_len();
+                    (
+                        transformer.run_joint_pag(
+                            self.text,
+                            &[latents],
+                            sigma,
+                            &layout,
+                            Some(perturb_blocks),
+                            Trace::none(),
+                        )?,
+                        EvaluationPath::Prefill,
+                        total,
+                    )
+                }
+            }
+        } else {
+            let cache = self.cache.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "qwen_image_2_1 PAG: cached perturbed pass requires an extracted PrefixKvCache"
+                        .into(),
+                )
+            })?;
+            let (velocity, block_tokens) = transformer.run_joint_cached_pag(
+                latents,
+                sigma,
+                cache,
+                Some(perturb_blocks),
+                Trace::none(),
+            )?;
+            (velocity, EvaluationPath::Cached, block_tokens)
+        };
+        report.perturbed_evaluations.push(ModelEvaluation {
+            branch: self.kind,
+            path,
+            block_tokens,
+        });
+        Ok(velocity)
+    }
 }
 
 /// The denoise loop: with a negative branch each model evaluation applies `neg + s·(pos − neg)`.
@@ -491,11 +568,29 @@ pub fn denoise_reported(
     report: &mut DenoiseReport,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_reported_with_pag(inputs, None, report, on_progress)
+}
+
+/// [`denoise_reported`] with optional resolved Perturbed-Attention Guidance (`pag`).
+///
+/// When active on a step (`step_scale > 0.0`), evaluates `cond` (and `uncond` if True CFG is
+/// enabled), materializes `cond` / `guided` via `mlx_rs::transforms::eval` before running the
+/// perturbed pass so MLX never holds two 32-block lazy graphs simultaneously, and reuses the
+/// positive branch's `PrefixKvCache` read-only when `KvCacheMode::On` is active.
+pub fn denoise_reported_with_pag(
+    inputs: DenoiseInputs<'_>,
+    pag: Option<&PagResolved>,
+    report: &mut DenoiseReport,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     let (h, w) = latent_grid(inputs.width, inputs.height);
     let grid = (h as usize, w as usize);
     let transformer = inputs.transformer;
     let scale = inputs.true_cfg_scale;
     let references = inputs.references.as_ref();
+    let total_steps = inputs.sigmas.len().saturating_sub(1);
+    let num_blocks = transformer.num_blocks();
+    let sigmas = inputs.sigmas;
     // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
     let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
     mlx_gen::image_execution::policy_debug("qwen-image-2-1.kv_cached", &cached);
@@ -528,16 +623,45 @@ pub fn denoise_reported(
     // consumes it, so the caches are dropped when the loop returns, whatever the outcome.
     let predict = move |latents: &Array, sigma: f32| -> Result<Array> {
         let velocity = positive.evaluate(transformer, cached, latents, sigma, grid, report)?;
-        match negative.as_mut() {
+        let has_negative = negative.is_some();
+        let guided = match negative.as_mut() {
             Some(negative) => {
                 let uncond =
                     negative.evaluate(transformer, cached, latents, sigma, grid, report)?;
                 // `neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)`
                 let diff = subtract(&velocity, &uncond)?;
-                Ok(add(&uncond, &multiply(&diff, Array::from_f32(scale))?)?)
+                add(&uncond, &multiply(&diff, Array::from_f32(scale))?)?
             }
-            None => Ok(velocity),
+            None => velocity.clone(),
+        };
+        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+        if pag_scale > 0.0 {
+            if let Some(perturb_blocks) =
+                pag_perturb_block_flags(pag, num_blocks, step_idx, total_steps)
+            {
+                if has_negative {
+                    mlx_rs::transforms::eval([&velocity, &guided])?;
+                } else {
+                    mlx_rs::transforms::eval([&velocity])?;
+                }
+                let perturbed = positive.evaluate_perturbed(
+                    transformer,
+                    cached,
+                    latents,
+                    sigma,
+                    grid,
+                    &perturb_blocks,
+                    report,
+                )?;
+                let pag_diff = subtract(&velocity, &perturbed)?;
+                return Ok(add(
+                    &guided,
+                    &multiply(&pag_diff, Array::from_f32(pag_scale))?,
+                )?);
+            }
         }
+        Ok(guided)
     };
     run_flow_sampler(
         SamplerRun {
@@ -776,5 +900,15 @@ mod tests {
         let rgb = rgba_to_rgb_over_white(&rgba).unwrap();
         let v: Vec<f32> = rgb.as_slice().to_vec();
         assert_eq!(v, vec![1.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn denoise_report_tracks_perturbed_evaluations_separately() {
+        let report = DenoiseReport::default();
+        assert!(report.evaluations.is_empty());
+        assert!(report.perturbed_evaluations.is_empty());
+        let range = gen_core_family::qwen_image_2_1::pag::pag_joint_target_range(128, 384).unwrap();
+        assert_eq!(range, 128..384);
+        assert!(gen_core_family::qwen_image_2_1::pag::pag_joint_target_range(384, 384).is_err());
     }
 }

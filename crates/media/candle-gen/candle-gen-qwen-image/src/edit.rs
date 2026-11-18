@@ -151,6 +151,8 @@ pub struct QwenEditRequest {
     /// DiT sequence inside the predict closure and narrowed straight back off, so the sampler's
     /// running latent — the only thing the hook is ever handed — never carries a reference token.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance (PAG) configuration (SW-7179).
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
 }
 
 impl Default for QwenEditRequest {
@@ -171,8 +173,31 @@ impl Default for QwenEditRequest {
             memory: None,
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
+            pag: None,
         }
     }
+}
+
+/// Shared PAG capability for Qwen-Image-Edit 2511 / Lightning (60 blocks, default `[30]`).
+pub fn pag_capability() -> candle_gen::gen_core::PagCapability {
+    crate::pag_capability()
+}
+
+/// Validate and resolve an optional [`PagConfig`](candle_gen::gen_core::PagConfig) for
+/// `QwenEdit`.
+pub fn resolve_edit_pag(
+    pag: Option<&candle_gen::gen_core::PagConfig>,
+) -> Result<Option<candle_gen::gen_core::PagResolved>> {
+    candle_gen::gen_core::resolve_pag(Some(&pag_capability()), "qwen_image_edit", pag).map_err(
+        |err| match err.kind() {
+            candle_gen::gen_core::PagPolicyErrorKind::Unsupported => {
+                CandleError::Unsupported(err.to_string())
+            }
+            candle_gen::gen_core::PagPolicyErrorKind::Invalid => {
+                CandleError::Msg(format!("qwen_image_edit: {err}"))
+            }
+        },
+    )
 }
 
 /// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype`.
@@ -712,10 +737,12 @@ impl QwenEdit {
         neg: Option<&Tensor>,
         static_latents: &Tensor,
         cond_grids: &[(usize, usize)],
+        resolved_pag: Option<&candle_gen::gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+    ) -> Result<(Image, u32)> {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let noise_seq = lat_h * lat_w;
+        let num_blocks = transformer.block_count();
 
         let (native, mu) = if req.lightning {
             (
@@ -735,6 +762,7 @@ impl QwenEdit {
             req.steps,
             &native,
         )?;
+        let total_steps = sigmas.len().saturating_sub(1);
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
         let memory = req.memory.unwrap_or_default();
@@ -787,7 +815,7 @@ impl QwenEdit {
                         &req.cancel,
                     )?
                     .narrow(1, 0, noise_seq)?;
-                match neg {
+                let guided = match neg {
                     Some(neg) => {
                         let neg_v = transformer
                             .forward_edit_with_memory(
@@ -803,14 +831,43 @@ impl QwenEdit {
                                 &req.cancel,
                             )?
                             .narrow(1, 0, noise_seq)?;
-                        Ok(pipeline::compute_guided_noise(
-                            &pos_v,
-                            &neg_v,
-                            req.guidance,
-                        )?)
+                        pipeline::compute_guided_noise(&pos_v, &neg_v, req.guidance)?
                     }
-                    None => Ok(pos_v),
+                    None => pos_v.clone(),
+                };
+                let step_idx = pipeline::pag_step_index_for_sigma(&sigmas, sigma);
+                let pag_scale = resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                if pag_scale > 0.0 {
+                    if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(
+                        resolved_pag,
+                        num_blocks,
+                        step_idx,
+                        total_steps,
+                    ) {
+                        let perturbed_v = transformer
+                            .forward_edit_with_memory_pag(
+                                &joint,
+                                pos,
+                                sigma,
+                                lat_h,
+                                lat_w,
+                                cond_grids,
+                                self.zero_cond_t,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                                Some(&perturb_mask),
+                            )?
+                            .narrow(1, 0, noise_seq)?;
+                        return Ok(pipeline::combine_pag_guidance(
+                            &guided,
+                            &pos_v,
+                            &perturbed_v,
+                            pag_scale,
+                        )?);
+                    }
                 }
+                Ok(guided)
             },
         )?;
 
@@ -829,7 +886,10 @@ impl QwenEdit {
                 )
             }),
         )?;
-        crate::control_common::to_image(&decoded)
+        Ok((
+            crate::control_common::to_image(&decoded)?,
+            total_steps as u32,
+        ))
     }
 
     /// Reference-conditioned edit. `references` is the (validated non-empty) reference image set: the
@@ -846,13 +906,38 @@ impl QwenEdit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+        candle_gen::execution::capture_direct_report(&crate::descriptor(), &req.cancel, || {
             candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "QwenEdit");
             candle_gen::execution::policy("direct_route", "qwen-image/edit/generate".into());
-            let image = self
-                .generate(req, references, &mut report_progress)
-                .map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            self.generate_with_report(req, references, &mut report_progress)
+        })
+    }
+
+    /// Reference-conditioned edit returning [`GenerationReport`](candle_gen::gen_core::GenerationReport)
+    /// (carrying [`PagExecutionReport`](candle_gen::gen_core::PagExecutionReport) when PAG is active).
+    pub fn generate_with_report(
+        &self,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        let (image, pag) = run_edit_request(
+            &self.lifecycle,
+            || {
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    ensure_ordinary_generate_allowed(self.admitted_context.as_ref())?;
+                    validate_memory_authority(req, self.admitted_context.as_ref())?;
+                    self.generate_inner(req, references, on_progress)
+                })
+            },
+            || self.device.synchronize(),
+        )
+        .map_err(candle_gen::gen_core::Error::from)?;
+        Ok(candle_gen::gen_core::GenerationReport {
+            pag,
+            ..candle_gen::gen_core::GenerationReport::from_output(
+                candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+            )
         })
     }
 
@@ -869,6 +954,7 @@ impl QwenEdit {
                     ensure_ordinary_generate_allowed(self.admitted_context.as_ref())?;
                     validate_memory_authority(req, self.admitted_context.as_ref())?;
                     self.generate_inner(req, references, on_progress)
+                        .map(|(image, _)| image)
                 })
             },
             || self.device.synchronize(),
@@ -889,16 +975,67 @@ impl QwenEdit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+        candle_gen::execution::capture_direct_report(&crate::descriptor(), &req.cancel, || {
             candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "QwenEdit");
             candle_gen::execution::policy(
                 "direct_route",
                 "qwen-image/edit/generate_with_memory_context".into(),
             );
-            let image = self
-                .generate_with_memory_context(context, req, references, &mut report_progress)
-                .map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            self.generate_with_memory_context_with_report(
+                context,
+                req,
+                references,
+                &mut report_progress,
+            )
+        })
+    }
+
+    /// Memory-context edit returning [`GenerationReport`](candle_gen::gen_core::GenerationReport)
+    /// (carrying [`PagExecutionReport`](candle_gen::gen_core::PagExecutionReport) when PAG is active).
+    pub fn generate_with_memory_context_with_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        let (image, pag) = run_edit_request(
+            &self.lifecycle,
+            || {
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "qwen edit: model was not loaded with a memory context".to_owned(),
+                        )
+                    })?;
+                    let contract = self.memory_contract.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "qwen edit: admitted model lost its memory contract".to_owned(),
+                        )
+                    })?;
+                    let spec = self.prepared_spec.as_ref().ok_or_else(|| {
+                        CandleError::Msg("qwen edit: admitted model lost its load spec".to_owned())
+                    })?;
+                    validate_admitted_context(admitted, context)?;
+                    crate::memory_strategy::validate_edit_context(
+                        contract,
+                        context,
+                        self.loaded_quant,
+                        !spec.adapters.is_empty(),
+                    )
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                    validate_memory_request(context, contract, spec, req, references.len())?;
+                    self.generate_inner(req, references, on_progress)
+                })
+            },
+            || self.device.synchronize(),
+        )
+        .map_err(candle_gen::gen_core::Error::from)?;
+        Ok(candle_gen::gen_core::GenerationReport {
+            pag,
+            ..candle_gen::gen_core::GenerationReport::from_output(
+                candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+            )
         })
     }
 
@@ -936,6 +1073,7 @@ impl QwenEdit {
                     .map_err(|error| CandleError::Msg(error.to_string()))?;
                     validate_memory_request(context, contract, spec, req, references.len())?;
                     self.generate_inner(req, references, on_progress)
+                        .map(|(image, _)| image)
                 })
             },
             || self.device.synchronize(),
@@ -947,10 +1085,12 @@ impl QwenEdit {
         req: &QwenEditRequest,
         references: &[Image],
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+    ) -> Result<(Image, Option<candle_gen::gen_core::PagExecutionReport>)> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let resolved_pag = resolve_edit_pag(req.pag.as_ref())?;
+        crate::record_pag_policy("qwen_image_edit/pag", resolved_pag.as_ref());
         if references.is_empty() {
             return Err(CandleError::Msg(
                 "qwen edit: at least one reference image is required".to_owned(),
@@ -967,7 +1107,7 @@ impl QwenEdit {
                     .into(),
             ));
         }
-        self.residency.run_request_scoped(
+        let (image, actual_steps) = self.residency.run_request_scoped(
             stage_residency,
             memory.stream_transformer_blocks,
             &req.cancel,
@@ -984,11 +1124,18 @@ impl QwenEdit {
                     neg.as_ref(),
                     &static_latents,
                     &cond_grids,
+                    resolved_pag.as_ref(),
                     on_progress,
                 );
                 candle_gen::synchronize_result(&self.device, result)
             },
-        )
+        )?;
+        Ok((
+            image,
+            resolved_pag
+                .as_ref()
+                .map(|p| p.execution_report(actual_steps)),
+        ))
     }
 }
 
@@ -2100,6 +2247,39 @@ mod tests {
         std::fs::remove_dir_all(tmp.join("processor")).unwrap();
         std::fs::remove_dir_all(tmp.join("tokenizer")).unwrap();
         assert!(tokenizer_json_path(&tmp).is_err());
+    }
+
+    #[test]
+    fn edit_request_resolves_pag_capability_and_zero_scale_noop() {
+        let req = QwenEditRequest::default();
+        assert!(req.pag.is_none());
+        let cap = pag_capability();
+        assert_eq!(cap, crate::pag_capability());
+        assert!(resolve_edit_pag(None).unwrap().is_none());
+        assert!(resolve_edit_pag(Some(&candle_gen::gen_core::PagConfig {
+            scale: 0.0,
+            layers: Some(vec![30]),
+            ..Default::default()
+        }))
+        .unwrap()
+        .is_none());
+        assert!(resolve_edit_pag(Some(&candle_gen::gen_core::PagConfig {
+            scale: 0.0,
+            layers: Some(vec![60]),
+            ..Default::default()
+        }))
+        .is_err());
+        let active = resolve_edit_pag(Some(&candle_gen::gen_core::PagConfig {
+            scale: 1.2,
+            ..Default::default()
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(active.layers, vec![30]);
+        active
+            .execution_report(4)
+            .validate_with_capability(&cap)
+            .unwrap();
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c follow-up, sc-10968) — the edit sibling of

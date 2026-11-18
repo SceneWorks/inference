@@ -14,6 +14,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface and internal callers are unchanged.
+use mlx_gen::gen_core::PagResolved;
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
@@ -559,6 +560,47 @@ pub(crate) fn denoise_with_progress_windowed(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_with_progress_windowed_pag(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        start_step,
+        attention_budget,
+        window_size,
+        None,
+        cancel,
+        preview,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_with_progress_windowed_pag(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    start_step: usize,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    pag: Option<&PagResolved>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
     // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
     // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
@@ -566,6 +608,8 @@ pub(crate) fn denoise_with_progress_windowed(
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
+    let total_steps = sliced.len().saturating_sub(1);
+    let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     mlx_gen::image_execution::policy_debug("qwen-image.attention", &attention.budget);
@@ -591,7 +635,7 @@ pub(crate) fn denoise_with_progress_windowed(
             attention,
             block_window,
         )?;
-        match neg_embeds {
+        let guided = match neg_embeds {
             Some(neg) => {
                 let neg = transformer.forward_windowed(
                     latents,
@@ -604,10 +648,39 @@ pub(crate) fn denoise_with_progress_windowed(
                     attention,
                     block_window,
                 )?;
-                compute_guided_noise(&pos, &neg, guidance)
+                compute_guided_noise(&pos, &neg, guidance)?
             }
-            None => Ok(pos),
+            None => pos.clone(),
+        };
+        let step_idx = pag_step_index_for_sigma(sliced, sigma);
+        let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+        if pag_scale > 0.0 {
+            if let Some(perturb_mask) =
+                pag_perturb_block_flags(pag, num_blocks, step_idx, total_steps)
+            {
+                // Materialize `cond`/`guided` before building the 60-block perturbed graph so MLX
+                // never holds two 60-block lazy graphs simultaneously.
+                if neg_embeds.is_some() {
+                    mlx_rs::transforms::eval([&pos, &guided])?;
+                } else {
+                    mlx_rs::transforms::eval([&pos])?;
+                }
+                let perturbed = transformer.forward_windowed_pag(
+                    latents,
+                    pos_embeds,
+                    None,
+                    sigma,
+                    lh,
+                    lw,
+                    &[],
+                    attention,
+                    block_window,
+                    Some(&perturb_mask),
+                )?;
+                return combine_pag_guidance(&guided, &pos, &perturbed, pag_scale);
+            }
         }
+        Ok(guided)
     };
     // img2img loops `range(start_step, steps)`: slice the schedule from the matching sigma so the
     // blended init latents are denoised from there (the fork's `init_time_step`). Cancellation, the
@@ -693,10 +766,55 @@ pub(crate) fn denoise_control_with_progress_windowed(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_control_with_progress_windowed_pag(
+        transformer,
+        controlnet,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        control_cond,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        control_scale,
+        width,
+        height,
+        attention_budget,
+        window_size,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_control_with_progress_windowed_pag(
+    transformer: &QwenTransformer,
+    controlnet: &QwenFunControlBranch,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    control_cond: &Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    control_scale: f32,
+    width: u32,
+    height: u32,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    pag: Option<&PagResolved>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
     // by the RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let total_steps = sigmas.len().saturating_sub(1);
+    let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     mlx_gen::image_execution::policy_debug("qwen-image.attention", &attention.budget);
@@ -719,7 +837,7 @@ pub(crate) fn denoise_control_with_progress_windowed(
             attention,
             block_window,
         )?;
-        match neg_embeds {
+        let guided = match neg_embeds {
             Some(neg) => {
                 let neg = transformer.forward_control_windowed(
                     latents,
@@ -734,10 +852,39 @@ pub(crate) fn denoise_control_with_progress_windowed(
                     attention,
                     block_window,
                 )?;
-                compute_guided_noise(&pos, &neg, guidance)
+                compute_guided_noise(&pos, &neg, guidance)?
             }
-            None => Ok(pos),
+            None => pos.clone(),
+        };
+        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+        if pag_scale > 0.0 {
+            if let Some(perturb_mask) =
+                pag_perturb_block_flags(pag, num_blocks, step_idx, total_steps)
+            {
+                if neg_embeds.is_some() {
+                    mlx_rs::transforms::eval([&pos, &guided])?;
+                } else {
+                    mlx_rs::transforms::eval([&pos])?;
+                }
+                let perturbed = transformer.forward_control_windowed_pag(
+                    latents,
+                    pos_embeds,
+                    None,
+                    sigma,
+                    lh,
+                    lw,
+                    &[],
+                    Some((controlnet, control_cond)),
+                    control_scale,
+                    attention,
+                    block_window,
+                    Some(&perturb_mask),
+                )?;
+                return combine_pag_guidance(&guided, &pos, &perturbed, pag_scale);
+            }
         }
+        Ok(guided)
     };
     // Cancellation, the per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114).
     run_flow_sampler(
@@ -822,10 +969,55 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_edit_with_progress_windowed_pag(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        static_image_latents,
+        cond_grids,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        attention_budget,
+        window_size,
+        None,
+        cancel,
+        preview,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_edit_with_progress_windowed_pag(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    static_image_latents: &Array,
+    cond_grids: &[(usize, usize)],
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    pag: Option<&PagResolved>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
     // `denoise_with_progress`. Bit-exact; scoped + restored on drop by the RAII guard (F-006).
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
+    let total_steps = sigmas.len().saturating_sub(1);
+    let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
     mlx_gen::image_execution::policy_debug("qwen-image.attention", &attention.budget);
@@ -853,7 +1045,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
             )?,
             noise_seq,
         )?;
-        match neg_embeds {
+        let guided = match neg_embeds {
             Some(neg) => {
                 let neg = slice_seq(
                     &transformer.forward_windowed(
@@ -869,10 +1061,40 @@ pub(crate) fn denoise_edit_with_progress_windowed(
                     )?,
                     noise_seq,
                 )?;
-                compute_guided_noise(&pos, &neg, guidance)
+                compute_guided_noise(&pos, &neg, guidance)?
             }
-            None => Ok(pos),
+            None => pos.clone(),
+        };
+        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+        if pag_scale > 0.0 {
+            if let Some(perturb_mask) =
+                pag_perturb_block_flags(pag, num_blocks, step_idx, total_steps)
+            {
+                if neg_embeds.is_some() {
+                    mlx_rs::transforms::eval([&pos, &guided])?;
+                } else {
+                    mlx_rs::transforms::eval([&pos])?;
+                }
+                let perturbed = slice_seq(
+                    &transformer.forward_windowed_pag(
+                        &hidden,
+                        pos_embeds,
+                        None,
+                        sigma,
+                        lh,
+                        lw,
+                        cond_grids,
+                        attention,
+                        block_window,
+                        Some(&perturb_mask),
+                    )?,
+                    noise_seq,
+                )?;
+                return combine_pag_guidance(&guided, &pos, &perturbed, pag_scale);
+            }
         }
+        Ok(guided)
     };
     // Cancellation, the per-step `eval` (the command-buffer-watchdog boundary), and progress live in
     // `run_flow_sampler` (epic 7114 P3).
@@ -888,6 +1110,51 @@ pub(crate) fn denoise_edit_with_progress_windowed(
         latents,
         predict,
     )
+}
+
+/// Map a descending flow-match `sigma` onto its zero-based step index in `0..sigmas.len() - 1`.
+pub(crate) fn pag_step_index_for_sigma(sigmas: &[f32], sigma: f32) -> usize {
+    let total_steps = sigmas.len().saturating_sub(1);
+    if total_steps == 0 {
+        return 0;
+    }
+    sigmas[..total_steps]
+        .iter()
+        .filter(|&&s| s > sigma)
+        .count()
+        .min(total_steps - 1)
+}
+
+/// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this
+/// step (`step_scale > 0.0`), or `None` when inactive.
+pub(crate) fn pag_perturb_block_flags(
+    pag: Option<&PagResolved>,
+    num_blocks: usize,
+    step_index: usize,
+    total_steps: usize,
+) -> Option<Vec<bool>> {
+    let pag = pag?;
+    if pag.step_scale(step_index, total_steps) <= 0.0 {
+        return None;
+    }
+    Some(
+        (0..num_blocks)
+            .map(|idx| pag.perturbs_block(idx as u32, step_index, total_steps))
+            .collect(),
+    )
+}
+
+/// Combine True-CFG (or raw cond) velocity with PAG: `guided + step_pag_scale * (cond - perturbed)`.
+pub(crate) fn combine_pag_guidance(
+    guided: &Array,
+    cond: &Array,
+    perturbed: &Array,
+    pag_scale: f32,
+) -> Result<Array> {
+    Ok(add(
+        guided,
+        &multiply(&subtract(cond, perturbed)?, scalar(pag_scale))?,
+    )?)
 }
 
 /// Slice the transformer velocity `[1, full_seq, 64]` back to the noise prefix `[1, n, 64]`. A
@@ -1543,5 +1810,39 @@ mod execution_policy_tests {
         assert_eq!(weak.randomness, strong.randomness);
         assert_eq!(weak.schedule, strong.schedule);
         assert_ne!(weak.provider_choices, strong.provider_choices);
+    }
+
+    #[test]
+    fn pag_guidance_and_step_masks_behave_as_specified() {
+        let cap = crate::model::pag_capability();
+        let resolved = mlx_gen::gen_core::resolve_pag(
+            Some(&cap),
+            "qwen_image",
+            Some(&mlx_gen::gen_core::PagConfig {
+                scale: 1.5,
+                start: Some(0.0),
+                stop: Some(0.5),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+
+        let sigmas = [1.0f32, 0.75, 0.5, 0.25, 0.0];
+        assert_eq!(pag_step_index_for_sigma(&sigmas, 1.0), 0);
+        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.5), 2);
+        let flags_step0 = pag_perturb_block_flags(Some(&resolved), 60, 0, 4).unwrap();
+        assert_eq!(flags_step0.len(), 60);
+        assert!(flags_step0[30]);
+        assert!(!flags_step0[0]);
+        // step 2 is at progress 0.5 == stop -> inactive.
+        assert!(pag_perturb_block_flags(Some(&resolved), 60, 2, 4).is_none());
+
+        let guided = Array::from_slice(&[2.0f32, 4.0], &[1, 2]);
+        let cond = Array::from_slice(&[3.0f32, 6.0], &[1, 2]);
+        let perturbed = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
+        let out = combine_pag_guidance(&guided, &cond, &perturbed, 1.5).unwrap();
+        // guided + 1.5 * (cond - perturbed) = [2 + 3, 4 + 6] = [5, 10]
+        assert_eq!(out.as_slice::<f32>(), &[5.0, 10.0]);
     }
 }

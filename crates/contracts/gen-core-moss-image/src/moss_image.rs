@@ -147,6 +147,91 @@ pub fn moss_guidance(
     Ok(output)
 }
 
+/// FP32 guidance combining MOSS CFG + optional SLG with Perturbed-Attention Guidance (PAG):
+/// `eps_base + pag_scale * (eps_cond - eps_perturbed)`.
+///
+/// When `pag_scale == 0.0`, returns `moss_guidance(...)` bit-for-bit without requiring a
+/// perturbed branch (while still validating any supplied `perturbed` slice).
+pub fn moss_guidance_with_pag(
+    conditional: &[f32],
+    unconditional: Option<&[f32]>,
+    skipped: Option<&[f32]>,
+    perturbed: Option<&[f32]>,
+    cfg: f32,
+    slg_scale: f32,
+    pag_scale: f32,
+) -> Result<Vec<f32>> {
+    require(
+        pag_scale.is_finite() && pag_scale >= 0.0,
+        "invalid PAG guidance",
+    )?;
+    let base = moss_guidance(conditional, unconditional, skipped, cfg, slg_scale)?;
+    if let Some(p) = perturbed {
+        require(
+            p.len() == conditional.len() && p.iter().all(|v| v.is_finite()),
+            "invalid prediction branch",
+        )?;
+    }
+    if pag_scale == 0.0 {
+        return Ok(base);
+    }
+    let perturbed = perturbed.ok_or_else(|| {
+        Error::Unsupported("MOSS-Image: PAG requires a perturbed prediction".into())
+    })?;
+    let output: Vec<f32> = base
+        .iter()
+        .zip(conditional)
+        .zip(perturbed)
+        .map(|((&b, &c), &p)| b + pag_scale * (c - p))
+        .collect();
+    require(
+        output.iter().all(|v| v.is_finite()),
+        "nonfinite guided prediction",
+    )?;
+    Ok(output)
+}
+
+/// FP32 8-step DMD velocity with optional Perturbed-Attention Guidance (PAG):
+/// `v_cond + pag_scale * (v_cond - v_perturbed)`.
+///
+/// When `pag_scale == 0.0`, returns `conditional` unchanged without requiring `perturbed`.
+pub fn moss_dmd_velocity_with_pag(
+    conditional: &[f32],
+    perturbed: Option<&[f32]>,
+    pag_scale: f32,
+) -> Result<Vec<f32>> {
+    require(
+        pag_scale.is_finite() && pag_scale >= 0.0,
+        "invalid PAG guidance",
+    )?;
+    require(
+        conditional.iter().all(|v| v.is_finite()),
+        "nonfinite prediction",
+    )?;
+    if let Some(p) = perturbed {
+        require(
+            p.len() == conditional.len() && p.iter().all(|v| v.is_finite()),
+            "invalid prediction branch",
+        )?;
+    }
+    if pag_scale == 0.0 {
+        return Ok(conditional.to_vec());
+    }
+    let perturbed = perturbed.ok_or_else(|| {
+        Error::Unsupported("MOSS-Image: PAG requires a perturbed prediction".into())
+    })?;
+    let output: Vec<f32> = conditional
+        .iter()
+        .zip(perturbed)
+        .map(|(&c, &p)| c + pag_scale * (c - p))
+        .collect();
+    require(
+        output.iter().all(|v| v.is_finite()),
+        "nonfinite guided prediction",
+    )?;
+    Ok(output)
+}
+
 /// Exact frozen DMD tensor coverage. Views retain caller-owned payloads; validation never merges.
 pub fn dmd_lora_shapes() -> BTreeMap<String, Vec<usize>> {
     let mut expected = BTreeMap::new();
@@ -568,6 +653,130 @@ mod tests {
         assert_eq!(moss_guidance(&[4.], None, None, 1., 0.).unwrap(), [4.]);
         assert!(moss_guidance(&[4.], None, None, 3., 0.).is_err());
         assert!(moss_guidance(&[f32::NAN], None, None, 1., 0.).is_err());
+    }
+    #[test]
+    fn guidance_with_pag_combines_cfg_slg_dmd_and_preserves_scale_zero_identity() {
+        use gen_core::PagConfig;
+
+        let cond = [-0.0_f32, 4.0, -2.5, 1.25];
+        let uncond = [0.0_f32, 1.0, -0.5, 0.25];
+        let skipped = [0.0_f32, 2.0, -1.5, 0.75];
+        let perturbed = [0.0_f32, 1.5, -1.0, 2.25];
+
+        // Scale 0.0 is strictly bit-identical to baseline moss_guidance without needing perturbed.
+        for (u, s, cfg, slg) in [
+            (Some(uncond.as_slice()), None, 3.0_f32, 0.0_f32),
+            (Some(uncond.as_slice()), Some(skipped.as_slice()), 3.0, 2.0),
+            (None, Some(skipped.as_slice()), 1.0, 3.0),
+            (None, None, 1.0, 0.0),
+        ] {
+            let baseline = moss_guidance(&cond, u, s, cfg, slg).unwrap();
+            let zero_pag = moss_guidance_with_pag(&cond, u, s, None, cfg, slg, 0.0).unwrap();
+            let zero_pag_with_pert =
+                moss_guidance_with_pag(&cond, u, s, Some(&perturbed), cfg, slg, 0.0).unwrap();
+            assert_eq!(
+                baseline.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                zero_pag.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                baseline.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                zero_pag_with_pert
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Ordinary CFG + SLG + PAG: base = 1 + 3*(4-1) + 2*(4-2) = 14; + 2.5*(4 - 1.5) = 20.25.
+        let combined = moss_guidance_with_pag(
+            &[4.0],
+            Some(&[1.0]),
+            Some(&[2.0]),
+            Some(&[1.5]),
+            3.0,
+            2.0,
+            2.5,
+        )
+        .unwrap();
+        assert_eq!(combined, [20.25]);
+
+        // CFG == 1.0 (uncond omitted) + PAG: 4 + 2.0*(4 - 1.5) = 9.0.
+        assert_eq!(
+            moss_guidance_with_pag(&[4.0], None, None, Some(&[1.5]), 1.0, 0.0, 2.0).unwrap(),
+            [9.0]
+        );
+
+        // 8-step DMD + PAG: velocity = v_cond + pag_scale * (v_cond - v_perturbed), x0 = z - v.
+        assert_eq!(
+            moss_dmd_velocity_with_pag(&cond, None, 0.0)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            cond.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let v_dmd = moss_dmd_velocity_with_pag(&[3.0, -1.0], Some(&[1.0, 0.5]), 2.0).unwrap();
+        assert_eq!(v_dmd, [7.0, -4.0]);
+        assert_eq!(moss_dmd_update(&[10.0, -2.0], &v_dmd).unwrap(), [3.0, 2.0]);
+
+        // Resolved PAG coexists with uncond_skip_layers + SLG and with 8-step DMD.
+        let ordinary_pag_req = GenerationRequest {
+            steps: Some(10),
+            guidance: Some(3.5),
+            pag: Some(PagConfig {
+                scale: 2.5,
+                layers: None,
+                start: Some(0.2),
+                stop: Some(0.8),
+                adaptive_scale: Some(1.0),
+            }),
+            moss_image: Some(MossImageOptions {
+                uncond_skip_layers: Some(vec![22]),
+                slg: Some(MossSkipLayerGuidance {
+                    layers: vec![24],
+                    scale: 1.5,
+                    start: 0.1,
+                    stop: 0.9,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            let resolved = MossImageResolved::resolve(variant, &ordinary_pag_req).unwrap();
+            let pag = resolved.pag.as_ref().expect("active PAG");
+            assert_eq!(pag.layers, [20]);
+            assert_eq!(resolved.pag_step_scale(0, 10), 0.0);
+            assert!((resolved.pag_step_scale(2, 10) - 2.3).abs() < 1e-6);
+            assert_eq!(resolved.pag_step_scale(8, 10), 0.0);
+            assert_eq!(pag.execution_report(10).active_steps, 6);
+        }
+
+        let mut dmd_pag_req = dmd_request();
+        dmd_pag_req.pag = Some(PagConfig {
+            scale: 2.0,
+            layers: Some(vec![41, 0, 20]),
+            start: Some(0.0),
+            stop: Some(0.5),
+            adaptive_scale: None,
+        });
+        let resolved_dmd = MossImageResolved::resolve(MossImageVariant::Sft, &dmd_pag_req).unwrap();
+        let dmd_pag = resolved_dmd.pag.as_ref().expect("DMD PAG");
+        assert_eq!(dmd_pag.layers, [0, 20, 41]);
+        assert_eq!(dmd_pag.execution_report(8).active_steps, 4);
+
+        // Reject missing perturbed branch, mismatched lengths, negative/non-finite PAG scale.
+        assert!(moss_guidance_with_pag(&[4.0], None, None, None, 1.0, 0.0, 1.0).is_err());
+        assert!(
+            moss_guidance_with_pag(&[4.0, 2.0], None, None, Some(&[1.0]), 1.0, 0.0, 1.0).is_err()
+        );
+        assert!(moss_guidance_with_pag(&[4.0], None, None, Some(&[1.0]), 1.0, 0.0, -0.1).is_err());
+        assert!(
+            moss_guidance_with_pag(&[4.0], None, None, Some(&[f32::NAN]), 1.0, 0.0, 0.0).is_err()
+        );
+        assert!(moss_dmd_velocity_with_pag(&[4.0], None, 1.0).is_err());
+        assert!(moss_dmd_velocity_with_pag(&[4.0], Some(&[1.0, 2.0]), 1.0).is_err());
+        assert!(moss_dmd_velocity_with_pag(&[4.0], Some(&[1.0]), f32::NAN).is_err());
     }
     #[test]
     fn nonsymmetric_mix_and_fixed_noise_recurrence_match_hand_fixture() {

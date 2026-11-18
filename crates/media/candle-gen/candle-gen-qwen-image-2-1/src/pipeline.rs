@@ -9,15 +9,18 @@
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tiling::TilingConfig;
-use candle_gen::gen_core::{CancelFlag, GenerationRequest, Image, Progress, RgbaImage};
+use candle_gen::gen_core::{
+    CancelFlag, GenerationRequest, Image, PagResolved, Progress, RgbaImage,
+};
 use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_family::qwen_image_2_1::pag::{pag_perturb_block_flags, pag_step_index_for_sigma};
 use gen_core_tokenizer::TextTokenizer;
 
 use crate::config::VAE_SCALE_FACTOR;
 use crate::reference::{prepare_references, PreparedReference};
 use crate::text_encoder::{QwenImage21TextEncoder, TextConditioning};
-use crate::transformer::{JointLayout, PrefixKvCache, QwenImage21Transformer, Segment};
+use crate::transformer::{JointLayout, Ops, PrefixKvCache, QwenImage21Transformer, Segment};
 use crate::vae::QwenImage21Vae;
 
 /// `_pack_latents`: 2.1 consumes latents unpatched, so packing is a plain spatial flatten —
@@ -355,6 +358,9 @@ pub struct DenoiseReport {
     /// Every transformer forward, in order. A solver that evaluates the model more than once per
     /// step contributes one entry per evaluation and branch.
     pub evaluations: Vec<ModelEvaluation>,
+    /// Perturbed PAG forward passes, recorded separately so `evaluations` retains its exact
+    /// unperturbed `Positive`/`Negative` branch count while proving read-only `Cached` reuse.
+    pub perturbed_evaluations: Vec<ModelEvaluation>,
 }
 
 /// Everything one denoise run needs.
@@ -456,6 +462,78 @@ impl BranchRun<'_> {
         });
         Ok(velocity)
     }
+
+    /// Perturbed PAG evaluation of this branch at `sigma`.
+    ///
+    /// When `cached == true`, `self.evaluate` has already run on this step and populated
+    /// `self.cache`, so the perturbed pass reuses `&PrefixKvCache` strictly read-only without
+    /// recomputing the prefix or mutating the cache.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_perturbed(
+        &self,
+        transformer: &QwenImage21Transformer,
+        cached: bool,
+        latents: &Tensor,
+        sigma: f32,
+        grid: (usize, usize),
+        perturb_blocks: &[bool],
+        report: &mut DenoiseReport,
+    ) -> Result<Tensor> {
+        let (h, w) = grid;
+        let (velocity, path, block_tokens) = if !cached {
+            match self.conditioned {
+                Some((reference_latents, layout)) => {
+                    let images = joint_images(reference_latents, latents);
+                    (
+                        transformer.run_joint_pag(
+                            self.text,
+                            &images,
+                            sigma,
+                            layout,
+                            Ops::Fused,
+                            Some(perturb_blocks),
+                            Default::default(),
+                        )?,
+                        EvaluationPath::Prefill,
+                        layout.total_len(),
+                    )
+                }
+                None => {
+                    let layout = JointLayout::text_to_image(self.text.dim(1)?, h, w);
+                    let total = layout.total_len();
+                    (
+                        transformer.run_joint_pag(
+                            self.text,
+                            &[latents],
+                            sigma,
+                            &layout,
+                            Ops::Fused,
+                            Some(perturb_blocks),
+                            Default::default(),
+                        )?,
+                        EvaluationPath::Prefill,
+                        total,
+                    )
+                }
+            }
+        } else {
+            let cache = self.cache.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "qwen_image_2_1 PAG: cached perturbed pass requires an extracted PrefixKvCache"
+                        .into(),
+                )
+            })?;
+            let (velocity, block_tokens) =
+                transformer.cached_counted_pag(latents, sigma, cache, Some(perturb_blocks))?;
+            (velocity, EvaluationPath::Cached, block_tokens)
+        };
+        report.perturbed_evaluations.push(ModelEvaluation {
+            branch: self.kind,
+            path,
+            block_tokens,
+        });
+        Ok(velocity)
+    }
 }
 
 /// The denoise loop: with a negative branch each model evaluation applies `neg + s·(pos − neg)`.
@@ -485,10 +563,23 @@ pub fn denoise_reported(
     report: &mut DenoiseReport,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Tensor> {
+    denoise_reported_with_pag(inputs, None, report, on_progress)
+}
+
+/// [`denoise_reported`] with optional resolved Perturbed-Attention Guidance (`pag`).
+pub fn denoise_reported_with_pag(
+    inputs: DenoiseInputs<'_>,
+    pag: Option<&PagResolved>,
+    report: &mut DenoiseReport,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Tensor> {
     let grid = latent_grid(inputs.width, inputs.height);
     let transformer = inputs.transformer;
     let scale = inputs.true_cfg_scale as f64;
     let references = inputs.references.as_ref();
+    let total_steps = inputs.sigmas.len().saturating_sub(1);
+    let num_blocks = transformer.num_blocks();
+    let sigmas = inputs.sigmas;
     // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
     let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
     *report = DenoiseReport {
@@ -515,16 +606,36 @@ pub fn denoise_reported(
     // consumes it, so the caches are dropped when the loop returns, whatever the outcome.
     let predict = move |latents: &Tensor, sigma: f32| -> Result<Tensor> {
         let velocity = positive.evaluate(transformer, cached, latents, sigma, grid, report)?;
-        match negative.as_mut() {
+        let guided = match negative.as_mut() {
             Some(negative) => {
                 let uncond =
                     negative.evaluate(transformer, cached, latents, sigma, grid, report)?;
                 // `neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)`
                 let diff = ((&velocity - &uncond)? * scale)?;
-                Ok((&uncond + diff)?)
+                (&uncond + diff)?
             }
-            None => Ok(velocity),
+            None => velocity.clone(),
+        };
+        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+        if pag_scale > 0.0 {
+            if let Some(perturb_blocks) =
+                pag_perturb_block_flags(pag, num_blocks, step_idx, total_steps)
+            {
+                let perturbed = positive.evaluate_perturbed(
+                    transformer,
+                    cached,
+                    latents,
+                    sigma,
+                    grid,
+                    &perturb_blocks,
+                    report,
+                )?;
+                let pag_diff = ((&velocity - &perturbed)? * pag_scale as f64)?;
+                return Ok((&guided + pag_diff)?);
+            }
         }
+        Ok(guided)
     };
     run_flow_sampler(
         inputs.sampler,
@@ -770,5 +881,15 @@ mod tests {
         let rgb = rgba_to_rgb_over_white(&rgba).unwrap();
         let v = rgb.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v, vec![1.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn denoise_report_tracks_perturbed_evaluations_separately() {
+        let report = DenoiseReport::default();
+        assert!(report.evaluations.is_empty());
+        assert!(report.perturbed_evaluations.is_empty());
+        let range = gen_core_family::qwen_image_2_1::pag::pag_joint_target_range(128, 384).unwrap();
+        assert_eq!(range, 128..384);
+        assert!(gen_core_family::qwen_image_2_1::pag::pag_joint_target_range(384, 384).is_err());
     }
 }

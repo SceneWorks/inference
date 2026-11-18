@@ -140,19 +140,17 @@ fn masked(v: &Value, mask: &Value, device: &Device) -> Tensor {
         )
         .unwrap()
 }
+fn request() -> GenerationRequest {
+    GenerationRequest {
+        width: 48,
+        height: 32,
+        steps: Some(2),
+        guidance: Some(4.),
+        ..Default::default()
+    }
+}
 fn resolved() -> MossImageResolved {
-    MossImageResolved::resolve(
-        MossImageVariant::Sft,
-        &edit_request(&GenerationRequest {
-            width: 48,
-            height: 32,
-            steps: Some(2),
-            guidance: Some(4.),
-            ..Default::default()
-        })
-        .unwrap(),
-    )
-    .unwrap()
+    MossImageResolved::resolve(MossImageVariant::Sft, &edit_request(&request()).unwrap()).unwrap()
 }
 fn time_probes(model: &Transformer, f: &Value, device: &Device) {
     for probe in f["time_probes"].as_array().unwrap() {
@@ -723,6 +721,93 @@ fn run(device: &Device) {
             .run(&hidden, &CancelFlag::new(), &mut |_| {})
             .unwrap();
         assert_eq!(values(&sampled), values(&reentry));
+
+        let mut pag_zero_req = request();
+        pag_zero_req.pag = Some(candle_gen::gen_core::pag::PagConfig {
+            scale: 0.0,
+            layers: Some(vec![0]),
+            ..Default::default()
+        });
+        let pag_zero_resolved = MossImageResolved::resolve(
+            MossImageVariant::Sft,
+            &edit_request(&pag_zero_req).unwrap(),
+        )
+        .unwrap();
+        assert!(pag_zero_resolved.pag.is_none());
+        let pag_zero_sampled = crate::edit::EditSampling {
+            resolved: &pag_zero_resolved,
+            ..sampling
+        }
+        .run(&hidden, &CancelFlag::new(), &mut |_| {})
+        .unwrap();
+        assert_eq!(values(&sampled), values(&pag_zero_sampled));
+
+        for guidance in [1.0, 4.0] {
+            let mut pag_req = request();
+            pag_req.guidance = Some(guidance);
+            pag_req.pag = Some(candle_gen::gen_core::pag::PagConfig {
+                scale: 2.0,
+                layers: Some(vec![0]),
+                ..Default::default()
+            });
+            let pag_resolved =
+                MossImageResolved::resolve(MossImageVariant::Sft, &edit_request(&pag_req).unwrap())
+                    .unwrap();
+            let pag_cached = crate::edit::EditSampling {
+                resolved: &pag_resolved,
+                use_cache: true,
+                ..sampling
+            }
+            .run(&hidden, &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+            let pag_uncached = crate::edit::EditSampling {
+                resolved: &pag_resolved,
+                use_cache: false,
+                ..sampling
+            }
+            .run(&hidden, &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+            assert_eq!(pag_cached.dims(), sampled.dims());
+            assert_eq!(values(&pag_cached), values(&pag_uncached));
+            if guidance == 4.0 {
+                assert_ne!(values(&pag_cached), values(&sampled));
+            }
+        }
+    }
+    {
+        // Custom FP32 LoRA residuals on a BF16 edit model must compose cleanly with PAG.
+        let mut custom_model = self::model(&f, device, false);
+        let down = Tensor::from_vec(vec![0.05f32; 2 * 16], (2, 16), device).unwrap();
+        let up = Tensor::from_vec(vec![0.05f32; 16 * 2], (16, 2), device).unwrap();
+        for target in ["layers.0.proj.q", "layers.0.proj.o"] {
+            custom_model
+                .push_residual(
+                    target,
+                    crate::adapters::Residual::Lora {
+                        down: down.clone(),
+                        up: up.clone(),
+                        scale: 0.5,
+                    },
+                )
+                .unwrap();
+        }
+        let custom_cache = custom_model
+            .prepare_edit_cache(&references, &cancel)
+            .unwrap();
+        let custom_out = custom_model
+            .forward_edit_with_pag(
+                &hidden,
+                time,
+                EditConditioning {
+                    context: &positive,
+                    references: &references,
+                    cache: Some(&custom_cache),
+                },
+                &[0],
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(custom_out.dims(), hidden.dims());
     }
     sampler_precision(&f, device, false);
     request_local_lifecycle(&f, device);

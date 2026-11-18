@@ -342,6 +342,7 @@ fn reference_latent(vae: &Flux2Vae, image: &Array, cancel: &CancelFlag) -> Resul
 }
 /// Shared production CFG/Euler update. Network predictions may be BF16, but guidance,
 /// integration and the returned accumulator always use FP32.
+#[cfg(test)]
 fn cfg_euler_step(
     current: &Array,
     conditional: &Array,
@@ -349,13 +350,41 @@ fn cfg_euler_step(
     guidance: f32,
     delta_sigma: f32,
 ) -> Result<Array> {
+    cfg_pag_euler_step(
+        current,
+        conditional,
+        unconditional,
+        None,
+        guidance,
+        0.0,
+        delta_sigma,
+    )
+}
+
+fn cfg_pag_euler_step(
+    current: &Array,
+    conditional: &Array,
+    unconditional: Option<&Array>,
+    perturbed: Option<&Array>,
+    guidance: f32,
+    pag_scale: f32,
+    delta_sigma: f32,
+) -> Result<Array> {
     let scalar = |x: f32| Array::from_slice(&[x], &[1]);
-    let mut prediction = conditional.as_dtype(Dtype::Float32)?;
+    let cond_f32 = conditional.as_dtype(Dtype::Float32)?;
+    let mut prediction = cond_f32.clone();
     if let Some(unconditional) = unconditional {
         let negative = unconditional.as_dtype(Dtype::Float32)?;
         prediction = add(
             &negative,
             multiply(subtract(prediction, &negative)?, scalar(guidance))?,
+        )?;
+    }
+    if let Some(perturbed) = perturbed.filter(|_| pag_scale > 0.0) {
+        let perturbed = perturbed.as_dtype(Dtype::Float32)?;
+        prediction = add(
+            prediction,
+            multiply(subtract(&cond_f32, &perturbed)?, scalar(pag_scale))?,
         )?;
     }
     Ok(add(
@@ -397,16 +426,23 @@ impl EditSampling<'_> {
             self.resolved.shift,
             self.resolved.training_shift,
         )?;
+        let total_steps = sigmas.len() - 1;
         let mut latents = noise.as_dtype(Dtype::Float32)?;
         for (index, pair) in sigmas.windows(2).enumerate() {
+            let pag_scale = self.resolved.pag_step_scale(index, total_steps);
+            let pag_layers = self
+                .resolved
+                .pag
+                .as_ref()
+                .map_or(&[][..], |pag| pag.step_layers(index, total_steps));
             let mut outputs = Vec::new();
             for (sample, positive) in self.positive.iter().enumerate() {
                 check(cancel)?;
                 let current = mlx_gen::attention::slice_axis(&latents, 0, sample as i32, 1)?;
-                let predict = |context: &Array| -> Result<Array> {
+                let predict = |context: &Array, layers: &[u32]| -> Result<Array> {
                     Ok(self
                         .transformer
-                        .forward_edit(
+                        .forward_edit_with_pag(
                             &current,
                             pair[0],
                             crate::transformer::EditConditioning {
@@ -414,21 +450,29 @@ impl EditSampling<'_> {
                                 references: self.references,
                                 cache: cache.as_ref(),
                             },
+                            layers,
                             cancel,
                         )?
                         .as_dtype(Dtype::Float32)?)
                 };
-                let prediction = predict(positive)?;
+                let prediction = predict(positive, &[])?;
                 let negative = if self.resolved.guidance != 1.0 {
-                    Some(predict(&self.negative[sample])?)
+                    Some(predict(&self.negative[sample], &[])?)
                 } else {
                     None
                 };
-                let next = cfg_euler_step(
+                let perturbed = if pag_scale > 0.0 {
+                    Some(predict(positive, pag_layers)?)
+                } else {
+                    None
+                };
+                let next = cfg_pag_euler_step(
                     &current,
                     &prediction,
                     negative.as_ref(),
+                    perturbed.as_ref(),
                     self.resolved.guidance,
+                    pag_scale,
                     pair[1] - pair[0],
                 )?;
                 mlx_rs::transforms::eval([&next])?;
@@ -438,7 +482,7 @@ impl EditSampling<'_> {
                         trace.push([
                             current.clone(),
                             prediction.clone(),
-                            negative.as_ref().unwrap().clone(),
+                            negative.as_ref().unwrap_or(&prediction).clone(),
                             next.clone(),
                         ]);
                     }
@@ -449,7 +493,7 @@ impl EditSampling<'_> {
             check(cancel)?;
             progress(Progress::Step {
                 current: index as u32 + 1,
-                total: sigmas.len() as u32 - 1,
+                total: total_steps as u32,
             });
         }
         check(cancel)?;
@@ -606,6 +650,37 @@ mod tests {
                     );
                 }
             }
+            // Verify cfg_pag_euler_step: pag_scale == 0 is bit-identical; guidance == 1 (2-pass)
+            // and guidance != 1 (3-pass) combine PAG in FP32.
+            let current = Array::from_slice(&[0.25_f32, -0.5], &[1, 2, 1, 1]);
+            let cond = Array::from_slice(&[2.0_f32, -1.0], &[1, 2, 1, 1]);
+            let uncond = Array::from_slice(&[0.5_f32, 0.5], &[1, 2, 1, 1]);
+            let perturbed = Array::from_slice(&[1.0_f32, -0.25], &[1, 2, 1, 1]);
+            let base = cfg_euler_step(&current, &cond, Some(&uncond), 4.0, -0.1).unwrap();
+            let zero_pag =
+                cfg_pag_euler_step(&current, &cond, Some(&uncond), None, 4.0, 0.0, -0.1).unwrap();
+            assert_eq!(
+                logical_f32_readback(&base).unwrap(),
+                logical_f32_readback(&zero_pag).unwrap()
+            );
+            let two_pass =
+                cfg_pag_euler_step(&current, &cond, None, Some(&perturbed), 1.0, 2.5, -0.1)
+                    .unwrap();
+            let two_vals = logical_f32_readback(&two_pass).unwrap();
+            assert!((two_vals[0] - (0.25 - 0.1 * (2.0 + 2.5 * (2.0 - 1.0)))).abs() < 1e-6);
+            assert!((two_vals[1] - (-0.5 - 0.1 * (-1.0 + 2.5 * (-1.0 + 0.25)))).abs() < 1e-6);
+            let three_pass = cfg_pag_euler_step(
+                &current,
+                &cond,
+                Some(&uncond),
+                Some(&perturbed),
+                4.0,
+                2.5,
+                -0.1,
+            )
+            .unwrap();
+            let three_vals = logical_f32_readback(&three_pass).unwrap();
+            assert!((three_vals[0] - (0.25 - 0.1 * (0.5 + 4.0 * 1.5 + 2.5 * 1.0))).abs() < 1e-6);
         });
     }
     fn values(v: &Value) -> Vec<f32> {

@@ -151,6 +151,7 @@ fn descriptor(variant: MossImageVariant) -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: crate::SIZE_MULTIPLE,
             },
+            pag: Some(moss_image_pag_capability()),
             mac_only: true,
             ..Default::default()
         },
@@ -412,8 +413,9 @@ impl MossImage {
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
         self.execute_with_execution(request, inputs, progress, edit)
-            .map(|(output, _)| output)
+            .map(|(output, _, _)| output)
     }
+    #[allow(clippy::type_complexity)]
     fn execute_with_execution(
         &self,
         request: &GenerationRequest,
@@ -422,6 +424,7 @@ impl MossImage {
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<(
         MossImageAdvancedOutput,
+        Option<gen_core::PagExecutionReport>,
         gen_core::generator::ExecutionIdentity,
     )> {
         let mut state = self
@@ -441,7 +444,7 @@ impl MossImage {
             progress,
             edit,
         );
-        let result = result.and_then(|output| {
+        let result = result.and_then(|(output, pag)| {
             check(&request.cancel)?;
             let mut execution = gen_core_moss_image::execution::completed_identity(
                 state.report.as_ref(),
@@ -453,7 +456,7 @@ impl MossImage {
                 &self.spec.adapters,
                 &state.apply_reports,
             )?;
-            Ok((output, execution))
+            Ok((output, pag, execution))
         });
         if result.is_err() {
             *edit_report = None;
@@ -485,7 +488,10 @@ impl MossImage {
         inputs: MossImageAdvancedInputs<'_>,
         progress: &mut dyn FnMut(Progress),
         edit: Option<MossImageEditInputs<'_>>,
-    ) -> Result<MossImageAdvancedOutput> {
+    ) -> Result<(
+        MossImageAdvancedOutput,
+        Option<gen_core::PagExecutionReport>,
+    )> {
         check(&request.cancel)?;
         let device_before = selected_stream_device();
         self.sources.ensure_unchanged()?;
@@ -559,6 +565,14 @@ impl MossImage {
             mut apply_reports,
             adapter_reports,
         } = receipts;
+        let actual_steps = match &sampling {
+            MossImageSamplingReceipt::Euler { sigmas } => sigmas.len().saturating_sub(1) as u32,
+            MossImageSamplingReceipt::Dmd { step_codes, .. } => step_codes.len() as u32,
+        };
+        let pag_report = resolved
+            .pag
+            .as_ref()
+            .map(|pag| pag.execution_report(actual_steps));
         apply_reports.extend(adapter_reports.iter().cloned());
         #[cfg(feature = "test-support")]
         if self.sources.is_fixture() {
@@ -566,7 +580,7 @@ impl MossImage {
             // No sealed author receipt is manufactured for generated synthetic source bytes.
             state.report = None;
             state.apply_reports = apply_reports;
-            return Ok(output);
+            return Ok((output, pag_report));
         }
         let report = MossImageExecutionReport::new(MossImageExecutionData {
             execution_device: MossImageExecutionDevice::Mlx,
@@ -587,7 +601,7 @@ impl MossImage {
             output_kind: inputs.output,
             component_dtypes: dtypes,
             adapter_reports,
-            pag: None,
+            pag: pag_report.clone(),
         })?;
         check(&request.cancel)?;
         if let (Some(edit), Some(assets), Some((_, references))) =
@@ -606,7 +620,7 @@ impl MossImage {
             state.report = Some(report);
         }
         state.apply_reports = apply_reports;
-        Ok(output)
+        Ok((output, pag_report))
     }
 
     /// Validate the request, select its immutable sources and check the structural peak (plus
@@ -967,6 +981,7 @@ fn publish_edit_report(
 ) -> Result<()> {
     assets.ensure_unchanged()?;
     check(cancel)?;
+    let pag = report.pag().cloned();
     let receipt = edit_report.insert(MossImageEditExecutionReport {
         base: report,
         adapter_path: assets.path().to_path_buf(),
@@ -979,7 +994,7 @@ fn publish_edit_report(
         references,
         reference_max_edge: edit.reference_max_edge,
         use_kv_cache: edit.use_kv_cache,
-        pag: None,
+        pag,
     });
     receipt.validate()?;
     apply_reports.push(gen_core::AdapterApplyReport {
@@ -1006,18 +1021,26 @@ impl MossImageAdvancedGenerator for MossImage {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedMossImageAdvanced> {
-        let (output, execution) =
+        let (output, _, execution) =
             self.execute_with_execution(request, inputs, on_progress, None)?;
         gen_core::generator::CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
 }
 impl Generator for MossImage {
+    fn generate_with_report(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.generate_with_execution_report(request, on_progress)
+            .map(|completed| completed.generation)
+    }
     fn generate_with_execution_report(
         &self,
         request: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-        let (output, execution) = self.execute_with_execution(
+        let (output, pag, execution) = self.execute_with_execution(
             request,
             MossImageAdvancedInputs::default(),
             progress,
@@ -1026,11 +1049,9 @@ impl Generator for MossImage {
         let MossImageAdvancedOutput::Images(images) = output else {
             unreachable!("default image output")
         };
-        gen_core::generator::CompletedGeneration::new(
-            gen_core::GenerationReport::from_output(GenerationOutput::Images(images)),
-            execution,
-            &self.descriptor,
-        )
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = pag;
+        gen_core::generator::CompletedGeneration::new(report, execution, &self.descriptor)
     }
     fn generate_moss_image_edit(
         &self,
@@ -1062,7 +1083,7 @@ impl Generator for MossImage {
         }
         inputs.validate()?;
         let request = edit_request(request)?;
-        let (output, execution) =
+        let (output, _, execution) =
             self.execute_with_execution(&request, inputs.advanced, progress, Some(inputs))?;
         gen_core::generator::CompletedMossImageEdit::new(output, execution, &self.descriptor)
     }
@@ -1341,6 +1362,15 @@ mod cpu_tests {
             assert!(descriptor.capabilities.conditioning.is_empty());
             assert!(descriptor.capabilities.supports_lora);
             assert!(descriptor.capabilities.supports_lokr);
+            let pag_cap = descriptor
+                .capabilities
+                .pag
+                .as_ref()
+                .expect("MOSS PAG capability");
+            assert_eq!(pag_cap, &moss_image_pag_capability());
+            assert_eq!(pag_cap.num_blocks, 42);
+            assert_eq!(pag_cap.default_layers, vec![20]);
+            assert!(gen_core::registry::model_descriptor_errors(&descriptor).is_empty());
             assert!(descriptor
                 .capabilities
                 .validate_request(
@@ -1353,6 +1383,37 @@ mod cpu_tests {
                     }
                 )
                 .is_ok());
+            let noop = GenerationRequest {
+                width: 16,
+                height: 32,
+                pag: Some(gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![0, 20, 41]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                descriptor
+                    .capabilities
+                    .resolve_pag(descriptor.id, &noop)
+                    .unwrap(),
+                None
+            );
+            let bad_layer = GenerationRequest {
+                width: 16,
+                height: 32,
+                pag: Some(gen_core::PagConfig {
+                    scale: 2.0,
+                    layers: Some(vec![42]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(descriptor
+                .capabilities
+                .validate_request(descriptor.id, &bad_layer)
+                .is_err());
         }
         let request = GenerationRequest {
             steps: Some(8),
@@ -1364,6 +1425,226 @@ mod cpu_tests {
                 .acceleration,
             MossImageAcceleration::Off
         );
+    }
+
+    #[test]
+    fn pag_attention_perturbs_video_and_preserves_text_and_edit_reference_kv_cpu() {
+        const CHILD: &str = "MOSS_PAG_ATTENTION_CPU_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model::cpu_tests::pag_attention_perturbs_video_and_preserves_text_and_edit_reference_kv_cpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "CPU PAG attention child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            use crate::pipeline::logical_f32_readback;
+            use crate::transformer::{attention, edit_body_attention, rope, Geometry};
+            use mlx_gen::attention::slice_axis;
+            use mlx_rs::Dtype;
+
+            let g = Geometry {
+                dim: 16,
+                ffn: 24,
+                heads: 2,
+                layers: 2,
+                text: 12,
+                freq: 8,
+                channels: 4,
+            };
+            let cancel = CancelFlag::new();
+            let make = |n: usize, offset: usize, shape: &[i32], dtype: Dtype| {
+                let vals: Vec<f32> = (0..n)
+                    .map(|i| (((i * 11 + offset) % 37) as f32 - 18.0) / 16.0)
+                    .collect();
+                Array::from_slice(&vals, shape).as_dtype(dtype).unwrap()
+            };
+
+            // 1. T2I sequence [video (2), text (3)], total seq = 5.
+            let (video_len, text_len, seq_len) = (2_i32, 3_i32, 5_i32);
+            let r = rope(1, 2, text_len, g.dim / g.heads).unwrap();
+            for (qk_dtype, v_dtype) in [
+                (Dtype::Bfloat16, Dtype::Bfloat16),
+                (Dtype::Float32, Dtype::Bfloat16),
+                (Dtype::Float32, Dtype::Float32),
+            ] {
+                let q = make(
+                    (seq_len * g.dim) as usize,
+                    1,
+                    &[1, seq_len, g.dim],
+                    qk_dtype,
+                );
+                let k = make(
+                    (seq_len * g.dim) as usize,
+                    5,
+                    &[1, seq_len, g.dim],
+                    qk_dtype,
+                );
+                let v = make(
+                    (seq_len * g.dim) as usize,
+                    13,
+                    &[1, seq_len, g.dim],
+                    v_dtype,
+                );
+                let r_cast = r.as_dtype(v_dtype).unwrap();
+                let unperturbed =
+                    attention(&q, &k, &v, &r_cast, &g, &cancel, false, false, None).unwrap();
+                let perturbed = attention(
+                    &q,
+                    &k,
+                    &v,
+                    &r_cast,
+                    &g,
+                    &cancel,
+                    false,
+                    false,
+                    Some(video_len),
+                )
+                .unwrap();
+                assert_eq!(perturbed.shape(), &[1, seq_len, g.dim]);
+                assert_eq!(perturbed.dtype(), v_dtype);
+                // Video slice 0..video_len receives v_video directly (distinct from full SDPA).
+                let got_video =
+                    logical_f32_readback(&slice_axis(&perturbed, 1, 0, video_len).unwrap())
+                        .unwrap();
+                let expected_video =
+                    logical_f32_readback(&slice_axis(&v, 1, 0, video_len).unwrap()).unwrap();
+                let unperturbed_video =
+                    logical_f32_readback(&slice_axis(&unperturbed, 1, 0, video_len).unwrap())
+                        .unwrap();
+                assert_eq!(got_video, expected_video);
+                assert_ne!(got_video, unperturbed_video);
+                // Text slice video_len..seq_len matches normal SDPA bit-for-bit.
+                let got_text =
+                    logical_f32_readback(&slice_axis(&perturbed, 1, video_len, text_len).unwrap())
+                        .unwrap();
+                let expected_text = logical_f32_readback(
+                    &slice_axis(&unperturbed, 1, video_len, text_len).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    got_text.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected_text
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    attention(&q, &k, &v, &r_cast, &g, &cancel, false, false, Some(6)).is_err()
+                );
+            }
+
+            // 2. Edit body sequence [text (3), video (4)] (q_len = 7) with reference_kv (5)
+            // spliced in the middle: K_all/V_all = [text_kv (3), ref_kv (5), video_kv (4)] (12).
+            let head_dim = g.dim / g.heads;
+            let (edit_text, edit_video, ref_len) = (3_i32, 4_i32, 5_i32);
+            let q_len = edit_text + edit_video;
+            for dtype in [Dtype::Bfloat16, Dtype::Float32] {
+                let q = make(
+                    (g.heads * q_len * head_dim) as usize,
+                    3,
+                    &[1, g.heads, q_len, head_dim],
+                    dtype,
+                );
+                let k = make(
+                    (g.heads * q_len * head_dim) as usize,
+                    7,
+                    &[1, g.heads, q_len, head_dim],
+                    dtype,
+                );
+                let v = make(
+                    (g.heads * q_len * head_dim) as usize,
+                    19,
+                    &[1, g.heads, q_len, head_dim],
+                    dtype,
+                );
+                let ref_a = (
+                    make(
+                        (g.heads * ref_len * head_dim) as usize,
+                        23,
+                        &[1, g.heads, ref_len, head_dim],
+                        dtype,
+                    ),
+                    make(
+                        (g.heads * ref_len * head_dim) as usize,
+                        29,
+                        &[1, g.heads, ref_len, head_dim],
+                        dtype,
+                    ),
+                );
+                let ref_b = (
+                    make(
+                        (g.heads * ref_len * head_dim) as usize,
+                        31,
+                        &[1, g.heads, ref_len, head_dim],
+                        dtype,
+                    ),
+                    make(
+                        (g.heads * ref_len * head_dim) as usize,
+                        41,
+                        &[1, g.heads, ref_len, head_dim],
+                        dtype,
+                    ),
+                );
+                let normal_a =
+                    edit_body_attention(&q, &k, &v, &ref_a, edit_text, false, &g, &cancel).unwrap();
+                let normal_b =
+                    edit_body_attention(&q, &k, &v, &ref_b, edit_text, false, &g, &cancel).unwrap();
+                let pert_a =
+                    edit_body_attention(&q, &k, &v, &ref_a, edit_text, true, &g, &cancel).unwrap();
+                let pert_b =
+                    edit_body_attention(&q, &k, &v, &ref_b, edit_text, true, &g, &cancel).unwrap();
+                assert_eq!(pert_a.shape(), &[1, g.heads, q_len, head_dim]);
+                assert_eq!(pert_a.dtype(), dtype);
+
+                // Unperturbed block retains full reference KV attention on both text and video.
+                assert_ne!(
+                    logical_f32_readback(&slice_axis(&normal_a, 2, edit_text, edit_video).unwrap())
+                        .unwrap(),
+                    logical_f32_readback(&slice_axis(&normal_b, 2, edit_text, edit_video).unwrap())
+                        .unwrap()
+                );
+
+                // Perturbed block preserves Q_text over [text_kv, reference_kv, video_kv]...
+                let pert_text_a =
+                    logical_f32_readback(&slice_axis(&pert_a, 2, 0, edit_text).unwrap()).unwrap();
+                let norm_text_a =
+                    logical_f32_readback(&slice_axis(&normal_a, 2, 0, edit_text).unwrap()).unwrap();
+                let pert_text_b =
+                    logical_f32_readback(&slice_axis(&pert_b, 2, 0, edit_text).unwrap()).unwrap();
+                assert_eq!(
+                    pert_text_a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    norm_text_a.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+                assert_ne!(pert_text_a, pert_text_b);
+
+                // ...and replaces Q_video with exact target-length V_video (independent of ref_kv).
+                let pert_vid_a =
+                    logical_f32_readback(&slice_axis(&pert_a, 2, edit_text, edit_video).unwrap())
+                        .unwrap();
+                let pert_vid_b =
+                    logical_f32_readback(&slice_axis(&pert_b, 2, edit_text, edit_video).unwrap())
+                        .unwrap();
+                let expected_vid =
+                    logical_f32_readback(&slice_axis(&v, 2, edit_text, edit_video).unwrap())
+                        .unwrap();
+                assert_eq!(pert_vid_a, expected_vid);
+                assert_eq!(pert_vid_b, expected_vid);
+            }
+        });
     }
 }
 

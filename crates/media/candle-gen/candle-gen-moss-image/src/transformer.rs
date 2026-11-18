@@ -386,8 +386,45 @@ fn attention_value_operand(v: &Tensor, heads: usize) -> Result<Tensor> {
         .contiguous()?)
 }
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Result<Tensor> {
+    attention_with_pag(q, k, v, r, heads, None)
+}
+pub(crate) fn attention_with_pag(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    r: &Tensor,
+    heads: usize,
+    perturbed_video_len: Option<usize>,
+) -> Result<Tensor> {
     let (b, s, d) = q.dims3()?;
     let output_dtype = v.dtype();
+    if let Some(video_len) = perturbed_video_len {
+        if video_len > s {
+            return Err(CandleError::Msg(
+                "MOSS PAG video token length out of bounds".into(),
+            ));
+        }
+        let v_video = v.narrow(1, 0, video_len)?;
+        let text_len = s - video_len;
+        if text_len == 0 {
+            return Ok(v_video.contiguous()?);
+        }
+        let (qh, kt) = attention_qk_operands(q, k, output_dtype, r, heads)?;
+        let vh = attention_value_operand(v, heads)?;
+        let qh_text = qh.narrow(2, video_len, text_len)?.contiguous()?;
+        let scores = (qh_text.matmul(&kt)? / ((d / heads) as f64).sqrt())?;
+        let p = if scores.track_op() {
+            candle_nn::ops::softmax(&scores, candle_gen::candle_core::D::Minus1)?
+        } else {
+            candle_nn::ops::softmax_last_dim(&scores)?
+        };
+        let attn_text = p
+            .matmul(&vh)?
+            .to_dtype(output_dtype)?
+            .transpose(1, 2)?
+            .reshape((b, text_len, d))?;
+        return Ok(Tensor::cat(&[&v_video, &attn_text], 1)?);
+    }
     // Explicit FP32 score and value accumulation, then round to the activation dtype.
     let (qh, kt) = attention_qk_operands(q, k, output_dtype, r, heads)?;
     let vh = attention_value_operand(v, heads)?;
@@ -541,6 +578,15 @@ impl Block {
         })
     }
     fn forward(&self, x: &Tensor, r: &Tensor, m: &Tensor) -> Result<Tensor> {
+        self.forward_with_pag(x, r, m, None)
+    }
+    fn forward_with_pag(
+        &self,
+        x: &Tensor,
+        r: &Tensor,
+        m: &Tensor,
+        perturbed_video_len: Option<usize>,
+    ) -> Result<Tensor> {
         let part = |i| m.i((.., i, ..))?.unsqueeze(1);
         let dtype = if x.dtype() == DType::F32 || m.dtype() == DType::F32 {
             DType::F32
@@ -575,7 +621,14 @@ impl Block {
             .kn
             .forward(&k.reshape((b, s, self.heads, d / self.heads))?)?
             .reshape((b, s, d))?;
-        let projected = self.o.forward(&attention(&q, &k, &v, r, self.heads)?)?;
+        let projected = self.o.forward(&attention_with_pag(
+            &q,
+            &k,
+            &v,
+            r,
+            self.heads,
+            perturbed_video_len,
+        )?)?;
         // Selective custom targets can widen Q without widening O (or vice versa). Promote
         // the actual multiplication/addition operands, never infer O's dtype from Q.
         let promoted = |a: DType, b: DType| {
@@ -1188,6 +1241,20 @@ impl Transformer {
         skip: &[u32],
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
+        self.forward_with_pag(x, time, context, mask, skip, &[], cancel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_pag(
+        &self,
+        x: &Tensor,
+        time: f32,
+        context: &Tensor,
+        mask: &[u8],
+        skip: &[u32],
+        pag_layers: &[u32],
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
         check_cancel(cancel)?;
         let (batch, c, h, w) = x.dims4()?;
         let (cb, s, td) = context.dims3()?;
@@ -1196,9 +1263,11 @@ impl Transformer {
             || td != self.g.text
             || mask.len() != batch * s
             || skip.iter().any(|i| *i as usize >= self.g.layers)
+            || pag_layers.iter().any(|i| *i as usize >= self.g.layers)
         {
             return Err(CandleError::Msg("MOSS forward geometry/mask/skip".into()));
         }
+        let video_len = h * w;
         let features = if self.g.freq == 256 {
             gen_core_moss_image::moss_image::moss_time_features(time)?.to_vec()
         } else {
@@ -1243,7 +1312,7 @@ impl Transformer {
             )?;
             let video = x
                 .narrow(0, b, 1)?
-                .reshape((1, c, h * w))?
+                .reshape((1, c, video_len))?
                 .transpose(1, 2)?
                 .to_dtype(self.video.dtype())?
                 .contiguous()?;
@@ -1259,7 +1328,7 @@ impl Transformer {
             let mut text = self.project_context(&ctx)?;
             for block in &self.text_blocks {
                 check_cancel(cancel)?;
-                text = block.forward(&text, &r.narrow(1, h * w, indices.len())?)?;
+                text = block.forward(&text, &r.narrow(1, video_len, indices.len())?)?;
                 x.device().synchronize()?;
                 check_cancel(cancel)?;
             }
@@ -1267,14 +1336,15 @@ impl Transformer {
             for (i, block) in self.layers.iter().enumerate() {
                 check_cancel(cancel)?;
                 if !skip.contains(&(i as u32)) {
-                    y = block.forward(&y, &r, &m)?;
+                    let perturbed = pag_layers.contains(&(i as u32)).then_some(video_len);
+                    y = block.forward_with_pag(&y, &r, &m, perturbed)?;
                     x.device().synchronize()?;
                     check_cancel(cancel)?;
                 }
             }
             let y = self
                 .norm
-                .forward(&y.narrow(1, 0, h * w)?.to_dtype(self.norm.0.dtype())?)?;
+                .forward(&y.narrow(1, 0, video_len)?.to_dtype(self.norm.0.dtype())?)?;
             let dtype = if y.dtype() == DType::F32 || head.dtype() == DType::F32 {
                 DType::F32
             } else {
@@ -1399,6 +1469,95 @@ mod attention_layout_tests {
                     assert_eq!(operand.dtype(), DType::F32);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn pag_attention_perturbs_video_and_preserves_text_and_edit_reference_kv() {
+        let flatten = |x: &Tensor| {
+            x.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        for batch in [1, 2] {
+            for (qk_dtype, value_dtype, rope_dtype) in policies() {
+                let (q, k, v, r) = inputs(&Device::Cpu, batch, qk_dtype, value_dtype, rope_dtype);
+                let normal = attention(&q, &k, &v, &r, HEADS).unwrap();
+                let perturbed = attention_with_pag(&q, &k, &v, &r, HEADS, Some(2)).unwrap();
+                assert_eq!(perturbed.dims(), [batch, SEQUENCE, HEADS * WIDTH]);
+                assert_eq!(perturbed.dtype(), value_dtype);
+                assert_eq!(
+                    flatten(&perturbed.narrow(1, 0, 2).unwrap()),
+                    flatten(&v.narrow(1, 0, 2).unwrap()),
+                    "T2I video query slice must bypass spatial SDPA and receive v_video"
+                );
+                assert_eq!(
+                    flatten(&perturbed.narrow(1, 2, 3).unwrap()),
+                    flatten(&normal.narrow(1, 2, 3).unwrap()),
+                    "T2I text query slice must retain full SDPA over [video, text]"
+                );
+                assert_ne!(
+                    flatten(&perturbed.narrow(1, 0, 2).unwrap()),
+                    flatten(&normal.narrow(1, 0, 2).unwrap())
+                );
+                assert!(attention_with_pag(&q, &k, &v, &r, HEADS, Some(6)).is_err());
+            }
+        }
+
+        // Edit body queries are [text (3), video (4)], while K/V splice reference (5) in middle:
+        // K_all = [text_kv, reference_kv, video_kv], V_all = [text_v, reference_v, video_v].
+        for dtype in [DType::BF16, DType::F32] {
+            let make_4d = |seq: usize, offset: usize| {
+                let values: Vec<f32> = (0..HEADS * seq * WIDTH)
+                    .map(|i| (((i * 11 + offset) % 31) as f32 - 15.) / 16.)
+                    .collect();
+                Tensor::from_vec(values, (1, HEADS, seq, WIDTH), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let q = make_4d(7, 1);
+            let k = make_4d(7, 5);
+            let v = make_4d(7, 9);
+            let ref_kv_a = (make_4d(5, 13), make_4d(5, 17));
+            let ref_kv_b = (make_4d(5, 21), make_4d(5, 25));
+
+            let normal_a = edit::edit_body_attention(&q, &k, &v, &ref_kv_a, 3, false).unwrap();
+            let normal_b = edit::edit_body_attention(&q, &k, &v, &ref_kv_b, 3, false).unwrap();
+            let pert_a = edit::edit_body_attention(&q, &k, &v, &ref_kv_a, 3, true).unwrap();
+            let pert_b = edit::edit_body_attention(&q, &k, &v, &ref_kv_b, 3, true).unwrap();
+
+            assert_eq!(pert_a.dims(), [1, HEADS, 7, WIDTH]);
+            assert_eq!(pert_a.dtype(), dtype);
+            assert_eq!(
+                flatten(&pert_a.narrow(2, 0, 3).unwrap()),
+                flatten(&normal_a.narrow(2, 0, 3).unwrap()),
+                "Edit text queries must retain full attention over [text_kv, ref_kv, video_kv]"
+            );
+            assert_ne!(
+                flatten(&pert_a.narrow(2, 0, 3).unwrap()),
+                flatten(&pert_b.narrow(2, 0, 3).unwrap()),
+                "Edit text queries must continue to attend to cached reference_kv"
+            );
+            assert_eq!(
+                flatten(&pert_a.narrow(2, 3, 4).unwrap()),
+                flatten(&v.narrow(2, 3, 4).unwrap()),
+                "Edit video queries must receive target-length v_video without shape mismatch"
+            );
+            assert_eq!(
+                flatten(&pert_a.narrow(2, 3, 4).unwrap()),
+                flatten(&pert_b.narrow(2, 3, 4).unwrap()),
+                "Edit perturbed video queries must be independent of reference_kv"
+            );
+            assert_ne!(
+                flatten(&normal_a.narrow(2, 3, 4).unwrap()),
+                flatten(&normal_b.narrow(2, 3, 4).unwrap()),
+                "Unperturbed edit blocks must attend to cached reference_kv on video queries"
+            );
+            assert!(edit::edit_body_attention(&q, &k, &v, &ref_kv_a, 8, true).is_err());
         }
     }
 

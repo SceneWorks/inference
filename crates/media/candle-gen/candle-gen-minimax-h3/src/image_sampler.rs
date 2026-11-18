@@ -33,6 +33,7 @@ impl H3ImageStepOps for CandleStepOps<'_> {
     }
 
     fn gaussian_like(&mut self, like: &Tensor, seed: u64) -> Result<Tensor> {
+        candle_gen::execution::stream("h3_image_lcm_step_noise", seed);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         Ok(Tensor::from_vec(
             seeded_normal_vec(&mut rng, like.elem_count()),

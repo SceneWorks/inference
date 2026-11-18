@@ -143,6 +143,7 @@ pub fn descriptor() -> ModelDescriptor {
             // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
             samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
             supports_h3_image_sampler: true,
+            pag: Some(mlx_gen::gen_core::h3_image::minimax_h3_image_pag_capability()),
             ..Default::default()
         },
     }
@@ -657,11 +658,16 @@ impl MiniMaxH3Image {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(IMAGE_MODEL_ID, req)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        let retries_before = mlx_gen::coherence::retries();
         // Resolved before any weight maps, so an unadmitted geometry or window is a request error.
         let tiling = decode_tiling_for(req)?;
         let window = self.requested_transformer_window(req)?;
@@ -679,6 +685,19 @@ impl MiniMaxH3Image {
 
         let references = edit_reference_images(&req.conditioning)
             .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+        mlx_gen::image_execution::policy(
+            "h3_image_residency",
+            serde_json::json!({
+                "transformer_window": window,
+                "dtype": format!("{:?}", self.dtype),
+                "canvas": [canvas_w, canvas_h],
+                "reference_count": references.len(),
+            }),
+        );
+        mlx_gen::image_execution::policy_debug("h3_image_decode_tiling", &tiling);
+        if let Some(pag) = resolved_pag.as_ref() {
+            mlx_gen::image_execution::policy_debug("h3_image_pag", pag);
+        }
         let patch = crate::dit::config::MiniMaxH3ImageDitConfig::default()
             .base
             .patch_size;
@@ -804,13 +823,53 @@ impl MiniMaxH3Image {
             };
             let done = n * steps;
             // Image `n`'s LCM noise is seeded from its own seed, like its initial latent.
-            let rows =
-                denoiser.denoise_with(&sampler, image_seed, &packed, &req.cancel, &mut |s| {
+            let rows = denoiser.denoise_with_pag(
+                &sampler,
+                resolved_pag.as_ref(),
+                image_seed,
+                &packed,
+                &req.cancel,
+                &mut |s| {
                     on_progress(Progress::Step {
                         current: done + s as u32,
                         total,
                     })
-                })?;
+                },
+            )?;
+            let rng_scheme = match sampler {
+                mlx_gen::gen_core::h3_image::H3ImageSampler::Euler => {
+                    "mlx-keyed-normal-v1;initial=image_seed;ref_posterior=seed*phi+(0<<32)+(i+1);ref_aug=image_seed*phi+(1<<32)+(i+1)"
+                }
+                mlx_gen::gen_core::h3_image::H3ImageSampler::Lcm { .. } => {
+                    "mlx-keyed-normal-v1;initial=image_seed;ref_posterior=seed*phi+(0<<32)+(i+1);ref_aug=image_seed*phi+(1<<32)+(i+1);step=lcm_noise_seed(image_seed,step)"
+                }
+            };
+            let sampler_fact = match sampler {
+                mlx_gen::gen_core::h3_image::H3ImageSampler::Euler => serde_json::json!({
+                    "solver": "euler",
+                    "timestep_convention": "velocity",
+                    "latent_dtype": "Float32",
+                    "rng_scheme": rng_scheme,
+                }),
+                mlx_gen::gen_core::h3_image::H3ImageSampler::Lcm {
+                    s_noise,
+                    s_noise_end,
+                    noise_clip_std,
+                } => serde_json::json!({
+                    "solver": "lcm",
+                    "s_noise_bits": s_noise.to_bits(),
+                    "s_noise_end_bits": s_noise_end.to_bits(),
+                    "noise_clip_std_bits": noise_clip_std.to_bits(),
+                    "timestep_convention": "velocity",
+                    "latent_dtype": "Float32",
+                    "rng_scheme": rng_scheme,
+                }),
+            };
+            mlx_gen::image_execution::sampled(
+                sampler_fact,
+                &mlx_gen::gen_core::h3_image::sampler_sigmas(),
+                image_seed,
+            );
             let rows = denoiser.generated_rows(&rows)?;
             let latent = unpatchify_video_rows(
                 &rows,
@@ -850,7 +909,20 @@ impl MiniMaxH3Image {
             )?);
         }
         release((vae, latents));
-        Ok(GenerationOutput::Images(images))
+        let retries = mlx_gen::coherence::retries().saturating_sub(retries_before);
+        let mut report =
+            mlx_gen::gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = resolved_pag.as_ref().map(|pag| pag.execution_report(steps));
+        if retries != 0 {
+            report.warnings.push(mlx_gen::gen_core::GenerationWarning {
+                code: crate::model::GPU_VISIBILITY_RECOVERED.to_owned(),
+                message: format!(
+                    "GPU weight visibility recovered after {retries} verification retries; \
+                     generation was not retried"
+                ),
+            });
+        }
+        Ok(report)
     }
 }
 
@@ -868,7 +940,51 @@ impl Generator for MiniMaxH3Image {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| {
+            let report = self.generate_impl(req, on_progress)?;
+            report.output.ok_or_else(|| {
+                Error::Msg(format!("{IMAGE_MODEL_ID}: the render produced no output"))
+            })
+        })
+        .map_err(Into::into)
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| self.generate_impl(req, on_progress))
+            .map_err(Into::into)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "MiniMaxH3Image.load_shape",
+                    &self.load_shape,
+                );
+                mlx_gen::image_execution::policy_debug("MiniMaxH3Image.dtype", &self.dtype);
+                mlx_gen::image_execution::policy_debug(
+                    "MiniMaxH3Image.memory_tier",
+                    &self.memory_tier,
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "MiniMaxH3Image.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_impl(req, &mut progress).map_err(Into::into)
+            },
+        )
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1241,5 +1357,111 @@ mod tests {
         assert_ne!(draw(7, 0, 0), draw(7, 1, 0));
         assert_ne!(draw(7, 0, 0), draw(7, 0, 1));
         assert_ne!(draw(7, 0, 0), draw(8, 0, 0));
+    }
+
+    #[test]
+    fn pag_capability_validates_blocks_zero_to_49_while_preserving_no_cfg_contract() {
+        let d = descriptor();
+        assert!(mlx_gen::gen_core::registry::model_descriptor_errors(&d).is_empty());
+        assert!(!d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        let pag_cap = d.capabilities.pag.as_ref().expect("PAG advertised");
+        assert_eq!(
+            pag_cap,
+            &mlx_gen::gen_core::h3_image::minimax_h3_image_pag_capability()
+        );
+        assert_eq!(pag_cap.num_blocks, 50);
+        assert_eq!(pag_cap.default_layers, vec![25]);
+
+        // T2I and 1..=16 reference edit accept active PAG while keeping guidance=1.0 / no negative prompt.
+        let t2i_pag = GenerationRequest {
+            guidance: Some(1.0),
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: pag_cap.recommended_scale,
+                ..Default::default()
+            }),
+            ..req(2048, 2048)
+        };
+        validate_request(&d.capabilities, &t2i_pag).unwrap();
+        let resolved = d
+            .capabilities
+            .resolve_pag(IMAGE_MODEL_ID, &t2i_pag)
+            .unwrap()
+            .expect("active PAG");
+        assert_eq!(resolved.layers, vec![25]);
+        assert_eq!(resolved.active_steps(FIXED_STEPS), 4);
+        assert_eq!(
+            resolved.execution_report(FIXED_STEPS),
+            mlx_gen::gen_core::PagExecutionReport {
+                layers: vec![25],
+                active_steps: 4,
+                total_steps: FIXED_STEPS,
+                scale: 1.2,
+                adaptive_scale: 0.0,
+                start: 0.0,
+                stop: 0.66,
+            }
+        );
+
+        let mut edit_pag = with_refs(16, 64, 64);
+        edit_pag.pag = Some(mlx_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![49, 0, 25]),
+            ..Default::default()
+        });
+        validate_request(&d.capabilities, &edit_pag).unwrap();
+        assert_eq!(
+            d.capabilities
+                .resolve_pag(IMAGE_MODEL_ID, &edit_pag)
+                .unwrap()
+                .unwrap()
+                .layers,
+            vec![0, 25, 49]
+        );
+
+        // Zero scale resolves to None; block 50 is rejected even at scale 0.
+        let zero_pag = GenerationRequest {
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 0.0,
+                layers: Some(vec![25]),
+                ..Default::default()
+            }),
+            ..req(2048, 2048)
+        };
+        validate_request(&d.capabilities, &zero_pag).unwrap();
+        assert!(d
+            .capabilities
+            .resolve_pag(IMAGE_MODEL_ID, &zero_pag)
+            .unwrap()
+            .is_none());
+
+        for bad in [
+            GenerationRequest {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![50]),
+                    ..Default::default()
+                }),
+                ..req(2048, 2048)
+            },
+            GenerationRequest {
+                pag: Some(mlx_gen::gen_core::PagConfig {
+                    scale: 1.2,
+                    layers: Some(vec![50]),
+                    ..Default::default()
+                }),
+                ..req(2048, 2048)
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..t2i_pag.clone()
+            },
+            GenerationRequest {
+                negative_prompt: Some("low quality".into()),
+                ..t2i_pag
+            },
+        ] {
+            assert!(validate_request(&d.capabilities, &bad).is_err(), "{bad:?}");
+        }
     }
 }

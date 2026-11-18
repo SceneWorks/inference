@@ -623,6 +623,68 @@ impl Krea2Transformer {
         ))
     }
 
+    /// Run conditional and PAG-perturbed prepared states through one block traversal (2-pass PAG,
+    /// SW-7176). Target image tokens start at `positive.cap_len`; prefix text tokens retain normal
+    /// attention on every block.
+    pub(crate) fn forward_prepared_pag_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        perturbed_layers: &[u32],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let positive = self.joint_inputs(latent, timestep, positive)?;
+        let (cond_combined, pag_combined) = self.run_blocks_cond_and_perturbed(
+            (positive.combined.clone(), positive.combined.clone()),
+            (&positive.tvec, &positive.rcos, &positive.rsin),
+            positive.cap_len,
+            perturbed_layers,
+            window,
+            attention,
+        )?;
+        Ok((
+            self.finalize(&cond_combined, &positive.t, &positive)?,
+            self.finalize(&pag_combined, &positive.t, &positive)?,
+        ))
+    }
+
+    /// Run conditional, unconditional, and PAG-perturbed prepared states through one block
+    /// traversal (3-pass CFG + PAG, SW-7176).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_cfg_pag_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &JointPrep,
+        negative: &JointPrep,
+        perturbed_layers: &[u32],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array, Array)> {
+        let positive = self.joint_inputs(latent, timestep, positive)?;
+        let negative = self.joint_inputs(latent, timestep, negative)?;
+        let (cond_combined, uncond_combined, pag_combined) = self.run_blocks_cfg_and_perturbed(
+            (
+                positive.combined.clone(),
+                negative.combined.clone(),
+                positive.combined.clone(),
+            ),
+            (&positive.tvec, &positive.rcos, &positive.rsin),
+            (&negative.tvec, &negative.rcos, &negative.rsin),
+            positive.cap_len,
+            perturbed_layers,
+            window,
+            attention,
+        )?;
+        Ok((
+            self.finalize(&cond_combined, &positive.t, &positive)?,
+            self.finalize(&uncond_combined, &negative.t, &negative)?,
+            self.finalize(&pag_combined, &positive.t, &positive)?,
+        ))
+    }
+
     /// Prepared edit forward with the same windowing semantics as the ordinary prepared forward.
     #[cfg(test)]
     pub(crate) fn forward_prepared_edit_windowed(
@@ -711,6 +773,89 @@ impl Krea2Transformer {
         ))
     }
 
+    /// Paired conditional + PAG-perturbed Kontext edit forward with one block-window traversal
+    /// (2-pass edit PAG, SW-7176). Both `[ctx]` and `[ref_latents…]` lie inside `0..head` and keep
+    /// normal unperturbed attention; only target tokens `head..seq_len` receive `V_target`.
+    pub(crate) fn forward_prepared_edit_pag_pair_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        perturbed_layers: &[u32],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let (positive_combined, positive_t, positive_tvec) =
+            self.edit_joint_inputs(latent, timestep, positive)?;
+        let img_len = positive.ht * positive.wt;
+        let head = positive.cap_len + positive.n_refs * img_len;
+        let (cond_combined, pag_combined) = self.run_blocks_cond_and_perturbed(
+            (positive_combined.clone(), positive_combined),
+            (&positive_tvec, &positive.rcos, &positive.rsin),
+            head,
+            perturbed_layers,
+            window,
+            attention,
+        )?;
+        let finish = |combined: &Array| -> Result<Array> {
+            let out = self.final_layer(combined, &positive_t)?;
+            let img_out = split_axis1(&out, head)?.swap_remove(1);
+            unpatchify(
+                &img_out,
+                positive.ht,
+                positive.wt,
+                positive.p,
+                positive.latent_ch,
+            )
+        };
+        Ok((finish(&cond_combined)?, finish(&pag_combined)?))
+    }
+
+    /// Triple conditional + unconditional + PAG-perturbed Kontext edit forward with one
+    /// block-window traversal (3-pass edit CFG + PAG, SW-7176).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_edit_cfg_pag_windowed_budgeted(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        positive: &EditPrep,
+        negative: &EditPrep,
+        perturbed_layers: &[u32],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array, Array)> {
+        let (positive_combined, positive_t, positive_tvec) =
+            self.edit_joint_inputs(latent, timestep, positive)?;
+        let (negative_combined, negative_t, negative_tvec) =
+            self.edit_joint_inputs(latent, timestep, negative)?;
+        let pos_head = positive.cap_len + positive.n_refs * positive.ht * positive.wt;
+        let (cond_combined, uncond_combined, pag_combined) = self.run_blocks_cfg_and_perturbed(
+            (
+                positive_combined.clone(),
+                negative_combined,
+                positive_combined,
+            ),
+            (&positive_tvec, &positive.rcos, &positive.rsin),
+            (&negative_tvec, &negative.rcos, &negative.rsin),
+            pos_head,
+            perturbed_layers,
+            window,
+            attention,
+        )?;
+        let finish = |combined: &Array, t: &Array, prep: &EditPrep| -> Result<Array> {
+            let out = self.final_layer(combined, t)?;
+            let img_len = prep.ht * prep.wt;
+            let head = prep.cap_len + prep.n_refs * img_len;
+            let img_out = split_axis1(&out, head)?.swap_remove(1);
+            unpatchify(&img_out, prep.ht, prep.wt, prep.p, prep.latent_ch)
+        };
+        Ok((
+            finish(&cond_combined, &positive_t, positive)?,
+            finish(&uncond_combined, &negative_t, negative)?,
+            finish(&pag_combined, &positive_t, positive)?,
+        ))
+    }
+
     /// Pose-control forward over the same request-scoped base-block window as the ordinary routes.
     /// The control branch remains a separately-accounted resident overlay; `inject` applies its
     /// precomputed residual immediately before each matching frozen base block.
@@ -792,6 +937,172 @@ impl Krea2Transformer {
             },
             |(positive, negative): &(Array, Array)| {
                 Ok(mlx_rs::transforms::eval([positive, negative])?)
+            },
+        )
+    }
+
+    fn run_blocks_cond_and_perturbed(
+        &self,
+        mut states: (Array, Array),
+        positive: (&Array, &Array, &Array),
+        prefix_len: i32,
+        perturbed_layers: &[u32],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array)> {
+        let perturb = |index: usize| {
+            perturbed_layers
+                .binary_search(&(index as u32))
+                .is_ok()
+                .then_some(prefix_len)
+        };
+        let Some(window) = window else {
+            self.require_resident_blocks()?;
+            for block in &self.blocks {
+                states.0 = block
+                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+            }
+            // Materialize the conditional pass before constructing the 28-block perturbed graph
+            // so two full-trunk lazy MLX graphs are never retained simultaneously in GPU memory.
+            mlx_rs::transforms::eval([&states.0])?;
+            for (index, block) in self.blocks.iter().enumerate() {
+                states.1 = block.forward_budgeted_with_pag(
+                    &states.1,
+                    positive.0,
+                    positive.1,
+                    positive.2,
+                    attention,
+                    perturb(index),
+                )?;
+            }
+            return Ok(states);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.cfg.num_layers
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            states,
+            || stream.open(),
+            |mut states, view, range| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    states.0 = block.forward_budgeted(
+                        &states.0, positive.0, positive.1, positive.2, attention,
+                    )?;
+                    states.1 = block.forward_budgeted_with_pag(
+                        &states.1,
+                        positive.0,
+                        positive.1,
+                        positive.2,
+                        attention,
+                        perturb(index),
+                    )?;
+                }
+                Ok(states)
+            },
+            |(cond, perturbed): &(Array, Array)| Ok(mlx_rs::transforms::eval([cond, perturbed])?),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blocks_cfg_and_perturbed(
+        &self,
+        mut states: (Array, Array, Array),
+        positive: (&Array, &Array, &Array),
+        negative: (&Array, &Array, &Array),
+        prefix_len: i32,
+        perturbed_layers: &[u32],
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Array, Array, Array)> {
+        let perturb = |index: usize| {
+            perturbed_layers
+                .binary_search(&(index as u32))
+                .is_ok()
+                .then_some(prefix_len)
+        };
+        let Some(window) = window else {
+            self.require_resident_blocks()?;
+            for block in &self.blocks {
+                states.0 = block
+                    .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
+            }
+            // Materialize each 28-block pass before constructing the next so multiple full-trunk
+            // lazy MLX graphs are never retained simultaneously in GPU memory.
+            mlx_rs::transforms::eval([&states.0])?;
+            for block in &self.blocks {
+                states.1 = block
+                    .forward_budgeted(&states.1, negative.0, negative.1, negative.2, attention)?;
+            }
+            mlx_rs::transforms::eval([&states.1])?;
+            for (index, block) in self.blocks.iter().enumerate() {
+                states.2 = block.forward_budgeted_with_pag(
+                    &states.2,
+                    positive.0,
+                    positive.1,
+                    positive.2,
+                    attention,
+                    perturb(index),
+                )?;
+            }
+            return Ok(states);
+        };
+        let stream = self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "krea: bounded transformer residency was requested without a re-openable block stream"
+                    .to_owned(),
+            )
+        })?;
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
+            return Err(mlx_gen::Error::Msg(format!(
+                "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
+                window.plan.n_blocks(),
+                stream.n_blocks(),
+                self.cfg.num_layers
+            )));
+        }
+        mlx_gen::block_residency::run_windowed(
+            &window.plan,
+            window.cancel,
+            states,
+            || stream.open(),
+            |mut states, view, range| {
+                for index in range {
+                    let block = stream.materialize(view, index)?;
+                    states.0 = block.forward_budgeted(
+                        &states.0, positive.0, positive.1, positive.2, attention,
+                    )?;
+                    states.1 = block.forward_budgeted(
+                        &states.1, negative.0, negative.1, negative.2, attention,
+                    )?;
+                    states.2 = block.forward_budgeted_with_pag(
+                        &states.2,
+                        positive.0,
+                        positive.1,
+                        positive.2,
+                        attention,
+                        perturb(index),
+                    )?;
+                }
+                Ok(states)
+            },
+            |(cond, uncond, perturbed): &(Array, Array, Array)| {
+                Ok(mlx_rs::transforms::eval([cond, uncond, perturbed])?)
             },
         )
     }
