@@ -231,13 +231,14 @@ impl ZImageAttention {
         })
     }
 
-    fn forward_with_attention_plan(
+    fn forward_with_attention_plan_and_pag(
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         cos: &Tensor,
         sin: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag_x_len: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
@@ -263,7 +264,9 @@ impl ZImageAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let context = self.attention_dispatch(&q, &k, &v, attention_mask, scale, attention_plan)?;
+        let context = crate::common::apply_attention_with_pag(&q, &k, &v, pag_x_len, |q, k, v| {
+            self.attention_dispatch(q, k, v, attention_mask, scale, attention_plan)
+        })?;
 
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
         Ok(self.to_out.forward(&context)?)
@@ -314,7 +317,7 @@ impl ZImageAttention {
         mask: Option<&Tensor>,
         scale: f64,
     ) -> Result<Tensor> {
-        let sdpa_mask = self.prepare_sdpa_mask(mask, q)?;
+        let sdpa_mask = self.prepare_sdpa_mask(mask, q, k.dim(2)?)?;
         candle_gen::candle_nn::ops::sdpa(q, k, v, sdpa_mask.as_ref(), false, scale as f32, 1.0)
     }
 
@@ -349,14 +352,19 @@ impl ZImageAttention {
         )
     }
 
-    fn prepare_sdpa_mask(&self, mask: Option<&Tensor>, q: &Tensor) -> Result<Option<Tensor>> {
+    fn prepare_sdpa_mask(
+        &self,
+        mask: Option<&Tensor>,
+        q: &Tensor,
+        k_len: usize,
+    ) -> Result<Option<Tensor>> {
         match mask {
             Some(m) => {
-                let (b, _, seq_len, _) = q.dims4()?;
+                let (b, _, q_len, _) = q.dims4()?;
                 let m = m.unsqueeze(1)?.unsqueeze(2)?;
                 let m = m.to_dtype(q.dtype())?;
                 let m = ((m - 1.0)? * 1e9)?;
-                let m = m.broadcast_as((b, self.n_heads, seq_len, seq_len))?;
+                let m = m.broadcast_as((b, self.n_heads, q_len, k_len))?;
                 Ok(Some(m))
             }
             None => Ok(None),
@@ -594,6 +602,28 @@ impl ZImageTransformerBlock {
         adaln_input: Option<&Tensor>,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_with_attention_plan_and_pag(
+            x,
+            attn_mask,
+            cos,
+            sin,
+            adaln_input,
+            attention_plan,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_attention_plan_and_pag(
+        &self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        adaln_input: Option<&Tensor>,
+        attention_plan: AttentionPlan<'_>,
+        pag_x_len: Option<usize>,
+    ) -> candle_gen::Result<Tensor> {
         if let Some(ref adaln) = self.adaln_modulation {
             let adaln_input = adaln_input.expect("adaln_input required when modulation=true");
             let modulation = adaln.forward(adaln_input)?.unsqueeze(1)?;
@@ -608,12 +638,13 @@ impl ZImageTransformerBlock {
 
             let normed = __model_proof_output!(self.attention_norm1.forward(x))?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
-            let attn_out = self.attention.forward_with_attention_plan(
+            let attn_out = self.attention.forward_with_attention_plan_and_pag(
                 &scaled,
                 attn_mask,
                 cos,
                 sin,
                 attention_plan,
+                pag_x_len,
             )?;
             let attn_out = __model_proof_output!(self.attention_norm2.forward(&attn_out))?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
@@ -625,12 +656,13 @@ impl ZImageTransformerBlock {
             Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
             let normed = __model_proof_output!(self.attention_norm1.forward(x))?;
-            let attn_out = self.attention.forward_with_attention_plan(
+            let attn_out = self.attention.forward_with_attention_plan_and_pag(
                 &normed,
                 attn_mask,
                 cos,
                 sin,
                 attention_plan,
+                pag_x_len,
             )?;
             let attn_out = __model_proof_output!(self.attention_norm2.forward(&attn_out))?;
             let x = (x + attn_out)?;
@@ -1181,6 +1213,25 @@ impl ZImageTransformer2DModel {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_prepared_with_memory_and_pag(
+            x,
+            t,
+            prepared,
+            attention_plan,
+            transformer_window,
+            None,
+        )
+    }
+
+    pub(crate) fn forward_prepared_with_memory_and_pag(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        pag: Option<crate::common::PagStepContext<'_>>,
+    ) -> candle_gen::Result<Tensor> {
         let (b, c, f, h, w) = x.dims5()?;
         if (b, c, f, h, w) != prepared.geometry
             || x.dtype() != prepared.dtype
@@ -1210,14 +1261,16 @@ impl ZImageTransformer2DModel {
         let mut unified = Tensor::cat(&[&x, &prepared.cap], 1)?;
         match &self.layers {
             TransformerLayers::Resident(layers) => {
-                for layer in layers {
-                    unified = layer.forward_with_attention_plan(
+                for (i, layer) in layers.iter().enumerate() {
+                    let pag_x_len = pag.and_then(|ctx| ctx.layer_x_len(i, prepared.img_seq_len));
+                    unified = layer.forward_with_attention_plan_and_pag(
                         &unified,
                         Some(&prepared.unified_attn_mask),
                         &prepared.unified_cos,
                         &prepared.unified_sin,
                         Some(&adaln_input),
                         attention_plan,
+                        pag_x_len,
                     )?;
                 }
             }
@@ -1273,15 +1326,19 @@ impl ZImageTransformer2DModel {
                                 )?;
                             }
                         }
-                        for block in &blocks {
+                        for (offset, block) in blocks.iter().enumerate() {
                             candle_gen::check_cancel(cancel)?;
-                            state = block.forward_with_attention_plan(
+                            let index = first + offset;
+                            let pag_x_len =
+                                pag.and_then(|ctx| ctx.layer_x_len(index, prepared.img_seq_len));
+                            state = block.forward_with_attention_plan_and_pag(
                                 &state,
                                 Some(&prepared.unified_attn_mask),
                                 &prepared.unified_cos,
                                 &prepared.unified_sin,
                                 Some(&adaln_input),
                                 attention_plan,
+                                pag_x_len,
                             )?;
                         }
                         Ok(state)

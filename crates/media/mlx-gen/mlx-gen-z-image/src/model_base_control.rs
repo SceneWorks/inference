@@ -36,7 +36,7 @@ use crate::model::validate_request;
 use crate::model_base::{DEFAULT_GUIDANCE, DEFAULT_STEPS, SCHEDULE_SHIFT};
 use crate::model_control::{load_control_residency, ZImageControlHeavyOwned};
 use crate::pipeline::{
-    self, denoise_control_cfg_with_progress_and_preview, encode_control_context,
+    self, denoise_control_cfg_with_progress_preview_and_pag, encode_control_context,
     encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
@@ -83,6 +83,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            pag: Some(crate::model_base::base_pag_capability()),
             ..Default::default()
         },
     }
@@ -167,12 +168,13 @@ impl ZImageControl {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
-    fn generate_impl(
+    fn generate_report_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -305,6 +307,13 @@ impl ZImageControl {
 
                 let sampler_name = req.sampler.as_deref();
                 let neg_cap_ref = neg_cap.as_ref();
+                let resolved_pag_ref = resolved_pag.as_ref();
+                let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+                let actual_steps = scheduler
+                    .sigmas
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_sub(start) as u32;
                 let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
@@ -313,7 +322,7 @@ impl ZImageControl {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_control_cfg_with_progress_and_preview(
+                        denoise_control_cfg_with_progress_preview_and_pag(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -329,17 +338,18 @@ impl ZImageControl {
                             block_window,
                             &req.cancel,
                             &req.preview,
+                            resolved_pag_ref,
                             op,
                         )
                     },
                 )?;
-                Ok(latents)
+                Ok((latents, actual_steps))
             },
             // Materialize the latents so the control DiT is no longer held via the lazy graph, then shed.
-            |latents| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            |(latents, _steps)| Ok(mlx_rs::transforms::eval(latents.iter())?),
             // ── Phase C (decode): light (VAE) view + latents → images (no PiD on control). Tiled under
             // `Sequential`.
-            |view, latents, on_progress| {
+            |view, (latents, actual_steps), on_progress| {
                 pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
@@ -348,7 +358,12 @@ impl ZImageControl {
                     &req.cancel,
                     on_progress,
                 )?;
-                Ok(GenerationOutput::Images(images))
+                let mut report =
+                    gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                report.pag = resolved_pag
+                    .as_ref()
+                    .map(|resolved| resolved.execution_report(actual_steps));
+                Ok(report)
             },
         )?;
         Ok(images)
@@ -374,7 +389,23 @@ impl Generator for ZImageControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         mlx_gen::image_execution::without_capture(|| {
-            self.generate_impl(req, on_progress).map_err(Into::into)
+            self.generate_report_impl(req, on_progress)
+                .map_err(Into::<gen_core::Error>::into)?
+                .output
+                .ok_or_else(|| {
+                    gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
+                })
+        })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_report_impl(req, on_progress)
+                .map_err(Into::into)
         })
     }
 
@@ -383,15 +414,20 @@ impl Generator for ZImageControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
-            mlx_gen::image_execution::applied_adapter_controls(
-                "ZImageControl.applied_adapter_controls",
-                &self.adapters,
-            );
-            let mut progress =
-                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-            self.generate_impl(req, &mut progress).map_err(Into::into)
-        })
+        mlx_gen::image_execution::complete_image_report_attempt(
+            &self.descriptor,
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "ZImageControl.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_report_impl(req, &mut progress)
+                    .map_err(Into::into)
+            },
+        )
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -543,5 +579,14 @@ mod tests {
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }
+    }
+
+    #[test]
+    fn base_control_descriptor_advertises_base_pag_capability() {
+        let d = descriptor();
+        assert_eq!(
+            d.capabilities.pag.as_ref(),
+            Some(&crate::model_base::base_pag_capability())
+        );
     }
 }

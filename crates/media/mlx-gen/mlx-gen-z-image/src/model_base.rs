@@ -33,7 +33,7 @@ use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma};
 
 use crate::model::{validate_request, ZImageHeavyOwned};
 use crate::pipeline::{
-    self, denoise_cfg_with_progress_and_preview, encode_init_latents, init_time_step,
+    self, denoise_cfg_with_progress_preview_and_pag, encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 
@@ -57,6 +57,19 @@ pub const MODEL_ID: &str = "z_image";
 /// PiD backbone tag for the base Z-Image (epic 7840). Identical VAE latent space to Turbo (Flux1-dev's
 /// 16-ch VAE), so it reuses the same `flux` PiD student via the `zimage-turbo` registry alias.
 pub const PID_BACKBONE: &str = "zimage-turbo";
+
+/// Perturbed-Attention Guidance (PAG) capability descriptor for base (non-Turbo) Z-Image.
+pub fn base_pag_capability() -> gen_core::PagCapability {
+    gen_core::PagCapability {
+        num_blocks: 30,
+        block_domain: std::borrow::Cow::Borrowed("layers"),
+        default_layers: vec![15],
+        default_start: 0.0,
+        default_stop: 1.0,
+        recommended_scale: 1.5,
+        max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
+    }
+}
 
 /// Base Z-Image's identity + capabilities — constructible without loading weights. Unlike Turbo, the
 /// base is a non-distilled foundation model: real CFG (guidance + negative prompt) is supported.
@@ -94,6 +107,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            pag: Some(base_pag_capability()),
             ..Default::default()
         },
     }
@@ -166,7 +180,23 @@ impl Generator for ZImage {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         mlx_gen::image_execution::without_capture(|| {
-            self.generate_impl(req, on_progress).map_err(Into::into)
+            self.generate_report_impl(req, on_progress)
+                .map_err(Into::<gen_core::Error>::into)?
+                .output
+                .ok_or_else(|| {
+                    gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
+                })
+        })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_report_impl(req, on_progress)
+                .map_err(Into::into)
         })
     }
 
@@ -175,15 +205,20 @@ impl Generator for ZImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
-            mlx_gen::image_execution::applied_adapter_controls(
-                "ZImage.applied_adapter_controls",
-                &self.adapters,
-            );
-            let mut progress =
-                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-            self.generate_impl(req, &mut progress).map_err(Into::into)
-        })
+        mlx_gen::image_execution::complete_image_report_attempt(
+            &self.descriptor,
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "ZImage.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_report_impl(req, &mut progress)
+                    .map_err(Into::into)
+            },
+        )
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -218,12 +253,13 @@ impl ZImage {
     /// [`Residency::run`] seam (sc-11124), which owns the eval/drop/clear discipline, the
     /// stage-boundary cancel checks, and the error-safe cache flush — identically to the Turbo
     /// flagship. Base delta vs Turbo: real CFG (a negative-prompt uncond branch) and no bf16 cap cast.
-    fn generate_impl(
+    fn generate_report_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -362,6 +398,13 @@ impl ZImage {
 
                 let sampler_name = req.sampler.as_deref();
                 let neg_cap_ref = neg_cap.as_ref();
+                let resolved_pag_ref = resolved_pag.as_ref();
+                let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+                let actual_steps = scheduler
+                    .sigmas
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_sub(start) as u32;
                 let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
@@ -370,7 +413,7 @@ impl ZImage {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_cfg_with_progress_and_preview(
+                        denoise_cfg_with_progress_preview_and_pag(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
@@ -384,16 +427,17 @@ impl ZImage {
                             block_window,
                             &req.cancel,
                             &req.preview,
+                            resolved_pag_ref,
                             op,
                         )
                     },
                 )?;
-                Ok((latents, pid_decoder))
+                Ok((latents, pid_decoder, actual_steps))
             },
             // Materialize the latents so the DiT is no longer held via the lazy graph, then it is shed.
             |mid| Ok(mlx_rs::transforms::eval(mid.0.iter())?),
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
-            |view, (latents, pid_decoder), on_progress| {
+            |view, (latents, pid_decoder, actual_steps), on_progress| {
                 pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let decoder: &dyn LatentDecoder = pid_decoder
                     .as_ref()
@@ -406,7 +450,12 @@ impl ZImage {
                     &req.cancel,
                     on_progress,
                 )?;
-                Ok(GenerationOutput::Images(images))
+                let mut report =
+                    gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                report.pag = resolved_pag
+                    .as_ref()
+                    .map(|resolved| resolved.execution_report(actual_steps));
+                Ok(report)
             },
         )?;
         Ok(images)
@@ -546,5 +595,47 @@ mod tests {
                 "{policy:?} must begin with no warm request-scoped pair"
             );
         }
+    }
+
+    #[test]
+    fn base_pag_capability_and_validation_match_contract() {
+        let cap = base_pag_capability();
+        assert_eq!(cap.num_blocks, 30);
+        assert_eq!(cap.block_domain, "layers");
+        assert_eq!(cap.default_layers, vec![15]);
+        assert_eq!(cap.default_start, 0.0);
+        assert_eq!(cap.default_stop, 1.0);
+        assert_eq!(cap.recommended_scale, 1.5);
+        assert_eq!(cap.max_scale, gen_core::DEFAULT_PAG_MAX_SCALE);
+
+        let d = descriptor();
+        assert_eq!(d.capabilities.pag.as_ref(), Some(&cap));
+
+        let active = GenerationRequest {
+            prompt: "a fox".into(),
+            pag: Some(gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(MODEL_ID, &d.capabilities, &active).is_ok());
+        let resolved = d
+            .capabilities
+            .resolve_pag(MODEL_ID, &active)
+            .unwrap()
+            .expect("active PAG resolves");
+        assert_eq!(resolved.execution_report(50).active_steps, 50);
+
+        let noop = GenerationRequest {
+            prompt: "a fox".into(),
+            pag: Some(gen_core::PagConfig {
+                scale: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(MODEL_ID, &d.capabilities, &noop).is_ok());
+        assert_eq!(d.capabilities.resolve_pag(MODEL_ID, &noop).unwrap(), None);
     }
 }

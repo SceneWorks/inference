@@ -399,6 +399,84 @@ pub(crate) fn decoded_to_image(decoded: &Tensor) -> Result<Image> {
     })
 }
 
+/// Split lengths for a Z-Image unified `[x_emb ; cap_emb]` sequence under PAG perturbation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PagAttentionSplit {
+    pub(crate) x_len: usize,
+    pub(crate) cap_len: usize,
+}
+
+impl PagAttentionSplit {
+    /// Validate `x_len` against `total_len` and derive the trailing `cap_len`.
+    pub(crate) fn from_total(x_len: usize, total_len: usize) -> Result<Self> {
+        if x_len == 0 || x_len > total_len {
+            return Err(CandleError::Msg(format!(
+                "z-image PAG split invalid: x_len={x_len}, total_len={total_len}"
+            )));
+        }
+        Ok(Self {
+            x_len,
+            cap_len: total_len - x_len,
+        })
+    }
+}
+
+/// Step-level PAG routing context threaded into a transformer forward pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PagStepContext<'a> {
+    pub(crate) resolved: &'a candle_gen::gen_core::PagResolved,
+    pub(crate) step_idx: usize,
+    pub(crate) total_steps: usize,
+}
+
+impl<'a> PagStepContext<'a> {
+    /// Return `Some(x_len)` when main layer `layer_idx` should replace `x_emb` self-attention with
+    /// `V_x` at this step while preserving `cap_emb` attention.
+    pub(crate) fn layer_x_len(self, layer_idx: usize, x_len: usize) -> Option<usize> {
+        self.resolved
+            .perturbs_block(layer_idx as u32, self.step_idx, self.total_steps)
+            .then_some(x_len)
+    }
+}
+
+/// Map a `1 - sigma` flow-match timestep back to its 0-based step index in `sigmas`.
+pub(crate) fn pag_step_index(sigmas: &[f32], timestep: f32) -> usize {
+    let total_steps = sigmas.len().saturating_sub(1);
+    if total_steps == 0 {
+        return 0;
+    }
+    sigmas[..total_steps]
+        .iter()
+        .filter(|&&s| (1.0f32 - s) < timestep)
+        .count()
+        .min(total_steps - 1)
+}
+
+/// Apply Z-Image PAG attention perturbation on `[B, H, seq_len, D]` BHSD tensors when
+/// `pag_x_len` is `Some(x_len)`: image prefix `0..x_len` receives `V_x` directly, while caption
+/// tail `x_len..seq_len` runs `sdpa(&q_cap, k, v)` against the full `[K_x, K_cap]` and
+/// `[V_x, V_cap]`.
+pub(crate) fn apply_attention_with_pag(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    pag_x_len: Option<usize>,
+    sdpa: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let Some(x_len) = pag_x_len else {
+        return sdpa(q, k, v);
+    };
+    let seq_len = q.dim(2)?;
+    let split = PagAttentionSplit::from_total(x_len, seq_len)?;
+    let v_x = v.narrow(2, 0, split.x_len)?;
+    if split.cap_len == 0 {
+        return Ok(v_x);
+    }
+    let q_cap = q.narrow(2, split.x_len, split.cap_len)?;
+    let o_cap = sdpa(&q_cap, k, v)?;
+    Ok(Tensor::cat(&[&v_x, &o_cap], 2)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -681,5 +759,136 @@ mod tests {
         // A different seed diverges.
         let c = seed_noise(43, 4, 6, &Device::Cpu, DType::F32).unwrap();
         assert_ne!(va, c.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+    }
+
+    #[test]
+    fn pag_split_and_attention_prefix_perturbation_preserves_caption_tail() {
+        assert_eq!(
+            PagAttentionSplit::from_total(4, 7).unwrap(),
+            PagAttentionSplit {
+                x_len: 4,
+                cap_len: 3,
+            }
+        );
+        assert!(PagAttentionSplit::from_total(0, 7).is_err());
+        assert!(PagAttentionSplit::from_total(8, 7).is_err());
+
+        let dev = Device::Cpu;
+        let (b, h, x_len, cap_len, hd) = (1, 2, 3, 2, 4);
+        let total_len = x_len + cap_len;
+        let q_vals: Vec<f32> = (0..(b * h * total_len * hd))
+            .map(|i| ((i * 7 + 3) % 19) as f32 * 0.1 - 0.8)
+            .collect();
+        let k_vals: Vec<f32> = (0..(b * h * total_len * hd))
+            .map(|i| ((i * 11 + 5) % 23) as f32 * 0.1 - 1.0)
+            .collect();
+        let v_vals: Vec<f32> = (0..(b * h * total_len * hd))
+            .map(|i| ((i * 13 + 1) % 17) as f32 * 0.1 - 0.7)
+            .collect();
+        let q = Tensor::from_vec(q_vals, (b, h, total_len, hd), &dev).unwrap();
+        let k = Tensor::from_vec(k_vals, (b, h, total_len, hd), &dev).unwrap();
+        let v = Tensor::from_vec(v_vals, (b, h, total_len, hd), &dev).unwrap();
+        let scale = 1.0 / (hd as f64).sqrt();
+
+        let full_sdpa = apply_attention_with_pag(&q, &k, &v, None, |qs, ks, vs| {
+            candle_gen::sdpa_planned_bhsd(
+                qs,
+                ks,
+                vs,
+                scale,
+                None,
+                candle_gen::candle_nn::ops::softmax_last_dim,
+                candle_gen::gen_core::attention_budget::AttentionPlan::UNBOUNDED,
+            )
+        })
+        .unwrap();
+        let perturbed = apply_attention_with_pag(&q, &k, &v, Some(x_len), |qs, ks, vs| {
+            assert_eq!(qs.dims(), &[b, h, cap_len, hd]);
+            assert_eq!(ks.dims(), &[b, h, total_len, hd]);
+            assert_eq!(vs.dims(), &[b, h, total_len, hd]);
+            candle_gen::sdpa_planned_bhsd(
+                qs,
+                ks,
+                vs,
+                scale,
+                None,
+                candle_gen::candle_nn::ops::softmax_last_dim,
+                candle_gen::gen_core::attention_budget::AttentionPlan::UNBOUNDED,
+            )
+        })
+        .unwrap();
+
+        // Image prefix 0..x_len equals V_x exactly.
+        let got_x = perturbed
+            .narrow(2, 0, x_len)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let want_x = v
+            .narrow(2, 0, x_len)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(got_x, want_x);
+
+        // Caption tail x_len..total_len matches normal SDPA over full [K_x, K_cap] / [V_x, V_cap].
+        let got_cap = perturbed
+            .narrow(2, x_len, cap_len)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let want_cap = full_sdpa
+            .narrow(2, x_len, cap_len)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let max_diff = got_cap
+            .iter()
+            .zip(&want_cap)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_diff < 1e-6, "caption tail diverged by {max_diff}");
+    }
+
+    #[test]
+    fn pag_step_index_and_context_layer_selection() {
+        let sigmas = [1.0f32, 0.75, 0.5, 0.25, 0.0];
+        for (i, &s) in sigmas[..4].iter().enumerate() {
+            assert_eq!(pag_step_index(&sigmas, 1.0 - s), i);
+        }
+        // Non-dyadic sigmas: verify no 1-ULP off-by-one.
+        let non_dyadic = [1.0f32, 2.0 / 3.0, 1.0 / 3.0, 0.0];
+        for (i, &s) in non_dyadic[..3].iter().enumerate() {
+            assert_eq!(pag_step_index(&non_dyadic, 1.0 - s), i);
+        }
+
+        let resolved = candle_gen::gen_core::PagResolved {
+            scale: 1.2,
+            adaptive_scale: 0.0,
+            layers: vec![15],
+            start: 0.0,
+            stop: 0.75,
+        };
+        let ctx_step0 = PagStepContext {
+            resolved: &resolved,
+            step_idx: 0,
+            total_steps: 4,
+        };
+        assert_eq!(ctx_step0.layer_x_len(15, 256), Some(256));
+        assert_eq!(ctx_step0.layer_x_len(14, 256), None);
+        let ctx_step3 = PagStepContext {
+            resolved: &resolved,
+            step_idx: 3,
+            total_steps: 4,
+        };
+        assert_eq!(ctx_step3.layer_x_len(15, 256), None);
     }
 }

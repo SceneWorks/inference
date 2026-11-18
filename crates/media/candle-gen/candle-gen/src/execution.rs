@@ -303,17 +303,29 @@ pub fn capture_direct(
     cancel: &gen_core::CancelFlag,
     body: impl FnOnce() -> gen_core::Result<GenerationOutput>,
 ) -> gen_core::Result<CompletedGeneration> {
+    capture_direct_report(descriptor, cancel, || {
+        body().map(gen_core::GenerationReport::from_output)
+    })
+}
+
+/// Run a standalone image provider entry point preserving its [`gen_core::GenerationReport`]
+/// (e.g. `pag` execution reports, warnings, or artifacts) under the same attempt-local contract.
+pub fn capture_direct_report(
+    descriptor: &gen_core::ModelDescriptor,
+    cancel: &gen_core::CancelFlag,
+    body: impl FnOnce() -> gen_core::Result<gen_core::GenerationReport>,
+) -> gen_core::Result<CompletedGeneration> {
     let attempt = Attempt::begin();
-    let output = body()?;
+    let generation = body()?;
     if cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
     }
-    let execution = attempt.finish_image(descriptor, &output);
-    CompletedGeneration::new(
-        gen_core::GenerationReport::from_output(output),
-        execution,
-        descriptor,
-    )
+    let output = generation
+        .output
+        .as_ref()
+        .ok_or_else(|| gen_core::Error::Msg(format!("{}: produced no output", descriptor.id)))?;
+    let execution = attempt.finish_image(descriptor, output);
+    CompletedGeneration::new(generation, execution, descriptor)
 }
 
 /// Run one provider attempt and bind only observations from that invocation to its output.

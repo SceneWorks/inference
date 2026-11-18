@@ -522,7 +522,20 @@ impl Generator for ZImageGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg("z_image_turbo: generator returned no output".into())
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
@@ -582,10 +595,14 @@ impl Generator for ZImageGenerator {
                         .map_err(candle_gen::CandleError::from)?;
                     drop(candle_gen::lock_recover(&self.components).take());
                     drop(candle_gen::lock_recover(&self.vae_encoder).take());
-                    let images = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
-                        pipe.render_base_sequential(&experimental_cfg_request(req), on_progress)?
-                    } else { pipe.render_sequential(req, on_progress)? };
-                    return Ok(GenerationOutput::Images(images));
+                    let (images, actual_steps) = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
+                        pipe.render_base_sequential(&experimental_cfg_request(req), resolved_pag.as_ref(), on_progress)?
+                    } else {
+                        pipe.render_sequential(req, resolved_pag.as_ref(), on_progress)?
+                    };
+                    let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                    report.pag = resolved_pag.as_ref().map(|resolved| resolved.execution_report(actual_steps));
+                    return Ok(report);
                 }
                 let components = self.components(&pipe)?;
 
@@ -611,15 +628,30 @@ impl Generator for ZImageGenerator {
                     None
                 };
 
-                let images = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
+                let (images, actual_steps) = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
                     let request = experimental_cfg_request(req);
-                    pipe.render_base(&request, &components, clean.as_ref(), start_step, on_progress)?
+                    pipe.render_base(&request, &components, clean.as_ref(), start_step, resolved_pag.as_ref(), on_progress)?
                 } else {
-                    pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?
+                    pipe.render(req, &components, clean.as_ref(), start_step, resolved_pag.as_ref(), on_progress)?
                 };
-                Ok(GenerationOutput::Images(images))
+                let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                report.pag = resolved_pag.as_ref().map(|resolved| resolved.execution_report(actual_steps));
+                Ok(report)
             },
         )
+    }
+}
+
+/// Perturbed-Attention Guidance (PAG) capability descriptor for Z-Image Turbo and Edit.
+pub fn turbo_pag_capability() -> gen_core::PagCapability {
+    gen_core::PagCapability {
+        num_blocks: 30,
+        block_domain: std::borrow::Cow::Borrowed("layers"),
+        default_layers: vec![15],
+        default_start: 0.0,
+        default_stop: 0.75,
+        recommended_scale: 1.2,
+        max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
     }
 }
 
@@ -678,6 +710,7 @@ pub fn descriptor() -> ModelDescriptor {
             // the name-driven control + edit providers' bespoke Euler loops emit directly. The
             // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
             supports_preview: true,
+            pag: Some(turbo_pag_capability()),
             ..Default::default()
         },
     }
@@ -1702,6 +1735,66 @@ mod tests {
         assert!(!accel_attn_enabled());
         set_accel_attn(true);
         assert!(accel_attn_enabled());
+    }
+
+    #[test]
+    fn turbo_pag_capability_and_validation_match_contract() {
+        use candle_gen::gen_core::PagConfig;
+
+        let cap = turbo_pag_capability();
+        assert_eq!(cap.num_blocks, 30);
+        assert_eq!(cap.block_domain, "layers");
+        assert_eq!(cap.default_layers, vec![15]);
+        assert_eq!(cap.default_start, 0.0);
+        assert_eq!(cap.default_stop, 0.75);
+        assert_eq!(cap.recommended_scale, 1.2);
+        assert_eq!(cap.max_scale, gen_core::DEFAULT_PAG_MAX_SCALE);
+
+        let desc = descriptor();
+        assert_eq!(desc.capabilities.pag.as_ref(), Some(&cap));
+
+        let noop = GenerationRequest {
+            prompt: "a test".into(),
+            pag: Some(PagConfig {
+                scale: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        desc.capabilities.validate_request(MODEL_ID, &noop).unwrap();
+        assert_eq!(
+            desc.capabilities.resolve_pag(MODEL_ID, &noop).unwrap(),
+            None
+        );
+
+        let active = GenerationRequest {
+            prompt: "a test".into(),
+            pag: Some(PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = desc
+            .capabilities
+            .resolve_pag(MODEL_ID, &active)
+            .unwrap()
+            .expect("active PAG resolves");
+        assert_eq!(resolved.layers, vec![15]);
+        assert_eq!(resolved.start, 0.0);
+        assert_eq!(resolved.stop, 0.75);
+        assert_eq!(resolved.execution_report(4).active_steps, 3);
+
+        let oob = GenerationRequest {
+            prompt: "a test".into(),
+            pag: Some(PagConfig {
+                scale: 1.0,
+                layers: Some(vec![30]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(desc.capabilities.validate_request(MODEL_ID, &oob).is_err());
     }
 }
 
