@@ -6426,7 +6426,7 @@ jobs:
   sensenova-loop-reference:
     name: SenseNova Loop upstream BF16 CUDA reference
     needs: model-proof-plan
-    if: ${{ fromJSON(needs.model-proof-plan.outputs.matrix).include[0].asset_setup == 'sensenova-loop' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'model-inference-proofs' && fromJSON(needs.model-proof-plan.outputs.matrix).include[0].asset_setup == 'sensenova-loop' }}
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -6459,7 +6459,7 @@ jobs:
   model-proof-execute:
     name: Explicit ${{ needs.model-proof-plan.outputs.backend }} model tests
     needs: [model-proof-plan, sensenova-loop-reference]
-    if: ${{ !cancelled() && needs.model-proof-plan.result == 'success' && (needs.sensenova-loop-reference.result == 'success' || needs.sensenova-loop-reference.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'model-inference-proofs' && !cancelled() && needs.model-proof-plan.result == 'success' && (needs.sensenova-loop-reference.result == 'success' || needs.sensenova-loop-reference.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
