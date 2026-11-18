@@ -265,6 +265,9 @@ pub fn x_decode(report: &DecodeReport) -> Value {
         "path": report.path,
         "proposer": report.proposer.label(),
         "draft_tokens": report.draft_tokens,
+        "draft": report.draft.as_ref().map(|d| json!({
+            "source": d.source, "format": d.format, "precision": d.precision,
+        })),
         "mean_accepted_length": report.mean_accepted_length(),
         "sampler": report.sampler,
         "kv_cache": report.kv_cache,

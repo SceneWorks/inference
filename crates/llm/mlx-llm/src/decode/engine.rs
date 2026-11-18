@@ -876,6 +876,52 @@ impl DraftSampler<'_, '_> {
     }
 }
 
+impl DraftSampler<'_, '_> {
+    /// Sample one draft among `candidates` (distinct ids below `width`, ascending) scored
+    /// `scores`, every other id of the `width`-wide vocabulary at `-inf` — a block draft's
+    /// refined row (SW-F360). The draw is [`sample_draft`](Self::sample_draft)'s over that dense
+    /// row, so the knobs, penalties and constraint apply and a stochastic draft's `q` is exactly
+    /// what it was drawn from. A plain greedy run (no penalty, no constraint) takes the row's
+    /// argmax on the host — the lowest id among equal scores, as the dense argmax. `None` when
+    /// the constraint allows no candidate: the proposal stops there.
+    pub fn sample_among(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        draft_history: &[i32],
+    ) -> Result<Option<DraftSample>> {
+        if let Some(c) = self.constraint.as_mut() {
+            let allowed = c.allowed();
+            let any = candidates.iter().any(|&t| {
+                usize::try_from(t).is_ok_and(|t| allowed.get(t).copied().unwrap_or(false))
+            });
+            if !any {
+                return Ok(None);
+            }
+        }
+        if self.greedy() && self.constraint.is_none() && !self.sampler.reads_history() {
+            let best =
+                scores
+                    .iter()
+                    .enumerate()
+                    .fold(None, |best: Option<(usize, f32)>, (i, &s)| match best {
+                        Some((_, b)) if s <= b => best,
+                        _ => Some((i, s)),
+                    });
+            return Ok(best.map(|(i, _)| (candidates[i], None)));
+        }
+        let mut row = vec![f32::NEG_INFINITY; width];
+        for (&t, &s) in candidates.iter().zip(scores) {
+            if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
+                *slot = s;
+            }
+        }
+        let logits = Array::from_slice(&row, &[1, width as i32]);
+        self.sample_draft(&logits, draft_history).map(Some)
+    }
+}
+
 /// The inverse-CDF draw over an unnormalised, never-empty distribution given a uniform `u` in
 /// `[0, 1)` — [`sample`](crate::primitives::sample)'s host walk; the draft rule of every MLX
 /// speculative loop.
@@ -1877,6 +1923,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
         ProposerKind::Mtp => "mtp",
         ProposerKind::PromptLookup => "prompt_lookup",
         ProposerKind::DraftModel => "draft_model",
+        ProposerKind::BlockDraft => "block_draft",
     };
     let none = || PathReport {
         path: "none".into(),
@@ -1887,6 +1934,8 @@ fn report<T: SpeculativeTarget + ?Sized>(
         proposer,
         draft_tokens: (proposer != ProposerKind::None)
             .then(|| u32::try_from(drafts).unwrap_or(u32::MAX)),
+        // The provider names the draft weights it resident-loaded (SW-F360 E8).
+        draft: None,
         sampler: sampler.map_or_else(|| "none".to_string(), |p| p.to_string()),
         kv_cache: target.kv_cache_label().into(),
         attention: target.attention_label().into(),

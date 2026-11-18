@@ -132,6 +132,37 @@ impl Projection {
         }
     }
 
+    /// The weight rows for `ids` (any integer shape `[..]`) as dense `[.., in]` in the stored
+    /// compute dtype: a gather of the dense weight, or of the packed codes, scales and biases
+    /// followed by a dequantize of just those rows. A Prism projection is refused.
+    pub fn rows(&self, ids: &Array) -> Result<Array> {
+        let shape = ids.shape().to_vec();
+        let flat = ids.reshape(&[-1])?;
+        let rows = match self {
+            Projection::Dense { weight, .. } => weight.take_axis(&flat, 0)?,
+            Projection::Quantized(q) => {
+                let biases = q.biases.take_axis(&flat, 0)?;
+                mlx_rs::ops::dequantize(
+                    q.weight.take_axis(&flat, 0)?,
+                    q.scales.take_axis(&flat, 0)?,
+                    Some(&biases),
+                    q.group_size,
+                    q.bits,
+                )?
+                .as_dtype(q.scales.dtype())?
+            }
+            Projection::Prism(_) => {
+                return Err(crate::error::Error::Unsupported(
+                    "a Prism projection has no dense rows to gather".into(),
+                ))
+            }
+        };
+        let width = *rows.shape().last().unwrap_or(&0);
+        let mut out = shape;
+        out.push(width);
+        Ok(rows.reshape(&out)?)
+    }
+
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Projection::Quantized(_) | Projection::Prism(_))

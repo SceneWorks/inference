@@ -35,11 +35,11 @@ use crate::decode::CancelFlag;
 #[cfg(feature = "campaign")]
 use crate::decode::{generate_batch, BatchRequest, GenerationOutput};
 use crate::decode::{
-    generate_speculative, generate_with_observer, prefill_restored, Boundary, ConstraintMask,
-    Decode, DraftModelProposer, DynCacheTarget, EngineOptions, FinishReason, GenerationConfig,
-    MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixPrefill, PrefixStats, Proposer,
-    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun,
-    SpeculativeTarget, StreamEvent,
+    generate_speculative, generate_with_observer, prefill_restored, BlockDraftProposer, Boundary,
+    ConstraintMask, Decode, DraftModelProposer, DynCacheTarget, EngineOptions, FinishReason,
+    GenerationConfig, MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixPrefill,
+    PrefixStats, Proposer, Qwen35MtpMultimodalPrompt, RewindableConstraintMask, SpeculativePrompt,
+    SpeculativeRun, SpeculativeTarget, StreamEvent, TappedQwen35,
 };
 use crate::error::to_core;
 use crate::image::{Qwen35ImageProcessor, Qwen35Preprocess};
@@ -1020,6 +1020,10 @@ pub struct LlamaProvider {
     /// named a compatible one ([`LoadSpec::draft_source`]); `draft_model` is advertised exactly
     /// then. A second decoder with its own cache per request, driven as a proposer by the engine.
     draft: Option<ResidentDraft>,
+    /// The resident block draft for `block_draft` speculation (SW-F360), present iff the load's
+    /// [`LoadSpec::draft_source`] names a block-draft checkpoint (its `architectures`) that fits
+    /// this target; `block_draft` is advertised exactly then.
+    block_draft: Option<ResidentBlockDraft>,
     /// What the load settled: the requested weight format, what became of a named draft
     /// (resident, or refused with the reason), the prefix cache's admitted budget, and every other
     /// optional accelerator — the companion MTP head (sc-24444) — requested but not attached,
@@ -1068,6 +1072,29 @@ struct ResidentDraft {
     context: usize,
 }
 
+/// A block draft resident beside its Qwen35 target (SW-F360).
+struct ResidentBlockDraft {
+    model: crate::models::DSpineDraft,
+    /// What the decode report names it by (E8).
+    report: core_llm::DecodeDraft,
+}
+
+/// A named draft's load bytes: a block draft (its `architectures`, SW-F360) priced by the shared
+/// [`core_llm::BlockDraftConfig::load_bytes`] at its requested precision — its group-by-group
+/// load ([`crate::models::DSpineDraft::load`]) plus that load's pacing slack — any other draft by
+/// the ordinary load estimate.
+fn draft_required_bytes(spec: &LoadSpec) -> CoreResult<u64> {
+    let dir = Path::new(&spec.source);
+    if core_llm::BlockDraftFormat::of_dir(dir).is_none() {
+        return crate::load_memory::required_bytes(spec);
+    }
+    let refused = |e: core_llm::BlockDraftRefusal| CoreError::Load(e.to_string());
+    let cfg = core_llm::BlockDraftConfig::read(dir).map_err(refused)?;
+    let precision =
+        core_llm::BlockDraftPrecision::from_request(spec.draft_quantize).map_err(refused)?;
+    Ok(cfg.load_bytes(precision) + crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES)
+}
+
 /// What a load does with its named draft model (sc-24436), decided before any weight is read.
 enum DraftPlan {
     /// No draft named.
@@ -1088,7 +1115,7 @@ impl DraftPlan {
             return Ok(DraftPlan::None);
         };
         let draft_spec = draft_load_spec(spec, source);
-        let draft_required = match crate::load_memory::required_bytes(&draft_spec) {
+        let draft_required = match draft_required_bytes(&draft_spec) {
             Ok(bytes) => bytes,
             Err(e) => {
                 core_llm::admit_load_memory(target_required, available)?;
@@ -1118,6 +1145,8 @@ fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
         // A draft keeps no cross-turn prefix cache of its own (sc-24437), and no companion head.
         prefix_cache_bytes: Some(0),
         draft_source: None,
+        // A block draft's own precision (SW-F360 E8) travels with its spec.
+        draft_quantize: spec.draft_quantize,
         mtp_head_source: None,
     }
 }
@@ -1813,7 +1842,7 @@ impl LlamaProvider {
         let draft = DraftPlan::admit(spec, required, available)?;
         let mut admitted = match &draft {
             DraftPlan::Load(draft_spec) => {
-                required.saturating_add(crate::load_memory::required_bytes(draft_spec)?)
+                required.saturating_add(draft_required_bytes(draft_spec)?)
             }
             DraftPlan::None | DraftPlan::Refused(_) => required,
         };
@@ -1870,6 +1899,9 @@ impl LlamaProvider {
     /// ([`core_llm::draft_compatibility`]): resident — `draft_model` advertised — or refused
     /// with the reason in the load report, the target unaffected either way (sc-24436, E2).
     fn attach_draft(&mut self, spec: &LoadSpec) {
+        if let Some(format) = core_llm::BlockDraftFormat::of_dir(Path::new(&spec.source)) {
+            return self.attach_block_draft(spec, format);
+        }
         let source = spec.source.clone();
         let target_logits = self.model.memory_geometry().vocab_size as usize;
         // The tokenizer is checked before any draft weight is touched when the draft ships one.
@@ -1903,6 +1935,71 @@ impl LlamaProvider {
             recommended_depths(),
         );
         self.draft = draft;
+        self.load_report.draft = Some(report);
+    }
+
+    /// Load the block draft `spec` names (SW-F360) and keep it only if it fits this target: its
+    /// config is checked against the target (hidden size, vocabulary, mask token, target layers,
+    /// attention geometry — the shared [`core_llm::BlockDraftConfig::mismatches`]) and its stored
+    /// tensors before any weight is built, then it is loaded at the requested precision (E8).
+    /// Resident — `block_draft` advertised — or refused with every typed reason named in the load
+    /// report, the target unaffected either way (E1, AC2).
+    fn attach_block_draft(&mut self, spec: &LoadSpec, format: core_llm::BlockDraftFormat) {
+        let source = spec.source.clone();
+        let outcome = (|| -> std::result::Result<ResidentBlockDraft, String> {
+            let refused = |e: core_llm::BlockDraftRefusal| e.to_string();
+            let Decoder::Qwen35(target) = &self.model else {
+                return Err(core_llm::BlockDraftRefusal::TargetFamily(
+                    "block drafts read Qwen3.5/3.8 hybrid (qwen3_5) targets only".into(),
+                )
+                .to_string());
+            };
+            if target.is_prism() {
+                return Err(core_llm::BlockDraftRefusal::TargetFamily(
+                    "a Prism target's packed LM head has no dense rows for the refinement".into(),
+                )
+                .to_string());
+            }
+            let cfg = core_llm::BlockDraftConfig::read(Path::new(&source)).map_err(refused)?;
+            let precision = core_llm::BlockDraftPrecision::from_request(spec.draft_quantize)
+                .map_err(refused)?;
+            let tcfg = target.config();
+            let mismatches = cfg.mismatches(&core_llm::BlockDraftTarget {
+                hidden_size: tcfg.hidden_size as usize,
+                num_layers: target.num_layers(),
+                vocab_size: tcfg.vocab_size as usize,
+                tokenizer_vocab: self.tokenizer.vocab_size(),
+            });
+            if !mismatches.is_empty() {
+                return Err(core_llm::block_draft_refusal_reason(&mismatches));
+            }
+            let model = crate::models::DSpineDraft::load(Path::new(&source), cfg, precision)
+                .map_err(refused)?;
+            Ok(ResidentBlockDraft {
+                model,
+                report: core_llm::DecodeDraft {
+                    source: source.clone(),
+                    format: format.label().into(),
+                    precision: precision.label().into(),
+                },
+            })
+        })();
+        let report = match outcome {
+            Ok(draft) => {
+                let max_depth = core_llm::verify_depth_bound(&self.descriptor.capabilities);
+                self.descriptor
+                    .capabilities
+                    .speculative
+                    .push(core_llm::block_draft_capabilities(
+                        max_depth,
+                        draft.model.config().max_depth(),
+                        recommended_depths(),
+                    ));
+                self.block_draft = Some(draft);
+                DraftReport::resident(source)
+            }
+            Err(why) => DraftReport::refused(source, why).named_in(&mut self.load_report.fallbacks),
+        };
         self.load_report.draft = Some(report);
     }
 
@@ -2128,6 +2225,7 @@ impl LlamaProvider {
             prefix: RefCell::new(PrefixCache::with_budget(0)),
             speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
+            block_draft: None,
             load_report: core_llm::LoadReport {
                 fallbacks: load_fallbacks,
                 ..core_llm::LoadReport::default()
@@ -2234,6 +2332,7 @@ impl LlamaProvider {
             )),
             speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
+            block_draft: None,
             load_report: core_llm::LoadReport::default(),
         })
     }
@@ -2323,6 +2422,7 @@ impl LlamaProvider {
             )),
             speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
+            block_draft: None,
             load_report: core_llm::LoadReport::default(),
         }
     }
@@ -3988,6 +4088,8 @@ impl LlamaProvider {
             core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
+        let route =
+            self.fit_block_draft_route(route, multimodal, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
         // instead, by name (sc-24436, E2).
         let route = self.fit_draft_route(
@@ -4682,71 +4784,92 @@ impl LlamaProvider {
                         }
                         Decoder::Qwen35(model) => {
                             let model: &Qwen35Model = model;
-                            let mtp = route.is_mtp();
-                            let restored = if prefix_route {
-                                self.prefix
-                                    .borrow_mut()
-                                    .restore::<Qwen35Cache>(&prompt_ids, mtp)
-                                    .map_err(to_core)?
+                            if let (SpeculativeRoute::BlockDraft { .. }, Some(block)) =
+                                (route, self.block_draft.as_ref())
+                            {
+                                self.run_block_draft(
+                                    model,
+                                    block,
+                                    &prompt_ids,
+                                    prefix_route,
+                                    prefix_boundary,
+                                    keep_prefix,
+                                    &config,
+                                    width,
+                                    &req.cancel,
+                                    &mut sink,
+                                    options,
+                                    &mut prefix_hit,
+                                    &mut prefix_path,
+                                )
                             } else {
-                                None
-                            };
-                            let PrefixPrefill {
-                                mut cache,
-                                logits,
-                                hidden,
-                                fed_tokens,
-                                mtp: resume,
-                                boundary,
-                                ..
-                            } = prefill_restored(
-                                model,
-                                restored,
-                                &prompt_ids,
-                                prefix_boundary,
-                                mtp,
-                                &req.cancel,
-                            )
-                            .map_err(to_core)?;
-                            // Measured, not looked up: the positions the prefill did not feed.
-                            prefix_hit = prompt_ids.len() - fed_tokens;
-                            if prefix_hit > 0 {
-                                prefix_path = "hit";
-                            }
-                            let mut head = mtp.then(|| {
-                                MtpProposer::new()
-                                    .resume_from(resume)
-                                    .capture_at(boundary.as_ref().map(Boundary::len))
-                            });
-                            let mut plain = route.plain_proposer(self.draft.as_ref());
-                            let proposer: &mut dyn Proposer<Qwen35Model> = match head.as_mut() {
-                                Some(head) => head,
-                                None => &mut *plain,
-                            };
-                            let run = generate_speculative(
-                                model,
-                                proposer,
-                                SpeculativePrompt::Prefilled {
-                                    cache: &mut cache,
+                                let mtp = route.is_mtp();
+                                let restored = if prefix_route {
+                                    self.prefix
+                                        .borrow_mut()
+                                        .restore::<Qwen35Cache>(&prompt_ids, mtp)
+                                        .map_err(to_core)?
+                                } else {
+                                    None
+                                };
+                                let PrefixPrefill {
+                                    mut cache,
                                     logits,
                                     hidden,
-                                    history: &prompt_ids,
-                                    position_delta: 0,
-                                },
-                                &config,
-                                width,
-                                &req.cancel,
-                                &mut sink,
-                                options,
-                            );
-                            if let (Ok(run), true) = (&run, keep_prefix) {
-                                let captured = head.as_mut().and_then(MtpProposer::take_captured);
-                                self.prefix
-                                    .borrow_mut()
-                                    .store_run(&prompt_ids, run, cache, boundary, captured)
-                                    .map_err(to_core)?;
+                                    fed_tokens,
+                                    mtp: resume,
+                                    boundary,
+                                    ..
+                                } = prefill_restored(
+                                    model,
+                                    restored,
+                                    &prompt_ids,
+                                    prefix_boundary,
+                                    mtp,
+                                    &req.cancel,
+                                )
+                                .map_err(to_core)?;
+                                // Measured, not looked up: the positions the prefill did not feed.
+                                prefix_hit = prompt_ids.len() - fed_tokens;
+                                if prefix_hit > 0 {
+                                    prefix_path = "hit";
+                                }
+                                let mut head = mtp.then(|| {
+                                    MtpProposer::new()
+                                        .resume_from(resume)
+                                        .capture_at(boundary.as_ref().map(Boundary::len))
+                                });
+                                let mut plain = route.plain_proposer(self.draft.as_ref());
+                                let proposer: &mut dyn Proposer<Qwen35Model> = match head.as_mut() {
+                                    Some(head) => head,
+                                    None => &mut *plain,
+                                };
+                                let run = generate_speculative(
+                                    model,
+                                    proposer,
+                                    SpeculativePrompt::Prefilled {
+                                        cache: &mut cache,
+                                        logits,
+                                        hidden,
+                                        history: &prompt_ids,
+                                        position_delta: 0,
+                                    },
+                                    &config,
+                                    width,
+                                    &req.cancel,
+                                    &mut sink,
+                                    options,
+                                );
+                                if let (Ok(run), true) = (&run, keep_prefix) {
+                                    let captured =
+                                        head.as_mut().and_then(MtpProposer::take_captured);
+                                    self.prefix
+                                        .borrow_mut()
+                                        .store_run(&prompt_ids, run, cache, boundary, captured)
+                                        .map_err(to_core)?;
+                                }
+                                run
                             }
-                            run
                         }
                     }
                 }
@@ -4925,9 +5048,19 @@ fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpeculativeRoute {
     Plain,
-    Mtp { width: usize },
-    PromptLookup { width: usize },
-    DraftModel { width: usize },
+    Mtp {
+        width: usize,
+    },
+    PromptLookup {
+        width: usize,
+    },
+    DraftModel {
+        width: usize,
+    },
+    /// The resident block draft over the Qwen35 target (SW-F360); text prompts only.
+    BlockDraft {
+        width: usize,
+    },
 }
 
 impl SpeculativeRoute {
@@ -4936,7 +5069,8 @@ impl SpeculativeRoute {
             SpeculativeRoute::Plain => 0,
             SpeculativeRoute::Mtp { width }
             | SpeculativeRoute::PromptLookup { width }
-            | SpeculativeRoute::DraftModel { width } => width,
+            | SpeculativeRoute::DraftModel { width }
+            | SpeculativeRoute::BlockDraft { width } => width,
         }
     }
 
@@ -4964,8 +5098,14 @@ impl SpeculativeRoute {
                 }
             }
             // `speculative_route` routes `draft_model` only with a resident draft.
+            // A block draft runs only on the Qwen35 text path, over its tapped target.
             (SpeculativeRoute::DraftModel { .. }, None)
-            | (SpeculativeRoute::Plain | SpeculativeRoute::Mtp { .. }, _) => Box::new(NoProposer),
+            | (
+                SpeculativeRoute::Plain
+                | SpeculativeRoute::Mtp { .. }
+                | SpeculativeRoute::BlockDraft { .. },
+                _,
+            ) => Box::new(NoProposer),
         }
     }
 }
@@ -5040,7 +5180,9 @@ impl LlamaProvider {
                 .checked_add(m.checkpoint_ring_bytes(width)?)?;
         }
         let (priced_width, overshoot) = match route {
-            SpeculativeRoute::PromptLookup { width } | SpeculativeRoute::DraftModel { width } => {
+            SpeculativeRoute::PromptLookup { width }
+            | SpeculativeRoute::DraftModel { width }
+            | SpeculativeRoute::BlockDraft { width } => {
                 let width = u64::try_from(width).ok()?;
                 let kv_position = geometry
                     .layers
@@ -5121,6 +5263,14 @@ impl LlamaProvider {
                 )?
                 .checked_add(draft.promoted_request_bytes()?)?
             }
+            // A block draft's request (SW-F360 E8): the tapped target rows it reads, its
+            // window-bounded context and a step's transients — the shared pricing.
+            (SpeculativeRoute::BlockDraft { width }, _) => self
+                .block_draft
+                .as_ref()?
+                .model
+                .config()
+                .request_bytes(prompt_tokens, max_new_tokens, width)?,
             _ => 0,
         };
         target.checked_add(draft)
@@ -5221,9 +5371,122 @@ impl LlamaProvider {
                 fallbacks.push(core_llm::DRAFT_MODEL_NOT_LOADED.into());
                 SpeculativeRoute::Plain
             }
+            // `block_draft` is advertised only while a block draft is resident beside a Qwen35
+            // target; a Gemma 4 multimodal prompt never reaches it.
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::BlockDraft,
+                depth,
+            } if self.block_draft.is_some() && !gemma4_mm_request => SpeculativeRoute::BlockDraft {
+                width: depth as usize,
+            },
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::BlockDraft,
+                ..
+            } => {
+                fallbacks.push(BLOCK_DRAFT_NOT_LOADED.into());
+                SpeculativeRoute::Plain
+            }
         }
     }
+
+    /// Run a text prompt with the resident block draft (SW-F360) on the Qwen35 target: the
+    /// target tapped at the draft's layers ([`TappedQwen35`]), prefilled through the cross-turn
+    /// prefix cache like any hybrid request (a hit hands the draft the suffix's rows only), the
+    /// proposer warmed on the tapped prompt rows, and the report naming the draft (E8).
+    #[allow(clippy::too_many_arguments)]
+    fn run_block_draft(
+        &self,
+        model: &Qwen35Model,
+        block: &ResidentBlockDraft,
+        prompt_ids: &[i32],
+        prefix_route: bool,
+        prefix_boundary: Option<usize>,
+        keep_prefix: bool,
+        config: &GenerationConfig,
+        width: usize,
+        cancel: &crate::decode::CancelFlag,
+        sink: &mut dyn FnMut(StreamEvent),
+        options: EngineOptions<'_, '_>,
+        prefix_hit: &mut usize,
+        prefix_path: &mut &'static str,
+    ) -> crate::error::Result<SpeculativeRun> {
+        let target = TappedQwen35::for_draft(model, &block.model);
+        let restored = if prefix_route {
+            self.prefix
+                .borrow_mut()
+                .restore::<Qwen35Cache>(prompt_ids, false)?
+        } else {
+            None
+        };
+        let PrefixPrefill {
+            mut cache,
+            logits,
+            hidden,
+            fed_tokens,
+            boundary,
+            ..
+        } = prefill_restored(&target, restored, prompt_ids, prefix_boundary, true, cancel)?;
+        *prefix_hit = prompt_ids.len() - fed_tokens;
+        if *prefix_hit > 0 {
+            *prefix_path = "hit";
+        }
+        let mut proposer = BlockDraftProposer::new(&block.model);
+        let mut run = generate_speculative(
+            &target,
+            &mut proposer,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits,
+                hidden,
+                history: prompt_ids,
+                position_delta: 0,
+            },
+            config,
+            width,
+            cancel,
+            sink,
+            options,
+        )?;
+        if keep_prefix {
+            self.prefix
+                .borrow_mut()
+                .store_run(prompt_ids, &run, cache, boundary, None)?;
+        }
+        run.report.draft = Some(block.report.clone());
+        Ok(run)
+    }
+
+    /// A `block_draft` route on an image or video prompt (SW-F360): the draft's context would
+    /// need the target's rows at the fused visual positions, which this proposer does not take
+    /// yet, so the request runs what `auto` resolves to instead, by name. Any other route is
+    /// returned unchanged.
+    fn fit_block_draft_route(
+        &self,
+        route: SpeculativeRoute,
+        multimodal: bool,
+        gemma4_mm_request: bool,
+        fallbacks: &mut Vec<String>,
+    ) -> SpeculativeRoute {
+        if !multimodal || !matches!(route, SpeculativeRoute::BlockDraft { .. }) {
+            return route;
+        }
+        fallbacks.push(BLOCK_DRAFT_MULTIMODAL.into());
+        let auto = core_llm::resolve_speculative(
+            core_llm::Speculative::Auto,
+            &self.descriptor.capabilities,
+        );
+        fallbacks.extend(auto.fallback);
+        self.speculative_route(auto.plan, gemma4_mm_request, fallbacks)
+    }
 }
+
+/// The fallback a `block_draft` plan names on a provider with no resident block draft.
+const BLOCK_DRAFT_NOT_LOADED: &str = "speculative: `block_draft` has no block draft loaded \
+     beside this target; decoded without a proposer";
+
+/// The fallback a `block_draft` plan names on an image or video prompt.
+const BLOCK_DRAFT_MULTIMODAL: &str = "speculative: `block_draft` does not run on image or video \
+     prompts yet; decoded as `auto` would";
 
 /// The descriptor for the `mlx-llama` provider (constructible without loading weights; used for
 /// explicit catalog composition and inspection).

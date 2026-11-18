@@ -994,6 +994,7 @@ fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
         // A draft keeps no cross-turn prefix cache of its own (sc-24437), and no companion head.
         prefix_cache_bytes: Some(0),
         draft_source: None,
+        draft_quantize: None,
         mtp_head_source: None,
     }
 }

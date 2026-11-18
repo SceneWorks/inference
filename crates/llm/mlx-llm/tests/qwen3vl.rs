@@ -500,6 +500,7 @@ fn qwen3vl_vision_q4_q8_import_path() {
             mtp_head_source: None,
             prefix_cache_bytes: None,
             draft_source: None,
+            draft_quantize: None,
         };
 
         // The concrete provider exposes `is_quantized()` — assert the decoder actually quantized

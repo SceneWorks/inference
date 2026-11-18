@@ -11,6 +11,7 @@ use self::stream::{FinishReason as StreamFinishReason, StreamEvent as DecodeEven
 use crate::primitives::kv_cache::KV_BLOCK_TOKENS;
 
 pub mod batch;
+pub mod block_draft;
 pub mod cancel;
 pub mod continuous;
 pub mod engine;
@@ -21,6 +22,7 @@ pub mod speculative;
 pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
+pub use block_draft::{BlockDraftProposer, TappedQwen35};
 pub use cancel::CancelFlag;
 pub use continuous::{
     generate_continuous, generate_continuous_kv, BatchExactness, ContinuousConfig, ContinuousKv,

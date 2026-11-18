@@ -56,6 +56,9 @@ pub enum DecodePath {
     /// Draft-model speculation: the unified engine with the draft-model proposer, or the pre-epic
     /// loop over a `CausalLm` pair.
     DraftModel,
+    /// Block-draft speculation (SW-F360). Candle advertises no block draft yet, so no engine run
+    /// takes this path; it keeps the label table total.
+    BlockDraft,
 }
 
 impl DecodePath {
@@ -67,6 +70,7 @@ impl DecodePath {
             DecodePath::Mtp { .. } => "mtp",
             DecodePath::PromptLookup => "prompt_lookup",
             DecodePath::DraftModel => "draft_model",
+            DecodePath::BlockDraft => "block_draft",
         }
     }
 }
@@ -394,6 +398,7 @@ impl DecodeRecord {
             path: self.path.label().to_string(),
             proposer: self.proposer,
             draft_tokens,
+            draft: None,
             sampler: self.sampler.label(),
             kv_cache: self.kv_cache.label().to_string(),
             attention: self.attn_formulation.label().to_string(),

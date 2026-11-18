@@ -1599,6 +1599,70 @@ impl Qwen35Model {
         Ok(logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?)
     }
 
+    /// The decoder over `input_ids` with **hidden-state taps** (SW-F360 E2): the residual-stream
+    /// output of each decoder layer in `layers` (0-based, in order), concatenated on the feature
+    /// axis — `[B, rows, layers.len() · hidden]` — beside the logits (`all`: every position,
+    /// else the last, as [`Self::forward`] / [`Self::decode_logits`]). `keep` caps the tapped rows
+    /// at the **last** `keep` positions (a block draft's context window, E5), so a long prefill
+    /// never holds every prompt row's taps.
+    pub(crate) fn forward_tapped(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        layers: &[usize],
+        keep: Option<usize>,
+        all: bool,
+    ) -> Result<(Array, Array)> {
+        let h0 = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let s = h0.shape()[1];
+        let rows = keep.map_or(s, |k| i32::try_from(k).unwrap_or(i32::MAX).min(s));
+        let (cos, sin) = self.rope.cos_sin(s, offset, compute())?;
+        let mut taps: Vec<Option<Array>> = vec![None; layers.len()];
+        let mut h = h0;
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = layer.forward(&h, &cos, &sin, slot)?;
+            for (tap, _) in taps.iter_mut().zip(layers).filter(|(_, &l)| l == i) {
+                *tap = Some(if rows < s {
+                    let idx = Array::arange::<i32, i32>(s - rows, s, None)?;
+                    h.take_axis(&idx, 1)?
+                } else {
+                    h.clone()
+                });
+            }
+        }
+        let taps: Vec<Array> = taps.into_iter().collect::<Option<_>>().ok_or_else(|| {
+            Error::Config(format!(
+                "qwen3_5: tapped layers {layers:?} outside the {}-layer decoder",
+                self.layers.len()
+            ))
+        })?;
+        let refs: Vec<&Array> = taps.iter().collect();
+        let tapped = concatenate_axis(&refs, 2)?;
+        let logits = if all {
+            self.project(&h)?
+        } else {
+            self.project_last(&h)?
+        };
+        Ok((tapped, logits))
+    }
+
+    /// Decoder layers (a block draft's `target_layer_ids` must fall inside them).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The LM head's rows for `ids` (any shape), dense in the compute dtype — a block draft's
+    /// refinement scores its candidates against them (SW-F360).
+    pub(crate) fn lm_head_rows(&self, ids: &Array) -> Result<Array> {
+        self.language_head()?.rows(ids)
+    }
+
+    /// The LM head over already-normalized rows `[.., hidden]` → `[.., vocab]`.
+    pub(crate) fn lm_head(&self, normalized: &Array) -> Result<Array> {
+        self.language_head()?.forward(normalized)
+    }
+
     /// Run the decoder over `input_ids` `[B, S]` at sequence `offset`, returning logits for **every**
     /// position `[B, S, vocab]`.
     pub fn forward(

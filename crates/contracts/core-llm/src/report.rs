@@ -112,6 +112,17 @@ pub struct CudaGraphsReport {
     pub fallback_reason: Option<String>,
 }
 
+/// The draft weights a decode ran its proposer on (SW-F360 E8).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecodeDraft {
+    /// The draft source the load named.
+    pub source: String,
+    /// The checkpoint format (`dspine`).
+    pub format: String,
+    /// The load precision (`q8`, `q4`).
+    pub precision: String,
+}
+
 /// Which decode path served one generation, as the backend measured it (epic sc-24128 E2: the path
 /// that ran is visible and a fallback is named). Carried on
 /// [`TextLlmOutput::decode`](crate::TextLlmOutput::decode).
@@ -126,6 +137,10 @@ pub struct DecodeReport {
     pub proposer: ProposerKind,
     /// Draft tokens per verification pass (the depth) when a proposer ran.
     pub draft_tokens: Option<u32>,
+    /// The draft weights the proposer ran on (SW-F360 E8), when it ran on one the report can name
+    /// — the block draft's source, format and load precision. `None` for a proposer without its
+    /// own weights or a backend that does not report it.
+    pub draft: Option<DecodeDraft>,
     /// The sampler path: `device`, `host:<reason>` (for example `host:penalty`), or `none`.
     pub sampler: String,
     /// The KV cache implementation (`growing`, `static`).

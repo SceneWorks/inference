@@ -1383,6 +1383,7 @@ fn nvfp4_spec(source: &str) -> core_llm::LoadSpec {
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     }
 }
 

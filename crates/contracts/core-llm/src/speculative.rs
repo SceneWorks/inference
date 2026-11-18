@@ -50,17 +50,20 @@ pub enum ProposerKind {
     PromptLookup,
     /// A separate draft model.
     DraftModel,
+    /// A block draft reading the target's hidden rows (SW-F360).
+    BlockDraft,
 }
 
 impl ProposerKind {
     /// Stable lower-case label for logs and evidence rows (`none`, `mtp`, `prompt_lookup`,
-    /// `draft_model`).
+    /// `draft_model`, `block_draft`).
     pub fn label(self) -> &'static str {
         match self {
             ProposerKind::None => "none",
             ProposerKind::Mtp => "mtp",
             ProposerKind::PromptLookup => "prompt_lookup",
             ProposerKind::DraftModel => "draft_model",
+            ProposerKind::BlockDraft => "block_draft",
         }
     }
 }
@@ -71,6 +74,7 @@ impl From<crate::SpeculativeProposer> for ProposerKind {
             crate::SpeculativeProposer::Mtp => ProposerKind::Mtp,
             crate::SpeculativeProposer::PromptLookup => ProposerKind::PromptLookup,
             crate::SpeculativeProposer::DraftModel => ProposerKind::DraftModel,
+            crate::SpeculativeProposer::BlockDraft => ProposerKind::BlockDraft,
         }
     }
 }
@@ -548,8 +552,8 @@ pub enum PlainDecode {
 /// The mean accepted length per verify below which `proposer` at `depth` loses to `plain`
 /// decoding at the cheapest measured verify cost (see the constants above), or `None` when no
 /// demotion applies: no proposer, a zero depth, prompt lookup falling back to MLX's unpipelined
-/// loop (no measured regression there), or `draft_model` — which [`Speculative::Auto`] never
-/// resolves to ([`resolve_speculative`] picks MTP, else prompt lookup) and whose cost the campaign
+/// loop (no measured regression there), or `draft_model` / `block_draft` — which
+/// [`Speculative::Auto`] never resolves to ([`resolve_speculative`] picks MTP, else prompt lookup) and whose cost the campaign
 /// did not measure.
 ///
 /// [`Speculative::Auto`]: crate::Speculative::Auto
@@ -571,7 +575,7 @@ pub fn demotion_threshold(proposer: ProposerKind, depth: u32, plain: PlainDecode
         (ProposerKind::Mtp, PlainDecode::MlxPipelined | PlainDecode::MlxUnpipelined) => {
             Some(MTP_DEMOTE_BELOW_AT_ONE_DRAFT + MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT * extra)
         }
-        (ProposerKind::None | ProposerKind::DraftModel, _) => None,
+        (ProposerKind::None | ProposerKind::DraftModel | ProposerKind::BlockDraft, _) => None,
     }
 }
 

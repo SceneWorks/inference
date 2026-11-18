@@ -103,6 +103,7 @@ impl Args {
             mtp_head_source: self.mtp_head.clone(),
             prefix_cache_bytes: self.prefix_cache_bytes,
             draft_source: self.draft_model.clone(),
+            draft_quantize: None,
         }
     }
 }
@@ -1225,6 +1226,7 @@ mod tests {
                         path: "prompt_lookup".into(),
                         proposer: core_llm::ProposerKind::PromptLookup,
                         draft_tokens: Some(4),
+                        draft: None,
                         sampler: "host:penalty".into(),
                         kv_cache: "growing".into(),
                         attention: "gqa".into(),
@@ -1299,6 +1301,7 @@ mod tests {
                 "path": "prompt_lookup",
                 "proposer": "prompt_lookup",
                 "draft_tokens": 4,
+                "draft": null,
                 "mean_accepted_length": 1.5,
                 "sampler": "host:penalty",
                 "kv_cache": "growing",
