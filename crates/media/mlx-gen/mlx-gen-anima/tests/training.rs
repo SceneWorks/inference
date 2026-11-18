@@ -781,17 +781,6 @@ fn train_emits_in_training_previews() {
     let mb = magenta_score(&img_base);
     save_png(&img_base, out_dir().join("preview_base.png"));
     save_proof_png(&img_base, "preview_base.png");
-    // TEMPORARY SW-7172 diagnostic: a failing case's previews are not published, so dump them.
-    for (name, img) in [("first", first), ("last", last), ("base", &img_base)] {
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
-            .unwrap()
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let hex: String = png.get_ref().iter().map(|b| format!("{b:02x}")).collect();
-        eprintln!("SW7172_PNG_HEX {name} {hex}");
-    }
-
     eprintln!(
         "[sc-10641] {} previews across {} cadences; prompt0 magenta: base {mb:.1}, first(step {first_step}) {mf:.1} → last(step {last_step}) {ml:.1}",
         samples.len(),
