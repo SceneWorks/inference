@@ -282078,7 +282078,7 @@
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
-    "fixture_identity": "pinned Hub snapshots under MLX_GEN_MODELS_ROOT (SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4, SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d); MLX_LLM_BLOCK_DRAFT_TARGET,MLX_LLM_BLOCK_DRAFT_SOURCE override",
+    "fixture_identity": "product-pinned Hub snapshots staged into the runner Hub cache and bound by path: target SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4 (MLX_LLM_BLOCK_DRAFT_TARGET) and DSpine draft SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d (MLX_LLM_BLOCK_DRAFT_SOURCE)",
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
@@ -282087,7 +282087,6 @@
     "route_metadata": {
       "ignore_reason": "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT",
       "env_gates": [
-        "MLX_GEN_MODELS_ROOT",
         "MLX_LLM_BLOCK_DRAFT_TARGET",
         "MLX_LLM_BLOCK_DRAFT_SOURCE",
         "MLX_LLM_BLOCK_DRAFT_PRECISION"
@@ -282143,7 +282142,21 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "required_environment": [
+      "MLX_LLM_BLOCK_DRAFT_TARGET",
+      "MLX_LLM_BLOCK_DRAFT_SOURCE"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "pin": "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4"
+      },
+      {
+        "environment": "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "pin": "SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d"
+      }
+    ]
   },
   {
     "package": "candle-gen-moss-image",

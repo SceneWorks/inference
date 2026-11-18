@@ -99,6 +99,14 @@ class RegisteredHubSnapshotCases(unittest.TestCase):
                 with self.subTest(binding=binding):
                     proofs.validate_hub_snapshot_slots(item)
 
+    def test_dspine_smoke_binds_target_and_draft_by_fixed_pin(self):
+        item = self.rows["mlx-llm/integration/block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass"]
+        bound = proofs.bind_hub_snapshots((item,), {})
+        self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_TARGET"],
+                         {"repository": "SceneWorks/qwen3.8-27b-abliterated-mlx", "revision": REV, "subfolder": "q4"})
+        self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_SOURCE"]["repository"], "SceneWorks/qwen3.8-27b-dspine-b16")
+        self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_SOURCE"]["subfolder"], "")
+
     def test_the_nax_route_selects_only_the_rw_llm_mac(self):
         self.assertIn("rw-llm", proofs.NAX_ROUTES["nax"]["labels"])
         self.assertEqual(proofs.NAX_ROUTES["nax"]["name"], "nax-macos-2")
