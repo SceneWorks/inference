@@ -188,8 +188,9 @@ impl Proposer<TappedQwen35<'_>> for BlockDraftProposer<'_> {
         let draft = self.draft;
         let cfg = draft.config();
         let depth = ctx.max_drafts.min(cfg.block_size - 1);
+        let len = block_len(draft.causal(), cfg.block_size, depth, ctx.budget_drafts);
         let mut block = vec![ctx.cur];
-        block.resize(depth + 1, cfg.mask_token_id as i32);
+        block.resize(len, cfg.mask_token_id as i32);
         let model = target.model;
         let embeds = model.embed_input_ids(&input_ids(&block))?;
         let context = self
@@ -199,6 +200,7 @@ impl Proposer<TappedQwen35<'_>> for BlockDraftProposer<'_> {
         let (cand, table) = draft.propose(
             context,
             &embeds,
+            depth,
             ctx.cur,
             &|rows| model.lm_head(rows),
             &|ids| model.lm_head_rows(ids),
@@ -250,6 +252,20 @@ impl Proposer<TappedQwen35<'_>> for BlockDraftProposer<'_> {
         })?;
         let draft = self.draft;
         draft.append_context(self.context_mut()?, rows)
+    }
+}
+
+/// The rows of the block a proposal of `depth` drafts runs (anchor included) for a draft trained
+/// on `block_size`-row blocks, with `budget` drafts left in the token budget. A causal draft's
+/// first rows are the same whatever follows them, so it runs only the rows it proposes. A
+/// non-causal one (the published DFlash2 drafts) conditions every row on the whole block: it runs
+/// the block it was trained on — shortened only where the token budget ends, as the reference
+/// does — and proposes its first `depth` rows.
+fn block_len(causal: bool, block_size: usize, depth: usize, budget: usize) -> usize {
+    if causal {
+        depth + 1
+    } else {
+        block_size.min(budget.max(depth) + 1)
     }
 }
 

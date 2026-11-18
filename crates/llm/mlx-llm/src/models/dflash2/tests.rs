@@ -188,7 +188,12 @@ fn the_block_mask_is_non_causal_over_the_block_and_windowed_over_the_context() {
     ctx.values = vec![row.clone(), row];
     let mask = draft.mask(&ctx, 3).unwrap().unwrap();
     assert_eq!(mask.shape(), [1, 1, 3, 10]);
-    let m = mask.as_slice::<f32>();
+    // The block's queries are BF16 (`bf16` of the embeddings); the fused kernel needs a mask that
+    // promotes to them, so an f32 mask would fail once the window clips the context.
+    let queries = bf16(&Array::zeros::<f32>(&[1, 3, 64]).unwrap()).unwrap();
+    assert_eq!(mask.dtype(), queries.dtype());
+    let m = f32(&mask).unwrap();
+    let m = m.as_slice::<f32>();
     for i in 0..3usize {
         for j in 0..10usize {
             let blocked = m[i * 10 + j] < -1.0;

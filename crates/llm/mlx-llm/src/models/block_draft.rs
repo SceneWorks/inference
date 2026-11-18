@@ -5,8 +5,9 @@
 //!
 //! Both formats project the target's tapped rows with `fc` + `hidden_norm` into the draft's
 //! **context**, whose per-layer roped keys and values the draft caches over its sliding window
-//! (E5), and run a block `[anchor, mask × depth]` through Qwen3 layers whose queries, keys and
-//! values come from the block rows. They differ in how a block's rows become candidates and
+//! (E5), and run a block `[anchor, mask × …]` through Qwen3 layers whose queries, keys and
+//! values come from the block rows (DSpine, causal: `depth` mask rows; DFlash2, non-causal: the
+//! trained block's). They differ in how a block's rows become candidates and
 //! predecessor-conditioned scores: DSpine's code bridge ([`DSpineDraft`]) and DFlash2's dynamic
 //! convolutions and candidate-path selector ([`DFlash2Draft`]). Either way a proposal is the same
 //! `[rows, K]` candidate ids and `[rows, K, K]` score table the proposer walks.
@@ -14,7 +15,9 @@
 use mlx_rs::ops::{concatenate_axis, multiply};
 use mlx_rs::{Array, Dtype};
 
-use core_llm::{BlockDraftConfig, BlockDraftFormat, BlockDraftPrecision, BlockDraftRefusal};
+use core_llm::{
+    BlockDraftConfig, BlockDraftFormat, BlockDraftHead, BlockDraftPrecision, BlockDraftRefusal,
+};
 
 use crate::error::{Error, Result};
 use crate::models::{DFlash2Draft, DSpineDraft};
@@ -326,6 +329,16 @@ impl BlockDraft {
         }
     }
 
+    /// Whether a block row sees only the block rows before it: DSpine always, DFlash2 when its
+    /// checkpoint says `is_causal` (the published ones are non-causal — every row sees the whole
+    /// block, so a shorter block changes every row's output).
+    pub fn causal(&self) -> bool {
+        !matches!(
+            self.config().head,
+            BlockDraftHead::DFlash2 { causal: false, .. }
+        )
+    }
+
     /// An empty context at absolute position `start`.
     pub fn new_context(&self, start: i32) -> BlockDraftContext {
         BlockDraftContext::new(start)
@@ -340,21 +353,44 @@ impl BlockDraft {
     }
 
     /// One proposal for the block `embeds` `[1, T, hidden]` (the target's embedding of
-    /// `[anchor, mask × (T - 1)]`): each draft row's candidate ids, ascending, `[T - 1, K]` i32,
-    /// and their `[T - 1, K, K]` f32 scores — row `i`'s candidates scored for each candidate
-    /// sender of row `i - 1` (row 0's sender is the anchor, the same for every sender column).
-    /// `head` is the target's LM head over normalized rows; `head_rows` gathers its dense rows.
+    /// `[anchor, mask × (T - 1)]`), scoring its first `n` draft rows (`1 <= n <= T - 1`; the rest
+    /// only condition a non-causal block, and a causal DSpine block scores all `T - 1`): each
+    /// scored row's candidate ids, ascending, `[n, K]` i32, and their `[n, K, K]` f32 scores —
+    /// row `i`'s candidates scored for each candidate sender of row `i - 1` (row 0's sender is
+    /// the anchor, the same for every sender column). `head` is the target's LM head over
+    /// normalized rows; `head_rows` gathers its dense rows.
     pub fn propose(
         &self,
         ctx: &BlockDraftContext,
         embeds: &Array,
+        n: usize,
         anchor: i32,
         head: &dyn Fn(&Array) -> Result<Array>,
         head_rows: &dyn Fn(&Array) -> Result<Array>,
     ) -> Result<(Array, Array)> {
+        let t = embeds.shape()[1];
+        let n = i32::try_from(n)
+            .ok()
+            .filter(|&n| n >= 1 && n < t)
+            .ok_or_else(|| {
+                Error::Msg(format!("block draft: {n} rows scored of a {t}-row block"))
+            })?;
         match self {
+            // Causal: the proposer runs only the rows it scores.
+            Self::DSpine(_) if n != t - 1 => Err(Error::Msg(format!(
+                "block draft: a causal draft scores its whole block ({} rows), not {n}",
+                t - 1
+            ))),
             Self::DSpine(d) => d.table(&d.block(ctx, embeds, anchor)?, anchor, head, head_rows),
-            Self::DFlash2(d) => d.table(&d.block(ctx, embeds)?, anchor, head),
+            Self::DFlash2(d) => {
+                let rows = d.block(ctx, embeds)?;
+                let rows = if n == t - 1 {
+                    rows
+                } else {
+                    rows.take_axis(&Array::arange::<i32, i32>(0, n, None)?, 0)?
+                };
+                d.table(&rows, anchor, head)
+            }
         }
     }
 }

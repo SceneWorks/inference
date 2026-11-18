@@ -281946,7 +281946,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@6ed0fc6fb719e95452b23fe8cffa82a26c5d2f100dd4a29d0a96683813fffa6f",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@da2ff2c329df76e212df9d1f374e6abdcff8ea20e5b4b41d42e0b6e02e6c0eda",
       "requirements": []
     }
   },
@@ -281976,7 +281976,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@150a10e740a36de18eb5f933fba4a377982ed81740a8e59e71cf02565a3d318d",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@7eb357967404b691399657683cc657f23281480c100d73dfcbe731bd605f01f2",
       "requirements": []
     }
   },
@@ -282006,7 +282006,37 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@aa7596567e69d28b3cfb9da3b4ae20935b28e6585e923a56c8577bae6634df89",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@70902b5d0eaa12a130fd921ae9eeb1ea406092610d5482c47b79d0955d2b4f3e",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@0f759057d7ecce5201cd1aa56d2146c899e0780305acaa1d18589606a0bba432",
       "requirements": []
     }
   },
@@ -282066,7 +282096,7 @@
     "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_resident_block_draft_runs_block_draft_and_is_named@2ebef3f849a5a8eb4dac4b3d21447a9a7cbd811d9a844c5e98937eab134cf7d4",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_resident_block_draft_runs_block_draft_and_is_named@a73bcb2bff7c656ab16f061938ef80fa5422cadebe7c8e07914d5f5420dda27c",
       "requirements": []
     }
   },
@@ -282105,7 +282135,7 @@
     "source": "crates/llm/mlx-llm/tests/block_draft.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@f55a5045864f0e0df14027fe55365c12282d1c6d1dd845d01d9b81b5c21656d7",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@3da42e50199e7df78d0d1f2bed8fefaebb8ccd96ab6bead3d11255489c9c9fab",
       "requirements": [
         {
           "slot": "model-weight-collections",
@@ -282184,7 +282214,7 @@
     "source": "crates/llm/mlx-llm/src/models/dflash2/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/dflash2/tests.rs::models::dflash2::tests::a_dflash2_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build@f6d57b1cb3587275e7bcbf982e4109d70e9e01279aaf209d4c18a07ea57c42dd",
+      "source_identity": "crates/llm/mlx-llm/src/models/dflash2/tests.rs::models::dflash2::tests::a_dflash2_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build@b924c89a8ccdceb50594096df2e98492985600522bcde8e1b16fdad8fd33188c",
       "requirements": []
     }
   },
@@ -282214,7 +282244,7 @@
     "source": "crates/llm/mlx-llm/src/models/dflash2/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/dflash2/tests.rs::models::dflash2::tests::the_selector_table_is_the_reference_edge_score@286b9820e91dab750244dd86d2e5f3c14734c4a0888a07b33312744a04f87171",
+      "source_identity": "crates/llm/mlx-llm/src/models/dflash2/tests.rs::models::dflash2::tests::the_selector_table_is_the_reference_edge_score@66c7fb42a00ca63222173bc204a28f64ce466783ef5ea06478dfcf02c8965a11",
       "requirements": []
     }
   },
@@ -282253,7 +282283,7 @@
     "source": "crates/llm/mlx-llm/tests/block_draft.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@7c30145ad61cb7d0ddbee6b4bd8428d510139c55a5bf12fd16322e437a3e5e4d",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@e4069e4e267b3854e3947404e512a4b0a266d8b270fee501aad5ecdb2f4e2749",
       "requirements": [
         {
           "slot": "model-weight-collections",

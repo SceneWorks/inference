@@ -6,7 +6,8 @@
 //! The draft reads the target's tapped rows as every block draft does
 //! ([`crate::models::block_draft`]): `fc` + `hidden_norm` fuse the five tapped layers into the
 //! context, whose roped keys and values each draft layer caches over the 2,048-token window
-//! (E5). A block `[anchor, mask × depth]`, embedded by the target, runs through the draft layers
+//! (E5). A block `[anchor, mask × (block_size - 1)]` — the trained block whatever the depth, cut
+//! short only at the token budget's end — embedded by the target, runs through the draft layers
 //! in **one parallel pass** — the published drafts are non-causal (`is_causal: false`): every
 //! block row attends to the whole block, and to the context rows its window still covers. Each
 //! layer wraps its attention and its MLP in a **two-tap dynamic convolution**: a grouped causal
@@ -43,6 +44,10 @@ use crate::primitives::Weights;
 
 /// The additive mask's blocked value (the attention primitives' own).
 const MASK_NEG: f32 = -1e30;
+
+/// The block forward's activation dtype: its queries, keys and values are BF16, so its additive
+/// mask is too (MLX's fused attention needs a mask that promotes to the output dtype).
+const ATTN_DTYPE: Dtype = Dtype::Bfloat16;
 
 /// One grouped dynamic causal convolution (`GroupedDynamicCausalConv`): a `[2, taps, hidden]`
 /// base kernel (stage × tap) and the projection that gives every row its own per-group taps.
@@ -339,7 +344,7 @@ impl DFlash2Draft {
     /// The attention mask of a `t`-row block at `ctx.next..` over the context's rows then the
     /// block's: a block row at position `p` sees a context row at `c` while `p - c` is inside the
     /// window, and every block row (non-causal) or the block rows up to itself (causal) — the
-    /// reference's `context | block` mask.
+    /// reference's `context | block` mask. Built in [`ATTN_DTYPE`], the queries' dtype.
     fn mask(&self, ctx: &BlockDraftContext, t: i32) -> Result<Option<Array>> {
         let rows = ctx.rows();
         let window = self.cfg.sliding_window.map(|w| w as i32);
@@ -362,7 +367,9 @@ impl DFlash2Draft {
                 }
             }
         }
-        Ok(Some(Array::from_slice(&data, &[1, 1, t, k])))
+        Ok(Some(
+            Array::from_slice(&data, &[1, 1, t, k]).as_dtype(ATTN_DTYPE)?,
+        ))
     }
 
     /// One parallel block forward over `embeds` `[1, T, hidden]` (the target's embedding of
@@ -371,7 +378,7 @@ impl DFlash2Draft {
     pub fn block(&self, ctx: &BlockDraftContext, embeds: &Array) -> Result<Array> {
         let t = embeds.shape()[1];
         let eps = self.cfg.rms_norm_eps;
-        let (cos, sin) = self.rope.cos_sin(t, ctx.next, Dtype::Bfloat16)?;
+        let (cos, sin) = self.rope.cos_sin(t, ctx.next, ATTN_DTYPE)?;
         let additive = self.mask(ctx, t)?;
         let mask = match &additive {
             Some(m) => AttnMask::Additive(m),

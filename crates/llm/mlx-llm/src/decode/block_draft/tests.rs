@@ -1,7 +1,7 @@
 //! The block-draft proposer's model-inference proofs (SW-7193, SW-7194): a tiny random draft of
 //! each format — DSpine and DFlash2 — over a tiny random `qwen3_5` target through the engine's
-//! linear verifier. Every test runs learned forwards, so each is ignored in ordinary CI and
-//! registered for the explicit model-proof workflow.
+//! linear verifier. Every test that runs learned forwards is ignored in ordinary CI and
+//! registered for the explicit model-proof workflow; the block-length rule is plain arithmetic.
 
 use std::collections::HashMap;
 
@@ -221,6 +221,105 @@ fn greedy_block_draft_is_the_plain_loop() {
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_block_draft_is_the_plain_loop"
+    );
+}
+
+/// A non-causal draft runs its trained block whatever the depth, shortened only at the token
+/// budget's end; a causal one runs the anchor and the rows it proposes.
+#[test]
+fn a_non_causal_draft_runs_its_trained_block_and_a_causal_one_its_drafts() {
+    // DFlash2's published block of 8 (anchor + 7) at the default depth 4 and a long budget.
+    assert_eq!(block_len(false, 8, 4, 100), 8);
+    assert_eq!(block_len(false, 8, 1, 100), 8);
+    assert_eq!(block_len(false, 8, 7, 7), 8);
+    // The budget's end: 2 drafts left, so anchor + 2, as the reference shortens it.
+    assert_eq!(block_len(false, 8, 2, 2), 3);
+    assert_eq!(block_len(false, 8, 4, 5), 6);
+    // Causal (DSpine): anchor + depth, whatever the budget.
+    assert_eq!(block_len(true, 8, 4, 100), 5);
+    assert_eq!(block_len(true, 8, 1, 1), 2);
+}
+
+/// E2 (block conditioning): a non-causal DFlash2 draft's first rows, scored alone, are exactly
+/// those rows of its whole-block proposal, and change when the block is shorter (so the proposer
+/// runs the trained block); a causal DSpine draft's first rows are the same in a shorter block.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn a_non_causal_draft_scores_its_rows_over_the_whole_block() {
+    let model = tiny_target();
+    for (format, draft) in tiny_drafts(None) {
+        let cfg = draft.config();
+        let mut cache = model.new_cache();
+        let (taps, _) = model
+            .forward_tapped(
+                &input_ids(&PROMPT),
+                &mut cache,
+                0,
+                &cfg.target_layer_ids,
+                None,
+                false,
+            )
+            .unwrap();
+        let mut context = draft.new_context(0);
+        draft.append_context(&mut context, &taps).unwrap();
+        let anchor = 5;
+        let embed = |len: usize| {
+            let mut block = vec![anchor];
+            block.resize(len, cfg.mask_token_id as i32);
+            model.embed_input_ids(&input_ids(&block)).unwrap()
+        };
+        let propose = |len: usize, n: usize| {
+            let (cand, table) = draft
+                .propose(
+                    &context,
+                    &embed(len),
+                    n,
+                    anchor,
+                    &|rows| model.lm_head(rows),
+                    &|ids| model.lm_head_rows(ids),
+                )
+                .unwrap();
+            (host(&cand), host(&table))
+        };
+        let full = cfg.block_size;
+        let worst = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (whole_cand, whole_table) = propose(full, full - 1);
+        let k = whole_cand.len() / (full - 1);
+        let (first_cand, first_table) = (&whole_cand[..2 * k], &whole_table[..2 * k * k]);
+        let (short_cand, short_table) = propose(3, 2);
+        let diff = worst(&short_table, first_table);
+        if draft.causal() {
+            assert_eq!(
+                short_cand, first_cand,
+                "{format}: causal rows ignore later rows"
+            );
+            assert!(
+                diff <= 1e-3,
+                "{format}: a shorter causal block moved scores by {diff}"
+            );
+        } else {
+            // The whole block's first rows, scored alone, are exactly those rows.
+            let (cand, table) = propose(full, 2);
+            assert_eq!(cand, first_cand, "{format}: candidates of the first rows");
+            let same = worst(&table, first_table);
+            assert!(
+                same <= 1e-3,
+                "{format}: the first rows' scores moved by {same}"
+            );
+            assert!(
+                short_cand != first_cand || diff > 1e-3,
+                "{format}: a non-causal draft's rows see the whole block"
+            );
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block"
     );
 }
 
