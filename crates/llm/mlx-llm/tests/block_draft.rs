@@ -1,6 +1,7 @@
-//! Real-weight block-draft smokes (epic SW-F360, stories SW-7193 and SW-7194), `#[ignore]`d: the
-//! Qwen3.8-27B target with the DSpine or the DFlash2 draft resident beside it, through the
-//! provider.
+//! Real-weight block-draft smokes (epic SW-F360, stories SW-7193, SW-7194 and SW-7195),
+//! `#[ignore]`d: the Qwen3.8-27B target with the DSpine or the DFlash2 draft resident beside it,
+//! through the provider, on a text request and on an image + text request (the image generated
+//! in the test).
 //!
 //! It reads the pinned snapshots under the explicit models root `MLX_GEN_MODELS_ROOT` (a Hugging
 //! Face Hub-layout root holding `models--*/snapshots`; inference never derives a cache location,
@@ -31,8 +32,8 @@
 //! bit-match where a near-tie flips — exact agreement is proven on the tiny fixtures).
 
 use core_llm::{
-    LoadSpec, Message, ProposerKind, Quantize, Sampling, Speculative, SpeculativeProposer,
-    StreamEvent, TextLlm, TextLlmRequest, ThinkingMode,
+    Content, ImageRef, LoadSpec, Message, ProposerKind, Quantize, Role, Sampling, Speculative,
+    SpeculativeProposer, StreamEvent, TextLlm, TextLlmRequest, ThinkingMode,
 };
 
 fn generate(
@@ -93,17 +94,14 @@ fn snapshot(override_var: &str, snapshot: &str) -> Result<String, String> {
 }
 
 /// Load the pinned target (`target_var`) with the block draft (`source_var`, pinned at
-/// `draft_snapshot`) at the precision `precision_var` names, and assert the draft is resident,
-/// named as `format` at that precision, and that a greedy `block_draft` request of `depth` drafts
-/// per step accepts more than one draft token per target pass.
-fn accepts_more_than_one_token_per_pass(
+/// `draft_snapshot`) at the precision `precision_var` names, and assert the draft is resident and
+/// `block_draft` advertised. Returns the provider, the draft's path and its requested precision.
+fn load_with_block_draft(
     target_var: &str,
     source_var: &str,
     precision_var: &str,
     draft_snapshot: &str,
-    format: &str,
-    depth: u32,
-) {
+) -> (mlx_llm::LlamaProvider, String, Option<Quantize>) {
     let (target, draft) = match (
         snapshot(target_var, TARGET_SNAPSHOT),
         snapshot(source_var, draft_snapshot),
@@ -133,6 +131,22 @@ fn accepts_more_than_one_token_per_pass(
         .capabilities
         .proposer(SpeculativeProposer::BlockDraft)
         .is_some());
+    (provider, draft, precision)
+}
+
+/// Load the pinned target with the block draft ([`load_with_block_draft`]) and assert the draft
+/// is named as `format` at its precision, and that a greedy `block_draft` request of `depth`
+/// drafts per step accepts more than one draft token per target pass.
+fn accepts_more_than_one_token_per_pass(
+    target_var: &str,
+    source_var: &str,
+    precision_var: &str,
+    draft_snapshot: &str,
+    format: &str,
+    depth: u32,
+) {
+    let (provider, draft, precision) =
+        load_with_block_draft(target_var, source_var, precision_var, draft_snapshot);
 
     let (ids, out) = generate(
         &provider,
@@ -203,5 +217,138 @@ fn qwen38_27b_dflash2_accepts_more_than_one_token_per_pass() {
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass"
+    );
+}
+
+/// The image request (SW-7195, E10): a 448 × 448 picture generated here — the left half orange,
+/// the right half deep blue — and a describe instruction, greedy, thinking off, as the describer
+/// asks.
+fn generate_image(
+    provider: &mlx_llm::LlamaProvider,
+    speculative: Speculative,
+) -> (Vec<u32>, core_llm::TextLlmOutput) {
+    let (w, h) = (448u32, 448u32);
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            pixels.extend_from_slice(if x < w / 2 {
+                &[240, 140, 30]
+            } else {
+                &[20, 40, 140]
+            });
+        }
+    }
+    let req = TextLlmRequest {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::Image(ImageRef::new(w, h, pixels).unwrap()),
+                Content::text(
+                    "Describe this image in two short paragraphs: its colours, how the picture \
+                     is divided, and what it might be used for.",
+                ),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 160,
+        seed: Some(0),
+        thinking: ThinkingMode::Disabled,
+        speculative: Some(speculative),
+        ..Default::default()
+    };
+    let mut ids = Vec::new();
+    let out = provider
+        .generate(&req, &mut |ev| {
+            if let StreamEvent::Token { id, .. } = ev {
+                ids.push(id);
+            }
+        })
+        .unwrap();
+    (ids, out)
+}
+
+/// Load the pinned describer target with the block draft and assert that a greedy image + text
+/// `block_draft` request runs the draft — no fallback, the draft named as `format` — and accepts
+/// more than one draft token per target pass; it reports where the stream first differs from the
+/// same engine with speculation off.
+fn image_request_runs_the_block_draft(
+    target_var: &str,
+    source_var: &str,
+    precision_var: &str,
+    draft_snapshot: &str,
+    format: &str,
+    depth: u32,
+) {
+    let (provider, draft, _) =
+        load_with_block_draft(target_var, source_var, precision_var, draft_snapshot);
+    let (ids, out) = generate_image(
+        &provider,
+        Speculative::proposer(SpeculativeProposer::BlockDraft, depth),
+    );
+    let decode = out.decode.unwrap();
+    let (off_ids, _) = generate_image(&provider, Speculative::Off);
+    let first_difference = ids.iter().zip(&off_ids).position(|(a, b)| a != b);
+    let per_pass = decode.mean_accepted_length().unwrap_or(0.0);
+    println!(
+        "BLOCK_DRAFT_IMAGE proposer={} draft={:?} fallbacks={:?} target_passes={} accepted={} \
+         accepted_per_pass={per_pass:.2} first_difference={first_difference:?} tokens={} \
+         off_tokens={} text={:?}",
+        decode.proposer.label(),
+        decode.draft,
+        decode.fallbacks,
+        decode.verify_steps,
+        decode.accepted_tokens,
+        ids.len(),
+        off_ids.len(),
+        out.text,
+    );
+    assert_eq!(decode.proposer, ProposerKind::BlockDraft);
+    assert!(
+        decode.fallbacks.iter().all(|f| !f.contains("block_draft")),
+        "{:?}",
+        decode.fallbacks
+    );
+    let named = decode.draft.unwrap();
+    assert_eq!(named.source, draft);
+    assert_eq!(named.format, format);
+    assert!(
+        per_pass > 1.0,
+        "accepted tokens per target pass {per_pass:.2} must exceed 1 on the image prompt"
+    );
+}
+
+#[test]
+#[ignore = "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT"]
+fn qwen38_27b_dspine_runs_on_an_image_request() {
+    image_request_runs_the_block_draft(
+        "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "MLX_LLM_BLOCK_DRAFT_PRECISION",
+        DRAFT_SNAPSHOT,
+        "dspine",
+        4,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dspine_runs_on_an_image_request"
+    );
+}
+
+#[test]
+#[ignore = "needs the pinned Qwen3.8-27B target and DFlash2 draft under MLX_GEN_MODELS_ROOT"]
+fn qwen38_27b_dflash2_runs_on_an_image_request() {
+    image_request_runs_the_block_draft(
+        "MLX_LLM_DFLASH2_TARGET",
+        "MLX_LLM_DFLASH2_SOURCE",
+        "MLX_LLM_DFLASH2_PRECISION",
+        DFLASH2_SNAPSHOT,
+        "dflash2",
+        7,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dflash2_runs_on_an_image_request"
     );
 }

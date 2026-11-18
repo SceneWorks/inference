@@ -1724,13 +1724,77 @@ impl Qwen35Model {
         all: bool,
     ) -> Result<(Array, Array)> {
         let h0 = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin(h0.shape()[1], offset, compute())?;
+        let (tapped, h) = self.tapped_layers(h0, &cos, &sin, cache, layers, keep, |_, h| Ok(h))?;
+        let logits = if all {
+            self.project(&h)?
+        } else {
+            self.project_last(&h)?
+        };
+        Ok((tapped, logits))
+    }
+
+    /// The tapped decoder over a fused multimodal prompt (SW-7195, E10): the prompt's decoder
+    /// input embeddings `[1, S, hidden]` — the vision encoder's rows already spliced in — run
+    /// under their explicit three-axis M-RoPE `positions` with the DeepStack features added
+    /// after the first layers, exactly as the multimodal prefill
+    /// ([`Self::prefill_hidden_and_last_logits_from_embeds_with_deepstack`]) runs them. Returns
+    /// the tapped rows of [`Self::forward_tapped`] — image positions included, the last `keep` of
+    /// them — and the last position's logits `[1, vocab]`. A layer's tap is the residual stream
+    /// the next layer reads, so a DeepStack layer's tap carries its fused features.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_tapped_from_embeds_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+        layers: &[usize],
+        keep: Option<usize>,
+    ) -> Result<(Array, Array)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            compute(),
+        )?;
+        let h0 = embeds.as_dtype(compute())?;
+        let (tapped, h) =
+            self.tapped_layers(
+                h0,
+                &cos,
+                &sin,
+                cache,
+                layers,
+                keep,
+                |i, h| match deepstack.get(i) {
+                    Some(feature) => deepstack::add_visual_features(&h, visual_pos_mask, feature),
+                    None => Ok(h),
+                },
+            )?;
+        Ok((tapped, self.project_last(&h)?))
+    }
+
+    /// Run every decoder layer over `h0` roped by (`cos`, `sin`), `fuse` applied after each layer
+    /// (its index, its output), keeping the outputs of `layers` — their last `keep` rows —
+    /// concatenated on the feature axis. Returns the taps and the last layer's (fused) output.
+    #[allow(clippy::too_many_arguments)]
+    fn tapped_layers(
+        &self,
+        h0: Array,
+        cos: &Array,
+        sin: &Array,
+        cache: &mut Qwen35Cache,
+        layers: &[usize],
+        keep: Option<usize>,
+        mut fuse: impl FnMut(usize, Array) -> Result<Array>,
+    ) -> Result<(Array, Array)> {
         let s = h0.shape()[1];
         let rows = keep.map_or(s, |k| i32::try_from(k).unwrap_or(i32::MAX).min(s));
-        let (cos, sin) = self.rope.cos_sin(s, offset, compute())?;
         let mut taps: Vec<Option<Array>> = vec![None; layers.len()];
         let mut h = h0;
         for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            h = layer.forward(&h, &cos, &sin, slot)?;
+            h = fuse(i, layer.forward(&h, cos, sin, slot)?)?;
             for (tap, _) in taps.iter_mut().zip(layers).filter(|(_, &l)| l == i) {
                 *tap = Some(if rows < s {
                     let idx = Array::arange::<i32, i32>(s - rows, s, None)?;
@@ -1747,13 +1811,7 @@ impl Qwen35Model {
             ))
         })?;
         let refs: Vec<&Array> = taps.iter().collect();
-        let tapped = concatenate_axis(&refs, 2)?;
-        let logits = if all {
-            self.project(&h)?
-        } else {
-            self.project_last(&h)?
-        };
-        Ok((tapped, logits))
+        Ok((concatenate_axis(&refs, 2)?, h))
     }
 
     /// Decoder layers (a block draft's `target_layer_ids` must fall inside them).
