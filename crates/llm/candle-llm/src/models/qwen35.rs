@@ -24,15 +24,20 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 use serde_json::Value;
 
-use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
+use crate::decode::step::{
+    LogitsScope, StepModel, StepOutput, StepRequest, TreeOutput, TreeVerify,
+};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
-use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
+use crate::primitives::attention::{
+    repeat_kv, sdpa, sdpa_gqa, sdpa_gqa_causal, AttnFormulation, AttnMask,
+};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, tree_depthwise_conv, DeltaNetCache,
+    RingSpec, TreePlan,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
@@ -440,6 +445,28 @@ impl GatedDeltaNet {
         cache: &mut DeltaNetCache,
         positions: Option<&DevicePositions>,
     ) -> Result<Tensor> {
+        self.forward_mode(x, cache, positions, None)
+    }
+
+    /// The layer over a verify **tree** (feature SW-F328): each row convolves and recurs along
+    /// its own branch ([`tree_depthwise_conv`], [`DeltaNetCache::advance_tree`]); the cache keeps
+    /// the per-row states aside until the engine keeps one branch.
+    fn forward_tree(
+        &self,
+        x: &Tensor,
+        cache: &mut DeltaNetCache,
+        plan: &TreePlan,
+    ) -> Result<Tensor> {
+        self.forward_mode(x, cache, None, Some(plan))
+    }
+
+    fn forward_mode(
+        &self,
+        x: &Tensor,
+        cache: &mut DeltaNetCache,
+        positions: Option<&DevicePositions>,
+        tree: Option<&TreePlan>,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
         // Four independent in-projections (dtype follows the projection weights).
@@ -454,70 +481,81 @@ impl GatedDeltaNet {
 
         // Short conv over the q‖k‖v channels (only these are convolved), seeded by the cache tail,
         // then a *contiguous* split into q [key_dim] ‖ k [key_dim] ‖ v [value_dim] and reshape to heads.
+        // A tree row convolves its own branch instead of the rows packed before it.
         let conv_state = match cache.live_conv_state(positions)? {
             Some(cs) => cs,
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
-        let (conv_out, conv_trace) =
-            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+        let (conv_out, conv) = match tree {
+            None => {
+                let (out, trace) =
+                    causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+                (out, Ok(trace))
+            }
+            Some(plan) => {
+                let windows = plan.conv_windows(self.conv_kernel);
+                let (out, cat) =
+                    tree_depthwise_conv(&mixed, &self.conv_weight, &conv_state, &windows)?;
+                (out, Err((cat, windows)))
+            }
+        };
         // Fused preparation (bit-identical to the chains below) when it serves this layer.
         let q_scale = (self.head_k_dim as f64).powf(-0.5);
-        if let Some(prepared) = self.fused_prep(&conv_out, &a_in, &b_in, q_scale)? {
-            let (q, k, v, g, beta) = prepared;
-            let y = if crate::primitives::in_prefill() {
-                cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
-            } else {
-                cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
-            };
-            let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-            return self.out_proj.forward(&out.reshape((b, s, self.value_dim))?);
-        }
-        let qc = conv_out
-            .narrow(2, 0, self.key_dim)?
-            .contiguous()?
-            .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
-        let kc = conv_out
-            .narrow(2, self.key_dim, self.key_dim)?
-            .contiguous()?
-            .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
-        let vc = conv_out
-            .narrow(2, 2 * self.key_dim, self.value_dim)?
-            .contiguous()?
-            .reshape((b, s, self.num_v_heads, self.head_v_dim))?;
+        let (q, k, v, g, beta) = match self.fused_prep(&conv_out, &a_in, &b_in, q_scale)? {
+            Some(prepared) => prepared,
+            None => {
+                let qc = conv_out
+                    .narrow(2, 0, self.key_dim)?
+                    .contiguous()?
+                    .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
+                let kc = conv_out
+                    .narrow(2, self.key_dim, self.key_dim)?
+                    .contiguous()?
+                    .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
+                let vc = conv_out
+                    .narrow(2, 2 * self.key_dim, self.value_dim)?
+                    .contiguous()?
+                    .reshape((b, s, self.num_v_heads, self.head_v_dim))?;
 
-        // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim — `use_qk_l2norm_in_kernel`.
-        let inv = (self.head_k_dim as f64).powf(-0.5);
-        let qn = l2norm(&qc, 1e-6)?.affine(inv, 0.0)?;
-        let kn = l2norm(&kc, 1e-6)?;
+                // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim —
+                // `use_qk_l2norm_in_kernel`.
+                let inv = (self.head_k_dim as f64).powf(-0.5);
+                let qn = l2norm(&qc, 1e-6)?.affine(inv, 0.0)?;
+                let kn = l2norm(&kc, 1e-6)?;
+                let beta = sigmoid(&b_in)?;
+                let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
+                let f = DType::F32;
+                (
+                    qn.to_dtype(f)?,
+                    kn.to_dtype(f)?,
+                    vc.to_dtype(f)?,
+                    g.to_dtype(f)?,
+                    beta.to_dtype(f)?,
+                )
+            }
+        };
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
         // the cache so every token's post-step state (conv tail + SSM state) lands in its
         // checkpoint ring (sc-24131) — except in a prompt prefill, whose positions are never
         // rolled back to: it runs final-state-only and rings just its last state (sc-24446).
         // GQA (q/k from Hk key heads → Hv value heads) is handled inside the recurrence
-        // primitive.
-        let beta = sigmoid(&b_in)?;
-        let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
-        let f = DType::F32;
-        let (q, k, v, g, beta) = (
-            qn.to_dtype(f)?,
-            kn.to_dtype(f)?,
-            vc.to_dtype(f)?,
-            g.to_dtype(f)?,
-            beta.to_dtype(f)?,
-        );
-        let y = if crate::primitives::in_prefill() {
-            cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
-        } else {
-            cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
+        // primitive. A tree forward recurs along each row's branch and keeps the per-row states
+        // aside (SW-F328).
+        let y = match conv {
+            Err((cat, windows)) => {
+                let plan = tree.expect("a tree conv implies a plan");
+                cache.advance_tree(plan, cat, windows, &q, &k, &v, &g, &beta)?
+            }
+            Ok(trace) if crate::primitives::in_prefill() => {
+                cache.advance_prefill(&trace, &q, &k, &v, &g, &beta)?
+            }
+            Ok(trace) => cache.advance_at(&trace, &q, &k, &v, &g, &beta, positions)?,
         };
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-        let result = self
-            .out_proj
-            .forward(&out.reshape((b, s, self.value_dim))?)?;
-        Ok(result)
+        self.out_proj.forward(&out.reshape((b, s, self.value_dim))?)
     }
 }
 
@@ -586,6 +624,11 @@ enum KvSlot<'a> {
     /// The static cache on the device-positions step (sc-24441): written at the staged device
     /// start, attended by the length-aware decode attention over the whole buffers.
     Indexed(&'a mut StaticKvCache, &'a DevicePositions),
+    /// A tree verify forward (feature SW-F328): the rows appended to the growing slot, attended
+    /// through the ancestor-only additive mask over `[cache ‖ rows]`.
+    GrowingTree(&'a mut AttnKv, &'a Tensor),
+    /// A tree verify forward on the static slot, written at its host offset.
+    StaticTree(&'a mut StaticKvCache, &'a Tensor),
 }
 
 impl Qwen35Attention {
@@ -634,6 +677,16 @@ impl Qwen35Attention {
             )
         };
         let out = match (cache, formulation) {
+            // A tree verify forward (SW-F328): the same un-expanded grouped-query attention as
+            // the causal step, through the ancestor-only mask.
+            (KvSlot::GrowingTree(growing, mask), _) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                sdpa_gqa(&q, &k_all, &v_all, self.scale, AttnMask::Additive(mask))?
+            }
+            (KvSlot::StaticTree(fixed, mask), _) => {
+                let (k_all, v_all) = fixed.update(0, &k, &v)?;
+                sdpa_gqa(&q, &k_all, &v_all, self.scale, AttnMask::Additive(mask))?
+            }
             // A short cached step of a model with device positions (sc-24441): the static
             // path's length-aware attention, over the growing concat — one arithmetic still.
             (
@@ -820,10 +873,48 @@ impl DecoderLayer {
             }
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
-        // Residual add + post-attention norm as one fused leaf (sc-24137); `h` carries forward.
-        let (h, normed) = rms_norm_residual(x, &r, &self.post_ln, self.eps)?;
+        self.finish(x, &r)
+    }
+
+    /// Residual add + post-attention norm as one fused leaf (sc-24137), then the FFN; `h` carries
+    /// forward.
+    fn finish(&self, x: &Tensor, r: &Tensor) -> Result<Tensor> {
+        let (h, normed) = rms_norm_residual(x, r, &self.post_ln, self.eps)?;
         let m = self.ffn.forward(&normed)?;
         Ok(h.broadcast_add(&m)?)
+    }
+
+    /// The layer over a verify tree (feature SW-F328): a DeltaNet layer recurs along each row's
+    /// branch, an attention layer attends through the ancestor-only `mask`.
+    fn forward_tree(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35LayerCache,
+        plan: &TreePlan,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let r = match (&self.mixer, cache) {
+            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward_tree(&normed, c, plan)?,
+            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(
+                &normed,
+                cos,
+                sin,
+                KvSlot::GrowingTree(c, mask),
+                AttnFormulation::Gqa,
+            )?,
+            (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => a.forward(
+                &normed,
+                cos,
+                sin,
+                KvSlot::StaticTree(c, mask),
+                AttnFormulation::Gqa,
+            )?,
+            _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
+        };
+        self.finish(x, &r)
     }
 }
 
@@ -1506,6 +1597,24 @@ impl DecodeCache for Qwen35Cache {
         self.offset()
     }
 
+    /// Every layer kind keeps a branch: the attention KV by gather, the DeltaNet layers from the
+    /// tree forward's per-row states (feature SW-F328).
+    fn tree_unsupported(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        Qwen35Cache::commit_tree(self, base, path)
+    }
+
+    fn abort_tree(&mut self, base: i32) -> Result<()> {
+        Qwen35Cache::abort_tree(self, base)
+    }
+
+    fn tree_bytes(&self) -> usize {
+        Qwen35Cache::tree_bytes(self)
+    }
+
     fn rollback_to(&mut self, n: i32) -> Result<()> {
         Qwen35Cache::rollback_to(self, n)
     }
@@ -1624,6 +1733,78 @@ impl DecodeCache for Qwen35Cache {
             }
         }
         Ok(())
+    }
+}
+
+impl Qwen35Cache {
+    /// Keep the tree branch `path` (rows from the anchor, `path[0] == 0`) of the tree forward that
+    /// started at position `base` (feature SW-F328): every attention layer gathers the branch's
+    /// rows and writes them back at `base` (in place on a static slot), every DeltaNet layer
+    /// commits the branch's per-row conv tails and recurrent states as one-token steps — the
+    /// cache a linear decode of the branch would have left.
+    pub fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        // The attention layers hold every tree row (a schedule without one has no rows to check).
+        let len = self
+            .layers
+            .iter()
+            .find_map(|l| match l {
+                Qwen35LayerCache::Attn(a) => Some(a.offset()),
+                Qwen35LayerCache::StaticAttn(s) => Some(s.offset()),
+                Qwen35LayerCache::Delta(_) => None,
+            })
+            .unwrap_or(i32::MAX);
+        let rows = crate::primitives::step_kv_cache::tree_branch_rows(base, path, len)?;
+        let gather = |k: &Tensor, v: &Tensor| {
+            crate::primitives::step_kv_cache::gather_tree_branch(k, v, base, &rows)
+        };
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.commit_tree(path)?,
+                Qwen35LayerCache::Attn(a) => {
+                    let Some((k, v)) = a.kv.as_ref() else {
+                        return Err(Error::Msg("Qwen35Cache::commit_tree: no tree rows".into()));
+                    };
+                    let (k, v) = gather(k, v)?;
+                    a.truncate(base)?;
+                    a.update(&k, &v)?;
+                }
+                Qwen35LayerCache::StaticAttn(s) => {
+                    let (k, v) = s.views(0)?;
+                    let (k, v) = gather(&k, &v)?;
+                    s.truncate(base)?;
+                    s.update(0, &k, &v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo a tree forward that started at position `base`, keeping nothing of it (a failed
+    /// forward or decision, a cancel; feature SW-F328): the attention KV truncates back to `base`
+    /// and the DeltaNet layers drop their per-row states, their live state and ring untouched.
+    pub fn abort_tree(&mut self, base: i32) -> Result<()> {
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.abort_tree();
+                    // A commit that failed part-way may have advanced this layer already.
+                    if c.offset() > base {
+                        c.rollback_to(base)?;
+                    }
+                }
+                Qwen35LayerCache::Attn(a) => a.truncate(base.min(a.offset()))?,
+                Qwen35LayerCache::StaticAttn(s) => s.truncate(base.min(s.offset()))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes a pending tree forward's per-row recurrent states and conv inputs hold.
+    pub fn tree_bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |acc, l| match l {
+            Qwen35LayerCache::Delta(c) => acc.saturating_add(c.tree_bytes()),
+            Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => acc,
+        })
     }
 }
 
@@ -3649,6 +3830,42 @@ impl StepModel for Qwen35Model {
             }
         };
         Ok(StepOutput { logits, hidden })
+    }
+    /// Every cache this model builds keeps a tree branch (feature SW-F328).
+    fn tree_unsupported(&self, cache: &Qwen35Cache) -> Option<&'static str> {
+        DecodeCache::tree_unsupported(cache)
+    }
+
+    /// The tree rows on the host path at the cache's position: each row at the RoPE position of
+    /// its depth (plus the cache's RoPE delta), every DeltaNet layer recurring along the row's
+    /// branch from the live state, every attention layer attending through the ancestor-only
+    /// mask. The attention KV holds every row afterwards and the DeltaNet layers the per-row
+    /// states, until the cache commits a branch or aborts.
+    fn forward_tree(&self, cache: &mut Qwen35Cache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
+        let base = cache.offset();
+        let rows = tree.tree.rows();
+        cache.begin_forward(rows)?;
+        let plan = TreePlan::new(tree.tree);
+        let mask = tree.mask(base as usize, self.dtype, &self.device)?;
+        let mask_bytes = tensor_bytes(&mask);
+        let positions = tree.positions(base + cache.rope_delta());
+        let (cos, sin) = self.rope.cos_sin_at(&positions, self.dtype, &self.device)?;
+        let mut h = self
+            .embed_tokens
+            .forward(&tree.ids(&self.device)?)?
+            .to_dtype(self.dtype)?;
+        for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
+            h = layer.forward_tree(&h, &cos, &sin, slot, &plan, &mask)?;
+        }
+        let normalized = self.normalize(&h)?;
+        let logits = self.project_normalized(&normalized)?;
+        Ok(TreeOutput {
+            step: StepOutput {
+                logits,
+                hidden: tree.want_hidden.then_some(normalized),
+            },
+            mask_bytes,
+        })
     }
 }
 

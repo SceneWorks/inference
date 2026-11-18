@@ -136,7 +136,7 @@ pub struct TreeVerifyReport {
     /// Rows the verify passes fed the target, anchors included (every pass).
     pub rows_verified: u64,
     /// Rows the branching-tree passes alone fed the target, anchors included. Backends that run
-    /// tree verification (MLX; Candle should fill it too) set this beside `tree_passes`.
+    /// tree verification (MLX and Candle) set this beside `tree_passes`.
     pub tree_rows_verified: u64,
     /// Candidates the branching-tree passes alone accepted.
     pub tree_accepted_tokens: u64,
