@@ -1866,6 +1866,28 @@ impl Qwen35Model {
         Ok((logits, want_hidden.then_some(normalized)))
     }
 
+    /// [`Self::forward_tree`] with **hidden-state taps** (SW-7196): every row's logits
+    /// `[1, rows, vocab]` and the outputs of decoder `layers` for every row, concatenated —
+    /// `[1, rows, layers.len() · hidden]`, as [`Self::forward_tapped`]. Row `r`'s taps see only
+    /// the cached prefix and `r`'s ancestors, so after [`Qwen35Cache::commit_tree`] the accepted
+    /// branch's rows are the taps a linear forward of that branch returns — the rows a block
+    /// draft's context reads.
+    pub(crate) fn forward_tree_tapped(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        positions: &[i32],
+        plan: std::sync::Arc<TreePlan>,
+        mask: &Array,
+        layers: &[usize],
+    ) -> Result<(Array, Array)> {
+        cache.arm_tree(plan, mask);
+        let h0 = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin_at(positions, compute())?;
+        let (tapped, h) = self.tapped_layers(h0, &cos, &sin, cache, layers, None, |_, h| Ok(h))?;
+        Ok((self.project(&h)?, tapped))
+    }
+
     /// Run the decoder and return logits for the **last** position only, `[B, vocab]` — the
     /// [`crate::decode::Decode::step`] contract (prefill + single-token decode).
     pub fn decode_logits(

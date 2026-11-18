@@ -184,8 +184,8 @@ pub use resource::{
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::tree::{
-    ngram_propose_tree, resolve_tree_verify, resolve_tree_verify_with, DraftTree, TreeResolution,
-    TreeWalk, MAX_TREE_ROWS,
+    ngram_propose_tree, resolve_tree_verify, resolve_tree_verify_with, tree_workspace_rows,
+    DraftTree, TreeResolution, TreeWalk, MAX_TREE_ROWS,
 };
 pub use speculative::{
     accept_greedy_run, accept_token, decode_clock, demotion_threshold, draft_compatibility,

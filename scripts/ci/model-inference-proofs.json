@@ -282134,6 +282134,126 @@
     "package": "mlx-llm",
     "target": "mlx_llm",
     "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@ed4f4a279429f6bc17828e37d1993dca24b66d32b896b934c516ff61fe08a9aa",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@f071e04c09b32e7cc78f04b46c0b367f1d53f53f549412f459e0b6e7f91fe035",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path@f295a3c2bb7bdbf7406a43d67e91265db111a56f39b436898a4248e259ff377a",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@8988d4ddc6a728bb253a196ac5d9c2998d9594f2b848719e278ed4ce3effd89f",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
     "fqn": "decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution",
     "execution_role": "direct",
     "backend": "mlx",
@@ -282402,6 +282522,94 @@
     "package": "mlx-llm",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "block_draft::qwen38_27b_dspine_tree_verifies_its_candidates",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned Hub snapshots staged into the runner Hub cache and bound by path: target SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4 (MLX_LLM_BLOCK_DRAFT_TARGET) and DSpine draft SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d (MLX_LLM_BLOCK_DRAFT_SOURCE)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT",
+      "env_gates": [
+        "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "MLX_LLM_BLOCK_DRAFT_PRECISION"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/tests/block_draft.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_tree_verifies_its_candidates@081dedb85354e7237c9962e710e65328b9b7873e95cf5291ecdd0349ff93ce3c",
+      "requirements": [
+        {
+          "slot": "model-weight-collections",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-configurations",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file",
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_environment": [
+      "MLX_LLM_BLOCK_DRAFT_TARGET",
+      "MLX_LLM_BLOCK_DRAFT_SOURCE"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "pin": "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4"
+      },
+      {
+        "environment": "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "pin": "SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d"
+      }
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "block_draft::qwen38_27b_dspine_runs_on_an_image_request",
     "execution_role": "direct",
     "backend": "mlx",
@@ -282582,6 +282790,94 @@
     "input_contract": {
       "fixture_kind": "external",
       "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@e4069e4e267b3854e3947404e512a4b0a266d8b270fee501aad5ecdb2f4e2749",
+      "requirements": [
+        {
+          "slot": "model-weight-collections",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-configurations",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file",
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_environment": [
+      "MLX_LLM_DFLASH2_TARGET",
+      "MLX_LLM_DFLASH2_SOURCE"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "MLX_LLM_DFLASH2_TARGET",
+        "pin": "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4"
+      },
+      {
+        "environment": "MLX_LLM_DFLASH2_SOURCE",
+        "pin": "SceneWorks/qwen3.8-27b-dflash2@9030fabfb5e3ca0c5c180f84927af86aa9f9a2e9"
+      }
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "block_draft::qwen38_27b_dflash2_tree_verifies_its_candidates",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned Hub snapshots staged into the runner Hub cache and bound by path: target SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4 (MLX_LLM_DFLASH2_TARGET) and DFlash2 draft SceneWorks/qwen3.8-27b-dflash2@9030fabfb5e3ca0c5c180f84927af86aa9f9a2e9 (MLX_LLM_DFLASH2_SOURCE)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the pinned Qwen3.8-27B target and DFlash2 draft under MLX_GEN_MODELS_ROOT",
+      "env_gates": [
+        "MLX_LLM_DFLASH2_TARGET",
+        "MLX_LLM_DFLASH2_SOURCE",
+        "MLX_LLM_DFLASH2_PRECISION"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/tests/block_draft.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_tree_verifies_its_candidates@45807a6ca9f55eb172059a0cdea80a1be24aa5ce0461e5138d940fb2151056ba",
       "requirements": [
         {
           "slot": "model-weight-collections",

@@ -1,4 +1,4 @@
-//! Real-weight block-draft smokes (epic SW-F360, stories SW-7193, SW-7194 and SW-7195),
+//! Real-weight block-draft smokes (epic SW-F360, stories SW-7193, SW-7194, SW-7195 and SW-7196),
 //! `#[ignore]`d: the Qwen3.8-27B target with the DSpine or the DFlash2 draft resident beside it,
 //! through the provider, on a text request and on an image + text request (the image generated
 //! in the test).
@@ -33,7 +33,7 @@
 
 use core_llm::{
     Content, ImageRef, LoadSpec, Message, ProposerKind, Quantize, Role, Sampling, Speculative,
-    SpeculativeProposer, StreamEvent, TextLlm, TextLlmRequest, ThinkingMode,
+    SpeculativeProposer, SpeculativeVerify, StreamEvent, TextLlm, TextLlmRequest, ThinkingMode,
 };
 
 fn generate(
@@ -350,5 +350,141 @@ fn qwen38_27b_dflash2_runs_on_an_image_request() {
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dflash2_runs_on_an_image_request"
+    );
+}
+
+/// The text request of [`generate`] under the verify layout `verify` (SW-7196).
+fn generate_verified(
+    provider: &mlx_llm::LlamaProvider,
+    speculative: Speculative,
+    verify: SpeculativeVerify,
+) -> (Vec<u32>, core_llm::TextLlmOutput) {
+    let req = TextLlmRequest {
+        messages: vec![Message::user(
+            "Describe, in four short paragraphs, how a lighthouse keeper's day changes from \
+             summer to winter.",
+        )],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 192,
+        seed: Some(0),
+        thinking: ThinkingMode::Disabled,
+        speculative: Some(speculative),
+        speculative_verify: verify,
+        ..Default::default()
+    };
+    let mut ids = Vec::new();
+    let out = provider
+        .generate(&req, &mut |ev| {
+            if let StreamEvent::Token { id, .. } = ev {
+                ids.push(id);
+            }
+        })
+        .unwrap();
+    (ids, out)
+}
+
+/// Load the pinned target with the block draft and run the same greedy `block_draft` request of
+/// `depth` drafts linearly and under a 16-row tree (SW-7196). Prints committed tokens per target
+/// pass for both, and the tree run's rows verified and tokens accepted per pass; asserts the tree
+/// run verified branching trees with no linear fallback, reports its rows and acceptance per pass,
+/// and commits more than one token per target pass.
+fn tree_verifies_block_draft_candidates(
+    target_var: &str,
+    source_var: &str,
+    precision_var: &str,
+    draft_snapshot: &str,
+    format: &str,
+    depth: u32,
+) {
+    let (provider, _, _) =
+        load_with_block_draft(target_var, source_var, precision_var, draft_snapshot);
+    let speculative = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+    let (linear_ids, linear) = generate_verified(&provider, speculative, SpeculativeVerify::Linear);
+    let (tree_ids, tree) = generate_verified(
+        &provider,
+        speculative,
+        SpeculativeVerify::Tree { max_rows: 16 },
+    );
+    let linear = linear.decode.unwrap();
+    let tree = tree.decode.unwrap();
+    let per_pass = |tokens: usize, passes: u64| tokens as f64 / passes.max(1) as f64;
+    let linear_per_pass = per_pass(linear_ids.len(), linear.verify_steps);
+    let tree_per_pass = per_pass(tree_ids.len(), tree.verify_steps);
+    let report = tree.tree_verify.expect("the tree request ran a tree");
+    let first_difference = tree_ids.iter().zip(&linear_ids).position(|(a, b)| a != b);
+    println!(
+        "BLOCK_DRAFT_TREE format={format} depth={depth} linear_tokens={} linear_passes={} \
+         linear_tokens_per_pass={linear_per_pass:.2} tree_tokens={} tree_passes={} \
+         tree_tokens_per_pass={tree_per_pass:.2} tree_branching_passes={} \
+         rows_verified_per_pass={:.2} accepted_per_pass={:.2} rows_per_tree_pass={:.2} \
+         accepted_per_tree_pass={:.2} max_rows_per_pass={} \
+         peak_workspace_bytes={} first_difference={first_difference:?} fallbacks={:?}",
+        linear_ids.len(),
+        linear.verify_steps,
+        tree_ids.len(),
+        tree.verify_steps,
+        report.tree_passes,
+        report.rows_per_pass().unwrap_or(0.0),
+        report.accepted_per_pass().unwrap_or(0.0),
+        report.rows_per_tree_pass().unwrap_or(0.0),
+        report.accepted_per_tree_pass().unwrap_or(0.0),
+        report.max_rows_per_pass,
+        report.peak_workspace_bytes,
+        tree.fallbacks,
+    );
+    assert_eq!(tree.proposer, ProposerKind::BlockDraft);
+    assert_eq!(tree.draft.unwrap().format, format);
+    assert!(
+        tree.fallbacks.iter().all(|f| !f.contains("tree")),
+        "{:?}",
+        tree.fallbacks
+    );
+    assert_eq!(report.max_rows, 16);
+    assert!(
+        report.tree_passes > 0,
+        "the tree run verified branching trees"
+    );
+    assert_eq!(report.passes, tree.verify_steps);
+    assert_eq!(report.accepted_tokens, tree.accepted_tokens);
+    assert!(report.tree_rows_verified > report.tree_passes);
+    assert!(report.tree_accepted_tokens <= report.accepted_tokens);
+    assert!(report.rows_per_tree_pass().unwrap() > 1.0);
+    assert!(
+        tree_per_pass > 1.0,
+        "committed tokens per target pass {tree_per_pass:.2} must exceed 1 under a tree"
+    );
+}
+
+#[test]
+#[ignore = "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT"]
+fn qwen38_27b_dspine_tree_verifies_its_candidates() {
+    tree_verifies_block_draft_candidates(
+        "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "MLX_LLM_BLOCK_DRAFT_PRECISION",
+        DRAFT_SNAPSHOT,
+        "dspine",
+        4,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dspine_tree_verifies_its_candidates"
+    );
+}
+
+#[test]
+#[ignore = "needs the pinned Qwen3.8-27B target and DFlash2 draft under MLX_GEN_MODELS_ROOT"]
+fn qwen38_27b_dflash2_tree_verifies_its_candidates() {
+    tree_verifies_block_draft_candidates(
+        "MLX_LLM_DFLASH2_TARGET",
+        "MLX_LLM_DFLASH2_SOURCE",
+        "MLX_LLM_DFLASH2_PRECISION",
+        DFLASH2_SNAPSHOT,
+        "dflash2",
+        7,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dflash2_tree_verifies_its_candidates"
     );
 }

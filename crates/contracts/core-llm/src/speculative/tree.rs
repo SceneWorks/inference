@@ -502,6 +502,19 @@ pub fn resolve_tree_verify_with(
     }
 }
 
+/// The candidate rows a request's tree workspace must hold beyond its linear verify (feature
+/// SW-F328, E6) when `kind` runs under a tree bound of `tree_rows`: the whole bound for a proposer
+/// that builds branching trees ([`ProposerKind::builds_trees`](super::ProposerKind::builds_trees)),
+/// `0` for any other — its one branch is capped at `min(drafts, tree_rows)` candidates and verified
+/// on the linear path, which the linear route's price already covers.
+pub fn tree_workspace_rows(kind: super::ProposerKind, tree_rows: usize) -> usize {
+    if kind.builds_trees() {
+        tree_rows
+    } else {
+        0
+    }
+}
+
 /// Why a model without a tree advertisement verifies linearly.
 pub const TREE_VERIFY_NOT_ADVERTISED: &str =
     "tree verification is not available for this model; verified linearly";
