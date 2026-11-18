@@ -234,8 +234,10 @@ pub trait Proposer {
     /// drawn from (`None`: a deterministic candidate). Called instead of
     /// [`propose`](Self::propose) on a tree run; [`commit`](Self::commit) then receives the
     /// accepted branch's candidates. `None` (the default) is a proposer with one candidate per
-    /// position: the engine asks it for its linear proposal, which is the one-branch tree and is
-    /// verified on the linear path — so its drafts may stay on the device.
+    /// position: the engine asks it for its linear proposal of at most `ctx.max_rows` drafts,
+    /// which is the one-branch tree and is verified on the linear path — so its drafts may stay on
+    /// the device. Only a [`ProposerKind::builds_trees`] proposer may return a branching tree:
+    /// tree workspace is sized and priced for no other.
     fn propose_tree(
         &mut self,
         ctx: &ProposeContext<'_>,
@@ -604,7 +606,10 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             let capacity = prompt_ids
                 .len()
                 .saturating_add(config.max_new_tokens)
-                .saturating_add(tree_extra_positions(drafts, tree_rows));
+                .saturating_add(tree_extra_positions(
+                    drafts,
+                    core_llm::tree_workspace_rows(kind, tree_rows),
+                ));
             let cache = owned.insert(model.new_cache_for(capacity, drafts)?);
             // A prompt prefill: no position inside it is ever rolled back to (sc-24446).
             core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
@@ -862,6 +867,16 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                     },
                     None,
                 ),
+                // A one-branch proposer (MTP, a draft model): its linear proposal is the tree,
+                // capped at the row bound as MLX prunes it (`pruned(k, tree_rows, …)`), so a pass
+                // never verifies more candidate rows than the request allows.
+                None if tree_rows > 0 => {
+                    let capped = ProposeContext {
+                        max_drafts: k.min(tree_rows),
+                        ..ctx
+                    };
+                    (proposer.propose(&capped, &mut sampler)?, None)
+                }
                 None => (proposer.propose(&ctx, &mut sampler)?, None),
             }
         };

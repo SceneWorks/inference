@@ -884,6 +884,32 @@ impl Proposer for LinearOnly {
     }
 }
 
+/// A one-branch proposer of the draft-model kind (the MTP head behaves alike): every proposal is
+/// `max_drafts` copies of `cur`, and the tree hook is left at its default.
+struct OneBranch;
+
+impl Proposer for OneBranch {
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::DraftModel
+    }
+    fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
+        Ok(())
+    }
+    fn propose(
+        &mut self,
+        ctx: &ProposeContext<'_>,
+        _: &mut DraftSampler<'_, '_>,
+    ) -> Result<Proposal> {
+        Ok(Proposal {
+            drafts: Some(Drafts::Host(vec![ctx.cur; ctx.max_drafts])),
+            dists: Vec::new(),
+        })
+    }
+    fn commit(&mut self, _: i32, _: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A model without a tree forward (the trait's defaults): a tree request on it verifies linearly.
 struct NoTree<'a, M>(&'a M);
 
@@ -935,6 +961,21 @@ fn check_linear<M: StepModel>(name: &str, model: &M) {
         "{name}: chains never run a tree forward"
     );
     assert_eq!(tree.passes as usize, chained.stats.verify_steps, "{name}");
+    // E1: a one-branch proposer (a draft model, the MTP head) under a two-row bound verifies at
+    // most two candidates per pass — MLX prunes the same chain to the bound — however many drafts
+    // the engine runs, and still commits the plain loop's tokens.
+    let bounded = tree_run(model, &mut OneBranch, &config, 2, None);
+    assert_eq!(bounded.output.tokens, linear.output.tokens, "{name}");
+    let report = bounded.record.tree_verify.expect("a tree run reports");
+    assert_eq!(report.max_rows, 2, "{name}");
+    assert_eq!(
+        report.tree_passes, 0,
+        "{name}: a chain runs no tree forward"
+    );
+    assert_eq!(
+        report.max_rows_per_pass, 3,
+        "{name}: the anchor and at most two candidates per pass"
+    );
     // E5: a model that cannot keep a tree branch verifies linearly — the same tokens — and the
     // report names why.
     let refused = tree_run(

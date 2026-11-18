@@ -117429,7 +117429,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@c45b7f60fda9b837ba2fa418cbaae3c96029a1f894c319585b667d7c6f850db3",
       "requirements": []
     }
   },
@@ -117499,7 +117499,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@c45b7f60fda9b837ba2fa418cbaae3c96029a1f894c319585b667d7c6f850db3",
       "requirements": []
     }
   },
@@ -117569,7 +117569,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@c45b7f60fda9b837ba2fa418cbaae3c96029a1f894c319585b667d7c6f850db3",
       "requirements": []
     }
   },
@@ -117639,7 +117639,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@c45b7f60fda9b837ba2fa418cbaae3c96029a1f894c319585b667d7c6f850db3",
       "requirements": []
     }
   },
@@ -117666,7 +117666,7 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path; source setup helpers=causal,tiny_qwen3,text_model_on,LinearOnly,NoTree,tree_run; source-bound asset/control facts below",
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path; source setup helpers=causal,tiny_qwen3,text_model_on,LinearOnly,OneBranch,NoTree,tree_run; source-bound asset/control facts below",
     "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
@@ -117709,7 +117709,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@c45b7f60fda9b837ba2fa418cbaae3c96029a1f894c319585b667d7c6f850db3",
       "requirements": []
     }
   },
@@ -117779,7 +117779,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named@c45b7f60fda9b837ba2fa418cbaae3c96029a1f894c319585b667d7c6f850db3",
       "requirements": []
     }
   },

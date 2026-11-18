@@ -178,6 +178,14 @@ impl DecodeRoute {
             DecodeRoute::Engine { drafts, .. } => drafts,
         }
     }
+
+    /// The proposer the route runs ([`ProposerKind::None`] on the reference loop).
+    fn proposer(self) -> ProposerKind {
+        match self {
+            DecodeRoute::Reference => ProposerKind::None,
+            DecodeRoute::Engine { proposer, .. } => proposer,
+        }
+    }
 }
 
 /// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens (the
@@ -247,14 +255,19 @@ const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not avai
 /// ([`tree_extra_positions`](crate::decode::tree_extra_positions)) and their logit and hidden
 /// rows, the ancestor mask over the whole context, and — on the hybrid — every row's transient
 /// recurrent state (one full state per linear layer per row, held until the branch is kept).
-/// `0` without a tree; `None` on overflow.
+/// Only a `proposer` that builds branching trees carries that workspace
+/// ([`core_llm::tree_workspace_rows`]); any other's one branch is capped at `drafts` candidates
+/// and verified on the linear path the linear route already prices. `0` without a tree; `None`
+/// on overflow.
 fn tree_request_bytes(
     model: &Decoder,
+    proposer: ProposerKind,
     drafts: u32,
     tree_rows: usize,
     prompt: usize,
     max_new_tokens: u32,
 ) -> Option<u64> {
+    let tree_rows = core_llm::tree_workspace_rows(proposer, tree_rows);
     if drafts == 0 || tree_rows == 0 {
         return Some(0);
     }

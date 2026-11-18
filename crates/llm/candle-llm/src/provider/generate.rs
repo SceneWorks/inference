@@ -290,6 +290,7 @@ impl TextLlm for LlamaProvider {
             .and_then(|bytes| {
                 bytes.checked_add(tree_request_bytes(
                     &self.model,
+                    route.proposer(),
                     route.drafts(),
                     tree_rows,
                     admitted_prompt,
@@ -589,6 +590,9 @@ impl TextLlm for LlamaProvider {
                 // and CUDA-graph runner, for a request whose speculation is off. The reference
                 // `Decode` loop stays selectable (`set_decode_path`) as the oracle.
                 let drafts = drafts as usize;
+                // The tree rows the cache holds past the linear overshoot: only a tree-building
+                // proposer's (SW-F328, E6), as admission priced them.
+                let tree_workspace = core_llm::tree_workspace_rows(route_proposer, tree_rows);
                 let mut mtp_proposer = match route_proposer {
                     ProposerKind::Mtp => {
                         Some(MtpProposer::new(self.mtp.as_ref().ok_or_else(|| {
@@ -633,7 +637,7 @@ impl TextLlm for LlamaProvider {
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_rows),
+                                capacity + tree_extra_positions(drafts, tree_workspace),
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
@@ -714,7 +718,7 @@ impl TextLlm for LlamaProvider {
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_rows),
+                                capacity + tree_extra_positions(drafts, tree_workspace),
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
@@ -831,6 +835,9 @@ impl TextLlm for LlamaProvider {
                     ));
                 }
                 let drafts = drafts as usize;
+                // The tree rows the cache holds past the linear overshoot: only a tree-building
+                // proposer's (SW-F328, E6), as admission priced them.
+                let tree_workspace = core_llm::tree_workspace_rows(route_proposer, tree_rows);
                 let mut ngram_proposer = NgramProposer::default();
                 let mut no_proposer = NoProposer;
                 // A resident draft model (sc-24436): its cache spans the effective prompt (the
@@ -873,7 +880,7 @@ impl TextLlm for LlamaProvider {
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_rows),
+                                capacity + tree_extra_positions(drafts, tree_workspace),
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
@@ -946,7 +953,7 @@ impl TextLlm for LlamaProvider {
                         )?;
                         let mut cache = model
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_rows),
+                                capacity + tree_extra_positions(drafts, tree_workspace),
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
@@ -999,7 +1006,7 @@ impl TextLlm for LlamaProvider {
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
                             .new_cache_for(
-                                capacity + tree_extra_positions(drafts, tree_rows),
+                                capacity + tree_extra_positions(drafts, tree_workspace),
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;

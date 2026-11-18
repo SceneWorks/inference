@@ -43,17 +43,28 @@ fn a_loaded_decoder_advertises_tree_verification_and_a_tree_is_priced() {
             max_rows: core_llm::MAX_TREE_ROWS
         })
     );
-    let tree = super::tree_request_bytes(&provider.model, 4, 16, 100, 50).unwrap();
+    let lookup = ProposerKind::PromptLookup;
+    let tree = super::tree_request_bytes(&provider.model, lookup, 4, 16, 100, 50).unwrap();
     assert!(tree > 0);
-    assert!(super::tree_request_bytes(&provider.model, 4, 32, 100, 50).unwrap() == tree);
+    assert!(super::tree_request_bytes(&provider.model, lookup, 4, 32, 100, 50).unwrap() == tree);
     assert_eq!(
-        super::tree_request_bytes(&provider.model, 4, 0, 100, 50),
+        super::tree_request_bytes(&provider.model, lookup, 4, 0, 100, 50),
         Some(0)
     );
     assert_eq!(
-        super::tree_request_bytes(&provider.model, 0, 16, 100, 50),
+        super::tree_request_bytes(&provider.model, lookup, 0, 16, 100, 50),
         Some(0)
     );
+    // A one-branch proposer (a draft model, the MTP head) verifies at most `drafts` candidates on
+    // the linear path its route already prices: a tree request adds no tree workspace (E6).
+    for one_branch in [ProposerKind::DraftModel, ProposerKind::Mtp] {
+        assert_eq!(
+            super::tree_request_bytes(&provider.model, one_branch, 4, 16, 100, 50),
+            Some(0),
+            "{}",
+            one_branch.label()
+        );
+    }
     // The request resolves against the advertisement: a tree needs a running proposer.
     let verify = core_llm::SpeculativeVerify::Tree { max_rows: 40 };
     let run = core_llm::resolve_tree_verify(
