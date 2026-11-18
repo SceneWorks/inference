@@ -1094,6 +1094,17 @@ fn tree_report(run: &SpeculativeRun, label: &str) -> core_llm::TreeVerifyReport 
         "{label}: at most the anchor and the bound per pass"
     );
     assert!(tree.rows_per_pass().is_some() && tree.accepted_per_pass().is_some());
+    // Tree-pass-only figures: a subset of the every-pass totals, anchors counted per tree pass.
+    assert!(tree.tree_passes <= tree.passes, "{label}");
+    assert!(tree.tree_rows_verified <= tree.rows_verified, "{label}");
+    assert!(tree.tree_accepted_tokens <= tree.accepted_tokens, "{label}");
+    if tree.tree_passes > 0 {
+        assert!(
+            tree.tree_rows_verified > tree.tree_passes,
+            "{label}: a tree pass feeds its anchor and at least one candidate"
+        );
+        assert!(tree.rows_per_tree_pass().is_some() && tree.accepted_per_tree_pass().is_some());
+    }
     tree
 }
 
@@ -1147,11 +1158,14 @@ fn greedy_block_draft_tree_is_the_plain_loop() {
                     let tree = tree_report(&run, &label);
                     println!(
                         "BLOCK_DRAFT_TREE {label}: passes={} tree_passes={} rows_per_pass={:.2} \
-                         accepted_per_pass={:.2}",
+                         accepted_per_pass={:.2} rows_per_tree_pass={:.2} \
+                         accepted_per_tree_pass={:.2}",
                         tree.passes,
                         tree.tree_passes,
                         tree.rows_per_pass().unwrap(),
-                        tree.accepted_per_pass().unwrap()
+                        tree.accepted_per_pass().unwrap(),
+                        tree.rows_per_tree_pass().unwrap_or(0.0),
+                        tree.accepted_per_tree_pass().unwrap_or(0.0)
                     );
                     let t = totals.entry(format).or_default();
                     t.0 += tree.tree_passes;
@@ -1288,13 +1302,25 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
         let draft: &'static BlockDraft = Box::leak(Box::new(draft));
         let target = TappedQwen35::for_draft(model, draft);
         let prompt = &PROMPT[..6];
-        let params = SamplingParams {
+        let plain = SamplingParams {
             temperature: 1.0,
             top_k: 4,
             top_p: 1.0,
             ..SamplingParams::default()
         };
-        for forbidden in [&[][..], &[1usize, 9][..]] {
+        // The penalized case scores every branch row against its own ancestor path (prompt plus
+        // the tokens committed above it), so a branch that read the wrong history shows in the
+        // chi-square.
+        let penalized = SamplingParams {
+            repetition_penalty: 1.6,
+            presence_penalty: 0.6,
+            ..plain
+        };
+        for (forbidden, params) in [
+            (&[][..], plain),
+            (&[1usize, 9][..], plain),
+            (&[][..], penalized),
+        ] {
             let mask = Forbid::new(forbidden).allow;
             let masked = (!forbidden.is_empty()).then_some(mask.as_slice());
             let mut expected: HashMap<[i32; 3], f64> = HashMap::new();
@@ -1366,9 +1392,10 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
             let z = 3.09;
             let critical = k * (1.0 - 2.0 / (9.0 * k) + z * (2.0 / (9.0 * k)).sqrt()).powi(3);
             println!(
-                "BLOCK_DRAFT_TREE_SAMPLED {format} forbidden {forbidden:?}: chi-square {chi2:.1} \
+                "BLOCK_DRAFT_TREE_SAMPLED {format} forbidden {forbidden:?} penalties {}: chi-square {chi2:.1} \
                  over {cells} cells (critical {critical:.1}); {tree_passes} tree passes, \
-                 {accepted}/{proposed} accepted"
+                 {accepted}/{proposed} accepted",
+                params.repetition_penalty != 1.0
             );
             assert!(
                 chi2 < critical,

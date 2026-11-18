@@ -416,7 +416,8 @@ fn tree_verifies_block_draft_candidates(
         "BLOCK_DRAFT_TREE format={format} depth={depth} linear_tokens={} linear_passes={} \
          linear_tokens_per_pass={linear_per_pass:.2} tree_tokens={} tree_passes={} \
          tree_tokens_per_pass={tree_per_pass:.2} tree_branching_passes={} \
-         rows_verified_per_pass={:.2} accepted_per_pass={:.2} max_rows_per_pass={} \
+         rows_verified_per_pass={:.2} accepted_per_pass={:.2} rows_per_tree_pass={:.2} \
+         accepted_per_tree_pass={:.2} max_rows_per_pass={} \
          peak_workspace_bytes={} first_difference={first_difference:?} fallbacks={:?}",
         linear_ids.len(),
         linear.verify_steps,
@@ -425,6 +426,8 @@ fn tree_verifies_block_draft_candidates(
         report.tree_passes,
         report.rows_per_pass().unwrap_or(0.0),
         report.accepted_per_pass().unwrap_or(0.0),
+        report.rows_per_tree_pass().unwrap_or(0.0),
+        report.accepted_per_tree_pass().unwrap_or(0.0),
         report.max_rows_per_pass,
         report.peak_workspace_bytes,
         tree.fallbacks,
@@ -443,6 +446,9 @@ fn tree_verifies_block_draft_candidates(
     );
     assert_eq!(report.passes, tree.verify_steps);
     assert_eq!(report.accepted_tokens, tree.accepted_tokens);
+    assert!(report.tree_rows_verified > report.tree_passes);
+    assert!(report.tree_accepted_tokens <= report.accepted_tokens);
+    assert!(report.rows_per_tree_pass().unwrap() > 1.0);
     assert!(
         tree_per_pass > 1.0,
         "committed tokens per target pass {tree_per_pass:.2} must exceed 1 under a tree"

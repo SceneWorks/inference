@@ -133,8 +133,13 @@ pub struct TreeVerifyReport {
     pub passes: u64,
     /// Passes that verified a branching tree in one tree forward.
     pub tree_passes: u64,
-    /// Rows the verify passes fed the target, anchors included.
+    /// Rows the verify passes fed the target, anchors included (every pass).
     pub rows_verified: u64,
+    /// Rows the branching-tree passes alone fed the target, anchors included. Backends that run
+    /// tree verification (MLX; Candle should fill it too) set this beside `tree_passes`.
+    pub tree_rows_verified: u64,
+    /// Candidates the branching-tree passes alone accepted.
+    pub tree_accepted_tokens: u64,
     /// The most rows one pass fed.
     pub max_rows_per_pass: u64,
     /// Candidates accepted over the run's passes.
@@ -153,6 +158,16 @@ impl TreeVerifyReport {
     /// Candidates accepted per authoritative (target) pass, or `None` before any pass.
     pub fn accepted_per_pass(&self) -> Option<f64> {
         (self.passes > 0).then(|| self.accepted_tokens as f64 / self.passes as f64)
+    }
+
+    /// Rows verified per branching-tree pass, or `None` before any tree pass.
+    pub fn rows_per_tree_pass(&self) -> Option<f64> {
+        (self.tree_passes > 0).then(|| self.tree_rows_verified as f64 / self.tree_passes as f64)
+    }
+
+    /// Candidates accepted per branching-tree pass, or `None` before any tree pass.
+    pub fn accepted_per_tree_pass(&self) -> Option<f64> {
+        (self.tree_passes > 0).then(|| self.tree_accepted_tokens as f64 / self.tree_passes as f64)
     }
 }
 

@@ -314,6 +314,10 @@ pub fn x_decode(report: &DecodeReport) -> Value {
             "max_rows_per_pass": tree.max_rows_per_pass,
             "accepted_tokens": tree.accepted_tokens,
             "accepted_per_pass": tree.accepted_per_pass(),
+            "tree_rows_verified": tree.tree_rows_verified,
+            "rows_per_tree_pass": tree.rows_per_tree_pass(),
+            "tree_accepted_tokens": tree.tree_accepted_tokens,
+            "accepted_per_tree_pass": tree.accepted_per_tree_pass(),
             "peak_workspace_bytes": tree.peak_workspace_bytes,
         });
     }

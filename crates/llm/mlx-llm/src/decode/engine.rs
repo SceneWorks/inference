@@ -1901,6 +1901,8 @@ where
                 }
                 if let Some(report) = stats.tree.as_mut() {
                     report.tree_passes += 1;
+                    report.tree_rows_verified += 1 + tree.len() as u64;
+                    report.tree_accepted_tokens += walk.accepted as u64;
                     report.peak_workspace_bytes = report.peak_workspace_bytes.max(workspace);
                 }
                 let TreeWalk {

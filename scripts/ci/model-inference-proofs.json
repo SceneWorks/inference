@@ -282186,7 +282186,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@078930795a836747ee2d8bd9b1b6f171722c888c25cefb4c461371d9865d8f71",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@f071e04c09b32e7cc78f04b46c0b367f1d53f53f549412f459e0b6e7f91fe035",
       "requirements": []
     }
   },
@@ -282246,7 +282246,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@54fb7ca6a5b338ef08a6c48c92525e984f4835f4b46c93c6e37bd9bd544b2700",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@8988d4ddc6a728bb253a196ac5d9c2998d9594f2b848719e278ed4ce3effd89f",
       "requirements": []
     }
   },
