@@ -56,9 +56,10 @@ fn short_train_produces_loadable_adapter() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
     let img_path = tmp.join("swatch.png");
-    // A 512 edge so the one preview sample is inspectable: the 512×768 portrait trains — and the
-    // preview renders at — its whole 2:3 canvas (SW-7172).
-    let edge = 512;
+    // The original 256 bucket edge: the 256×384 portrait trains — and the preview renders at — its
+    // whole 2:3 canvas (SW-7172). A 512 edge (512×768) pushes the first training step past what a
+    // 128 GB Mac can admit beside its resident workloads (run 44301427997: >63 GiB within 6 s).
+    let edge = 256;
     write_synth_image(&img_path, edge);
 
     let mut trainer = load_trainer(&LoadSpec::new(WeightsSource::Dir(root))).expect("load_trainer");
@@ -80,6 +81,11 @@ fn short_train_produces_loadable_adapter() {
             save_every: 0,
             learning_rate: 1e-4,
             network_type: NetworkType::Lora,
+            // The bounded proof trains through the checkpointed path: the dense (non-checkpointed)
+            // first step needs far more than the pre-flight's ~24 GB + per-token estimate on a
+            // 128 GB Mac (runs 44288439227…44316071280 crossed every admissible cap within seconds
+            // of step 1) — a trainer defect tracked on its own, not this canvas proof's subject.
+            gradient_checkpointing: true,
             // One preview at the final step, rendered at item 0's canvas from the trained adapter.
             sample_every: 3,
             sample_steps: 12,

@@ -478,22 +478,9 @@ pub fn training_mix(sigma: f32) -> (f32, f32) {
 /// the target keeps its aspect either way, so capping its area keeps references and target
 /// aligned exactly as before. A degenerate (zero) side falls back to the square `edge` canvas.
 pub fn training_canvas((width, height): (u32, u32), edge: u32) -> (u32, u32) {
-    let stride = f64::from(TRAINING_CANVAS_STRIDE);
-    // The epsilon keeps a side that lands on a stride multiple through a square root from flooring
-    // a whole stride down on rounding error.
-    let snap = |v: f64| ((v / stride + 1e-9).floor() * stride).max(stride) as u32;
-    if width == 0 || height == 0 {
-        let e = snap(f64::from(edge));
-        return (e, e);
-    }
-    let (w, h) = (f64::from(width), f64::from(height));
-    let area = f64::from(edge) * f64::from(edge);
-    if w * h <= area {
-        // Never upscale: a source at or below the edge's area trains at its own size.
-        return (snap(w), snap(h));
-    }
-    let scale = (area / (w * h)).sqrt();
-    (snap(w * scale), snap(h * scale))
+    // The shared aspect-preserving rule every trainer uses (SW-7172), at H3's stride. H3 keeps the
+    // unbounded-aspect form: its references condition at their own sizes, so no 4:1 source crop.
+    crate::canvas::aspect_canvas((width, height), edge, TRAINING_CANVAS_STRIDE)
 }
 
 // ── the training-step memory envelope ───────────────────────────────────────────────────────────
