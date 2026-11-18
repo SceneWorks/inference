@@ -6551,6 +6551,9 @@ jobs:
         if: matrix.asset_setup == 'sensenova-loop' && runner.os == 'macOS'
         shell: bash
         env:
+          # Rust 1.96 can mis-strip macOS proc-macro dylibs (rust-lang/rust#157750).
+          CARGO_PROFILE_RELEASE_STRIP: 'none'
+          CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: 'none'
           SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-input-${{ github.run_id }}-${{ github.run_attempt }}
           SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
           # Published to GITHUB_ENV by the preparation script, then passed to the exact test.
