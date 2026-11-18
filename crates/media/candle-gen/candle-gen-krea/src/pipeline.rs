@@ -3058,21 +3058,14 @@ fn edit_pid_model_id(distilled: bool) -> &'static str {
     }
 }
 
-/// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`
-/// `v = v_cond + guidance·(v_cond − v_uncond)`, **NOT** the standard `v_uncond + g·Δ`. Krea's guidance
-/// is offset by one: the standard form applies one full step LESS guidance, and at `guidance = 1.0`
-/// collapses to exactly `v_cond` (zero effective CFG — the washed-out-render trap). Single source of
-/// truth so the Raw inference path (sc-9994) and the trainer preview (`training::render_sample`) can
-/// never drift again (mirrors the mlx-gen sc-10009 dedupe). The caller runs this only for
-/// `guidance > 0` (a single conditional forward otherwise, matching `cfg = guidance > 0`).
 /// Whether classifier-free guidance (an unconditional branch) is active for Krea 2 (SW-7176).
 ///
-/// Both `0.0` (Krea's offset-by-one CFG-free sentinel) and `1.0` (the unified SceneWorks CFG-off
-/// guidance value) disable the unconditional pass so CFG-free Turbo and low-guidance Raw/Edit
-/// (`guidance = 1.0`) run single-pass baseline or 2-pass (`cond + perturbed`) PAG without needing a
-/// negative prompt.
+/// Krea's CFG formula `v = v_cond + guidance·(v_cond − v_uncond)` is offset by one from standard
+/// CFG, so `guidance == 0.0` is CFG-off (`v = v_cond`, 1-pass baseline / 2-pass PAG), whereas
+/// `guidance != 0.0` (including `guidance == 1.0`, `v = 2·v_cond − v_uncond`) runs active true CFG
+/// (2-pass baseline / 3-pass CFG + PAG), matching [`gen_core_family::krea_multiphase::phase_uses_cfg`].
 pub fn krea_uses_cfg(guidance: f32) -> bool {
-    guidance != 0.0 && guidance != 1.0
+    gen_core_family::krea_multiphase::phase_uses_cfg(guidance)
 }
 
 /// Active per-step Perturbed-Attention Guidance parameters resolved against the executed schedule
@@ -3180,6 +3173,13 @@ pub(crate) fn executed_steps_for_request(
     Ok(sigmas.len().saturating_sub(1) as u32)
 }
 
+/// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`
+/// `v = v_cond + guidance·(v_cond − v_uncond)`, **NOT** the standard `v_uncond + g·Δ`. Krea's guidance
+/// is offset by one: the standard form applies one full step LESS guidance, and at `guidance = 1.0`
+/// collapses to exactly `v_cond` (zero effective CFG — the washed-out-render trap). Single source of
+/// truth so the Raw inference path (sc-9994) and the trainer preview (`training::render_sample`) can
+/// never drift again (mirrors the mlx-gen sc-10009 dedupe). The caller runs this only when
+/// [`krea_uses_cfg`] holds (a single conditional forward otherwise).
 pub(crate) fn krea_cfg_combine(
     v_cond: &Tensor,
     v_uncond: &Tensor,
@@ -4625,6 +4625,12 @@ mod tests {
         assert_eq!(turbo_report.total_steps, 8);
         assert_eq!(turbo_report.layers, vec![14]);
 
+        // `krea_uses_cfg` follows `phase_uses_cfg` (guidance != 0.0): 0.0 is CFG-off (2-pass PAG),
+        // whereas 1.0 and 3.5 both run active true CFG (3-pass CFG + PAG).
+        assert!(!krea_uses_cfg(0.0));
+        assert!(krea_uses_cfg(1.0));
+        assert!(krea_uses_cfg(3.5));
+
         // 2-pass (`cond + scale * (cond - perturbed)`) vs 3-pass (`cfg + scale * (cond - perturbed)`).
         let cond = Tensor::from_vec(vec![3.0f32, -1.0], (2,), &Device::Cpu).unwrap();
         let uncond = Tensor::from_vec(vec![1.0f32, 0.5], (2,), &Device::Cpu).unwrap();
@@ -4634,6 +4640,15 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(two_pass, vec![4.5, 0.5]);
+
+        // At guidance == 1.0, Krea CFG is active: cond + 1.0*(cond - uncond) = [5.0, -2.5],
+        // and 3-pass PAG adds 1.5*(cond - perturbed) = [1.5, 1.5] -> [6.5, -1.0].
+        let cfg_one = krea_cfg_combine(&cond, &uncond, 1.0).unwrap();
+        let three_pass_one = krea_pag_combine(&cfg_one, &cond, &perturbed, 1.5)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(three_pass_one, vec![6.5, -1.0]);
 
         let cfg = krea_cfg_combine(&cond, &uncond, 3.5).unwrap();
         let three_pass = krea_pag_combine(&cfg, &cond, &perturbed, 1.5)

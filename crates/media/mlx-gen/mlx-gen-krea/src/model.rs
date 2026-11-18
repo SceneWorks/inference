@@ -1291,7 +1291,8 @@ impl Krea {
     /// `Sequential` loads the text phase, encodes, then the seam materializes + DROPS it + `clear_cache()`
     /// so its ~4 GB frees before the DiT/VAE load. `is_edit` uses the Qwen3-VL grounded encode over the
     /// source image; `is_raw`/Turbo the plain text encode. The unconditional context is built only when
-    /// `encode_neg` is true (`krea_uses_cfg(guidance)`); CFG-free Turbo and `guidance == 1.0` skip it.
+    /// `encode_neg` is true (`krea_uses_cfg(guidance)`); CFG-free Turbo and `guidance == 0.0` skip it,
+    /// while nonzero guidance (including `1.0`) builds it.
     #[allow(clippy::too_many_arguments)]
     fn encode_contexts(
         &self,
@@ -1962,8 +1963,7 @@ pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Resu
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
-    if id.starts_with("krea_2_turbo")
-        && !crate::pipeline::krea_uses_cfg(req.guidance.unwrap_or(0.0))
+    if !request_uses_cfg(id, req)
         && req
             .negative_prompt
             .as_ref()
@@ -2005,6 +2005,23 @@ pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Resu
     }
     validate_phases(id, req)?;
     Ok(())
+}
+
+/// Whether the resolved request enables classifier-free guidance (`guidance != 0.0`) for `id`,
+/// matching [`Krea::resolve_request`] across all four Krea 2 variants and multi-phase Raw.
+fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
+    let default_guidance = if matches!(id, KREA_2_RAW_ID | KREA_2_EDIT_ID) {
+        DEFAULT_RAW_GUIDANCE
+    } else {
+        0.0
+    };
+    let effective_guidance = req.guidance.unwrap_or(default_guidance);
+    match req.phases.as_deref() {
+        Some(phases) if id == KREA_2_RAW_ID && !phases.is_empty() => phases.iter().any(|phase| {
+            crate::pipeline::krea_uses_cfg(phase.guidance.unwrap_or(effective_guidance))
+        }),
+        _ => crate::pipeline::krea_uses_cfg(effective_guidance),
+    }
 }
 
 /// Multi-phase request validation (epic 13879, sc-13884). Multi-phase is the **Raw t2i** variant only:
@@ -4401,8 +4418,55 @@ mod tests {
             }
         }
 
-        // Low-guidance Raw / Edit (`guidance == 1.0`) with PAG and no negative prompt validates
-        // cleanly and treats CFG as inactive (`!krea_uses_cfg(1.0)`).
+        // CFG-off (`guidance == 0.0`) with PAG across all four variants accepts absent or
+        // whitespace-only negative prompts for 2-pass PAG, and rejects non-empty negative prompts.
+        for desc in [
+            descriptor(),
+            turbo_edit_descriptor(),
+            raw_descriptor(),
+            edit_descriptor(),
+        ] {
+            let mut base_zero = req(1024, 1024);
+            base_zero.guidance = Some(0.0);
+            base_zero.negative_prompt = None;
+            base_zero.pag = Some(PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            });
+            if matches!(desc.id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                base_zero.conditioning = vec![Conditioning::Reference {
+                    image: tiny_image(),
+                    strength: None,
+                }];
+            }
+            assert!(
+                validate_request(&desc, &base_zero).is_ok(),
+                "{} at g=0.0 without neg",
+                desc.id
+            );
+
+            let mut whitespace_neg = base_zero.clone();
+            whitespace_neg.negative_prompt = Some("   ".into());
+            assert!(
+                validate_request(&desc, &whitespace_neg).is_ok(),
+                "{} at g=0.0 with whitespace neg",
+                desc.id
+            );
+
+            let mut with_neg = base_zero;
+            with_neg.negative_prompt = Some("blurry".into());
+            assert!(
+                matches!(
+                    validate_request(&desc, &with_neg),
+                    Err(Error::Unsupported(_))
+                ),
+                "{} at g=0.0 must reject non-empty negative_prompt",
+                desc.id
+            );
+        }
+
+        // `guidance == 1.0` on Raw / Edit runs active true CFG (`krea_uses_cfg(1.0) == true`,
+        // `2 * v_cond - v_uncond`), so both absent and non-empty negative prompts are accepted.
         for desc in [raw_descriptor(), edit_descriptor()] {
             let mut r = req(1024, 1024);
             r.guidance = Some(1.0);
@@ -4417,9 +4481,28 @@ mod tests {
                 }];
             }
             assert!(validate_request(&desc, &r).is_ok());
-            assert!(!crate::pipeline::krea_uses_cfg(1.0));
-            assert!(!crate::pipeline::krea_uses_cfg(0.0));
-            assert!(crate::pipeline::krea_uses_cfg(3.5));
+            r.negative_prompt = Some("blurry".into());
+            assert!(validate_request(&desc, &r).is_ok());
         }
+
+        // Multiphase Raw: rejects non-empty negative_prompt when every phase resolves to CFG-off
+        // (`0.0`), accepts when any phase resolves to nonzero CFG (including `1.0`).
+        let mut all_cfg_off = phase_req(vec![phase(20, Some(0.0)), phase(8, None)]);
+        all_cfg_off.guidance = Some(0.0);
+        all_cfg_off.negative_prompt = Some("blurry".into());
+        assert!(matches!(
+            validate_request(&raw_descriptor(), &all_cfg_off),
+            Err(Error::Unsupported(_))
+        ));
+        let mut all_cfg_off_no_neg = all_cfg_off.clone();
+        all_cfg_off_no_neg.negative_prompt = None;
+        assert!(validate_request(&raw_descriptor(), &all_cfg_off_no_neg).is_ok());
+        let mut mixed_cfg = all_cfg_off;
+        mixed_cfg.phases = Some(vec![phase(20, Some(0.0)), phase(8, Some(1.0))]);
+        assert!(validate_request(&raw_descriptor(), &mixed_cfg).is_ok());
+
+        assert!(!crate::pipeline::krea_uses_cfg(0.0));
+        assert!(crate::pipeline::krea_uses_cfg(1.0));
+        assert!(crate::pipeline::krea_uses_cfg(3.5));
     }
 }
