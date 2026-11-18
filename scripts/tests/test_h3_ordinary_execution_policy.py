@@ -473,6 +473,10 @@ REAL_WEIGHT_MODULES = {
     # Synthetic-DiT training-adapter proofs (SW-F369), registered in model-inference-proofs.json
     # and run only by model-inference-proofs.yml.
     ("candle", "training::training_adapter_tests"),
+    # Synthetic-DiT PAG proofs (SW-F371), registered in model-inference-proofs.json
+    # and run only by model-inference-proofs.yml.
+    ("mlx", "h3_image::dit"),
+    ("candle", "dit::pag_tests"),
     ("candle", "ref2va_checkpoint"),
     ("candle", "veda_ab"),
     ("candle", "vram_probe"),
