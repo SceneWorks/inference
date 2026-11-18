@@ -1615,11 +1615,11 @@ pub(crate) fn render_sample(
     pooled: &Array,
     guidance: f32,
     seed: u64,
-    edge: u32,
+    (width, height): (u32, u32),
     steps: usize,
 ) -> Result<Image> {
     random::seed(seed)?;
-    let latent_shape = [1, (edge / 8) as i32, (edge / 8) as i32, 4];
+    let latent_shape = [1, (height / 8) as i32, (width / 8) as i32, 4];
     let prior = base_sampler.sample_prior(&latent_shape)?;
     let sampler = AncestralEuler::new(base_sampler, steps.max(1), base_sampler.max_time())?;
     let time_ids = text_time_ids(pooled.shape()[0]);

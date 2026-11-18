@@ -247,18 +247,18 @@ pub(crate) fn render_sample(
     pooled: &Array,
     guidance: f32,
     seed: u64,
-    edge: u32,
+    (width, height): (u32, u32),
     steps: usize,
     dtype: Dtype,
 ) -> Result<Image> {
     random::seed(seed)?;
-    let lh = (edge as i32) / SPATIAL_SCALE;
-    let lw = (edge as i32) / SPATIAL_SCALE;
+    let lh = (height as i32) / SPATIAL_SCALE;
+    let lw = (width as i32) / SPATIAL_SCALE;
     let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
     let sampler = KolorsEulerSampler::kolors(steps.max(1), dtype)?;
     // Match the time_ids batch to the conditioning batch the caller supplied (mirrors SDXL's
     // `render_sample`), so this stays correct if the preview ever runs a B=1 (CFG-off) batch.
-    let time_ids = kolors_time_ids(pooled.shape()[0], edge as i32, edge as i32);
+    let time_ids = kolors_time_ids(pooled.shape()[0], height as i32, width as i32);
     let latents = sampler.scale_initial_noise(&init_noise)?;
     let d = Denoiser::new(unet, &sampler);
     let latents = denoise(

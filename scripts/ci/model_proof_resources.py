@@ -527,7 +527,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
     """
     if backend != 'candle-cuda':
         hosted = env.get('MODEL_PROOF_RUNNER_ENVIRONMENT') == 'github-hosted'
-        if not hosted and env.get('RUNNER_NAME') != 'nax-macos-2':
+        # The provisioned Macs (model_inference_proofs.NAX_ROUTES): nax-macos-2 and nax-macos.
+        if not hosted and env.get('RUNNER_NAME') not in ('nax-macos-2', 'nax-macos'):
             raise ValueError('wrong physical execution route')
         if hosted:
             record = {'mechanism': 'isolated hosted runner', 'runner': env.get('RUNNER_NAME'),

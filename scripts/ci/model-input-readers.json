@@ -1174,6 +1174,12 @@
         "reader-binding"
       ]
     },
+    "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_rgb::image::open@2345": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
     "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_square::image::open@2345": {
       "role": "reference",
       "grades": [
@@ -3875,6 +3881,18 @@
       ]
     },
     "candle-gen-moss-image::text_encoder::tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen-moss-image::loader::read_weights": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen-moss-image::text_encoder::tokenizer": {
       "role": "tokenizer",
       "grades": [
         "reader-binding"

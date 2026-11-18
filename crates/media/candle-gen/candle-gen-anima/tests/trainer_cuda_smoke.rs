@@ -123,6 +123,23 @@ fn anima_base_lokr_real_cuda() {
 }
 
 #[cfg(feature = "model-inference-proof")]
+/// A 2:3 portrait fixture (`width × 1.5·width`): a cream, figure-like centred block on `ground`, so a
+/// sample or latent from a run trained on it shows whether the whole non-square frame was used (the
+/// aspect canvas, SW-7172) rather than a centre-cropped square.
+fn write_portrait(path: &std::path::Path, width: u32, ground: [u8; 3]) {
+    let height = width * 3 / 2;
+    image::RgbImage::from_fn(width, height, |x, y| {
+        if x.abs_diff(width / 2) <= width / 6 && y.abs_diff(height / 2) <= height / 3 {
+            image::Rgb([235, 225, 200])
+        } else {
+            image::Rgb(ground)
+        }
+    })
+    .save(path)
+    .unwrap();
+}
+
+#[cfg(feature = "model-inference-proof")]
 fn bounded_root() -> std::path::PathBuf {
     let root = std::path::PathBuf::from(
         std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
@@ -167,10 +184,14 @@ fn anima_bounded_acceleration_acceptance() {
                 let snapshot = PathBuf::from(
                     std::env::var_os("ANIMA_TRAIN_SNAPSHOT").expect("installed snapshot"),
                 );
+                // Sources at least the run's 512² area (the canvas never upscales): the square
+                // trains its historical 512² canvas, the 512×768 portrait its whole 2:3 frame.
                 let input = root.join("comparison_input.png");
-                image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
+                image::RgbImage::from_pixel(512, 512, image::Rgb([80, 140, 210]))
                     .save(&input)
                     .unwrap();
+                let portrait = root.join("comparison_portrait.png");
+                write_portrait(&portrait, 512, [80, 140, 210]);
                 let mut trainer = candle_gen_anima::provider_registry()
                     .unwrap()
                     .load_trainer("anima_base", &LoadSpec::new(WeightsSource::Dir(snapshot)))
@@ -178,7 +199,13 @@ fn anima_bounded_acceleration_acceptance() {
                 let output = trainer
                     .train(
                         &TrainingRequest {
-                            items: vec![TrainingItem::captioned(input, "a blue tile".into())],
+                            items: vec![
+                                TrainingItem::captioned(input, "a blue tile".into()),
+                                TrainingItem::captioned(
+                                    portrait,
+                                    "a cream figure on a blue tile".into(),
+                                ),
+                            ],
                             config: TrainingConfig {
                                 rank: 2,
                                 alpha: 2.,
@@ -220,6 +247,10 @@ fn anima_bounded_acceleration_acceptance() {
     image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
         .save(&input)
         .unwrap();
+    // A 64×96 portrait (above the run's 64² area) so the bounded run also trains a non-square
+    // aspect canvas over its whole frame.
+    let portrait = root.join("portrait.png");
+    write_portrait(&portrait, 64, [80, 140, 210]);
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()));
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
     let output = candle_gen::train::profile::with_bounded_cohort_for(
@@ -235,7 +266,10 @@ fn anima_bounded_acceleration_acceptance() {
                 .load_trainer("anima_base", &spec)
                 .unwrap();
             let req = TrainingRequest {
-                items: vec![TrainingItem::captioned(input, "a blue tile".into())],
+                items: vec![
+                    TrainingItem::captioned(input, "a blue tile".into()),
+                    TrainingItem::captioned(portrait, "a cream figure on a blue tile".into()),
+                ],
                 config: TrainingConfig {
                     rank: 2,
                     alpha: 2.,

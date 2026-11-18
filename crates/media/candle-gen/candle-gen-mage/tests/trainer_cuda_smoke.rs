@@ -171,6 +171,23 @@ fn mage_base_full_real_cuda() {
 }
 
 #[cfg(feature = "model-inference-proof")]
+/// A 2:3 portrait fixture (`width × 1.5·width`): a cream, figure-like centred block on `ground`, so a
+/// sample or latent from a run trained on it shows whether the whole non-square frame was used (the
+/// aspect canvas, SW-7172) rather than a centre-cropped square.
+fn write_portrait(path: &std::path::Path, width: u32, ground: [u8; 3]) {
+    let height = width * 3 / 2;
+    image::RgbImage::from_fn(width, height, |x, y| {
+        if x.abs_diff(width / 2) <= width / 6 && y.abs_diff(height / 2) <= height / 3 {
+            image::Rgb([235, 225, 200])
+        } else {
+            image::Rgb(ground)
+        }
+    })
+    .save(path)
+    .unwrap();
+}
+
+#[cfg(feature = "model-inference-proof")]
 fn bounded_root() -> std::path::PathBuf {
     let root = std::path::PathBuf::from(
         std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
@@ -219,6 +236,10 @@ fn mage_bounded_acceleration_acceptance() {
     )
     .save(&input)
     .unwrap();
+    // A resolution × 1.5·resolution portrait (above the run's resolution² area, which the canvas
+    // never upscales past) so the run also trains a non-square aspect canvas over its whole frame.
+    let portrait = root.join("portrait.png");
+    write_portrait(&portrait, resolution, [210, 160, 30]);
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()))
         .with_component(
             candle_gen_mage::COMPONENT_TEXT_ENCODER,
@@ -247,7 +268,10 @@ fn mage_bounded_acceleration_acceptance() {
         gradient_checkpointing: false,
         ..Default::default()
     };
-    let items = vec![TrainingItem::captioned(input, "a gold tile".into())];
+    let items = vec![
+        TrainingItem::captioned(input, "a gold tile".into()),
+        TrainingItem::captioned(portrait, "a cream figure on a gold tile".into()),
+    ];
     let sampler = (!comparison).then(candle_gen::testkit::PeakSampler::start_rendered);
     // A new child owns a fresh native trainer/Run, initial parameters, native
     // optimizer, EMA/data cursors and (restoration) critic/SN state. No quality

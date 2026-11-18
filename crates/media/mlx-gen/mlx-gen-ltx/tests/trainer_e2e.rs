@@ -33,21 +33,44 @@ fn snapshot() -> PathBuf {
         .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
 }
 
-/// Two solid-colour swatch PNGs + captions in `dir`.
-fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+/// The Gemma text-encoder dir: `LTX_GEMMA_DIR`, else the base tier's sibling `gemma/` (the hosted
+/// `SceneWorks/ltx-2.3-mlx` snapshot keeps `gemma/` beside its `q8/` tier, not inside it).
+fn gemma_dir() -> PathBuf {
+    std::env::var_os("LTX_GEMMA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshot().join("gemma"))
+}
+
+/// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a 2:3 portrait of three
+/// distinct horizontal bands (blue / cream / green), item 1 a solid red square swatch, so every run
+/// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
+/// centre-cropped square) is visible in its latents — and the previews, which render at item 0's
+/// canvas, are themselves portrait. The square side is `edge` (never below the historical 96 px)
+/// and the portrait is that width × 1.5: the canvas never upscales a source (SW-7172), so a fixture
+/// smaller than `edge²` would silently train a smaller workload than the run claims.
+fn make_dataset(dir: &Path, edge: u32) -> Vec<TrainingItem> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
+    let side = edge.max(96);
+    let fixtures: [(u32, u32, &[[u8; 3]], &str); 2] = [
+        (
+            side,
+            side * 3 / 2,
+            &[[40, 80, 200], [235, 225, 200], [40, 160, 70]],
+            "a blue, cream and green banded swatch",
+        ),
+        (side, side, &[[200, 40, 40]], "a solid red colour swatch"),
+    ];
     let mut items = Vec::new();
-    for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
-        let mut img = image::RgbImage::new(128, 128);
-        for px in img.pixels_mut() {
-            *px = image::Rgb(*color);
-        }
+    for (i, (w, h, bands, caption)) in fixtures.into_iter().enumerate() {
+        let img = image::RgbImage::from_fn(w, h, |_, y| {
+            image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+        });
         let path = dir.join(format!("img{i}.png"));
         img.save(&path).unwrap();
         items.push(TrainingItem {
             image_path: path,
-            caption: format!("a solid colour swatch number {i}"),
+            caption: format!("{caption} number {i}"),
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
@@ -57,12 +80,29 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
     items
 }
 
+/// Save preview `n` under the model-proof executor's owned output directory, where the registered
+/// row declares it as an `output_artifacts` entry so the proof artifact carries the rendered
+/// sample for inspection (SW-7172). A manual run outside the executor writes nothing.
+fn save_proof_preview(n: usize, preview: &mlx_gen::Image) {
+    if let Some(dir) = std::env::var_os("MODEL_PROOF_OUTPUT_DIR") {
+        let path = Path::new(&dir).join(format!("preview_{n}.png"));
+        image::save_buffer(
+            path,
+            &preview.pixels,
+            preview.width,
+            preview.height,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 #[ignore = "needs real LTX-2.3 + Gemma weights"]
 fn ltx_trainer_trains_and_writes_lora_that_reloads() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 256);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
 
     let mut trainer = mlx_gen_ltx::provider_registry()
@@ -70,7 +110,7 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
         .load_trainer(
             "ltx_2_3",
             &LoadSpec::new(WeightsSource::Dir(snapshot()))
-                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+                .with_text_encoder(WeightsSource::Dir(gemma_dir())),
         )
         .expect("ltx_2_3 trainer should be registered");
 
@@ -194,14 +234,14 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
 fn ltx_trainer_trains_with_gradient_checkpointing() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 256);
 
     let mut trainer = mlx_gen_ltx::provider_registry()
         .unwrap()
         .load_trainer(
             "ltx_2_3",
             &LoadSpec::new(WeightsSource::Dir(snapshot()))
-                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+                .with_text_encoder(WeightsSource::Dir(gemma_dir())),
         )
         .expect("ltx_2_3 trainer should be registered");
 
@@ -270,14 +310,16 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
 fn ltx_trainer_emits_preview_samples() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    // A 512 edge so the saved preview frame is inspectable: item 0's 512×768 portrait trains — and
+    // the preview renders at — its whole 2:3 canvas (SW-7172).
+    let items = make_dataset(&tmp, 512);
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
     let mut trainer = mlx_gen_ltx::provider_registry()
         .unwrap()
         .load_trainer(
             "ltx_2_3",
             &LoadSpec::new(WeightsSource::Dir(snapshot()))
-                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+                .with_text_encoder(WeightsSource::Dir(gemma_dir())),
         )
         .expect("ltx_2_3 trainer should be registered");
 
@@ -286,14 +328,14 @@ fn ltx_trainer_emits_preview_samples() {
         alpha: 8.0,
         learning_rate: 1e-4,
         steps: 4,
-        resolution: 256,
+        resolution: 512,
         save_every: 0,
         seed: 7,
         network_type: NetworkType::Lora,
         sample_every: 4,
         sample_steps: 4,
         sample_guidance_scale: 1.0,
-        sample_prompts: vec!["a solid red colour swatch".to_string()],
+        sample_prompts: vec!["a blue, cream and green banded swatch".to_string()],
         ..Default::default()
     };
     let req = TrainingRequest {
@@ -329,6 +371,14 @@ fn ltx_trainer_emits_preview_samples() {
                     image.pixels.iter().any(|&b| b != 0),
                     "preview frame is not all-black"
                 );
+                // Previews render at item 0's canvas: the 2:3 portrait, whole frame (SW-7172).
+                assert!(
+                    image.height > image.width,
+                    "preview frame renders at item 0's portrait canvas, got {}x{}",
+                    image.width,
+                    image.height
+                );
+                save_proof_preview(samples.len(), &image);
                 samples.push((step, index, total, prompt));
             }
         })

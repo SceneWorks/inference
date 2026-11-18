@@ -12,8 +12,9 @@
 //!
 //! ## Cache → loop → save, on the flow-match objective
 //!
-//!  1. **Cache** — for each captioned image: decode/crop/resize to a VAE-input tensor
-//!     ([`decode_square`] + [`square_image_tensor`]), encode the **deterministic latent mean** through the Qwen-Image
+//!  1. **Cache** — for each captioned image: decode it whole and resize it onto its aspect-keeping
+//!     canvas at each bucket edge ([`decode_rgb`] + [`canvas_image_tensor`]: about `edge²` pixels,
+//!     never upscaled, sides multiples of `CANVAS_STRIDE` — never centre-cropped to a square), encode the **deterministic latent mean** through the Qwen-Image
 //!     [`QwenVaeEncoder`] (the `(mean − latents_mean)/latents_std` the DiT consumes — `encode` already
 //!     skips the `DiagonalGaussian` draw), and encode the caption through the Qwen3-VL-4B text encoder
 //!     with the *exact* tokenizer + select-layer stack inference uses → `(L, num_text_layers,
@@ -59,7 +60,7 @@ use candle_gen::gen_core::train::{
     TrainingRequest,
 };
 use candle_gen::gen_core::{self, Image, LoadSpec, Modality, Progress, WeightsSource};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, combine_terms, prepared_subject_mask_weight, run_flow_match_training, step_terms,
     validate_flow_match_request, weighted_velocity_loss, AuxStep, FlowMatchTrainer, SamplePlan,
@@ -70,7 +71,7 @@ use candle_gen::train::lora::LoraSet;
 use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, LatentDecoder, Result};
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
@@ -86,6 +87,10 @@ use crate::train_dit::{KreaTrainDit, PreparedCaption, KREA_ATTN_TARGETS};
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count — the Turbo
 /// inference constants ([`crate::pipeline`]) the preview-sample render mirrors.
 const SPATIAL_SCALE: u32 = 8;
+/// Every training canvas side is a multiple of this: one VAE cell (8 px) times the DiT's 2×2 patch.
+pub(crate) const CANVAS_STRIDE: u32 = SPATIAL_SCALE * 2;
+/// The longest canvas side the trainer keeps — the family's render cap (`RES_MAX`).
+pub(crate) const CANVAS_MAX_SIDE: Option<u32> = Some(crate::RES_MAX);
 const LATENT_CHANNELS: usize = 16;
 
 /// Max preview prompts pre-encoded + rendered per sample cadence (sc-8650). Matches the
@@ -369,25 +374,29 @@ pub(crate) fn encode_caption(
 ///    branch; pre-encoded once here while the encoder is resident (mirrors the MLX trainer).
 ///  * `vae` — the resident Qwen-Image VAE **decoder** (`Arc` as inference holds it); the cache pass
 ///    loads only the encoder, so the decoder is loaded here for the preview path.
-///  * `edge` — the square preview edge: the largest training-bucket edge ([`bucket_edges`], just
-///    `bucket_resolution(cfg.resolution)` with buckets off — the edge the cached latents use) the
-///    seeded preview noise is shaped at.
+///  * `size` — the preview canvas `(width, height)`: item 0's training canvas at the largest
+///    training-bucket edge ([`bucket_edges`]) — a shape the cached latents train at, within the
+///    `edge²` area the memory preflight prices — the seeded preview noise is shaped at.
 pub struct KreaSampleState {
     contexts: Vec<Tensor>,
     ctx_neg: Tensor,
     vae: Arc<QwenVae>,
-    edge: u32,
+    size: (u32, u32),
 }
 
-/// Seeded initial Gaussian latent noise `[1, 16, edge/8, edge/8]` (f32) for a preview render — the
-/// training-side twin of [`crate::pipeline`]'s `init_noise`, square at the bucketed training `edge`
-/// (sc-8650). Deterministic launch-portable CPU RNG (sc-3673), mirroring the inference path.
-fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> {
-    let lat = (edge / SPATIAL_SCALE) as usize;
-    let n = LATENT_CHANNELS * lat * lat;
+/// Seeded initial Gaussian latent noise `[1, 16, height/8, width/8]` (f32) for a preview render —
+/// the training-side twin of [`crate::pipeline`]'s `init_noise` at the preview canvas `(width,
+/// height)` (sc-8650). Deterministic launch-portable CPU RNG (sc-3673), mirroring the inference
+/// path.
+fn sample_noise_latent((width, height): (u32, u32), seed: u64, device: &Device) -> Result<Tensor> {
+    let (lw, lh) = (
+        (width / SPATIAL_SCALE) as usize,
+        (height / SPATIAL_SCALE) as usize,
+    );
+    let n = LATENT_CHANNELS * lh * lw;
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
-    Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat, lat), &Device::Cpu)?.to_device(device)?)
+    Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lh, lw), &Device::Cpu)?.to_device(device)?)
 }
 
 /// VAE-decode a final preview latent `[1, 16, H/8, W/8]` → RGB8 [`Image`] — the training-side twin of
@@ -660,6 +669,9 @@ impl FlowMatchTrainer for KreaTrainer {
         // Item-major over the bucket edges: `cache[item * edges.len() + bucket]` — the layout the
         // driver's `BucketSchedule` indexes (sc-2127).
         let mut cache: Vec<Self::Cached> = Vec::with_capacity(req.items.len() * edges.len());
+        // The preview canvas: item 0's training canvas at the largest bucket edge (a shape the run
+        // trains at); the square edge only if caching was cancelled before item 0.
+        let mut preview_size = (edge, edge);
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -676,15 +688,21 @@ impl FlowMatchTrainer for KreaTrainer {
                 item,
                 req.config.subject_mask_loss.as_ref(),
             )?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Every
+            // micro-step trains one cached entry, so entries of different shapes never share a batch.
+            let rgb = decode_rgb(&item.image_path)?;
+            if i == 0 {
+                preview_size = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE).size();
+            }
             for &edge in &edges {
-                let img = square_image_tensor(&square, edge, device)?;
-                let x0 = vae_encoder.encode(&img)?; // (1, 16, edge/8, edge/8), already normalized
-                                                    // `decode_square` centre-crops to a square, so the mask takes the same crop.
+                let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                let img = canvas_image_tensor(&rgb, &canvas, device)?;
+                let x0 = vae_encoder.encode(&img)?; // (1, 16, h/8, w/8), already normalized
+                                                    // The mask (same dimensions as the image) takes the image's own source box.
                 let mask_weight = prepared_subject_mask_weight(
                     LABEL,
                     mask.as_ref(),
-                    CropBox::center_square,
+                    |_, _| canvas.crop,
                     x0.dims(),
                     device,
                 )?;
@@ -722,7 +740,7 @@ impl FlowMatchTrainer for KreaTrainer {
                     contexts,
                     ctx_neg,
                     vae,
-                    edge,
+                    size: preview_size,
                 }),
             }
         } else {
@@ -820,12 +838,14 @@ impl FlowMatchTrainer for KreaTrainer {
     ) -> Result<Image> {
         let device = &self.device;
         let steps = (cfg.sample_steps.max(1)) as usize;
-        // Raw resolution-dynamic `mu` schedule (image-sequence length = `(edge/16)²`), mirroring the MLX
-        // trainer — the Raw checkpoint is not TDM-distilled, so the fixed Turbo `mu` does not apply.
-        let img_seq = (state.edge as f64 / 16.0).powi(2);
+        // Raw resolution-dynamic `mu` schedule (image-sequence length = `(w/16)·(h/16)`), mirroring
+        // the MLX trainer — the Raw checkpoint is not TDM-distilled, so the fixed Turbo `mu` does
+        // not apply.
+        let (w, h) = state.size;
+        let img_seq = (w as f64 / 16.0) * (h as f64 / 16.0);
         let sigmas = krea_sigmas(steps, dynamic_mu(img_seq));
 
-        let noise = sample_noise_latent(state.edge, seed, device)?;
+        let noise = sample_noise_latent(state.size, seed, device)?;
         // The DiT's `text_fusion` consumes a batched `(1, L, n, d)` context — the cached
         // `encode_caption` output is `(L, n, d)`, so unsqueeze the batch axis exactly as
         // `compute_loss_grads` does before its own forward.
@@ -883,6 +903,32 @@ mod tests {
     use crate::testfix::{randn_seeded, tiny_batch, tiny_batch_seeded, tiny_dit, tiny_dit_seeded};
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
+
+    /// The captioned-item canvas keeps the source aspect on the DiT's 16 px grid (no square crop,
+    /// no upscale), and the preview noise follows a non-square canvas `(width, height)`.
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        let c = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        assert_eq!(
+            gen_core_train::canvas::training_canvas(
+                (1365, 2048),
+                2048,
+                CANVAS_STRIDE,
+                CANVAS_MAX_SIDE
+            )
+            .size(),
+            (1360, 2048)
+        );
+        let noise = sample_noise_latent((1360, 2048), 7, &Device::Cpu).unwrap();
+        assert_eq!(noise.dims(), &[1, LATENT_CHANNELS, 256, 170]);
+    }
 
     /// `build_batch`: `x_t = (1−σ)x0 + σ·noise`, `target = noise − x0`, `timestep = σ` (the Krea raw-σ
     /// convention — NOT the Z-Image `1−σ` — layered over the shared `flow_match::build_batch`).

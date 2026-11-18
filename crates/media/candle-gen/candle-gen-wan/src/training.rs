@@ -33,8 +33,10 @@
 //!     `{stem}.low_noise` pair — what the inference loader ([`crate::adapters`] via [`crate::wan14b`])
 //!     merges back onto the matching expert ([`MoeExpert`](candle_gen::gen_core::MoeExpert)).
 //!
-//! Caching: each still image is z16-VAE-encoded to a single-frame latent `[1, 16, 1, h, w]` (the
-//! deterministic posterior **mean**, normalized) and its caption UMT5-encoded to `[1, 512, 4096]`
+//! Caching: each still image is decoded whole, resized onto its aspect-keeping training canvas at
+//! each bucket edge (about `edge²` pixels, never upscaled, sides multiples of the variant's
+//! `TrainVariant::canvas_stride` — never centre-cropped to a square), and VAE-encoded to a
+//! single-frame latent `[1, C, 1, h, w]` (the deterministic posterior **mean**, normalized) and its caption UMT5-encoded to `[1, 512, 4096]`
 //! (zero-padded to 512, the same context surface inference feeds). The VAE + text encoder are dropped
 //! after caching; the two experts are the working set.
 
@@ -54,7 +56,7 @@ use candle_gen::gen_core::{
     self, BucketSchedule, Image, LoadSpec, Modality, NetworkType, Progress, WeightsSource,
 };
 use candle_gen::train::checkpoint::file_stem;
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor, SquareImage};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, prepared_subject_mask_weight, validate_flow_match_request, weighted_velocity_loss,
 };
@@ -69,12 +71,13 @@ use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, Result};
 use gen_core_tokenizer::TextTokenizer;
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::canvas::canvas_crop;
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, VaeConfig, I2V_14B_BOUNDARY, MODEL_ID,
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, NUM_TRAIN_TIMESTEPS, T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT,
-    VAE16_STRIDE_SPATIAL,
+    VAE16_STRIDE_SPATIAL, VAE_STRIDE_SPATIAL,
 };
 use crate::dit_train::{WanTransformerTrain, WAN_ATTN_TARGETS};
 use crate::pipeline::{create_noise, frames_to_images};
@@ -86,6 +89,12 @@ use crate::vae16::WanVae16;
 
 /// Error-message prefix shared by [`validate_flow_match_request`] and the component-IO helpers.
 const LABEL: &str = "wan trainer";
+
+/// The longest training-canvas side the trainer keeps: `None` — Wan's 3D RoPE spans
+/// `rope_max_seq_len` (1024) patch positions per axis (16 384 px at the 14B's 16 px token stride),
+/// far past any bucket edge, so only the shared 4:1 source crop
+/// ([`canvas_crop`], edge-independent) bounds the canvas.
+const CANVAS_MAX_SIDE: Option<u32> = None;
 
 /// Sample a timestep `t ∈ [lo, hi)` inside an expert's noise band: draw a unit `t_unit`
 /// ([`flow_match::sample_unit_timestep`]) then affine-map it into `(lo, hi)`. The high-noise expert
@@ -138,34 +147,50 @@ fn expert_cache_index(step: u32, dual: bool, schedule: &BucketSchedule) -> usize
     schedule.cache_index(expert_sample_counter(step, dual))
 }
 
-/// One `(cos, sin)` RoPE table pair per resolution bucket (sc-2127), derived from the cached latent
-/// geometry of the first item at each bucket (`cache[b]`; every item shares a bucket's geometry, so
-/// the table for cache entry `i` is `ropes[i % n_buckets]`). Training stills ⇒ one latent frame.
-fn bucket_rope_tables(
+/// The distinct `(cos, sin)` RoPE tables and each cache entry's index into them.
+type EntryRopeTables = (Vec<(Tensor, Tensor)>, Vec<usize>);
+
+/// The `(cos, sin)` RoPE tables the cache trains on, one per distinct cached latent patch grid
+/// `(frames, h, w)`, plus each cache entry's index into them (`ropes[rope_of[i]]` is entry `i`'s
+/// table). Each still trains on its own aspect canvas, so items at one bucket edge no longer share a
+/// grid — the table follows every entry's own `(h, w)` (never a square, never its bucket's first
+/// item), and entries of equal shape share one table. Training stills ⇒ one latent frame.
+fn entry_rope_tables(
     cache: &[(Tensor, Tensor, Option<Tensor>)],
-    n_buckets: usize,
     dit_cfg: &TransformerConfig,
     device: &Device,
-) -> Result<Vec<(Tensor, Tensor)>> {
+) -> Result<EntryRopeTables> {
     let (pt, ph, pw) = dit_cfg.patch;
     let rope = WanRope::new(dit_cfg);
-    cache
-        .iter()
-        .take(n_buckets)
-        .map(|(x0, _, _)| {
-            let (_, _, fl, hl, wl) = x0.dims5()?;
-            Ok(rope.cos_sin(fl / pt, hl / ph, wl / pw, device)?)
-        })
-        .collect()
+    let mut grids: Vec<(usize, usize, usize)> = Vec::new();
+    let mut tables = Vec::new();
+    let mut rope_of = Vec::with_capacity(cache.len());
+    for (x0, _, _) in cache {
+        let (_, _, fl, hl, wl) = x0.dims5()?;
+        let grid = (fl / pt, hl / ph, wl / pw);
+        let idx = match grids.iter().position(|g| *g == grid) {
+            Some(idx) => idx,
+            None => {
+                tables.push(rope.cos_sin(grid.0, grid.1, grid.2, device)?);
+                grids.push(grid);
+                grids.len() - 1
+            }
+        };
+        rope_of.push(idx);
+    }
+    Ok((tables, rope_of))
 }
 
-/// One item's item-major cache entries (sc-2127 × sc-24828): the decoded `square` encoded at each
-/// bucket edge by `encode` (`[1, 3, edge, edge]` → clean `[1, C, 1, h, w]` latent), each paired with
-/// its subject-mask loss weight on THAT bucket's latent grid (`None` when masked loss is off).
-/// `decode_square` center-crops, so the mask is cropped with [`CropBox::center_square`].
+/// One item's item-major cache entries (sc-2127 × sc-24828): the whole decoded `rgb` resized onto
+/// its aspect-keeping training canvas at each bucket edge (`stride`-aligned sides, about `edge²`
+/// pixels, never upscaled) and encoded by `encode` (`[1, 3, h_px, w_px]` → clean `[1, C, 1, h, w]`
+/// latent), each paired with its subject-mask loss weight on THAT entry's latent grid (`None` when
+/// masked loss is off). The mask shares the image's dimensions, so it takes the canvas's own source
+/// box.
 fn encode_item_buckets(
-    square: &SquareImage,
+    rgb: &image::RgbImage,
     edges: &[u32],
+    stride: u32,
     mask: Option<&PreparedSubjectMask>,
     device: &Device,
     mut encode: impl FnMut(&Tensor) -> Result<Tensor>,
@@ -173,14 +198,10 @@ fn encode_item_buckets(
     edges
         .iter()
         .map(|&edge| {
-            let x0 = encode(&square_image_tensor(square, edge, device)?)?;
-            let mask_weight = prepared_subject_mask_weight(
-                LABEL,
-                mask,
-                CropBox::center_square,
-                x0.dims(),
-                device,
-            )?;
+            let canvas = image_canvas(rgb, edge, stride, CANVAS_MAX_SIDE);
+            let x0 = encode(&canvas_image_tensor(rgb, &canvas, device)?)?;
+            let mask_weight =
+                prepared_subject_mask_weight(LABEL, mask, |_, _| canvas.crop, x0.dims(), device)?;
             Ok((x0, mask_weight))
         })
         .collect()
@@ -595,14 +616,23 @@ const SAMPLE_PROMPT_CAP: usize = 4;
 ///    [`WanTransformerTrain::embed_text`].
 ///  * `vae` — a resident **decode-only** [`WanVae16`] (the cache pass loads the VAE *with* the encoder
 ///    for latent caching, then drops it; the preview path needs only the decoder).
-///  * `edge` — the square edge the seeded single-frame preview noise is shaped at: the largest
-///    training bucket edge (`bucket_edges(cfg)` max — just the floored `cfg.resolution` when buckets
-///    are off, the same edge the cached latents use).
+///  * `size` — the preview canvas `(width, height)` the seeded single-frame preview noise is shaped
+///    at: item 0's training canvas at the largest training bucket edge (`bucket_edges(cfg)` max) — a
+///    shape the cached latents train at, within the `edge²` area the memory guard prices.
 struct WanSampleState {
     prompts: Vec<String>,
     umt5: Vec<Tensor>,
     vae: WanVae16,
-    edge: u32,
+    size: (u32, u32),
+}
+
+/// The single-frame preview latent grid `(h_lat, w_lat)` of a `(width, height)` preview canvas at the
+/// z16 VAE's spatial stride.
+fn preview_latent_grid((width, height): (u32, u32)) -> (usize, usize) {
+    (
+        (height / VAE16_STRIDE_SPATIAL) as usize,
+        (width / VAE16_STRIDE_SPATIAL) as usize,
+    )
 }
 
 /// Render ONE still preview frame (sc-8650) from the **in-progress** dual-expert A14B onto an RGB8
@@ -639,10 +669,9 @@ fn render_one_preview(
     // F32 `create_noise` prior would otherwise hit an F32×BF16 matmul mismatch on the first block.
     let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
 
-    // Single-frame latent geometry (F = 1) at the square training edge, z16 strides.
+    // Single-frame latent geometry (F = 1) at the preview canvas, z16 strides.
     let t_lat = 1usize;
-    let h_lat = (state.edge / VAE16_STRIDE_SPATIAL) as usize;
-    let w_lat = (state.edge / VAE16_STRIDE_SPATIAL) as usize;
+    let (h_lat, w_lat) = preview_latent_grid(state.size);
     let (pt, ph, pw) = dit_cfg.patch;
     let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
     let (cos, sin) = WanRope::new(&dit_cfg).cos_sin(ppf, pph, ppw, device)?;
@@ -768,6 +797,20 @@ impl TrainVariant {
         } else {
             16
         }
+    }
+
+    /// Every training-canvas side is a multiple of this: the VAE's spatial downscale times the DiT's
+    /// 2×2 spatial patch — 8 × 2 = 16 for the z16 A14B VAE, 16 × 2 = 32 for the TI2V-5B's z48 VAE
+    /// (the inference `SIZE_MULTIPLE_14B` / `SIZE_MULTIPLE` grids).
+    fn canvas_stride(self) -> u32 {
+        let (_, ph, pw) = self.dit_config().patch;
+        debug_assert_eq!(ph, pw, "Wan patches square spatial tiles");
+        let vae = if self == Self::Ti2v5b {
+            VAE_STRIDE_SPATIAL
+        } else {
+            VAE16_STRIDE_SPATIAL
+        };
+        vae * pw as u32
     }
 
     fn boundary(self) -> f64 {
@@ -1069,9 +1112,11 @@ impl WanMoeTrainer {
         }
         on_progress(TrainingProgress::Preparing);
         // sc-2127 — one training edge per resolution bucket (just the floored `resolution` when buckets
-        // are off); the preview renders at the largest. Frame count is untouched (stills, T = 1).
+        // are off); the preview renders at item 0's canvas at the largest. Frame count is untouched
+        // (stills, T = 1).
         let edges = bucket_edges(cfg);
         let max_edge = edges.iter().copied().max().unwrap_or(0);
+        let stride = self.variant.canvas_stride();
         let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
         let variant = self.variant;
         let dit_cfg = variant.dit_config();
@@ -1123,6 +1168,9 @@ impl WanMoeTrainer {
         // unless subject-masked loss is on (sc-24828).
         let mut cache: Vec<(Tensor, Tensor, Option<Tensor>)> =
             Vec::with_capacity(req.items.len() * edges.len());
+        // The preview canvas: item 0's training canvas at the largest bucket edge (a shape the run
+        // trains at); the square edge only if caching was cancelled before item 0.
+        let mut preview_size = (max_edge, max_edge);
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -1132,14 +1180,20 @@ impl WanMoeTrainer {
                 total,
             });
             let cap = encode_caption(&tokenizer, &te_cfg, &text_encoder, &item.caption, device)?;
-            let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
-                                                           // The item's subject mask, read + checked once (None when masked loss is off).
+            // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Each
+            // micro-step trains ONE cached entry, so entries of different shapes never share a batch.
+            let rgb = decode_rgb(&item.image_path)?;
+            if i == 0 {
+                preview_size = image_canvas(&rgb, max_edge, stride, CANVAS_MAX_SIDE).size();
+            }
+            // The item's subject mask, read + checked once (None when masked loss is off).
             let mask =
                 PreparedSubjectMask::load_if_enabled(LABEL, item, cfg.subject_mask_loss.as_ref())?;
-            let buckets = encode_item_buckets(&square, &edges, mask.as_ref(), device, |img| {
-                let video = img.unsqueeze(2)?; // [1,3,1,edge,edge] (T=1 still frame)
-                Ok(vae.encode(&video)?.to_dtype(DType::F32)?) // [1,16,1,h,w] normalized mean
-            })?;
+            let buckets =
+                encode_item_buckets(&rgb, &edges, stride, mask.as_ref(), device, |img| {
+                    let video = img.unsqueeze(2)?; // [1,3,1,h_px,w_px] (T=1 still frame)
+                    Ok(vae.encode(&video)?.to_dtype(DType::F32)?) // [1,C,1,h,w] normalized mean
+                })?;
             for (x0, mask_weight) in buckets {
                 cache.push((x0, cap.clone(), mask_weight));
             }
@@ -1176,7 +1230,7 @@ impl WanMoeTrainer {
                     prompts,
                     umt5,
                     vae: preview_vae,
-                    edge: max_edge,
+                    size: preview_size,
                 })
             } else {
                 None
@@ -1193,9 +1247,9 @@ impl WanMoeTrainer {
             ));
         }
 
-        // RoPE tables per resolution bucket — every cached latent of one bucket shares its token
-        // geometry (sc-2127; a single table when buckets are off).
-        let ropes = bucket_rope_tables(&cache, edges.len(), &dit_cfg, device)?;
+        // RoPE tables per distinct cached latent grid — each item trains on its own aspect canvas,
+        // so an entry's table follows its own `(h, w)`, not its bucket's first item (sc-2127).
+        let (ropes, rope_of) = entry_rope_tables(&cache, &dit_cfg, device)?;
         // sc-2127: which cached (item, bucket) latent each expert visit trains on.
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
@@ -1203,13 +1257,13 @@ impl WanMoeTrainer {
         // windows of one update of every expert.
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image and resampled onto its decoded size.
+            // cropped like the image (its canvas source box) and resampled onto its decoded size.
             let masks = gen_core_train::subject_mask::PerceptualSubjectMasks::load(
                 "wan trainer",
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?;
             prepare_perceptual_references(path, cache.iter().map(|(x0, _, _)| x0), masks)?;
         }
@@ -1331,7 +1385,7 @@ impl WanMoeTrainer {
             let ci = expert_cache_index(step, dual, &schedule);
             let (x0, mask_weight) = &cache[ci];
             let cap = &contexts[ei][ci];
-            let (cos, sin) = &ropes[ci % edges.len()];
+            let (cos, sin) = &ropes[rope_of[ci]];
             let band = experts[ei].band;
             let mut t = sample_band_timestep(
                 &cfg.timestep_type,
@@ -1640,15 +1694,15 @@ mod tests {
     }
 
     /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached still latent
-    /// `[1, C, 1, h, w]` carries a weight of ITS OWN shape (built on that bucket's grid), and the
-    /// masked-out region is zero.
+    /// `[1, C, 1, h, w]` carries a weight of ITS OWN shape (built on that entry's aspect-canvas
+    /// grid), and the masked-out region is zero — the mask takes the whole frame like the image.
     #[test]
     fn subject_mask_weight_follows_each_buckets_latent() {
         use candle_gen::candle_core::IndexOp;
         use candle_gen::gen_core::train::TrainingItem;
         use candle_gen::gen_core::SubjectMaskLoss;
         let dir = tempfile::tempdir().unwrap();
-        // 48×32 image → center square x ∈ [8, 40); the subject is that square's left half (x < 24).
+        // 48×32 landscape, kept whole; the subject is the frame's left half (x < 24).
         let image_path = dir.path().join("img.png");
         image::RgbImage::from_pixel(48, 32, image::Rgb([128, 64, 32]))
             .save(&image_path)
@@ -1670,52 +1724,114 @@ mod tests {
             subject_weight: 1.0,
         };
         let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
-        let square = decode_square(&item.image_path).unwrap();
+        let rgb = decode_rgb(&item.image_path).unwrap();
         let dev = Device::Cpu;
-        // A stand-in /8 still-frame encoder: `[1, 3, edge, edge]` → `[1, 3, 1, edge/8, edge/8]`.
+        let stride = TrainVariant::T2v14b.canvas_stride();
+        // A stand-in /8 still-frame encoder: `[1, 3, h, w]` → `[1, 3, 1, h/8, w/8]`.
         let encode = |img: &Tensor| Ok(img.avg_pool2d(8)?.unsqueeze(2)?);
-        let entries = encode_item_buckets(&square, &[32, 64], Some(&mask), &dev, encode).unwrap();
+        let entries =
+            encode_item_buckets(&rgb, &[32, 64], stride, Some(&mask), &dev, encode).unwrap();
         assert_eq!(entries.len(), 2);
-        for ((x0, w), grid) in entries.iter().zip([4usize, 8]) {
-            assert_eq!(x0.dims(), &[1, 3, 1, grid, grid]);
+        // Edge 32: 48×32 at ~32² px floored to 16 → a 32×16 canvas (4×2 latent). Edge 64: the
+        // source is under 64², so it trains at its own 48×32 (6×4 latent) — never upscaled.
+        for ((x0, w), (gh, gw)) in entries.iter().zip([(2usize, 4usize), (4, 6)]) {
+            assert_eq!(x0.dims(), &[1, 3, 1, gh, gw]);
             let w = w.as_ref().expect("masked loss is on");
-            assert_eq!(w.dims(), x0.dims(), "bucket {grid}: weight shape");
+            assert_eq!(w.dims(), x0.dims(), "grid {gh}x{gw}: weight shape");
             let rows = w.i((0, 0, 0)).unwrap().to_vec2::<f32>().unwrap();
             for row in rows {
                 for (x, v) in row.into_iter().enumerate() {
-                    let want = if x < grid / 2 { 1.0 } else { 0.0 };
-                    assert_eq!(v, want, "bucket {grid}: column {x}");
+                    let want = if x < gw / 2 { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "grid {gh}x{gw}: column {x}");
                 }
             }
         }
-        let off = encode_item_buckets(&square, &[32, 64], None, &dev, encode).unwrap();
+        let off = encode_item_buckets(&rgb, &[32, 64], stride, None, &dev, encode).unwrap();
         assert!(off.iter().all(|(_, w)| w.is_none()));
     }
 
-    /// sc-2127: one RoPE table pair per bucket, shaped from that bucket's cached latent geometry —
-    /// a 4×4 and an 8×8 latent get distinct tables equal to a direct `cos_sin` at their patch grid.
-    /// (Mutation: building every table from `cache[0]` makes the 8×8 table the wrong length.)
+    /// sc-2127 × aspect canvas: every cache entry gets the RoPE table of ITS OWN latent grid — two
+    /// items of different aspect at one bucket edge get different tables (a portrait 8×4 and a
+    /// landscape 4×8 latent hold the same token count, so this checks the table equals a direct
+    /// `cos_sin` at the entry's own `(h, w)`), and equal grids share one table.
+    /// (Mutation: indexing by `entry % n_buckets`, i.e. the bucket's first item, hands item 1 the
+    /// portrait table.)
     #[test]
-    fn bucket_rope_tables_follow_each_buckets_latent_grid() {
+    fn rope_tables_follow_each_entrys_own_latent_grid() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let cap = Tensor::zeros((1, 3, cfg.text_dim), DType::F32, &dev).unwrap();
-        let latent = |hw: usize| Tensor::zeros((1, 16, 1, hw, hw), DType::F32, &dev).unwrap();
-        // Two items × two buckets, item-major.
+        let latent =
+            |h: usize, w: usize| Tensor::zeros((1, 16, 1, h, w), DType::F32, &dev).unwrap();
+        // Two items × two buckets, item-major: item 0 portrait, item 1 landscape.
         let cache = vec![
-            (latent(4), cap.clone(), None),
-            (latent(8), cap.clone(), None),
-            (latent(4), cap.clone(), None),
-            (latent(8), cap.clone(), None),
+            (latent(8, 4), cap.clone(), None),
+            (latent(16, 8), cap.clone(), None),
+            (latent(4, 8), cap.clone(), None),
+            (latent(8, 16), cap.clone(), None),
         ];
-        let ropes = bucket_rope_tables(&cache, 2, &cfg, &dev).unwrap();
-        assert_eq!(ropes.len(), 2);
-        for (b, hw) in [(0usize, 4usize), (1, 8)] {
-            let (cos, sin) = WanRope::new(&cfg).cos_sin(1, hw / 2, hw / 2, &dev).unwrap();
-            assert_eq!(ropes[b].0.dims(), cos.dims(), "bucket {b} cos");
-            assert_eq!(ropes[b].1.dims(), sin.dims(), "bucket {b} sin");
+        let (ropes, rope_of) = entry_rope_tables(&cache, &cfg, &dev).unwrap();
+        assert_eq!(ropes.len(), 4, "four distinct grids");
+        assert_eq!(rope_of, vec![0, 1, 2, 3]);
+        let rope = WanRope::new(&cfg);
+        for (i, (h, w)) in [(8usize, 4usize), (16, 8), (4, 8), (8, 16)]
+            .into_iter()
+            .enumerate()
+        {
+            let (cos, sin) = rope.cos_sin(1, h / 2, w / 2, &dev).unwrap();
+            let (got_cos, got_sin) = &ropes[rope_of[i]];
+            assert_eq!(got_cos.dims(), cos.dims(), "entry {i} cos");
+            let diff = (got_cos - &cos).unwrap().abs().unwrap().sum_all().unwrap();
+            assert_eq!(
+                diff.to_scalar::<f32>().unwrap(),
+                0.0,
+                "entry {i} cos values"
+            );
+            let diff = (got_sin - &sin).unwrap().abs().unwrap().sum_all().unwrap();
+            assert_eq!(
+                diff.to_scalar::<f32>().unwrap(),
+                0.0,
+                "entry {i} sin values"
+            );
         }
-        assert_ne!(ropes[0].0.dims(), ropes[1].0.dims());
+        // Equal grids dedupe onto one table.
+        let same = vec![
+            (latent(8, 4), cap.clone(), None),
+            (latent(8, 4), cap.clone(), None),
+        ];
+        let (ropes, rope_of) = entry_rope_tables(&same, &cfg, &dev).unwrap();
+        assert_eq!((ropes.len(), rope_of), (1, vec![0, 0]));
+    }
+
+    /// The aspect canvas on each variant's token grid (VAE × 2×2 patch: 16 for the z16 A14B, 32
+    /// for the z48 TI2V-5B): a 1365×2048 portrait keeps its aspect within `edge²` (no square crop,
+    /// no upscale), its subject-mask crop rule is the whole frame, and the preview latent follows
+    /// the non-square canvas.
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        use gen_core_train::canvas::training_canvas;
+        assert_eq!(TrainVariant::T2v14b.canvas_stride(), 16);
+        assert_eq!(TrainVariant::I2v14b.canvas_stride(), 16);
+        assert_eq!(TrainVariant::Ti2v5b.canvas_stride(), 32);
+        for variant in [TrainVariant::T2v14b, TrainVariant::Ti2v5b] {
+            let stride = variant.canvas_stride();
+            let c = training_canvas((1365, 2048), 1024, stride, CANVAS_MAX_SIDE);
+            assert_eq!((c.width % stride, c.height % stride), (0, 0));
+            assert!(c.height > c.width && c.area() <= 1024 * 1024, "{c:?}");
+            assert_eq!(c.crop, canvas_crop(1365, 2048));
+            assert_eq!((c.crop.width, c.crop.height), (1365, 2048), "whole frame");
+        }
+        // A source under the edge's area trains at its own (stride-floored) size.
+        assert_eq!(
+            training_canvas((1365, 2048), 2048, 16, CANVAS_MAX_SIDE).size(),
+            (1360, 2048)
+        );
+        let c = training_canvas((1365, 2048), 1024, 16, CANVAS_MAX_SIDE);
+        assert_eq!(
+            preview_latent_grid(c.size()),
+            ((c.height / 8) as usize, (c.width / 8) as usize)
+        );
+        assert_eq!(preview_latent_grid((832, 1248)), (156, 104));
     }
 
     fn tiny_i2v_cfg() -> TransformerConfig {
@@ -3030,8 +3146,7 @@ mod subject_mask_reference_tests {
         let clean: Vec<Tensor> = (0..2u64)
             .map(|i| splitmix_uniform(&[1, 16, 1, 4, 4], 7 + i, 1.0, 0.0, &Device::Cpu).unwrap())
             .collect();
-        let loaded =
-            PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
+        let loaded = PerceptualSubjectMasks::load("t", &items, &cfg, 1, canvas_crop).unwrap();
         let expected = loaded.clone().unwrap();
         prepare_perceptual_references(&mut path, clean.iter(), loaded).unwrap();
         let seen = candle_gen::lock_recover(&seen);

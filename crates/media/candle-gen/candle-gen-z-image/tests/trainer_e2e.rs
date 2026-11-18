@@ -49,16 +49,31 @@ fn snapshot() -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Two solid-colour swatch PNGs + captions in `dir`.
-fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
+/// Two captioned PNGs in `dir` for a run at bucket edge `edge`: item 0 a solid red square swatch,
+/// item 1 a 2:3 portrait of three distinct horizontal bands (blue / cream / green), so every run
+/// trains a non-square aspect-preserving canvas whose whole frame (all three bands, never a
+/// centre-cropped square) is visible in its latents and samples. The square side is `edge` (never
+/// below the historical 96 px) and the portrait is that width × 1.5: the canvas never upscales a
+/// source (SW-7172), so a fixture smaller than `edge²` would silently train a smaller workload than
+/// the run claims. At edge 64 that is the historical 96² square plus a 96×144 portrait; at the
+/// 512 comparison edge a 512² square (canvas 512², exactly as before) plus a 512×768 portrait.
+fn make_dataset(dir: &Path, edge: u32) -> Vec<TrainingItem> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
+    let side = edge.max(96);
+    let fixtures: [(u32, u32, &[[u8; 3]]); 2] = [
+        (side, side, &[[200, 40, 40]]),
+        (
+            side,
+            side * 3 / 2,
+            &[[40, 80, 200], [235, 225, 200], [40, 160, 70]],
+        ),
+    ];
     let mut items = Vec::new();
-    for (i, color) in [[200u8, 40, 40], [40, 80, 200]].iter().enumerate() {
-        let mut img = image::RgbImage::new(96, 96);
-        for px in img.pixels_mut() {
-            *px = image::Rgb(*color);
-        }
+    for (i, (w, h, bands)) in fixtures.into_iter().enumerate() {
+        let img = image::RgbImage::from_fn(w, h, |_, y| {
+            image::Rgb(bands[(y as usize * bands.len()) / h as usize])
+        });
         let path = dir.join(format!("img{i}.png"));
         img.save(&path).unwrap();
         items.push(TrainingItem {
@@ -114,7 +129,8 @@ fn run(
     steps: u32,
     grad_ckpt: bool,
 ) -> RunOut {
-    let items = make_dataset(tmp);
+    let cfg = config(network_type, steps, grad_ckpt);
+    let items = make_dataset(tmp, cfg.resolution);
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
 
     let mut trainer = candle_gen_z_image::provider_registry()
@@ -127,7 +143,7 @@ fn run(
 
     let req = TrainingRequest {
         items,
-        config: config(network_type, steps, grad_ckpt),
+        config: cfg,
         output_dir: tmp.join("out"),
         file_name: file_name.to_string(),
         trigger_words: vec![],
@@ -358,7 +374,7 @@ fn z_image_trainer_emits_preview_samples() {
     }
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let items = make_dataset(&tmp);
+    let items = make_dataset(&tmp, 64);
     assert_eq!(candle_gen_z_image::MODEL_ID, "z_image_turbo");
     let mut trainer = candle_gen_z_image::provider_registry()
         .unwrap()
@@ -602,7 +618,7 @@ fn z_image_bounded_acceleration_acceptance() {
             || {
                 comparison::record_initialization(&serde_json::json!({
                     "model_source": snapshot().display().to_string(),
-                    "dataset": "existing two96px RGB swatches and exact source captions",
+                    "dataset": "a 512px red square swatch and a 512x768 three-band portrait (whole-frame aspect canvas) with exact source captions",
                     "workload": "512px single-bucket training, no previews/resume/intermediate save"
                 }));
                 run(

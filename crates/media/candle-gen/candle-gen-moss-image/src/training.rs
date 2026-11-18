@@ -19,7 +19,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::train::{
     checkpoint,
-    dataset::square_image_tensor,
+    dataset::canvas_image_tensor,
     flow_match::{prepared_subject_mask_weight, sample_noise},
     lora::{self, LoraSet},
     optim::{accumulate_grads, scale_grads, TrainOptimizer},
@@ -512,10 +512,13 @@ fn encode_entry(
     check_cancel(&req.cancel)?;
     let source = plan.decode_rgb(geometry.item, host_budget)?;
     let pixels = if req.config.aspect_ratio_buckets.is_empty() {
-        let crop = geometry.crop_box();
-        let square =
-            image::imageops::crop_imm(&source, crop.x, crop.y, crop.width, crop.height).to_image();
-        square_image_tensor(&square, geometry.width, device)?
+        // Default path: the plan's aspect-preserving canvas (source box + non-square size).
+        let canvas = gen_core_train::canvas::TrainingCanvas {
+            crop: geometry.crop_box(),
+            width: geometry.width,
+            height: geometry.height,
+        };
+        canvas_image_tensor(&source, &canvas, device)?
     } else {
         let row = gen_core::AspectRatioBucket {
             width: geometry.width,

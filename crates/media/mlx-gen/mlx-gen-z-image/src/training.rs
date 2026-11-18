@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
@@ -39,9 +39,10 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::tae::TinyDecoderConfig;
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
+use gen_core_train::canvas::canvas_crop;
 pub use mlx_gen::train::lora::LoraTarget;
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::trainer_loop::{
     adapter_optimizer, adapter_stem, block_local_targets, build_adapter, cache_items,
     draw_flow_step, encode_preview_prompts, ensure_cached, flow_velocity_batch, largest_edge,
@@ -71,6 +72,13 @@ use crate::vae::Vae;
 /// Z-Image reconstructs its LoKr delta at **bf16** (the bf16-residual inference path); training must
 /// match so the adapter round-trips bit-for-bit.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
+
+/// Every training canvas side is a multiple of this: one VAE cell (8 px) times the DiT's 2×2 patch
+/// (the candle twin's constant).
+pub(crate) const CANVAS_STRIDE: u32 = crate::pipeline::SPATIAL_SCALE * 2;
+/// The longest canvas side the trainer keeps — the family's render cap (`Capabilities::max_size`,
+/// 2048). The RoPE axes reach well past it.
+pub(crate) const CANVAS_MAX_SIDE: Option<u32> = Some(2048);
 
 /// `(x_t, target, timestep)` for a single sample at flow-match `sigma`:
 /// `x_t = (1-σ)·x0 + σ·noise`, `target = noise - x0`, `timestep = 1-σ`.
@@ -298,7 +306,7 @@ impl ZImageTurboTrainer {
 
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
-        let cache = self.cache_dataset(req, &edges, on_progress)?;
+        let (cache, preview_size) = self.cache_dataset(req, &edges, edge, on_progress)?;
 
         // Epic 2123 E8: each image's perceptual reference (TAEF1 decode of its cached clean latent →
         // DA2 depth) is computed exactly once per job, by the `AuxDriver` before the loop.
@@ -310,7 +318,7 @@ impl ZImageTurboTrainer {
                 &req.items,
                 cfg,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?,
             None => None,
         };
@@ -385,7 +393,7 @@ impl ZImageTurboTrainer {
             checkpoint_main: use_checkpoint.then_some(main_block_locals.as_slice()),
             sample_caps: &sample_caps,
             sample_scheduler: sample_scheduler.as_ref(),
-            edge,
+            preview_size,
         };
         run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
@@ -444,19 +452,32 @@ impl ZImageTurboTrainer {
     }
 
     /// The caching pass: per item, its caption embedding once and one clean latent per bucket
-    /// edge. Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean latent,
-    /// caption embeds, and (subject-masked loss, sc-24828) that bucket's latent loss-weight map
-    /// — `None` when the technique is off.
+    /// edge, each the whole image resized onto its aspect-keeping canvas at that edge (about
+    /// `edge²` pixels, never upscaled, sides multiples of `CANVAS_STRIDE` — never centre-cropped
+    /// to a square). Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean
+    /// latent, caption embeds, and (subject-masked loss, sc-24828) that bucket's latent loss-weight
+    /// map — `None` when the technique is off. Also returns the preview canvas: item 0's canvas at
+    /// the largest edge `edge` (a shape the run trains at; the square `edge` only if caching was
+    /// cancelled before item 0). Every micro-step trains one cache entry (no stacking), so entries
+    /// of different shapes never share a batch.
     fn cache_dataset(
         &self,
         req: &TrainingRequest,
         edges: &[u32],
+        edge: u32,
         on_progress: &mut dyn FnMut(TrainingProgress),
-    ) -> Result<Vec<CacheEntry>> {
+    ) -> Result<(Vec<CacheEntry>, (u32, u32))> {
         let cfg = &req.config;
         let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
+        let mut preview_size: Option<(u32, u32)> = None;
         cache_items(req, on_progress, |item| {
-            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // Decoded once, whole; cut + resized onto its canvas per bucket edge.
+            let img = decode_image(&item.image_path)?;
+            preview_size.get_or_insert_with(|| {
+                canvas_source(&img, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE)
+                    .0
+                    .size()
+            });
             // sc-24828: the item's subject mask is read + checked once, then resampled per bucket.
             let mask = PreparedSubjectMask::load_if_enabled(
                 "z_image_turbo trainer",
@@ -483,7 +504,11 @@ impl ZImageTurboTrainer {
                 edges,
                 mask.as_ref(),
                 &cap,
-                |edge| encode_init_latents(&self.vae, &img, edge, edge),
+                |edge| {
+                    let (canvas, source) =
+                        canvas_source(&img, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+                    encode_init_latents(&self.vae, &source, canvas.width, canvas.height)
+                },
                 &mut cache,
             )
         })?;
@@ -492,7 +517,7 @@ impl ZImageTurboTrainer {
         // `gen_core::Error::Canceled`, so the conformance suite distinguishes it from failure);
         // an empty cache with no cancel is a real "no usable dataset items" error.
         ensure_cached(cache.len(), &req.cancel, "z_image_turbo trainer")?;
-        Ok(cache)
+        Ok((cache, preview_size.unwrap_or((edge, edge))))
     }
 
     /// sc-5637 — pre-encode the preview-sample prompts while the Qwen encoder is still resident
@@ -572,7 +597,8 @@ struct ZImageLoop<'a> {
     checkpoint_main: Option<&'a [Vec<String>]>,
     sample_caps: &'a [(String, Array)],
     sample_scheduler: Option<&'a FlowMatchEuler>,
-    edge: u32,
+    /// The preview canvas `(width, height)`: item 0's training canvas at the largest edge.
+    preview_size: (u32, u32),
 }
 
 impl TrainLoopFamily for ZImageLoop<'_> {
@@ -656,7 +682,7 @@ impl TrainLoopFamily for ZImageLoop<'_> {
                     scheduler,
                     cap,
                     sample_seed,
-                    self.edge,
+                    self.preview_size,
                     self.compute_dtype,
                     &self.req.cancel,
                 )
@@ -790,8 +816,9 @@ type CacheEntry = (Array, Array, Option<Array>);
 
 /// Append one item's cache entries, one per bucket edge (item-major, sc-2127): `encode(edge)` is
 /// the bucket's clean latent, and — sc-24828 — its loss-weight map is the item's already-loaded
-/// mask cropped with the center square `center_crop_square` cut, area-averaged onto THIS bucket's
-/// latent grid and broadcast to that latent's shape (`None` when masked loss is off).
+/// mask cropped with the image's own canvas source box ([`canvas_crop`]; the mask shares the
+/// image's dimensions), area-averaged onto THIS bucket's latent grid and broadcast to that
+/// latent's shape (`None` when masked loss is off).
 fn cache_item_buckets(
     edges: &[u32],
     mask: Option<&PreparedSubjectMask>,
@@ -801,12 +828,8 @@ fn cache_item_buckets(
 ) -> Result<()> {
     for &edge in edges {
         let x0 = encode(edge)?;
-        let mask_weight = prepared_subject_mask_weight(
-            "z_image_turbo trainer",
-            mask,
-            CropBox::center_square,
-            x0.shape(),
-        )?;
+        let mask_weight =
+            prepared_subject_mask_weight("z_image_turbo trainer", mask, canvas_crop, x0.shape())?;
         eval([&x0])?;
         cache.push((x0, cap.clone(), mask_weight));
     }
@@ -1211,7 +1234,7 @@ mod first_step_repro {
         dtype: Dtype,
         tag: &str,
     ) -> Result<(f32, f64, [i32; 4])> {
-        let img = center_crop_square(&swatch(edge));
+        let img = swatch(edge);
         let x0 = encode_init_latents(&trainer.vae, &img, edge, edge)?;
         eval([&x0])?;
         let shape = {
@@ -1329,7 +1352,7 @@ mod first_step_repro {
     fn first_step_memory_attribution() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         for edge in [512u32, 768] {
-            let img = center_crop_square(&swatch(edge));
+            let img = swatch(edge);
             let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
             let noise =
                 random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap()))
@@ -1501,7 +1524,7 @@ mod first_step_repro {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         let locals = main_block_local_targets(&trainer);
         let edge = 256u32; // small enough that the dense path is cheap; math is resolution-agnostic
-        let img = center_crop_square(&swatch(edge));
+        let img = swatch(edge);
         let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
         let noise =
             random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
@@ -1568,7 +1591,7 @@ mod first_step_repro {
     fn attn_ckpt_grads_match_retained() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         let edge = 256u32;
-        let img = center_crop_square(&swatch(edge));
+        let img = swatch(edge);
         let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
         let noise =
             random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
@@ -1697,7 +1720,7 @@ mod first_step_repro {
 
         // Grad reference at 256 in f32.
         let edge = 256u32;
-        let img = center_crop_square(&swatch(edge));
+        let img = swatch(edge);
         let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
         let noise =
             random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
@@ -1815,6 +1838,40 @@ mod first_step_repro {
         #[cfg(target_os = "macos")]
         crate::test_metal_guard::record_model_inference_device();
         eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_grads_direction_and_memory_vs_f32");
+    }
+}
+
+/// The captioned-item canvas keeps the source aspect on the DiT's 16 px grid (no square crop, no
+/// upscale) and the preview prior follows a non-square canvas. Pure arithmetic (the candle twin's
+/// test).
+#[cfg(test)]
+mod aspect_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn a_portrait_trains_and_previews_on_its_own_aspect_canvas() {
+        assert_eq!(CANVAS_STRIDE, 16);
+        let c = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(c.crop, canvas_crop(1365, 2048));
+        assert_eq!(c.size(), (832, 1248));
+        assert!(c.area() <= 1024 * 1024);
+        assert_eq!(
+            gen_core_train::canvas::training_canvas(
+                (1365, 2048),
+                2048,
+                CANVAS_STRIDE,
+                CANVAS_MAX_SIDE
+            )
+            .size(),
+            (1360, 2048)
+        );
+        let noise = crate::pipeline::create_noise(7, 1360, 2048).unwrap();
+        assert_eq!(noise.shape(), &[16, 1, 256, 170]);
     }
 }
 
@@ -2111,9 +2168,9 @@ mod weight_noise_update_tests {
     }
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each cache entry's weight map has
-    /// THAT bucket's latent shape, and the background (right half of the center-square crop, with
-    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is x ∈ [8, 40);
-    /// the subject is x < 24 — the crop's left half.
+    /// THAT bucket's (non-square, aspect-canvas) latent shape, and the background (the right half
+    /// of the whole 48×32 frame, with `background_weight` 0) is zero at both grids; the subject is
+    /// x < 24 — the frame's left half.
     #[test]
     fn subject_mask_weight_is_computed_per_bucket() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2143,8 +2200,14 @@ mod weight_noise_update_tests {
             Some(&mask),
             &cap,
             |edge| {
-                let g = (edge / 8) as i32;
-                Ok(Array::zeros::<f32>(&[16, 1, g, g])?)
+                let canvas = gen_core_train::canvas::training_canvas(
+                    (iw, ih),
+                    edge,
+                    CANVAS_STRIDE,
+                    CANVAS_MAX_SIDE,
+                );
+                let (gw, gh) = ((canvas.width / 8) as i32, (canvas.height / 8) as i32);
+                Ok(Array::zeros::<f32>(&[16, 1, gh, gw])?)
             },
             &mut cache,
         )
@@ -2157,17 +2220,18 @@ mod weight_noise_update_tests {
                 x0.shape(),
                 "weight must match its own bucket's latent"
             );
-            let g = x0.shape()[3] as usize;
+            let (gh, gw) = (x0.shape()[2] as usize, x0.shape()[3] as usize);
+            assert_ne!(gh, gw, "a 3:2 frame trains on a non-square grid");
             let dense = multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
             let v = dense.as_slice::<f32>();
-            // One [g, g] plane (all channels are the same broadcast plane).
-            for y in 0..g {
-                for x in 0..g {
-                    let val = v[y * g + x];
-                    if x < g / 2 {
-                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+            // One [gh, gw] plane (all channels are the same broadcast plane).
+            for y in 0..gh {
+                for x in 0..gw {
+                    let val = v[y * gw + x];
+                    if x < gw / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {gh}x{gw} = {val}");
                     } else {
-                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {gh}x{gw}");
                     }
                 }
             }
@@ -2947,8 +3011,8 @@ mod depth_anchoring_tests {
 }
 
 /// sc-24832: the Z-Image reference preparation hands each cache entry its item's subject mask —
-/// cropped like the image (centre square) and resampled onto that entry's decoded grid — to a
-/// mask-reading loss. Mutation: drop `path.attach_subject_masks(masks)` from
+/// cropped like the image (its canvas source box) and resampled onto that entry's decoded grid —
+/// to a mask-reading loss. Mutation: drop `path.attach_subject_masks(masks)` from
 /// `aux_driver` ⇒ the probe sees no mask ⇒ red.
 #[cfg(test)]
 mod subject_mask_reference_tests {
@@ -3052,8 +3116,7 @@ mod subject_mask_reference_tests {
             }],
         )
         .unwrap();
-        let loaded =
-            PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
+        let loaded = PerceptualSubjectMasks::load("t", &items, &cfg, 1, canvas_crop).unwrap();
         let expected = loaded.clone().unwrap();
         let schedule = BucketSchedule::new(
             cache.len(),
@@ -3077,14 +3140,9 @@ mod subject_mask_reference_tests {
         }
         assert_ne!(seen[0], seen[1], "each entry carries its own item's mask");
         // Off ⇒ no mask reaches the loss.
-        let none = PerceptualSubjectMasks::load(
-            "t",
-            &items,
-            &TrainingConfig::default(),
-            1,
-            CropBox::center_square,
-        )
-        .unwrap();
+        let none =
+            PerceptualSubjectMasks::load("t", &items, &TrainingConfig::default(), 1, canvas_crop)
+                .unwrap();
         assert!(none.is_none());
         #[cfg(target_os = "macos")]
         crate::test_metal_guard::record_model_inference_device();

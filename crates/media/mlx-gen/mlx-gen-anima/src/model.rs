@@ -18,7 +18,7 @@ const RES_MIN: u32 = 512;
 /// Above ~1920 px/side the Cosmos RoPE would index out of its trained range; `rope.rs` **rejects**
 /// (errors on) such a request rather than clamping. The shipped ceiling is 1536² (post-patch 96, well
 /// within the 120-position max_size), so the guard is unreachable via the normal path. See [`crate::rope`].
-const RES_MAX: u32 = 1536;
+pub(crate) const RES_MAX: u32 = 1536;
 
 /// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
 /// prompt); Base/Aesthetic run true classifier-free guidance.

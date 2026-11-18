@@ -41,16 +41,36 @@ fn load_spec(adapters: Vec<AdapterSpec>) -> LoadSpec {
     spec
 }
 
-fn make_item(dir: &Path) -> TrainingItem {
+/// A `side × side` solid red swatch item in a fresh `dir`. `side` must be at least the run's
+/// resolution: the aspect canvas never upscales a source (SW-7172).
+fn make_item(dir: &Path, side: u32) -> TrainingItem {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
-    let mut image = image::RgbImage::new(64, 64);
+    let mut image = image::RgbImage::new(side, side);
     for pixel in image.pixels_mut() {
         *pixel = image::Rgb([190, 45, 35]);
     }
     let image_path = dir.join("red_swatch.png");
     image.save(&image_path).unwrap();
     TrainingItem::captioned(image_path, "a solid red colour swatch".to_string())
+}
+
+/// A 2:3 portrait item (`width × 1.5·width`) in the existing `dir`: a cream, figure-like centred block
+/// on a red ground, so a render from an adapter trained on it shows whether the whole non-square
+/// frame was used (the aspect canvas, SW-7172) rather than a centre-cropped square.
+#[cfg(feature = "model-inference-proof")]
+fn make_portrait_item(dir: &Path, width: u32) -> TrainingItem {
+    let height = width * 3 / 2;
+    let image = image::RgbImage::from_fn(width, height, |x, y| {
+        if x.abs_diff(width / 2) <= width / 6 && y.abs_diff(height / 2) <= height / 3 {
+            image::Rgb([235, 225, 200])
+        } else {
+            image::Rgb([190, 45, 35])
+        }
+    });
+    let image_path = dir.join("figure_portrait.png");
+    image.save(&image_path).unwrap();
+    TrainingItem::captioned(image_path, "a cream figure on a red background".to_string())
 }
 
 fn render(adapter: Option<&Path>) -> Vec<u8> {
@@ -100,7 +120,7 @@ fn ltx_trainer_round_trips_through_inference_and_changes_render() {
 
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
-    let item = make_item(&tmp.join("data"));
+    let item = make_item(&tmp.join("data"), 64);
     let output_dir = tmp.join("out");
     let mut trainer = candle_gen_ltx::provider_registry()
         .unwrap()
@@ -268,9 +288,9 @@ fn ltx23_bounded_acceleration_acceptance() {
                 comparison::record_initialization(&serde_json::json!({
                     "model_source": required_dir("LTX_TRAINING_TIER").display().to_string(),
                     "text_encoder_source": required_dir("LTX_GEMMA_DIR").display().to_string(),
-                    "dataset": "existing64px red swatch and exact caption, VAE-encoded at256px",
+                    "dataset": "a 256px red swatch and a 256x384 figure portrait (whole-frame aspect canvas) with exact captions, VAE-encoded at256px area",
                     "video_frames": 1, "audio_mode": "none",
-                "qualification": "single-image256px case; no dense projection packing on q4"
+                "qualification": "two single-image items at a256px area; no dense projection packing on q4"
                 }));
                 let mut trainer = candle_gen_ltx::provider_registry()
                     .unwrap()
@@ -279,7 +299,13 @@ fn ltx23_bounded_acceleration_acceptance() {
                 let output = trainer
                     .train(
                         &TrainingRequest {
-                            items: vec![make_item(&root.join("data"))],
+                            // At least the run's 256² area (the canvas never upscales): the
+                            // square trains its historical 256² canvas, the 256×384 portrait its
+                            // whole 2:3 frame.
+                            items: vec![
+                                make_item(&root.join("data"), 256),
+                                make_portrait_item(&root.join("data"), 256),
+                            ],
                             config: TrainingConfig {
                                 rank: 4,
                                 alpha: 4.,
@@ -322,14 +348,17 @@ fn ltx23_bounded_acceleration_acceptance() {
 
     let tmp = bounded_output_root();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let item = make_item(&tmp.join("data"));
+    // The historical 64² swatch plus a 64×96 portrait (above the run's 64² area), so the bounded
+    // run also trains a non-square aspect canvas over its whole frame.
+    let item = make_item(&tmp.join("data"), 64);
+    let portrait = make_portrait_item(&tmp.join("data"), 64);
     let output_dir = tmp.join("out");
     let mut trainer = candle_gen_ltx::provider_registry()
         .unwrap()
         .load_trainer(candle_gen_ltx::config::TRAINER_ID, &load_spec(Vec::new()))
         .expect("registered LTX trainer");
     let request = TrainingRequest {
-        items: vec![item],
+        items: vec![item, portrait],
         config: TrainingConfig {
             rank: 4,
             alpha: 4.0,
@@ -371,7 +400,7 @@ fn ltx23_bounded_acceleration_acceptance() {
         },
     );
     bounded_peak(sampler, &tmp);
-    assert_eq!(cached, [(1, 1)]);
+    assert_eq!(cached, [(1, 2), (2, 2)]);
     assert_eq!(trained.len(), 4);
     assert_eq!((trained[3].0, trained[3].1), (4, 4));
     assert!(trained.iter().all(|row| row.2.is_finite()));

@@ -43,8 +43,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mlx_gen::media::Image;
+use mlx_gen::train::canvas::canvas_crop;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::dataset::{bucket_edges, canvas_source, decode_image};
 use mlx_gen::train::lora::{accumulate_grads, adapter_optimizer_update, average_grads, LoraParams};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
@@ -52,7 +53,7 @@ use mlx_gen::train::perceptual::{
     X0Decoder,
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
-use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::subject_mask::PreparedSubjectMask;
 use mlx_gen::train::taehv::{TaehvConfig, TaehvDecoder};
 use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::weights::{to_dtype, Weights};

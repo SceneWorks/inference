@@ -989,8 +989,8 @@ impl StagedHeavy for AnimaHeavy {
 // and mirror the inference denoise ([`AnimaPipeline::denoise`]): [`anima_sigmas`] + [`run_flow_sampler`]
 // over [`TimestepConvention::Sigma`], CFG-combining a live uncond conditioner forward on CFG variants.
 
-/// Render one preview image from the in-training adapter (sc-10641): run the (live) conditioner, denoise
-/// the DiT from seeded noise, VAE-decode → RGB. `source`/`t5_ids` are the cached conditioner inputs for
+/// Render one preview image from the in-training adapter (sc-10641) at the `(width, height)` preview
+/// canvas: run the (live) conditioner, denoise the DiT from seeded noise, VAE-decode → RGB. `source`/`t5_ids` are the cached conditioner inputs for
 /// the positive prompt; `uncond` is the cached empty-prompt inputs (CFG variants only). Forward-only.
 ///
 /// The conditioner forward here is the sc-10522 correctness point: the DiT + conditioner adapters must
@@ -1007,12 +1007,12 @@ pub(crate) fn render_preview(
     uncond: Option<&(Array, Array)>,
     steps: usize,
     guidance: f32,
-    edge: u32,
+    (width, height): (u32, u32),
     seed: u64,
     dtype: Dtype,
     cancel: &CancelFlag,
 ) -> Result<Image> {
-    let init = create_noise(seed, edge, edge)?;
+    let init = create_noise(seed, width, height)?;
     let latent = render_preview_latent(
         dit,
         conditioner,

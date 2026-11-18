@@ -1,9 +1,10 @@
 #![cfg(test)]
 
 use super::{
-    encode_bucket_latents, flatten_latent, guard_latent_edge, largest_bucket, latent_edge_of,
-    projected_dense_peak_gb, step_entry, still_subject_weight, trainer_descriptor,
-    trainer_descriptor_25, PreparedSubjectMask,
+    canvas_latent_hw, encode_bucket_latents, entry_position_grids, flatten_latent,
+    guard_latent_edge, largest_bucket, latent_edge_of, projected_dense_peak_gb, step_entry,
+    still_subject_weight, trainer_descriptor, trainer_descriptor_25, PreparedSubjectMask,
+    CANVAS_MAX_SIDE, CANVAS_STRIDE,
 };
 use crate::positions::create_position_grid;
 use mlx_gen::gen_core::{self, BucketSchedule, ResolutionBucket, TrainingConfig};
@@ -32,18 +33,17 @@ fn only_the_2_3_descriptor_declares_resolution_buckets() {
 }
 
 /// sc-24828 × sc-2127: with subject-masked loss on and two buckets, each bucket's cached
-/// weight is the item's mask resampled onto **that bucket's** latent grid (centre-square crop
-/// of a non-square image) and patchified like it — the patchified clean latent's exact
-/// `(1, S, C)` shape — with the masked-out (right-half-of-crop) tokens zero and the subject
-/// tokens at the subject weight.
+/// weight is the item's mask resampled onto **that bucket's** latent grid (the whole frame of a
+/// non-square image — its canvas source box) and patchified like it — the patchified clean
+/// latent's exact `(1, S, C)` shape — with the masked-out (right-half) tokens zero and the
+/// subject tokens at the subject weight.
 ///
 /// *Mutation that reds this:* `encode_bucket_latents` resampling the mask once at the first
 /// bucket's latent shape and reusing it for every bucket.
 #[test]
 fn subject_mask_weight_is_resampled_per_bucket() {
     let tmp = tempfile::tempdir().unwrap();
-    // 96×64 image: the centre square is x ∈ [16, 80); the subject is x < 48 — exactly the
-    // crop's left half.
+    // 96×64 image, kept whole; the subject is x < 48 — exactly the frame's left half.
     let image_path = tmp.path().join("a.png");
     image::RgbImage::from_pixel(96, 64, image::Rgb([90, 120, 150]))
         .save(&image_path)
@@ -65,8 +65,15 @@ fn subject_mask_weight_is_resampled_per_bucket() {
     let entries = encode_bucket_latents(
         &edges,
         |edge| {
-            let le = (edge / 32) as i32;
-            Ok(mlx_rs::ops::zeros::<f32>(&[1, channels as i32, 1, le, le])?)
+            // A 3:2 still latent (the 96×64 frame's own aspect canvas): `(2k, 3k)`.
+            let k = (edge / 128) as i32;
+            Ok(mlx_rs::ops::zeros::<f32>(&[
+                1,
+                channels as i32,
+                1,
+                2 * k,
+                3 * k,
+            ])?)
         },
         |shape| still_subject_weight("ltx", mask.as_ref(), shape),
     )
@@ -75,11 +82,12 @@ fn subject_mask_weight_is_resampled_per_bucket() {
     for (b, (clean, weight)) in entries.iter().enumerate() {
         let weight = weight.as_ref().expect("mask loss on ⇒ a weight");
         assert_eq!(weight.shape(), clean.shape(), "bucket {b} weight shape");
-        let le = (edges[b] / 32) as usize;
-        assert_eq!(clean.shape()[1] as usize, le * le, "bucket {b} tokens");
+        let k = (edges[b] / 128) as usize;
+        let (lh, lw) = (2 * k, 3 * k);
+        assert_eq!(clean.shape()[1] as usize, lh * lw, "bucket {b} tokens");
         let flat = weight.reshape(&[-1]).unwrap();
         for (token, chans) in flat.as_slice::<f32>().chunks(channels).enumerate() {
-            let want = if token % le < le / 2 { 1.0 } else { 0.0 };
+            let want = if token % lw < lw / 2 { 1.0 } else { 0.0 };
             assert!(
                 chans.iter().all(|&v| (v - want).abs() < 1e-5),
                 "bucket {b} token {token}: {chans:?} want {want}"
@@ -165,4 +173,25 @@ fn ltx25_preflight_refuses_resolution_buckets() {
         }
         other => panic!("expected a typed Unsupported, got {other:?}"),
     }
+}
+
+/// The captioned-still canvas keeps the source aspect on the VAE's 32 px token grid (no square
+/// crop, no upscale), its long side within the 2048 px RoPE span, and the per-entry RoPE grids
+/// follow each entry's own `(h, w)` — equal grids share one grid, unequal ones never do.
+#[test]
+fn a_portrait_trains_on_its_own_aspect_canvas_and_grid() {
+    use mlx_gen::train::canvas::{canvas_crop, training_canvas};
+    let c = training_canvas((1365, 2048), 1024, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+    assert_eq!((c.width % 32, c.height % 32), (0, 0));
+    assert!(c.height > c.width && c.area() <= 1024 * 1024, "{c:?}");
+    assert_eq!(c.crop, canvas_crop(1365, 2048));
+    let (h, w) = canvas_latent_hw(c.size());
+    assert_eq!((h, w), ((c.height / 32) as usize, (c.width / 32) as usize));
+    let strip = training_canvas((8192, 2048), 2048, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+    assert!(strip.width <= 2048, "{strip:?}");
+    let hws = [(4, 2), (2, 4), (4, 2)];
+    let (grids, entry_grid) = entry_position_grids(&hws);
+    assert_eq!((grids.len(), entry_grid), (2, vec![0, 1, 0]));
+    assert_eq!(grids[0].shape(), create_position_grid(1, 1, 4, 2).shape());
+    assert_eq!(grids[1].shape(), create_position_grid(1, 1, 2, 4).shape());
 }

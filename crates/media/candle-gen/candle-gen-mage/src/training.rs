@@ -14,7 +14,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
-use candle_gen::train::dataset::{bucket_edges, decode_square, square_image_tensor};
+use candle_gen::train::dataset::{bucket_edges, canvas_image_tensor, decode_rgb, image_canvas};
 use candle_gen::train::flow_match::{
     self, check_aux_memory, combine_terms, component_bytes, device_training_budget_bytes,
     effective_weight_decay, noise_seed, prepared_subject_mask_weight, sample_noise, save_adapter,
@@ -29,7 +29,8 @@ use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, Tr
 use candle_gen::train::perceptual::{AuxModelFootprint, Parameterization, X0Decoder};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::{CandleError, Result};
-use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
+use gen_core_train::canvas::canvas_crop;
+use gen_core_train::subject_mask::PreparedSubjectMask;
 
 use crate::config::{self, MageConfig, VAE_DOWNSAMPLE};
 use crate::rope::{ImgShape, PackLayout};
@@ -39,6 +40,13 @@ const LABEL: &str = "mage_flow_base trainer";
 const TRANSFORMER_WEIGHTS: &str = "diffusion_pytorch_model.safetensors";
 const TRANSFORMER_CONFIG: &str = "config.json";
 const DEFAULT_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+/// Every training canvas side is a multiple of this: one Mage-VAE latent cell (16 px) — the DiT
+/// packs one token per latent cell (`patch_size` 1).
+const CANVAS_STRIDE: u32 = VAE_DOWNSAMPLE as u32;
+/// The longest canvas side the trainer keeps — the family's render cap ([`config::MAX_SIZE`]).
+/// MSRoPE is computed (no positional table), so this bounds the trained positions to what
+/// inference renders rather than a hard table limit.
+const CANVAS_MAX_SIDE: Option<u32> = Some(config::MAX_SIZE);
 
 pub fn trainer_descriptor() -> TrainerDescriptor {
     TrainerDescriptor {
@@ -456,34 +464,38 @@ struct CachedSample {
     latent: Tensor,
     text: Tensor,
     layout: PackLayout,
-    /// Subject-mask loss weight packed exactly like `latent` (`[1, grid², C]`); `None` unless
+    /// Subject-mask loss weight packed exactly like `latent` (`[1, gh·gw, C]`); `None` unless
     /// subject-masked loss is on (sc-24828).
     mask_weight: Option<Tensor>,
 }
 
-/// Pack a `[1, C, grid, grid]` latent-grid tensor into Mage's `[1, grid², C]` token sequence — the
-/// layout the cached latent (and so the velocity target) uses. Shared with the subject-mask loss
-/// weight so it lines up element-for-element with the latent it multiplies.
-fn pack_latent_tokens(latent: &Tensor, grid: usize, channels: usize) -> Result<Tensor> {
+/// A latent grid `(height, width)` in latent cells — non-square for a non-square training canvas.
+type LatentGrid = (usize, usize);
+
+/// Pack a `[1, C, gh, gw]` latent-grid tensor into Mage's row-major `[1, gh·gw, C]` token sequence
+/// — the layout the cached latent (and so the velocity target) uses. Shared with the subject-mask
+/// loss weight so it lines up element-for-element with the latent it multiplies.
+fn pack_latent_tokens(latent: &Tensor, (gh, gw): LatentGrid, channels: usize) -> Result<Tensor> {
     Ok(latent
         .permute((0, 2, 3, 1))?
-        .reshape((1, grid * grid, channels))?)
+        .reshape((1, gh * gw, channels))?)
 }
 
 /// The subject-mask loss weight for one bucket's cached latent (sc-24828 × sc-2127), `None` when
-/// masked loss is off. The item's mask (loaded once) takes [`decode_square`]'s centre-square crop,
-/// is area-averaged onto this bucket's unpacked `[1, C, grid, grid]` latent grid, and is packed with
-/// [`pack_latent_tokens`] exactly like that bucket's latent.
+/// masked loss is off. The item's mask (loaded once; same dimensions as its image) takes the
+/// image's own canvas source box ([`canvas_crop`]: the whole frame unless the source is beyond
+/// 4:1), is area-averaged onto this bucket's unpacked `[1, C, gh, gw]` latent grid, and is packed
+/// with [`pack_latent_tokens`] exactly like that bucket's latent.
 fn bucket_mask_weight(
     mask: Option<&PreparedSubjectMask>,
-    grid: usize,
+    grid: LatentGrid,
     device: &Device,
 ) -> Result<Option<Tensor>> {
     prepared_subject_mask_weight(
         LABEL,
         mask,
-        CropBox::center_square,
-        &[1, config::LATENT_CHANNELS, grid, grid],
+        canvas_crop,
+        &[1, config::LATENT_CHANNELS, grid.0, grid.1],
         device,
     )?
     .map(|weight| pack_latent_tokens(&weight, grid, config::LATENT_CHANNELS))
@@ -545,24 +557,33 @@ fn step_loss(
     Ok((loss, losses, prediction))
 }
 
-/// The square latent grid side of a cached sample (`[1, grid², C]` tokens).
-fn sample_grid(sample: &CachedSample) -> Result<usize> {
+/// The latent grid `(height, width)` of a cached sample — its layout's single still-image shape,
+/// checked against the latent's `[1, gh·gw, C]` token count.
+fn sample_grid(sample: &CachedSample) -> Result<LatentGrid> {
     let tokens = sample.latent.dim(1)?;
-    let grid = (tokens as f64).sqrt().round() as usize;
-    if grid * grid != tokens {
+    let grid = match sample.layout.shapes() {
+        [shape] if shape.frames == 1 => (shape.height, shape.width),
+        shapes => {
+            return Err(CandleError::Msg(format!(
+                "{LABEL}: cached latent layout is not one still image: {shapes:?}"
+            )))
+        }
+    };
+    if grid.0 * grid.1 != tokens {
         return Err(CandleError::Msg(format!(
-            "{LABEL}: cached latent has {tokens} tokens, not a square grid"
+            "{LABEL}: cached latent has {tokens} tokens, not its {}x{} layout grid",
+            grid.0, grid.1
         )));
     }
     Ok(grid)
 }
 
-/// Mage tokens `[1, grid², C]` → the decoder's NCHW grid `[1, C, grid, grid]` (inverse of
+/// Mage tokens `[1, gh·gw, C]` → the decoder's NCHW grid `[1, C, gh, gw]` (inverse of
 /// [`pack_latent_tokens`]).
-fn tokens_to_latent_grid(tokens: &Tensor, grid: usize) -> Result<Tensor> {
+fn tokens_to_latent_grid(tokens: &Tensor, (gh, gw): LatentGrid) -> Result<Tensor> {
     let channels = tokens.dim(2)?;
     Ok(tokens
-        .reshape((1, grid, grid, channels))?
+        .reshape((1, gh, gw, channels))?
         .permute((0, 3, 1, 2))?
         .contiguous()?)
 }
@@ -708,12 +729,16 @@ fn verify_bounded_caption_warmup(
     Ok(())
 }
 
-/// The packed latent grid side and the single-image generation layout for one bucket `edge` and a
-/// `text_len`-token caption (sc-2127): every bucket's cached latent carries the layout of its own
-/// grid, so the MSRoPE table built per step always matches the token count it is applied to.
-fn bucket_layout(edge: u32, text_len: usize) -> Result<(usize, PackLayout)> {
-    let grid = edge as usize / VAE_DOWNSAMPLE;
-    let layout = PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![text_len])?;
+/// The latent grid `(height, width)` and the single-image generation layout for one item's training
+/// canvas `(width, height)` at one bucket and a `text_len`-token caption (sc-2127): every cached
+/// latent carries the layout of its own (generally non-square) grid, so the MSRoPE table built per
+/// step always matches the token count and the `h × w` positions it is applied to.
+fn bucket_layout((width, height): (u32, u32), text_len: usize) -> Result<(LatentGrid, PackLayout)> {
+    let grid = (
+        height as usize / VAE_DOWNSAMPLE,
+        width as usize / VAE_DOWNSAMPLE,
+    );
+    let layout = PackLayout::generation(vec![ImgShape::latent(grid.0, grid.1)], vec![text_len])?;
     Ok((grid, layout))
 }
 
@@ -728,7 +753,9 @@ fn cache_samples(
         MageTextEncoder::load_component_with_quant(&dirs.text_encoder, false, None, device)?;
     let vae = MageVae::load_full(&dirs.vae, device)?;
     // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off);
-    // each bucket packs its own latent grid.
+    // each (item, bucket) packs its own latent grid: the item's aspect-keeping canvas at about
+    // `edge²` pixels (never upscaled, sides multiples of `CANVAS_STRIDE`, never centre-cropped to
+    // a square).
     let edges = bucket_edges(&req.config);
     let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
     // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
@@ -756,10 +783,14 @@ fn cache_samples(
             item,
             req.config.subject_mask_loss.as_ref(),
         )?;
-        let square = decode_square(&item.image_path)?; // decoded once, resized per bucket edge
+        // Decoded once, whole; resized onto its aspect-keeping canvas per bucket edge. Every
+        // micro-step trains one cached entry (`run_step`), so entries of different shapes never
+        // share a batch.
+        let rgb = decode_rgb(&item.image_path)?;
         for &edge in &edges {
-            let (grid, layout) = bucket_layout(edge, text.dim(1)?)?;
-            let image = square_image_tensor(&square, edge, device)?;
+            let canvas = image_canvas(&rgb, edge, CANVAS_STRIDE, CANVAS_MAX_SIDE);
+            let (grid, layout) = bucket_layout(canvas.size(), text.dim(1)?)?;
+            let image = canvas_image_tensor(&rgb, &canvas, device)?;
             let latent = pack_latent_tokens(
                 &vae.encode_sample(&image, req.config.seed.wrapping_add(index as u64))?,
                 grid,
@@ -840,7 +871,8 @@ impl MageTrainer {
     ) -> Result<TrainingOutput> {
         on_progress(TrainingProgress::Preparing);
         // Epic 2123 E7: the auxiliary perceptual models count against the device budget before any
-        // caching (one reference per (item, bucket) entry, sized at the largest bucket edge).
+        // caching (one reference per (item, bucket) entry, sized at the largest bucket edge's square
+        // `edge²` — every aspect canvas is at most that area, so the square is the worst case).
         let edges = bucket_edges(&req.config);
         let edge = edges.iter().copied().max().unwrap_or(req.config.resolution);
         let decoder = mage_decoder_spec(&req.config, &self.dirs.vae)?;
@@ -949,7 +981,7 @@ impl MageTrainer {
                 &req.items,
                 &req.config,
                 edges.len(),
-                CropBox::center_square,
+                canvas_crop,
             )?);
         }
         let mut aux = perceptual
@@ -1347,13 +1379,13 @@ mod tests {
         let unpacked = [1usize, channels, grid, grid];
         let latent = Tensor::from_vec(values(16, 0.1), &unpacked, &Device::Cpu).unwrap();
         CachedSample {
-            latent: pack_latent_tokens(&latent, grid, channels).unwrap(),
+            latent: pack_latent_tokens(&latent, (grid, grid), channels).unwrap(),
             text: Tensor::from_vec(values(8, 0.1), (1, 1, 8), &Device::Cpu).unwrap(),
             layout: PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![1]).unwrap(),
             mask_weight: mask.map(|m| {
                 let w = flow_match::subject_mask_weight(m, grid, grid, &unpacked, &Device::Cpu)
                     .unwrap();
-                pack_latent_tokens(&w, grid, channels).unwrap()
+                pack_latent_tokens(&w, (grid, grid), channels).unwrap()
             }),
         }
     }
@@ -1615,7 +1647,7 @@ mod tests {
         let w =
             flow_match::subject_mask_weight(&vals, grid, grid, &[1, 4, grid, grid], &Device::Cpu)
                 .unwrap();
-        let packed = pack_latent_tokens(&w, grid, 4).unwrap();
+        let packed = pack_latent_tokens(&w, (grid, grid), 4).unwrap();
         assert_eq!(packed.dims(), &[1, grid * grid, 4]);
         let rows = packed.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
         for (token, row) in rows.iter().enumerate() {
@@ -1625,20 +1657,19 @@ mod tests {
     }
 
     /// sc-24828 × sc-2127: with two resolution buckets and masked loss on, the item's mask (loaded
-    /// once) yields a weight per bucket packed exactly like that bucket's latent (`[1, grid², C]`),
-    /// and the masked-out region (the right half of the centre crop) is zero.
+    /// once) yields a weight per bucket packed exactly like that bucket's latent (`[1, gh·gw, C]`)
+    /// on the item's own (non-square) canvas grid — the whole frame, not a centre square — and the
+    /// masked-out right half of the frame is zero.
     #[test]
     fn bucket_mask_weight_follows_each_bucket_latent() {
         let dir = tempfile::tempdir().unwrap();
-        // A 48x32 landscape image: centre crop x in [8, 40); subject = crop's left half [8, 24).
+        // A 64x32 landscape image; subject = the frame's left half [0, 32).
         let img = dir.path().join("img.png");
-        image::RgbImage::new(48, 32).save(&img).unwrap();
+        image::RgbImage::new(64, 32).save(&img).unwrap();
         let mask_path = dir.path().join("mask.png");
-        image::GrayImage::from_fn(48, 32, |x, _| {
-            image::Luma([if (8..24).contains(&x) { 255 } else { 0 }])
-        })
-        .save(&mask_path)
-        .unwrap();
+        image::GrayImage::from_fn(64, 32, |x, _| image::Luma([if x < 32 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
         let mut item = gen_core::TrainingItem::captioned(img, "c".into());
         item.subject_mask_path = Some(mask_path);
         let on = gen_core::SubjectMaskLoss {
@@ -1648,23 +1679,101 @@ mod tests {
         let mask = PreparedSubjectMask::load_if_enabled(LABEL, &item, Some(&on))
             .unwrap()
             .expect("masked loss on");
-        for edge in [4 * VAE_DOWNSAMPLE as u32, 8 * VAE_DOWNSAMPLE as u32] {
-            let (grid, _) = bucket_layout(edge, 1).unwrap();
-            let latent_shape = [1usize, grid * grid, config::LATENT_CHANNELS];
+        // Edge 64 keeps the 64x32 source whole (no upscale): grid 2x4; edge 32 scales it to 32x16:
+        // grid 1x2.
+        for (edge, expected_grid) in [(64u32, (2usize, 4usize)), (32, (1, 2))] {
+            let canvas = gen_core_train::canvas::training_canvas(
+                (64, 32),
+                edge,
+                CANVAS_STRIDE,
+                CANVAS_MAX_SIDE,
+            );
+            let (grid, layout) = bucket_layout(canvas.size(), 1).unwrap();
+            assert_eq!(grid, expected_grid, "edge {edge}");
+            assert_eq!(layout.image_tokens(), grid.0 * grid.1);
+            let latent_shape = [1usize, grid.0 * grid.1, config::LATENT_CHANNELS];
             let w = bucket_mask_weight(Some(&mask), grid, &Device::Cpu)
                 .unwrap()
                 .expect("weight");
             assert_eq!(w.dims(), &latent_shape, "edge {edge}");
             let rows = w.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
             for (token, row) in rows.iter().enumerate() {
-                let expected = if token % grid < grid / 2 { 1.0 } else { 0.0 };
+                let expected = if token % grid.1 < grid.1 / 2 {
+                    1.0
+                } else {
+                    0.0
+                };
                 assert!(
                     row.iter().all(|v| *v == expected),
                     "edge {edge} token {token}: {row:?}"
                 );
             }
         }
-        assert!(bucket_mask_weight(None, 4, &Device::Cpu).unwrap().is_none());
+        assert!(bucket_mask_weight(None, (4, 4), &Device::Cpu)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The captioned-item canvas keeps the source aspect on Mage's 16 px latent grid (no square
+    /// crop, no upscale, within `edge²` and the `MAX_SIZE` side cap), its layout carries the
+    /// non-square `h × w` grid, and the token pack / unpack round-trips that grid row-major.
+    #[test]
+    fn a_portrait_caches_on_its_own_aspect_grid() {
+        let c = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            1024,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!((c.width % 16, c.height % 16), (0, 0));
+        assert!(c.height > c.width && c.area() <= 1024 * 1024);
+        assert_eq!(
+            c.crop,
+            gen_core_train::subject_mask::CropBox::full(1365, 2048)
+        );
+        // At the 2048 edge the portrait trains at its own area — never upscaled to 2048².
+        let big = gen_core_train::canvas::training_canvas(
+            (1365, 2048),
+            2048,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert_eq!(big.size(), (1360, 2048));
+        let (grid, layout) = bucket_layout(big.size(), 3).unwrap();
+        assert_eq!(grid, (128, 85));
+        assert_eq!(layout.shapes(), &[ImgShape::latent(128, 85)]);
+        assert_eq!(layout.image_tokens(), 128 * 85);
+        // A 3:1 strip at the 2048 edge is held to the 2048 side cap.
+        let strip = gen_core_train::canvas::training_canvas(
+            (6000, 2000),
+            2048,
+            CANVAS_STRIDE,
+            CANVAS_MAX_SIDE,
+        );
+        assert!(strip.width <= config::MAX_SIZE && strip.width > strip.height);
+        // Pack / unpack a 2x3 grid: token y·3 + x carries cell (y, x); the sample grid comes from
+        // the layout, not a square root of the token count.
+        let (gh, gw, ch) = (2usize, 3usize, 2usize);
+        let vals: Vec<f32> = (0..ch * gh * gw).map(|i| i as f32).collect();
+        let nchw = Tensor::from_vec(vals, (1, ch, gh, gw), &Device::Cpu).unwrap();
+        let tokens = pack_latent_tokens(&nchw, (gh, gw), ch).unwrap();
+        assert_eq!(tokens.dims(), &[1, gh * gw, ch]);
+        let rows = tokens.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(rows[4], vec![4.0, 10.0]); // cell (1, 1)
+        let sample = CachedSample {
+            latent: tokens.clone(),
+            text: Tensor::zeros((1, 1, 8), DType::F32, &Device::Cpu).unwrap(),
+            layout: bucket_layout((gw as u32 * 16, gh as u32 * 16), 1)
+                .unwrap()
+                .1,
+            mask_weight: None,
+        };
+        assert_eq!(sample_grid(&sample).unwrap(), (gh, gw));
+        let back = tokens_to_latent_grid(&tokens, (gh, gw)).unwrap();
+        assert_eq!(
+            back.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            nchw.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     #[test]
@@ -1679,8 +1788,8 @@ mod tests {
     fn each_bucket_packs_its_own_grid_and_forwards() {
         assert!(trainer_descriptor().techniques.resolution_buckets);
         for (edge, grid) in [(512u32, 32usize), (1024, 64)] {
-            let (g, layout) = bucket_layout(edge, 7).unwrap();
-            assert_eq!(g, grid, "edge {edge}");
+            let (g, layout) = bucket_layout((edge, edge), 7).unwrap();
+            assert_eq!(g, (grid, grid), "edge {edge}");
             assert_eq!(layout.image_tokens(), grid * grid, "edge {edge}");
             assert_eq!(layout.text_tokens(), 7);
         }
@@ -1690,7 +1799,7 @@ mod tests {
                 .unwrap();
         let (_, text, sigma, _) = tiny_inputs();
         for edge in [VAE_DOWNSAMPLE as u32, 2 * VAE_DOWNSAMPLE as u32] {
-            let (grid, layout) = bucket_layout(edge, text.dim(1).unwrap()).unwrap();
+            let ((grid, _), layout) = bucket_layout((edge, edge), text.dim(1).unwrap()).unwrap();
             let latent = Tensor::from_vec(
                 values(grid * grid * 4, 0.1),
                 (1, grid * grid, 4),
@@ -1865,7 +1974,7 @@ mod tests {
                 .affine(1.0, seed as f64 * 0.01)
                 .unwrap();
             CachedSample {
-                latent: pack_latent_tokens(&latent, grid, channels).unwrap(),
+                latent: pack_latent_tokens(&latent, (grid, grid), channels).unwrap(),
                 text: Tensor::randn(0f32, 1f32, (1, 1, 8), &Device::Cpu).unwrap(),
                 layout: PackLayout::generation(vec![ImgShape::latent(grid, grid)], vec![1])
                     .unwrap(),
