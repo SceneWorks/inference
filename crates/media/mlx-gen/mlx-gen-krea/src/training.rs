@@ -221,30 +221,7 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
 }
 
 /// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
-
-/// TEMPORARY SW-7172 diagnostic: MLX's own memory counters at each trainer phase, written straight
-/// to stderr (bypassing libtest's capture, which a watchdog kill would discard).
-fn sw7172_diag(phase: &str) {
-    use std::io::Write as _;
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let t = START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs_f64();
-    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
-    let mut err = std::io::stderr().lock();
-    let _ = writeln!(
-        err,
-        "SW7172_DIAG t={t:.1}s phase={phase} mlx_active={:.2}GiB mlx_peak={:.2}GiB mlx_cache={:.2}GiB",
-        gib(mlx_rs::memory::get_active_memory()),
-        gib(mlx_rs::memory::get_peak_memory()),
-        gib(mlx_rs::memory::get_cache_memory()),
-    );
-    let _ = err.flush();
-}
-
 fn load_weights(spec: &LoadSpec) -> Result<KreaRawTrainer> {
-    sw7172_diag("load_weights:start");
     let root = snapshot_root(spec)?;
     let dtype = match spec.precision {
         Precision::Bf16 => Dtype::Bfloat16,
@@ -252,16 +229,12 @@ fn load_weights(spec: &LoadSpec) -> Result<KreaRawTrainer> {
     };
     let tokenizer = KreaTokenizer::from_snapshot(root)?;
     let mut encoder = load_text_encoder(root)?;
-    sw7172_diag("encoder:loaded");
     encoder.quantize(TRAINER_ENCODER_BITS)?;
-    sw7172_diag("encoder:quantized");
     let mut transformer = load_transformer(root)?;
-    sw7172_diag("transformer:loaded");
     if transformer.compute_dtype() != dtype {
         transformer.cast_weights(dtype)?;
     }
     let vae = load_vae(root)?;
-    sw7172_diag("vae:loaded");
     Ok(KreaRawTrainer {
         descriptor: trainer_descriptor(),
         tokenizer,
@@ -356,7 +329,6 @@ impl KreaRawTrainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
         warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
-        sw7172_diag("train_impl:start");
         validate_request(req)?;
         let cfg = &req.config;
 
@@ -387,9 +359,7 @@ impl KreaRawTrainer {
 
         // --- prepare → load → cache: VAE-latents + caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
-        sw7172_diag("cache:start");
         let cache = self.cache_dataset(req, &edges, on_progress)?;
-        sw7172_diag("cache:done");
         // Previews render at item 0's canvas at the largest edge — a shape the run trains at,
         // within the `edge²` area the pre-flight priced: read back off item 0's cached latent.
         let preview_size = edges
@@ -399,13 +369,11 @@ impl KreaRawTrainer {
             .map(|entry| preview_canvas(entry.0.shape()))
             .unwrap_or((edge, edge));
         let (sample_caps, sample_neg) = self.encode_previews(req)?;
-        sw7172_diag("previews:encoded");
 
         // Every caption is cached now — free the 4 B-param encoder and evict its buffers before the
         // train loop, reclaiming that resident for the DiT working set.
         self.encoder = None;
         mlx_rs::memory::clear_cache();
-        sw7172_diag("encoder:freed");
 
         // Epic 2123 E8: each (item, bucket) entry's perceptual reference (TAEW2.1 decode of its
         // cached clean latent → DA2 depth) is computed exactly once per job, by the `AuxDriver`
@@ -425,7 +393,6 @@ impl KreaRawTrainer {
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let (adapter, params) = build_adapter(&mut self.transformer, &target_paths, cfg)?;
-        sw7172_diag("adapter:built");
         let mae = mae_loss(&cfg.loss_type, LossTypeFold::Lowercase);
 
         // sc-7577 — gradient checkpointing. Collect, per single-stream block, the adapter-routable
@@ -489,7 +456,6 @@ impl KreaRawTrainer {
             sample_neg: sample_neg.as_ref(),
             preview_size,
         };
-        sw7172_diag("train_loop:start");
         run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
 
@@ -627,7 +593,6 @@ struct KreaLoop<'a> {
 
 impl TrainLoopFamily for KreaLoop<'_> {
     fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
-        sw7172_diag(&format!("micro_step:{step}:start"));
         let cfg = &self.req.config;
         let cache = self.cache;
         let draw = draw_flow_step(self.aux.as_mut(), step, self.schedule, cfg, |entry| {
