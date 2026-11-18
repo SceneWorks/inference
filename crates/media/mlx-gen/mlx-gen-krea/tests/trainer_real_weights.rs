@@ -27,7 +27,7 @@ fn raw_snapshot() -> Option<PathBuf> {
 /// visible. It is `edge` wide × 1.5 tall: the canvas never upscales a source (SW-7172), so a fixture
 /// smaller than `edge²` would silently train a smaller workload than the run claims.
 fn write_synth_image(path: &std::path::Path, edge: u32) {
-    let (w, h) = (edge, edge * 3 / 2);
+    let (w, h) = (edge, edge); // TEMPORARY SW-7172 control: square fixture
     let bands = [[40u8, 80, 200], [235, 225, 200], [40, 160, 70]];
     let img = image::RgbImage::from_fn(w, h, |_, y| {
         image::Rgb(bands[(y as usize * bands.len()) / h as usize])
