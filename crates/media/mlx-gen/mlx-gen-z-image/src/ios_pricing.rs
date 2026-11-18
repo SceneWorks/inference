@@ -161,6 +161,18 @@ fn pricing_roles_from_kinds(
     Ok((counts[0], counts[1], counts[2]))
 }
 
+fn reject_active_pag(generation: &mlx_gen::GenerationRequest, context: &str) -> Result<()> {
+    if generation
+        .effective_pag()?
+        .is_some_and(|cfg| cfg.scale > 0.0)
+    {
+        return Err(Error::Unsupported(format!(
+            "{context}: PAG execution has no certified iOS source graph"
+        )));
+    }
+    Ok(())
+}
+
 /// Price one iOS request header-only on the device backend (Metal).
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
     req.validate_work_context()?;
@@ -178,6 +190,7 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
         masks,
         controls,
     )?;
+    reject_active_pag(generation, req.provider)?;
     let initial_width = crate::sampling::initial_state_width(generation, true_refs == 1)?;
     let route = Route::from_controls(req, generation.count, initial_width, true_refs)?;
     let sampling = crate::sampling::resolve_with_init(generation, route.mode.img2img())?;
@@ -243,6 +256,7 @@ fn resolve_bound_side(
 )> {
     let req = side.pricing;
     if let Some(generation) = req.generation {
+        reject_active_pag(generation, "z-image transfer certificate")?;
         let (true_refs, _, _) = pricing_roles_from_kinds(
             generation
                 .conditioning
@@ -341,6 +355,12 @@ fn certify_transfer(
             "z-image transfer certificate: adapter execution has no certified source graph".into(),
         ));
     }
+    if let Some(generation) = anchor.pricing.generation {
+        reject_active_pag(generation, "z-image transfer certificate")?;
+    }
+    if let Some(generation) = request.pricing.generation {
+        reject_active_pag(generation, "z-image transfer certificate")?;
+    }
     let model = Model::new(Facts::from_spec(request.pricing.provider, spec)?)?;
     let certificates = certificates::window_certificates(
         &model,
@@ -403,6 +423,117 @@ mod production_bounder_tests {
         assert!(refusal(facts(true, false)).contains("iOS-quantum-scope graph"));
         certificates::certified_execution_refusal(facts(true, true)).unwrap();
         certificates::certified_execution_refusal(facts(false, true)).unwrap();
+    }
+
+    #[test]
+    fn active_pag_is_refused_while_zero_scale_pag_is_accepted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(scratch.path().to_owned()));
+        let execution = GenerationMemory::default();
+        let selection = mlx_gen::gen_core::MemorySelection {
+            strategy: mlx_gen::gen_core::MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier: mlx_gen::gen_core::MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            },
+        };
+        let mode = MemoryMode::TextToImage;
+        let geometry = mlx_gen::gen_core::MemoryGeometry {
+            width: 512,
+            height: 512,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        let base_req = IosPricingRequest {
+            provider: crate::model::MODEL_ID,
+            spec: &spec,
+            mode: &mode,
+            geometry,
+            selection: &selection,
+            execution: &execution,
+            generation: None,
+            transform: None,
+            depth: None,
+            token_window: 0,
+        };
+
+        let active_gen = GenerationRequest {
+            width: 512,
+            height: 512,
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let active_req = IosPricingRequest {
+            generation: Some(&active_gen),
+            ..base_req
+        };
+        assert!(matches!(
+            ios_pricing(&active_req),
+            Err(Error::Unsupported(ref msg)) if msg.contains("PAG")
+        ));
+        assert!(matches!(
+            resolve_bound_side(
+                &mlx_gen::ios_pricing::IosBoundRequest {
+                    pricing: &active_req,
+                    replay: None,
+                },
+                1 << 20,
+            ),
+            Err(Error::Unsupported(ref msg)) if msg.contains("PAG")
+        ));
+        let certified = CertifiedExecution {
+            load_order: HeavyLoadOrder::VaeBeforeQuantize,
+            ios_quantum_scope: true,
+            cpu_stream: false,
+        };
+        assert!(matches!(
+            ios_bounder_with_execution(
+                &active_req,
+                &IosPricing::default(),
+                &active_req,
+                &IosPricing::default(),
+                certified,
+                1 << 20,
+            ),
+            Err(Error::Unsupported(ref msg)) if msg.contains("PAG")
+        ));
+
+        let noop_gen = GenerationRequest {
+            width: 512,
+            height: 512,
+            pag: Some(mlx_gen::gen_core::PagConfig {
+                scale: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let none_gen = GenerationRequest {
+            width: 512,
+            height: 512,
+            pag: None,
+            ..Default::default()
+        };
+        let noop_err = ios_pricing(&IosPricingRequest {
+            generation: Some(&noop_gen),
+            ..base_req
+        })
+        .unwrap_err();
+        let none_err = ios_pricing(&IosPricingRequest {
+            generation: Some(&none_gen),
+            ..base_req
+        })
+        .unwrap_err();
+        assert!(
+            !matches!(noop_err, Error::Unsupported(_)),
+            "zero-scale PAG must not be refused as unsupported: {noop_err:?}"
+        );
+        assert_eq!(noop_err.to_string(), none_err.to_string());
     }
 }
 
@@ -5647,7 +5778,7 @@ mod load_quantization_header_tests {
     fn native_zero_forward_and_curated_possible_families_are_source_bound() {
         let recipe = |scheduler: &str| {
             serde_json::from_str::<mlx_gen::sampler::flow_sampling::FlowSamplingRecipe>(&format!(
-            "{{\"version\":1,\"solver\":\"euler\",\"scheduler\":{scheduler},\"steps\":4,\"guidance\":null,\"strength\":1.0,\"reference_strength\":null,\"use_pid\":false,\"pid_capture_sigma\":null}}"
+            "{{\"version\":1,\"solver\":\"euler\",\"scheduler\":{scheduler},\"steps\":4,\"guidance\":0.0,\"strength\":1.0,\"reference_strength\":null,\"use_pid\":false,\"pid_capture_sigma\":null}}"
         )).unwrap()
         };
         let native = mlx_gen::sampler::flow_sampling::ResolvedFlowControls::from_recipe(

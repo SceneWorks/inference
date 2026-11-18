@@ -104,6 +104,8 @@ pub struct ZImageEditRequest {
     /// hook to a driver. Frames cover the **reduced** `start..steps` tail the strength selects, which
     /// is also the range the lane reports as `Progress::Step`.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance configuration using the Turbo/Edit layer defaults.
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
 }
 
 impl Default for ZImageEditRequest {
@@ -117,6 +119,7 @@ impl Default for ZImageEditRequest {
             seed: 0,
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
+            pag: None,
         }
     }
 }
@@ -213,6 +216,40 @@ impl ZImageEdit {
         })
     }
 
+    /// Perturbed-Attention Guidance (PAG) capability advertised by Z-Image Edit (Turbo parity).
+    pub fn pag_capability() -> candle_gen::gen_core::PagCapability {
+        crate::turbo_pag_capability()
+    }
+
+    /// Validate a [`ZImageEditRequest`] and resolve optional PAG settings against
+    /// [`Self::pag_capability`].
+    pub fn validate_request(
+        req: &ZImageEditRequest,
+    ) -> Result<Option<candle_gen::gen_core::PagResolved>> {
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+            return Err(CandleError::Msg(format!(
+                "z-image edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                req.width, req.height
+            )));
+        }
+        candle_gen::gen_core::resolve_pag(
+            Some(&Self::pag_capability()),
+            "z_image_edit",
+            req.pag.as_ref(),
+        )
+        .map_err(|error| {
+            let err = match error.kind() {
+                candle_gen::gen_core::PagPolicyErrorKind::Unsupported => {
+                    candle_gen::gen_core::Error::Unsupported(error.to_string())
+                }
+                candle_gen::gen_core::PagPolicyErrorKind::Invalid => {
+                    candle_gen::gen_core::Error::Msg(format!("z_image_edit: {error}"))
+                }
+            };
+            CandleError::from(err)
+        })
+    }
+
     /// img2img: regenerate `source` toward `req.prompt` at `req.strength`, denoising with the distilled
     /// flow-match Euler schedule (no CFG). VAE-encodes the source once into the clean init latent, blends
     /// it with seeded noise at the start sigma, then runs the reduced `init_time_step..steps` loop.
@@ -226,12 +263,10 @@ impl ZImageEdit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+        candle_gen::execution::capture_direct_report(&crate::descriptor(), &req.cancel, || {
             candle_gen::execution::policy("direct_route", "z-image/edit/generate".into());
-            let image = self
-                .generate(req, source, &mut report_progress)
-                .map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            self.generate_with_report(req, source, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)
         })
     }
 
@@ -241,15 +276,31 @@ impl ZImageEdit {
         source: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let report = self.generate_with_report(req, source, on_progress)?;
+        match report.output {
+            Some(candle_gen::gen_core::GenerationOutput::Images(mut images))
+                if images.len() == 1 =>
+            {
+                Ok(images.remove(0))
+            }
+            _ => Err(CandleError::Msg(
+                "z-image edit: expected a single output image".into(),
+            )),
+        }
+    }
+
+    /// Execute Z-Image Edit and return a [`candle_gen::gen_core::GenerationReport`] carrying any
+    /// resolved PAG execution details.
+    pub fn generate_with_report(
+        &self,
+        req: &ZImageEditRequest,
+        source: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<candle_gen::gen_core::GenerationReport> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(CandleError::Msg(format!(
-                "z-image edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
+        let resolved_pag = Self::validate_request(req)?;
         let steps = req.steps.max(1);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
@@ -298,6 +349,7 @@ impl ZImageEdit {
         // pub) and doing the Euler step inline is byte-identical to the txt2img loop's
         // `current_timestep_normalized()` + `step()` — it just starts at `start` instead of 0.
         let total = (steps - start) as u32;
+        let total_steps = steps - start;
         // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
         // against the shared step-keyed counter — built over `total`, the REDUCED step count this lane
         // reports as `Progress::Step { total }`, and fed the loop-local `step_i - start`. Using the
@@ -316,6 +368,7 @@ impl ZImageEdit {
             "z-image-edit",
             format!("start={start};sigma_start_bits={}", sigma_start.to_bits()).into(),
         );
+        common::observe_pag_policy(resolved_pag.as_ref());
         for step_i in start..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -330,11 +383,41 @@ impl ZImageEdit {
             let t_norm = (1000.0 - scheduler.timesteps[step_i]) / 1000.0;
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
             // The Z-Image DiT velocity is negated before the flow-match Euler step (the sign convention).
-            let raw_velocity = self
-                .transformer
-                .forward_prepared(&latents, &t, &dit_prepared)?;
+            let raw_velocity =
+                self.transformer
+                    .forward_prepared_with_pag(&latents, &t, &dit_prepared, None)?;
             common::observe_component_output("dit", &raw_velocity);
-            let velocity = raw_velocity.neg()?;
+            let v_cond = raw_velocity.neg()?;
+            let step_idx = step_i - start;
+            let velocity = if let Some(resolved) = resolved_pag.as_ref() {
+                let step_pag_scale = resolved.step_scale(step_idx, total_steps);
+                if step_pag_scale > 0.0 {
+                    let pag_ctx = common::PagStepContext {
+                        resolved,
+                        step_idx,
+                        total_steps,
+                    };
+                    let perturbed_raw = self.transformer.forward_prepared_with_pag(
+                        &latents,
+                        &t,
+                        &dit_prepared,
+                        Some(pag_ctx),
+                    )?;
+                    common::observe_component_output("dit", &perturbed_raw);
+                    let v_perturbed = perturbed_raw.neg()?;
+                    candle_gen::gen_core::guidance::pag_apply(
+                        &candle_gen::CandleLatentOps,
+                        &v_cond,
+                        &v_cond,
+                        &v_perturbed,
+                        step_pag_scale,
+                    )?
+                } else {
+                    v_cond
+                }
+            } else {
+                v_cond
+            };
             // Euler step: x_{i+1} = x_i + (σ_{i+1} − σ_i)·velocity (= scheduler.step).
             let dt = scheduler.sigmas[step_i + 1] - scheduler.sigmas[step_i];
             latents = (latents + (velocity * dt)?)?;
@@ -345,7 +428,14 @@ impl ZImageEdit {
         }
 
         on_progress(Progress::Decoding);
-        self.decode(&latents)
+        let image = self.decode(&latents)?;
+        let mut report = candle_gen::gen_core::GenerationReport::from_output(
+            candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+        );
+        report.pag = resolved_pag
+            .as_ref()
+            .map(|resolved| resolved.execution_report(total));
+        Ok(report)
     }
 
     /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the shared Qwen chat template
@@ -524,5 +614,59 @@ mod tests {
             "z-image edit"
         )
         .is_err());
+    }
+
+    #[test]
+    fn edit_pag_capability_and_validation_match_turbo_contract() {
+        use candle_gen::gen_core::PagConfig;
+
+        let cap = ZImageEdit::pag_capability();
+        assert_eq!(cap, crate::turbo_pag_capability());
+        assert_eq!(cap.num_blocks, 30);
+        assert_eq!(cap.block_domain, "layers");
+        assert_eq!(cap.default_layers, vec![15]);
+        assert_eq!(cap.default_start, 0.0);
+        assert_eq!(cap.default_stop, 0.75);
+        assert_eq!(cap.recommended_scale, 1.2);
+
+        let default_req = ZImageEditRequest::default();
+        assert!(default_req.pag.is_none());
+        assert_eq!(ZImageEdit::validate_request(&default_req).unwrap(), None);
+
+        let noop_req = ZImageEditRequest {
+            pag: Some(PagConfig {
+                scale: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(ZImageEdit::validate_request(&noop_req).unwrap(), None);
+
+        let active_req = ZImageEditRequest {
+            pag: Some(PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = ZImageEdit::validate_request(&active_req)
+            .unwrap()
+            .expect("active PAG must resolve");
+        assert_eq!(resolved.layers, vec![15]);
+        assert_eq!(resolved.start, 0.0);
+        assert_eq!(resolved.stop, 0.75);
+        let report = resolved.execution_report(4);
+        assert_eq!(report.active_steps, 3);
+        assert_eq!(report.total_steps, 4);
+
+        let oob_req = ZImageEditRequest {
+            pag: Some(PagConfig {
+                scale: 1.2,
+                layers: Some(vec![30]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(ZImageEdit::validate_request(&oob_req).is_err());
     }
 }

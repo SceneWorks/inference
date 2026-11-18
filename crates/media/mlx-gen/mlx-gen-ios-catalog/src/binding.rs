@@ -50,6 +50,7 @@ impl fmt::Debug for GenerationView<'_> {
             .field("guidance_momentum", &r.guidance_momentum)
             .field("guidance_norm_threshold", &r.guidance_norm_threshold)
             .field("cfg_interval", &r.cfg_interval)
+            .field("pag", &r.pag)
             .field("prompt_batch", &r.prompt_batch)
             .field("caption_overflow", &r.caption_overflow)
             .field("conditioning", &r.conditioning)
@@ -333,6 +334,11 @@ pub(crate) mod tests {
         request.h3_image_sampler = Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(1.1));
         check(&request);
         request.h3_image_sampler = Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.9));
+        check(&request);
+        request.pag = Some(mlx_gen::gen_core::PagConfig {
+            scale: 1.2,
+            ..Default::default()
+        });
         check(&request);
     }
 
