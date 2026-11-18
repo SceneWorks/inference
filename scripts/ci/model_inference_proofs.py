@@ -1151,6 +1151,15 @@ def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
     if not cargo_home.is_absolute():
         raise ValueError('Cargo home must be absolute for verified Rustup selection')
     bin_dir = cargo_home / 'bin'
+    # Mirror posix-rust.sh: GitHub-hosted macOS images install rustup with Homebrew, so the
+    # proxies live in `brew --prefix rustup`/bin; they still honour rust-toolchain.toml.
+    if (not (bin_dir / 'rustup').is_file() and env.get('RUNNER_OS') == 'macOS'
+            and env.get('MODEL_PROOF_RUNNER_ENVIRONMENT') == 'github-hosted'):
+        bin_dir = Path(subprocess.run(['brew', '--prefix', 'rustup'], env=env, check=True,
+                                      capture_output=True, text=True, timeout=30,
+                                      encoding='utf-8').stdout.strip()) / 'bin'
+        if not bin_dir.is_absolute():
+            raise ValueError('Homebrew rustup prefix must be absolute for verified Rustup selection')
     suffix = '.exe' if os.name == 'nt' else ''
     proxies = {tool: bin_dir / (tool + suffix) for tool in ('cargo', 'rustc', 'rustup')}
     if not all(path.is_file() and os.access(path, os.X_OK) for path in proxies.values()):
