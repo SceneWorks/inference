@@ -468,8 +468,12 @@ impl GatedDeltaNet {
             Some(cs) => cs,
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
-        let (conv_out, conv_trace) =
-            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+        let conv = if self.sensenova {
+            crate::primitives::gated_delta::sensenova_depthwise_conv
+        } else {
+            causal_depthwise_conv_traced
+        };
+        let (conv_out, conv_trace) = conv(&mixed, &self.conv_weight, &conv_state)?;
         // Fused preparation (bit-identical to the chains below) when it serves this layer.
         let q_scale = (self.head_k_dim as f64).powf(-0.5);
         if let Some(prepared) = self.fused_prep(&conv_out, &a_in, &b_in, q_scale)? {
@@ -556,7 +560,8 @@ impl GatedDeltaNet {
         b_in: &Tensor,
         q_scale: f64,
     ) -> Result<Option<(Tensor, Tensor, Tensor, Tensor, Tensor)>> {
-        let served = crate::primitives::gated_delta::fused_prep_serves(conv_out)
+        let served = !self.sensenova
+            && crate::primitives::gated_delta::fused_prep_serves(conv_out)
             && candle_quant_kernels::gdn_qkv_serves_key_dim(self.head_k_dim)
             && [a_in, b_in, &self.a_log, &self.dt_bias]
                 .iter()
@@ -1016,6 +1021,7 @@ impl Qwen35LayerCache {
 /// Not `Clone` — see [`try_clone`](Self::try_clone).
 #[derive(Debug)]
 pub struct Qwen35Cache {
+    owner: std::sync::Arc<[usize]>,
     layers: Vec<Qwen35LayerCache>,
     /// Positions before the current one the linear layers' rings can roll back to (`0`: no ring).
     max_checkpoints: usize,
@@ -1036,6 +1042,7 @@ impl Qwen35Cache {
     /// ring), and a failed copy is returned as the device's error rather than panicking.
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
+            owner: self.owner.clone(),
             layers: self
                 .layers
                 .iter()
@@ -1343,6 +1350,7 @@ impl Qwen35Cache {
 /// static KV buffers, the checkpoint ring) can never reach it.
 #[derive(Clone, Debug)]
 pub struct Qwen35PrefixState {
+    owner: std::sync::Arc<[usize]>,
     layers: Vec<Qwen35PrefixLayer>,
     len: usize,
 }
@@ -1486,7 +1494,11 @@ impl Qwen35Cache {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Qwen35PrefixState { layers, len })
+        Ok(Qwen35PrefixState {
+            owner: self.owner.clone(),
+            layers,
+            len,
+        })
     }
 
     /// Seed an **empty** cache with `state`, positioning it at `state.len()`: the attention KV is
@@ -1496,6 +1508,11 @@ impl Qwen35Cache {
     /// one, so `len` is the ring's oldest restorable position and a verify step's rollback never
     /// reaches below it. The stored tensors are never written.
     pub fn restore_prefix(&mut self, state: &Qwen35PrefixState) -> Result<()> {
+        if !std::sync::Arc::ptr_eq(&state.owner, &self.owner) {
+            return Err(Error::Config(
+                "Qwen35Cache: prefix state belongs to another decoder".into(),
+            ));
+        }
         if self.offset() != 0 {
             return Err(Error::Msg(format!(
                 "Qwen35Cache: a prefix restores into an empty cache, not one at {}",
@@ -1511,6 +1528,25 @@ impl Qwen35Cache {
         }
         let len = i32::try_from(state.len)
             .map_err(|_| Error::Msg("Qwen35Cache: prefix length overflow".into()))?;
+        let compatible =
+            self.layers
+                .iter()
+                .zip(&state.layers)
+                .all(|(slot, stored)| match (slot, stored) {
+                    (Qwen35LayerCache::Delta(_), Qwen35PrefixLayer::Delta(state)) => {
+                        len == 0 || state.is_some()
+                    }
+                    (
+                        Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_),
+                        Qwen35PrefixLayer::Attn(state),
+                    ) => len == 0 || state.is_some(),
+                    _ => false,
+                });
+        if !compatible {
+            return Err(Error::Config(
+                "Qwen35Cache: prefix layer schedule or state differs from the cache".into(),
+            ));
+        }
         for (slot, stored) in self.layers.iter_mut().zip(&state.layers) {
             match (slot, stored) {
                 (Qwen35LayerCache::Delta(c), Qwen35PrefixLayer::Delta(Some((conv, ssm)))) => {
@@ -1669,7 +1705,7 @@ impl DecodeCache for Qwen35Cache {
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 pub struct Qwen35Model {
     /// Physical layer index for each independent cache slot.
-    visits: Vec<usize>,
+    visits: std::sync::Arc<[usize]>,
     embed_tokens: QwenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
@@ -2597,6 +2633,7 @@ impl Qwen35Model {
             })
             .collect();
         Qwen35Cache {
+            owner: self.visits.clone(),
             layers,
             max_checkpoints,
             recurrent_shape: shape,
@@ -2642,7 +2679,7 @@ impl Qwen35Model {
         );
         let shape = self.recurrent_shape();
         let mut layers = Vec::with_capacity(self.visits.len());
-        for &i in &self.visits {
+        for &i in self.visits.iter() {
             layers.push(if self.cfg.is_linear(i) {
                 Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
             } else {
@@ -2662,6 +2699,7 @@ impl Qwen35Model {
             .then(|| DevicePositions::new(&self.device))
             .transpose()?;
         Ok(Qwen35Cache {
+            owner: self.visits.clone(),
             layers,
             max_checkpoints,
             recurrent_shape: shape,
@@ -2795,6 +2833,30 @@ impl Qwen35Model {
         &self.device
     }
 
+    fn validate_cache(&self, cache: &Qwen35Cache) -> Result<()> {
+        if !std::sync::Arc::ptr_eq(&self.visits, &cache.owner)
+            || cache.layers.len() != self.visits.len()
+        {
+            return Err(Error::Config(
+                "Qwen35Cache: cache belongs to another decoder or has the wrong visit count".into(),
+            ));
+        }
+        if self
+            .visits
+            .iter()
+            .zip(&cache.layers)
+            .any(|(&physical, slot)| {
+                self.cfg.is_linear(physical) != matches!(slot, Qwen35LayerCache::Delta(_))
+            })
+        {
+            return Err(Error::Config(
+                "Qwen35Cache: attention kind differs from the physical layer at a cache visit"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
     ///
@@ -2817,6 +2879,7 @@ impl Qwen35Model {
         offset: i32,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
     ) -> Result<Tensor> {
+        self.validate_cache(cache)?;
         check(input_ids)?;
         let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         let s = h.dim(1)?;
@@ -2895,6 +2958,7 @@ impl Qwen35Model {
         cache: &mut Qwen35Cache,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
     ) -> Result<Tensor> {
+        self.validate_cache(cache)?;
         check(embeds)?;
         let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
@@ -2980,6 +3044,9 @@ impl Qwen35Model {
         offset: i32,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
     ) -> Result<Tensor> {
+        // A caller can supply another decoder's cache. Preserve it even though
+        // a canceled or failed forward on our own cache must reset its state.
+        self.validate_cache(cache)?;
         let result = (|| {
             let h = self.hidden_checked(input_ids, cache, offset, check)?;
             check(&h)?;
@@ -3190,6 +3257,7 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<Tensor> {
+        self.validate_cache(cache)?;
         // A prompt prefill (sc-24446): the linear layers ring only its final state.
         let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
@@ -3229,6 +3297,7 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<(Tensor, Tensor)> {
+        self.validate_cache(cache)?;
         // A prompt prefill (sc-24446): the linear layers ring only its final state.
         let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
@@ -3268,6 +3337,7 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<(Tensor, Tensor)> {
+        self.validate_cache(cache)?;
         // A prompt prefill (sc-24446): the linear layers ring only its final state.
         let _prefill = crate::primitives::prefill_scope(true);
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
@@ -3467,8 +3537,10 @@ impl Qwen35Model {
         let conv_dim = key_dim * 2 + value_dim;
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
 
+        // The published F32 values pass through HF's BF16 module load. The
+        // gating expression widens those rounded values, including on the CPU.
         let gate_dtype = if cfg.sensenova_loop.is_some() {
-            DType::F32
+            DType::BF16
         } else {
             dtype
         };
@@ -3716,6 +3788,7 @@ impl StepModel for Qwen35Model {
             ));
         }
         // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
+        self.validate_cache(cache)?;
         let offset = cache.offset() + cache.rope_delta();
         let ids = request.tokens.ids(&self.device)?;
         if let Some(b) = request.snapshot_at {
@@ -5176,6 +5249,23 @@ pub(crate) mod tests {
         )
         .unwrap();
         (cfg, model)
+    }
+
+    #[test]
+    fn sensenova_cache_checks_owner_count_and_every_visit_before_use() {
+        let (_, model) = text_model();
+        let mut cache = model.new_cache();
+        model.validate_cache(&cache).unwrap();
+        let (_, other) = text_model();
+        assert!(other.validate_cache(&cache).is_err());
+        let prefix = cache.prefix_snapshot_at(0).unwrap();
+        assert!(other.new_cache().restore_prefix(&prefix).is_err());
+        cache.layers.swap(2, 3);
+        assert!(model.validate_cache(&cache).is_err());
+        assert!(cache.restore_prefix(&prefix).is_err());
+        cache.layers.pop();
+        assert!(model.validate_cache(&cache).is_err());
+        assert_eq!(cache.offset(), 0);
     }
 
     /// The synthetic decoder's weights moved to `device` (bf16 on a GPU, f32 on CPU: what the

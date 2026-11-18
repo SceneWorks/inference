@@ -710,9 +710,32 @@ pub fn causal_depthwise_conv_traced(
     weight: &Tensor,
     conv_state: &Tensor,
 ) -> Result<(Tensor, ConvTrace)> {
+    depthwise_conv_traced(x, weight, conv_state, false)
+}
+
+/// The frozen SenseNova wrapper calls grouped conv1d in the activation dtype:
+/// BF16 operands accumulate in FP32, then round *once* before SiLU.
+pub(crate) fn sensenova_depthwise_conv(
+    x: &Tensor,
+    weight: &Tensor,
+    conv_state: &Tensor,
+) -> Result<(Tensor, ConvTrace)> {
+    depthwise_conv_traced(x, weight, conv_state, true)
+}
+
+fn depthwise_conv_traced(
+    x: &Tensor,
+    weight: &Tensor,
+    conv_state: &Tensor,
+    float_accumulate: bool,
+) -> Result<(Tensor, ConvTrace)> {
     let (_b, s, c) = x.dims3()?;
     let kk = weight.dim(1)?; // kernel size K (weight is [C, K])
-    if fused_prep_serves(x) && weight.dtype() == DType::BF16 && conv_state.dtype() == DType::BF16 {
+    if !float_accumulate
+        && fused_prep_serves(x)
+        && weight.dtype() == DType::BF16
+        && conv_state.dtype() == DType::BF16
+    {
         // One kernel for the concat, the K-tap conv and the SiLU, bit-identical to the chain below.
         let (cat, out) = candle_quant_kernels::gdn_conv_silu(conv_state, x, weight)?;
         return Ok((
@@ -725,9 +748,14 @@ pub fn causal_depthwise_conv_traced(
         ));
     }
     let cat = Tensor::cat(&[conv_state, x], 1)?; // [B, S+K-1, C]
+    let (widened, weight) = if float_accumulate {
+        (cat.to_dtype(DType::F32)?, weight.to_dtype(DType::F32)?)
+    } else {
+        (cat.clone(), weight.clone())
+    };
     let mut acc: Option<Tensor> = None;
     for j in 0..kk {
-        let window = cat.narrow(1, j, s)?; // cat[:, j:j+S, :] → [B,S,C]
+        let window = widened.narrow(1, j, s)?; // cat[:, j:j+S, :] → [B,S,C]
         let wj = weight.narrow(1, j, 1)?.contiguous()?.reshape((1, 1, c))?; // weight[:,j] → [1,1,C]
         let term = window.broadcast_mul(&wj)?;
         acc = Some(match acc {
@@ -735,7 +763,12 @@ pub fn causal_depthwise_conv_traced(
             Some(a) => a.broadcast_add(&term)?,
         });
     }
-    let out = silu(&acc.expect("conv kernel size must be >= 1"))?; // [B,S,C]
+    let raw = acc.ok_or_else(|| Error::Msg("conv kernel size must be >= 1".into()))?;
+    let out = if float_accumulate {
+        silu(&raw.to_dtype(x.dtype())?.to_dtype(DType::F32)?)?.to_dtype(x.dtype())?
+    } else {
+        silu(&raw)?
+    }; // [B,S,C]
     Ok((
         out,
         ConvTrace {
@@ -1702,6 +1735,32 @@ fn repeat_heads(x: &Tensor, r: usize) -> Result<Tensor> {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn sensenova_depthwise_convolution_rounds_once_in_prompt_and_cached_step() {
+        let dev = &Device::Cpu;
+        let x = Tensor::from_slice(&[256f32, 1., -256., 0.], (1, 4, 1), dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let w = Tensor::ones((1, 4), DType::BF16, dev).unwrap();
+        let tail = Tensor::zeros((1, 3, 1), DType::BF16, dev).unwrap();
+        let (full, trace) = sensenova_depthwise_conv(&x, &w, &tail).unwrap();
+        let last = x.narrow(1, 3, 1).unwrap();
+        let (step, _) = sensenova_depthwise_conv(&last, &w, &trace.tail_after(2).unwrap()).unwrap();
+        let value = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        // 256 + 1 rounds to 256 in BF16. FP32 accumulation retains that one
+        // through cancellation, and the single BF16 round of SiLU(1) is 0.73046875.
+        assert_eq!(value(full.narrow(1, 3, 1).unwrap()), [0.73046875]);
+        assert_eq!(value(step), [0.73046875]);
+    }
 
     // Numeric oracle generated from `mlx_lm.models.gated_delta.gated_delta_update(..., use_kernel=
     // False)` (the ops reference) on seeded inputs — B=1, T=3, Hk=2, Hv=4 (GQA ×2), Dk=2, Dv=2.

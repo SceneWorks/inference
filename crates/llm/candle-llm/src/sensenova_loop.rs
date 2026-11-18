@@ -63,10 +63,10 @@ pub(crate) fn tier(
 
 pub(crate) fn validate_snapshot(dir: &Path, q: Option<QuantSpec>) -> Result<()> {
     validate_sidecars(dir).map_err(Error::Config)?;
-    validate_indexed_weights(dir, q)
+    indexed_sizes(dir, q).map(|_| ())
 }
 
-fn validate_indexed_weights(dir: &Path, q: Option<QuantSpec>) -> Result<()> {
+pub(crate) fn indexed_sizes(dir: &Path, q: Option<QuantSpec>) -> Result<(u64, u64)> {
     let index = dir.join("model.safetensors.index.json");
     let index: Value = serde_json::from_reader(std::fs::File::open(&index).map_err(|e| {
         Error::Config(format!(
@@ -88,11 +88,20 @@ fn validate_indexed_weights(dir: &Path, q: Option<QuantSpec>) -> Result<()> {
             expected.len()
         )));
     }
+    if q.is_some() {
+        validate_packed_index(map)?;
+    }
+    let (mut total, mut largest) = (0u64, 0u64);
     for path in shards(dir) {
         let filename = path.file_name().and_then(|s| s.to_str());
         let header = crate::provider::read_safetensors_header(&path).map_err(|e| {
             Error::Config(format!("SenseNova-Loop: reading {}: {e}", path.display()))
         })?;
+        let bytes = path.metadata()?.len();
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Config("SenseNova checkpoint size overflow".into()))?;
+        largest = largest.max(bytes);
         for (key, tensor) in header {
             if key == "__metadata__" {
                 continue;
@@ -118,6 +127,34 @@ fn validate_indexed_weights(dir: &Path, q: Option<QuantSpec>) -> Result<()> {
         return Err(Error::Config(format!(
             "SenseNova-Loop: missing indexed tensor {key}"
         )));
+    }
+    if q.is_none() {
+        core_llm::sensenova_loop::validate_source_index(dir).map_err(Error::Config)?;
+    }
+    Ok((total, largest))
+}
+
+// The preparer updates metadata.total_size and preserves every original shard
+// assignment. Hash (tensor NUL filename NUL) in sorted tensor-name order so
+// serialization order and whitespace cannot affect the derived index identity.
+fn validate_packed_index(map: &serde_json::Map<String, Value>) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (key, value) in map.iter().collect::<BTreeMap<_, _>>() {
+        let filename = value.as_str().ok_or_else(|| {
+            Error::Config(format!("SenseNova-Loop: invalid shard name for {key}"))
+        })?;
+        digest.update(key.as_bytes());
+        digest.update([0]);
+        digest.update(filename.as_bytes());
+        digest.update([0]);
+    }
+    if format!("{:x}", digest.finalize())
+        != "e3e07552b949a7e7649d10c255cf072e38fb3c2cc9ab3ea8322d9d6206b1c87f"
+    {
+        return Err(Error::Config(
+            "SenseNova-Loop: packed index differs from the released target weight map".into(),
+        ));
     }
     Ok(())
 }
@@ -196,6 +233,8 @@ mod tests {
     #[test]
     fn sensenova_native_incomplete_snapshot_names_the_missing_shard() {
         let dir = tempfile::tempdir().unwrap();
+        let error = indexed_sizes(dir.path(), None).unwrap_err().to_string();
+        assert!(error.contains("missing shard index"), "{error}");
         let names: serde_json::Map<_, _> = core_llm::sensenova_loop::target_tensors()
             .map(|(name, _, _)| (name, json!("model-00001.safetensors")))
             .collect();
@@ -204,9 +243,7 @@ mod tests {
             json!({"weight_map":names}).to_string(),
         )
         .unwrap();
-        let error = validate_indexed_weights(dir.path(), None)
-            .unwrap_err()
-            .to_string();
+        let error = indexed_sizes(dir.path(), None).unwrap_err().to_string();
         assert!(error.contains("model-00001.safetensors"), "{error}");
     }
 
@@ -221,6 +258,55 @@ mod tests {
         assert_eq!(plan.visits().filter(|&i| cfg.is_linear(i)).count(), 42);
         validate_snapshot(&dir, tier(&config, None).unwrap()).unwrap();
         let spec = core_llm::LoadSpec::dense(dir.to_string_lossy());
+        let index: Value = serde_json::from_reader(
+            std::fs::File::open(dir.join("model.safetensors.index.json")).unwrap(),
+        )
+        .unwrap();
+        let mut map = index["weight_map"].as_object().unwrap().clone();
+        validate_packed_index(&map).unwrap();
+        map.insert("lm_head.weight".into(), json!("mtp.safetensors"));
+        assert!(validate_packed_index(&map).is_err());
+        let sizes: Vec<_> = shards(&dir)
+            .iter()
+            .map(|p| p.metadata().unwrap().len())
+            .collect();
+        let (total, largest) = indexed_sizes(&dir, None).unwrap();
+        assert_eq!(total, sizes.iter().sum::<u64>());
+        assert_eq!(largest, *sizes.iter().max().unwrap());
+        for cuda in [true, false] {
+            let price = crate::LlamaProvider::load_memory_estimate(&spec, cuda).unwrap();
+            assert_eq!(price.payload_bytes, total);
+        }
+        #[cfg(unix)]
+        {
+            // Borrow immutable source files to exercise additions/removals without
+            // copying the release or modifying the user's snapshot.
+            let scratch = tempfile::tempdir().unwrap();
+            for item in shards(&dir)
+                .into_iter()
+                .chain(["config.json", "model.safetensors.index.json"].map(|name| dir.join(name)))
+            {
+                std::os::unix::fs::symlink(&item, scratch.path().join(item.file_name().unwrap()))
+                    .unwrap();
+            }
+            let staged = core_llm::LoadSpec::dense(scratch.path().to_string_lossy());
+            std::fs::write(
+                scratch.path().join("mtp.safetensors"),
+                b"separate optional companion",
+            )
+            .unwrap();
+            let price = crate::LlamaProvider::load_memory_estimate(&staged, true).unwrap();
+            assert_eq!(price.payload_bytes, total);
+            assert_eq!(
+                indexed_sizes(scratch.path(), None).unwrap(),
+                (total, largest)
+            );
+            std::fs::remove_file(scratch.path().join("model.safetensors.index.json")).unwrap();
+            assert!(crate::LlamaProvider::load_memory_estimate(&staged, true)
+                .unwrap_err()
+                .to_string()
+                .contains("missing shard index"));
+        }
         assert!(crate::provider::can_load(&spec));
         assert!(crate::provider::can_load_vision(&spec));
         assert_eq!(crate::provider::eos_token_ids(&dir), [248044, 248046]);

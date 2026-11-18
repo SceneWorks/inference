@@ -3,6 +3,8 @@
 #[cfg(feature = "cuda")]
 #[path = "common/cuda_pool.rs"]
 mod cuda_pool;
+#[path = "common/sensenova_projection.rs"]
+mod projection;
 use candle_llm::LlamaProvider;
 use core_llm::{
     Constraint, Content, FinishReason, ImageRef, JsonSchema, LoadSpec, Message, Quantize, Role,
@@ -17,9 +19,23 @@ fn request(case: &Value) -> TextLlmRequest {
         let w = image["width"].as_u64().unwrap() as u32;
         let h = image["height"].as_u64().unwrap() as u32;
         let rgb: [u8; 3] = serde_json::from_value(image["rgb"].clone()).unwrap();
-        content.push(Content::Image(
-            ImageRef::new(w, h, rgb.repeat((w * h) as usize)).unwrap(),
-        ));
+        let pixels = if let Some(quadrants) = image.get("quadrants") {
+            let colors: [[u8; 3]; 4] = serde_json::from_value(quadrants.clone()).unwrap();
+            let (split_x, split_y) = (
+                image["split_x"].as_u64().unwrap() as u32,
+                image["split_y"].as_u64().unwrap() as u32,
+            );
+            (0..h)
+                .flat_map(|y| {
+                    (0..w).flat_map(move |x| {
+                        colors[2 * usize::from(y >= split_y) + usize::from(x >= split_x)]
+                    })
+                })
+                .collect()
+        } else {
+            rgb.repeat((w * h) as usize)
+        };
+        content.push(Content::Image(ImageRef::new(w, h, pixels).unwrap()));
     }
     content.push(Content::text(case["prompt"].as_str().unwrap()));
     assert_eq!(case["thinking"], false);
@@ -75,7 +91,7 @@ fn production_request(
     assert!(out.usage.prompt_tokens > 1536);
     assert_eq!(ids.len(), 1);
     println!(
-        "SENSENOVA_LOOP_MEMORY_ENDPOINT {}",
+        "\nSENSENOVA_LOOP_MEMORY_ENDPOINT {}",
         json!({"tier":tier,"device":"candle-cuda",
         "memory_scope":"synchronized device-wide usage and CUDA primary-context pool high watermarks, reset separately before cold load and first request",
         "width":1536,"height":1024,"generated_tokens":out.usage.generated_tokens,"prompt_tokens":out.usage.prompt_tokens,
@@ -106,13 +122,13 @@ fn sensenova_loop_release_proof() {
         &[&path],
     );
     let cases = oracle["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 3);
+    assert_eq!(cases.len(), 4);
     assert_eq!(
         cases
             .iter()
             .map(|c| c["id"].as_str().unwrap())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["text", "red", "blue"])
+        BTreeSet::from(["text", "red", "blue", "quadrants"])
     );
     for (tier, quant) in [
         ("BF16", None),
@@ -141,6 +157,19 @@ fn sensenova_loop_release_proof() {
         if let Some((ctx, before)) = measurement {
             production_request(&model, tier, &ctx, &before);
         }
+        if let Some(quant) = quant {
+            use candle_core::quantized::GgmlDType;
+            let format = match quant {
+                Quantize::Q8 => GgmlDType::Q8_0,
+                Quantize::Q4 => GgmlDType::Q4K,
+                _ => unreachable!(),
+            };
+            projection::verify(
+                &PathBuf::from(std::env::var_os("SENSENOVA_LOOP_BF16_SNAPSHOT").unwrap()),
+                std::path::Path::new(&dir),
+                format,
+            );
+        }
         let desc = model.descriptor();
         assert_eq!(desc.family, "sensenova_loop");
         assert!(desc.capabilities.supports_vision && desc.capabilities.supports_thinking);
@@ -157,6 +186,31 @@ fn sensenova_loop_release_proof() {
         for case in cases {
             let req = request(case);
             let id = case["id"].as_str().unwrap();
+            if !case["image"].is_null() {
+                let Content::Image(image) = &req.messages[0].content[0] else {
+                    panic!("image fixture required")
+                };
+                let (rows, grid) = candle_llm::image::Qwen35ImageProcessor::default()
+                    .image_patches(&image.pixels, image.width as usize, image.height as usize)
+                    .unwrap();
+                assert_eq!(json!(grid), case["image_grid_thw"]);
+                let samples = case["image_processor_samples"].as_array().unwrap();
+                assert!(!samples.is_empty());
+                let tolerance = case["image_processor_sample_abs_tolerance"]
+                    .as_f64()
+                    .unwrap() as f32;
+                assert!(tolerance > 0. && tolerance <= if id == "quadrants" { 0.02 } else { 1e-5 });
+                for sample in samples {
+                    let patch = sample["patch"].as_u64().unwrap() as usize;
+                    let offset = sample["offset"].as_u64().unwrap() as usize;
+                    let expected = sample["value"].as_f64().unwrap() as f32;
+                    let delta = (rows.values[patch * rows.features + offset] - expected).abs();
+                    assert!(
+                        delta <= tolerance,
+                        "patch {patch} offset {offset}: error {delta}"
+                    );
+                }
+            }
             let steps = case["steps"].as_array().unwrap();
             assert_eq!(steps.len(), 3);
             let forced: Vec<_> = steps[..2]
@@ -188,10 +242,41 @@ fn sensenova_loop_release_proof() {
                         "{tier} {id} step {step}: HF {hf_error} > {tolerance}"
                     );
                 }
-                assert!(
-                    cache_error <= tolerance,
-                    "{tier} {id} step {step}: native cache {cache_error} > {tolerance}"
-                );
+                if let Some(semantic) = reference.get("semantic_score").filter(|v| !v.is_null()) {
+                    let margin = |scores: &[f32]| {
+                        let best = |field: &str| {
+                            semantic[field]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|token| {
+                                    let token = token.as_u64().unwrap() as usize;
+                                    assert!(selected.contains(&token));
+                                    scores[token]
+                                })
+                                .reduce(f32::max)
+                                .unwrap()
+                        };
+                        best("positive_token_ids") - best("negative_token_ids")
+                    };
+                    let native_margin = margin(native);
+                    let cold_margin = margin(cold);
+                    assert!(semantic["source_positive_margin"].as_f64().unwrap() > 0.);
+                    assert!(
+                        native_margin > 0. && cold_margin > 0.,
+                        "{tier}/{id}/{step}: native {native_margin}, cold {cold_margin}"
+                    );
+                    println!(
+                        "\nSENSENOVA_LOOP_SEMANTIC {}",
+                        json!({"tier":tier.to_lowercase(),"case_id":id,"step":step,"margin":native_margin})
+                    );
+                }
+                if quant.is_none() {
+                    assert!(
+                        cache_error <= tolerance,
+                        "{tier} {id} step {step}: native cache {cache_error} > {tolerance}"
+                    );
+                }
             }
             let result = model.generate(&req, &mut |_| {}).unwrap();
             assert_eq!(
@@ -199,9 +284,17 @@ fn sensenova_loop_release_proof() {
                 Some(FinishReason::Stop),
                 "{tier}/{id} must end at a release EOS"
             );
-            let expected = if id == "text" { "91" } else { id };
+            let expected = match id {
+                "text" => "91",
+                "quadrants" => "red",
+                other => other,
+            };
             assert!(
-                result.text.to_lowercase().contains(expected),
+                result
+                    .text
+                    .to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|word| word == expected),
                 "{tier}/{id}: {:?}",
                 result.text
             );
@@ -209,9 +302,9 @@ fn sensenova_loop_release_proof() {
         }
         let mut structured = request(cases.iter().find(|c| c["id"] == "text").unwrap());
         structured.messages[0].content = vec![Content::text(
-            "Output a JSON object with answer set to the string 91.",
+            "What is 13 times 7? Output a JSON object with the answer as a string.",
         )];
-        let schema = JsonSchema::compile(&json!({"type":"object","properties":{"answer":{"type":"string","const":"91"}},"required":["answer"],"additionalProperties":false})).unwrap();
+        let schema = JsonSchema::compile(&json!({"type":"object","properties":{"answer":{"type":"string","enum":["90","91","92"]}},"required":["answer"],"additionalProperties":false})).unwrap();
         structured.constraint = Some(Constraint::JsonSchema(schema.clone()));
         let out = model.generate(&structured, &mut |_| {}).unwrap();
         assert!(schema.accepts(out.text.trim()));

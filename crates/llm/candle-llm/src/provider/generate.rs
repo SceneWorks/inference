@@ -93,6 +93,10 @@ impl TextLlm for LlamaProvider {
     }
 
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
+        if self.descriptor.family == "sensenova_loop" {
+            core_llm::sensenova_loop::validate_messages(&req.messages)
+                .map_err(CoreError::InvalidRequest)?;
+        }
         self.descriptor
             .capabilities
             .validate_request(&self.descriptor.id, req)

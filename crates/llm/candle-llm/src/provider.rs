@@ -1948,8 +1948,33 @@ impl LlamaProvider {
         target: bool,
     ) -> CoreResult<LoadMemoryEstimate> {
         let source = Path::new(&spec.source);
-        let payload = core_llm::checkpoint_payload_bytes(source)?;
-        let staging = core_llm::checkpoint_staging_bytes(source)?;
+        let config = source
+            .is_dir()
+            .then(|| read_json(source, "config.json"))
+            .flatten();
+        let loop_config = config
+            .as_ref()
+            .filter(|v| v["model_type"] == "sensenova_loop");
+        let requested = CopyFormat::requested(spec.quantize);
+        let (payload, staging) = if let Some(v) = loop_config {
+            core_llm::sensenova_loop::SenseNovaLoop::from_config(v).map_err(CoreError::Load)?;
+            let projection = match requested {
+                Some(CopyFormat::Ggml(spec)) => Some(ProjectionFormat::from(spec)),
+                Some(CopyFormat::Nvfp4) => {
+                    return Err(CoreError::Load(
+                        "SenseNova-Loop: unsupported NVFP4 tier".into(),
+                    ))
+                }
+                None => None,
+            };
+            let tier = crate::sensenova_loop::tier(v, projection.as_ref()).map_err(to_core)?;
+            crate::sensenova_loop::indexed_sizes(source, tier).map_err(to_core)?
+        } else {
+            (
+                core_llm::checkpoint_payload_bytes(source)?,
+                core_llm::checkpoint_staging_bytes(source)?,
+            )
+        };
         let projector = spec
             .projector_source
             .as_ref()
@@ -1957,7 +1982,6 @@ impl LlamaProvider {
             .transpose()?
             .unwrap_or(0);
         let overflow = || CoreError::Load("load memory estimate overflow".into());
-        let requested = CopyFormat::requested(spec.quantize);
         // What the load holds on its device while it builds the decoder.
         let mut moe_tables = 0u64;
         // Whether the load can run steps that ask for hidden rows — an MTP head, native (a
@@ -1972,11 +1996,9 @@ impl LlamaProvider {
                 gguf_working_set(source, requested, cuda)?
             }
         } else {
-            let config = read_json(source, "config.json");
             let decoder = PricedDecoder::from_config(config.as_ref());
             moe_tables = decoder.moe_indexed_table_bytes();
-            hidden_steps |=
-                matches!(&decoder, PricedDecoder::Qwen35(cfg, _) if cfg.mtp_num_hidden_layers > 0);
+            hidden_steps |= matches!(&decoder, PricedDecoder::Qwen35(cfg, _) if cfg.sensenova_loop.is_none() && cfg.mtp_num_hidden_layers > 0);
             // A ModelOpt NVFP4 snapshot's own format is NVFP4 (SW-7099), as `load_dir` loads it.
             let modelopt = config
                 .as_ref()
