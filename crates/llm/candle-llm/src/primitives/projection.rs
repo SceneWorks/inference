@@ -37,7 +37,7 @@ pub struct QuantSpec {
 
 impl QuantSpec {
     /// 4-bit (GGML Q4_K).
-    pub fn q4() -> Self {
+    pub const fn q4() -> Self {
         Self {
             dtype: GgmlDType::Q4K,
             group_size: 64,
@@ -46,7 +46,7 @@ impl QuantSpec {
     }
 
     /// 8-bit (GGML Q8_0).
-    pub fn q8() -> Self {
+    pub const fn q8() -> Self {
         Self {
             dtype: GgmlDType::Q8_0,
             group_size: 64,
@@ -383,6 +383,14 @@ impl WeightCensus {
         self.other.count += 1;
         self.other.params += t.elem_count() as u64;
         self.other.resident_bytes += (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+    }
+
+    /// Add a non-projection weight of `params` logical elements stored in `bytes` (a quantized
+    /// embedding table).
+    pub fn record_packed(&mut self, params: u64, bytes: u64) {
+        self.other.count += 1;
+        self.other.params += params;
+        self.other.resident_bytes += bytes;
     }
 
     /// Add a non-projection weight whose storage is not measured here (a Prism embedding).

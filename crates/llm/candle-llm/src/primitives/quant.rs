@@ -141,6 +141,109 @@ pub fn from_ggml_block_tensor(stored: &Tensor, device: &Device) -> Result<QTenso
     )?)
 }
 
+/// A token-embedding table a fully quantized tier stores as Q8_0 GGML blocks (SW-7201), held on the
+/// device as one byte per weight plus one f16 scale per 32-weight block — the stored blocks' own
+/// precision and ~their size — so a lookup gathers the requested rows and dequantizes only those.
+/// The codes are kept offset by 128 (`u8 = i8 + 128`), which `index_select` and the `u8 → f32`
+/// cast every backend has can read directly.
+#[derive(Clone)]
+pub struct Q8RowEmbedding {
+    /// `[rows, cols]` offset-binary codes.
+    codes: Tensor,
+    /// `[rows, cols / 32]` per-block scales (GGML `d`).
+    scales: Tensor,
+}
+
+impl Q8RowEmbedding {
+    /// Read the stored Q8_0 GGML block tensor `stored` (`[rows, cols / 32, 34]` `U8`, host) of the
+    /// table `stem` onto `device`. Any other block type is refused: both fully quantized tiers
+    /// store their embedding Q8_0.
+    pub fn from_stored(stem: &str, stored: &Tensor, device: &Device) -> Result<Self> {
+        use crate::error::Error;
+        let storage = ggml_block_storage(stored.dtype() == DType::U8, stored.dims());
+        let (dtype, rows, cols) = match (storage, stored.rank()) {
+            (Some(found), 3) => found,
+            _ => {
+                return Err(Error::Config(format!(
+                    "embedding `{stem}` {:?} {:?} is not a rank-3 stored GGML block tensor",
+                    stored.dtype(),
+                    stored.shape()
+                )))
+            }
+        };
+        if dtype != GgmlDType::Q8_0 {
+            return Err(Error::Unsupported(format!(
+                "embedding `{stem}` is stored {dtype:?}; a quantized embedding table must be Q8_0"
+            )));
+        }
+        // Read the host blocks in place (a weight reader keeps stored blocks on the host): only
+        // the device-bound codes and scales are allocated beside them.
+        let host = stored.to_device(&Device::Cpu)?.contiguous()?;
+        let (storage, layout) = host.storage_and_layout();
+        let candle_core::Storage::Cpu(cpu) = &*storage else {
+            return Err(Error::Config(format!(
+                "embedding `{stem}` blocks are not on the host"
+            )));
+        };
+        let start = layout.start_offset();
+        let bytes = &cpu.as_slice::<u8>()?[start..start + host.elem_count()];
+        let block_bytes = GgmlDType::Q8_0.type_size();
+        let mut codes = Vec::with_capacity(rows * cols);
+        let mut scales = Vec::with_capacity(bytes.len() / block_bytes);
+        for block in bytes.chunks_exact(block_bytes) {
+            scales.push(half::f16::from_le_bytes([block[0], block[1]]));
+            codes.extend(block[2..].iter().map(|&b| b ^ 0x80));
+        }
+        drop(storage);
+        let blocks = cols / GgmlDType::Q8_0.block_size();
+        Ok(Self {
+            codes: Tensor::from_vec(codes, (rows, cols), device)?,
+            scales: Tensor::from_vec(scales, (rows, blocks), device)?,
+        })
+    }
+
+    /// The rows of `ids` (`[batch, seq]`), dequantized to `[batch, seq, cols]` f32: `d · q` per
+    /// block, exactly as GGML dequantizes Q8_0.
+    pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let (b, s) = ids.dims2()?;
+        let (_, cols) = self.codes.dims2()?;
+        let blocks = self.scales.dim(1)?;
+        let flat = ids.flatten_all()?;
+        let n = flat.dim(0)?;
+        let codes = self
+            .codes
+            .index_select(&flat, 0)?
+            .to_dtype(DType::F32)?
+            .affine(1.0, -128.0)?
+            .reshape((n, blocks, cols / blocks))?;
+        let scales = self
+            .scales
+            .index_select(&flat, 0)?
+            .to_dtype(DType::F32)?
+            .unsqueeze(2)?;
+        Ok(codes.broadcast_mul(&scales)?.reshape((b, s, cols))?)
+    }
+
+    /// `(rows, cols)` of the logical table.
+    pub fn dims(&self) -> Result<(usize, usize)> {
+        Ok(self.codes.dims2()?)
+    }
+
+    /// Resident bytes: the codes plus the scales.
+    pub fn resident_bytes(&self) -> u64 {
+        (self.codes.elem_count() + self.scales.elem_count() * self.scales.dtype().size_in_bytes())
+            as u64
+    }
+
+    /// The device bytes [`Self::from_stored`] allocates for a `[rows, cols]` Q8_0 table, from its
+    /// shape alone (load admission). `None` on overflow.
+    pub fn device_bytes(rows: usize, cols: usize) -> Option<u64> {
+        let elems = (rows as u64).checked_mul(cols as u64)?;
+        let blocks = elems / GgmlDType::Q8_0.block_size() as u64;
+        elems.checked_add(blocks.checked_mul(2)?)
+    }
+}
+
 /// A linear projection whose weight is stored GGML block-quantized.
 pub struct QuantizedLinear {
     inner: QuantizedWeight,
@@ -423,6 +526,47 @@ mod tests {
     use super::*;
     use crate::primitives::nn::linear;
     use candle_core::Device;
+
+    /// SW-7201: a Q8 row embedding gathers exactly the rows GGML's own Q8_0 dequantization
+    /// produces from the stored blocks, sized as admission prices it; a non-Q8_0 table is
+    /// refused.
+    #[test]
+    fn a_q8_row_embedding_dequantizes_the_stored_blocks_exactly() {
+        let data: Vec<f32> = (0..6 * 64)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 61.0)
+            .collect();
+        let table = Tensor::from_vec(data, (6, 64), &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&table, GgmlDType::Q8_0).unwrap();
+        let stored = to_ggml_block_tensor(&qt).unwrap();
+        let embedding = Q8RowEmbedding::from_stored("t", &stored, &Device::Cpu).unwrap();
+        let ids = Tensor::from_vec(vec![4u32, 0, 5, 4], (2, 2), &Device::Cpu).unwrap();
+        let rows = embedding.forward(&ids).unwrap();
+        assert_eq!(rows.dims(), &[2, 2, 64]);
+        let expected = qt
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .index_select(&ids.flatten_all().unwrap(), 0)
+            .unwrap()
+            .reshape((2, 2, 64))
+            .unwrap();
+        let diff = (rows - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(diff, 0.0);
+        assert_eq!(
+            Some(embedding.resident_bytes()),
+            Q8RowEmbedding::device_bytes(6, 64)
+        );
+
+        let q4 =
+            to_ggml_block_tensor(&QTensor::quantize(&table, GgmlDType::Q4_0).unwrap()).unwrap();
+        assert!(Q8RowEmbedding::from_stored("t", &q4, &Device::Cpu).is_err());
+    }
 
     /// Quantized matmul should approximate the dense linear it replaces (Q8_0, in=256 = 8 blocks).
     #[test]

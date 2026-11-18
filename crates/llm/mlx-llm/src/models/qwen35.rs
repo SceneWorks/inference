@@ -18,6 +18,7 @@
 //! a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next `(1 + weight)` convention.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 
 use mlx_rs::ops::{
     add, concatenate_axis, mean_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis,
@@ -37,6 +38,7 @@ use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
 use crate::primitives::nn::{embed, rms_norm, silu};
 use crate::primitives::prism::PrismEmbedding;
 use crate::primitives::projection::{Projection, QuantSpec};
+use crate::primitives::quant::QuantizedEmbedding;
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::Weights;
 use crate::prism::PrismMlxPack;
@@ -226,6 +228,11 @@ pub struct Qwen35Config {
     /// Stored Q4/Q8 projection format, read from either the decoder's nested `text_config` or the
     /// top-level snapshot config. `None` means dense weights (which may still be quantized on load).
     pub quantization: Option<QuantSpec>,
+    /// Stored tensors whose format differs from [`Self::quantization`] (a mixed tier, SW-7201: a
+    /// 4-bit body with an 8-bit `lm_head` / `embed_tokens`), keyed by checkpoint tensor stem
+    /// (`lm_head`, `model.language_model.embed_tokens`). Read from the `quantization` block's
+    /// per-module entries, which name modules as mlx-lm does ([`mlx_lm_module_path`]).
+    pub quantization_overrides: BTreeMap<String, QuantSpec>,
 }
 
 impl Qwen35Config {
@@ -269,6 +276,38 @@ impl Qwen35Config {
             )));
         }
         let quantization = nested_quant.or(top_quant);
+        let vlm = !std::ptr::eq(c, v);
+        let nested_overrides =
+            parse_quantization_overrides(c.get("quantization"), "text_config.quantization", vlm)?;
+        let top_overrides = if vlm && !is_prism {
+            parse_quantization_overrides(v.get("quantization"), "quantization", vlm)?
+        } else {
+            BTreeMap::new()
+        };
+        if nested_quant.is_some()
+            && top_quant.is_some()
+            && !nested_overrides.is_empty()
+            && !top_overrides.is_empty()
+            && nested_overrides != top_overrides
+        {
+            return Err(Error::Config(
+                "qwen3_5 config.json has conflicting nested/top-level per-module quantization \
+                 entries"
+                    .into(),
+            ));
+        }
+        let quantization_overrides = if nested_overrides.is_empty() {
+            top_overrides
+        } else {
+            nested_overrides
+        };
+        if quantization.is_none() && !quantization_overrides.is_empty() {
+            return Err(Error::Config(
+                "qwen3_5 config.json has per-module quantization entries but no default \
+                 `bits` / `group_size`"
+                    .into(),
+            ));
+        }
         Ok(Self {
             hidden_size,
             num_layers: req("num_hidden_layers")? as usize,
@@ -314,7 +353,17 @@ impl Qwen35Config {
                     [g(0), g(1), g(2)]
                 }),
             quantization,
+            quantization_overrides,
         })
+    }
+
+    /// The stored format of the tensor whose key stem (the key without `.weight`) is `stem`: its
+    /// per-module entry, else the snapshot-wide [`Self::quantization`].
+    pub fn stored_spec(&self, stem: &str) -> Option<QuantSpec> {
+        self.quantization_overrides
+            .get(stem)
+            .copied()
+            .or(self.quantization)
     }
 
     /// The interleaved M-RoPE section `[t, h, w]`, defaulting to an even split of `rotary_dim/2` when
@@ -421,6 +470,68 @@ fn parse_quantization(value: Option<&serde_json::Value>, label: &str) -> Result<
         )));
     }
     Ok(Some(spec))
+}
+
+/// The module path mlx-lm gives the checkpoint tensor stem `stem` (its per-module quantization
+/// key): a VLM-wrapped `qwen3_5` (`vlm`, a config with `text_config`) maps
+/// `model.language_model.*` to `language_model.model.*` and roots everything else under
+/// `language_model.` (`lm_head` → `language_model.lm_head`), as its `sanitize` does; a text-only
+/// config keeps the stem.
+pub fn mlx_lm_module_path(stem: &str, vlm: bool) -> String {
+    if !vlm || stem.starts_with("language_model.") {
+        stem.to_string()
+    } else if let Some(rest) = stem.strip_prefix("model.language_model.") {
+        format!("language_model.model.{rest}")
+    } else {
+        format!("language_model.{stem}")
+    }
+}
+
+/// The inverse of [`mlx_lm_module_path`]: the checkpoint tensor stem of an mlx-lm module path.
+fn checkpoint_stem(path: &str, vlm: bool) -> String {
+    if !vlm {
+        path.to_string()
+    } else if let Some(rest) = path.strip_prefix("language_model.model.") {
+        format!("model.language_model.{rest}")
+    } else if let Some(rest) = path.strip_prefix("language_model.") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// The per-module entries of a `quantization` block (`"language_model.lm_head": {"group_size":
+/// 64, "bits": 8}`), keyed by checkpoint tensor stem. mlx-lm's `false` (leave the module dense)
+/// needs no entry: the loader reads a tensor as quantized only when its `.scales` part is stored.
+fn parse_quantization_overrides(
+    value: Option<&serde_json::Value>,
+    label: &str,
+    vlm: bool,
+) -> Result<BTreeMap<String, QuantSpec>> {
+    let mut out = BTreeMap::new();
+    let Some(obj) = value.and_then(|v| v.as_object()) else {
+        return Ok(out);
+    };
+    for (key, entry) in obj {
+        match entry {
+            serde_json::Value::Object(_) => {
+                let spec = parse_quantization(Some(entry), &format!("{label}.{key}"))?
+                    .expect("an object entry parses to a spec");
+                out.insert(checkpoint_stem(key, vlm), spec);
+            }
+            serde_json::Value::Bool(false) => {}
+            _ if matches!(
+                key.as_str(),
+                "group_size" | "bits" | "mode" | "quant_method"
+            ) => {}
+            _ => {
+                return Err(Error::Config(format!(
+                    "{label}.{key} must be a per-module quantization object"
+                )))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Multiply `x` by an f32 scalar (cast to `x`'s dtype).
@@ -1151,6 +1262,8 @@ pub struct Qwen35Model {
 #[derive(Debug)]
 enum TokenEmbedding {
     Dense(Array),
+    /// A fully quantized tier's stored affine table (SW-7201), gathered then dequantized per row.
+    Quantized(QuantizedEmbedding),
     Prism(PrismEmbedding),
 }
 
@@ -1158,6 +1271,9 @@ impl TokenEmbedding {
     fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
             Self::Dense(weight) => out.push(weight.clone()),
+            Self::Quantized(q) => {
+                out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()])
+            }
             Self::Prism(embedding) => embedding.push_arrays(out),
         }
     }
@@ -1165,7 +1281,21 @@ impl TokenEmbedding {
     fn forward(&self, input_ids: &Array) -> Result<Array> {
         match self {
             Self::Dense(weight) => embed(weight, input_ids),
+            Self::Quantized(embedding) => embedding.forward(input_ids),
             Self::Prism(embedding) => embedding.forward(input_ids),
+        }
+    }
+
+    /// The LM head of a tied checkpoint: the embedding table itself, dense or stored-quantized
+    /// (never materialized twice). Prism refuses a tied head before reaching here.
+    fn tied_projection(&self) -> Projection {
+        match self {
+            Self::Dense(weight) => Projection::Dense {
+                weight: weight.clone(),
+                bias: None,
+            },
+            Self::Quantized(q) => Projection::Quantized(q.tied_linear()),
+            Self::Prism(_) => unreachable!("Prism refuses tied embeddings"),
         }
     }
 }
@@ -1929,14 +2059,27 @@ impl Qwen35Model {
             ));
         }
         let saw_stored = Cell::new(false);
+        // Per tensor: its per-module entry (a mixed tier, SW-7201), else the snapshot-wide format.
+        let overrides = cfg.quantization_overrides.clone();
+        let stored_spec = |stem: &str| overrides.get(stem).copied().or(stored_quant);
         let proj_q = |key: String| -> Result<Projection> {
             if let Some(pack) = prism {
                 return Ok(Projection::Prism(pack.linear(w, &key, compute())?));
             }
-            load_projection(w, &key, stored_quant, quant, &saw_stored)
+            let stem = key.strip_suffix(".weight").unwrap_or(&key);
+            load_projection(w, &key, stored_spec(stem), quant, &saw_stored)
+        };
+        // A matrix the plain tiers keep dense (`in_proj_a` / `in_proj_b`, the LM head) is read as
+        // stored when a fully quantized tier (SW-7201) stores its `.scales` part, else dense.
+        let stored_part = |key: &str| -> Option<String> {
+            let stem = key.strip_suffix(".weight").unwrap_or(key);
+            (prism.is_none() && w.contains(&format!("{stem}.scales"))).then(|| stem.to_string())
         };
         let proj_dense = |key: String| -> Result<Projection> {
-            Projection::load(w.require(&key)?.as_dtype(compute())?, None)
+            match stored_part(&key) {
+                Some(stem) => load_projection(w, &key, stored_spec(&stem), None, &saw_stored),
+                None => Projection::load(w.require(&key)?.as_dtype(compute())?, None),
+            }
         };
         let dp = |s: &str| {
             if prefix.is_empty() {
@@ -1947,16 +2090,40 @@ impl Qwen35Model {
         };
 
         let embed_key = dp("embed_tokens.weight");
-        let embed_weight = if prism.is_none() {
-            Some(req(embed_key.clone())?)
-        } else {
-            None
-        };
         let embed_tokens = if let Some(pack) = prism {
             TokenEmbedding::Prism(pack.embedding(w, &embed_key)?)
+        } else if let Some(stem) = stored_part(&embed_key) {
+            let spec = stored_spec(&stem).ok_or_else(|| {
+                Error::Config(format!(
+                    "snapshot stores quantized tensor `{stem}.scales` but config.json has no \
+                     `quantization` block"
+                ))
+            })?;
+            saw_stored.set(true);
+            TokenEmbedding::Quantized(
+                QuantizedEmbedding::from_quantized(
+                    w.require(&embed_key)?.clone(),
+                    w.require(&format!("{stem}.scales"))?.clone(),
+                    w.require(&format!("{stem}.biases"))?.clone(),
+                    spec.group_size,
+                    spec.bits,
+                    compute(),
+                )
+                .map_err(|e| Error::Config(format!("stored quantized `{stem}`: {e}")))?,
+            )
         } else {
-            TokenEmbedding::Dense(embed_weight.clone().expect("dense embedding"))
+            TokenEmbedding::Dense(req(embed_key.clone())?)
         };
+        if let TokenEmbedding::Quantized(q) = &embed_tokens {
+            if q.hidden_size() != cfg.hidden_size {
+                return Err(Error::Config(format!(
+                    "stored quantized `{embed_key}` reconstructs width {} but hidden_size is {} \
+                     (its per-module bits disagree with the stored words)",
+                    q.hidden_size(),
+                    cfg.hidden_size
+                )));
+            }
+        }
         let norm = norm_w(dp("norm.weight"))?;
         let lm_head = if !with_lm_head {
             None
@@ -1968,11 +2135,11 @@ impl Qwen35Model {
                             .into(),
                     ));
                 }
-                Projection::load(embed_weight.expect("dense embedding"), None)?
+                embed_tokens.tied_projection()
             } else if let Some(pack) = prism {
                 Projection::Prism(pack.linear(w, "language_model.lm_head.weight", compute())?)
             } else {
-                Projection::load(req("lm_head.weight".to_string())?, None)?
+                proj_dense("lm_head.weight".to_string())?
             })
         };
 
