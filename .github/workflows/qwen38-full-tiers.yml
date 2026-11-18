@@ -1,8 +1,11 @@
 name: Qwen3.8-27B full tiers (convert and publish)
 
-# SW-7202 (feature SW-F374). Dispatch-only: never part of PR or push CI, and it runs no model. One
-# dispatch converts ONE model's fully quantized tiers on ONE backend with SW-7201's
-# `prepare_snapshot` recipes `q8-full` / `q4-full` and publishes them to the SceneWorks re-host:
+# SW-7202 (feature SW-F374). A reusable workflow, reached ONLY through the dispatch-only
+# `qwen38-full-tiers-*` profiles of `real-weights.yml` (job `qwen38-full-tiers`): GitHub dispatches a
+# workflow only when its file exists on the default branch, and `real-weights.yml` does, so its
+# profiles route here from any `--ref`. Never part of PR or push CI, and it runs no model. One run
+# converts ONE model's fully quantized tiers on ONE backend with SW-7201's `prepare_snapshot`
+# recipes `q8-full` / `q4-full` and publishes them to the SceneWorks re-host:
 #
 # * model `describer`: huihui-ai/Huihui-Qwen3.8-27B-abliterated @739e3c5b (bf16) to
 #   SceneWorks/qwen3.8-27b-abliterated-mlx (backend mlx) or -candle (backend candle),
@@ -18,37 +21,34 @@ name: Qwen3.8-27B full tiers (convert and publish)
 # size and sha256: the SceneWorks manifest pins are filled from it.
 #
 # MLX runs on the Mac the `mac_runner` input names, and the job refuses any other runner name before
-# doing any work. `nax-macos` (label `rw-starvector`, Michael's dev Mac) is the default ONLY while
-# nax-macos-2's model disk is full: Michael approved that loan for SW-7202 on 2026-11-18. Its
-# task-owned weights root is on /Volumes/Models (~1.4 TB free), never the internal disk. Switch the
-# default back to `nax-macos-2` (`rw-llm`, weights root under $HOME) once its new drive is fitted. Candle conversion is CPU-only on the
-# Windows CUDA real-weights box. Uploads use the runner's own Hugging Face login, as the SW-7104
-# publication lanes do. Each job checks free disk before every write and removes only its own
-# run-scoped scratch. `publish: false` converts and reports sizes without uploading.
+# doing any work. `nax-macos` (label `rw-starvector`, Michael's dev Mac) is the profiles' MLX target
+# ONLY while nax-macos-2's model disk is full: Michael approved that loan for SW-7202 on 2026-11-18.
+# Its task-owned weights root is on /Volumes/Models (~1.4 TB free), never the internal disk. Use the
+# `-mlx-nax-macos-2` profiles (`rw-llm`, weights root under $HOME) once its new drive is fitted.
+# Candle conversion is CPU-only on the Windows CUDA real-weights box. Uploads use the runner's own
+# Hugging Face login, as the SW-7104 publication lanes do. Each job checks free disk before every
+# write and removes only its own run-scoped scratch. `publish: false` (the `-convert-only`
+# profiles) converts and reports sizes without uploading. No `concurrency` here: the caller's
+# per-backend `inference-qwen38-full-tiers-*` group serializes runs on each box.
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       model:
         description: describer (Qwen3.8-27B abliterated) or expander (MiniMax-H3-Image-PE)
         required: true
-        type: choice
-        options: [describer, expander]
+        type: string
       backend:
         description: mlx (the Mac `mac_runner` names) or candle (Windows CUDA real-weights box, CPU conversion)
         required: true
-        type: choice
-        options: [mlx, candle]
+        type: string
       mac_runner:
-        description: MLX runner. nax-macos (dev Mac, approved loan while nax-macos-2's disk is full) or nax-macos-2
+        description: MLX runner, nax-macos or nax-macos-2 (ignored by the candle backend)
         required: true
-        type: choice
-        options: [nax-macos, nax-macos-2]
-        default: nax-macos
+        type: string
       publish:
         description: Upload the converted tiers to the SceneWorks re-host
         required: true
         type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -56,13 +56,9 @@ permissions:
 jobs:
   mlx:
     name: Convert and publish the ${{ inputs.model }} MLX full tiers
-    if: inputs.backend == 'mlx'
+    if: github.event_name == 'workflow_dispatch' && inputs.backend == 'mlx'
     runs-on: [self-hosted, macOS, ARM64, "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"]
     timeout-minutes: 720
-    # One writer per box: the conversion and the upload share its disk.
-    concurrency:
-      group: qwen38-full-tiers-mlx
-      cancel-in-progress: false
     env:
       QWEN38_FULL_TIERS_MODEL: ${{ inputs.model }}
       MAC_RUNNER: ${{ inputs.mac_runner }}
@@ -154,12 +150,9 @@ jobs:
 
   candle:
     name: Convert and publish the ${{ inputs.model }} Candle full tiers
-    if: inputs.backend == 'candle'
+    if: github.event_name == 'workflow_dispatch' && inputs.backend == 'candle'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 720
-    concurrency:
-      group: qwen38-full-tiers-candle
-      cancel-in-progress: false
     env:
       QWEN38_FULL_TIERS_MODEL: ${{ inputs.model }}
       CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target

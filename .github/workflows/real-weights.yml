@@ -157,7 +157,7 @@ on:
         default: ""
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture, moss-cuda-unit, model-exhaustive-tests, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, ios-simulator-sana, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2, minimax-h3-image, minimax-h3-image-acceptance, minimax-h3-image-pe, minimax-h3-image-train, minimax-h3-image-train-cuda, minimax-h3-image-publish, minimax-h3-image-publish-mlx, minimax-h3-image-publish-candle, minimax-h3-image-publish-mlx-nax-macos, minimax-h3-image-publish-mlx-pe, minimax-h3-image-publish-mlx-nax-macos-pe]
+        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture, moss-cuda-unit, model-exhaustive-tests, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, ios-simulator-sana, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2, minimax-h3-image, minimax-h3-image-acceptance, minimax-h3-image-pe, minimax-h3-image-train, minimax-h3-image-train-cuda, minimax-h3-image-publish, minimax-h3-image-publish-mlx, minimax-h3-image-publish-candle, minimax-h3-image-publish-mlx-nax-macos, minimax-h3-image-publish-mlx-pe, minimax-h3-image-publish-mlx-nax-macos-pe, qwen38-full-tiers-describer-mlx-nax-macos, qwen38-full-tiers-describer-mlx-nax-macos-2, qwen38-full-tiers-describer-candle, qwen38-full-tiers-expander-mlx-nax-macos, qwen38-full-tiers-expander-mlx-nax-macos-2, qwen38-full-tiers-expander-candle, qwen38-full-tiers-describer-mlx-nax-macos-convert-only, qwen38-full-tiers-describer-mlx-nax-macos-2-convert-only, qwen38-full-tiers-describer-candle-convert-only, qwen38-full-tiers-expander-mlx-nax-macos-convert-only, qwen38-full-tiers-expander-mlx-nax-macos-2-convert-only, qwen38-full-tiers-expander-candle-convert-only]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -356,7 +356,13 @@ concurrency:
         github.event_name == 'workflow_dispatch' &&
         inputs.profile == 'qwen-image-2-1-lora-mlx' &&
         inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&
-        'inference-real-weights-qwen21-primary-mac' || 'inference-real-weights-physical-host' }}
+        'inference-real-weights-qwen21-primary-mac' ||
+        github.event_name == 'workflow_dispatch' &&
+        (inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos' || inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos-2' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos-2' || inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos-convert-only' || inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos-2-convert-only' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos-convert-only' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos-2-convert-only') &&
+        'inference-qwen38-full-tiers-mlx' ||
+        github.event_name == 'workflow_dispatch' &&
+        (inputs.profile == 'qwen38-full-tiers-describer-candle' || inputs.profile == 'qwen38-full-tiers-expander-candle' || inputs.profile == 'qwen38-full-tiers-describer-candle-convert-only' || inputs.profile == 'qwen38-full-tiers-expander-candle-convert-only') &&
+        'inference-qwen38-full-tiers-candle' || 'inference-real-weights-physical-host' }}
   cancel-in-progress: false
 
 # BUILD ARTIFACTS OUTSIDE THE DIRECTORY `actions/checkout` CLEANS.
@@ -4848,6 +4854,23 @@ jobs:
     uses: ./.github/workflows/real-weights-minimax-h3-image.yml
     with:
       profile: ${{ inputs.profile }}
+
+  # SW-7202 Qwen3.8-27B describer / MiniMax-H3-Image-PE expander `q8-full` + `q4-full` conversion and
+  # re-host publication, in the reusable qwen38-full-tiers.yml. DISPATCH-ONLY (never `all`, never the
+  # schedule); runs no model. Profile `qwen38-full-tiers-<model>-<target>[-convert-only]`: target
+  # `mlx-nax-macos` / `mlx-nax-macos-2` names the Mac the job requires, `candle` the Windows CUDA box.
+  # Each backend has its own concurrency group (above), so the Mac and Windows runs proceed in
+  # parallel and stay out of the shared physical-host group. GitHub keeps one pending run per group
+  # and cancels the older pending one, so queue at most two runs per backend at a time.
+  qwen38-full-tiers:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos' || inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos-2' || inputs.profile == 'qwen38-full-tiers-describer-candle' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos-2' || inputs.profile == 'qwen38-full-tiers-expander-candle' || inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos-convert-only' || inputs.profile == 'qwen38-full-tiers-describer-mlx-nax-macos-2-convert-only' || inputs.profile == 'qwen38-full-tiers-describer-candle-convert-only' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos-convert-only' || inputs.profile == 'qwen38-full-tiers-expander-mlx-nax-macos-2-convert-only' || inputs.profile == 'qwen38-full-tiers-expander-candle-convert-only')
+    uses: ./.github/workflows/qwen38-full-tiers.yml
+    with:
+      model: ${{ contains(inputs.profile, '-expander-') && 'expander' || 'describer' }}
+      backend: ${{ contains(inputs.profile, '-candle') && 'candle' || 'mlx' }}
+      mac_runner: ${{ contains(inputs.profile, '-mlx-nax-macos-2') && 'nax-macos-2' || 'nax-macos' }}
+      publish: ${{ !endsWith(inputs.profile, '-convert-only') }}
 
   # sc-24114 — Qwen-Image 2.1 real-weight evidence on candle/CUDA. DISPATCH-ONLY (`qwen-image-2-1`
   # profile; never `all`, never the schedule): it renders at the upstream 2048² / 40-step default and
