@@ -117429,7 +117429,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@fbeedd9db47dc9747a1618b3746155bfe31d382e4e9c06f134ec382bd61c9fb8",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@76f9b6bfa9c945d85f74d55aa595682d0f4b2701ddea937a5e5f3b026cd51156",
       "requirements": []
     }
   },
@@ -117499,7 +117499,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@fbeedd9db47dc9747a1618b3746155bfe31d382e4e9c06f134ec382bd61c9fb8",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@76f9b6bfa9c945d85f74d55aa595682d0f4b2701ddea937a5e5f3b026cd51156",
       "requirements": []
     }
   },
@@ -117569,7 +117569,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@fbeedd9db47dc9747a1618b3746155bfe31d382e4e9c06f134ec382bd61c9fb8",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@76f9b6bfa9c945d85f74d55aa595682d0f4b2701ddea937a5e5f3b026cd51156",
       "requirements": []
     }
   },
@@ -117639,7 +117639,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@fbeedd9db47dc9747a1618b3746155bfe31d382e4e9c06f134ec382bd61c9fb8",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@76f9b6bfa9c945d85f74d55aa595682d0f4b2701ddea937a5e5f3b026cd51156",
       "requirements": []
     }
   },
@@ -117709,7 +117709,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@fbeedd9db47dc9747a1618b3746155bfe31d382e4e9c06f134ec382bd61c9fb8",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@76f9b6bfa9c945d85f74d55aa595682d0f4b2701ddea937a5e5f3b026cd51156",
       "requirements": []
     }
   },
@@ -117779,7 +117779,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named@fbeedd9db47dc9747a1618b3746155bfe31d382e4e9c06f134ec382bd61c9fb8",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named@76f9b6bfa9c945d85f74d55aa595682d0f4b2701ddea937a5e5f3b026cd51156",
       "requirements": []
     }
   },
