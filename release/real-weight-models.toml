@@ -3569,3 +3569,28 @@ expected_files = [
   "prompt/t2i/request_params.json",
   "prompt/edit/task_prompt.txt",
 ]
+
+# SW-7202 (feature SW-F374): the full-precision source of the Qwen3.8-27B describer's fully
+# quantized tiers. `qwen38-full-tiers.yml` materializes it on nax-macos-2 (MLX) and on the CUDA
+# real-weights box (Candle) and converts it with `prepare_snapshot ... q8-full` / `q4-full`
+# before publishing the tiers to SceneWorks/qwen3.8-27b-abliterated-{mlx,candle}.
+[[models]]
+key = "qwen38-27b-abliterated"
+repository = "huihui-ai/Huihui-Qwen3.8-27B-abliterated"
+revision = "739e3c5b89849f6c238ce1e5b70008612ae42cdd"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-full-tiers"]
+environment = ["QWEN38_DESCRIBER_BF16_SNAPSHOT"]
+download_files = ["*.json", "*.jinja", "*.safetensors", "LICENSE"]
+expected_files = [
+  "config.json",
+  "generation_config.json",
+  "chat_template.jinja",
+  "preprocessor_config.json",
+  "video_preprocessor_config.json",
+  "tokenizer.json",
+  "tokenizer_config.json",
+  "model.safetensors.index.json",
+  "LICENSE",
+]
