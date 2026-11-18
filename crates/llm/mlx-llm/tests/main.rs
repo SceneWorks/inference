@@ -25,6 +25,9 @@ mod architecture_regression;
 #[path = "batch.rs"]
 mod batch;
 
+#[path = "block_draft.rs"]
+mod block_draft;
+
 #[path = "breadth.rs"]
 mod breadth;
 

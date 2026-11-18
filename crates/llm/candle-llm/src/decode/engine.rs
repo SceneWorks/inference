@@ -640,6 +640,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             },
             ProposerKind::PromptLookup => DecodePath::PromptLookup,
             ProposerKind::DraftModel => DecodePath::DraftModel,
+            ProposerKind::BlockDraft => DecodePath::BlockDraft,
         };
         let record = DecodeRecord::speculative(path, stats, generated.len(), span.counters())
             .with_kv_cache(cache.kv_kind())

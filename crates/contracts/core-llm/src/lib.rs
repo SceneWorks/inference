@@ -57,6 +57,7 @@ mod model_input_macros;
 #[path = "../../gen-core/src/model_input_proof.rs"]
 pub mod model_input_proof;
 
+pub mod block_draft;
 pub mod cancel;
 pub mod capabilities;
 pub mod constraint;
@@ -95,6 +96,11 @@ pub mod tokenizer;
 pub mod tool;
 pub mod vision_preprocess;
 
+pub use block_draft::{
+    block_draft_capabilities, block_draft_refusal_reason, BlockDraftConfig, BlockDraftFormat,
+    BlockDraftPrecision, BlockDraftRefusal, BlockDraftTarget, BLOCK_DRAFT_GROUP_SIZE,
+    BLOCK_DRAFT_RECOMMENDED_DEPTH,
+};
 pub use cancel::CancelFlag;
 pub use capabilities::{
     ModelSamplingDefaults, MtpCapabilities, ProposerCapabilities, TextLlmCapabilities,
@@ -159,8 +165,8 @@ pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use report::{
-    prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeReport, DraftReport,
-    FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
+    prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeDraft, DecodeReport,
+    DraftReport, FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,

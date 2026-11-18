@@ -6,6 +6,7 @@
 //! mutable state in a forward pass is the KV cache, threaded in as `&mut dyn KvCache`.
 
 pub mod deepstack;
+pub mod dspine;
 pub mod gemma4_mm;
 pub mod gpt_bigcode;
 pub mod llama;
@@ -15,6 +16,7 @@ pub mod siglip;
 pub mod starcoder2;
 pub mod starvector_vision;
 
+pub use dspine::{DSpineBlock, DSpineContext, DSpineDraft};
 pub use gemma4_mm::{
     Gemma4AudioConfig, Gemma4AudioEmbedder, Gemma4Layout, Gemma4Mm, Gemma4MmConfig,
     Gemma4VisionConfig, Gemma4VisionEmbedder,

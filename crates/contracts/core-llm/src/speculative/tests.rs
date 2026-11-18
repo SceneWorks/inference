@@ -8,6 +8,7 @@ const DEPTHS: crate::RecommendedDepths = crate::RecommendedDepths {
     mtp: 3,
     prompt_lookup: 4,
     draft_model: 4,
+    block_draft: 4,
 };
 
 /// E5: the shared advertisements recommend the depth of the defaults-table row they are handed
@@ -19,6 +20,7 @@ fn the_advertised_recommended_depth_is_the_rows() {
         mtp: 2,
         prompt_lookup: 6,
         draft_model: 5,
+        block_draft: 3,
     };
     assert_eq!(prompt_lookup_capabilities(8, &row).recommended_depth, 6);
     assert_eq!(prompt_lookup_capabilities(8, &DEPTHS).recommended_depth, 4);
