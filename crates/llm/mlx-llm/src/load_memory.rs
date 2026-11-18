@@ -65,10 +65,29 @@ impl SnapshotFacts {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => return Err(Error::Load(e.to_string())),
         };
+        let (headers, payload) = if let Some(shards) =
+            crate::sensenova_snapshot::release_shards(dir, &config)
+                .map_err(crate::error::to_core)?
+        {
+            let mut headers = Vec::with_capacity(shards.len());
+            let mut payload = 0u64;
+            for path in shards {
+                payload = payload
+                    .checked_add(path.metadata()?.len())
+                    .ok_or_else(overflow)?;
+                headers.push(read_safetensors_header(&path)?);
+            }
+            (headers, payload)
+        } else {
+            (
+                safetensors_headers(dir)?,
+                core_llm::checkpoint_payload_bytes(dir)?,
+            )
+        };
         Ok(Self {
             config,
-            headers: safetensors_headers(dir)?,
-            payload: core_llm::checkpoint_payload_bytes(dir)?,
+            headers,
+            payload,
             tokenizer_bytes,
         })
     }
@@ -407,26 +426,28 @@ pub(crate) fn safetensors_headers(dir: &Path) -> Result<Vec<Value>> {
         if path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
             continue;
         }
-        let mut file = load_progress::reader::open_with_phase(
-            &path,
-            load_progress::LoadActivityPhase::Checking,
-        )
-        .map_err(|e| Error::Load(e.to_string()))?;
-        let mut prefix = [0u8; 8];
-        file.read_exact(&mut prefix)
-            .map_err(|e| Error::Load(e.to_string()))?;
-        let len = u64::from_le_bytes(prefix);
-        if len > 64 * 1024 * 1024 {
-            return Err(Error::Load(
-                "safetensors admission header exceeds 64 MiB".into(),
-            ));
-        }
-        let mut header = vec![0u8; len as usize];
-        file.read_exact(&mut header)
-            .map_err(|e| Error::Load(e.to_string()))?;
-        headers.push(serde_json::from_slice(&header).map_err(|e| Error::Load(e.to_string()))?);
+        headers.push(read_safetensors_header(&path)?);
     }
     Ok(headers)
+}
+
+fn read_safetensors_header(path: &Path) -> Result<Value> {
+    let mut file =
+        load_progress::reader::open_with_phase(path, load_progress::LoadActivityPhase::Checking)
+            .map_err(|e| Error::Load(e.to_string()))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|e| Error::Load(e.to_string()))?;
+    let len = u64::from_le_bytes(prefix);
+    if len > 64 * 1024 * 1024 {
+        return Err(Error::Load(
+            "safetensors admission header exceeds 64 MiB".into(),
+        ));
+    }
+    let mut header = vec![0u8; len as usize];
+    file.read_exact(&mut header)
+        .map_err(|e| Error::Load(e.to_string()))?;
+    serde_json::from_slice(&header).map_err(|e| Error::Load(e.to_string()))
 }
 
 /// The conversion intermediates every `*.safetensors` header in `dir` implies with no load-time

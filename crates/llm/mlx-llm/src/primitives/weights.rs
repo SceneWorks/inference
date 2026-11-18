@@ -94,6 +94,12 @@ mod footprint {
     const MAX_WAIT: Duration = Duration::from_secs(3);
 }
 
+/// Current Darwin process physical footprint, including host and Metal allocations.
+/// Returns zero if the host cannot provide the measurement.
+pub fn process_footprint_bytes() -> u64 {
+    footprint::current()
+}
+
 impl Weights {
     /// Construct directly from an in-memory map (used by converters and tests).
     pub fn from_map(tensors: HashMap<String, Array>) -> Self {
@@ -132,6 +138,10 @@ impl Weights {
             )));
         }
         shards.sort();
+        Self::from_shards(shards)
+    }
+
+    pub(crate) fn from_shards(shards: Vec<std::path::PathBuf>) -> Result<Self> {
         #[cfg(feature = "model-inference-proof")]
         let __input_paths = shards.clone(); // deterministic merge order
         crate::load_progress::register_files(&shards);
@@ -148,6 +158,11 @@ impl Weights {
             &__input_paths,
         );
         Ok(Self::from_map(tensors))
+    }
+
+    /// Inspect its header without marking a tensor for materialization.
+    pub(crate) fn metadata(&self, key: &str) -> Option<&Array> {
+        self.tensors.get(key)
     }
 
     /// Fetch a tensor by key, erroring if absent. Records the key in the access set.

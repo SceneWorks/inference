@@ -8,6 +8,7 @@ use core_llm::{
 use crate::error::to_core;
 use crate::gguf::{convert_file, ConvertOptions};
 use crate::primitives::projection::QuantSpec;
+
 use crate::primitives::Weights;
 use crate::snapshot::write_hf_snapshot;
 
@@ -105,7 +106,7 @@ fn resolve_gguf_path(source: &Path) -> CoreResult<PathBuf> {
     })
 }
 
-fn validate_supported_hf_architecture(source: &Path) -> CoreResult<()> {
+fn validate_supported_hf_architecture(source: &Path) -> CoreResult<serde_json::Value> {
     let config_path = source.join("config.json");
     let text = std::fs::read_to_string(&config_path).map_err(|e| {
         CoreError::Unsupported(format!(
@@ -113,7 +114,7 @@ fn validate_supported_hf_architecture(source: &Path) -> CoreResult<()> {
             source.display()
         ))
     })?;
-    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+    let config = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
         CoreError::Unsupported(format!(
             "cannot prepare '{}': config.json is not valid JSON: {e}",
             source.display()
@@ -126,12 +127,12 @@ fn validate_supported_hf_architecture(source: &Path) -> CoreResult<()> {
             source.display()
         )));
     }
-    Ok(())
+    Ok(config)
 }
 
 fn validate_loadable_snapshot(source: &Path) -> CoreResult<usize> {
-    validate_supported_hf_architecture(source)?;
-    let weights = Weights::from_dir(source).map_err(to_core)?;
+    let config = validate_supported_hf_architecture(source)?;
+    let weights = Weights::from_configured_dir(source, &config).map_err(to_core)?;
     if weights.is_empty() {
         return Err(CoreError::Unsupported(format!(
             "cannot prepare '{}': snapshot has no weight tensors",

@@ -138,3 +138,6 @@ mod thinking;
 
 #[path = "throughput_breakdown.rs"]
 mod throughput_breakdown;
+
+#[path = "sensenova_loop_real_weights.rs"]
+mod sensenova_loop_real_weights;
