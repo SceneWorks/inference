@@ -90,6 +90,22 @@ impl SenseNovaLoop {
             return Ok(None);
         }
         validate_fields(config, &release_config(), "")?;
+        for field in [
+            "num_experts",
+            "rope_scaling",
+            "sliding_window",
+            "layer_type",
+            "quantization_config",
+        ] {
+            if config["text_config"]
+                .get(field)
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(format!(
+                    "SenseNova-Loop-9B: unsupported text_config/{field} override"
+                ));
+            }
+        }
         for name in ["loop_settings", "mhc"] {
             let expected_keys = if name == "mhc" { 6 } else { 4 };
             if config[name].as_object().map(|o| o.len()) != Some(expected_keys) {
@@ -181,6 +197,7 @@ mod tests {
             "/text_config/rope_parameters/mrope_section",
             "/vision_config/patch_size",
             "/text_config/layer_types/2",
+            "/text_config/use_cache",
         ] {
             let mut cfg = release_config();
             *cfg.pointer_mut(path).unwrap() = Value::Null;
