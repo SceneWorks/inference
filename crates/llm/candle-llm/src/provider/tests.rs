@@ -2247,13 +2247,17 @@ fn a_mixed_qwen35_tier_without_its_entries_is_refused() {
 /// SW-7201 (AC2 on the tiny fixture): each fully quantized tier decodes like the plain tier of
 /// the same body bits — its logits stay within a small fraction of the plain tier's range, and at
 /// every prompt position the greedy token agrees unless the plain tier's top two are nearer than
-/// the logit difference between the tiers (a near-tie).
+/// the logit difference between the tiers (a near-tie). A `cuda` build runs both tiers on CUDA,
+/// where the stored Q8 embedding table is gathered row by row from its U8 blocks.
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn qwen35_fully_quantized_tiers_decode_like_the_plain_tier() {
     use crate::models::{Qwen35Config, Qwen35Model};
     use crate::primitives::projection::ProjectionFormat;
     use candle_core::Device;
+    #[cfg(feature = "cuda")]
+    let device = Device::new_cuda(0).expect("a cuda build proves the tiers on a CUDA device");
+    #[cfg(not(feature = "cuda"))]
     let device = Device::Cpu;
     let load = |dir: &std::path::Path| {
         let config: serde_json::Value =
