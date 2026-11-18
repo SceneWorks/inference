@@ -763,6 +763,9 @@ impl QwenEdit {
             &native,
         )?;
         let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
         let memory = req.memory.unwrap_or_default();
@@ -835,7 +838,13 @@ impl QwenEdit {
                     }
                     None => pos_v.clone(),
                 };
-                let step_idx = pipeline::pag_step_index_for_sigma(&sigmas, sigma);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
                 let pag_scale = resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
                 if pag_scale > 0.0 {
                     if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(

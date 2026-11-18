@@ -204,19 +204,6 @@ fn l2_over_channels(x: &Tensor) -> Result<Tensor> {
     ((xf.sqr()?.sum_keepdim(D::Minus1)? + 1e-12)?.sqrt()?).to_dtype(dtype)
 }
 
-/// Map a descending flow-match `sigma` onto its zero-based step index in `0..sigmas.len() - 1`.
-pub(crate) fn pag_step_index_for_sigma(sigmas: &[f32], sigma: f32) -> usize {
-    let total_steps = sigmas.len().saturating_sub(1);
-    if total_steps == 0 {
-        return 0;
-    }
-    sigmas[..total_steps]
-        .iter()
-        .filter(|&&s| s > sigma)
-        .count()
-        .min(total_steps - 1)
-}
-
 /// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this
 /// step (`step_scale > 0.0`), or `None` when inactive.
 pub(crate) fn pag_perturb_block_flags(
@@ -365,9 +352,17 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sigmas = [1.0f32, 0.75, 0.5, 0.25, 0.0];
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 1.0), 0);
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.5), 2);
+        use candle_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+        let euler = canonical_solver_or_euler(None);
+        assert_eq!(step_index_for_eval(euler, 0, 4), 0);
+        assert_eq!(step_index_for_eval(euler, 2, 4), 2);
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            let steps: Vec<usize> = (0..8)
+                .map(|eval_idx| step_index_for_eval(solver, eval_idx, 4))
+                .collect();
+            assert_eq!(steps, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        }
         let flags = pag_perturb_block_flags(Some(&resolved), 60, 1, 4).unwrap();
         assert!(flags[30] && !flags[29]);
         assert!(pag_perturb_block_flags(Some(&resolved), 60, 2, 4).is_none());

@@ -265,23 +265,11 @@ pub fn denoise_cfg_with_progress(
     )
 }
 
-/// Map a `1 - sigma` flow-match timestep back to its 0-based step index in `sigmas`.
-pub(crate) fn pag_step_index(sigmas: &[f32], timestep: f32) -> usize {
-    let total_steps = sigmas.len().saturating_sub(1);
-    if total_steps == 0 {
-        return 0;
-    }
-    sigmas[..total_steps]
-        .iter()
-        .rposition(|&s| (1.0f32 - s) <= timestep)
-        .unwrap_or(0)
-}
-
 fn finalize_cfg_and_pag<F>(
     v_cond: &Array,
     eps_base: Array,
-    sigmas: &[f32],
-    timestep: f32,
+    step_idx: usize,
+    total_steps: usize,
     pag: Option<&mlx_gen::gen_core::PagResolved>,
     cfg_active: bool,
     forward_perturbed: F,
@@ -292,8 +280,6 @@ where
     let Some(resolved_pag) = pag else {
         return Ok(eps_base);
     };
-    let total_steps = sigmas.len().saturating_sub(1);
-    let step_idx = pag_step_index(sigmas, timestep);
     let step_pag_scale = resolved_pag.step_scale(step_idx, total_steps);
     if step_pag_scale <= 0.0 {
         return Ok(eps_base);
@@ -393,10 +379,20 @@ pub fn denoise_cfg_with_progress_preview_and_pag(
     let window = transformer.block_window(block_window, cancel)?;
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     let sigmas = &scheduler.sigmas[start..];
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
     // delta is the per-step CFG + PAG combine of velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
         let eps_base = match &neg_prep {
             Some(np) => {
@@ -410,8 +406,8 @@ pub fn denoise_cfg_with_progress_preview_and_pag(
         finalize_cfg_and_pag(
             &v_cond,
             eps_base,
-            sigmas,
-            timestep,
+            step_idx,
+            total_steps,
             pag,
             neg_prep.is_some(),
             |pag_ctx| {
@@ -697,11 +693,21 @@ pub fn denoise_control_cfg_with_progress_preview_and_pag(
     let window = transformer.control_block_window(block_window, cancel)?;
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     let sigmas = &scheduler.sigmas[start..];
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let v_cond = transformer.forward_with_control_rungs(
             &prep,
             x,
@@ -731,8 +737,8 @@ pub fn denoise_control_cfg_with_progress_preview_and_pag(
         finalize_cfg_and_pag(
             &v_cond,
             eps_base,
-            sigmas,
-            timestep,
+            step_idx,
+            total_steps,
             pag,
             neg_prep.is_some(),
             |pag_ctx| {
@@ -1764,14 +1770,23 @@ mod tests {
 
     #[test]
     fn pag_step_index_and_finalize_cover_window_noop_two_pass_and_three_pass() {
-        let sigmas = [1.0f32, 2.0 / 3.0, 1.0 / 3.0, 0.0];
-        assert_eq!(pag_step_index(&sigmas, 1.0 - sigmas[0]), 0);
-        assert_eq!(pag_step_index(&sigmas, 1.0 - sigmas[1]), 1);
-        assert_eq!(pag_step_index(&sigmas, 1.0 - sigmas[2]), 2);
-        // Multi-stage solver substeps (`1 - sigmas[i] < t < 1 - sigmas[i + 1]`) stay at step `i`.
-        for i in 0..3 {
-            let midpoint = 0.5 * ((1.0 - sigmas[i]) + (1.0 - sigmas[i + 1]));
-            assert_eq!(pag_step_index(&sigmas, midpoint), i);
+        use mlx_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+        let euler = canonical_solver_or_euler(None);
+        assert_eq!(
+            (0..3)
+                .map(|eval| step_index_for_eval(euler, eval, 3))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Two-stage solvers (`heun`, `dpmpp_sde`) keep both evaluations of outer step `i` on `i`.
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            assert_eq!(
+                (0..6)
+                    .map(|eval| step_index_for_eval(solver, eval, 3))
+                    .collect::<Vec<_>>(),
+                vec![0, 0, 1, 1, 2, 2]
+            );
         }
 
         let cap = crate::model::turbo_pag_capability();
@@ -1797,8 +1812,8 @@ mod tests {
         let two_pass = finalize_cfg_and_pag(
             &v_cond,
             v_cond.clone(),
-            &sigmas,
-            1.0 - sigmas[2],
+            2,
+            3,
             Some(&resolved),
             false,
             |ctx| {
@@ -1819,8 +1834,8 @@ mod tests {
         let three_pass = finalize_cfg_and_pag(
             &v_cond,
             eps_cfg.clone(),
-            &sigmas,
-            1.0 - sigmas[1],
+            1,
+            3,
             Some(&resolved),
             true,
             |_| {
@@ -1834,13 +1849,12 @@ mod tests {
         assert_eq!(three_pass.as_slice::<f32>(), &[4.2f32, 7.4]);
 
         // Step 3 on a 4-step schedule -> progress 0.75 >= 0.75 -> zero extra pass.
-        let sigmas4 = [1.0f32, 0.75, 0.5, 0.25, 0.0];
         let mut skipped_calls = 0usize;
         let out_of_window = finalize_cfg_and_pag(
             &v_cond,
             eps_cfg.clone(),
-            &sigmas4,
-            1.0 - sigmas4[3],
+            3,
+            4,
             Some(&resolved),
             true,
             |_| {

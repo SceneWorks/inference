@@ -609,6 +609,8 @@ pub(crate) fn denoise_with_progress_windowed_pag(
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
     let total_steps = sliced.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
     let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
@@ -652,7 +654,13 @@ pub(crate) fn denoise_with_progress_windowed_pag(
             }
             None => pos.clone(),
         };
-        let step_idx = pag_step_index_for_sigma(sliced, sigma);
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
             if let Some(perturb_mask) =
@@ -814,6 +822,8 @@ pub(crate) fn denoise_control_with_progress_windowed_pag(
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
     let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
@@ -856,7 +866,13 @@ pub(crate) fn denoise_control_with_progress_windowed_pag(
             }
             None => pos.clone(),
         };
-        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
             if let Some(perturb_mask) =
@@ -1017,6 +1033,8 @@ pub(crate) fn denoise_edit_with_progress_windowed_pag(
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
     let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
@@ -1065,7 +1083,13 @@ pub(crate) fn denoise_edit_with_progress_windowed_pag(
             }
             None => pos.clone(),
         };
-        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
             if let Some(perturb_mask) =
@@ -1110,19 +1134,6 @@ pub(crate) fn denoise_edit_with_progress_windowed_pag(
         latents,
         predict,
     )
-}
-
-/// Map a descending flow-match `sigma` onto its zero-based step index in `0..sigmas.len() - 1`.
-pub(crate) fn pag_step_index_for_sigma(sigmas: &[f32], sigma: f32) -> usize {
-    let total_steps = sigmas.len().saturating_sub(1);
-    if total_steps == 0 {
-        return 0;
-    }
-    sigmas[..total_steps]
-        .iter()
-        .filter(|&&s| s > sigma)
-        .count()
-        .min(total_steps - 1)
 }
 
 /// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this
@@ -1828,9 +1839,17 @@ mod execution_policy_tests {
         .unwrap()
         .unwrap();
 
-        let sigmas = [1.0f32, 0.75, 0.5, 0.25, 0.0];
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 1.0), 0);
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.5), 2);
+        use mlx_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+        let euler = canonical_solver_or_euler(None);
+        assert_eq!(step_index_for_eval(euler, 0, 4), 0);
+        assert_eq!(step_index_for_eval(euler, 2, 4), 2);
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            let steps: Vec<usize> = (0..8)
+                .map(|eval_idx| step_index_for_eval(solver, eval_idx, 4))
+                .collect();
+            assert_eq!(steps, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        }
         let flags_step0 = pag_perturb_block_flags(Some(&resolved), 60, 0, 4).unwrap();
         assert_eq!(flags_step0.len(), 60);
         assert!(flags_step0[30]);
