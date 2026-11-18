@@ -7107,14 +7107,6 @@ fn a_block_draft_request_is_priced_beside_the_target() {
             SpeculativeRoute::BlockDraft { width: 4 }
         );
         assert!(why.is_empty());
-        let routed = provider.fit_block_draft_route(
-            SpeculativeRoute::BlockDraft { width: 4 },
-            true,
-            false,
-            &mut why,
-        );
-        assert_ne!(routed, SpeculativeRoute::BlockDraft { width: 4 });
-        assert_eq!(why[0], BLOCK_DRAFT_MULTIMODAL);
     }
 }
 

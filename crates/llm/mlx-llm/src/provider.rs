@@ -4091,8 +4091,6 @@ impl LlamaProvider {
             core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
-        let route =
-            self.fit_block_draft_route(route, multimodal, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
         // instead, by name (sc-24436, E2).
         let route = self.fit_draft_route(
@@ -4412,57 +4410,81 @@ impl LlamaProvider {
                                 deepstack: &m.deepstack,
                                 continuation_delta: *delta,
                             };
-                            let mut cache = model.new_cache();
-                            let (mut proposer, logits, hidden) = if route.is_mtp() {
-                                let (hidden, logits) = model
-                                    .prefill_hidden_and_last_logits_from_embeds_with_deepstack(
-                                        &m.embeds,
-                                        pos,
-                                        &mut cache,
-                                        &m.visual_pos_mask,
-                                        &m.deepstack,
-                                    )
-                                    .map_err(to_core)?;
-                                let proposer: Box<dyn Proposer<Qwen35Model>> =
-                                    Box::new(MtpProposer::multimodal(&mtp_prompt));
-                                (proposer, logits, Some(hidden))
+                            if let (SpeculativeRoute::BlockDraft { .. }, Some(block)) =
+                                (route, self.block_draft.as_ref())
+                            {
+                                self.run_block_draft_multimodal(
+                                    model,
+                                    block,
+                                    &mtp_prompt,
+                                    &config,
+                                    width,
+                                    &req.cancel,
+                                    &mut sink,
+                                    EngineOptions {
+                                        constraint: json_mask
+                                            .as_mut()
+                                            .map(|m| m as &mut dyn RewindableConstraintMask),
+                                        should_stop: should_stop_opt,
+                                        delivered: Some(&delivered),
+                                        prefill_clock: clock,
+                                        speculative_mode,
+                                        ..EngineOptions::default()
+                                    },
+                                )
                             } else {
-                                let logits = model
-                                    .prefill_with_deepstack(
-                                        &m.embeds,
-                                        pos,
-                                        &mut cache,
-                                        &m.visual_pos_mask,
-                                        &m.deepstack,
-                                    )
-                                    .map_err(to_core)?;
-                                (route.plain_proposer(self.draft.as_ref()), logits, None)
-                            };
-                            generate_speculative(
-                                model,
-                                &mut *proposer,
-                                SpeculativePrompt::Prefilled {
-                                    cache: &mut cache,
-                                    logits,
-                                    hidden,
-                                    history: &m.expanded_ids,
-                                    position_delta: *delta,
-                                },
-                                &config,
-                                width,
-                                &req.cancel,
-                                &mut sink,
-                                EngineOptions {
-                                    constraint: json_mask
-                                        .as_mut()
-                                        .map(|m| m as &mut dyn RewindableConstraintMask),
-                                    should_stop: should_stop_opt,
-                                    delivered: Some(&delivered),
-                                    prefill_clock: clock,
-                                    speculative_mode,
-                                    ..EngineOptions::default()
-                                },
-                            )
+                                let mut cache = model.new_cache();
+                                let (mut proposer, logits, hidden) = if route.is_mtp() {
+                                    let (hidden, logits) = model
+                                        .prefill_hidden_and_last_logits_from_embeds_with_deepstack(
+                                            &m.embeds,
+                                            pos,
+                                            &mut cache,
+                                            &m.visual_pos_mask,
+                                            &m.deepstack,
+                                        )
+                                        .map_err(to_core)?;
+                                    let proposer: Box<dyn Proposer<Qwen35Model>> =
+                                        Box::new(MtpProposer::multimodal(&mtp_prompt));
+                                    (proposer, logits, Some(hidden))
+                                } else {
+                                    let logits = model
+                                        .prefill_with_deepstack(
+                                            &m.embeds,
+                                            pos,
+                                            &mut cache,
+                                            &m.visual_pos_mask,
+                                            &m.deepstack,
+                                        )
+                                        .map_err(to_core)?;
+                                    (route.plain_proposer(self.draft.as_ref()), logits, None)
+                                };
+                                generate_speculative(
+                                    model,
+                                    &mut *proposer,
+                                    SpeculativePrompt::Prefilled {
+                                        cache: &mut cache,
+                                        logits,
+                                        hidden,
+                                        history: &m.expanded_ids,
+                                        position_delta: *delta,
+                                    },
+                                    &config,
+                                    width,
+                                    &req.cancel,
+                                    &mut sink,
+                                    EngineOptions {
+                                        constraint: json_mask
+                                            .as_mut()
+                                            .map(|m| m as &mut dyn RewindableConstraintMask),
+                                        should_stop: should_stop_opt,
+                                        delivered: Some(&delivered),
+                                        prefill_clock: clock,
+                                        speculative_mode,
+                                        ..EngineOptions::default()
+                                    },
+                                )
+                            }
                         }
                         Decoder::Causal(model) => {
                             let model: &CausalLm = model;
@@ -5060,7 +5082,7 @@ enum SpeculativeRoute {
     DraftModel {
         width: usize,
     },
-    /// The resident block draft over the Qwen35 target (SW-F360); text prompts only.
+    /// The resident block draft over the Qwen35 target (SW-F360): text, image and video prompts.
     BlockDraft {
         width: usize,
     },
@@ -5101,7 +5123,7 @@ impl SpeculativeRoute {
                 }
             }
             // `speculative_route` routes `draft_model` only with a resident draft.
-            // A block draft runs only on the Qwen35 text path, over its tapped target.
+            // A block draft runs only on the Qwen35 paths, over its tapped target.
             (SpeculativeRoute::DraftModel { .. }, None)
             | (
                 SpeculativeRoute::Plain
@@ -5459,37 +5481,62 @@ impl LlamaProvider {
         Ok(run)
     }
 
-    /// A `block_draft` route on an image or video prompt (SW-F360): the draft's context would
-    /// need the target's rows at the fused visual positions, which this proposer does not take
-    /// yet, so the request runs what `auto` resolves to instead, by name. Any other route is
-    /// returned unchanged.
-    fn fit_block_draft_route(
+    /// Run a Qwen-VL image or video prompt with the resident block draft (SW-7195, E10): the
+    /// target tapped at the draft's layers prefills the fused embeddings under the prompt's
+    /// M-RoPE positions and DeepStack fusion — the multimodal rules the MTP proposer follows
+    /// ([`Qwen35MtpMultimodalPrompt`]) — so the draft's context reads the target's own rows at
+    /// the image and video positions, never re-embedded placeholder ids. The draft's context is
+    /// indexed by sequence position (the references' draft cache offset), the continuation's
+    /// target rows at their M-RoPE text positions (`continuation_delta`). A multimodal prompt
+    /// never reads or feeds the cross-turn prefix cache.
+    #[allow(clippy::too_many_arguments)]
+    fn run_block_draft_multimodal(
         &self,
-        route: SpeculativeRoute,
-        multimodal: bool,
-        gemma4_mm_request: bool,
-        fallbacks: &mut Vec<String>,
-    ) -> SpeculativeRoute {
-        if !multimodal || !matches!(route, SpeculativeRoute::BlockDraft { .. }) {
-            return route;
-        }
-        fallbacks.push(BLOCK_DRAFT_MULTIMODAL.into());
-        let auto = core_llm::resolve_speculative(
-            core_llm::Speculative::Auto,
-            &self.descriptor.capabilities,
-        );
-        fallbacks.extend(auto.fallback);
-        self.speculative_route(auto.plan, gemma4_mm_request, fallbacks)
+        model: &Qwen35Model,
+        block: &ResidentBlockDraft,
+        prompt: &Qwen35MtpMultimodalPrompt<'_>,
+        config: &GenerationConfig,
+        width: usize,
+        cancel: &crate::decode::CancelFlag,
+        sink: &mut dyn FnMut(StreamEvent),
+        options: EngineOptions<'_, '_>,
+    ) -> crate::error::Result<SpeculativeRun> {
+        let target = TappedQwen35::for_draft(model, &block.model);
+        let mut cache = model.new_cache();
+        let (hidden, logits) = model.prefill_tapped_from_embeds_with_deepstack(
+            prompt.embeddings,
+            prompt.positions,
+            &mut cache,
+            prompt.visual_pos_mask,
+            prompt.deepstack,
+            &target.layers,
+            target.keep,
+        )?;
+        let mut proposer = BlockDraftProposer::new(&block.model);
+        let mut run = generate_speculative(
+            &target,
+            &mut proposer,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits,
+                hidden: Some(hidden),
+                history: prompt.input_ids,
+                position_delta: prompt.continuation_delta,
+            },
+            config,
+            width,
+            cancel,
+            sink,
+            options,
+        )?;
+        run.report.draft = Some(block.report.clone());
+        Ok(run)
     }
 }
 
 /// The fallback a `block_draft` plan names on a provider with no resident block draft.
 const BLOCK_DRAFT_NOT_LOADED: &str = "speculative: `block_draft` has no block draft loaded \
      beside this target; decoded without a proposer";
-
-/// The fallback a `block_draft` plan names on an image or video prompt.
-const BLOCK_DRAFT_MULTIMODAL: &str = "speculative: `block_draft` does not run on image or video \
-     prompts yet; decoded as `auto` would";
 
 /// The descriptor for the `mlx-llama` provider (constructible without loading weights; used for
 /// explicit catalog composition and inspection).

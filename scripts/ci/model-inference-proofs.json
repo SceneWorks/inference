@@ -282044,6 +282044,66 @@
     "package": "mlx-llm",
     "target": "mlx_llm",
     "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::image_draft_context_follows_the_target_positions",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_draft_context_follows_the_target_positions@0033cf24afaceaa15928b357b692edcd1ff91bc9ae3fea43874aa243660b4eb3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::greedy_image_block_draft_is_the_plain_loop",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_is_the_plain_loop@e7b5c58fe1ca2f6633c39ddbe2b6b5d2be27a63584170407869c3ca0ee4055d9",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
     "fqn": "models::dspine::tests::a_draft_loaded_from_disk_releases_its_sources_and_matches_the_resident_build",
     "execution_role": "direct",
     "backend": "mlx",
@@ -282136,6 +282196,94 @@
     "input_contract": {
       "fixture_kind": "external",
       "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@3da42e50199e7df78d0d1f2bed8fefaebb8ccd96ab6bead3d11255489c9c9fab",
+      "requirements": [
+        {
+          "slot": "model-weight-collections",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-configurations",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file",
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_environment": [
+      "MLX_LLM_BLOCK_DRAFT_TARGET",
+      "MLX_LLM_BLOCK_DRAFT_SOURCE"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "pin": "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4"
+      },
+      {
+        "environment": "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "pin": "SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d"
+      }
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "block_draft::qwen38_27b_dspine_runs_on_an_image_request",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned Hub snapshots staged into the runner Hub cache and bound by path: target SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4 (MLX_LLM_BLOCK_DRAFT_TARGET) and DSpine draft SceneWorks/qwen3.8-27b-dspine-b16@8e450d7faf38238b64580163a7d3dd7e44af759d (MLX_LLM_BLOCK_DRAFT_SOURCE); image generated in the test body (448x448 two-colour RGB)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT",
+      "env_gates": [
+        "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "MLX_LLM_BLOCK_DRAFT_PRECISION"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/tests/block_draft.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dspine_runs_on_an_image_request@097c8758d44a5aeb18501e363560a4460a8a5773d91696d79f38216a057d9a57",
       "requirements": [
         {
           "slot": "model-weight-collections",
@@ -282284,6 +282432,94 @@
     "input_contract": {
       "fixture_kind": "external",
       "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@e4069e4e267b3854e3947404e512a4b0a266d8b270fee501aad5ecdb2f4e2749",
+      "requirements": [
+        {
+          "slot": "model-weight-collections",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-configurations",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file",
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_environment": [
+      "MLX_LLM_DFLASH2_TARGET",
+      "MLX_LLM_DFLASH2_SOURCE"
+    ],
+    "hub_snapshots": [
+      {
+        "environment": "MLX_LLM_DFLASH2_TARGET",
+        "pin": "SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4"
+      },
+      {
+        "environment": "MLX_LLM_DFLASH2_SOURCE",
+        "pin": "SceneWorks/qwen3.8-27b-dflash2@9030fabfb5e3ca0c5c180f84927af86aa9f9a2e9"
+      }
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "block_draft::qwen38_27b_dflash2_runs_on_an_image_request",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "product-pinned Hub snapshots staged into the runner Hub cache and bound by path: target SceneWorks/qwen3.8-27b-abliterated-mlx@76f3c445cd5347fdb85fc24066350724fe272017/q4 (MLX_LLM_DFLASH2_TARGET) and DFlash2 draft SceneWorks/qwen3.8-27b-dflash2@9030fabfb5e3ca0c5c180f84927af86aa9f9a2e9 (MLX_LLM_DFLASH2_SOURCE); image generated in the test body (448x448 two-colour RGB)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the pinned Qwen3.8-27B target and DFlash2 draft under MLX_GEN_MODELS_ROOT",
+      "env_gates": [
+        "MLX_LLM_DFLASH2_TARGET",
+        "MLX_LLM_DFLASH2_SOURCE",
+        "MLX_LLM_DFLASH2_PRECISION"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/tests/block_draft.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_runs_on_an_image_request@8351dbf28de9215954b02cf7cbe94ca2e08bb5db4b93aabc2f9753010fabd2c0",
       "requirements": [
         {
           "slot": "model-weight-collections",
