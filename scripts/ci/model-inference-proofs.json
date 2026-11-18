@@ -117367,6 +117367,426 @@
     "package": "candle-llm",
     "target": "candle_llm",
     "target_kind": "lib",
+    "fqn": "decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch",
+    "source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch; source setup helpers=causal,tiny_qwen3,text_model_on,shapes,prefilled,direct,tree_forward; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache",
+    "source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache; source setup helpers=causal,tiny_qwen3,text_model_on,shapes,prefilled,direct,tree_forward,CancelWhileProposing,CancelInTree,Siblings; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop",
+    "source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop; source setup helpers=causal,tiny_qwen3,text_model_on,NoisyTree,Forbid,plain,tree_run; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution",
+    "source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution; source setup helpers=causal,tiny_qwen3,tree_forward,tree_walk; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path",
+    "source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path; source setup helpers=causal,tiny_qwen3,text_model_on,LinearOnly,NoTree,tree_run; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named",
+    "source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named; source setup helpers=causal,tiny_qwen3,text_model_on,GraphRunner,NoisyTree,plain,tree_run; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::tree_steps_run_eager_through_the_graph_runner_with_the_reason_named@e0239b323f94777759defd6c527af3a73a4d7c4968d0809064b3d992030399c3",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
     "fqn": "decode::engine::tests::no_proposer_is_the_step_driver_and_reports_proposer_none",
     "source": "crates/llm/candle-llm/src/decode/engine.rs",
     "cargo_target_metadata": {

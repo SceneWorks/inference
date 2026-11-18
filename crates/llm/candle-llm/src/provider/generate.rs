@@ -262,8 +262,40 @@ impl TextLlm for LlamaProvider {
             .into_iter()
             .chain(route_fallback)
             .collect();
+        // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
+        // will actually run (a proposer on the engine), at the advertised row bound — else
+        // linear, by name. The multimodal paths prefill spliced embeddings and verify linearly
+        // (MLX's rule). Admission prices the tree's rows, mask and per-row states.
+        let tree = core_llm::resolve_tree_verify(
+            req.speculative_verify,
+            match route {
+                DecodeRoute::Engine { proposer, drafts }
+                    if proposer != ProposerKind::None && drafts > 0 =>
+                {
+                    resolution.plan
+                }
+                _ => SpeculativePlan::Off,
+            },
+            &self.descriptor.capabilities,
+        );
+        fallbacks.extend(tree.fallback);
+        let tree_rows = if tree.max_rows > 0 && (multimodal || gemma4_mm_request) {
+            fallbacks.push(TREE_MULTIMODAL_LINEAR.into());
+            0
+        } else {
+            tree.max_rows as usize
+        };
         let required = self
             .request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
+            .and_then(|bytes| {
+                bytes.checked_add(tree_request_bytes(
+                    &self.model,
+                    route.drafts(),
+                    tree_rows,
+                    admitted_prompt,
+                    req.max_new_tokens,
+                )?)
+            })
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         // The cross-turn prefix cache (sc-24437) serves the engine's text routes. It keys on token
         // ids, which cannot tell two images (or clips) behind the same placeholder ids apart — a
@@ -600,7 +632,10 @@ impl TextLlm for LlamaProvider {
                         // inside the cache.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_rows),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
                         let positions = [t.as_slice(), h.as_slice(), w.as_slice()];
@@ -655,6 +690,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             None,
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -677,7 +713,10 @@ impl TextLlm for LlamaProvider {
                         let prefill_started = generation_started;
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_rows),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let restored = self
                             .prefix_cache()
@@ -741,6 +780,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             Some(&mut boundary),
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -832,7 +872,10 @@ impl TextLlm for LlamaProvider {
                         // above priced the expanded prompt from the visual geometry.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_rows),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
                         let logits = model
@@ -870,6 +913,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             None,
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -901,7 +945,10 @@ impl TextLlm for LlamaProvider {
                             self.prefix_cache().reclaim_for(required, available),
                         )?;
                         let mut cache = model
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_rows),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let logits = model
                             .step_prefill_from_embeds(&m.embeds, &mut cache)
@@ -931,6 +978,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             None,
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -950,7 +998,10 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_rows),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let restored = self
                             .prefix_cache()
@@ -998,6 +1049,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             Some(&mut boundary),
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -1333,15 +1385,18 @@ impl TextLlm for LlamaProvider {
 
 /// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
 /// switch, carrying the speculative resolution's and the route's fallback reasons verbatim (epic
-/// sc-24432 E2) — the record is the engine's and starts with none.
+/// sc-24432 E2), then the engine's own (a tree request it verified linearly, SW-F328).
 pub(super) fn request_report(
     record: &DecodeRecord,
     cuda_graphs_on: bool,
-    fallbacks: Vec<String>,
+    mut fallbacks: Vec<String>,
 ) -> core_llm::DecodeReport {
+    let mut report = record.report(cuda_graphs_on);
+    // The engine's own (a tree its model or cache could not run, SW-F328) follow the request's.
+    fallbacks.append(&mut report.fallbacks);
     core_llm::DecodeReport {
         fallbacks,
-        ..record.report(cuda_graphs_on)
+        ..report
     }
 }
 

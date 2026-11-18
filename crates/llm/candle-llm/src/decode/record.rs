@@ -185,6 +185,12 @@ pub struct DecodeRecord {
     pub speculative_demoted_at: Option<u64>,
     /// [`core_llm::DecodeReport::speculative_monitor`]; `None` when no monitor judged a window.
     pub speculative_monitor: Option<core_llm::MonitorDecision>,
+    /// What tree verification did (feature SW-F328, E8): passes, rows per pass, accepted
+    /// candidates and the peak tree workspace — `None` unless the run verified under a tree bound.
+    pub tree_verify: Option<core_llm::TreeVerifyReport>,
+    /// Why the run's tree request verified linearly (feature SW-F328, E5), named in the report's
+    /// `fallbacks`; `None` otherwise.
+    pub tree_fallback: Option<&'static str>,
 }
 
 impl DecodeRecord {
@@ -220,6 +226,8 @@ impl DecodeRecord {
             prefix_cache_reason: None,
             speculative_demoted_at: None,
             speculative_monitor: None,
+            tree_verify: None,
+            tree_fallback: None,
         }
     }
 
@@ -336,6 +344,8 @@ impl DecodeRecord {
             prefix_cache_reason: None,
             speculative_demoted_at: stats.demoted_at.map(|n| n as u64),
             speculative_monitor: stats.monitor,
+            tree_verify: stats.tree,
+            tree_fallback: stats.tree_fallback,
         }
     }
 
@@ -386,8 +396,9 @@ impl DecodeRecord {
     /// rows. `cuda_graphs_enabled` is the graph switch the request ran under (the loaded model's
     /// `LoadSpec::cuda_graphs`, else the process switch at load), which the tally alone cannot
     /// say: a request that never reached the runner reads `none` either way. The report's
-    /// `fallbacks` start empty: the record is the engine's, and the speculative resolution and
-    /// route that may fall back are the provider's, which appends their reasons.
+    /// `fallbacks` hold only the engine's own (a tree request its model or cache could not run,
+    /// SW-F328): the speculative resolution and route that may fall back are the provider's,
+    /// which puts their reasons first.
     pub fn report(&self, cuda_graphs_enabled: bool) -> core_llm::DecodeReport {
         let draft_tokens = (self.proposer != ProposerKind::None).then_some(self.drafts);
         core_llm::DecodeReport {
@@ -426,10 +437,20 @@ impl DecodeRecord {
                 path: self.prefix_cache.to_string(),
                 reason: self.prefix_cache_reason.map(str::to_string),
             },
-            fallbacks: Vec::new(),
-            tree_verify: None,
+            fallbacks: self
+                .tree_fallback
+                .map(tree_fallback_reason)
+                .into_iter()
+                .collect(),
+            tree_verify: self.tree_verify,
         }
     }
+}
+
+/// The report's words for a tree request the engine verified linearly because the model or its
+/// cache cannot keep a tree branch (feature SW-F328) — MLX's wording.
+pub fn tree_fallback_reason(why: &str) -> String {
+    format!("speculative: tree verification unavailable ({why}); verified linearly")
 }
 
 /// Brackets a request on the current thread: constructed before the first forward, `finish`ed after
@@ -702,6 +723,8 @@ mod tests {
                 replays: 1,
                 demoted_at: Some(7),
                 monitor: Some(DECISION),
+                tree: None,
+                tree_fallback: None,
             },
             10,
             SpanCounters {
