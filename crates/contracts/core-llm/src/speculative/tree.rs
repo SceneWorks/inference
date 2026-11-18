@@ -86,7 +86,10 @@ impl DraftTree {
         }
     }
 
-    /// Append a candidate under `parent` (a row already in the tree) and return its row.
+    /// Append a candidate under `parent` and return its row. `parent` is a **row** index, the
+    /// one indexing every consumer shares (mask, RoPE depth, recurrent levels, `commit_tree`
+    /// paths): `0` is the anchor and `1..=len()` the candidates already pushed, so the new row is
+    /// `len() + 1` and its parent always precedes it. Any larger `parent` is refused.
     pub fn push(
         &mut self,
         parent: usize,
@@ -95,8 +98,9 @@ impl DraftTree {
     ) -> Result<usize, TreeShapeError> {
         if parent > self.nodes.len() {
             return Err(TreeShapeError(format!(
-                "draft tree: parent row {parent} is not in a tree of {} rows",
-                self.rows()
+                "draft tree: parent row {parent} is not in a tree of {} rows (0..={})",
+                self.rows(),
+                self.nodes.len()
             )));
         }
         self.nodes.push(DraftNode {

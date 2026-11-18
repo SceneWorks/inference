@@ -55,9 +55,10 @@ fn shapes(vocab: i32) -> Vec<(&'static str, DraftTree)> {
     };
     let chain: Vec<usize> = (0..16).collect();
     let star = vec![0; 16];
-    let mut two = vec![0, 0];
-    two.extend((0..7).map(|i| if i == 0 { 1 } else { 2 * i + 1 }));
-    two.extend((0..7).map(|i| if i == 0 { 2 } else { 2 * i + 2 }));
+    // Rows 1 and 2 hang off the anchor; every later row `r` continues `r - 2`, so the odd rows
+    // and the even rows form two interleaved branches of eight. A parent is a row index (`0` the
+    // anchor) and must precede the row it is pushed as.
+    let two: Vec<usize> = [0, 0].into_iter().chain(1..=14).collect();
     let binary: Vec<usize> = (1..=15).map(|r| (r - 1) / 2).collect();
     let mut out = vec![
         ("chain", build(&chain, &mut token)),
