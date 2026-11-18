@@ -277,6 +277,38 @@ class Collector(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'RUSTC differs'):
                     proof.verified_toolchain(env, root=root)
 
+    @unittest.skipIf(os.name == 'nt', 'Unix proxy contract; Windows pinned binaries have separate tests')
+    def test_hosted_macos_toolchain_selects_the_homebrew_rustup_proxies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "repository-channel"\n', encoding='utf-8')
+            (root / 'cargo-home').mkdir()
+            brew_bin = root / 'homebrew/opt/rustup/bin'
+            brew_bin.mkdir(parents=True)
+            for tool in ('cargo', 'rustc', 'rustup'):
+                path = brew_bin / tool
+                path.write_text('MOCK; never executed', encoding='utf-8')
+                path.chmod(0o755)
+            env = {'CARGO_HOME': str(root / 'cargo-home'), 'PATH': '/shadow', 'RUNNER_OS': 'macOS',
+                   'MODEL_PROOF_RUNNER_ENVIRONMENT': 'github-hosted'}
+            def inspect(argv, **kwargs):
+                if argv[0] == 'brew':
+                    self.assertEqual(argv, ['brew', '--prefix', 'rustup'])
+                    return subprocess.CompletedProcess(argv, 0, stdout=str(brew_bin.parent) + '\n')
+                output = str(root / 'installed/bin' / argv[-1]) if 'which' in argv else 'MOCK version'
+                return subprocess.CompletedProcess(argv, 0, stdout=output + '\n')
+            with patch.object(proof.subprocess, 'run', side_effect=inspect), \
+                    patch.object(proof, 'configure_native_darwin_build',
+                                 return_value={'mechanism': 'MOCK linker; not executed'}):
+                value = proof.verified_toolchain(dict(env), root=root)
+            self.assertEqual(value['proxies'], {tool: str(brew_bin / tool) for tool in ('cargo', 'rustc', 'rustup')})
+            # A self-hosted runner never falls back: missing Cargo-home proxies still refuse.
+            env['MODEL_PROOF_RUNNER_ENVIRONMENT'] = 'self-hosted'
+            with patch.object(proof.subprocess, 'run') as command:
+                with self.assertRaisesRegex(ValueError, 'proxies are missing'):
+                    proof.verified_toolchain(dict(env), root=root)
+                command.assert_not_called()
+
     def test_toolchain_rejects_unexpected_override_before_any_compiler_or_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
