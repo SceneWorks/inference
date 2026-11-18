@@ -817,6 +817,9 @@ pub struct ProposeContext<'a> {
     pub position: i32,
     /// At most this many drafts (already clamped to the remaining budget, `>= 1`).
     pub max_drafts: usize,
+    /// The most drafts the remaining token budget alone allows (`>= max_drafts`): a proposer whose
+    /// draft runs a fixed-size block shortens it only here.
+    pub budget_drafts: usize,
 }
 
 /// One host-sampled draft: the token and, for a stochastic run, the proposal distribution it was
@@ -1476,6 +1479,7 @@ where
                 previous_hidden: previous_hidden.as_ref(),
                 position,
                 max_drafts: k,
+                budget_drafts: remaining.saturating_sub(1),
             };
             let mut draft_sampler = DraftSampler {
                 config,

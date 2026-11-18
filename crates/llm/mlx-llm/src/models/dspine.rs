@@ -21,33 +21,20 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
-use core_llm::{BlockDraftConfig, BlockDraftPrecision, BlockDraftRefusal};
+use core_llm::{BlockDraftConfig, BlockDraftHead, BlockDraftPrecision, BlockDraftRefusal};
 
 use crate::error::{Error, Result};
-use crate::primitives::attention::{sdpa, AttnMask};
-use crate::primitives::nn::{rms_norm, silu};
+use crate::models::block_draft::{
+    bf16, f32, rows_from, BlockDraftContext, ContextWriter, DraftLayer, GroupReader,
+};
+use crate::primitives::attention::AttnMask;
+use crate::primitives::nn::rms_norm;
 use crate::primitives::projection::{Projection, QuantGrid, QuantSpec};
-use crate::primitives::rope::{apply_rope, Rope};
+use crate::primitives::rope::Rope;
 use crate::primitives::Weights;
 
 /// `torch.finfo(torch.float32).tiny`, the clamp floor of the bridge's read RMS.
 const F32_TINY: f32 = 1.175_494_4e-38;
-
-/// One draft decoder layer (Qwen3 attention with q/k norms, SwiGLU MLP).
-#[derive(Debug)]
-struct DraftLayer {
-    q_proj: Projection,
-    k_proj: Projection,
-    v_proj: Projection,
-    o_proj: Projection,
-    q_norm: Array,
-    k_norm: Array,
-    gate_proj: Projection,
-    up_proj: Projection,
-    down_proj: Projection,
-    input_layernorm: Array,
-    post_attention_layernorm: Array,
-}
 
 /// The code bridge's tensors (BF16, never quantized: the refinement depends on their rounding),
 /// plus the f32 copies the refinement computes with.
@@ -64,38 +51,6 @@ struct Bridge {
     predecessor_gate_f32: Array,
     prev_f32: Array,
     last_write_f32: Array,
-}
-
-/// The draft's context: per layer, the roped keys and the values of the target rows it has read,
-/// at most [`BlockDraftConfig::context_rows`] of them (E5).
-#[derive(Clone, Debug, Default)]
-pub struct DSpineContext {
-    keys: Vec<Array>,
-    values: Vec<Array>,
-    /// The absolute position the next context row (and so the next block's anchor) occupies.
-    next: i32,
-}
-
-impl DSpineContext {
-    /// The absolute position of the next row — the next block's anchor.
-    pub fn next_position(&self) -> i32 {
-        self.next
-    }
-
-    /// Context rows held (bounded by the window).
-    pub fn rows(&self) -> i32 {
-        self.keys.first().map_or(0, |k| k.shape()[2])
-    }
-
-    /// Every layer's keys then values (equivalence tests compare these).
-    pub fn arrays(&self) -> impl Iterator<Item = &Array> {
-        self.keys.iter().chain(&self.values)
-    }
-
-    /// Bytes the context holds.
-    pub fn bytes(&self) -> u64 {
-        self.arrays().map(|a| a.nbytes() as u64).sum()
-    }
 }
 
 /// One block forward's outputs: the final-normalized rows after the anchor, and the last
@@ -119,39 +74,10 @@ pub struct DSpineDraft {
     norm: Array,
     bridge: Bridge,
     rope: Rope,
-}
-
-fn bf16(a: &Array) -> Result<Array> {
-    Ok(a.as_dtype(Dtype::Bfloat16)?)
-}
-
-fn f32(a: &Array) -> Result<Array> {
-    Ok(a.as_dtype(Dtype::Float32)?)
-}
-
-/// Rows `start..` of a `[.., S, ..]` array along `axis`.
-fn rows_from(a: &Array, start: i32, axis: i32) -> Result<Array> {
-    let n = a.shape()[axis as usize];
-    let idx = Array::arange::<i32, i32>(start, n, None)?;
-    Ok(a.take_axis(&idx, axis)?)
-}
-
-/// One load group's view of the weights ([`BlockDraftConfig::load_groups`]): a read outside the
-/// group's tensors is an error, so the draft converts exactly what the group was priced for.
-struct GroupReader<'a> {
-    w: &'a Weights,
-    tensors: &'a [String],
-}
-
-impl GroupReader<'_> {
-    fn require(&self, name: &str) -> Result<&Array> {
-        if !self.tensors.iter().any(|t| t == name) {
-            return Err(Error::Msg(format!(
-                "`{name}` is read outside its priced load group"
-            )));
-        }
-        self.w.require(name)
-    }
+    /// The code bridge's code width, rank and epsilon ([`BlockDraftHead::DSpine`]).
+    code_size: usize,
+    bridge_rank: usize,
+    bridge_eps: f32,
 }
 
 impl DSpineDraft {
@@ -254,6 +180,17 @@ impl DSpineDraft {
             bits: p.bits() as i32,
             grid: QuantGrid::Computed,
         });
+        let BlockDraftHead::DSpine {
+            code_size,
+            bridge_rank,
+            bridge_eps,
+        } = cfg.head
+        else {
+            return Err(Error::Msg(format!(
+                "a {} config is not a DSpine draft",
+                cfg.format.label()
+            )));
+        };
         let layers = groups[..layer_count]
             .iter()
             .enumerate()
@@ -262,23 +199,7 @@ impl DSpineDraft {
                     w,
                     tensors: &group.tensors,
                 };
-                let proj = |s: &str| {
-                    Projection::load(bf16(r.require(&format!("layers.{i}.{s}"))?)?, quant)
-                };
-                let vec = |s: &str| bf16(r.require(&format!("layers.{i}.{s}"))?);
-                Ok(DraftLayer {
-                    q_proj: proj("self_attn.q_proj.weight")?,
-                    k_proj: proj("self_attn.k_proj.weight")?,
-                    v_proj: proj("self_attn.v_proj.weight")?,
-                    o_proj: proj("self_attn.o_proj.weight")?,
-                    q_norm: vec("self_attn.q_norm.weight")?,
-                    k_norm: vec("self_attn.k_norm.weight")?,
-                    gate_proj: proj("mlp.gate_proj.weight")?,
-                    up_proj: proj("mlp.up_proj.weight")?,
-                    down_proj: proj("mlp.down_proj.weight")?,
-                    input_layernorm: vec("input_layernorm.weight")?,
-                    post_attention_layernorm: vec("post_attention_layernorm.weight")?,
-                })
+                DraftLayer::load(&r, i, quant)
             })
             .collect::<Result<Vec<_>>>()?;
         let r = GroupReader {
@@ -314,6 +235,9 @@ impl DSpineDraft {
             bridge,
             precision,
             cfg,
+            code_size,
+            bridge_rank,
+            bridge_eps,
         })
     }
 
@@ -325,23 +249,7 @@ impl DSpineDraft {
             .iter()
             .map(|l| {
                 let mut out = Vec::new();
-                for p in [
-                    &l.q_proj,
-                    &l.k_proj,
-                    &l.v_proj,
-                    &l.o_proj,
-                    &l.gate_proj,
-                    &l.up_proj,
-                    &l.down_proj,
-                ] {
-                    p.push_arrays(&mut out);
-                }
-                out.extend([
-                    l.q_norm.clone(),
-                    l.k_norm.clone(),
-                    l.input_layernorm.clone(),
-                    l.post_attention_layernorm.clone(),
-                ]);
+                l.push_arrays(&mut out);
                 out
             })
             .collect();
@@ -379,91 +287,40 @@ impl DSpineDraft {
 
     /// An empty context at absolute position `start` (the position of the first row it will be
     /// fed).
-    pub fn new_context(&self, start: i32) -> DSpineContext {
-        DSpineContext {
-            keys: Vec::new(),
-            values: Vec::new(),
-            next: start,
-        }
-    }
-
-    fn heads(&self, x: &Array, heads: usize) -> Result<Array> {
-        let s = x.shape();
-        Ok(x.reshape(&[s[0], s[1], heads as i32, self.cfg.head_dim as i32])?)
+    pub fn new_context(&self, start: i32) -> BlockDraftContext {
+        BlockDraftContext::new(start)
     }
 
     /// Append target rows `taps` `[1, n, tap_width]` — positions `ctx.next..` — to the context,
     /// then drop rows no later block can see.
-    pub fn append_context(&self, ctx: &mut DSpineContext, taps: &Array) -> Result<()> {
-        let n = taps.shape()[1];
-        if n == 0 {
-            return Ok(());
+    pub fn append_context(&self, ctx: &mut BlockDraftContext, taps: &Array) -> Result<()> {
+        ContextWriter {
+            cfg: &self.cfg,
+            rope: &self.rope,
+            fc: &self.fc,
+            hidden_norm: &self.hidden_norm,
+            layers: self.layers.iter().collect(),
         }
-        // A row older than the window can never be seen again: feed only the last ones.
-        let taps = match self.cfg.context_rows() {
-            Some(keep) if n > keep as i32 => rows_from(taps, n - keep as i32, 1)?,
-            _ => taps.clone(),
-        };
-        let fed = taps.shape()[1];
-        let skipped = n - fed;
-        let x = rms_norm(
-            &self.fc.forward(&bf16(&taps)?)?,
-            &self.hidden_norm,
-            self.cfg.rms_norm_eps,
-        )?;
-        let (cos, sin) = self
-            .rope
-            .cos_sin(fed, ctx.next + skipped, Dtype::Bfloat16)?;
-        let kv = self.cfg.num_key_value_heads;
-        let mut keys = Vec::with_capacity(self.layers.len());
-        let mut values = Vec::with_capacity(self.layers.len());
-        for (i, layer) in self.layers.iter().enumerate() {
-            let k = rms_norm(
-                &self.heads(&layer.k_proj.forward(&x)?, kv)?,
-                &layer.k_norm,
-                self.cfg.rms_norm_eps,
-            )?;
-            let k = apply_rope(&k, &cos, &sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
-            let v = self
-                .heads(&layer.v_proj.forward(&x)?, kv)?
-                .transpose_axes(&[0, 2, 1, 3])?;
-            let (k, v) = match (ctx.keys.get(i), ctx.values.get(i)) {
-                (Some(old_k), Some(old_v)) => (
-                    concatenate_axis(&[old_k, &k], 2)?,
-                    concatenate_axis(&[old_v, &v], 2)?,
-                ),
-                _ => (k, v),
-            };
-            let (k, v) = match self.cfg.context_rows() {
-                Some(keep) if k.shape()[2] > keep as i32 => {
-                    let start = k.shape()[2] - keep as i32;
-                    (rows_from(&k, start, 2)?, rows_from(&v, start, 2)?)
-                }
-                _ => (k, v),
-            };
-            keys.push(k);
-            values.push(v);
-        }
-        ctx.keys = keys;
-        ctx.values = values;
-        ctx.next += n;
-        Ok(())
+        .append(ctx, taps)
     }
 
     /// One block forward over `embeds` `[1, T, hidden]` (the target's embedding of `[anchor,
     /// mask × (T - 1)]`) at positions `ctx.next..`, attending to the context and causally within
     /// the block. The context is read, not written: the block's own keys never enter it.
-    pub fn block(&self, ctx: &DSpineContext, embeds: &Array, anchor: i32) -> Result<DSpineBlock> {
+    pub fn block(
+        &self,
+        ctx: &BlockDraftContext,
+        embeds: &Array,
+        anchor: i32,
+    ) -> Result<DSpineBlock> {
         let t = embeds.shape()[1];
-        let (heads, kv) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads);
         let (cos, sin) = self.rope.cos_sin(t, ctx.next, Dtype::Bfloat16)?;
-        let scale = (self.cfg.head_dim as f32).powf(-0.5);
         let keys_total = ctx.rows() + t;
         let mask = match self.cfg.sliding_window {
             Some(w) if keys_total > w as i32 => AttnMask::SlidingCausal { window: w as i32 },
             _ => AttnMask::Causal,
         };
-        let sqrt_c = (self.cfg.code_size as f32).sqrt();
+        let sqrt_c = (self.code_size as f32).sqrt();
         let anchor_code =
             bf16(&(f32(&self.bridge.codebook.try_index(anchor)?)? * Array::from_f32(sqrt_c)))?
                 .reshape(&[1, 1, -1])?;
@@ -477,36 +334,10 @@ impl DSpineDraft {
         let last = self.layers.len() - 1;
         let mut stash = None;
         for (i, layer) in self.layers.iter().enumerate() {
-            let q = rms_norm(
-                &self.heads(&layer.q_proj.forward(&x_in)?, heads)?,
-                &layer.q_norm,
-                self.cfg.rms_norm_eps,
-            )?;
-            let k = rms_norm(
-                &self.heads(&layer.k_proj.forward(&x_in)?, kv)?,
-                &layer.k_norm,
-                self.cfg.rms_norm_eps,
-            )?;
-            let v = self.heads(&layer.v_proj.forward(&x_in)?, kv)?;
-            let q = apply_rope(&q, &cos, &sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
-            let k = apply_rope(&k, &cos, &sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
-            let v = v.transpose_axes(&[0, 2, 1, 3])?;
-            let (k, v) = match (ctx.keys.get(i), ctx.values.get(i)) {
-                (Some(ck), Some(cv)) => (
-                    concatenate_axis(&[ck, &k], 2)?,
-                    concatenate_axis(&[cv, &v], 2)?,
-                ),
-                _ => (k, v),
-            };
-            let attn = sdpa(&q, &k, &v, scale, mask)?
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[1, t, -1])?;
-            let h = add(&residual, &layer.o_proj.forward(&attn)?)?;
+            let attn = layer.attend(&self.cfg, &x_in, ctx.layer(i), &cos, &sin, mask)?;
+            let h = add(&residual, &attn)?;
             let normed = rms_norm(&h, &layer.post_attention_layernorm, self.cfg.rms_norm_eps)?;
-            let mlp = layer.down_proj.forward(&multiply(
-                &silu(&layer.gate_proj.forward(&normed)?)?,
-                &layer.up_proj.forward(&normed)?,
-            )?)?;
+            let mlp = layer.mlp(&normed)?;
             let out = add(&h, &mlp)?;
             let next_norm = if i < last {
                 &self.layers[i + 1].input_layernorm
@@ -540,9 +371,9 @@ impl DSpineDraft {
     ) -> Result<(Array, Array, (Array, Array, Array))> {
         let b = &self.bridge;
         let t = hidden.shape()[1];
-        let r = self.cfg.bridge_rank as i32;
-        let eps = Array::from_f32(self.cfg.bridge_eps);
-        let sqrt_c = Array::from_f32((self.cfg.code_size as f32).sqrt());
+        let r = self.bridge_rank as i32;
+        let eps = Array::from_f32(self.bridge_eps);
+        let sqrt_c = Array::from_f32((self.code_size as f32).sqrt());
         let f = f32(&bf16(hidden)?)?;
         let rms = sqrt(&maximum(
             &mean_axis(&f.square()?, -1, None)?,
@@ -633,7 +464,7 @@ impl DSpineDraft {
         } else {
             anchor_row
         };
-        let sqrt_c = Array::from_f32((self.cfg.code_size as f32).sqrt());
+        let sqrt_c = Array::from_f32((self.code_size as f32).sqrt());
         let e = multiply(
             &f32(&b.codebook.take_axis(&senders.reshape(&[-1])?, 0)?)?,
             &sqrt_c,
