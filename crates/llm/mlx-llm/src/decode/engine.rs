@@ -35,6 +35,17 @@
 //! accepted drafts, the recovery replays and the measured sampler path (E3); the provider adds the
 //! request's fallback reasons (E2).
 //!
+//! ## Tree verification (feature SW-F328)
+//! With [`EngineOptions::tree_rows`] set, a step asks the proposer for a candidate **tree**
+//! ([`Proposer::propose_tree`]; the default is the linear proposal as one branch). A one-branch
+//! tree takes the linear step above. A branching tree is verified in one target forward
+//! ([`SpeculativeTarget::forward_tree`]: the anchor and every candidate, each row attending only
+//! its ancestors at the RoPE position of its depth), walked from the anchor with `core_llm`'s tree
+//! rules (greedy, or recursive rejection sampling over each row's children), and the target keeps
+//! only the accepted branch ([`SpeculativeTarget::commit_tree`]: the softmax KV compacted into
+//! place, the Qwen35 hybrid's DeltaNet state of the branch's last row). A failure after the
+//! forward returns the cache to the step start ([`SpeculativeTarget::abort_tree`]).
+//!
 //! ## Extension points
 //! A new proposal source (a draft model, a companion MTP head) is a [`Proposer`] impl; a cache that
 //! can roll back per token (a DeltaNet checkpoint ring) is a [`CacheRollback`] impl returning
@@ -53,13 +64,15 @@
 use std::time::Instant;
 
 use mlx_rs::transforms::{async_eval, eval};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
+use core_llm::speculative::tree::{greedy_tree_step, sampled_tree_step, walk_tree, TreeStep};
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
     AcceptanceMonitor, CudaGraphsReport, DecodeReport, HostSampleReason, PathReport, PlainDecode,
     ProposerKind, SamplerPath, Speculative, StepObservation,
 };
+use core_llm::{DraftTree, TreeVerifyReport, TreeWalk};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::speculative::SpeculativeStats;
@@ -294,6 +307,100 @@ pub trait SpeculativeTarget {
     }
     /// How attention is computed, for the report (`gqa`, `expanded`).
     fn attention_label(&self) -> &'static str;
+
+    /// Why this target cannot verify a candidate tree on `cache`, or `None` when it can (feature
+    /// SW-F328). A tree request on a target that cannot verifies linearly, the reason named.
+    fn tree_unsupported(&self, _cache: &Self::Cache) -> Option<String> {
+        Some("this target verifies only linear proposals".into())
+    }
+
+    /// The dtype of the additive tree mask ([`TreeInputs::mask`]) — the activation dtype.
+    fn tree_mask_dtype(&self) -> Dtype {
+        Dtype::Bfloat16
+    }
+
+    /// Verify the tree `inputs` in one forward (feature SW-F328), appending every row to `cache`
+    /// with ancestor-only visibility; returns every row's logits `[1, rows, vocab]` (and hidden
+    /// rows when asked). The cache holds all rows until [`commit_tree`](Self::commit_tree) keeps
+    /// one branch or [`abort_tree`](Self::abort_tree) drops them.
+    fn forward_tree(
+        &self,
+        _cache: &mut Self::Cache,
+        _inputs: &TreeInputs,
+        _want_hidden: bool,
+    ) -> Result<TargetOutput> {
+        Err(Error::Unsupported(
+            "this target verifies only linear proposals".into(),
+        ))
+    }
+
+    /// Keep the tree branch `path` (rows from the anchor) of the tree forward that started at
+    /// cache position `base`: the cache then equals a linear decode of the branch.
+    fn commit_tree(&self, _cache: &mut Self::Cache, _base: i32, _path: &[usize]) -> Result<()> {
+        Err(Error::Unsupported(
+            "this target verifies only linear proposals".into(),
+        ))
+    }
+
+    /// Return the cache to position `base`, before a tree forward that will not be committed.
+    fn abort_tree(&self, _cache: &mut Self::Cache, _base: i32) -> Result<()> {
+        Ok(())
+    }
+
+    /// Bytes a tree forward's pending per-row state holds beside the cache (the hybrid's
+    /// per-row recurrent states); the engine adds the mask's.
+    fn tree_workspace_bytes(&self, _cache: &Self::Cache) -> u64 {
+        0
+    }
+}
+
+/// One tree verify forward's inputs (feature SW-F328): the anchor then every candidate in row
+/// order, each row's RoPE position (the anchor's plus its depth), the additive ancestor-only
+/// mask over `[cache ‖ rows]` and the tree's parent rows.
+pub struct TreeInputs {
+    /// `[1, rows]` int32 ids.
+    pub ids: Array,
+    /// Each row's RoPE position.
+    pub positions: Vec<i32>,
+    /// `[1, 1, rows, base + rows]`: `0` where a row may attend, `-inf` elsewhere.
+    pub mask: Array,
+    /// Each candidate's parent row (`parents[r - 1]` for row `r`).
+    pub parents: Vec<usize>,
+}
+
+impl TreeInputs {
+    /// The inputs of `tree` after `anchor`, the anchor at cache position `base` and RoPE
+    /// position `rope_offset`, with the mask in `dtype`.
+    pub fn new(
+        tree: &DraftTree,
+        anchor: i32,
+        base: i32,
+        rope_offset: i32,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        let rows = tree.rows();
+        let mut ids = Vec::with_capacity(rows);
+        ids.push(anchor);
+        ids.extend(tree.nodes().iter().map(|n| n.token));
+        let positions = tree.depths().into_iter().map(|d| rope_offset + d).collect();
+        let prefix = base.max(0) as usize;
+        let cols = prefix + rows;
+        let visible = tree.visibility();
+        let mut mask = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..rows {
+                if !visible[i * rows + j] {
+                    mask[i * cols + prefix + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Ok(Self {
+            ids: input_ids(&ids),
+            positions,
+            mask: Array::from_slice(&mask, &[1, 1, rows as i32, cols as i32]).as_dtype(dtype)?,
+            parents: tree.nodes().iter().map(|n| n.parent).collect(),
+        })
+    }
 }
 
 impl SpeculativeTarget for CausalLm {
@@ -348,6 +455,53 @@ impl SpeculativeTarget for CausalLm {
             "gqa"
         }
     }
+
+    fn tree_unsupported(&self, _: &ContiguousKvCache) -> Option<String> {
+        CausalLm::tree_unsupported(self).map(str::to_string)
+    }
+
+    fn tree_mask_dtype(&self) -> Dtype {
+        self.compute_dtype()
+    }
+
+    fn forward_tree(
+        &self,
+        cache: &mut ContiguousKvCache,
+        inputs: &TreeInputs,
+        want_hidden: bool,
+    ) -> Result<TargetOutput> {
+        causal_forward_tree(self, cache, inputs, want_hidden)
+    }
+
+    fn commit_tree(&self, cache: &mut ContiguousKvCache, base: i32, path: &[usize]) -> Result<()> {
+        cache.compact_tail(base, &path_rows(path))
+    }
+
+    fn abort_tree(&self, cache: &mut ContiguousKvCache, base: i32) -> Result<()> {
+        cache.truncate(base.min(cache.offset()))
+    }
+}
+
+/// The causal decoder's tree forward over any KV cache that keeps a tree branch.
+fn causal_forward_tree(
+    model: &CausalLm,
+    cache: &mut dyn KvCache,
+    inputs: &TreeInputs,
+    want_hidden: bool,
+) -> Result<TargetOutput> {
+    if want_hidden {
+        return Err(Error::Msg(
+            "CausalLm: the speculative target does not return hidden states".into(),
+        ));
+    }
+    Ok(TargetOutput {
+        logits: model.decode_logits_tree(&inputs.ids, cache, &inputs.positions, &inputs.mask)?,
+        hidden: None,
+    })
+}
+
+fn path_rows(path: &[usize]) -> Vec<i32> {
+    path.iter().map(|&r| r as i32).collect()
 }
 
 impl SpeculativeTarget for Qwen35Model {
@@ -412,6 +566,50 @@ impl SpeculativeTarget for Qwen35Model {
 
     fn attention_label(&self) -> &'static str {
         "gqa"
+    }
+
+    fn tree_unsupported(&self, _: &Qwen35Cache) -> Option<String> {
+        None
+    }
+
+    fn tree_mask_dtype(&self) -> Dtype {
+        self.compute_dtype()
+    }
+
+    fn forward_tree(
+        &self,
+        cache: &mut Qwen35Cache,
+        inputs: &TreeInputs,
+        want_hidden: bool,
+    ) -> Result<TargetOutput> {
+        let plan = std::sync::Arc::new(crate::primitives::gated_delta::TreePlan::new(
+            &inputs.parents,
+        ));
+        let (logits, hidden) = Qwen35Model::forward_tree(
+            self,
+            &inputs.ids,
+            cache,
+            &inputs.positions,
+            plan,
+            &inputs.mask,
+            want_hidden,
+        )?;
+        if let Some(hidden) = hidden.as_ref() {
+            eval([hidden, &logits])?;
+        }
+        Ok(TargetOutput { logits, hidden })
+    }
+
+    fn commit_tree(&self, cache: &mut Qwen35Cache, base: i32, path: &[usize]) -> Result<()> {
+        cache.commit_tree(base, path)
+    }
+
+    fn abort_tree(&self, cache: &mut Qwen35Cache, base: i32) -> Result<()> {
+        cache.abort_tree(base)
+    }
+
+    fn tree_workspace_bytes(&self, cache: &Qwen35Cache) -> u64 {
+        cache.tree_bytes()
     }
 }
 
@@ -532,6 +730,41 @@ impl<'m> SpeculativeTarget for DynCacheTarget<'m> {
     fn attention_label(&self) -> &'static str {
         SpeculativeTarget::attention_label(self.0)
     }
+
+    fn tree_unsupported(&self, cache: &Box<dyn KvCache + 'm>) -> Option<String> {
+        if let Some(why) = CausalLm::tree_unsupported(self.0) {
+            return Some(why.into());
+        }
+        (!cache.supports_tree_verify())
+            .then(|| "this KV cache representation cannot keep an arbitrary tree branch".into())
+    }
+
+    fn tree_mask_dtype(&self) -> Dtype {
+        self.0.compute_dtype()
+    }
+
+    fn forward_tree(
+        &self,
+        cache: &mut Box<dyn KvCache + 'm>,
+        inputs: &TreeInputs,
+        want_hidden: bool,
+    ) -> Result<TargetOutput> {
+        causal_forward_tree(self.0, cache.as_mut(), inputs, want_hidden)
+    }
+
+    fn commit_tree(
+        &self,
+        cache: &mut Box<dyn KvCache + 'm>,
+        base: i32,
+        path: &[usize],
+    ) -> Result<()> {
+        cache.compact_tail(base, &path_rows(path))
+    }
+
+    fn abort_tree(&self, cache: &mut Box<dyn KvCache + 'm>, base: i32) -> Result<()> {
+        let keep = base.min(cache.offset());
+        cache.truncate(keep)
+    }
 }
 
 /// A caller's `&mut dyn KvCache` as an owned [`DynCacheTarget`] cache: every [`KvCache`] method
@@ -619,6 +852,14 @@ impl KvCache for BorrowedCache<'_> {
 
     fn record_events(&mut self) {
         self.0.record_events()
+    }
+
+    fn supports_tree_verify(&self) -> bool {
+        self.0.supports_tree_verify()
+    }
+
+    fn compact_tail(&mut self, base: i32, rows: &[i32]) -> Result<()> {
+        self.0.compact_tail(base, rows)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -815,8 +1056,12 @@ pub struct ProposeContext<'a> {
     pub previous_hidden: Option<&'a Array>,
     /// The RoPE position `cur` occupies.
     pub position: i32,
-    /// At most this many drafts (already clamped to the remaining budget, `>= 1`).
+    /// At most this many drafts (already clamped to the remaining budget, `>= 1`) — in a tree,
+    /// the deepest a candidate may sit below the anchor.
     pub max_drafts: usize,
+    /// At most this many candidate rows in a tree proposal ([`Proposer::propose_tree`], feature
+    /// SW-F328); `max_drafts` on a linear run.
+    pub max_rows: usize,
 }
 
 /// One host-sampled draft: the token and, for a stochastic run, the proposal distribution it was
@@ -920,6 +1165,23 @@ pub trait Proposer<T: SpeculativeTarget + ?Sized> {
         ctx: &ProposeContext<'_>,
         sampler: &mut DraftSampler<'_, '_>,
     ) -> Result<Proposal>;
+
+    /// Propose a **tree** of candidates after `ctx.cur` (feature SW-F328): at most
+    /// `ctx.max_rows` candidates, none deeper than `ctx.max_drafts`. Called instead of
+    /// [`propose`](Self::propose) on a tree run. The default is the linear proposal as a
+    /// one-branch tree, so every proposer runs under a tree request; a proposer with several
+    /// candidates per position overrides it. A candidate's distribution is the `q` it was drawn
+    /// from (`None` for a deterministic candidate). [`commit`](Self::commit) then receives the
+    /// accepted branch's candidates.
+    fn propose_tree(
+        &mut self,
+        target: &T,
+        ctx: &ProposeContext<'_>,
+        sampler: &mut DraftSampler<'_, '_>,
+    ) -> Result<DraftTree> {
+        let Proposal { drafts, dists } = self.propose(target, ctx, sampler)?;
+        Ok(DraftTree::chain(&drafts, &dists))
+    }
 
     /// The verify outcome: `accepted` is the accepted draft prefix; `kept_hidden` the target's
     /// hidden rows `[1, 1 + accepted.len(), hidden]` for `[cur, accepted…]` when
@@ -1033,6 +1295,10 @@ pub struct EngineOptions<'a, 'c> {
     /// itself to token-at-a-time decoding (see [`generate_speculative`]); any other option — an
     /// explicit proposer, `off`, the default — runs the proposer to the end.
     pub speculative_mode: Speculative,
+    /// Candidate rows per tree verify pass (feature SW-F328); `0` (the default) verifies
+    /// linearly. A target that cannot verify a tree on its cache
+    /// ([`SpeculativeTarget::tree_unsupported`]) verifies linearly and the report names why.
+    pub tree_rows: usize,
 }
 
 /// The most tokens the pipelined loop reads back unpipelined while the caller has delivered
@@ -1168,6 +1434,7 @@ where
         sampler,
         pipelining,
         speculative_mode,
+        tree_rows,
     } = options;
     let mut owned_sampler;
     let sampler: &mut dyn TokenSampler = match sampler {
@@ -1282,6 +1549,26 @@ where
         core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     }
     let mut rollback = target.rollback(width);
+    // Tree verification (feature SW-F328): only on a speculative run, at most the shared row
+    // bound, and only where the target can keep a tree branch on this cache — otherwise the run
+    // verifies linearly and the report names why.
+    let mut tree_fallback = None;
+    let tree_rows = if width == 0 || tree_rows == 0 {
+        0
+    } else if let Some(why) = target.tree_unsupported(cache) {
+        tree_fallback = Some(format!(
+            "speculative: tree verification unavailable ({why}); verified linearly"
+        ));
+        0
+    } else {
+        tree_rows.min(core_llm::MAX_TREE_ROWS as usize)
+    };
+    if tree_rows > 0 {
+        stats.tree = Some(TreeVerifyReport {
+            max_rows: tree_rows as u32,
+            ..TreeVerifyReport::default()
+        });
+    }
 
     // A cancel that tripped during the prefill ends the run before its first draw, exactly as the
     // plain loop's per-step check does.
@@ -1420,9 +1707,11 @@ where
         }
         let checkpoint = constraint.as_ref().map(|c| c.checkpoint());
 
-        // 1. Propose. The constraint is rewound only when a sampled draft advanced it.
-        let proposal = if k == 0 {
-            Proposal::default()
+        // 1. Propose. The constraint is rewound only when a sampled draft advanced it. A tree run
+        // (feature SW-F328) asks for a tree; a one-branch tree takes the linear path below, whose
+        // decision is the same rule, so only a branching tree runs a tree forward.
+        let (proposal, branching) = if k == 0 {
+            (Proposal::default(), None)
         } else {
             let ctx = ProposeContext {
                 cur,
@@ -1430,6 +1719,7 @@ where
                 previous_hidden: previous_hidden.as_ref(),
                 position,
                 max_drafts: k,
+                max_rows: if tree_rows > 0 { tree_rows } else { k },
             };
             let mut draft_sampler = DraftSampler {
                 config,
@@ -1437,107 +1727,186 @@ where
                 constraint: constraint.as_deref_mut(),
                 advanced: false,
             };
-            let proposal = proposer.propose(target, &ctx, &mut draft_sampler)?;
+            let proposed = if tree_rows > 0 {
+                let tree = proposer
+                    .propose_tree(target, &ctx, &mut draft_sampler)?
+                    .pruned(k, tree_rows, |t| config.stop_tokens.contains(&t));
+                if tree.is_chain() {
+                    let drafts = tree.nodes().iter().map(|n| n.token).collect();
+                    let dists = tree.nodes().iter().map_while(|n| n.dist.clone()).collect();
+                    (Proposal { drafts, dists }, None)
+                } else {
+                    (Proposal::default(), Some(tree))
+                }
+            } else {
+                (proposer.propose(target, &ctx, &mut draft_sampler)?, None)
+            };
             if draft_sampler.advanced {
                 if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
                     c.rewind(checkpoint);
                 }
             }
-            proposal
+            proposed
         };
-        let Proposal {
-            drafts: mut draft_ids,
-            dists,
-        } = proposal;
-        // Nothing past the first stop token is a proposal: it could never be committed.
-        if let Some(stop) = draft_ids
-            .iter()
-            .position(|t| config.stop_tokens.contains(t))
-        {
-            draft_ids.truncate(stop + 1);
-        }
-        draft_ids.truncate(k);
-        let num_drafts = draft_ids.len();
-        stats.proposed += num_drafts;
-        if cancel.is_cancelled() {
-            // Nothing has been written to the target cache yet.
-            finish = FinishReason::Cancelled;
-            break;
-        }
+        let (committed, accepted, last, kept_hidden, draft_ids, num_drafts) =
+            if let Some(tree) = branching {
+                // A branching tree: verify every candidate in one forward, walk the tree, keep only
+                // the accepted branch (feature SW-F328).
+                stats.proposed += tree.len();
+                if cancel.is_cancelled() {
+                    // Nothing has been written to the target cache yet.
+                    finish = FinishReason::Cancelled;
+                    break;
+                }
+                let (walk, kept_hidden, workspace) = tree_step(
+                    target,
+                    cache,
+                    &tree,
+                    (cur, base, position),
+                    wants_hidden,
+                    &history,
+                    config,
+                    sampler,
+                    constraint.as_deref_mut(),
+                )?;
+                if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
+                    c.rewind(checkpoint);
+                }
+                stats.forwards += 1;
+                stats.verify_steps += 1;
+                stats.accepted += walk.accepted;
+                if walk.accepted < tree.len() {
+                    stats.direct_rollbacks += 1;
+                }
+                if let Some(report) = stats.tree.as_mut() {
+                    report.tree_passes += 1;
+                    report.peak_workspace_bytes = report.peak_workspace_bytes.max(workspace);
+                }
+                let TreeWalk {
+                    committed,
+                    accepted,
+                    ..
+                } = walk;
+                let accepted_drafts = committed[..accepted].to_vec();
+                (
+                    committed,
+                    accepted,
+                    None,
+                    kept_hidden,
+                    accepted_drafts,
+                    tree.len(),
+                )
+            } else {
+                let Proposal {
+                    drafts: mut draft_ids,
+                    dists,
+                } = proposal;
+                // Nothing past the first stop token is a proposal: it could never be committed.
+                if let Some(stop) = draft_ids
+                    .iter()
+                    .position(|t| config.stop_tokens.contains(t))
+                {
+                    draft_ids.truncate(stop + 1);
+                }
+                draft_ids.truncate(k);
+                let num_drafts = draft_ids.len();
+                stats.proposed += num_drafts;
+                if cancel.is_cancelled() {
+                    // Nothing has been written to the target cache yet.
+                    finish = FinishReason::Cancelled;
+                    break;
+                }
 
-        // 2. Verify `[cur, drafts…]` in one target forward. A step without drafts feeds `cur` as
-        // it was drawn, so a device-resident token is never read back to build the input.
-        let mut verify = Vec::with_capacity(1 + num_drafts);
-        verify.push(cur);
-        verify.extend_from_slice(&draft_ids);
-        let (scope, input) = if num_drafts == 0 {
-            (LogitsScope::Last, cur_input)
-        } else {
-            rollback.begin(cache)?;
-            (LogitsScope::All, input_ids(&verify))
-        };
-        let out = target.forward(cache, &input, position, scope, wants_hidden)?;
-        drop(input);
-        if let Some(hidden) = out.hidden.as_ref() {
-            eval([hidden, &out.logits])?;
-        }
-        stats.forwards += 1;
-        stats.verify_steps += 1;
+                // 2. Verify `[cur, drafts…]` in one target forward. A step without drafts feeds `cur` as
+                // it was drawn, so a device-resident token is never read back to build the input.
+                let mut verify = Vec::with_capacity(1 + num_drafts);
+                verify.push(cur);
+                verify.extend_from_slice(&draft_ids);
+                let (scope, input) = if num_drafts == 0 {
+                    (LogitsScope::Last, cur_input)
+                } else {
+                    rollback.begin(cache)?;
+                    (LogitsScope::All, input_ids(&verify))
+                };
+                let out = target.forward(cache, &input, position, scope, wants_hidden)?;
+                drop(input);
+                if let Some(hidden) = out.hidden.as_ref() {
+                    eval([hidden, &out.logits])?;
+                }
+                stats.forwards += 1;
+                stats.verify_steps += 1;
 
-        // 3. Decide. Only a decision over drafts advances the constraint provisionally.
-        let Decision {
-            committed,
-            accepted,
-            last,
-        } = decide(
-            &out.logits,
-            &draft_ids,
-            &dists,
-            &history,
-            config,
-            sampler,
-            constraint.as_deref_mut(),
-        )?;
-        if num_drafts > 0 {
-            if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
-                c.rewind(checkpoint);
-            }
-        }
-        stats.accepted += accepted;
-
-        // 4. Recover the cache to `[cur, accepted…]`.
-        let keep_len = 1 + accepted;
-        let kept_hidden = if num_drafts == 0 {
-            out.hidden
-        } else {
-            match rollback.recover(cache, base + keep_len as i32)? {
-                Rollback::Direct => {
-                    if accepted < num_drafts {
-                        stats.direct_rollbacks += 1;
-                    }
-                    match out.hidden {
-                        Some(h) if accepted < num_drafts => Some(seq_rows(&h, 0, keep_len as i32)?),
-                        other => other,
+                // 3. Decide. Only a decision over drafts advances the constraint provisionally.
+                let Decision {
+                    committed,
+                    accepted,
+                    last,
+                } = decide(
+                    &out.logits,
+                    &draft_ids,
+                    &dists,
+                    &history,
+                    config,
+                    sampler,
+                    constraint.as_deref_mut(),
+                )?;
+                if num_drafts > 0 {
+                    if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
+                        c.rewind(checkpoint);
                     }
                 }
-                Rollback::Restored => {
-                    drop(out);
-                    let replayed = target.forward(
-                        cache,
-                        &input_ids(&verify[..keep_len]),
-                        position,
-                        LogitsScope::Last,
-                        wants_hidden,
-                    )?;
-                    if let Some(hidden) = replayed.hidden.as_ref() {
-                        eval([hidden])?;
+                stats.accepted += accepted;
+
+                // 4. Recover the cache to `[cur, accepted…]`.
+                let keep_len = 1 + accepted;
+                let kept_hidden = if num_drafts == 0 {
+                    out.hidden
+                } else {
+                    match rollback.recover(cache, base + keep_len as i32)? {
+                        Rollback::Direct => {
+                            if accepted < num_drafts {
+                                stats.direct_rollbacks += 1;
+                            }
+                            match out.hidden {
+                                Some(h) if accepted < num_drafts => {
+                                    Some(seq_rows(&h, 0, keep_len as i32)?)
+                                }
+                                other => other,
+                            }
+                        }
+                        Rollback::Restored => {
+                            drop(out);
+                            let replayed = target.forward(
+                                cache,
+                                &input_ids(&verify[..keep_len]),
+                                position,
+                                LogitsScope::Last,
+                                wants_hidden,
+                            )?;
+                            if let Some(hidden) = replayed.hidden.as_ref() {
+                                eval([hidden])?;
+                            }
+                            stats.forwards += 1;
+                            stats.replays += 1;
+                            replayed.hidden
+                        }
                     }
-                    stats.forwards += 1;
-                    stats.replays += 1;
-                    replayed.hidden
-                }
-            }
-        };
+                };
+                (
+                    committed,
+                    accepted,
+                    last,
+                    kept_hidden,
+                    draft_ids,
+                    num_drafts,
+                )
+            };
+        if let Some(report) = stats.tree.as_mut() {
+            report.passes += 1;
+            report.rows_verified += 1 + num_drafts as u64;
+            report.max_rows_per_pass = report.max_rows_per_pass.max(1 + num_drafts as u64);
+            report.accepted_tokens += accepted as u64;
+        }
         release.advance(committed.len());
         if !demoted {
             proposer.commit(
@@ -1644,9 +2013,109 @@ where
         stats.demoted_at = Some(generated.len());
     }
 
-    Ok(finished(
+    let mut run = finished(
         generated, finish, stats, sampler, timer, start_len, on_event,
-    ))
+    );
+    run.report.fallbacks.extend(tree_fallback);
+    Ok(run)
+}
+
+/// One branching tree verify step (feature SW-F328): the tree forward, the walk from the anchor
+/// with `core_llm`'s tree rules — the per-row argmax for a plain greedy run, per-row host draws
+/// with the running history and constraint for a penalized or constrained one, recursive
+/// rejection sampling over each row's children for a stochastic one — then the target keeps only
+/// the accepted branch. Any failure after the forward returns the cache to the step start. The
+/// constraint is advanced along the accepted branch (the caller rewinds it). Returns the walk,
+/// the kept hidden rows `[1, 1 + accepted, hidden]` when asked, and the step's workspace bytes.
+#[allow(clippy::too_many_arguments)]
+fn tree_step<T: SpeculativeTarget + ?Sized>(
+    target: &T,
+    cache: &mut T::Cache,
+    tree: &DraftTree,
+    (anchor, base, position): (i32, i32, i32),
+    wants_hidden: bool,
+    history: &[i32],
+    config: &GenerationConfig,
+    sampler: &mut dyn TokenSampler,
+    constraint: Option<&mut (dyn RewindableConstraintMask + '_)>,
+) -> Result<(TreeWalk, Option<Array>, u64)> {
+    let inputs = TreeInputs::new(tree, anchor, base, position, target.tree_mask_dtype())?;
+    let out = match target.forward_tree(cache, &inputs, wants_hidden) {
+        Ok(out) => out,
+        Err(e) => {
+            target.abort_tree(cache, base)?;
+            return Err(e);
+        }
+    };
+    let workspace = inputs.mask.nbytes() as u64 + target.tree_workspace_bytes(cache);
+    let walk = tree_walk(&out.logits, tree, history, config, sampler, constraint)
+        .and_then(|walk| target.commit_tree(cache, base, &walk.path).map(|()| walk));
+    let walk = match walk {
+        Ok(walk) => walk,
+        Err(e) => {
+            target.abort_tree(cache, base)?;
+            return Err(e);
+        }
+    };
+    let kept_hidden = match out.hidden {
+        Some(h) => {
+            let rows = path_rows(&walk.path);
+            Some(h.take_axis(Array::from_slice(&rows, &[rows.len() as i32]), 1)?)
+        }
+        None => None,
+    };
+    Ok((walk, kept_hidden, workspace))
+}
+
+/// The tree decision over every row's logits `[1, rows, vocab]` (see [`tree_step`]).
+fn tree_walk(
+    logits: &Array,
+    tree: &DraftTree,
+    history: &[i32],
+    config: &GenerationConfig,
+    sampler: &mut dyn TokenSampler,
+    mut constraint: Option<&mut (dyn RewindableConstraintMask + '_)>,
+) -> Result<TreeWalk> {
+    let rows = match logits.shape() {
+        [_, n, _] => *n as usize,
+        _ => 1,
+    };
+    if rows != tree.rows() {
+        return Err(Error::Msg(format!(
+            "tree verify returned {rows} positions for {} rows",
+            tree.rows()
+        )));
+    }
+    let is_stop = |t: i32| config.stop_tokens.contains(&t);
+    if config.sampling.is_plain_greedy() && constraint.is_none() {
+        let argmax = sampler.argmax_rows(logits)?;
+        return walk_tree(tree, is_stop, |row, children| {
+            Ok(greedy_tree_step(tree, children, argmax[row]))
+        });
+    }
+    let greedy = config.sampling.temperature <= 0.0;
+    let mut running = history.to_vec();
+    walk_tree(tree, is_stop, |row, children| -> Result<TreeStep> {
+        let row_logits = logits_row(logits, row as i32)?;
+        let mask = constraint.as_mut().map(|c| c.allowed());
+        let step = if greedy {
+            let target = sampler.sample(&row_logits, &running, mask)?.resolve()?;
+            greedy_tree_step(tree, children, target)
+        } else {
+            let p = sampler.distribution(&row_logits, &running, mask)?;
+            sampled_tree_step(tree, &p, children, &mut || sampler.uniform())
+        };
+        if let TreeStep::Child(child) = step {
+            let token = tree.node(child).token;
+            if !is_stop(token) {
+                if let Some(c) = constraint.as_mut() {
+                    c.accept(token);
+                }
+                running.push(token);
+            }
+        }
+        Ok(step)
+    })
 }
 
 /// Hand the plain probe's steps to the proposer ([`Proposer::catch_up`]): each probed token with
@@ -1914,6 +2383,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
         prefix_hit_tokens: 0,
         prefix_cache: none(),
         fallbacks: Vec::new(),
+        tree_verify: stats.tree,
     }
 }
 
@@ -2052,3 +2522,6 @@ fn last_row(hidden: &Array) -> Result<Array> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod tree_tests;

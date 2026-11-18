@@ -1369,5 +1369,7 @@ fn weight_of(candidates: &[(i32, f32)], token: i32) -> f32 {
         .unwrap_or(0.0)
 }
 
+pub mod tree;
+
 #[cfg(test)]
 mod tests;

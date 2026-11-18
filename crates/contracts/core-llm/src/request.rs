@@ -149,6 +149,34 @@ impl Speculative {
     }
 }
 
+/// How a speculative verify pass lays out its candidates (feature SW-F328): one proposed
+/// continuation (`linear`, the default and every pre-SW-F328 request's behaviour), or a bounded
+/// **tree** of candidate continuations verified in one target forward with ancestor-only
+/// visibility, keeping only the accepted branch's state.
+///
+/// The tree is an explicit opt-in: [`Speculative::Auto`] never turns it on. It runs only when a
+/// proposer runs and the loaded model advertises it
+/// ([`TextLlmCapabilities::tree_verify`](crate::TextLlmCapabilities::tree_verify)); otherwise the
+/// request verifies linearly and [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) says
+/// why ([`resolve_tree_verify`](crate::speculative::tree::resolve_tree_verify)). Like every
+/// speculative option it changes the speed, never the output distribution.
+///
+/// **Wire form.** `"linear"` or `{"tree": {"max_rows": N}}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculativeVerify {
+    /// One proposed continuation per verify pass.
+    #[default]
+    Linear,
+    /// A tree of at most `max_rows` candidate rows (beyond the anchor) per verify pass. Above
+    /// the advertised bound it runs at that bound, the clamp named in the decode report; `0` is
+    /// refused by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request).
+    Tree {
+        /// Candidate rows per verify pass (`>= 1`).
+        max_rows: u32,
+    },
+}
+
 impl From<MtpMode> for Speculative {
     fn from(mode: MtpMode) -> Self {
         match mode {
@@ -500,6 +528,9 @@ pub struct TextLlmRequest {
     /// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
     /// rather than silently preferring one.
     pub mtp: Option<MtpMode>,
+    /// How a speculative verify pass lays out its candidates (feature SW-F328): linear (the
+    /// default) or an explicitly requested tree. Inert when no proposer runs.
+    pub speculative_verify: SpeculativeVerify,
     /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
     /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
     /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a

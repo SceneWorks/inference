@@ -98,7 +98,7 @@ pub mod vision_preprocess;
 pub use cancel::CancelFlag;
 pub use capabilities::{
     ModelSamplingDefaults, MtpCapabilities, ProposerCapabilities, TextLlmCapabilities,
-    TextLlmDescriptor,
+    TextLlmDescriptor, TreeVerifyCapabilities,
 };
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
@@ -160,11 +160,11 @@ pub use registry::{
 };
 pub use report::{
     prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeReport, DraftReport,
-    FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
+    FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport, TreeVerifyReport,
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
-    Speculative, SpeculativeProposer, TextLlmRequest, ThinkingMode,
+    Speculative, SpeculativeProposer, SpeculativeVerify, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_draft_load, admit_load_memory, admit_request_memory, admit_request_memory_with_geometry,
@@ -176,6 +176,9 @@ pub use resource::{
     tiled_prefill_activation_bytes, LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
+pub use speculative::tree::{
+    ngram_propose_tree, resolve_tree_verify, DraftTree, TreeResolution, TreeWalk, MAX_TREE_ROWS,
+};
 pub use speculative::{
     accept_greedy_run, accept_token, decode_clock, demotion_threshold, draft_compatibility,
     draft_load_refusal, draft_model_capabilities, draft_refusal, draft_tokenizer_refusal,

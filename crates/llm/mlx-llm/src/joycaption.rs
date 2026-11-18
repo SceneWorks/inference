@@ -616,6 +616,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             mtp: None,
             speculative: Vec::new(),
             supported_constraints: Vec::new(),
+            tree_verify: None,
         },
     }
 }

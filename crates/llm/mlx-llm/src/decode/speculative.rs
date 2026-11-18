@@ -83,6 +83,8 @@ pub struct SpeculativeStats {
     /// The last window `auto`'s acceptance monitor judged (sc-24446); `None` when no monitor ran
     /// or the run ended before its first window.
     pub monitor: Option<core_llm::MonitorDecision>,
+    /// Tree verification's counters on a tree run (feature SW-F328); `None` otherwise.
+    pub tree: Option<core_llm::TreeVerifyReport>,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and

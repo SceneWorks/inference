@@ -2299,6 +2299,8 @@ impl LlamaProvider {
                 d.capabilities.speculative = vec![prompt_lookup_capabilities(
                     speculative_max_depth(causal_attention_geometries(model.config())),
                 )];
+                d.capabilities.tree_verify =
+                    tree_verify_capabilities(CausalLm::tree_unsupported(&model).is_none());
                 d
             },
             architecture,
@@ -3986,6 +3988,7 @@ impl LlamaProvider {
         let speculative_mode = req.speculative_or(self.speculative_default);
         let resolution =
             core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
+        let plan = resolution.plan;
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
@@ -3997,6 +4000,25 @@ impl LlamaProvider {
             gemma4_mm_request,
             &mut fallbacks,
         );
+        // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
+        // will actually run, at the advertised row bound — else linear, by name. The multimodal
+        // paths prefill spliced embeddings and verify linearly.
+        let tree = core_llm::resolve_tree_verify(
+            req.speculative_verify,
+            if route.width() == 0 {
+                core_llm::SpeculativePlan::Off
+            } else {
+                plan
+            },
+            &self.descriptor.capabilities,
+        );
+        fallbacks.extend(tree.fallback);
+        let tree_rows = if tree.max_rows > 0 && (multimodal || gemma4_mm_request) {
+            fallbacks.push(TREE_MULTIMODAL_LINEAR.into());
+            0
+        } else {
+            tree.max_rows as usize
+        };
 
         // sc-20679: the request's KV cache, decided against the qualification table before any
         // K/V mutation — and, since sc-20682, before admission, so the estimate prices the cache
@@ -4064,6 +4086,14 @@ impl LlamaProvider {
                 vision_workspace,
             )
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))
+        };
+        let tree_bytes = self
+            .tree_request_bytes(route, tree_rows, admitted_prompt, req.max_new_tokens)
+            .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
+        let estimate = |format| {
+            estimate(format)?
+                .checked_add(tree_bytes)
+                .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))
         };
         let required = estimate(compressed_format)?;
         // What a compressed generation that turns dense part-way grows to (its transition is
@@ -4524,6 +4554,7 @@ impl LlamaProvider {
                         delivered: Some(&delivered),
                         prefill_clock: Some(Instant::now()),
                         speculative_mode,
+                        tree_rows,
                         ..EngineOptions::default()
                     };
                     match &self.model {
@@ -4760,6 +4791,8 @@ impl LlamaProvider {
         // The request's resolution fallbacks join the engine's measured report (E2/E3), and so
         // does what the prefix cache restored. The engine counts a caller's prefill as its one
         // prefill forward: the boundary snapshot is taken inside it (sc-24446).
+        // The engine's own fallbacks (a tree it could not run on this cache) follow them.
+        fallbacks.append(&mut report.fallbacks);
         report.fallbacks = fallbacks;
         report.prefix_hit_tokens = prefix_hit as u64;
         report.prefix_cache = core_llm::PathReport {
@@ -4918,6 +4951,19 @@ fn recommended_depths() -> &'static core_llm::RecommendedDepths {
 /// MLX row's depth).
 fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
     core_llm::prompt_lookup_capabilities(max_depth, recommended_depths())
+}
+
+/// Why a multimodal request's tree verification ran linearly (feature SW-F328).
+const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not available on the \
+     multimodal decode path (its prompt is prefilled from spliced embeddings); verified linearly";
+
+/// The tree advertisement a loaded decoder carries (feature SW-F328): every Causal decoder but
+/// Gemma 4 ([`CausalLm::tree_unsupported`]) and the Qwen35 hybrid verify up to
+/// [`core_llm::MAX_TREE_ROWS`] candidate rows.
+fn tree_verify_capabilities(supported: bool) -> Option<core_llm::TreeVerifyCapabilities> {
+    supported.then_some(core_llm::TreeVerifyCapabilities {
+        max_rows: core_llm::MAX_TREE_ROWS,
+    })
 }
 
 /// The proposer a request runs on the engine, after its resolved plan meets the request's shape
@@ -5126,6 +5172,57 @@ impl LlamaProvider {
         target.checked_add(draft)
     }
 
+    /// What a tree route adds to the request's admission price beyond its linear route (feature
+    /// SW-F328, E6): `tree_rows` verify rows past the linear width — their KV positions (and the
+    /// block they round up to) and hidden + logit rows — the ancestor mask over the whole
+    /// context, and, on the hybrid, per-row recurrent states for `tree_rows` rows (priced as the
+    /// checkpoint ring at that width, which bounds them). `0` without a tree.
+    fn tree_request_bytes(
+        &self,
+        route: SpeculativeRoute,
+        tree_rows: usize,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+    ) -> Option<u64> {
+        let width = route.width();
+        if tree_rows == 0 || width == 0 {
+            return Some(0);
+        }
+        let geometry = self.model.memory_geometry();
+        let rows = u64::try_from(tree_rows).ok()?;
+        let extra = u64::try_from(tree_rows.saturating_sub(width)).ok()?;
+        let kv_position = geometry
+            .layers
+            .checked_mul(geometry.kv_heads)?
+            .checked_mul(geometry.head_dim)?
+            .checked_mul(geometry.element_bytes)?
+            .checked_mul(2)?;
+        let row = geometry
+            .hidden_size
+            .checked_add(geometry.vocab_size)?
+            .checked_mul(geometry.element_bytes)?;
+        let committed = u64::try_from(prompt_tokens)
+            .ok()?
+            .checked_add(u64::from(max_new_tokens))?;
+        let block = kv_overshoot_padding(committed, rows)?
+            .saturating_sub(kv_overshoot_padding(committed, u64::try_from(width).ok()?)?);
+        let mask = rows
+            .checked_add(1)?
+            .checked_mul(committed.checked_add(rows)?.checked_add(1)?)?
+            .checked_mul(4)?;
+        let states = match &self.model {
+            Decoder::Qwen35(m) => m
+                .checkpoint_ring_bytes(tree_rows)?
+                .saturating_sub(m.checkpoint_ring_bytes(width)?),
+            Decoder::Causal(_) => 0,
+        };
+        extra
+            .checked_mul(kv_position.checked_add(row)?)?
+            .checked_add(block.checked_mul(kv_position)?)?
+            .checked_add(mask)?
+            .checked_add(states)
+    }
+
     /// The resident draft's context window (`0`: no draft, or an unbounded one).
     fn draft_context(&self) -> usize {
         self.draft.as_ref().map_or(0, |draft| draft.context)
@@ -5261,6 +5358,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             speculative: vec![prompt_lookup_capabilities(SPECULATIVE_MAX_DEPTH)],
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
+            tree_verify: None,
         },
     }
 }
@@ -5274,6 +5372,7 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
     d.capabilities.speculative = vec![prompt_lookup_capabilities(speculative_max_depth(
         causal_attention_geometries(cfg),
     ))];
+    d.capabilities.tree_verify = tree_verify_capabilities(cfg.gemma4.is_none());
     d
 }
 
@@ -5287,6 +5386,7 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     // head — dense or sparse-MoE predictor layer — on both the legacy and the per-proposer field.
     let max_depth = speculative_max_depth([qwen35_attention_geometry(cfg)]);
     d.capabilities.speculative = vec![prompt_lookup_capabilities(max_depth)];
+    d.capabilities.tree_verify = tree_verify_capabilities(true);
     if cfg.mtp_num_hidden_layers > 0 {
         d.capabilities
             .advertise_mtp(max_depth, recommended_depths().mtp);
