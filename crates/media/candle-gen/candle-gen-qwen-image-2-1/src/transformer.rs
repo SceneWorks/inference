@@ -382,33 +382,6 @@ fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 ///
 /// `softmax` is the score normaliser every call applies: the fused `softmax_last_dim` on the render
 /// path, the composable f32 one on the training path ([`Ops`]).
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn block_causal_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    scale: f64,
-    prefix_segments: &[(usize, usize, bool)],
-    prefix_len: usize,
-    softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
-    budget: usize,
-    training: bool,
-) -> Result<Tensor> {
-    block_causal_attention_pag(
-        q,
-        k,
-        v,
-        scale,
-        prefix_segments,
-        prefix_len,
-        softmax,
-        budget,
-        training,
-        false,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn block_causal_attention_pag(
     q: &Tensor,
@@ -538,7 +511,7 @@ impl Attention {
     }
 
     /// The attention core both paths share: `q` `[B, heads, Sq, head_dim]` over `k`/`v`
-    /// `[B, heads, Sk, head_dim]` through [`block_causal_attention`], then the head merge and
+    /// `[B, heads, Sk, head_dim]` through [`block_causal_attention_pag`], then the head merge and
     /// `to_out`. This is the crate's **only** route to an SDPA call and the only place the scores
     /// budget is supplied, so the cached decode cannot leave the budgeted path the prefill is on.
     #[allow(clippy::too_many_arguments)]
@@ -2887,5 +2860,31 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(t_diff, 0.0, "target rows must equal V_target under PAG");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn block_causal_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+        prefix_segments: &[(usize, usize, bool)],
+        prefix_len: usize,
+        softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
+        budget: usize,
+        training: bool,
+    ) -> Result<Tensor> {
+        block_causal_attention_pag(
+            q,
+            k,
+            v,
+            scale,
+            prefix_segments,
+            prefix_len,
+            softmax,
+            budget,
+            training,
+            false,
+        )
     }
 }

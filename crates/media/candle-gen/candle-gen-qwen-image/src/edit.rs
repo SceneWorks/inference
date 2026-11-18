@@ -1090,10 +1090,7 @@ impl QwenEdit {
             return Err(CandleError::Canceled);
         }
         let resolved_pag = resolve_edit_pag(req.pag.as_ref())?;
-        candle_gen::execution::policy(
-            "qwen_image_edit/pag",
-            serde_json::json!(resolved_pag.as_ref().map(|p| p.scale)),
-        );
+        crate::record_pag_policy("qwen_image_edit/pag", resolved_pag.as_ref());
         if references.is_empty() {
             return Err(CandleError::Msg(
                 "qwen edit: at least one reference image is required".to_owned(),

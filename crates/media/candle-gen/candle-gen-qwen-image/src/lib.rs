@@ -1008,6 +1008,16 @@ pub struct QwenImageGenerator {
     memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
+pub(crate) fn record_pag_policy(
+    key: &str,
+    resolved_pag: Option<&candle_gen::gen_core::PagResolved>,
+) {
+    candle_gen::execution::policy(
+        key,
+        serde_json::to_value(resolved_pag).unwrap_or(serde_json::Value::Null),
+    );
+}
+
 impl Generator for QwenImageGenerator {
     fn generate_with_execution_report(
         &self,
@@ -1102,10 +1112,7 @@ impl Generator for QwenImageGenerator {
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
-        candle_gen::execution::policy(
-            "qwen_image/pag",
-            serde_json::json!(resolved_pag.as_ref().map(|p| p.scale)),
-        );
+        crate::record_pag_policy("qwen_image/pag", resolved_pag.as_ref());
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
         let stage_residency = req
@@ -2415,5 +2422,45 @@ mod execution_policy_tests {
             .execution_report(20)
             .validate_with_capability(pag)
             .unwrap();
+    }
+
+    #[test]
+    fn execution_pag_policy_captures_full_resolved_config() {
+        let cap = descriptor().capabilities.pag.unwrap();
+        let resolve = |cfg| {
+            candle_gen::gen_core::resolve_pag(Some(&cap), MODEL_ID, Some(&cfg))
+                .unwrap()
+                .unwrap()
+        };
+        let a = resolve(candle_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![30]),
+            start: Some(0.1),
+            stop: Some(0.8),
+            adaptive_scale: Some(0.2),
+        });
+        let b = resolve(candle_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![31]),
+            start: Some(0.2),
+            stop: Some(0.9),
+            adaptive_scale: Some(0.4),
+        });
+        let record = |p: Option<&candle_gen::gen_core::PagResolved>| {
+            candle_gen::testkit::execution_policy(|| {
+                crate::record_pag_policy("qwen_image/pag", p);
+            })
+        };
+        let policy_a = record(Some(&a));
+        let policy_b = record(Some(&b));
+        assert_ne!(policy_a, policy_b);
+        assert_ne!(policy_a, record(None));
+        let gen_core::generator::ExecutionFact::Resolved { value } =
+            &policy_a.resolved().unwrap().quality_policy
+        else {
+            panic!("resolved PAG policy fact expected");
+        };
+        let recorded = &value["operations"]["qwen_image/pag"][0]["value"];
+        assert_eq!(recorded, &serde_json::to_value(&a).unwrap());
     }
 }

@@ -734,6 +734,13 @@ pub(crate) fn stage_residency_for(spec: &LoadSpec, req: &GenerationRequest) -> b
 }
 
 impl QwenImage21 {
+    fn record_pag_policy(resolved_pag: Option<&candle_gen::gen_core::PagResolved>) {
+        candle_gen::execution::policy(
+            "qwen21/pag",
+            serde_json::to_value(resolved_pag).unwrap_or(serde_json::Value::Null),
+        );
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -744,10 +751,7 @@ impl QwenImage21 {
             .descriptor
             .capabilities
             .resolve_pag(self.variant.id(), req)?;
-        candle_gen::execution::policy(
-            "qwen21/pag",
-            serde_json::json!(resolved_pag.as_ref().map(|p| p.scale)),
-        );
+        Self::record_pag_policy(resolved_pag.as_ref());
         let params = match &self.schedule {
             Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req)?,
             Schedule::Saved(schedule) => resolve_turbo_run_params(schedule, req)?,
@@ -1298,8 +1302,17 @@ mod tests {
         assert_eq!(Variant::from_id(turbo.id), Some(Variant::Turbo));
         assert_eq!(Variant::from_id(base.id), Some(Variant::Base));
         assert_eq!(Variant::from_id("qwen_image"), None);
+        assert_eq!(
+            base.capabilities.pag,
+            Some(crate::qwen_image_2_1_pag_capability())
+        );
+        assert_eq!(
+            turbo.capabilities.pag,
+            Some(crate::qwen_image_2_1_turbo_pag_capability())
+        );
         let mut renamed = turbo.clone();
         renamed.id = base.id;
+        renamed.capabilities.pag = base.capabilities.pag.clone();
         assert_eq!(format!("{renamed:?}"), format!("{base:?}"));
         assert!(gen_core::registry::model_descriptor_errors(&turbo).is_empty());
         for sha in [
@@ -1688,5 +1701,45 @@ mod execution_policy_tests {
             .execution_report(8)
             .validate_with_capability(turbo.capabilities.pag.as_ref().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn execution_pag_policy_captures_full_resolved_config() {
+        let cap = descriptor().capabilities.pag.unwrap();
+        let resolve = |cfg| {
+            candle_gen::gen_core::resolve_pag(Some(&cap), MODEL_ID, Some(&cfg))
+                .unwrap()
+                .unwrap()
+        };
+        let a = resolve(candle_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![16]),
+            start: Some(0.1),
+            stop: Some(0.8),
+            adaptive_scale: Some(0.2),
+        });
+        let b = resolve(candle_gen::gen_core::PagConfig {
+            scale: 1.5,
+            layers: Some(vec![17]),
+            start: Some(0.2),
+            stop: Some(0.9),
+            adaptive_scale: Some(0.4),
+        });
+        let record = |p: Option<&candle_gen::gen_core::PagResolved>| {
+            candle_gen::testkit::execution_policy(|| {
+                QwenImage21::record_pag_policy(p);
+            })
+        };
+        let policy_a = record(Some(&a));
+        let policy_b = record(Some(&b));
+        assert_ne!(policy_a, policy_b);
+        assert_ne!(policy_a, record(None));
+        let gen_core::generator::ExecutionFact::Resolved { value } =
+            &policy_a.resolved().unwrap().quality_policy
+        else {
+            panic!("resolved PAG policy fact expected");
+        };
+        let recorded = &value["operations"]["qwen21/pag"][0]["value"];
+        assert_eq!(recorded, &serde_json::to_value(&a).unwrap());
     }
 }

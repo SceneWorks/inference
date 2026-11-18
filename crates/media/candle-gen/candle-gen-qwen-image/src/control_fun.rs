@@ -358,10 +358,7 @@ impl QwenFunControl {
                 CandleError::Msg(format!("qwen_image_control: {err}"))
             }
         })?;
-        candle_gen::execution::policy(
-            "qwen_image_control/pag",
-            serde_json::json!(resolved_pag.as_ref().map(|p| p.scale)),
-        );
+        crate::record_pag_policy("qwen_image_control/pag", resolved_pag.as_ref());
         require_prompt(&req.prompt)?;
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let num_blocks = self.transformer.block_count();
