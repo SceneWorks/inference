@@ -1603,6 +1603,16 @@ fn t2i_lora_trains_a_portrait_and_previews_at_its_canvas() {
         preview.width,
         preview.height
     );
+    // TEMPORARY SW-7172 diagnostic: the failing preview is not published, so dump its PNG.
+    {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_raw(preview.width, preview.height, preview.pixels.clone())
+            .unwrap()
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let hex: String = png.get_ref().iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("SW7172_PREVIEW_PNG_HEX {hex}");
+    }
     assert_sane("t2i portrait preview", preview);
     crate::model_inference_device::record_model_inference_device();
     println!("
