@@ -5171,6 +5171,17 @@ impl SpeculativeRoute {
         matches!(self, SpeculativeRoute::Mtp { .. })
     }
 
+    /// The proposer the route runs.
+    fn proposer_kind(self) -> ProposerKind {
+        match self {
+            SpeculativeRoute::Plain => ProposerKind::None,
+            SpeculativeRoute::Mtp { .. } => ProposerKind::Mtp,
+            SpeculativeRoute::PromptLookup { .. } => ProposerKind::PromptLookup,
+            SpeculativeRoute::DraftModel { .. } => ProposerKind::DraftModel,
+            SpeculativeRoute::BlockDraft { .. } => ProposerKind::BlockDraft,
+        }
+    }
+
     /// The proposer for any target: prompt lookup, the resident `draft` model, or none. (MTP
     /// needs the Qwen35 target.)
     fn plain_proposer<'a, T: SpeculativeTarget + 'a>(
@@ -5373,7 +5384,11 @@ impl LlamaProvider {
     /// SW-F328, E6): `tree_rows` verify rows past the linear width — their KV positions (and the
     /// block they round up to) and hidden + logit rows — the ancestor mask over the whole
     /// context, and, on the hybrid, per-row recurrent states for `tree_rows` rows (priced as the
-    /// checkpoint ring at that width, which bounds them). `0` without a tree.
+    /// checkpoint ring at that width, which bounds them). Only a route whose proposer builds
+    /// branching trees carries that workspace ([`core_llm::tree_workspace_rows`]); the MTP head's
+    /// and a draft model's one branch is pruned to the linear width and verified on the linear
+    /// path the route already prices. A block draft's tree forward also returns every extra row's
+    /// tapped layer outputs (SW-7196). `0` without a tree.
     fn tree_request_bytes(
         &self,
         route: SpeculativeRoute,
@@ -5381,6 +5396,7 @@ impl LlamaProvider {
         prompt_tokens: usize,
         max_new_tokens: u32,
     ) -> Option<u64> {
+        let tree_rows = core_llm::tree_workspace_rows(route.proposer_kind(), tree_rows);
         let width = route.width();
         if tree_rows == 0 || width == 0 {
             return Some(0);
@@ -5394,9 +5410,16 @@ impl LlamaProvider {
             .checked_mul(geometry.head_dim)?
             .checked_mul(geometry.element_bytes)?
             .checked_mul(2)?;
+        let taps = match (route, self.block_draft.as_ref()) {
+            (SpeculativeRoute::BlockDraft { .. }, Some(block)) => {
+                u64::try_from(block.model.config().tap_width()).ok()?
+            }
+            _ => 0,
+        };
         let row = geometry
             .hidden_size
             .checked_add(geometry.vocab_size)?
+            .checked_add(taps)?
             .checked_mul(geometry.element_bytes)?;
         let committed = u64::try_from(prompt_tokens)
             .ok()?
@@ -6591,6 +6614,33 @@ mod tree_admission_tests {
         );
         assert_eq!(tree_rows_for_kv_plan(16, false), (16, None));
         assert_eq!(tree_rows_for_kv_plan(0, true), (0, None));
+    }
+
+    /// Every route names the proposer it runs, so tree pricing asks the proposer's own capability
+    /// (E6): prompt lookup and a block draft build branching trees (SW-7196), the rest do not.
+    #[test]
+    fn only_tree_building_routes_price_tree_workspace() {
+        let routes = [
+            (SpeculativeRoute::Plain, ProposerKind::None),
+            (SpeculativeRoute::Mtp { width: 4 }, ProposerKind::Mtp),
+            (
+                SpeculativeRoute::PromptLookup { width: 4 },
+                ProposerKind::PromptLookup,
+            ),
+            (
+                SpeculativeRoute::DraftModel { width: 4 },
+                ProposerKind::DraftModel,
+            ),
+            (
+                SpeculativeRoute::BlockDraft { width: 4 },
+                ProposerKind::BlockDraft,
+            ),
+        ];
+        for (route, kind) in routes {
+            assert_eq!(route.proposer_kind(), kind);
+            let rows = core_llm::tree_workspace_rows(route.proposer_kind(), 16);
+            assert_eq!(rows, if kind.builds_trees() { 16 } else { 0 });
+        }
     }
 }
 

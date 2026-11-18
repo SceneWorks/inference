@@ -66,6 +66,20 @@ impl ProposerKind {
             ProposerKind::BlockDraft => "block_draft",
         }
     }
+
+    /// Whether this proposer can put more than one candidate at a position — a **branching**
+    /// tree under a tree request (feature SW-F328). Prompt lookup does
+    /// ([`ngram_propose_tree`](tree::ngram_propose_tree)), and so does a block draft (SW-7196:
+    /// every scored row carries its top-`K` candidates); the MTP head and a draft model propose
+    /// one branch, which a tree request caps at its row bound and verifies on the linear path.
+    /// Admission and cache sizing price tree workspace only for a proposer that builds trees
+    /// ([`tree_workspace_rows`](tree::tree_workspace_rows)).
+    pub fn builds_trees(self) -> bool {
+        match self {
+            ProposerKind::PromptLookup | ProposerKind::BlockDraft => true,
+            ProposerKind::None | ProposerKind::Mtp | ProposerKind::DraftModel => false,
+        }
+    }
 }
 
 impl From<crate::SpeculativeProposer> for ProposerKind {

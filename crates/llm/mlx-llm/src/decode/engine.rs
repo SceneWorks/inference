@@ -1139,14 +1139,8 @@ impl DraftSampler<'_, '_> {
         width: usize,
         draft_history: &[i32],
     ) -> Result<Option<DraftSample>> {
-        if let Some(c) = self.constraint.as_mut() {
-            let allowed = c.allowed();
-            let any = candidates.iter().any(|&t| {
-                usize::try_from(t).is_ok_and(|t| allowed.get(t).copied().unwrap_or(false))
-            });
-            if !any {
-                return Ok(None);
-            }
+        if self.allowed_among(candidates).is_empty() {
+            return Ok(None);
         }
         if self.greedy() && self.constraint.is_none() && !self.sampler.reads_history() {
             let best =
@@ -1159,15 +1153,86 @@ impl DraftSampler<'_, '_> {
                     });
             return Ok(best.map(|(i, _)| (candidates[i], None)));
         }
-        let mut row = vec![f32::NEG_INFINITY; width];
-        for (&t, &s) in candidates.iter().zip(scores) {
-            if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
-                *slot = s;
+        self.sample_draft(&dense_row(candidates, scores, width), draft_history)
+            .map(Some)
+    }
+
+    /// The `candidates` the constraint (if any) allows in its current state, in order.
+    pub fn allowed_among(&mut self, candidates: &[i32]) -> Vec<i32> {
+        match self.constraint.as_mut() {
+            Some(c) => {
+                let allowed = c.allowed();
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        usize::try_from(t).is_ok_and(|t| allowed.get(t).copied().unwrap_or(false))
+                    })
+                    .collect()
+            }
+            None => candidates.to_vec(),
+        }
+    }
+
+    /// The stochastic proposal distribution `q` over a block draft's row — exactly the one
+    /// [`sample_among`](Self::sample_among) draws a stochastic draft from — without drawing, or
+    /// `None` when the constraint allows no candidate. A tree proposal (SW-7196) reads it to
+    /// rank a node's deterministic siblings and draws the node's sampled child from it with
+    /// [`draw`](Self::draw).
+    pub fn among_distribution(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        draft_history: &[i32],
+    ) -> Result<Option<Vec<(i32, f32)>>> {
+        if self.allowed_among(candidates).is_empty() {
+            return Ok(None);
+        }
+        let logits = dense_row(candidates, scores, width);
+        let mask = self.constraint.as_mut().map(|c| c.allowed());
+        self.sampler
+            .distribution(&logits, draft_history, mask)
+            .map(Some)
+    }
+
+    /// One draw from `dist` with the run's seeded stream — the inverse-CDF draw
+    /// [`sample_draft`](Self::sample_draft) makes, so the draft is distributed exactly as `dist`.
+    /// The constraint is not advanced.
+    pub fn draw(&mut self, dist: &[(i32, f32)]) -> i32 {
+        draw_from(dist, self.sampler.uniform())
+    }
+
+    /// The constraint's checkpoint at the proposal's start (`None` without a constraint).
+    pub fn constraint_checkpoint(&self) -> Option<usize> {
+        self.constraint.as_ref().map(|c| c.checkpoint())
+    }
+
+    /// Put the constraint in its state at a tree node (SW-7196): rewound to `checkpoint` (the
+    /// proposal's start), then advanced by the node's `path` from the anchor, stop tokens
+    /// excepted. The engine rewinds the constraint after the proposal as for any draft.
+    pub fn enter_branch(&mut self, checkpoint: Option<usize>, path: &[i32]) {
+        let stops = &self.config.stop_tokens;
+        if let (Some(c), Some(checkpoint)) = (self.constraint.as_mut(), checkpoint) {
+            c.rewind(checkpoint);
+            for &token in path.iter().filter(|t| !stops.contains(t)) {
+                c.accept(token);
+                self.advanced = true;
             }
         }
-        let logits = Array::from_slice(&row, &[1, width as i32]);
-        self.sample_draft(&logits, draft_history).map(Some)
     }
+}
+
+/// A block draft's refined row as dense `[1, width]` logits: `scores` at `candidates`, `-inf`
+/// elsewhere.
+fn dense_row(candidates: &[i32], scores: &[f32], width: usize) -> Array {
+    let mut row = vec![f32::NEG_INFINITY; width];
+    for (&t, &s) in candidates.iter().zip(scores) {
+        if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
+            *slot = s;
+        }
+    }
+    Array::from_slice(&row, &[1, width as i32])
 }
 
 /// The inverse-CDF draw over an unnormalised, never-empty distribution given a uniform `u` in

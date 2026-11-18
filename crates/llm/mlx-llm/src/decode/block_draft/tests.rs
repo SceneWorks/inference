@@ -1024,3 +1024,526 @@ fn image_draft_context_follows_the_target_positions() {
         "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::image_draft_context_follows_the_target_positions"
     );
 }
+
+// ---- Tree verification (SW-7196). ----
+
+/// [`run_block`] under a tree request of `tree_rows` candidate rows, with an optional cancel flag.
+#[allow(clippy::too_many_arguments)]
+fn run_block_tree<P: Proposer<TappedQwen35<'static>> + ?Sized>(
+    target: &TappedQwen35<'static>,
+    proposer: &mut P,
+    prompt: &[i32],
+    config: &GenerationConfig,
+    depth: usize,
+    tree_rows: usize,
+    constraint: Option<&mut Forbid>,
+    cancel: &CancelFlag,
+) -> (SpeculativeRun, Qwen35Cache) {
+    let mut cache = target.new_cache();
+    let out = target
+        .forward(&mut cache, &input_ids(prompt), 0, LogitsScope::Last, true)
+        .unwrap();
+    let run = generate_speculative(
+        target,
+        proposer,
+        SpeculativePrompt::Prefilled {
+            cache: &mut cache,
+            logits: out.logits,
+            hidden: out.hidden,
+            history: prompt,
+            position_delta: 0,
+        },
+        config,
+        depth,
+        cancel,
+        &mut |_| {},
+        EngineOptions {
+            constraint: constraint.map(|c| c as &mut dyn RewindableConstraintMask),
+            pipelining: Pipelining::Off,
+            tree_rows,
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    (run, cache)
+}
+
+/// The tiny target, leaked so a tapped target over it is `'static` (one per test process).
+fn leaked_target() -> &'static Qwen35Model {
+    Box::leak(Box::new(tiny_target()))
+}
+
+/// The tree report of a block-draft tree run: present, verifying branching trees with no linear
+/// fallback, and counting every pass's rows and accepted tokens (AC2).
+fn tree_report(run: &SpeculativeRun, label: &str) -> core_llm::TreeVerifyReport {
+    let r = &run.report;
+    assert!(
+        r.fallbacks.iter().all(|f| !f.contains("tree")),
+        "{label}: {:?}",
+        r.fallbacks
+    );
+    let tree = r.tree_verify.expect("a tree run reports its tree");
+    assert_eq!(tree.passes, r.verify_steps, "{label}: every pass counted");
+    assert_eq!(tree.accepted_tokens, r.accepted_tokens, "{label}");
+    assert!(
+        tree.rows_verified >= tree.passes,
+        "{label}: anchors counted"
+    );
+    assert!(
+        tree.max_rows_per_pass <= 1 + u64::from(tree.max_rows),
+        "{label}: at most the anchor and the bound per pass"
+    );
+    assert!(tree.rows_per_pass().is_some() && tree.accepted_per_pass().is_some());
+    tree
+}
+
+/// SW-7196 AC1 (greedy): with tree verification on, for each format at every draft precision
+/// (BF16, Q8, Q4), each greedy configuration — plain, penalized, constrained — and two depths,
+/// the block draft's candidate trees commit exactly the plain loop's tokens (the constraint sees
+/// the same accepted sequence); the runs verify branching trees in one forward each, accept and
+/// reject candidates, and report rows and accepted tokens per pass (AC2).
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn greedy_block_draft_tree_is_the_plain_loop() {
+    let model = leaked_target();
+    let mut totals: HashMap<&str, (u64, u64, u64)> = HashMap::new();
+    for precision in [
+        None,
+        Some(BlockDraftPrecision::Q8),
+        Some(BlockDraftPrecision::Q4),
+    ] {
+        for (format, draft) in tiny_drafts(precision) {
+            let draft: &'static BlockDraft = Box::leak(Box::new(draft));
+            let target = TappedQwen35::for_draft(model, draft);
+            for depth in [2usize, 5] {
+                for (name, cfg, constrained) in [
+                    ("greedy", config(24, 7), false),
+                    ("penalized", penalized(24), false),
+                    ("constrained", config(24, 7), true),
+                ] {
+                    let label = format!("{format} {precision:?} depth {depth} {name} tree");
+                    let (mut a, mut b) = (Forbid::new(&[1, 9]), Forbid::new(&[1, 9]));
+                    let expected = plain(model, &PROMPT, &cfg, constrained.then_some(&mut a));
+                    let mut proposer = BlockDraftProposer::new(draft);
+                    let (run, _) = run_block_tree(
+                        &target,
+                        &mut proposer,
+                        &PROMPT,
+                        &cfg,
+                        depth,
+                        16,
+                        constrained.then_some(&mut b),
+                        &CancelFlag::new(),
+                    );
+                    assert_eq!(run.output.tokens, expected.tokens, "{label}");
+                    assert_eq!(b.accepted, a.accepted, "{label}: constraint");
+                    assert_eq!(run.report.proposer, ProposerKind::BlockDraft, "{label}");
+                    assert_eq!(run.report.replay_forwards, 0, "{label}");
+                    assert!(
+                        proposer.draft_forwards > 0
+                            && proposer.draft_forwards <= run.report.verify_steps,
+                        "{label}: at most one draft forward per target pass"
+                    );
+                    let tree = tree_report(&run, &label);
+                    println!(
+                        "BLOCK_DRAFT_TREE {label}: passes={} tree_passes={} rows_per_pass={:.2} \
+                         accepted_per_pass={:.2}",
+                        tree.passes,
+                        tree.tree_passes,
+                        tree.rows_per_pass().unwrap(),
+                        tree.accepted_per_pass().unwrap()
+                    );
+                    let t = totals.entry(format).or_default();
+                    t.0 += tree.tree_passes;
+                    t.1 += run.report.proposed_tokens;
+                    t.2 += run.report.accepted_tokens;
+                }
+            }
+        }
+    }
+    assert_eq!(totals.len(), 2);
+    for (format, (tree_passes, proposed, accepted)) in totals {
+        assert!(tree_passes > 0, "{format}: verified branching trees");
+        assert!(
+            accepted > 0 && proposed > accepted,
+            "{format}: {proposed} proposed, {accepted} accepted"
+        );
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop"
+    );
+}
+
+/// SW-7196 AC1 (state): after greedy and sampled tree runs with accepted and rejected branches,
+/// the hybrid cache holds exactly the committed sequence and the draft's context is exactly the
+/// context a fresh draft builds from the committed rows — a draft that only ever saw the accepted
+/// path: no rejected sibling's tapped row entered it, for either format.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn block_draft_tree_context_is_the_accepted_path() {
+    let model = leaked_target();
+    let mut sampled = config(20, 11);
+    sampled.sampling = SamplingParams {
+        temperature: 1.0,
+        top_k: 4,
+        top_p: 1.0,
+        ..SamplingParams::default()
+    };
+    for (format, draft) in tiny_drafts(Some(BlockDraftPrecision::Q8)) {
+        let draft: &'static BlockDraft = Box::leak(Box::new(draft));
+        let target = TappedQwen35::for_draft(model, draft);
+        for (mode, cfg) in [("greedy", config(20, 7)), ("sampled", sampled.clone())] {
+            for depth in [2usize, 5] {
+                let label = format!("{format} {mode} depth {depth} tree");
+                let mut proposer = BlockDraftProposer::new(draft);
+                let (run, mut cache) = run_block_tree(
+                    &target,
+                    &mut proposer,
+                    &PROMPT,
+                    &cfg,
+                    depth,
+                    16,
+                    None,
+                    &CancelFlag::new(),
+                );
+                let tree = tree_report(&run, &label);
+                assert!(tree.tree_passes > 0, "{label}: branching trees verified");
+                assert!(
+                    run.report.proposed_tokens > run.report.accepted_tokens,
+                    "{label}: rejected candidates"
+                );
+                let fed = run.committed_cache_len as usize;
+                let mut committed = PROMPT.to_vec();
+                committed.extend(&run.output.tokens);
+                assert_eq!(cache.offset() as usize, fed, "{label}");
+                assert_eq!(fed, committed.len() - 1, "{label}");
+
+                // Target: the next step on the committed cache is a fresh prefill's.
+                let last = *committed.last().unwrap();
+                let next = model
+                    .decode_logits(&input_ids(&[last]), &mut cache, fed as i32)
+                    .unwrap();
+                let mut fresh = model.new_cache();
+                let want = model
+                    .decode_logits(&input_ids(&committed), &mut fresh, 0)
+                    .unwrap();
+                assert_close(&next, &want, &format!("{label}: target logits"));
+
+                // Draft: the context of a draft that only ever saw the accepted path.
+                let context = proposer.context().unwrap();
+                assert_eq!(context.next_position() as usize, fed, "{label}");
+                let mut fresh = model.new_cache();
+                let (taps, _) = model
+                    .forward_tapped(
+                        &input_ids(&committed[..fed]),
+                        &mut fresh,
+                        0,
+                        &draft.config().target_layer_ids,
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                let mut rebuilt = draft.new_context(0);
+                draft.append_context(&mut rebuilt, &taps).unwrap();
+                assert_eq!(rebuilt.next_position(), context.next_position(), "{label}");
+                assert_eq!(rebuilt.rows(), context.rows(), "{label}");
+                for (i, (got, want)) in context.arrays().zip(rebuilt.arrays()).enumerate() {
+                    assert_close(got, want, &format!("{label}: context array {i}"));
+                }
+            }
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path"
+    );
+}
+
+/// SW-7196 AC1 (sampled): through the real tree verify, each format's candidate trees — one
+/// sampled child per node drawn from its own `q`, then the most probable other tokens as point
+/// masses — commit tokens that follow the target's distribution exactly: the joint law of the
+/// first three tokens over thousands of seeded runs (the second and third from one tree pass of
+/// depth 2) matches the target's chain rule by a chi-square test, with and without the
+/// constraint mask.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn sampled_block_draft_tree_keeps_the_target_distribution() {
+    let model: &'static Qwen35Model = Box::leak(Box::new(tiny_random_target()));
+    let q8 = Some(BlockDraftPrecision::Q8);
+    let mut dspine_cfg = dspine::tests::tiny_config();
+    dspine_cfg.head_topk = 32;
+    let mut dflash2_cfg = dflash2::tests::tiny_config();
+    dflash2_cfg.head_topk = 32;
+    for (format, draft) in [
+        (
+            "dspine",
+            BlockDraft::DSpine(dspine::tests::tiny_draft_with(dspine_cfg, q8)),
+        ),
+        (
+            "dflash2",
+            BlockDraft::DFlash2(dflash2::tests::tiny_draft_with(dflash2_cfg, q8)),
+        ),
+    ] {
+        let draft: &'static BlockDraft = Box::leak(Box::new(draft));
+        let target = TappedQwen35::for_draft(model, draft);
+        let prompt = &PROMPT[..6];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 4,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+        for forbidden in [&[][..], &[1usize, 9][..]] {
+            let mask = Forbid::new(forbidden).allow;
+            let masked = (!forbidden.is_empty()).then_some(mask.as_slice());
+            let mut expected: HashMap<[i32; 3], f64> = HashMap::new();
+            for (x0, p0) in target_dist(model, prompt, params, masked) {
+                let h0: Vec<i32> = prompt.iter().copied().chain([x0]).collect();
+                for (x1, p1) in target_dist(model, &h0, params, masked) {
+                    let h1: Vec<i32> = h0.iter().copied().chain([x1]).collect();
+                    for (x2, p2) in target_dist(model, &h1, params, masked) {
+                        expected.insert([x0, x1, x2], p0 * p1 * p2);
+                    }
+                }
+            }
+            let n = 2000u64;
+            let mut counts: HashMap<[i32; 3], u64> = HashMap::new();
+            let (mut tree_passes, mut proposed, mut accepted) = (0u64, 0u64, 0u64);
+            for seed in 0..n {
+                let mut cfg = config(4, seed);
+                cfg.sampling = params;
+                let mut constraint = Forbid::new(forbidden);
+                let mut proposer = BlockDraftProposer::new(draft);
+                let (run, _) = run_block_tree(
+                    &target,
+                    &mut proposer,
+                    prompt,
+                    &cfg,
+                    2,
+                    16,
+                    (!forbidden.is_empty()).then_some(&mut constraint),
+                    &CancelFlag::new(),
+                );
+                let t = &run.output.tokens;
+                assert!(t.iter().all(|&x| !forbidden.contains(&(x as usize))));
+                *counts.entry([t[0], t[1], t[2]]).or_default() += 1;
+                tree_passes += tree_report(&run, format).tree_passes;
+                proposed += run.report.proposed_tokens;
+                accepted += run.report.accepted_tokens;
+            }
+            assert!(tree_passes > 0, "{format}: branching trees verified");
+            assert!(
+                accepted > 0 && proposed > accepted,
+                "{format}: {proposed} proposed, {accepted} accepted"
+            );
+            for key in counts.keys() {
+                assert!(
+                    expected.contains_key(key),
+                    "{key:?} has target probability 0"
+                );
+            }
+            let (mut chi2, mut cells, mut pooled_e, mut pooled_o) =
+                (0.0f64, 0usize, 0.0f64, 0.0f64);
+            for (key, p) in &expected {
+                let e = p * n as f64;
+                let o = *counts.get(key).unwrap_or(&0) as f64;
+                if e < 5.0 {
+                    pooled_e += e;
+                    pooled_o += o;
+                } else {
+                    chi2 += (o - e).powi(2) / e;
+                    cells += 1;
+                }
+            }
+            if pooled_e > 0.0 {
+                chi2 += (pooled_o - pooled_e).powi(2) / pooled_e.max(1e-9);
+                cells += 1;
+            }
+            // 99.9 % critical value of chi-square with `cells - 1` degrees of freedom
+            // (Wilson–Hilferty).
+            let k = (cells - 1) as f64;
+            let z = 3.09;
+            let critical = k * (1.0 - 2.0 / (9.0 * k) + z * (2.0 / (9.0 * k)).sqrt()).powi(3);
+            println!(
+                "BLOCK_DRAFT_TREE_SAMPLED {format} forbidden {forbidden:?}: chi-square {chi2:.1} \
+                 over {cells} cells (critical {critical:.1}); {tree_passes} tree passes, \
+                 {accepted}/{proposed} accepted"
+            );
+            assert!(
+                chi2 < critical,
+                "{format} forbidden {forbidden:?}: chi-square {chi2:.1} over {cells} cells (critical {critical:.1})"
+            );
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution"
+    );
+}
+
+/// A block-draft proposer that cancels the request as it hands over its tree, keeping the tree.
+struct CancelOnTree<'d, 'c> {
+    inner: BlockDraftProposer<'d>,
+    cancel: &'c CancelFlag,
+    tree: Option<DraftTree>,
+}
+
+impl<'t> Proposer<TappedQwen35<'t>> for CancelOnTree<'_, '_> {
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::BlockDraft
+    }
+    fn wants_hidden(&self) -> bool {
+        true
+    }
+    fn warm(
+        &mut self,
+        target: &TappedQwen35<'t>,
+        prompt: &[i32],
+        hidden: Option<&Array>,
+    ) -> Result<Option<Array>> {
+        self.inner.warm(target, prompt, hidden)
+    }
+    fn propose(
+        &mut self,
+        _: &TappedQwen35<'t>,
+        _: &ProposeContext<'_>,
+        _: &mut DraftSampler<'_, '_>,
+    ) -> Result<Proposal> {
+        unreachable!("a tree run asks for a tree")
+    }
+    fn propose_tree(
+        &mut self,
+        target: &TappedQwen35<'t>,
+        ctx: &ProposeContext<'_>,
+        sampler: &mut DraftSampler<'_, '_>,
+    ) -> Result<DraftTree> {
+        let tree = self.inner.propose_tree(target, ctx, sampler)?;
+        self.cancel.cancel();
+        self.tree = Some(tree.clone());
+        Ok(tree)
+    }
+    fn commit(
+        &mut self,
+        target: &TappedQwen35<'t>,
+        cur: i32,
+        accepted: &[i32],
+        hidden: Option<&Array>,
+        position: i32,
+    ) -> Result<()> {
+        self.inner.commit(target, cur, accepted, hidden, position)
+    }
+}
+
+/// The hybrid cache's comparable state: every DeltaNet layer's live state and every attention
+/// layer's keys and values.
+fn cache_states(cache: &Qwen35Cache) -> Vec<Vec<f32>> {
+    cache
+        .delta_states()
+        .into_iter()
+        .chain(cache.attn_states())
+        .flat_map(|(a, b)| [a, b])
+        .collect()
+}
+
+/// SW-7196 (abort / cancel): a request cancelled as its block-draft tree is handed over stops
+/// before any tree row reaches the target cache, with the draft's context still the warm-up's;
+/// and that tree, verified on the prefilled cache and aborted, returns the target cache to the
+/// step start bit for bit while the draft context — which only a commit writes — is untouched.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean() {
+    let model = leaked_target();
+    for (format, draft) in tiny_drafts(Some(BlockDraftPrecision::Q8)) {
+        let draft: &'static BlockDraft = Box::leak(Box::new(draft));
+        let target = TappedQwen35::for_draft(model, draft);
+        let mut prefilled = target.new_cache();
+        let out = target
+            .forward(
+                &mut prefilled,
+                &input_ids(&PROMPT),
+                0,
+                LogitsScope::Last,
+                true,
+            )
+            .unwrap();
+        let mut warmed = BlockDraftProposer::new(draft);
+        warmed.warm(&target, &PROMPT, out.hidden.as_ref()).unwrap();
+        let warm: Vec<Vec<f32>> = warmed.context().unwrap().arrays().map(host).collect();
+        let start = cache_states(&prefilled);
+
+        // Cancel while the tree is handed over.
+        let cancel = CancelFlag::new();
+        let mut proposer = CancelOnTree {
+            inner: BlockDraftProposer::new(draft),
+            cancel: &cancel,
+            tree: None,
+        };
+        let (run, cache) = run_block_tree(
+            &target,
+            &mut proposer,
+            &PROMPT,
+            &config(8, 7),
+            4,
+            16,
+            None,
+            &cancel,
+        );
+        assert_eq!(
+            run.output.finish_reason,
+            FinishReason::Cancelled,
+            "{format}"
+        );
+        assert_eq!(
+            run.output.tokens.len(),
+            1,
+            "{format}: the prefill's token only"
+        );
+        assert_eq!(cache_states(&cache), start, "{format}: no tree row written");
+        let context: Vec<Vec<f32>> = proposer
+            .inner
+            .context()
+            .unwrap()
+            .arrays()
+            .map(host)
+            .collect();
+        assert_eq!(
+            context, warm,
+            "{format}: the draft context is the warm-up's"
+        );
+        let tree = proposer.tree.expect("the proposer built a tree");
+        assert!(!tree.is_chain(), "{format}: a branching tree");
+
+        // Verify that tree on the prefilled cache, then abort it.
+        let mut cache = target.new_cache();
+        let out = target
+            .forward(&mut cache, &input_ids(&PROMPT), 0, LogitsScope::Last, true)
+            .unwrap();
+        let anchor = mlx_rs::ops::indexing::argmax_axis(&out.logits, -1, None)
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()[0];
+        let base = cache.offset();
+        let inputs = TreeInputs::new(&tree, anchor, base, base, target.tree_mask_dtype()).unwrap();
+        let verified = target.forward_tree(&mut cache, &inputs, true).unwrap();
+        assert_eq!(
+            verified.hidden.as_ref().unwrap().shape(),
+            &[1, tree.rows() as i32, draft.config().tap_width() as i32],
+            "{format}: every tree row's taps"
+        );
+        target.abort_tree(&mut cache, base).unwrap();
+        assert_eq!(cache.offset(), base, "{format}");
+        assert_eq!(
+            cache_states(&cache),
+            start,
+            "{format}: the aborted tree left nothing"
+        );
+        let context: Vec<Vec<f32>> = warmed.context().unwrap().arrays().map(host).collect();
+        assert_eq!(context, warm, "{format}: an abort never reaches the draft");
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean"
+    );
+}
