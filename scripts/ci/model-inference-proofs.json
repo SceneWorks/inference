@@ -277571,7 +277571,7 @@
     "source": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@30b466c0e6bc427a3ca5e976121a3a9c9b21259963b090d52ec11a7d82a2cbc8",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::a_tree_forward_keeps_exactly_the_accepted_branch@cee4072b81505b89de042302c562c10a5fdaf678729294c43b675b798967cd99",
       "requirements": []
     }
   },
@@ -277601,7 +277601,7 @@
     "source": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@30b466c0e6bc427a3ca5e976121a3a9c9b21259963b090d52ec11a7d82a2cbc8",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::an_aborted_or_cancelled_tree_step_leaves_a_clean_cache@cee4072b81505b89de042302c562c10a5fdaf678729294c43b675b798967cd99",
       "requirements": []
     }
   },
@@ -277631,7 +277631,7 @@
     "source": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@30b466c0e6bc427a3ca5e976121a3a9c9b21259963b090d52ec11a7d82a2cbc8",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::greedy_tree_runs_are_the_plain_loop@cee4072b81505b89de042302c562c10a5fdaf678729294c43b675b798967cd99",
       "requirements": []
     }
   },
@@ -277661,7 +277661,7 @@
     "source": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@30b466c0e6bc427a3ca5e976121a3a9c9b21259963b090d52ec11a7d82a2cbc8",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::sampled_tree_acceptance_preserves_the_target_distribution@cee4072b81505b89de042302c562c10a5fdaf678729294c43b675b798967cd99",
       "requirements": []
     }
   },
@@ -277691,7 +277691,7 @@
     "source": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@30b466c0e6bc427a3ca5e976121a3a9c9b21259963b090d52ec11a7d82a2cbc8",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tree_tests.rs::decode::engine::tree_tests::linear_requests_and_one_branch_trees_keep_the_linear_path@cee4072b81505b89de042302c562c10a5fdaf678729294c43b675b798967cd99",
       "requirements": []
     }
   },

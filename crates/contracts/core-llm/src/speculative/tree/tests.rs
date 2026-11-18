@@ -62,6 +62,79 @@ fn a_tree_reports_its_shape() {
     assert!(!sees(1, 3), "no row sees a descendant");
 }
 
+/// The parent-row contract every producer and consumer shares: a parent is a row index where
+/// `0` is the anchor and `r >= 1` the `r`-th candidate pushed; the next row is `len() + 1`, so
+/// `0..=len()` are accepted and anything else is refused. The MLX tree proofs' shapes (chain,
+/// star, two interleaved branches, binary, random) are built here from the same parent lists, so
+/// a malformed fixture fails in ordinary CI instead of inside the model-proof workflow.
+#[test]
+fn a_parent_is_a_row_index_from_the_anchor() {
+    let mut t = DraftTree::new();
+    let refused = t.push(1, 7, None).unwrap_err().to_string();
+    assert!(refused.contains("parent row 1"), "{refused}");
+    assert_eq!(t.push(0, 7, None).unwrap(), 1, "the anchor is row 0");
+    assert_eq!(
+        t.push(1, 8, None).unwrap(),
+        2,
+        "the last row is a valid parent"
+    );
+    assert!(t.push(3, 9, None).is_err(), "a row cannot parent itself");
+    assert!(t.push(4, 9, None).is_err(), "nor a row after it");
+    assert_eq!(t.len(), 2, "a refused push adds nothing");
+    assert_eq!(t.parent(2), Some(1));
+    assert_eq!(t.path(2), vec![0, 1, 2]);
+
+    let build = |parents: &[usize]| {
+        let mut t = DraftTree::new();
+        for (i, &p) in parents.iter().enumerate() {
+            assert_eq!(t.push(p, i as i32, None).unwrap(), i + 1, "{parents:?}");
+        }
+        t
+    };
+    let chain: Vec<usize> = (0..16).collect();
+    let star = vec![0; 16];
+    let two: Vec<usize> = [0, 0].into_iter().chain(1..=14).collect();
+    let binary: Vec<usize> = (1..=15).map(|r| (r - 1) / 2).collect();
+    let max = MAX_TREE_ROWS as usize;
+
+    let t = build(&chain);
+    assert!(t.is_chain());
+    assert_eq!(t.depths(), (0..=16).collect::<Vec<i32>>());
+
+    let t = build(&star);
+    assert_eq!(t.max_depth(), 1);
+    assert_eq!(t.children(0), (1..=16).collect::<Vec<_>>());
+
+    let t = build(&two);
+    assert_eq!(t.len(), max);
+    assert_eq!(t.children(0), vec![1, 2]);
+    assert_eq!(t.path(15), vec![0, 1, 3, 5, 7, 9, 11, 13, 15]);
+    assert_eq!(t.path(16), vec![0, 2, 4, 6, 8, 10, 12, 14, 16]);
+    assert!((1..=16).all(|r| t.children(r).len() <= 1));
+
+    let t = build(&binary);
+    // Heap order with the anchor as the root: rows 0..=6 have two children, row 7 one.
+    assert_eq!(t.max_depth(), 4);
+    assert!((0..=6).all(|r| t.children(r).len() == 2));
+    assert_eq!(t.children(7), vec![15]);
+    assert!((8..=15).all(|r| t.children(r).is_empty()));
+
+    // Random parents in `0..r` for row `r` are always valid.
+    let mut draws = Draws(0x5eed_6914);
+    for _ in 0..64 {
+        let parents: Vec<usize> = (1..=max)
+            .map(|r| ((draws.next() * r as f32) as usize).min(r - 1))
+            .collect();
+        let t = build(&parents);
+        let depths = t.depths();
+        for r in 1..t.rows() {
+            let p = t.parent(r).unwrap();
+            assert!(p < r && depths[r] == depths[p] + 1);
+            assert_eq!(t.path(r).len(), depths[r] as usize + 1);
+        }
+    }
+}
+
 #[test]
 fn a_chain_is_a_linear_proposal() {
     let t = DraftTree::chain(&[4, 5, 6], &[vec![(4, 1.0)]]);
