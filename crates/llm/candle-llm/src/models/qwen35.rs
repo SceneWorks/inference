@@ -182,6 +182,8 @@ fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
 #[derive(Clone)]
 enum QwenEmbedding {
     Dense(Tensor),
+    /// A fully quantized tier's stored Q8_0 table (SW-7201).
+    Q8(std::sync::Arc<crate::primitives::quant::Q8RowEmbedding>),
     Prism(std::sync::Arc<crate::primitives::PrismPackedWeight>),
 }
 
@@ -189,6 +191,7 @@ impl QwenEmbedding {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(weight) => __model_proof_output!(embed(weight, ids)),
+            Self::Q8(table) => __model_proof_output!(table.forward(ids)),
             Self::Prism(weight) => __model_proof_output!(weight.embedding(ids)),
         }
     }
@@ -246,6 +249,10 @@ pub struct Qwen35Config {
     /// Whether the MTP predictor owns an embedding table rather than sharing the target embedding.
     /// Qwen3.8-27B publishes `false` and carries no `mtp.embed_tokens.weight` tensor.
     pub mtp_use_dedicated_embeddings: bool,
+    /// Stored GGML block tensors whose format differs from the tier's own (a mixed tier, SW-7201:
+    /// a Q4_K body with a Q8_0 `lm_head` / `embed_tokens`), keyed by checkpoint tensor stem
+    /// ([`crate::prepare::persisted_ggml_overrides`]).
+    pub stored_overrides: std::collections::BTreeMap<String, QuantSpec>,
 }
 
 impl Qwen35Config {
@@ -317,7 +324,22 @@ impl Qwen35Config {
                 .get("mtp_use_dedicated_embeddings")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            stored_overrides: crate::prepare::persisted_ggml_overrides(v)?,
         })
+    }
+
+    /// The format the stored tensor `key` is read in under the load's `format`: its per-tensor
+    /// entry when the load reads GGML blocks (a mixed tier), else `format` itself.
+    fn tensor_format(
+        &self,
+        key: &str,
+        format: Option<&ProjectionFormat>,
+    ) -> Option<ProjectionFormat> {
+        let stem = key.strip_suffix(".weight").unwrap_or(key);
+        match (format, self.stored_overrides.get(stem)) {
+            (Some(ProjectionFormat::Ggml(_)), Some(spec)) => Some(ProjectionFormat::Ggml(*spec)),
+            (format, _) => format.cloned(),
+        }
     }
 
     /// The interleaved M-RoPE section `[t, h, w]`, defaulting to an even split of `rotary_dim/2` when
@@ -2394,6 +2416,10 @@ impl Qwen35Model {
         match &self.embed_tokens {
             QwenEmbedding::Dense(t) if !head_is_embedding => census.record_tensor(t),
             QwenEmbedding::Dense(_) => {}
+            QwenEmbedding::Q8(table) => {
+                let (rows, cols) = table.dims().unwrap_or((0, 0));
+                census.record_packed((rows * cols) as u64, table.resident_bytes())
+            }
             QwenEmbedding::Prism(p) => {
                 census.record_unmeasured((p.rows() * p.input_width()) as u64)
             }
@@ -3333,21 +3359,60 @@ impl Qwen35Model {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
                 None => {
                     debug_assert_priced(&key, format);
-                    keyed_projection(w, &key, dtype, format, modelopt, &device)
+                    let format = cfg.tensor_format(&key, format);
+                    keyed_projection(w, &key, dtype, format.as_ref(), modelopt, &device)
                 }
             }
+        };
+        // A matrix the plain tiers keep dense (`in_proj_a` / `in_proj_b`, the LM head, the
+        // embedding) is read as stored GGML blocks when a fully quantized tier (SW-7201) stores it
+        // so, in its per-tensor format.
+        let stored = |key: &str| -> Option<&Tensor> {
+            w.get(key)
+                .filter(|t| prism.is_none() && is_ggml_block_tensor(t))
+        };
+        let load_stored = |key: &str, t: &Tensor| -> Result<Projection> {
+            let stem = key.strip_suffix(".weight").unwrap_or(key);
+            let format = cfg.tensor_format(key, format);
+            Projection::load_stored_blocks(stem, t, None, format.as_ref(), &device)
         };
         let proj_dense = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
-                None => Projection::load(req(key)?, None),
+                None => match stored(&key) {
+                    Some(t) => load_stored(&key, t),
+                    None => Projection::load(req(key)?, None),
+                },
             }
         };
 
         let embed_key = join("embed_tokens.weight");
         let embed_tokens = match prism.and_then(|registry| registry.get(&embed_key)) {
             Some(weight) => QwenEmbedding::Prism(weight.clone()),
-            None => QwenEmbedding::Dense(req(embed_key)?),
+            None => match stored(&embed_key) {
+                Some(t) => {
+                    // The table's stored blocks must be what the config says they are.
+                    let stem = embed_key.strip_suffix(".weight").unwrap_or(&embed_key);
+                    match cfg.tensor_format(&embed_key, format) {
+                        Some(ProjectionFormat::Ggml(q)) if q.bits() == 8 => {}
+                        other => {
+                            return Err(Error::Config(format!(
+                                "embedding `{stem}` is stored as GGML blocks, which a table \
+                                 is read from only as Q8; the config reads it as {}",
+                                match other {
+                                    Some(ProjectionFormat::Ggml(q)) => format!("Q{}", q.bits()),
+                                    Some(ProjectionFormat::Nvfp4(_)) => "NVFP4".into(),
+                                    None => "dense (no quantization block)".into(),
+                                }
+                            )))
+                        }
+                    }
+                    QwenEmbedding::Q8(std::sync::Arc::new(
+                        crate::primitives::quant::Q8RowEmbedding::from_stored(stem, t, &device)?,
+                    ))
+                }
+                None => QwenEmbedding::Dense(req(embed_key.clone())?),
+            },
         };
         let norm = norm_w(join("norm.weight"))?;
         let head_key = if prism.is_some() {
@@ -3358,29 +3423,39 @@ impl Qwen35Model {
         } else {
             "lm_head.weight".to_string()
         };
-        let lm_head = if !with_lm_head {
-            None
-        } else {
-            Some(std::sync::Arc::new(
-                if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
-                    Projection::load_prism(weight.clone())
-                } else if cfg.tie_word_embeddings {
-                    let QwenEmbedding::Dense(weight) = &embed_tokens else {
-                        return Err(Error::Config(
-                            "Prism tied embeddings require an explicit lm_head packed tensor"
-                                .into(),
-                        ));
-                    };
-                    Projection::load_as(weight.clone(), None, dense_format)?
-                } else if let Some(head) =
-                    crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
-                {
-                    head
-                } else {
-                    Projection::load_as(req(head_key)?, None, dense_format)?
-                },
-            ))
-        };
+        let lm_head =
+            if !with_lm_head {
+                None
+            } else {
+                Some(std::sync::Arc::new(
+                    if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+                        Projection::load_prism(weight.clone())
+                    } else if cfg.tie_word_embeddings {
+                        match &embed_tokens {
+                            QwenEmbedding::Dense(weight) => {
+                                Projection::load_as(weight.clone(), None, dense_format)?
+                            }
+                            // A tied stored table is the head's own blocks, as stored.
+                            QwenEmbedding::Q8(_) => load_stored(
+                                &embed_key,
+                                stored(&embed_key).expect("a Q8 table is stored"),
+                            )?,
+                            QwenEmbedding::Prism(_) => return Err(Error::Config(
+                                "Prism tied embeddings require an explicit lm_head packed tensor"
+                                    .into(),
+                            )),
+                        }
+                    } else if let Some(t) = stored(&head_key) {
+                        load_stored(&head_key, t)?
+                    } else if let Some(head) =
+                        crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
+                    {
+                        head
+                    } else {
+                        Projection::load_as(req(head_key)?, None, dense_format)?
+                    },
+                ))
+            };
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;

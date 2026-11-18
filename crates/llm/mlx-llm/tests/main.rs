@@ -106,6 +106,9 @@ mod qwen35_vision;
 #[path = "qwen38_bonsai.rs"]
 mod qwen38_bonsai;
 
+#[path = "qwen38_quantized_tiers.rs"]
+mod qwen38_quantized_tiers;
+
 #[path = "qwen3vl.rs"]
 mod qwen3vl;
 

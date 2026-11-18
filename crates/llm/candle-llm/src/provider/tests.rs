@@ -2108,6 +2108,218 @@ fn qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds() {
     assert_eq!(estimate(&moe), ggml_copy_built(&census, GgmlDType::Q8_0));
 }
 
+/// SW-7201: the fully quantized tiers prepared from the synthetic qwen3_5 (dense, with its MTP
+/// head) and the plain tier of the same body bits.
+fn qwen35_full_and_plain_tiers(
+    quant: core_llm::Quantize,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use core_llm::PrepareSpec;
+    let src = q8_capable_qwen35_snapshot(false);
+    let out = tempfile::tempdir().unwrap();
+    let (full, plain) = (out.path().join("full"), out.path().join("plain"));
+    crate::prepare::prepare_fully_quantized(&PrepareSpec::quantized(src.path(), &full, quant))
+        .unwrap();
+    crate::prepare::prepare(&PrepareSpec::quantized(src.path(), &plain, quant)).unwrap();
+    (src, out, full, plain)
+}
+
+/// The checkpoint stems a fully quantized tier of the synthetic qwen3_5 stores beyond the plain
+/// tier: the head, the embedding and the three DeltaNet layers' `in_proj_a` / `in_proj_b`.
+fn qwen35_remaining_stems() -> Vec<String> {
+    let mut stems = vec![
+        "lm_head".to_string(),
+        "model.language_model.embed_tokens".to_string(),
+    ];
+    for layer in 0..3 {
+        for part in ["a", "b"] {
+            stems.push(format!(
+                "model.language_model.layers.{layer}.linear_attn.in_proj_{part}"
+            ));
+        }
+    }
+    stems
+}
+
+/// SW-7201: a fully quantized tier stores the head, the embedding and every `in_proj_a` /
+/// `in_proj_b` as Q8_0 blocks beside its body (Q4 / Q8), names each in the `quantization` block
+/// when the body's bits differ, loads (constructor only, no forward) with those tensors served as
+/// Q8_0 and the embedding as a Q8 table, and admission prices exactly that: the plain tier's copy
+/// with the head at Q8_0 instead of the body's format, plus the decay / delta-strength inputs and
+/// the embedding table's device bytes.
+#[test]
+fn qwen35_fully_quantized_tiers_store_load_and_price_every_language_matrix() {
+    use crate::primitives::projection::{ggml_device_bytes, QuantSpec};
+    use crate::primitives::quant::Q8RowEmbedding;
+    use candle_core::quantized::GgmlDType;
+    use core_llm::Quantize;
+    let estimate = |dir: &std::path::Path| {
+        super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true)
+            .unwrap()
+            .quantized_copy_bytes
+    };
+    let stems = qwen35_remaining_stems();
+    for (quant, body) in [
+        (Quantize::Q4, QuantSpec::q4()),
+        (Quantize::Q8, QuantSpec::q8()),
+    ] {
+        let (_src, _out, full, plain) = qwen35_full_and_plain_tiers(quant);
+        let header =
+            crate::provider::read_safetensors_header(&full.join("model.safetensors")).unwrap();
+        for stem in &stems {
+            let entry = &header[&format!("{stem}.weight")];
+            assert_eq!(entry["dtype"], "U8", "{stem}");
+            assert_eq!(entry["shape"][2], 34, "{stem} is Q8_0");
+        }
+        let qkv = &header["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"];
+        assert_eq!(
+            qkv["shape"][2],
+            if body.bits() == 8 { 34 } else { 18 },
+            "the body keeps its own blocks"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(full.join("config.json")).unwrap())
+                .unwrap();
+        let block = config["quantization"].as_object().unwrap();
+        assert_eq!(block["storage"], "ggml");
+        if body.bits() == 8 {
+            assert_eq!(block.len(), 2, "an int8 tier needs no per-tensor entry");
+        } else {
+            assert_eq!(block.len(), 2 + stems.len());
+            for stem in &stems {
+                assert_eq!(
+                    block[stem.as_str()],
+                    serde_json::json!({"bits": 8}),
+                    "{stem}"
+                );
+            }
+        }
+
+        let census = loaded_census(&spec_at(&full, None));
+        let plain_census = loaded_census(&spec_at(&plain, None));
+        assert_eq!(
+            census.projections.ggml.count,
+            plain_census.projections.ggml.count + 6,
+            "the in_proj_a / in_proj_b join the GGML projections"
+        );
+        let device = crate::device::select_device().unwrap();
+        let dense_embedding = 50 * 32 * crate::device::compute_dtype(&device).size_in_bytes();
+        assert_eq!(census.other.params, plain_census.other.params);
+        assert_eq!(
+            census.other.resident_bytes,
+            plain_census.other.resident_bytes - dense_embedding as u64
+                + Q8RowEmbedding::device_bytes(50, 32).unwrap(),
+            "the dense embedding is replaced by its Q8 table"
+        );
+
+        let q8 = |rows: u64, cols: u64| ggml_device_bytes(rows * cols, GgmlDType::Q8_0).unwrap();
+        let body_head = ggml_device_bytes(50 * 32, body.dtype).unwrap();
+        assert_eq!(
+            estimate(&full),
+            estimate(&plain) - body_head
+                + q8(50, 32)
+                + 6 * q8(4, 32)
+                + Q8RowEmbedding::device_bytes(50, 32).unwrap()
+        );
+    }
+}
+
+/// SW-7201: a mixed tier read without its per-tensor entries is refused at the first Q8_0 tensor
+/// the 4-bit format cannot read, never served at the wrong precision.
+#[test]
+fn a_mixed_qwen35_tier_without_its_entries_is_refused() {
+    let (_src, _out, full, _plain) = qwen35_full_and_plain_tiers(core_llm::Quantize::Q4);
+    let path = full.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["quantization"] = serde_json::json!({"bits": 4, "storage": "ggml"});
+    std::fs::write(&path, config.to_string()).unwrap();
+    match super::LlamaProvider::load(&spec_at(&full, None)) {
+        Err(e) => assert!(e.to_string().contains("Q8"), "{e}"),
+        Ok(_) => panic!("a Q8_0 table read as Q4 must be refused"),
+    }
+}
+
+/// SW-7201 (AC2 on the tiny fixture): each fully quantized tier decodes like the plain tier of
+/// the same body bits — its logits stay within a small fraction of the plain tier's range, and at
+/// every prompt position the greedy token agrees unless the plain tier's top two are nearer than
+/// the logit difference between the tiers (a near-tie).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen35_fully_quantized_tiers_decode_like_the_plain_tier() {
+    use crate::models::{Qwen35Config, Qwen35Model};
+    use crate::primitives::projection::ProjectionFormat;
+    use candle_core::Device;
+    let device = Device::Cpu;
+    let load = |dir: &std::path::Path| {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let format = crate::prepare::persisted_ggml_blocks(&config).map(ProjectionFormat::from);
+        let weights = crate::primitives::Weights::from_dir(dir, &device).unwrap();
+        Qwen35Model::from_weights_format(
+            &weights,
+            "model.language_model",
+            Qwen35Config::from_json(&config).unwrap(),
+            format.as_ref(),
+        )
+        .unwrap()
+    };
+    for quant in [core_llm::Quantize::Q4, core_llm::Quantize::Q8] {
+        let (_src, _out, full, plain) = qwen35_full_and_plain_tiers(quant);
+        let ids = Tensor::from_vec(vec![3u32, 1, 4, 1, 5, 9, 2, 6], (1, 8), &device).unwrap();
+        let logits = |model: &Qwen35Model| -> Vec<f32> {
+            model
+                .forward(&ids, &mut model.new_cache(), 0)
+                .unwrap()
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let (full_logits, plain_logits) = (logits(&load(&full)), logits(&load(&plain)));
+        assert!(full_logits.iter().all(|v| v.is_finite()));
+        let diff = full_logits
+            .iter()
+            .zip(&plain_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let range = plain_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            diff <= 0.1 * range,
+            "{quant:?}: full/plain logit difference {diff} vs range {range}"
+        );
+        for (pos, (f, p)) in full_logits
+            .chunks(50)
+            .zip(plain_logits.chunks(50))
+            .enumerate()
+        {
+            let argmax = |row: &[f32]| {
+                (0..row.len())
+                    .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+                    .unwrap()
+            };
+            if argmax(f) != argmax(p) {
+                let mut sorted = p.to_vec();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                assert!(
+                    sorted[0] - sorted[1] <= 2.0 * diff,
+                    "{quant:?} position {pos}: greedy tokens differ outside a near-tie"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen35_fully_quantized_tiers_decode_like_the_plain_tier");
+}
+
 /// sc-24140 review: a qwen3_5 MoE snapshot loads under `Quantize::Q8` on every device and
 /// decodes. On a host device the loader hands the GGML quantizer each expert as a view
 /// narrowed out of the stacked tensors, which candle's quantizer read from the storage's

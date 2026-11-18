@@ -77,6 +77,11 @@ impl QuantizedEmbedding {
         })
     }
 
+    /// The embedding width the packed table reconstructs (`packed words · 32 / bits`).
+    pub fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
     /// Gather packed vocabulary rows and dequantize only the requested `[batch, sequence]` tokens.
     pub fn forward(&self, ids: &Array) -> Result<Array> {
         let ids_shape = ids.shape();

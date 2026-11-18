@@ -956,6 +956,46 @@ mod tests {
             .collect()
     }
 
+    /// SW-7201: a fully quantized tier is priced at its stored bytes. Its 8-bit embedding and LM
+    /// head stay resident as stored — packed words plus BF16 scales and biases, one page of
+    /// rounding each — where the plain tier keeps the BF16 tables, so the bound drops by exactly
+    /// that difference.
+    #[test]
+    fn a_fully_quantized_tier_is_priced_at_its_stored_bytes() {
+        let (vocab, hidden, words) = (4096u64, 64u64, 16u64);
+        let body = |t: &mut Vec<(String, &'static str, Vec<u64>)>| {
+            let p = "model.language_model.layers.0.mlp.up_proj";
+            t.push((format!("{p}.weight"), "U32", vec![1024, 256]));
+            t.push((format!("{p}.scales"), "BF16", vec![1024, 16]));
+            t.push((format!("{p}.biases"), "BF16", vec![1024, 16]));
+            t.push((
+                "model.language_model.norm.weight".into(),
+                "BF16",
+                vec![hidden],
+            ));
+        };
+        let tables = ["model.language_model.embed_tokens", "lm_head"];
+        let mut plain: Tensors = Vec::new();
+        body(&mut plain);
+        let mut full = plain.clone();
+        for stem in tables {
+            plain.push((format!("{stem}.weight"), "BF16", vec![vocab, hidden]));
+            full.push((format!("{stem}.weight"), "U32", vec![vocab, words]));
+            full.push((format!("{stem}.scales"), "BF16", vec![vocab, 1]));
+            full.push((format!("{stem}.biases"), "BF16", vec![vocab, 1]));
+        }
+        let config = json!({
+            "model_type": "qwen3_5",
+            "quantization": {"group_size": 64, "bits": 4},
+        });
+        let bound = |t: &Tensors| {
+            let (dir, _) = snapshot(config.clone(), &refs(t));
+            materialized_bound(&safetensors_headers(dir.path()).unwrap(), None).unwrap()
+        };
+        let per_table = vocab * hidden * 2 - (vocab * words * 4 + 2 * vocab * 2) - 2 * R;
+        assert_eq!(bound(&plain) - bound(&full), 2 * per_table);
+    }
+
     /// The probed cells are charged their materialize-at-load bound (the exact-peak re-probes
     /// cover every listed cell); every other cell outside `main`'s verified families keeps the
     /// two-copy floor, including a family the loader dispatches alike (Mistral, dense Qwen2 — the
