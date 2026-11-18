@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import sys
+from uuid import UUID
 
 COLOR_PROMPT = "What is the dominant color of this image? Answer with one word."
 RED = [205, 35, 35]
@@ -20,6 +21,22 @@ FIXTURES = (
       "quadrants": [RED, BLUE, [36, 174, 47], [232, 190, 40]]}, "red"),
 )
 STEPS = 3
+
+
+def validate_cuda_witness(witness, expected_uuid, cap):
+    """Validate process-local PyTorch metrics, separate from external WDDM samples."""
+    expected = "GPU-" + str(UUID(expected_uuid.removeprefix("GPU-")))
+    identity = (witness["device_uuid"], witness["visible_devices"], witness["device_ordinal"],
+                witness["live_tensor_dtype"], witness["allocator_scope"], witness["allocator_backend"])
+    if (identity != (expected, 1, 0, "bfloat16", "PyTorch CUDA allocator", "native")
+            or type(witness["visible_devices"]) is not int or type(witness["device_ordinal"]) is not int):
+        raise ValueError("reference CUDA UUID, ordinal or live BF16 tensor does not match admission")
+    if type(witness["forward_passes"]) is not int or witness["forward_passes"] != len(FIXTURES) * STEPS * 3:
+        raise ValueError("reference did not witness every learned CUDA forward")
+    counters = (witness["live_tensor_bytes"], witness["allocated_after_load_bytes"],
+                witness["peak_allocated_bytes"], witness["peak_reserved_bytes"])
+    if any(type(value) is not int for value in counters) or not 0 < counters[0] <= counters[1] <= counters[2] <= counters[3] <= cap:
+        raise ValueError("reference PyTorch CUDA peaks are missing, inconsistent or exceed the admitted child cap")
 
 
 def fixture_image(image, pil):
@@ -163,6 +180,8 @@ def run_case(model, inputs, torch, *, cached, tokens=None, expected_plan):
                 raise RuntimeError("upstream did not allocate an independent cache per Loop visit")
             if past.get_seq_length() != input_ids.shape[-1]:
                 raise RuntimeError("upstream Loop cache sequence length mismatch")
+        if output.logits.device != torch.device("cuda:0"):
+            raise RuntimeError("reference produced learned logits outside the admitted CUDA device")
         row = output.logits[0, -1, :].float().cpu()
         if not torch.isfinite(row).all():
             raise RuntimeError("non-finite oracle logits")
@@ -176,7 +195,7 @@ def run_case(model, inputs, torch, *, cached, tokens=None, expected_plan):
     return scores, chosen
 
 
-def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
+def main(snapshot: Path, inventory_sha: str, output: Path, expected_uuid: str, cap: int) -> None:
     import torch
     import transformers
     import torchvision
@@ -187,6 +206,14 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
         raise RuntimeError("official Transformers/PyTorch reference toolchain mismatch")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1 or not torch.cuda.is_bf16_supported():
         raise RuntimeError("reference requires one admitted native BF16 CUDA device")
+    device = torch.device("cuda:0")
+    uuid = "GPU-" + str(UUID(bytes=bytes(torch.cuda.get_device_properties(device).uuid.bytes)))
+    if uuid.casefold() != expected_uuid.casefold() or torch.cuda.current_device() != device.index:
+        raise RuntimeError("reference CUDA runtime did not open the leased GPU UUID")
+    allocator_backend = torch.cuda.get_allocator_backend()
+    if allocator_backend != "native":
+        raise RuntimeError("reference needs the native PyTorch CUDA allocator for its peak counters")
+    torch.cuda.reset_peak_memory_stats(device)
     # Pin the recurrent path to the reviewed wheel environment (without optional accelerator
     # kernels) and exclude TF32 rounding from prospective BF16 tolerance calibration.
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -196,6 +223,10 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
         snapshot, trust_remote_code=True, local_files_only=True,
         dtype=torch.bfloat16, device_map={"": "cuda:0"}, attn_implementation="eager",
     ).eval()
+    embedding = model.get_input_embeddings().weight
+    if embedding.device != device or embedding.dtype != torch.bfloat16:
+        raise RuntimeError("reference checkpoint embedding is not a live BF16 tensor on leased CUDA")
+    allocated_after_load = torch.cuda.memory_allocated(device)
     layers = model.model.language_model.layers
     plan = (*range(4), *range(4, 28), *range(4, 28), *range(28, 32))
     if len(layers) != 32 or any(
@@ -230,6 +261,7 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
         "model.language_model.layers.4.mhc_ffn.bias": layers[4].mhc_ffn.bias,
     }.items()}
     cases = []
+    forward_passes = 0
     with torch.inference_mode():
         for name, prompt, image, expected_answer in FIXTURES:
             content = [{"type": "text", "text": prompt}]
@@ -261,6 +293,7 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
             if model.model.language_model.config._attn_implementation != "sdpa":
                 raise RuntimeError("reference did not activate independent SDPA attention")
             alternate, _ = run_case(model, inputs, torch, cached=True, tokens=chosen, expected_plan=plan)
+            forward_passes += len(baseline) + len(cold) + len(alternate)
             semantic = semantic_checks(name, expected_answer, processor.tokenizer, chosen[:first_end], baseline)
             steps = []
             for index, (logits, token_id) in enumerate(zip(baseline, chosen, strict=True)):
@@ -297,6 +330,17 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
                     add_generation_prompt=True, enable_thinking=True,
                 ),
             })
+    torch.cuda.synchronize(device)
+    cuda_witness = {
+        "device_uuid": uuid, "visible_devices": torch.cuda.device_count(), "device_ordinal": device.index,
+        "live_tensor_dtype": str(embedding.dtype).removeprefix("torch."),
+        "live_tensor_bytes": embedding.numel() * embedding.element_size(),
+        "allocated_after_load_bytes": allocated_after_load, "allocator_scope": "PyTorch CUDA allocator",
+        "allocator_backend": allocator_backend,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(device), "forward_passes": forward_passes,
+    }
+    validate_cuda_witness(cuda_witness, expected_uuid, cap)
     payload = {
         "schema_version": 1, "hf_revision": snapshot.name,
         "source_inventory_sha256": inventory_sha,
@@ -304,10 +348,10 @@ def main(snapshot: Path, inventory_sha: str, output: Path) -> None:
         "processor_bindings": processor_binding, "loaded_parameter_dtypes": loaded_parameter_dtypes,
         "torch": torch.__version__, "transformers": transformers.__version__,
         "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(), "pillow": pillow_version,
-        "cases": cases,
+        "cases": cases, "cuda_witness": cuda_witness,
     }
     output.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]))
+    main(Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), sys.argv[4], int(sys.argv[5]))

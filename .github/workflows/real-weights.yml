@@ -6449,7 +6449,7 @@ jobs:
           SENSENOVA_REFERENCE_REPORT: ${{ runner.temp }}/sensenova-reference-report-${{ github.run_id }}-${{ github.run_attempt }}
         run: call scripts\ci\real-weights\model-proof-execute\sensenova-windows.cmd reference
       - name: Retain bounded reference evidence
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sensenova-loop-reference-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -6591,7 +6591,7 @@ jobs:
           SENSENOVA_NATIVE_REPORT: ${{ runner.temp }}/sensenova-native-report-${{ github.run_id }}-${{ github.run_attempt }}
         run: source scripts/ci/real-weights/model-proof-execute/sensenova-seal.sh
       - name: Upload native SenseNova input receipts
-        if: ${{ !cancelled() && matrix.asset_setup == 'sensenova-loop' }}
+        if: ${{ always() && matrix.asset_setup == 'sensenova-loop' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sensenova-loop-native-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
