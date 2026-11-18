@@ -289,7 +289,12 @@ def bind(bindings: dict[str, Pin], roots: list[tuple[str, Path]], download_missi
                 record["error"] = f"{type(error).__name__}: {str(error).splitlines()[0] if str(error) else ''}"
                 print(f"download of {pin.repository}@{pin.revision} failed: {record['error']}", flush=True)
             downloads.append(record)
-        resolved = {name: resolve(pin, roots) for name, pin in bindings.items()}
+        # A failed fetch can leave the small required files (configs, tokenizer) on disk without the
+        # weights (e.g. ENOSPC part-way through, run 44296944406): never bind a snapshot whose own
+        # download failed, whatever its required files say.
+        failed = {(record["repository"], record["revision"]) for record in downloads if "error" in record}
+        resolved = {name: None if (pin.repository, pin.revision) in failed else resolve(pin, roots)
+                    for name, pin in bindings.items()}
     return resolved, downloads
 
 

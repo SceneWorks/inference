@@ -136,6 +136,23 @@ class MlxTrainingAssets(unittest.TestCase):
             self.assertIsNone(resolved["GATED"])
             self.assertEqual(downloads[0]["error"], "RuntimeError: 403 Client Error")
 
+    def test_a_partial_download_that_failed_is_never_bound(self):
+        partial = assets.Pin("org/partial", "f" * 40, files=("config.json",))
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory).resolve()
+            roots = [(f"MLX_GEN_MODELS_ROOT={primary}", primary)]
+
+            def out_of_space(pin, cache_dir):
+                # The required (small) files land, then the weights fail.
+                (cache_dir / pin.relative()).mkdir(parents=True)
+                (cache_dir / pin.relative() / "config.json").write_text("{}", encoding="utf-8")
+                raise RuntimeError("No space left on device (os error 28)")
+
+            resolved, downloads = assets.bind({"PARTIAL": partial}, roots, True, download=out_of_space)
+            self.assertFalse(assets.complete(primary / partial.relative(), partial))
+            self.assertIsNone(resolved["PARTIAL"])
+            self.assertIn("No space left on device", downloads[0]["error"])
+
     def test_request_validates_download_missing_and_the_primary_mac_route(self):
         policy = {"backend": "darwin-mlx"}
         value = proofs.request(json.dumps({"selection": "x", "policy": policy, "runner": "nax-primary",
