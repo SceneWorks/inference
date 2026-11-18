@@ -114,6 +114,9 @@ pub(crate) fn write_test_snapshot_tensors(dir: &Path, names: &[&str], index: boo
 /// shared loader ([`Projection::load_as`](crate::primitives::Projection::load_as) /
 /// [`load_eligible`](crate::primitives::Projection::load_eligible)).
 pub(super) fn nvfp4_family_refusal(config: &Value) -> Option<String> {
+    if config["model_type"] == "sensenova_loop" {
+        return Some("SenseNova-Loop-9B serves the pinned BF16, Q8_0 and Q4_K tiers".into());
+    }
     if config.get("model_type").and_then(Value::as_str) == Some("prism_hadamard_qwen35") {
         return Some(
             "a Prism/Bonsai snapshot is already packed affine-2; NVFP4 projections are quantized \

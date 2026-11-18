@@ -131,9 +131,28 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
         )));
     }
 
+    let mut config = read_json(&config_path)?;
+    let loop_model =
+        core_llm::sensenova_loop::SenseNovaLoop::from_config(&config).map_err(Error::Config)?;
+    if loop_model.is_some() {
+        let tier = crate::sensenova_loop::tier(&config, None)?;
+        if tier.is_some() && spec.quantize.is_some() {
+            return Err(Error::Config(
+                "SenseNova-Loop: prepare quantized tiers from the original BF16 snapshot".into(),
+            ));
+        }
+        crate::sensenova_loop::validate_snapshot(src, tier)?;
+        if tier.is_none() {
+            core_llm::sensenova_loop::validate_source_shards(src).map_err(Error::Config)?;
+        }
+    }
     let Some(q) = spec.quantize.map(quant_spec).transpose()? else {
         // Dense: the source is already a loadable snapshot, so return it untouched (write nothing).
-        let num_tensors = count_safetensors_tensors(src)?;
+        let num_tensors = if loop_model.is_some() {
+            core_llm::sensenova_loop::target_tensors().count()
+        } else {
+            count_safetensors_tensors(src)?
+        };
         if num_tensors == 0 {
             return Err(Error::Msg(format!(
                 "prepare: HF source {} has no safetensors tensors",
@@ -152,7 +171,6 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     // Quantized. The selection's decoder-root probe needs every key of the snapshot, read from the
     // shard headers only; then each shard is read, rounded and written on its own, so peak host
     // memory is one shard. The source dtype is preserved (the loader casts to its compute dtype).
-    let mut config = read_json(&config_path)?;
     // A ModelOpt NVFP4 source stores packed U8 projections plus scale companions; quantizing those
     // bytes as ordinary weights would write a snapshot that cannot load. Refuse before any write.
     if core_llm::modelopt::modelopt_nvfp4(&config) != Ok(None) {
@@ -162,7 +180,11 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
             src.display()
         )));
     }
-    let shards = safetensors_shards(src)?;
+    let shards = if loop_model.is_some() {
+        crate::sensenova_loop::shards(src)
+    } else {
+        safetensors_shards(src)?
+    };
     if shards.is_empty() {
         return Err(Error::Msg(format!(
             "prepare: HF source {} has no safetensors tensors",
@@ -200,6 +222,14 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     }
 
     stamp_quantization(&mut config, q, stored);
+    if loop_model.is_some() {
+        config["quantization"]["format"] = Json::from(crate::sensenova_loop::format_name(q));
+        config["quantization"]["source_revision"] =
+            Json::from(core_llm::sensenova_loop::MODEL_REVISION);
+        for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
+            copy_optional(src, &spec.out_dir, name)?;
+        }
+    }
     write_json(&spec.out_dir.join("config.json"), &config)?;
     if shards.len() > 1 {
         let index = serde_json::json!({

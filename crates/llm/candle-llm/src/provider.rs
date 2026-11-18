@@ -66,6 +66,8 @@ mod chat_template;
 mod constraint;
 mod descriptor;
 mod generate;
+#[cfg(any(feature = "test-kv-arm", feature = "model-inference-proof"))]
+mod sensenova_proof;
 mod snapshot_headers;
 pub(crate) use admission::read_safetensors_header;
 pub use admission::LoadMemoryEstimate;
@@ -397,8 +399,16 @@ impl Decoder {
                         c.num_heads,
                         c.num_kv_heads,
                         c.head_dim,
-                        c.num_layers,
-                        c.hidden_size,
+                        if let Some(plan) = c.sensenova_loop {
+                            plan.visits().filter(|&i| !c.is_linear(i)).count()
+                        } else {
+                            c.num_layers
+                        },
+                        // The shared estimator charges eight hidden-width FP32
+                        // rows per token and uses this term for CUDA graph shapes
+                        // too. The Loop carries two residual streams through both
+                        // branches (including the FP32 router normalization).
+                        c.hidden_size * if c.sensenova_loop.is_some() { 2 } else { 1 },
                         c.intermediate_size,
                         c.vocab_size,
                         m.recurrent_state_bytes(1 + retained_checkpoints) as u64,
@@ -1877,6 +1887,9 @@ impl LlamaProvider {
                 "mtp_head: {}",
                 core_llm::COMPANION_MTP_ALREADY_NATIVE
             )),
+            (Decoder::Qwen35(model), None) if model.config().sensenova_loop.is_some() => Err(
+                "mtp_head: the frozen SenseNova-Loop inference wrapper does not attach MTP".into(),
+            ),
             (Decoder::Qwen35(model), None) => {
                 Qwen35Mtp::from_companion_dir(head, model).map_err(|e| format!("mtp_head: {e}"))
             }
@@ -2098,11 +2111,23 @@ impl LlamaProvider {
         } else {
             None
         };
+        let loop_model = core_llm::sensenova_loop::SenseNovaLoop::from_config(&cfg_value)
+            .map_err(CoreError::Load)?;
+        if loop_model.is_some() {
+            let q = crate::sensenova_loop::tier(&cfg_value, requested).map_err(to_core)?;
+            crate::sensenova_loop::validate_snapshot(dir, q).map_err(to_core)?;
+        }
         let (weights, prism) = if is_prism {
             let checkpoint =
                 crate::prism_checkpoint::PrismMlxCheckpoint::open(dir, device, &cfg_value)
                     .map_err(to_core)?;
             (checkpoint.weights, Some(checkpoint.registry))
+        } else if loop_model.is_some() {
+            (
+                Weights::from_shards(crate::sensenova_loop::shards(dir), device)
+                    .map_err(to_core)?,
+                None,
+            )
         } else {
             (Weights::from_dir(dir, device).map_err(to_core)?, None)
         };
@@ -2114,6 +2139,9 @@ impl LlamaProvider {
             // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
             let mut descriptor = descriptor_for_qwen35(&qcfg, device);
+            if loop_model.is_some() {
+                descriptor.family = "sensenova_loop".into();
+            }
             if is_prism {
                 descriptor.family = "prism_hadamard_qwen35".into();
                 descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
@@ -2147,19 +2175,23 @@ impl LlamaProvider {
             // run, loads the target plain with the reason named; a partial `mtp.*` set still
             // fails the load (integrity).
             let cfg = m.config();
-            let mtp = match core_llm::native_mtp_plan(
-                cfg.mtp_num_hidden_layers,
-                cfg.mtp_use_dedicated_embeddings,
-                weights.keys().any(|key| key.starts_with("mtp.")),
-            )? {
-                core_llm::NativeMtp::Absent => None,
-                core_llm::NativeMtp::Build => Some(
-                    Qwen35Mtp::from_weights_format(&weights, &m, format.as_ref())
-                        .map_err(to_core)?,
-                ),
-                core_llm::NativeMtp::Fallback(why) => {
-                    load_fallbacks.push(why);
-                    None
+            let mtp = if cfg.sensenova_loop.is_some() {
+                None
+            } else {
+                match core_llm::native_mtp_plan(
+                    cfg.mtp_num_hidden_layers,
+                    cfg.mtp_use_dedicated_embeddings,
+                    weights.keys().any(|key| key.starts_with("mtp.")),
+                )? {
+                    core_llm::NativeMtp::Absent => None,
+                    core_llm::NativeMtp::Build => Some(
+                        Qwen35Mtp::from_weights_format(&weights, &m, format.as_ref())
+                            .map_err(to_core)?,
+                    ),
+                    core_llm::NativeMtp::Fallback(why) => {
+                        load_fallbacks.push(why);
+                        None
+                    }
                 }
             };
             (Decoder::Qwen35(m), descriptor, mtp)
@@ -2195,6 +2227,13 @@ impl LlamaProvider {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
             let tower = if prism_vision {
                 Qwen35VisionModel::from_mlx_weights(&weights, "vision_tower", vcfg.clone())
+            } else if loop_model.is_some() {
+                Qwen35VisionModel::from_weights_dtype(
+                    &weights,
+                    "model.visual",
+                    vcfg.clone(),
+                    crate::device::compute_dtype(device),
+                )
             } else {
                 Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
             }

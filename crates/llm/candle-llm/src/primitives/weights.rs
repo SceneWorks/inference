@@ -85,6 +85,10 @@ impl Weights {
             )));
         }
         shards.sort();
+        Self::from_shards(shards, device)
+    }
+
+    pub(crate) fn from_shards(shards: Vec<std::path::PathBuf>, device: &Device) -> Result<Self> {
         #[cfg(feature = "model-inference-proof")]
         let __input_paths = shards.clone(); // deterministic merge order
         let mut tensors = HashMap::new();

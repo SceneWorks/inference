@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 pub struct Rope {
     /// `inv_freq[i]`, length `rotary_dim / 2`.
     inv_freq: Vec<f32>,
+    attention_scale: f32,
     /// The number of (last-axis) dimensions RoPE rotates — `head_dim` for full rotary, less for a
     /// partial schedule (GLM-4). Equals `inv_freq.len() * 2`.
     dim: usize,
@@ -49,6 +50,7 @@ impl Rope {
         Ok(Self {
             inv_freq,
             dim: self.dim,
+            attention_scale: self.attention_scale,
             interleaved: self.interleaved,
         })
     }
@@ -66,6 +68,7 @@ impl Rope {
         Self {
             inv_freq,
             dim,
+            attention_scale: 1.,
             interleaved: false,
         }
     }
@@ -82,6 +85,7 @@ impl Rope {
         Self {
             inv_freq,
             dim,
+            attention_scale: 1.,
             interleaved,
         }
     }
@@ -133,6 +137,7 @@ impl Rope {
         Self {
             inv_freq,
             dim,
+            attention_scale: 1.,
             interleaved: false,
         }
     }
@@ -182,6 +187,7 @@ impl Rope {
         Self {
             inv_freq,
             dim,
+            attention_scale: 1.,
             interleaved: true,
         }
     }
@@ -221,8 +227,22 @@ impl Rope {
         Self {
             inv_freq,
             dim,
+            attention_scale: 1.,
             interleaved: false,
         }
+    }
+
+    pub(crate) fn scaled_neox(inv_freq: Vec<f32>, attention_scale: f32) -> Self {
+        Self {
+            dim: 2 * inv_freq.len(),
+            inv_freq,
+            attention_scale,
+            interleaved: false,
+        }
+    }
+
+    pub(crate) fn attention_scale(&self) -> f32 {
+        self.attention_scale
     }
 
     /// The head dimension this RoPE rotates.
@@ -278,9 +298,7 @@ impl Rope {
             }
         }
         let emb = Tensor::from_vec(emb, (1, n, self.dim), device)?;
-        let cos_t = emb.cos()?.to_dtype(dtype)?;
-        let sin_t = emb.sin()?.to_dtype(dtype)?;
-        Ok((cos_t, sin_t))
+        trig_tables(&emb, self.attention_scale, dtype)
     }
 
     /// Build the **interleaved** 3-axis multimodal-RoPE `(cos, sin)` tables — Qwen3.6's
@@ -346,15 +364,23 @@ impl Rope {
             emb.extend_from_slice(&freqs);
         }
         let emb = Tensor::from_vec(emb, (1, l, self.dim), device)?;
-        let cos_t = emb.cos()?.to_dtype(dtype)?;
-        let sin_t = emb.sin()?.to_dtype(dtype)?;
-        Ok((cos_t, sin_t))
+        trig_tables(&emb, self.attention_scale, dtype)
     }
 
     /// Whether this RoPE uses the interleaved (GPT-J) pairing.
     pub fn interleaved(&self) -> bool {
         self.interleaved
     }
+}
+
+pub(super) fn trig_tables(angles: &Tensor, scale: f32, dtype: DType) -> Result<(Tensor, Tensor)> {
+    let mut cos = angles.cos()?;
+    let mut sin = angles.sin()?;
+    if scale != 1. {
+        cos = cos.affine(scale as f64, 0.)?;
+        sin = sin.affine(scale as f64, 0.)?;
+    }
+    Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
 }
 
 /// Per-head RMSNorm (`weight: [head_dim]`) followed by [`apply_rope`] — the Qwen3 / Qwen3.5

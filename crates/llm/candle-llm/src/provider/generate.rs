@@ -50,6 +50,34 @@ pub(super) fn emit_content(
     }
 }
 
+impl LlamaProvider {
+    pub(super) fn render_request(
+        &self,
+        req: &TextLlmRequest,
+        messages: &[Message],
+    ) -> CoreResult<(String, Vec<i32>)> {
+        let prompt = self.template.render_with(
+            messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+                tools: &req.tools,
+                date_string: None,
+            },
+        )?;
+        let prompt_ids: Vec<i32> = self
+            .tokenizer
+            .encode(&prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+
+        Ok((prompt, prompt_ids))
+    }
+}
+
 impl TextLlm for LlamaProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
@@ -173,23 +201,7 @@ impl TextLlm for LlamaProvider {
         // auto special tokens. `enable_thinking` flows into the template kwarg so a no-think
         // (Disabled) request injects the model's closed `<think></think>` generation prompt; Auto
         // omits the kwarg (template default).
-        let prompt = self.template.render_with(
-            messages,
-            &RenderOptions {
-                add_generation_prompt: true,
-                enable_thinking: req.enable_thinking_kwarg(),
-                reasoning_effort: req.reasoning_effort,
-                preserve_thinking: req.preserve_thinking,
-                tools: &req.tools,
-                date_string: None,
-            },
-        )?;
-        let prompt_ids: Vec<i32> = self
-            .tokenizer
-            .encode(&prompt, false)?
-            .into_iter()
-            .map(|id| id as i32)
-            .collect();
+        let (prompt, prompt_ids) = self.render_request(req, messages)?;
 
         // Price the request before image/video preprocessing or any model forward allocates native
         // tensors. The visual geometry path is pure integer math over request dimensions.

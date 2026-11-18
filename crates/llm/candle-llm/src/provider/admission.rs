@@ -398,11 +398,18 @@ pub(super) type SnapshotTensors = std::collections::HashMap<String, TensorHeader
 pub(super) fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors> {
     let io_error =
         |error: std::io::Error| CoreError::Load(format!("checkpoint admission: {error}"));
-    let mut shards: Vec<_> = std::fs::read_dir(dir)
-        .map_err(io_error)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("safetensors"))
-        .collect();
+    let mut shards: Vec<_> = if read_json(dir, "config.json")
+        .as_ref()
+        .is_some_and(|v| v["model_type"] == "sensenova_loop")
+    {
+        crate::sensenova_loop::shards(dir)
+    } else {
+        std::fs::read_dir(dir)
+            .map_err(io_error)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+            .collect()
+    };
     shards.sort();
     let mut tensors = SnapshotTensors::new();
     for shard in shards {

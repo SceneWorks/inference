@@ -34,6 +34,7 @@ use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVIC
 use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
+mod mhc;
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
 use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
@@ -41,6 +42,7 @@ use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, Wei
 use crate::primitives::quant::is_ggml_block_tensor;
 use crate::primitives::rope::{rms_norm_rope, Rope};
 use crate::primitives::{KvCache, PrismRegistry, Weights};
+use core_llm::sensenova_loop::SenseNovaLoop;
 
 /// Whether a dense [`Qwen35Model`] / [`Qwen35Mtp`] load stores the checkpoint tensor `key` in a
 /// requested projection format rather than dense: in every decoder (and MTP) layer the Gated
@@ -97,6 +99,9 @@ fn is_per_expert_projection(suffix: &str) -> bool {
 /// num_layers`) or of the configured MTP head. The one rule both load admission prices the
 /// quantized copy by and the snapshot preparer stores GGML blocks for (sc-19375).
 pub(crate) fn loads_quantized(cfg: &Qwen35Config, prefix: &str, key: &str) -> bool {
+    if cfg.sensenova_loop.is_some() && key == "lm_head.weight" {
+        return true;
+    }
     let mtp_layers = cfg.mtp_num_hidden_layers;
     let loaded = match super::split_layer_key(key) {
         Some((root, layer, _)) => {
@@ -213,6 +218,7 @@ pub struct MoeParams {
 /// `text_config` of the VLM wrapper (or the top-level config if not wrapped).
 #[derive(Clone, Debug)]
 pub struct Qwen35Config {
+    pub sensenova_loop: Option<SenseNovaLoop>,
     pub hidden_size: i32,
     pub num_layers: usize,
     pub intermediate_size: i32,
@@ -251,6 +257,7 @@ pub struct Qwen35Config {
 impl Qwen35Config {
     /// Parse from a `config.json` value, descending into `text_config` for the VLM wrapper.
     pub fn from_json(v: &Value) -> Result<Self> {
+        let sensenova_loop = SenseNovaLoop::from_config(v).map_err(Error::Config)?;
         let c = v.get("text_config").unwrap_or(v);
         let int = |k: &str| -> Option<i32> { c.get(k).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let req = |k: &str| -> Result<i32> {
@@ -275,6 +282,7 @@ impl Qwen35Config {
             .or_else(|| int("moe_intermediate_size"))
             .unwrap_or(0);
         Ok(Self {
+            sensenova_loop,
             hidden_size,
             num_layers: req("num_hidden_layers")? as usize,
             intermediate_size,
@@ -386,6 +394,8 @@ fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
 /// / `in_proj_b` (decay / delta-strength). After the conv, q/k/v are a **contiguous** split of the
 /// `[key_dim, key_dim, value_dim]` channels (no head interleaving).
 struct GatedDeltaNet {
+    /// Transformers 5.18 keeps Q/K normalization, decay and output gate math in F32.
+    sensenova: bool,
     in_proj_qkv: Projection, // [key_dim·2 + value_dim, hidden] → conv'd
     in_proj_z: Projection,   // [value_dim, hidden]             → output gate
     in_proj_a: Projection,   // [Hv, hidden]                    → decay input
@@ -487,8 +497,9 @@ impl GatedDeltaNet {
 
         // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim — `use_qk_l2norm_in_kernel`.
         let inv = (self.head_k_dim as f64).powf(-0.5);
-        let qn = l2norm(&qc, 1e-6)?.affine(inv, 0.0)?;
-        let kn = l2norm(&kc, 1e-6)?;
+        let prep_dtype = if self.sensenova { DType::F32 } else { dt };
+        let qn = l2norm(&qc.to_dtype(prep_dtype)?, 1e-6)?.affine(inv, 0.0)?;
+        let kn = l2norm(&kc.to_dtype(prep_dtype)?, 1e-6)?;
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
         // the cache so every token's post-step state (conv tail + SSM state) lands in its
@@ -497,7 +508,7 @@ impl GatedDeltaNet {
         // GQA (q/k from Hk key heads → Hv value heads) is handled inside the recurrence
         // primitive.
         let beta = sigmoid(&b_in)?;
-        let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
+        let g = compute_g(&a_in.to_dtype(prep_dtype)?, &self.a_log, &self.dt_bias)?;
         let f = DType::F32;
         let (q, k, v, g, beta) = (
             qn.to_dtype(f)?,
@@ -513,7 +524,18 @@ impl GatedDeltaNet {
         };
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
-        let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
+        let out = if self.sensenova {
+            let y = y.to_dtype(dt)?.to_dtype(DType::F32)?;
+            let normed = crate::primitives::nn::rms_norm_unscaled(&y, self.eps)?.to_dtype(dt)?;
+            let weighted = normed
+                .broadcast_mul(&self.norm_weight)?
+                .to_dtype(DType::F32)?;
+            weighted
+                .broadcast_mul(&crate::primitives::nn::silu(&z.to_dtype(DType::F32)?)?)?
+                .to_dtype(dt)?
+        } else {
+            rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?
+        };
         let result = self
             .out_proj
             .forward(&out.reshape((b, s, self.value_dim))?)?;
@@ -745,6 +767,7 @@ enum Mixer {
 }
 
 struct DecoderLayer {
+    routers: Option<mhc::Routers>,
     input_ln: Tensor,
     post_ln: Tensor,
     mixer: Mixer,
@@ -754,6 +777,11 @@ struct DecoderLayer {
 
 impl DecoderLayer {
     fn record(&self, census: &mut WeightCensus) {
+        if let Some(r) = &self.routers {
+            for t in r.tensors() {
+                census.record_tensor(t);
+            }
+        }
         census.record_tensor(&self.input_ln);
         census.record_tensor(&self.post_ln);
         match &self.mixer {
@@ -801,25 +829,36 @@ impl DecoderLayer {
         positions: Option<&DevicePositions>,
         decode_start: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let r = match (&self.mixer, cache) {
-            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward_at(&normed, c, positions)?,
-            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(
-                &normed,
-                cos,
-                sin,
-                KvSlot::Growing(c, decode_start),
-                formulation,
-            )?,
-            (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => {
-                let slot = match positions {
-                    Some(p) => KvSlot::Indexed(c, p),
-                    None => KvSlot::Static(c, decode_start),
-                };
-                a.forward(&normed, cos, sin, slot, formulation)?
-            }
-            _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
+        let attention = |x: &Tensor| -> Result<Tensor> {
+            let normed = rms_norm(x, &self.input_ln, self.eps)?;
+            Ok(match (&self.mixer, cache) {
+                (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => {
+                    d.forward_at(&normed, c, positions)?
+                }
+                (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(
+                    &normed,
+                    cos,
+                    sin,
+                    KvSlot::Growing(c, decode_start),
+                    formulation,
+                )?,
+                (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => {
+                    let slot = match positions {
+                        Some(p) => KvSlot::Indexed(c, p),
+                        None => KvSlot::Static(c, decode_start),
+                    };
+                    a.forward(&normed, cos, sin, slot, formulation)?
+                }
+                _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
+            })
         };
+        if let Some(routers) = &self.routers {
+            return routers.forward(x, attention, |branch| {
+                self.ffn
+                    .forward(&rms_norm(branch, &self.post_ln, self.eps)?)
+            });
+        }
+        let r = attention(x)?;
         // Residual add + post-attention norm as one fused leaf (sc-24137); `h` carries forward.
         let (h, normed) = rms_norm_residual(x, &r, &self.post_ln, self.eps)?;
         let m = self.ffn.forward(&normed)?;
@@ -1629,6 +1668,8 @@ impl DecodeCache for Qwen35Cache {
 
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 pub struct Qwen35Model {
+    /// Physical layer index for each independent cache slot.
+    visits: Vec<usize>,
     embed_tokens: QwenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
@@ -1966,6 +2007,7 @@ impl Qwen35Mtp {
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
         let lp = |suffix: &str| format!("mtp.layers.0.{suffix}");
         let layer = DecoderLayer {
+            routers: None,
             input_ln: norm_w(&lp("input_layernorm.weight"))?,
             post_ln: norm_w(&lp("post_attention_layernorm.weight"))?,
             mixer: Mixer::Attn(Qwen35Attention {
@@ -2439,6 +2481,9 @@ impl Qwen35Model {
         }
         for layer in &self.layers {
             values.extend([layer.input_ln.clone(), layer.post_ln.clone()]);
+            if let Some(r) = &layer.routers {
+                values.extend(r.tensors().into_iter().cloned());
+            }
             match &layer.mixer {
                 Mixer::Attn(a) => {
                     for p in [&a.q_proj, &a.k_proj, &a.v_proj, &a.o_proj] {
@@ -2521,7 +2566,10 @@ impl Qwen35Model {
     /// [`Qwen35Cache::recurrent_bytes`] reports for such a cache, and the term admission prices
     /// (E6). Saturating.
     pub fn recurrent_state_bytes(&self, states: usize) -> usize {
-        let linear_layers = (0..self.cfg.num_layers)
+        let linear_layers = self
+            .visits
+            .iter()
+            .copied()
             .filter(|&i| self.cfg.is_linear(i))
             .count();
         self.recurrent_shape()
@@ -2536,7 +2584,10 @@ impl Qwen35Model {
     /// [`Qwen35Cache::preallocate_recurrent`] (which [`StepModel::new_cache_for`] calls).
     pub fn new_cache_with_checkpoints(&self, max_checkpoints: usize) -> Qwen35Cache {
         let shape = self.recurrent_shape();
-        let layers = (0..self.cfg.num_layers)
+        let layers = self
+            .visits
+            .iter()
+            .copied()
             .map(|i| {
                 if self.cfg.is_linear(i) {
                     Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
@@ -2590,8 +2641,8 @@ impl Qwen35Model {
             self.cfg.head_dim.max(0) as usize,
         );
         let shape = self.recurrent_shape();
-        let mut layers = Vec::with_capacity(self.cfg.num_layers);
-        for i in 0..self.cfg.num_layers {
+        let mut layers = Vec::with_capacity(self.visits.len());
+        for &i in &self.visits {
             layers.push(if self.cfg.is_linear(i) {
                 Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
             } else {
@@ -2638,7 +2689,10 @@ impl Qwen35Model {
     /// K and V for every full-attention layer in the compute dtype — the term admission charges
     /// for the preallocation (E6). Saturating.
     pub fn static_kv_bytes(&self, capacity: usize) -> usize {
-        let attention_layers = (0..self.cfg.num_layers)
+        let attention_layers = self
+            .visits
+            .iter()
+            .copied()
             .filter(|&i| !self.cfg.is_linear(i))
             .count();
         StaticKvCache::buffer_bytes(
@@ -2782,7 +2836,8 @@ impl Qwen35Model {
                 .device_rope
                 .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
             let mut h = h;
-            for (layer, slot) in self.layers.iter().zip(layers.iter_mut()) {
+            for (&physical, slot) in self.visits.iter().zip(layers.iter_mut()) {
+                let layer = &self.layers[physical];
                 check(&h)?;
                 h = layer.forward_with(
                     &h,
@@ -2844,7 +2899,8 @@ impl Qwen35Model {
         let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
-        for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
+        for (&physical, slot) in self.visits.iter().zip(cache.layers.iter_mut()) {
+            let layer = &self.layers[physical];
             check(&h)?;
             h = layer.forward_with(
                 &h,
@@ -3148,9 +3204,15 @@ impl Qwen35Model {
             &h0,
             visual_pos_mask,
             deepstack,
-            self.layers.len(),
+            self.visits.len(),
             |i, h| {
-                self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i], self.attn_formulation)
+                self.layers[self.visits[i]].forward(
+                    h,
+                    &cos,
+                    &sin,
+                    &mut cache.layers[i],
+                    self.attn_formulation,
+                )
             },
         )?;
         self.project_last(&h)
@@ -3181,9 +3243,15 @@ impl Qwen35Model {
             &h0,
             visual_pos_mask,
             deepstack,
-            self.layers.len(),
+            self.visits.len(),
             |i, h| {
-                self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i], self.attn_formulation)
+                self.layers[self.visits[i]].forward(
+                    h,
+                    &cos,
+                    &sin,
+                    &mut cache.layers[i],
+                    self.attn_formulation,
+                )
             },
         )?;
         let hidden = self.normalize(&hidden)?;
@@ -3214,9 +3282,15 @@ impl Qwen35Model {
             &h0,
             visual_pos_mask,
             deepstack,
-            self.layers.len(),
+            self.visits.len(),
             |i, h| {
-                self.layers[i].forward(h, &cos, &sin, &mut cache.layers[i], self.attn_formulation)
+                self.layers[self.visits[i]].forward(
+                    h,
+                    &cos,
+                    &sin,
+                    &mut cache.layers[i],
+                    self.attn_formulation,
+                )
             },
         )?;
         let hidden = self.normalize(&hidden)?;
@@ -3325,7 +3399,11 @@ impl Qwen35Model {
         // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
         // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
         let norm_w = |key: String| -> Result<Tensor> {
-            let weight = req(key)?;
+            let weight = if cfg.sensenova_loop.is_some() {
+                dense_weight(w, &key, DType::F32)?
+            } else {
+                req(key)?
+            };
             checkpoint_norm_weight(weight, prism.is_some())
         };
         let proj_q = |key: String| -> Result<Projection> {
@@ -3372,6 +3450,8 @@ impl Qwen35Model {
                         ));
                     };
                     Projection::load_as(weight.clone(), None, dense_format)?
+                } else if cfg.sensenova_loop.is_some() {
+                    keyed_projection(w, &head_key, dtype, format, false, &device)?
                 } else if let Some(head) =
                     crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
                 {
@@ -3387,6 +3467,11 @@ impl Qwen35Model {
         let conv_dim = key_dim * 2 + value_dim;
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
 
+        let gate_dtype = if cfg.sensenova_loop.is_some() {
+            DType::F32
+        } else {
+            dtype
+        };
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let lp = |s: &str| join(&format!("layers.{i}.{s}"));
@@ -3395,13 +3480,14 @@ impl Qwen35Model {
                 let conv_weight = req(lp("linear_attn.conv1d.weight"))?
                     .reshape((conv_dim, cfg.linear_conv_kernel_dim as usize))?;
                 Mixer::Delta(GatedDeltaNet {
+                    sensenova: cfg.sensenova_loop.is_some(),
                     in_proj_qkv: proj_q(lp("linear_attn.in_proj_qkv.weight"))?,
                     in_proj_z: proj_q(lp("linear_attn.in_proj_z.weight"))?,
                     in_proj_a: proj_dense(lp("linear_attn.in_proj_a.weight"))?,
                     in_proj_b: proj_dense(lp("linear_attn.in_proj_b.weight"))?,
                     conv_weight,
-                    a_log: req(lp("linear_attn.A_log"))?,
-                    dt_bias: req(lp("linear_attn.dt_bias"))?,
+                    a_log: dense_weight(w, &lp("linear_attn.A_log"), gate_dtype)?,
+                    dt_bias: dense_weight(w, &lp("linear_attn.dt_bias"), gate_dtype)?,
                     norm_weight: req(lp("linear_attn.norm.weight"))?,
                     out_proj: proj_q(lp("linear_attn.out_proj.weight"))?,
                     num_k_heads: cfg.linear_num_key_heads as usize,
@@ -3440,6 +3526,18 @@ impl Qwen35Model {
                 &proj_q,
             )?;
             layers.push(DecoderLayer {
+                routers: cfg
+                    .sensenova_loop
+                    .filter(|plan| plan.mhc(i))
+                    .map(|_| {
+                        mhc::Routers::load(
+                            w,
+                            join(&format!("layers.{i}")),
+                            i,
+                            cfg.hidden_size as usize,
+                        )
+                    })
+                    .transpose()?,
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
                 mixer,
@@ -3448,10 +3546,19 @@ impl Qwen35Model {
             });
         }
 
-        let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
+        let (visits, rope) = if let Some(plan) = cfg.sensenova_loop {
+            let (freq, scale) = plan.yarn_frequencies();
+            (plan.visits().collect(), Rope::scaled_neox(freq, scale))
+        } else {
+            (
+                (0..cfg.num_layers).collect(),
+                Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false),
+            )
+        };
         let device_rope = DeviceRope::new(&rope, &device)?;
         let device_positions = crate::primitives::device_positions_default(&device);
         Ok(Self {
+            visits,
             embed_tokens,
             layers,
             norm,
@@ -4581,6 +4688,7 @@ pub(crate) mod tests {
         };
         let proj = |k: &str, dims: &[usize]| Projection::load(mk(k, dims), None).unwrap();
         let layer = GatedDeltaNet {
+            sensenova: false,
             in_proj_qkv: proj("in_proj_qkv", &[conv_dim, h]),
             in_proj_z: proj("in_proj_z", &[value_dim, h]),
             in_proj_a: proj("in_proj_a", &[hv, h]),
