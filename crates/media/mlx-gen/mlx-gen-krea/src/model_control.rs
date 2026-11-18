@@ -55,6 +55,9 @@ pub fn descriptor() -> ModelDescriptor {
     d.capabilities.conditioning = vec![ConditioningKind::Control];
     // Pose only — this branch is a single-signal ControlNet, not a Fun-Union.
     d.control_kinds = Some(AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose]));
+    // Pose control is outside the Krea 2 PAG surface (SW-7176); clear the inherited Turbo PAG
+    // advertisement so PAG requests fail closed at the capability floor rather than dropping it.
+    d.capabilities.pag = None;
     d
 }
 
