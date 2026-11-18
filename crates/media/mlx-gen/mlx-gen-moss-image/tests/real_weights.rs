@@ -15,7 +15,7 @@
 //!   cargo test -p mlx-gen-moss-image --features model-inference-proof --test integration \
 //!     real_weights::moss_bounded_training_trains_a_portrait -- --ignored --exact --nocapture
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::moss_image::{MossImageVariant, MOSS_SHARED_SNAPSHOT_COMPONENT};
 use mlx_gen::gen_core::ProviderRegistryBuilder;
@@ -37,11 +37,11 @@ fn required(name: &str) -> PathBuf {
 }
 
 /// The Base trainer/generator spec: the Base transformer plus the SFT shared components.
-fn spec(base: &PathBuf, shared: &PathBuf) -> LoadSpec {
-    let mut spec = LoadSpec::new(WeightsSource::Dir(base.clone()));
+fn spec(base: &Path, shared: &Path) -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base.to_path_buf()));
     spec.components.insert(
         MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
-        WeightsSource::Dir(shared.clone()),
+        WeightsSource::Dir(shared.to_path_buf()),
     );
     spec
 }
