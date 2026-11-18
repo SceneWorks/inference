@@ -592,8 +592,8 @@ def request(raw: str, backend: str) -> dict:
         reference = value.get('sensenova_reference_policy')
         if not isinstance(reference, dict) or reference.get('backend') != 'windows-cuda':
             raise ValueError('SenseNova proof requires an explicit Windows CUDA reference resource policy')
-        if backend == 'mlx' and value.get('runner') != 'nax':
-            raise ValueError('SenseNova MLX proof requires the provisioned secondary Mac')
+        if backend == 'mlx' and value.get('runner') not in NAX_ROUTES:
+            raise ValueError('SenseNova MLX proof requires an explicit provisioned Mac route')
         if type(value.get('sensenova_publish', False)) is not bool:
             raise ValueError('SenseNova publication selection requires an explicit boolean')
     elif {'sensenova_reference_policy', 'sensenova_publish', 'sensenova_source_sha'} & value.keys():

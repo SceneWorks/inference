@@ -1,7 +1,14 @@
 """Metadata-only regressions for the dedicated SenseNova evidence protocol."""
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 import unittest
+from unittest.mock import patch
+
+from scripts.ci.model_inference_proofs import NAX_ROUTES, SENSENOVA_PROOFS, request, require_host
+from scripts.ci.sensenova_loop_assets import check_source_disk
 
 from scripts.ci.sensenova_loop_seal import (
     TIERS, verify_memory_endpoints, verify_oracle_marker, verify_semantic_margins,
@@ -70,6 +77,63 @@ class SenseNovaProofProtocolTests(unittest.TestCase):
             for invalid in (log(bf16), log(bf16, q4, q4), zero_peak):
                 with self.subTest(backend=backend), self.assertRaises(ValueError):
                     verify_memory_endpoints(backend, invalid)
+
+
+class SenseNovaProvisioningTests(unittest.TestCase):
+    def test_mlx_requires_matching_explicit_provisioned_runner(self):
+        value = {
+            "selection": SENSENOVA_PROOFS["mlx"], "sensenova_source_sha": "a" * 40,
+            "policy": {"backend": "darwin-mlx"},
+            "sensenova_reference_policy": {"backend": "windows-cuda"},
+        }
+        for route, name, label in (
+            ("nax", "nax-macos-2", "rw-llm"), ("nax-primary", "nax-macos", "rw-starvector"),
+        ):
+            with self.subTest(route=route):
+                parsed = request(json.dumps({**value, "runner": route}), "mlx")
+                self.assertIn(label, NAX_ROUTES[parsed["runner"]]["labels"])
+                env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_OS": "macOS", "RUNNER_NAME": name}
+                require_host("mlx", env, route)
+                with self.assertRaisesRegex(ValueError, "must run on"):
+                    require_host("mlx", {**env, "RUNNER_NAME": "wrong Mac"}, route)
+        with self.assertRaisesRegex(ValueError, "explicit provisioned Mac route"):
+            request(json.dumps(value), "mlx")
+        with self.assertRaisesRegex(ValueError, "explicit provisioned Mac route"):
+            request(json.dumps({**value, "runner": "hosted"}), "mlx")
+
+    def test_missing_payload_space_counts_finalized_cache_entries_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary)
+            repo = hub / "models--sample--model"
+            snapshot = repo / "snapshots" / "pinned"
+            blobs = repo / "blobs"
+            blobs.mkdir(parents=True)
+            snapshot.mkdir(parents=True)
+            (blobs / "existing").write_bytes(b"ready")
+            (snapshot / "cached").symlink_to(blobs / "existing")
+            (blobs / "finalized").write_bytes(b"ready")
+            (blobs / "incomplete.incomplete").write_bytes(b"half")
+            (snapshot / "short").write_bytes(b"too short")
+            source = {
+                "repository": "sample/model", "revision": "pinned", "files": [
+                    {"path": "cached", "size": 5, "sha256": "existing"},
+                    {"path": "pending-link", "size": 5, "sha256": "finalized"},
+                    {"path": "pending-download", "size": 12, "sha256": "incomplete"},
+                    {"path": "short", "size": 10, "sha256": "short"},
+                ],
+            }
+            receipt = hub / "refused.json"
+            with patch("scripts.ci.sensenova_loop_assets.shutil.disk_usage", return_value=SimpleNamespace(free=21)) as disk:
+                with self.assertRaisesRegex(RuntimeError, "21 bytes free for 22 bytes"):
+                    check_source_disk(snapshot, source, receipt)
+                disk.assert_called_once_with(blobs)
+            result = json.loads(receipt.read_bytes())
+            self.assertEqual(result["missing_files"], [{"path": "pending-download", "size": 12}, {"path": "short", "size": 10}])
+            self.assertFalse(result["payload_fits_sampled_free_space"])
+            receipt = hub / "admitted.json"
+            with patch("scripts.ci.sensenova_loop_assets.shutil.disk_usage", return_value=SimpleNamespace(free=22)):
+                check_source_disk(snapshot, source, receipt)
+            self.assertTrue(json.loads(receipt.read_bytes())["payload_fits_sampled_free_space"])
 
 
 if __name__ == "__main__":

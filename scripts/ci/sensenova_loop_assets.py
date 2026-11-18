@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -46,7 +47,41 @@ def inventory(files: list[Path], root: Path) -> list[dict]:
              "sha256": digest(path)} for path in sorted(set(files))]
 
 
-def source_snapshot():
+def complete_cache_file(path: Path, size: int) -> bool:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size == size
+
+
+def check_source_disk(snapshot: Path, source: dict, receipt: Path) -> None:
+    """Preflight the Hub reconstruction destination without reading model file contents."""
+    blobs = snapshot.parent.parent / "blobs"
+    disk_path = next(path for path in (blobs, *blobs.parents) if path.is_dir())
+    free_bytes = shutil.disk_usage(disk_path).free
+    # A finalized LFS blob may exist before its snapshot symlink is installed.
+    # Partial files and Xet chunks do not prove that the payload can be reconstructed
+    # in place. Charge their full immutable file size to the remaining download.
+    missing = [item for item in source["files"]
+               if not complete_cache_file(snapshot / item["path"], item["size"])
+               and not complete_cache_file(blobs / item["sha256"], item["size"])]
+    missing_bytes = sum(item["size"] for item in missing)
+    write(receipt, {
+        "repository": source["repository"], "revision": source["revision"],
+        "snapshot": str(snapshot), "free_space_measured_at": str(disk_path),
+        "free_bytes": free_bytes, "missing_payload_bytes": missing_bytes,
+        "missing_files": [{"path": item["path"], "size": item["size"]} for item in missing],
+        "payload_fits_sampled_free_space": free_bytes >= missing_bytes,
+    })
+    if free_bytes < missing_bytes:
+        raise RuntimeError(
+            f"insufficient space for pinned SenseNova source: {disk_path} has {free_bytes} bytes free "
+            f"for {missing_bytes} bytes across {len(missing)} missing payloads"
+        )
+
+
+def source_snapshot(*, disk_receipt: Path | None = None):
     from huggingface_hub.constants import HF_HUB_CACHE
 
     source = json.loads(SOURCE.read_bytes())
@@ -58,6 +93,8 @@ def source_snapshot():
         raise ValueError("fixture manifest disagrees with pinned source bytes")
     hub = Path(HF_HUB_CACHE).expanduser().resolve()
     snapshot = hub / "models--sensenova--SenseNova-Loop-9B" / "snapshots" / source["revision"]
+    if disk_receipt is not None:
+        check_source_disk(snapshot, source, disk_receipt)
     ensure_snapshot(model, snapshot, download_snapshot)
     verify_snapshot(model, snapshot)
     observed = inventory([snapshot / name for name in expected_files], snapshot)
@@ -289,7 +326,8 @@ def main() -> None:
         raise ValueError("SenseNova resource request identifies a different engine source")
     phase = reference if args.reference_python else native
     try:
-        snapshot, source, source_sha = source_snapshot()
+        disk_receipt = args.report / "source-disk-preflight.json" if args.backend == "mlx" else None
+        snapshot, source, source_sha = source_snapshot(disk_receipt=disk_receipt)
         phase(args, source, source_sha, snapshot, args.work, args.report, request)
     finally:
         # Upload only known bounded file types, never snapshots, environment or worker caches.
