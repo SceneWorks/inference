@@ -33,8 +33,9 @@ pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
     generate_speculative, generate_speculative_monitored, generate_speculative_with,
-    generate_with_sampler, DraftSample, DraftSampler, Drafts, NoProposer, Proposal, ProposeContext,
-    Proposer, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, TokenSampler,
+    generate_with_sampler, tree_extra_positions, DraftSample, DraftSampler, Drafts, NoProposer,
+    Proposal, ProposeContext, Proposer, RewindableConstraintMask, SpeculativePrompt,
+    SpeculativeRun, TokenSampler,
 };
 pub use graph::{
     cuda_graphs_enabled, cuda_graphs_scope, graph_demoted_step_admission_bytes,
@@ -53,7 +54,7 @@ pub use record::{
 pub use speculative::SpeculativeStats;
 pub use step::{
     generate_step, generate_step_from_prefill, generate_step_timed, LogitsScope, StepModel,
-    StepOutput, StepRequest, StepTokens,
+    StepOutput, StepRequest, StepTokens, TreeOutput, TreeVerify, TREE_MODEL_UNSUPPORTED,
 };
 pub use stream::{
     generate, generate_from_prefill, generate_from_prefill_with_stop, generate_with,

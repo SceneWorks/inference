@@ -61,4 +61,10 @@ pub struct SpeculativeStats {
     /// The last window `auto`'s acceptance monitor judged (sc-24446); `None` when no monitor ran
     /// or the run ended before its first window.
     pub monitor: Option<core_llm::MonitorDecision>,
+    /// Tree verification's part (feature SW-F328): `None` unless the run verified under a tree
+    /// bound ([`DecodeRecord::tree_verify`](super::DecodeRecord::tree_verify)).
+    pub tree: Option<core_llm::TreeVerifyReport>,
+    /// Why a tree request on this run verified linearly — the model or its cache cannot keep a
+    /// tree branch (feature SW-F328, E5); `None` otherwise.
+    pub tree_fallback: Option<&'static str>,
 }

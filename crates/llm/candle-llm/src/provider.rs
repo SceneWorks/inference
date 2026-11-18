@@ -29,10 +29,10 @@ use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_monitored,
     graph_demoted_step_admission_bytes, graph_workspace_admission_bytes, prefill_restored,
-    Boundary, ConstraintMask, CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer,
-    FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer,
-    NoProposer, PrefixCache, PrefixStats, Proposer, RequestSpan, RewindableConstraintMask,
-    SpeculativePrompt, StepModel, StreamEvent,
+    tree_extra_positions, Boundary, ConstraintMask, CountingDecode, Decode, DecodePath,
+    DecodeRecord, DraftModelProposer, FinishReason, GenerationConfig, GraphRunner, GraphTally,
+    MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixStats, Proposer, RequestSpan,
+    RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::error::to_core;
@@ -178,6 +178,14 @@ impl DecodeRoute {
             DecodeRoute::Engine { drafts, .. } => drafts,
         }
     }
+
+    /// The proposer the route runs ([`ProposerKind::None`] on the reference loop).
+    fn proposer(self) -> ProposerKind {
+        match self {
+            DecodeRoute::Reference => ProposerKind::None,
+            DecodeRoute::Engine { proposer, .. } => proposer,
+        }
+    }
 }
 
 /// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens (the
@@ -229,6 +237,65 @@ fn priced_request_bytes(
         EAGER_ATTN_QUERY_CHUNK_SIZE,
         1,
     )
+}
+
+/// The tree bound a decoder that verifies trees advertises (feature SW-F328).
+const TREE_VERIFY_CAPABILITIES: core_llm::TreeVerifyCapabilities =
+    core_llm::TreeVerifyCapabilities {
+        max_rows: core_llm::MAX_TREE_ROWS,
+    };
+
+/// Why a multimodal request's tree verification ran linearly (feature SW-F328) — MLX's words.
+const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not available on the \
+     multimodal decode path (its prompt is prefilled from spliced embeddings); verified linearly";
+
+/// What a tree route adds to a request's admission price beyond its linear route (feature
+/// SW-F328, E6) on the engine with `drafts` drafts per verify step and a bound of `tree_rows`
+/// candidate rows: the static KV positions past the linear overshoot the tree writes
+/// ([`tree_extra_positions`](crate::decode::tree_extra_positions)) and their logit and hidden
+/// rows, the ancestor mask over the whole context, and — on the hybrid — every row's transient
+/// recurrent state (one full state per linear layer per row, held until the branch is kept).
+/// Only a `proposer` that builds branching trees carries that workspace
+/// ([`core_llm::tree_workspace_rows`]); any other's one branch is capped at `drafts` candidates
+/// and verified on the linear path the linear route already prices. `0` without a tree; `None`
+/// on overflow.
+fn tree_request_bytes(
+    model: &Decoder,
+    proposer: ProposerKind,
+    drafts: u32,
+    tree_rows: usize,
+    prompt: usize,
+    max_new_tokens: u32,
+) -> Option<u64> {
+    let tree_rows = core_llm::tree_workspace_rows(proposer, tree_rows);
+    if drafts == 0 || tree_rows == 0 {
+        return Some(0);
+    }
+    let g = model.step_memory_geometry(drafts as usize);
+    let rows = u64::try_from(tree_rows.min(core_llm::MAX_TREE_ROWS as usize) + 1).ok()?;
+    let extra = u64::try_from(tree_extra_positions(drafts as usize, tree_rows)).ok()?;
+    let kv_position = g
+        .layers
+        .checked_mul(g.kv_heads)?
+        .checked_mul(g.head_dim)?
+        .checked_mul(g.element_bytes)?
+        .checked_mul(2)?;
+    let row = g.hidden_size.checked_add(g.vocab_size)?.checked_mul(4)?;
+    let context = u64::try_from(prompt)
+        .ok()?
+        .checked_add(u64::from(max_new_tokens))?
+        .checked_add(extra)?;
+    let mask = rows
+        .checked_mul(context.checked_add(rows)?)?
+        .checked_mul(4)?;
+    let states = match model {
+        Decoder::Qwen35(m) => u64::try_from(m.recurrent_state_bytes(rows as usize)).ok()?,
+        Decoder::Causal(_) => 0,
+    };
+    extra
+        .checked_mul(kv_position.checked_add(row)?)?
+        .checked_add(mask)?
+        .checked_add(states)
 }
 
 /// The CUDA-graph workspace admission charges a request on the engine with `drafts` drafts per
@@ -322,6 +389,17 @@ impl Decoder {
             head_dim,
         );
         u64::try_from(crate::primitives::DevicePositions::BYTES.checked_add(workspace)?).ok()
+    }
+
+    /// The tree advertisement a loaded decoder carries (feature SW-F328): the qwen3_5 hybrid and
+    /// every llama-family decoder without sliding-window or KV-sharing layers
+    /// ([`CausalLm::tree_unsupported`]) verify up to [`core_llm::MAX_TREE_ROWS`] candidate rows.
+    fn tree_verify_capabilities(&self) -> Option<core_llm::TreeVerifyCapabilities> {
+        match self {
+            Decoder::Causal(m) => m.tree_unsupported().is_none(),
+            Decoder::Qwen35(_) => true,
+        }
+        .then_some(TREE_VERIFY_CAPABILITIES)
     }
 
     /// Whether the decoder's step can be captured as a CUDA graph at all
@@ -2292,6 +2370,7 @@ impl LlamaProvider {
             // sc-24140: the llama family reports its census too (bits/param by projection kind).
             Decoder::Causal(m) => Some(m.weight_census()),
         };
+        descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Ok(Self {
             descriptor,
             model,
@@ -2438,6 +2517,7 @@ impl LlamaProvider {
             } else {
                 None
             };
+            descriptor.capabilities.tree_verify = Some(TREE_VERIFY_CAPABILITIES);
             return Ok(Self {
                 descriptor,
                 model: Decoder::Qwen35(model),
@@ -2504,6 +2584,7 @@ impl LlamaProvider {
         descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
+        descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Ok(Self {
             descriptor,
             model,
@@ -2656,12 +2737,15 @@ impl LlamaProvider {
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         let backend = crate::device::decode_backend(model.device());
+        let model = Decoder::Causal(model);
+        let mut descriptor = provider_descriptor_on(backend);
+        descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Self {
             // No config identity, so no table family: a Llama decoder assembled from parts cannot
             // be told from a Mistral or dense Qwen2 one (as MLX's `from_parts`).
             kv_family: None,
-            descriptor: provider_descriptor_on(backend),
-            model: Decoder::Causal(model),
+            descriptor,
+            model,
             mtp: None,
             tokenizer,
             template: Box::new(Llama3Template),

@@ -51,7 +51,7 @@ use crate::error::{Error, Result};
 
 /// Disallowed-attention fill for the additive mask: a large finite negative (matching the
 /// candle-gen slices — avoids `-inf` propagation through the softmax kernel).
-const MASK_NEG: f32 = -1e30;
+pub(crate) const MASK_NEG: f32 = -1e30;
 
 /// Maximum query rows in one portable eager-attention tile.
 ///

@@ -585,3 +585,26 @@ fn the_verify_layout_has_a_stable_wire_form() {
     assert_eq!(tree, SpeculativeVerify::Tree { max_rows: 8 });
     assert_eq!(SpeculativeVerify::default(), SpeculativeVerify::Linear);
 }
+
+/// E6: only a proposer that builds branching trees (prompt lookup) carries tree workspace; the MTP
+/// head and a draft model propose one branch, verified on the linear path, so a tree request on
+/// them prices no tree rows — and no tree prices nothing for anyone.
+#[test]
+fn only_a_tree_building_proposer_prices_tree_workspace() {
+    use crate::ProposerKind;
+    assert!(ProposerKind::PromptLookup.builds_trees());
+    for kind in [
+        ProposerKind::None,
+        ProposerKind::Mtp,
+        ProposerKind::DraftModel,
+    ] {
+        assert!(!kind.builds_trees(), "{}", kind.label());
+        assert_eq!(tree_workspace_rows(kind, 16), 0, "{}", kind.label());
+    }
+    assert_eq!(tree_workspace_rows(ProposerKind::PromptLookup, 16), 16);
+    assert_eq!(tree_workspace_rows(ProposerKind::PromptLookup, 0), 0);
+    // Every request proposer resolves to the same capability.
+    assert!(ProposerKind::from(SpeculativeProposer::PromptLookup).builds_trees());
+    assert!(!ProposerKind::from(SpeculativeProposer::Mtp).builds_trees());
+    assert!(!ProposerKind::from(SpeculativeProposer::DraftModel).builds_trees());
+}
