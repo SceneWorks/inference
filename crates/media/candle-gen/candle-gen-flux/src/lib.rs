@@ -228,6 +228,22 @@ impl Variant {
     pub const fn is_dev(self) -> bool {
         matches!(self, Variant::Dev)
     }
+
+    pub fn pag_capability(self) -> gen_core::PagCapability {
+        let (default_stop, recommended_scale) = match self {
+            Variant::Schnell => (0.75, 1.2),
+            Variant::Dev => (1.0, 1.5),
+        };
+        gen_core::PagCapability {
+            num_blocks: 57,
+            block_domain: std::borrow::Cow::Borrowed("flux_blocks"),
+            default_layers: vec![28],
+            default_start: 0.0,
+            default_stop,
+            recommended_scale,
+            max_scale: gen_core::DEFAULT_PAG_MAX_SCALE,
+        }
+    }
 }
 
 /// A loaded candle FLUX generator (one per variant). The shared residency owner holds either the
@@ -321,10 +337,18 @@ impl Generator for FluxGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let plan = compile_base_plan(self.variant, req)?;
-        self.generate_planned(req, &plan, None, on_progress)?
+        self.generate_with_report(req, on_progress)?
             .output
             .ok_or_else(|| gen_core::Error::Msg("FLUX.1 base render produced no images".into()))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
+        let plan = compile_base_plan(self.variant, req)?;
+        self.generate_planned(req, &plan, None, on_progress)
     }
 
     fn generate_planned(
@@ -384,9 +408,14 @@ impl Generator for FluxGenerator {
         *candle_gen::lock_recover(&self.bounded_host_decode) = false;
         *candle_gen::lock_recover(&self.stream_cancel) = gen_core::CancelFlag::default();
         let images = result?;
-        Ok(GenerationReport::from_output(GenerationOutput::Images(
-            images,
-        )))
+        let pag_report = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.variant.model_id(), req)?
+            .map(|p| p.execution_report(plan.denoise_sigmas().len().saturating_sub(1) as u32));
+        let mut report = GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = pag_report;
+        Ok(report)
     }
 }
 
@@ -604,6 +633,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // advertise. `candle-gen-catalog`'s `preview_advertising` guard derives this from the
             // sources and fails if the flag and the wiring ever disagree.
             supports_preview: true,
+            pag: Some(variant.pag_capability()),
             ..Default::default()
         },
     }
@@ -1101,6 +1131,106 @@ mod tests {
             let err = load(&spec).err().expect("expected an error").to_string();
             assert!(err.contains("snapshot directory"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn pag_capability_validation_and_joint_attention_match_flux1_contract() {
+        use candle_core::{DType, Device, Tensor};
+        use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
+        use candle_gen::gen_core::PagConfig;
+
+        let dev = descriptor_dev();
+        let dev_pag = dev.capabilities.pag.as_ref().expect("dev pag");
+        assert_eq!(dev_pag.num_blocks, 57);
+        assert_eq!(dev_pag.block_domain.as_ref(), "flux_blocks");
+        assert_eq!(dev_pag.default_layers, vec![28]);
+        assert_eq!((dev_pag.default_start, dev_pag.default_stop), (0.0, 1.0));
+        assert_eq!((dev_pag.recommended_scale, dev_pag.max_scale), (1.5, 15.0));
+
+        let schnell = descriptor_schnell();
+        let schnell_pag = schnell.capabilities.pag.as_ref().expect("schnell pag");
+        assert_eq!(schnell_pag.num_blocks, 57);
+        assert_eq!(schnell_pag.block_domain.as_ref(), "flux_blocks");
+        assert_eq!(schnell_pag.default_layers, vec![28]);
+        assert_eq!(
+            (schnell_pag.default_start, schnell_pag.default_stop),
+            (0.0, 0.75)
+        );
+        assert_eq!(
+            (schnell_pag.recommended_scale, schnell_pag.max_scale),
+            (1.2, 15.0)
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = load_dev(&spec).unwrap();
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                pag: Some(PagConfig {
+                    scale: 1.5,
+                    layers: Some(vec![0, 28, 56]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .is_ok());
+        assert!(g
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                pag: Some(PagConfig {
+                    scale: 0.0,
+                    layers: Some(vec![57]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .is_err());
+
+        let cpu = Device::Cpu;
+        let (b, h, txt_seq, img_seq, d) = (1usize, 2usize, 3usize, 4usize, 4usize);
+        let total = txt_seq + img_seq;
+        let q = Tensor::randn(0f32, 1f32, (b, h, total, d), &cpu).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, total, d), &cpu).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, total, d), &cpu).unwrap();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+        let (o_txt, o_img) =
+            crate::ip_dit::pag_joint_attention_post_rope(&q, &k, &v, txt_seq, plan).unwrap();
+        let full = crate::ip_dit::scaled_dot_product_attention_planned(&q, &k, &v, plan)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .flatten_from(2)
+            .unwrap();
+        let full_txt = full.narrow(1, 0, txt_seq).unwrap();
+        let diff_txt = (&o_txt - &full_txt)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff_txt < 1e-6,
+            "Q_txt must match full SDPA, diff={diff_txt}"
+        );
+        let want_img = v
+            .narrow(2, txt_seq, img_seq)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .flatten_from(2)
+            .unwrap();
+        assert_eq!(
+            o_img
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            want_img.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     /// Shared real-weight sequential-residency A/B body for FLUX.1 dev and schnell (sc-12138). Runs ONE

@@ -20,6 +20,7 @@
 //! = 260 channels per image token (the union ControlNet's pose-only layout). See
 //! [`crate::transformer::Flux2ControlBranch`] for the hint-injection forward.
 
+use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -29,6 +30,7 @@ use mlx_gen::{
     LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
     Result, SamplerRun, TimestepConvention,
 };
+use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
@@ -93,6 +95,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // their activation levers; `generate` threads the request through
             // `MemoryConfig::with_request` into `Flux2ControlTransformer::forward_with_mem`.
             execution: crate::chunk::EXECUTION_SURFACE,
+            pag: Some(crate::config::Flux2Variant::Dev.pag_capability()),
             ..Default::default()
         },
     }
@@ -388,8 +391,12 @@ impl Flux2DevControl {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        let pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(FLUX2_DEV_CONTROL_ID, req)?;
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -497,20 +504,51 @@ impl Flux2DevControl {
                     // forward; the env knobs stay scoped to the base route they were introduced on
                     // (sc-6266), so nothing here changes for a deployment that only sets those.
                     let mem = MemoryConfig::with_request(MemoryConfig::OFF, req.memory.as_ref());
+                    let denoise_sigmas = &sched.sigmas[start_step..];
+                    let total_steps = denoise_sigmas.len().saturating_sub(1);
                     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-                        heavy.transformer.forward_with_mem(
+                        let ts = sigma * 1000.0;
+                        let pos = heavy.transformer.forward_with_mem_pag(
                             latents,
                             &prompt_embeds,
                             &latent_ids,
                             &text_ids,
-                            sigma * 1000.0,
+                            ts,
                             embedded_guidance,
                             &control_context,
                             control_scale,
                             &mem,
-                        )
+                            None,
+                        )?;
+                        let step_idx = crate::model::step_index_for_sigma(denoise_sigmas, sigma);
+                        let step_pag = pag
+                            .as_ref()
+                            .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                        if step_pag > 0.0 {
+                            eval([&pos])?;
+                            let layers = pag
+                                .as_ref()
+                                .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                            let pert = heavy.transformer.forward_with_mem_pag(
+                                latents,
+                                &prompt_embeds,
+                                &latent_ids,
+                                &text_ids,
+                                ts,
+                                embedded_guidance,
+                                &control_context,
+                                control_scale,
+                                &mem,
+                                Some(layers),
+                            )?;
+                            Ok(add(
+                                &pos,
+                                &multiply(&subtract(&pos, &pert)?, scalar(step_pag))?,
+                            )?)
+                        } else {
+                            Ok(pos)
+                        }
                     };
-                    let denoise_sigmas = &sched.sigmas[start_step..];
                     let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
                     let final_latents = run_flow_sampler_with_latent_hook(
                         SamplerRun {
@@ -546,7 +584,11 @@ impl Flux2DevControl {
                     let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
                     images.push(decoded_to_image(&nchw)?);
                 }
-                Ok(GenerationOutput::Images(images))
+                let executed_steps = sched.sigmas[start_step..].len().saturating_sub(1) as u32;
+                let mut report =
+                    gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                report.pag = pag.map(|p| p.execution_report(executed_steps));
+                Ok(report)
             },
         )
     }
@@ -587,6 +629,16 @@ impl Generator for Flux2DevControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_report_observed(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -638,8 +690,7 @@ impl Generator for Flux2DevControl {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_report_observed(req, &mut progress)
             },
         )
     }
@@ -651,6 +702,19 @@ impl Flux2DevControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        let report = self.generate_report_observed(req, on_progress)?;
+        report.output.ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{FLUX2_DEV_CONTROL_ID}: generation completed without output"
+            ))
+        })
+    }
+
+    fn generate_report_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }

@@ -44,15 +44,36 @@ pub fn denoise_flow_map(
     denoise_flow_map_with_references(dit, text, noise, image_ids, schedule, None, cancel, on_step)
 }
 
-/// Same frozen integrator with immutable AE conditioning shared by both CFG branches.
+fn apply_pag_mlx(
+    base: &Array,
+    cond: &Array,
+    pert: &Array,
+    step_pag: f32,
+    compute: Dtype,
+) -> Result<Array> {
+    let diff = cond
+        .as_dtype(Dtype::Float32)?
+        .subtract(&pert.as_dtype(Dtype::Float32)?)?
+        .as_dtype(compute)?;
+    let scaled = diff
+        .as_dtype(Dtype::Float32)?
+        .multiply(Array::from_f32(step_pag))?
+        .as_dtype(compute)?;
+    Ok(base
+        .as_dtype(Dtype::Float32)?
+        .add(&scaled.as_dtype(Dtype::Float32)?)?
+        .as_dtype(compute)?)
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn denoise_flow_map_with_references(
+fn denoise_flow_map_with_references_pag(
     dit: &Flux3Dit,
     text: &TextConditioning,
     noise: &Array,
     image_ids: &[[f32; 4]],
     schedule: &[f32],
     references: Option<&ReferenceConditioning>,
+    pag: Option<&mlx_gen::gen_core::PagResolved>,
     cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
 ) -> Result<Array> {
@@ -70,15 +91,16 @@ pub fn denoise_flow_map_with_references(
         )));
     }
     let compute = dit.compute_dtype();
+    let total_steps = schedule.len() - 1;
     let mut x = noise.as_dtype(Dtype::Float32)?;
-    for step in 0..schedule.len() - 1 {
+    for step in 0..total_steps {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
         let t = schedule[step];
         let dt = schedule[step + 1] - schedule[step];
         let target = schedule[step + 1];
-        let velocity = dit.forward(&[SampleTokens {
+        let sample = SampleTokens {
             text: &text.tokens,
             text_ids: &text.ids,
             image: &x,
@@ -86,7 +108,17 @@ pub fn denoise_flow_map_with_references(
             image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
             timestep: t,
             target_timestep: Some(target),
-        }])?;
+        };
+        let cond = dit.forward_pag(std::slice::from_ref(&sample), None)?;
+        let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
+        let velocity = if step_pag > 0.0 {
+            eval([&cond])?;
+            let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
+            let pert = dit.forward_pag(std::slice::from_ref(&sample), Some(layers))?;
+            apply_pag_mlx(&cond, &cond, &pert, step_pag, compute)?
+        } else {
+            cond
+        };
         // torch: the Python-float `dt` is NOT rounded to bf16 first; the multiply runs at f32
         // opmath and only the product takes the velocity's dtype.
         let scaled = velocity
@@ -98,6 +130,23 @@ pub fn denoise_flow_map_with_references(
         on_step(step + 1);
     }
     Ok(x)
+}
+
+/// Same frozen integrator with immutable AE conditioning shared by both CFG branches.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_flow_map_with_references(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    noise: &Array,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    references: Option<&ReferenceConditioning>,
+    cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Array> {
+    denoise_flow_map_with_references_pag(
+        dit, text, noise, image_ids, schedule, references, None, cancel, on_step,
+    )
 }
 
 /// Base Euler CFG with independent unconditional/conditional samples in that order.
@@ -130,6 +179,35 @@ pub fn denoise_cfg_with_references(
     guidance: f32,
     references: Option<&ReferenceConditioning>,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Array> {
+    denoise_base_with_references_pag(
+        dit,
+        text,
+        Some(negative),
+        noise,
+        image_ids,
+        schedule,
+        guidance,
+        references,
+        None,
+        cancel,
+        on_step,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_base_with_references_pag(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    negative: Option<&TextConditioning>,
+    noise: &Array,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    guidance: f32,
+    references: Option<&ReferenceConditioning>,
+    pag: Option<&mlx_gen::gen_core::PagResolved>,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
 ) -> Result<Array> {
     if dit.is_flow_map() || !guidance.is_finite() || guidance < 0.0 {
@@ -141,28 +219,74 @@ pub fn denoise_cfg_with_references(
         return Err(Error::Msg("flux3: CFG schedule needs two points".into()));
     }
     let compute = dit.compute_dtype();
+    let total_steps = schedule.len() - 1;
+    let cfg_off_with_pag = pag.is_some() && guidance <= 1.0;
     let mut x = noise.as_dtype(Dtype::Float32)?;
-    for step in 0..schedule.len() - 1 {
+    for step in 0..total_steps {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let samples = [negative, text].map(|conditioning| SampleTokens {
-            text: &conditioning.tokens,
-            text_ids: &conditioning.ids,
-            image: &x,
-            image_ids,
-            image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-            timestep: schedule[step],
-            target_timestep: None,
-        });
-        let prediction = dit.forward(&samples)?;
-        let rows = prediction.split(2, 0)?;
-        let difference = rows[1].subtract(&rows[0])?.as_dtype(compute)?;
-        let scaled = difference
-            .as_dtype(Dtype::Float32)?
-            .multiply(Array::from_f32(guidance))?
-            .as_dtype(compute)?;
-        let velocity = rows[0].add(&scaled)?.as_dtype(compute)?;
+        let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
+        let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
+        let velocity = if cfg_off_with_pag {
+            let pos_sample = SampleTokens {
+                text: &text.tokens,
+                text_ids: &text.ids,
+                image: &x,
+                image_ids,
+                image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                timestep: schedule[step],
+                target_timestep: None,
+            };
+            let cond = dit.forward_pag(std::slice::from_ref(&pos_sample), None)?;
+            if step_pag > 0.0 {
+                eval([&cond])?;
+                let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
+                apply_pag_mlx(&cond, &cond, &pert, step_pag, compute)?
+            } else {
+                cond
+            }
+        } else {
+            let negative = negative.ok_or_else(|| {
+                Error::Unsupported(
+                    "flux3: base CFG needs independently encoded negative conditioning".into(),
+                )
+            })?;
+            let samples = [negative, text].map(|conditioning| SampleTokens {
+                text: &conditioning.tokens,
+                text_ids: &conditioning.ids,
+                image: &x,
+                image_ids,
+                image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                timestep: schedule[step],
+                target_timestep: None,
+            });
+            let prediction = dit.forward(&samples)?;
+            let rows = prediction.split(2, 0)?;
+            let difference = rows[1].subtract(&rows[0])?.as_dtype(compute)?;
+            let scaled = difference
+                .as_dtype(Dtype::Float32)?
+                .multiply(Array::from_f32(guidance))?
+                .as_dtype(compute)?;
+            let pred_cfg = rows[0].add(&scaled)?.as_dtype(compute)?;
+            if step_pag > 0.0 {
+                let cond = rows[1].clone();
+                eval([&pred_cfg, &cond])?;
+                let pos_sample = SampleTokens {
+                    text: &text.tokens,
+                    text_ids: &text.ids,
+                    image: &x,
+                    image_ids,
+                    image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                    timestep: schedule[step],
+                    target_timestep: None,
+                };
+                let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
+                apply_pag_mlx(&pred_cfg, &cond, &pert, step_pag, compute)?
+            } else {
+                pred_cfg
+            }
+        };
         let dt = schedule[step + 1] - schedule[step];
         let update = velocity
             .as_dtype(Dtype::Float32)?
@@ -224,24 +348,29 @@ pub fn denoise_one_with_references(
     let z = noise(seed, h, w, channels)?;
     let schedule = params.schedule()?;
     let output = match params.guidance {
-        Some(guidance) => denoise_cfg_with_references(
+        Some(guidance) => denoise_base_with_references_pag(
             dit,
             text,
-            negative.ok_or_else(|| {
-                Error::Unsupported(
-                    "flux3: base CFG needs independently encoded negative conditioning".into(),
-                )
-            })?,
+            negative,
             &z,
             &ids,
             &schedule,
             guidance,
             references,
+            params.pag.as_ref(),
             cancel,
             on_step,
         ),
-        None => denoise_flow_map_with_references(
-            dit, text, &z, &ids, &schedule, references, cancel, on_step,
+        None => denoise_flow_map_with_references_pag(
+            dit,
+            text,
+            &z,
+            &ids,
+            &schedule,
+            references,
+            params.pag.as_ref(),
+            cancel,
+            on_step,
         ),
     }?;
     mlx_gen::image_execution::sampled_native_with_rng(

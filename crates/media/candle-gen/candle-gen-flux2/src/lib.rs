@@ -1188,6 +1188,11 @@ impl Pipeline {
             steps,
             &native,
         )?;
+        let pag = descriptor(self.variant)
+            .capabilities
+            .resolve_pag(self.variant.id(), req)?;
+        let total_steps = sigmas.len().saturating_sub(1);
+        let target_seq = lat_h * lat_w;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let latents =
@@ -1214,9 +1219,16 @@ impl Pipeline {
                 Some(&preview),
                 |latents, sigma| -> CResult<Tensor> {
                     let ts = sigma * 1000.0;
+                    let step_idx = step_index_for_sigma(&sigmas, sigma);
+                    let step_pag = pag
+                        .as_ref()
+                        .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                    let pag_layers = pag
+                        .as_ref()
+                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
                     let out = if embedded_guidance {
                         // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        transformer.forward_with_memory(
+                        let pos = transformer.forward_with_memory_pag(
                             latents,
                             prompt_embeds,
                             &img_ids,
@@ -1226,9 +1238,27 @@ impl Pipeline {
                             attention_plan,
                             transformer_window,
                             &req.cancel,
-                        )?
+                            None,
+                        )?;
+                        if step_pag > 0.0 {
+                            let pert = transformer.forward_with_memory_pag(
+                                latents,
+                                prompt_embeds,
+                                &img_ids,
+                                &txt_ids,
+                                ts,
+                                Some(guidance),
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                                Some((pag_layers, target_seq)),
+                            )?;
+                            (&pos + ((&pos - &pert)? * step_pag as f64)?)?
+                        } else {
+                            pos
+                        }
                     } else {
-                        let v = transformer.forward_with_memory(
+                        let v = transformer.forward_with_memory_pag(
                             latents,
                             prompt_embeds,
                             &img_ids,
@@ -1238,10 +1268,11 @@ impl Pipeline {
                             attention_plan,
                             transformer_window,
                             &req.cancel,
+                            None,
                         )?;
-                        match negative {
+                        let base = match negative {
                             Some(neg) => {
-                                let vn = transformer.forward_with_memory(
+                                let vn = transformer.forward_with_memory_pag(
                                     latents,
                                     neg,
                                     &img_ids,
@@ -1251,11 +1282,29 @@ impl Pipeline {
                                     attention_plan,
                                     transformer_window,
                                     &req.cancel,
+                                    None,
                                 )?;
                                 // vn + guidance·(v − vn)
                                 (&vn + ((&v - &vn)? * guidance as f64)?)?
                             }
-                            None => v,
+                            None => v.clone(),
+                        };
+                        if step_pag > 0.0 {
+                            let v_pert = transformer.forward_with_memory_pag(
+                                latents,
+                                prompt_embeds,
+                                &img_ids,
+                                &txt_ids,
+                                ts,
+                                None,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                                Some((pag_layers, target_seq)),
+                            )?;
+                            (&base + ((&v - &v_pert)? * step_pag as f64)?)?
+                        } else {
+                            base
                         }
                     };
                     observe_consumed_guidance(guidance, embedded_guidance, negative.is_some());
@@ -1343,6 +1392,14 @@ fn observe_consumed_guidance(guidance: f32, embedded: bool, negative: bool) {
     candle_gen::execution::f32_policy("flux2.guidance", guidance);
 }
 
+pub(crate) fn step_index_for_sigma(sigmas: &[f32], sigma: f32) -> usize {
+    let total_steps = sigmas.len().saturating_sub(1);
+    sigmas
+        .get(1..=total_steps)
+        .and_then(|tail| tail.iter().position(|&s_next| sigma > s_next))
+        .unwrap_or_else(|| total_steps.saturating_sub(1))
+}
+
 /// Complete a direct FLUX.2 image only after its legacy execution and device fence succeed.
 /// `missing_fact` names a route-local observation gap rather than filling it from submitted knobs.
 pub(crate) fn complete_bespoke_image(
@@ -1352,12 +1409,30 @@ pub(crate) fn complete_bespoke_image(
     missing_fact: &'static str,
     run: impl FnOnce() -> CResult<gen_core::Image>,
 ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-    candle_gen::execution::capture_direct(descriptor, cancel, || {
-        candle_gen::execution::policy("direct_route", route.into());
-        candle_gen::execution::unavailable(missing_fact);
-        let image = run().map_err(gen_core::Error::from)?;
-        Ok(gen_core::GenerationOutput::Images(vec![image]))
+    complete_bespoke_image_with_pag(descriptor, cancel, route, missing_fact, || {
+        Ok((run()?, None))
     })
+}
+
+pub(crate) fn complete_bespoke_image_with_pag(
+    descriptor: &ModelDescriptor,
+    cancel: &gen_core::CancelFlag,
+    route: &'static str,
+    missing_fact: &'static str,
+    run: impl FnOnce() -> CResult<(gen_core::Image, Option<gen_core::PagExecutionReport>)>,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    let attempt = candle_gen::execution::Attempt::begin();
+    candle_gen::execution::policy("direct_route", route.into());
+    candle_gen::execution::unavailable(missing_fact);
+    let (image, pag) = run().map_err(gen_core::Error::from)?;
+    if cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    let output = gen_core::GenerationOutput::Images(vec![image]);
+    let execution = attempt.finish_image(descriptor, &output);
+    let mut report = gen_core::GenerationReport::from_output(output);
+    report.pag = pag;
+    gen_core::generator::CompletedGeneration::new(report, execution, descriptor)
 }
 
 #[cfg(test)]
@@ -1677,6 +1752,24 @@ impl Generator for Flux2Generator {
         let images = images?;
         Ok(GenerationOutput::Images(images))
     }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let output = self.generate(req, on_progress)?;
+        let steps = req
+            .steps
+            .unwrap_or_else(|| self.pipe.variant.default_steps());
+        let mut report = gen_core::GenerationReport::from_output(output);
+        report.pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?
+            .map(|p| p.execution_report(steps));
+        Ok(report)
+    }
 }
 
 /// The txt2img descriptor for `variant`. **klein**: guidance advertised (defaults to 1.0 / CFG-free,
@@ -1727,6 +1820,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and strict
             // control descriptors remain false and fail closed before loading weights.
             supports_prompt_enhancement: variant.is_dev(),
+            pag: Some(variant.pag_capability()),
             ..Default::default()
         },
     }

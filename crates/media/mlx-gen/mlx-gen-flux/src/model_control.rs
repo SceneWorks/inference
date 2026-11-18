@@ -27,6 +27,7 @@
 //! resolves through the explicit registry as `flux1_dev_control`; the SceneWorks worker
 //! exposure + manifest re-pin are the driver/manifest stories (sc-8243/sc-8244), not this crate.
 
+use mlx_gen::array::scalar;
 use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
@@ -37,6 +38,7 @@ use mlx_gen::{
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
     Quant, Residency, Result, SamplerRun, TimestepConvention,
 };
+use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{FLUX1_DEV_CONTROL_ID, HYPER_SAMPLER};
@@ -103,6 +105,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
             supports_sequential_offload: true,
             supports_preview: true,
+            pag: Some(FluxVariant::Dev.pag_capability()),
             ..Default::default()
         },
     }
@@ -376,6 +379,11 @@ impl Flux1DevControl {
                 // Compiled elementwise glue (sc-2963), shared with the base flux1 path. Scoped +
                 // restored on drop by the RAII guard (F-007).
                 let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+                let pag = self
+                    .descriptor
+                    .capabilities
+                    .resolve_pag(FLUX1_DEV_CONTROL_ID, req)?;
+                let total_steps = sigmas.len().saturating_sub(1);
 
                 let images = run.images_with_denoise_phases(
                     on_progress,
@@ -406,18 +414,73 @@ impl Flux1DevControl {
                                 );
                             },
                             |x_in, timestep| {
-                                heavy.transformer.forward_composed(
-                                    x_in,
-                                    &control_latent,
-                                    &prompt_embeds,
-                                    &pooled_prompt_embeds,
-                                    timestep,
-                                    guidance,
-                                    req.width,
-                                    req.height,
-                                    control_scale,
-                                    injector,
-                                )
+                                let step_idx = sigmas
+                                    .get(1..=total_steps)
+                                    .and_then(|tail| {
+                                        tail.iter().position(|&s_next| timestep > s_next)
+                                    })
+                                    .unwrap_or_else(|| total_steps.saturating_sub(1));
+                                let step_pag = pag
+                                    .as_ref()
+                                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                                if step_pag > 0.0 {
+                                    let residuals = heavy.transformer.compute_residuals(
+                                        x_in,
+                                        &control_latent,
+                                        &prompt_embeds,
+                                        &pooled_prompt_embeds,
+                                        timestep,
+                                        guidance,
+                                        req.width,
+                                        req.height,
+                                    )?;
+                                    mlx_rs::transforms::eval(residuals.iter())?;
+                                    let pos = heavy.transformer.base().forward_control_pag(
+                                        x_in,
+                                        &prompt_embeds,
+                                        &pooled_prompt_embeds,
+                                        timestep,
+                                        guidance,
+                                        req.width,
+                                        req.height,
+                                        injector,
+                                        Some((&residuals, control_scale)),
+                                        None,
+                                    )?;
+                                    mlx_rs::transforms::eval([&pos])?;
+                                    let layers = pag
+                                        .as_ref()
+                                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                                    let pert = heavy.transformer.base().forward_control_pag(
+                                        x_in,
+                                        &prompt_embeds,
+                                        &pooled_prompt_embeds,
+                                        timestep,
+                                        guidance,
+                                        req.width,
+                                        req.height,
+                                        injector,
+                                        Some((&residuals, control_scale)),
+                                        Some(layers),
+                                    )?;
+                                    Ok(add(
+                                        &pos,
+                                        &multiply(&subtract(&pos, &pert)?, scalar(step_pag))?,
+                                    )?)
+                                } else {
+                                    heavy.transformer.forward_composed(
+                                        x_in,
+                                        &control_latent,
+                                        &prompt_embeds,
+                                        &pooled_prompt_embeds,
+                                        timestep,
+                                        guidance,
+                                        req.width,
+                                        req.height,
+                                        control_scale,
+                                        injector,
+                                    )
+                                }
                             },
                         )
                     },
@@ -566,7 +629,24 @@ impl Generator for Flux1DevControl {
         plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let output = self.run_planned_with_injector(req, None, &run, on_progress)?;
-        Ok(gen_core::GenerationReport::from_output(output))
+        let pag_report = self
+            .descriptor
+            .capabilities
+            .resolve_pag(FLUX1_DEV_CONTROL_ID, req)?
+            .map(|p| p.execution_report(plan.denoise_sigmas().len().saturating_sub(1) as u32));
+        let mut report = gen_core::GenerationReport::from_output(output);
+        report.pag = pag_report;
+        Ok(report)
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -604,8 +684,7 @@ impl Generator for Flux1DevControl {
                 self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_with_report_observed(req, &mut progress)
             },
         )
     }
@@ -631,6 +710,18 @@ impl Generator for Flux1DevControl {
 }
 
 impl Flux1DevControl {
+    fn generate_with_report_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        let plan = compile_control(&self.loaded_spec, req)?.ok_or_else(|| {
+            gen_core::Error::Msg("control plan compiler returned no route".into())
+        })?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
     fn generate_observed(
         &self,
         req: &GenerationRequest,

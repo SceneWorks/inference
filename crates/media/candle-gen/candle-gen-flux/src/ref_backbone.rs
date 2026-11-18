@@ -275,6 +275,26 @@ impl FluxRefBackbone {
         injector: Option<&dyn DitImageInjector>,
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
+        self.forward_injected_with_memory_pag(
+            heavy, img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, cancel, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_injected_with_memory_pag(
+        &self,
+        heavy: Option<&FluxRefHeavy>,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        cancel: &CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Tensor> {
         candle_gen::check_cancel(cancel)?;
         let budget = if self.memory.chunk_attention {
             self.memory
@@ -291,7 +311,7 @@ impl FluxRefBackbone {
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         if let Some(heavy) = heavy {
-            return self.pipeline.forward_injected_residency(
+            return self.pipeline.forward_injected_residency_pag(
                 &heavy.heavy,
                 img,
                 img_ids,
@@ -304,6 +324,7 @@ impl FluxRefBackbone {
                 plan,
                 window,
                 cancel,
+                pag_layers,
             );
         }
         let components = self.components.as_ref().ok_or_else(|| {
@@ -312,12 +333,15 @@ impl FluxRefBackbone {
             )
         })?;
         let out = match components {
-            Components::Stock { transformer, .. } => transformer.forward_injected_with_memory(
+            Components::Stock { transformer, .. } => transformer.forward_injected_with_memory_pag(
                 img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, plan, window, cancel,
+                pag_layers,
             )?,
-            Components::Packed { transformer, .. } => transformer.forward_injected_with_memory(
-                img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, plan, window, cancel,
-            )?,
+            Components::Packed { transformer, .. } => transformer
+                .forward_injected_with_memory_pag(
+                    img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, plan, window,
+                    cancel, pag_layers,
+                )?,
         };
         Ok(out)
     }

@@ -216,6 +216,52 @@ fn attention(
         .reshape(&[b, -1, q.shape()[1] * head_dim])?)
 }
 
+/// Perturbed-attention guidance over FLUX.2 `[txt, target, ref...]` post-RoPE BHSD tensors:
+/// `Q_txt` (`0..txt_seq`) and `Q_ref` (`txt_seq + target_seq .. q_seq` when present as queries)
+/// run normal SDPA over full `(k, v)` (including spliced `cached_ref` K/V in `CacheMode::Cached`),
+/// while `Q_target` (`txt_seq .. txt_seq + target_seq`) receives `V_target` directly.
+pub(crate) fn pag_joint_attention_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    txt_seq: i32,
+    target_seq: i32,
+    head_dim: i32,
+    plan: AttentionPlan<'_>,
+) -> Result<Array> {
+    let b = q.shape()[0];
+    let heads = q.shape()[1];
+    let q_seq = q.shape()[2];
+    let scale = (head_dim as f32).powf(-0.5);
+    let target_end = txt_seq + target_seq;
+    let q_parts = if q_seq > target_end {
+        q.split_axis(&[txt_seq, target_end], 2)?
+    } else {
+        q.split_axis(&[txt_seq], 2)?
+    };
+    let o_txt = sdpa_budgeted_bhsd(&q_parts[0], k, v, scale, None, plan)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[b, txt_seq, heads * head_dim])?;
+    let v_parts = if v.shape()[2] > target_end {
+        v.split_axis(&[txt_seq, target_end], 2)?
+    } else {
+        v.split_axis(&[txt_seq], 2)?
+    };
+    let o_target =
+        v_parts[1]
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, target_seq, heads * head_dim])?;
+    if q_seq > target_end {
+        let ref_seq = q_seq - target_end;
+        let o_ref = sdpa_budgeted_bhsd(&q_parts[2], k, v, scale, None, plan)?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, ref_seq, heads * head_dim])?;
+        Ok(concatenate_axis(&[&o_txt, &o_target, &o_ref], 1)?)
+    } else {
+        Ok(concatenate_axis(&[&o_txt, &o_target], 1)?)
+    }
+}
+
 /// SwiGLU: split last axis in half, `silu(x1) · x2`. The `split` runs eagerly (a shapeless
 /// `mx.compile` can't infer a split's output shapes); the fusable `silu(x1)·x2` arithmetic is
 /// compiled into one kernel when the sc-2963 glue toggle is on. The inline `a·sigmoid(a)` mirrors
@@ -359,6 +405,7 @@ impl DoubleAttention {
 
     /// Joint attention. Returns `(img_attn_out, txt_attn_out)`. `cache` (the 9b-kv edit path)
     /// stores/splices the trailing reference K/V for this double-stream layer post-RoPE.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         img: &Array,
@@ -367,6 +414,7 @@ impl DoubleAttention {
         sin: &Array,
         cache: CacheSlot<'_>,
         attention_plan: AttentionPlan<'_>,
+        pag_target_seq: Option<i32>,
     ) -> Result<(Array, Array)> {
         let (iq, ik, iv) = process_qkv(
             img,
@@ -402,9 +450,20 @@ impl DoubleAttention {
             Some((c, idx)) => c.apply(Stream::Double, idx, k, v)?,
             None => (k, v),
         };
-        let o = attention(&q, &k, &v, self.head_dim, attention_plan)?;
-        sc20686_finish_joint_read(sc20686, &o)?;
         let txt_seq = txt.shape()[1];
+        let o = match pag_target_seq {
+            Some(target_seq) => pag_joint_attention_bhsd(
+                &q,
+                &k,
+                &v,
+                txt_seq,
+                target_seq,
+                self.head_dim,
+                attention_plan,
+            )?,
+            None => attention(&q, &k, &v, self.head_dim, attention_plan)?,
+        };
+        sc20686_finish_joint_read(sc20686, &o)?;
         // `[txt ; img]` is a contiguous split at `txt_seq`; split rather than gather two aranges (F-111).
         let parts = o.split_axis(&[txt_seq], 1)?;
         let txt_out = self.to_add_out.forward(&parts[0])?;
@@ -456,6 +515,7 @@ impl DoubleBlock {
         cache: CacheSlot<'_>,
         ffn_chunk: Option<usize>,
         attention_plan: AttentionPlan<'_>,
+        pag_target_seq: Option<i32>,
     ) -> Result<(Array, Array)> {
         let (shift_msa, scale_msa, gate_msa) = &img_mod[0];
         let (shift_mlp, scale_mlp, gate_mlp) = &img_mod[1];
@@ -469,9 +529,15 @@ impl DoubleBlock {
             c_shift_msa,
         )?;
 
-        let (img_attn, txt_attn) =
-            self.attn
-                .forward(&norm_img, &norm_txt, cos, sin, cache, attention_plan)?;
+        let (img_attn, txt_attn) = self.attn.forward(
+            &norm_img,
+            &norm_txt,
+            cos,
+            sin,
+            cache,
+            attention_plan,
+            pag_target_seq,
+        )?;
         img = gated(&img, gate_msa, &img_attn)?;
         txt = gated(&txt, c_gate_msa, &txt_attn)?;
 
@@ -531,6 +597,7 @@ impl SingleBlock {
 
     /// `mod`: `(shift, scale, gate)`. `cache` (9b-kv edit) stores/splices the trailing reference
     /// K/V for this single-stream layer post-RoPE.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         hidden: &Array,
@@ -539,6 +606,7 @@ impl SingleBlock {
         sin: &Array,
         cache: CacheSlot<'_>,
         attention_plan: AttentionPlan<'_>,
+        pag: Option<(i32, i32)>,
     ) -> Result<Array> {
         let (shift, scale, gate) = m;
         let norm = modulate(&layer_norm(hidden, None, None, LN_EPS)?, scale, shift)?;
@@ -569,7 +637,18 @@ impl SingleBlock {
             Some((c, idx)) => c.apply(Stream::Single, idx, k, v)?,
             None => (k, v),
         };
-        let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?;
+        let attn = match pag {
+            Some((txt_seq, target_seq)) => pag_joint_attention_bhsd(
+                &q,
+                &k,
+                &v,
+                txt_seq,
+                target_seq,
+                self.head_dim,
+                attention_plan,
+            )?,
+            None => attention(&q, &k, &v, self.head_dim, attention_plan)?,
+        };
         sc20686_finish_joint_read(sc20686, &attn)?;
 
         let mlp = swiglu(&mlp)?;
@@ -861,6 +940,7 @@ impl Flux2Transformer {
             &MemoryConfig::OFF,
             AttentionPlan::UNBOUNDED,
             None,
+            None,
         )
     }
 
@@ -887,6 +967,7 @@ impl Flux2Transformer {
             &MemoryConfig::OFF,
             AttentionPlan::UNBOUNDED,
             None,
+            None,
         )
     }
 
@@ -902,6 +983,19 @@ impl Flux2Transformer {
         attention_plan: AttentionPlan<'_>,
         block_window: Option<(usize, &mlx_gen::CancelFlag)>,
     ) -> Result<Array> {
+        self.forward_with_mem_pag(inputs, cache, mem, attention_plan, block_window, None)
+    }
+
+    /// As [`Self::forward_with_mem`] with optional Perturbed-Attention Guidance `(layers, target_seq)`.
+    pub fn forward_with_mem_pag(
+        &self,
+        inputs: &Flux2ForwardInputs,
+        cache: Option<&Flux2KvCache>,
+        mem: &MemoryConfig,
+        attention_plan: AttentionPlan<'_>,
+        block_window: Option<(usize, &mlx_gen::CancelFlag)>,
+        pag: Option<(&[u32], i32)>,
+    ) -> Result<Array> {
         self.forward_inner(
             inputs.hidden_states,
             inputs.encoder_hidden_states,
@@ -914,6 +1008,7 @@ impl Flux2Transformer {
             mem,
             attention_plan,
             block_window,
+            pag,
         )
     }
 
@@ -945,6 +1040,18 @@ impl Flux2Transformer {
         control: (&Flux2ControlBranch, &Array, f32),
         mem: &MemoryConfig,
     ) -> Result<Array> {
+        self.forward_with_control_mem_pag(inputs, control, mem, None)
+    }
+
+    /// As [`Self::forward_with_control_mem`] with optional Perturbed-Attention Guidance `pag_layers`.
+    pub fn forward_with_control_mem_pag(
+        &self,
+        inputs: &Flux2ForwardInputs,
+        control: (&Flux2ControlBranch, &Array, f32),
+        mem: &MemoryConfig,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Array> {
+        let target_seq = inputs.hidden_states.shape()[1];
         self.forward_inner(
             inputs.hidden_states,
             inputs.encoder_hidden_states,
@@ -957,6 +1064,7 @@ impl Flux2Transformer {
             mem,
             AttentionPlan::UNBOUNDED,
             None,
+            pag_layers.map(|layers| (layers, target_seq)),
         )
     }
 
@@ -978,6 +1086,7 @@ impl Flux2Transformer {
         mem: &MemoryConfig,
         attention_plan: AttentionPlan<'_>,
         block_window: Option<(usize, &mlx_gen::CancelFlag)>,
+        pag: Option<(&[u32], i32)>,
     ) -> Result<Array> {
         let temb = self.temb(timestep, guidance)?;
         let mut img = self
@@ -1021,6 +1130,24 @@ impl Flux2Transformer {
             None => None,
         };
 
+        let num_double = self
+            .block_stream
+            .as_ref()
+            .map_or(self.double_blocks.len(), |s| s.double_blocks());
+        let perturbs_double = |idx: usize| -> Option<i32> {
+            pag.and_then(|(layers, target_seq)| {
+                layers.binary_search(&(idx as u32)).ok().map(|_| target_seq)
+            })
+        };
+        let perturbs_single = |idx: usize, txt_seq: i32| -> Option<(i32, i32)> {
+            pag.and_then(|(layers, target_seq)| {
+                layers
+                    .binary_search(&((num_double + idx) as u32))
+                    .ok()
+                    .map(|_| (txt_seq, target_seq))
+            })
+        };
+
         match block_window {
             None => {
                 if self.block_stream.is_some() {
@@ -1040,6 +1167,7 @@ impl Flux2Transformer {
                         cache.map(|c| (c, idx)),
                         mem.ffn_chunk_rows(),
                         attention_plan,
+                        perturbs_double(idx),
                     )?;
                     if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
                         if let Some(n) = branch.hint_index(idx) {
@@ -1082,6 +1210,7 @@ impl Flux2Transformer {
                                 cache.map(|c| (c, idx)),
                                 mem.ffn_chunk_rows(),
                                 attention_plan,
+                                perturbs_double(idx),
                             )?;
                         }
                         Ok((txt, img))
@@ -1107,6 +1236,7 @@ impl Flux2Transformer {
                         &sin,
                         cache.map(|c| (c, idx)),
                         attention_plan,
+                        perturbs_single(idx, txt_seq),
                     )?;
                     if mem.evaluates_after_block(idx) {
                         mlx_rs::transforms::eval([&hidden])?;
@@ -1133,6 +1263,7 @@ impl Flux2Transformer {
                                 &sin,
                                 cache.map(|c| (c, idx)),
                                 attention_plan,
+                                perturbs_single(idx, txt_seq),
                             )?;
                         }
                         Ok(hidden)
@@ -1340,6 +1471,7 @@ impl Flux2ControlBranch {
                 None,
                 None,
                 AttentionPlan::UNBOUNDED,
+                None,
             )?;
             hints.push(block.after_proj.forward(&new_c)?);
             c = new_c;
@@ -1421,7 +1553,35 @@ impl Flux2ControlTransformer {
         control_context_scale: f32,
         mem: &MemoryConfig,
     ) -> Result<Array> {
-        self.base.forward_with_control_mem(
+        self.forward_with_mem_pag(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            control_context,
+            control_context_scale,
+            mem,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_mem_pag(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Array,
+        control_context_scale: f32,
+        mem: &MemoryConfig,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Array> {
+        self.base.forward_with_control_mem_pag(
             &Flux2ForwardInputs {
                 hidden_states,
                 encoder_hidden_states,
@@ -1432,6 +1592,7 @@ impl Flux2ControlTransformer {
             },
             (&self.branch, control_context, control_context_scale),
             mem,
+            pag_layers,
         )
     }
 }
@@ -2735,5 +2896,92 @@ mod tests {
             "all four BFL renames across the prefix conventions resolve"
         );
         assert!(rep.unmatched_paths.is_empty());
+    }
+
+    #[test]
+    fn pag_joint_attention_perturbs_only_middle_target_slice() {
+        let (b, h, txt_seq, target_seq, ref_seq, d) = (1i32, 2i32, 3i32, 2i32, 3i32, 4i32);
+        let full_seq = txt_seq + target_seq + ref_seq;
+        let elems = (b * h * full_seq * d) as usize;
+        let q_vals: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.29 + 0.2).sin()).collect();
+        let k_vals: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.19 - 0.1).cos()).collect();
+        let v_vals: Vec<f32> = (0..elems).map(|i| i as f32 * 0.5 + 10.0).collect();
+        let q = Array::from_slice(&q_vals, &[b, h, full_seq, d]);
+        let k = Array::from_slice(&k_vals, &[b, h, full_seq, d]);
+        let v = Array::from_slice(&v_vals, &[b, h, full_seq, d]);
+
+        // 1) Packed edit: Q = [txt, target, ref], K/V = [txt, target, ref].
+        let pag_out =
+            pag_joint_attention_bhsd(&q, &k, &v, txt_seq, target_seq, d, AttentionPlan::UNBOUNDED)
+                .unwrap();
+        let full_out = attention(&q, &k, &v, d, AttentionPlan::UNBOUNDED).unwrap();
+        let pag_parts = pag_out
+            .split_axis(&[txt_seq, txt_seq + target_seq], 1)
+            .unwrap();
+        let full_parts = full_out
+            .split_axis(&[txt_seq, txt_seq + target_seq], 1)
+            .unwrap();
+
+        for (label, got, want) in [
+            ("txt", &pag_parts[0], &full_parts[0]),
+            ("ref", &pag_parts[2], &full_parts[2]),
+        ] {
+            let diff = got
+                .subtract(want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(
+                diff < 1e-6,
+                "{label} slice must match full SDPA, diff={diff}"
+            );
+        }
+        let want_target = v
+            .split_axis(&[txt_seq, txt_seq + target_seq], 2)
+            .unwrap()
+            .swap_remove(1)
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap()
+            .reshape(&[b, target_seq, h * d])
+            .unwrap();
+        assert!(
+            mlx_rs::ops::array_eq(&pag_parts[1], &want_target, false)
+                .unwrap()
+                .item::<bool>(),
+            "middle target slice must equal V_target exactly"
+        );
+
+        // 2) Cached KV edit: Q = [txt, target] (no ref queries), K/V = [txt, target, cached_ref].
+        let q_cached = q.split_axis(&[txt_seq + target_seq], 2).unwrap().remove(0);
+        let pag_cached = pag_joint_attention_bhsd(
+            &q_cached,
+            &k,
+            &v,
+            txt_seq,
+            target_seq,
+            d,
+            AttentionPlan::UNBOUNDED,
+        )
+        .unwrap();
+        assert_eq!(pag_cached.shape(), &[b, txt_seq + target_seq, h * d]);
+        let cached_parts = pag_cached.split_axis(&[txt_seq], 1).unwrap();
+        let txt_diff = cached_parts[0]
+            .subtract(&full_parts[0])
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            txt_diff < 1e-6,
+            "cached Q_txt must match full SDPA over [txt, target, ref]"
+        );
+        assert!(mlx_rs::ops::array_eq(&cached_parts[1], &want_target, false)
+            .unwrap()
+            .item::<bool>());
     }
 }

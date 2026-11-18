@@ -762,10 +762,16 @@ impl Pipeline {
         };
         let prepared =
             dit.prepare_conditioning(&state.img, &state.img_ids, &state.txt, &state.txt_ids)?;
+        let pag = crate::descriptor_for(self.variant)
+            .capabilities
+            .resolve_pag(self.variant.model_id(), req)
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        let denoise_sigmas = plan.denoise_sigmas();
+        let total_steps = denoise_sigmas.len().saturating_sub(1);
         candle_gen::run_flow_sampler_spans(
             Some(plan.sampler()),
             TimestepConvention::Sigma,
-            plan.denoise_sigmas(),
+            denoise_sigmas,
             &plan.denoise_spans(),
             Some(run),
             true,
@@ -788,50 +794,72 @@ impl Pipeline {
                     "flux/pipeline/transformer_window",
                     format!("{transformer_window:?}").into(),
                 );
-                let out = match (dit, &prepared) {
-                    // `IpFlux::forward` with `ip = None` is byte-identical to the stock
-                    // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
-                    (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                        .forward_prepared_with_memory(
-                            img,
-                            &state.img_ids,
-                            &state.txt,
-                            &state.txt_ids,
-                            &t_vec,
-                            &state.vec,
-                            Some(&guidance_t),
-                            None,
-                            None,
-                            None,
-                            prepared,
-                            attention_plan,
-                            transformer_window,
-                            &req.cancel,
-                        )?,
-                    (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                        .forward_prepared_with_memory(
-                            img,
-                            &state.img_ids,
-                            &state.txt,
-                            &state.txt_ids,
-                            &t_vec,
-                            &state.vec,
-                            packed_guidance,
-                            None,
-                            None,
-                            None,
-                            prepared,
-                            attention_plan,
-                            transformer_window,
-                            &req.cancel,
-                        )?,
-                    _ => {
-                        return Err(CandleError::Msg(
+                let forward_one = |pag_layers: Option<&[u32]>| -> Result<Tensor> {
+                    match (dit, &prepared) {
+                        // `IpFlux::forward` with `ip = None` is byte-identical to the stock
+                        // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
+                        (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
+                            .forward_prepared_with_memory_pag(
+                                img,
+                                &state.img_ids,
+                                &state.txt,
+                                &state.txt_ids,
+                                &t_vec,
+                                &state.vec,
+                                Some(&guidance_t),
+                                None,
+                                None,
+                                None,
+                                prepared,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                                pag_layers,
+                            ),
+                        (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
+                            .forward_prepared_with_memory_pag(
+                                img,
+                                &state.img_ids,
+                                &state.txt,
+                                &state.txt_ids,
+                                &t_vec,
+                                &state.vec,
+                                packed_guidance,
+                                None,
+                                None,
+                                None,
+                                prepared,
+                                attention_plan,
+                                transformer_window,
+                                &req.cancel,
+                                pag_layers,
+                            ),
+                        _ => Err(CandleError::Msg(
                             "flux: prepared conditioning belongs to another DiT variant".into(),
-                        ))
+                        )),
                     }
                 };
-                Ok(out)
+                let out = forward_one(None)?;
+                let step_idx = denoise_sigmas
+                    .get(1..=total_steps)
+                    .and_then(|tail| tail.iter().position(|&s_next| t > s_next))
+                    .unwrap_or_else(|| total_steps.saturating_sub(1));
+                let step_pag = pag
+                    .as_ref()
+                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                if step_pag > 0.0 {
+                    let layers = pag
+                        .as_ref()
+                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                    let pert = forward_one(Some(layers))?;
+                    let out_dtype = out.dtype();
+                    let out_f32 = out.to_dtype(DType::F32)?;
+                    let pert_f32 = pert.to_dtype(DType::F32)?;
+                    let diff = (&out_f32 - &pert_f32)?.affine(step_pag as f64, 0.0)?;
+                    Ok((&out_f32 + &diff)?.to_dtype(out_dtype)?)
+                } else {
+                    Ok(out)
+                }
             },
         )
     }
@@ -914,7 +942,7 @@ impl Pipeline {
     /// the PuLID/IP injector rides the same attention budget, cancellation token, and block window as
     /// plain txt2img, while the caller keeps only its small identity/control modules resident.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_injected_residency(
+    pub(crate) fn forward_injected_residency_pag(
         &self,
         heavy: &SeqHeavy,
         img: &Tensor,
@@ -928,9 +956,10 @@ impl Pipeline {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
     ) -> Result<Tensor> {
         match heavy.dit.as_ref() {
-            DitRef::Stock(transformer) => transformer.forward_injected_with_memory(
+            DitRef::Stock(transformer) => transformer.forward_injected_with_memory_pag(
                 img,
                 img_ids,
                 txt,
@@ -942,8 +971,9 @@ impl Pipeline {
                 attention_plan,
                 transformer_window,
                 cancel,
+                pag_layers,
             ),
-            DitRef::Packed(transformer) => transformer.forward_injected_with_memory(
+            DitRef::Packed(transformer) => transformer.forward_injected_with_memory_pag(
                 img,
                 img_ids,
                 txt,
@@ -955,6 +985,7 @@ impl Pipeline {
                 attention_plan,
                 transformer_window,
                 cancel,
+                pag_layers,
             ),
         }
     }

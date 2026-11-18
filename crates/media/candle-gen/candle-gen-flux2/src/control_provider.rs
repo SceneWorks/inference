@@ -131,13 +131,16 @@ pub struct Flux2Control {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
-fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+pub fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
     descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
     descriptor
 }
 
 impl Flux2Control {
+    pub fn descriptor(&self) -> candle_gen::gen_core::ModelDescriptor {
+        control_report_descriptor()
+    }
     /// Load the dev base (CPU-stage → quantize-onto-GPU when `quant` is set; dense otherwise — fixture
     /// only, the 32B does not fit dense), the Fun-Controlnet-Union control overlay (dense on the device
     /// → quantized in place), and the VAE with its encoder. `quant` (Q4/Q8) is required in practice for

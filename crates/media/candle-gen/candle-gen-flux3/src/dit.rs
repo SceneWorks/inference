@@ -28,8 +28,8 @@ use gen_core_flux3::{timestep_freqs, DitConfig, MODES, TIMESTEP_EMBED_DIM, TIMES
 
 use crate::nn::{
     cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention,
-    packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to, Linear, Loader,
-    PackedSource, PublisherSource, Rope,
+    packed_attention_pag, packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to,
+    Linear, Loader, PackedSource, PublisherSource, Rope,
 };
 
 /// `MLPEmbedder`: `out_layer(silu(in_layer(x)))`, bias-free.
@@ -149,6 +149,7 @@ impl Block {
         heads: usize,
         compute: DType,
         training: bool,
+        pag_image_placements: Option<&[(usize, usize)]>,
     ) -> Result<Tensor> {
         let n = x.dim(0)?;
         let x_mod = layernorm_modulation(x, m.scale, m.shift)?;
@@ -182,12 +183,17 @@ impl Block {
         let q = normalize(&split(q)?, &self.query_norm, rope)?;
         let k = normalize(&split(k)?, &self.key_norm, rope)?;
         let v = split(v)?;
-        let attention = if training {
-            packed_attention_training
-        } else {
-            packed_attention
+        let attn = match pag_image_placements {
+            Some(placements) => packed_attention_pag(&q, &k, &v, bounds, placements, compute)?,
+            None => {
+                let attention = if training {
+                    packed_attention_training
+                } else {
+                    packed_attention
+                };
+                attention(&q, &k, &v, bounds, compute)?
+            }
         };
-        let attn = attention(&q, &k, &v, bounds, compute)?;
         let mut gate_up = chunk_last(&self.mlp_in.forward(&x_mod)?, 2)?;
         let up = gate_up.pop().expect("two chunks");
         let gate_in = gate_up.pop().expect("two chunks");
@@ -700,7 +706,19 @@ impl Flux3Dit {
     /// Velocity prediction for the image tokens of every sample, `[Σ Ni, image_in_channels]` in
     /// the compute dtype, in sample order (the image tokens of sample 0, then sample 1, …).
     pub fn forward(&self, samples: &[SampleTokens<'_>]) -> Result<Tensor> {
-        __model_proof_output!(self.forward_impl(samples, false))
+        __model_proof_output!(self.forward_impl(samples, false, None))
+    }
+
+    /// As [`Self::forward`] with optional Perturbed-Attention Guidance over `flux3_blocks`:
+    /// `0..depth` perturbs ONLY early `image_blocks[i]` (leaving `image_cond_blocks` and
+    /// `txt_blocks` unperturbed), and `depth..depth+depth_single` perturbs `single_blocks[i - depth]`
+    /// on the leading `image` tokens of each sample while `[image_cond, text]` runs normal SDPA.
+    pub fn forward_pag(
+        &self,
+        samples: &[SampleTokens<'_>],
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Tensor> {
+        __model_proof_output!(self.forward_impl(samples, false, pag_layers))
     }
 
     /// Training-only autograd path. Inference retains the exact existing fused norm path.
@@ -710,10 +728,15 @@ impl Flux3Dit {
                 "flux3 training: requires the undistilled base DiT".into(),
             ));
         }
-        __model_proof_output!(self.forward_impl(samples, true))
+        __model_proof_output!(self.forward_impl(samples, true, None))
     }
 
-    fn forward_impl(&self, samples: &[SampleTokens<'_>], training: bool) -> Result<Tensor> {
+    fn forward_impl(
+        &self,
+        samples: &[SampleTokens<'_>],
+        training: bool,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Tensor> {
         if samples.is_empty() {
             return Err(Error::Msg("flux3: forward over no samples".into()));
         }
@@ -817,7 +840,17 @@ impl Flux3Dit {
                 _ => &self.txt_blocks,
             };
             let mut x = x;
-            for block in blocks {
+            for (idx, block) in blocks.iter().enumerate() {
+                let pag_placements = (mode == 0)
+                    .then(|| {
+                        pag_layers.and_then(|layers| {
+                            layers
+                                .binary_search(&(idx as u32))
+                                .ok()
+                                .map(|_| bounds[0].as_slice())
+                        })
+                    })
+                    .flatten();
                 x = block.forward(
                     &x,
                     &rope,
@@ -830,6 +863,7 @@ impl Flux3Dit {
                     heads,
                     compute,
                     training,
+                    pag_placements,
                 )?;
             }
             streams[mode] = Some(x);
@@ -878,7 +912,14 @@ impl Flux3Dit {
             cat(&refs, 0)
         };
         let m = [expand(&mods[0])?, expand(&mods[1])?, expand(&mods[2])?];
-        for block in &self.single_blocks {
+        let depth = self.cfg.depth;
+        for (idx, block) in self.single_blocks.iter().enumerate() {
+            let pag_placements = pag_layers.and_then(|layers| {
+                layers
+                    .binary_search(&((depth + idx) as u32))
+                    .ok()
+                    .map(|_| placement.as_slice())
+            });
             h = block.forward(
                 &h,
                 &rope,
@@ -891,6 +932,7 @@ impl Flux3Dit {
                 heads,
                 compute,
                 training,
+                pag_placements,
             )?;
         }
 
