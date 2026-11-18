@@ -449,18 +449,6 @@ impl<'a> PagStepContext<'a> {
     }
 }
 
-/// Map a `1 - sigma` flow-match timestep back to its 0-based step index in `sigmas`.
-pub(crate) fn pag_step_index(sigmas: &[f32], timestep: f32) -> usize {
-    let total_steps = sigmas.len().saturating_sub(1);
-    if total_steps == 0 {
-        return 0;
-    }
-    sigmas[..total_steps]
-        .iter()
-        .rposition(|&s| (1.0f32 - s) <= timestep)
-        .unwrap_or(0)
-}
-
 /// Apply Z-Image PAG attention perturbation on `[B, H, seq_len, D]` BHSD tensors when
 /// `pag_x_len` is `Some(x_len)`: image prefix `0..x_len` receives `V_x` directly, while caption
 /// tail `x_len..seq_len` runs `sdpa(&q_cap, k, v)` against the full `[K_x, K_cap]` and
@@ -869,19 +857,24 @@ mod tests {
 
     #[test]
     fn pag_step_index_and_context_layer_selection() {
-        let sigmas = [1.0f32, 0.75, 0.5, 0.25, 0.0];
-        for (i, &s) in sigmas[..4].iter().enumerate() {
-            assert_eq!(pag_step_index(&sigmas, 1.0 - s), i);
-        }
-        // Non-dyadic sigmas: verify no 1-ULP off-by-one.
-        let non_dyadic = [1.0f32, 2.0 / 3.0, 1.0 / 3.0, 0.0];
-        for (i, &s) in non_dyadic[..3].iter().enumerate() {
-            assert_eq!(pag_step_index(&non_dyadic, 1.0 - s), i);
-        }
-        // Multi-stage solver substeps (`1 - sigmas[i] < t < 1 - sigmas[i + 1]`) stay at step `i`.
-        for i in 0..3 {
-            let midpoint = 0.5 * ((1.0 - non_dyadic[i]) + (1.0 - non_dyadic[i + 1]));
-            assert_eq!(pag_step_index(&non_dyadic, midpoint), i);
+        use candle_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+
+        let euler = canonical_solver_or_euler(None);
+        assert_eq!(
+            (0..4)
+                .map(|eval| step_index_for_eval(euler, eval, 4))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        // Two-stage solvers (`heun`, `dpmpp_sde`) keep both evaluations of outer step `i` on `i`.
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            assert_eq!(
+                (0..8)
+                    .map(|eval| step_index_for_eval(solver, eval, 4))
+                    .collect::<Vec<_>>(),
+                vec![0, 0, 1, 1, 2, 2, 3, 3]
+            );
         }
 
         let resolved = candle_gen::gen_core::PagResolved {

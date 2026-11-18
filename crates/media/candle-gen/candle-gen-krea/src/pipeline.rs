@@ -1331,9 +1331,12 @@ pub(crate) fn render_three_stage_with_native(
         format!("{transformer_window:?}").into(),
     );
     let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let preview = crate::preview::hook(&req.preview);
+        let mut eval_idx = 0usize;
         candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -1345,7 +1348,14 @@ pub(crate) fn render_three_stage_with_native(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(pag.as_ref(), step_idx, total_steps);
                 let cond = dit.forward_with_memory(
                     x,
                     &t,
@@ -1624,10 +1634,13 @@ fn render_from_context(
         crate::KREA_2_TURBO_ID,
     )?;
     let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let preview = crate::preview::hook(&req.preview);
+        let mut eval_idx = 0usize;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -1639,7 +1652,14 @@ fn render_from_context(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(pag.as_ref(), step_idx, total_steps);
                 let cond = comps.dit.forward_prepared_with_memory(
                     x,
                     &t,
@@ -1798,6 +1818,7 @@ fn render_img2img_from_context(
         crate::KREA_2_TURBO_ID,
     )?;
     let pag = resolve_pag_for_id(crate::KREA_2_TURBO_ID, req)?;
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -1811,6 +1832,8 @@ fn render_img2img_from_context(
             // Numbered against the executed window `sub`, not the full schedule: an img2img render
             // genuinely performs only these steps, and the MLX twin numbers the same way.
             let preview = crate::preview::hook(&req.preview);
+            let total_steps = sub.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -1822,7 +1845,14 @@ fn render_img2img_from_context(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let pag_step = PagStep::for_sigma(pag.as_ref(), sub, timestep);
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    let pag_step = PagStep::for_step(pag.as_ref(), step_idx, total_steps);
                     let cond = comps.dit.forward_prepared_with_memory(
                         x,
                         &t,
@@ -1990,12 +2020,15 @@ fn render_base_from_contexts(
         crate::KREA_2_RAW_ID,
     )?;
     let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         // The hook sees the running latent `x`, never the CFG pair: both forwards happen inside this
         // closure and only the combined velocity leaves it, so no unconditional half can be projected.
         let preview = crate::preview::hook(&req.preview);
+        let mut eval_idx = 0usize;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -2007,7 +2040,14 @@ fn render_base_from_contexts(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(pag.as_ref(), step_idx, total_steps);
                 let cond = comps.dit.forward_prepared_with_memory(
                     x,
                     &t,
@@ -2257,6 +2297,8 @@ fn render_multiphase_driver<T>(
         phase_prepared.push((positive, negative));
     }
 
+    let full_total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
     let outputs = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
         // phase's output latent at the SHARED boundary sigma.
@@ -2280,6 +2322,8 @@ fn render_multiphase_driver<T>(
             let end = phase.slice.end.min(sigmas.len().saturating_sub(1));
             let start = phase.slice.start.min(end);
             let sub = &sigmas[start..=end];
+            let phase_steps = sub.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             let guidance = phase.guidance;
             candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
             latent = candle_gen::run_flow_sampler(
@@ -2293,7 +2337,15 @@ fn render_multiphase_driver<T>(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = start
+                        + gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            phase_steps,
+                        );
+                    let pag_step = PagStep::for_step(pag.as_ref(), step_idx, full_total_steps);
                     let cond = dit.forward_prepared_with_memory(
                         x,
                         &t,
@@ -2547,6 +2599,10 @@ fn render_base_img2img_from_contexts(
             // Numbered against the executed window `sub` (as the Turbo img2img route is), and blind to
             // the CFG pair, which is formed and combined inside the closure below.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = sub.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -2558,7 +2614,14 @@ fn render_base_img2img_from_contexts(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let pag_step = PagStep::for_sigma(pag.as_ref(), sub, timestep);
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    let pag_step = PagStep::for_step(pag.as_ref(), step_idx, total_steps);
                     let cond = comps.dit.forward_prepared_with_memory(
                         x,
                         &t,
@@ -2825,6 +2888,8 @@ fn render_edit_from_context(
     let pid_decoder =
         candle_gen_pid::resolve_pid_decoder(heavy.pid.as_deref(), req, base_seed, model_id)?;
     let pag = resolve_pag_for_id(model_id, req)?;
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -2832,6 +2897,7 @@ fn render_edit_from_context(
         // encoded reference latents into the DiT sequence internally, and both CFG legs are combined
         // inside the closure. A preview here can therefore only ever be the image being generated.
         let preview = crate::preview::hook(&req.preview);
+        let mut eval_idx = 0usize;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -2843,7 +2909,14 @@ fn render_edit_from_context(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let pag_step = PagStep::for_sigma(pag.as_ref(), &sigmas, timestep);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(pag.as_ref(), step_idx, total_steps);
                 // Thread the request's cancel flag into the block loop (sc-16003): an edit step at
                 // 2048² is ~45 s (a ~37k-token joint sequence), far too long for the sampler's
                 // between-steps poll to be the only checkpoint. Both CFG legs honor it.
@@ -3077,20 +3150,15 @@ pub(crate) struct PagStep<'a> {
 }
 
 impl<'a> PagStep<'a> {
-    pub(crate) fn for_sigma(
+    pub(crate) fn for_step(
         pag: Option<&'a gen_core::PagResolved>,
-        schedule_sigmas: &[f32],
-        timestep: f32,
+        step_index: usize,
+        total_steps: usize,
     ) -> Option<Self> {
         let pag = pag?;
-        let total_steps = schedule_sigmas.len().saturating_sub(1);
         if total_steps == 0 {
             return None;
         }
-        let step_index = schedule_sigmas[..total_steps]
-            .iter()
-            .rposition(|&s| s >= timestep)
-            .unwrap_or(0);
         let scale = pag.step_scale(step_index, total_steps);
         if scale <= 0.0 {
             return None;
@@ -4602,10 +4670,11 @@ mod tests {
 
     #[test]
     fn pag_step_window_and_combine_cover_noop_2pass_3pass_and_multiphase() {
+        use candle_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
         use candle_gen::gen_core::PagConfig;
 
         // 8-step Turbo schedule with default window [0.0, 0.75): steps 0..6 active (2-pass),
-        // steps 6..8 inactive (1-pass).
+        // steps 6..8 inactive (1-pass), across both Euler and two-stage solvers (`heun`, `dpmpp_sde`).
         let turbo_cap = crate::turbo_pag_capability();
         let turbo_pag = turbo_cap
             .resolve(Some(&PagConfig {
@@ -4613,13 +4682,25 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let turbo_sig = turbo_sigmas(8);
-        assert_eq!(turbo_sig.len(), 9);
+        let euler = canonical_solver_or_euler(None);
         let active_turbo: Vec<usize> = (0..8)
-            .filter(|&i| PagStep::for_sigma(Some(&turbo_pag), &turbo_sig, turbo_sig[i]).is_some())
+            .filter(|&eval_idx| {
+                let step_idx = step_index_for_eval(euler, eval_idx, 8);
+                PagStep::for_step(Some(&turbo_pag), step_idx, 8).is_some()
+            })
             .collect();
         assert_eq!(active_turbo, vec![0, 1, 2, 3, 4, 5]);
-        assert_eq!(PagStep::for_sigma(None, &turbo_sig, turbo_sig[0]), None);
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            let active_evals: Vec<usize> = (0..16)
+                .filter(|&eval_idx| {
+                    let step_idx = step_index_for_eval(solver, eval_idx, 8);
+                    PagStep::for_step(Some(&turbo_pag), step_idx, 8).is_some()
+                })
+                .collect();
+            assert_eq!(active_evals, (0..12).collect::<Vec<_>>());
+        }
+        assert_eq!(PagStep::for_step(None, 0, 8), None);
         let turbo_report = turbo_pag.execution_report(8);
         assert_eq!(turbo_report.active_steps, 6);
         assert_eq!(turbo_report.total_steps, 8);
@@ -4674,17 +4755,21 @@ mod tests {
                 ..Default::default()
             }))
             .unwrap();
-        let full = base_schedule(8, 1024, 1024, None);
-        let phase0 = &full[0..=4];
-        let phase1 = &full[4..=8];
-        let p0_active: Vec<usize> = (0..4)
-            .filter(|&i| PagStep::for_sigma(Some(&mp_pag), &full, phase0[i]).is_some())
+        let heun = canonical_solver_or_euler(Some("heun"));
+        let p0_active: Vec<usize> = (0..8)
+            .filter(|&eval_idx| {
+                let step_idx = step_index_for_eval(heun, eval_idx, 4);
+                PagStep::for_step(Some(&mp_pag), step_idx, 8).is_some()
+            })
             .collect();
-        let p1_active: Vec<usize> = (0..4)
-            .filter(|&i| PagStep::for_sigma(Some(&mp_pag), &full, phase1[i]).is_some())
+        let p1_active: Vec<usize> = (0..8)
+            .filter(|&eval_idx| {
+                let step_idx = 4 + step_index_for_eval(heun, eval_idx, 4);
+                PagStep::for_step(Some(&mp_pag), step_idx, 8).is_some()
+            })
             .collect();
-        assert_eq!(p0_active, vec![2, 3]);
-        assert_eq!(p1_active, vec![0, 1]);
+        assert_eq!(p0_active, vec![4, 5, 6, 7]);
+        assert_eq!(p1_active, vec![0, 1, 2, 3]);
         assert_eq!(mp_pag.execution_report(8).active_steps, 4);
     }
 }

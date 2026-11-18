@@ -322,7 +322,8 @@ fn predict_cfg_and_pag(
     uncond_prepared: Option<&PreparedDiT>,
     guidance: f32,
     pag: Option<&gen_core::PagResolved>,
-    run_sigmas: &[f32],
+    step_idx: usize,
+    total_steps: usize,
     cancel: &CancelFlag,
     attention_budget: usize,
     transformer_window: usize,
@@ -366,8 +367,6 @@ fn predict_cfg_and_pag(
     let Some(resolved_pag) = pag else {
         return Ok(eps_base);
     };
-    let total_steps = run_sigmas.len().saturating_sub(1);
-    let step_idx = common::pag_step_index(run_sigmas, t);
     let step_pag_scale = resolved_pag.step_scale(step_idx, total_steps);
     if step_pag_scale <= 0.0 {
         return Ok(eps_base);
@@ -1539,6 +1538,10 @@ impl Pipeline {
             // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
             // driver call and must start a fresh trajectory at frame 1. The driver owns the counter.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1549,6 +1552,13 @@ impl Pipeline {
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
                     predict_cfg_and_pag(
                         &self.device,
                         transformer,
@@ -1561,7 +1571,8 @@ impl Pipeline {
                         None,
                         1.0,
                         pag,
-                        run_sigmas,
+                        step_idx,
+                        total_steps,
                         &req.cancel,
                         attention_budget,
                         transformer_window,
@@ -1665,6 +1676,10 @@ impl Pipeline {
             // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
             // the predict closure below, so the hook only ever sees the conditional trajectory.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1675,6 +1690,13 @@ impl Pipeline {
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
                     predict_cfg_and_pag(
                         &self.device,
                         transformer,
@@ -1687,7 +1709,8 @@ impl Pipeline {
                         uncond_prepared.as_ref(),
                         guidance,
                         pag,
-                        run_sigmas,
+                        step_idx,
+                        total_steps,
                         &req.cancel,
                         attention_budget,
                         transformer_window,
@@ -1832,6 +1855,10 @@ impl Pipeline {
             // driver call and must start a fresh trajectory at frame 1. The driver owns the counter,
             // so this route's numbering can only ever key off the schedule it is integrating.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -1842,6 +1869,13 @@ impl Pipeline {
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
                     predict_cfg_and_pag(
                         &self.device,
                         &components.transformer,
@@ -1854,7 +1888,8 @@ impl Pipeline {
                         None,
                         1.0,
                         pag,
-                        run_sigmas,
+                        step_idx,
+                        total_steps,
                         &req.cancel,
                         attention_budget,
                         transformer_window,
@@ -2044,6 +2079,10 @@ impl Pipeline {
             // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
             // the predict closure below, so the hook only ever sees the conditional trajectory.
             let preview = crate::preview::hook(&req.preview);
+            let canonical_solver =
+                gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            let total_steps = run_sigmas.len().saturating_sub(1);
+            let mut eval_idx = 0usize;
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -2054,6 +2093,13 @@ impl Pipeline {
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
                     predict_cfg_and_pag(
                         &self.device,
                         &components.transformer,
@@ -2066,7 +2112,8 @@ impl Pipeline {
                         uncond_prepared.as_ref(),
                         guidance,
                         pag,
-                        run_sigmas,
+                        step_idx,
+                        total_steps,
                         &req.cancel,
                         attention_budget,
                         transformer_window,

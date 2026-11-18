@@ -37,21 +37,19 @@ pub fn qwen_image_2_1_turbo_pag_capability() -> PagCapability {
     }
 }
 
-/// Map a descending flow-match `sigma` onto its zero-based step index in `0..sigmas.len() - 1`.
+/// Map a per-trajectory model evaluation counter `eval_idx` (0-based, reset per sample) onto
+/// its zero-based outer schedule step index in `0..total_steps`.
 ///
-/// Matches the outer-step progress convention used by `candle_gen::sampler` (`sigmas` descending to
-/// trailing `0.0`), clamping to the final active step when a multi-evaluation solver queries at a
-/// smaller intermediate sigma.
-pub fn pag_step_index_for_sigma(sigmas: &[f32], sigma: f32) -> usize {
-    let total_steps = sigmas.len().saturating_sub(1);
-    if total_steps == 0 {
-        return 0;
-    }
-    sigmas[..total_steps]
-        .iter()
-        .filter(|&&s| s > sigma)
-        .count()
-        .min(total_steps - 1)
+/// Delegates to [`gen_core::sampling::canonical_solver_or_euler`] and
+/// [`gen_core::sampling::step_index_for_eval`] so two-stage solvers (`Heun`, `DpmppSde`) keep
+/// both evaluations of outer step `i` on the same PAG window/adaptive-scale index.
+pub fn pag_step_index_for_eval(
+    sampler_name: Option<&str>,
+    eval_idx: usize,
+    total_steps: usize,
+) -> usize {
+    let canonical_solver = gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    gen_core::sampling::step_index_for_eval(canonical_solver, eval_idx, total_steps)
 }
 
 /// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this
@@ -161,13 +159,23 @@ mod tests {
 
     #[test]
     fn step_index_and_block_flags_and_target_range() {
-        let sigmas = [1.0f32, 0.8, 0.5, 0.2, 0.0];
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 1.0), 0);
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.8), 1);
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.5), 2);
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.2), 3);
-        assert_eq!(pag_step_index_for_sigma(&sigmas, 0.0), 3);
-        assert_eq!(pag_step_index_for_sigma(&[], 1.0), 0);
+        // Single-stage Euler: each evaluation advances one outer step, clamping at total_steps - 1.
+        for sampler in [None, Some("euler"), Some("flow_match")] {
+            let steps: Vec<usize> = (0..5)
+                .map(|eval_idx| pag_step_index_for_eval(sampler, eval_idx, 4))
+                .collect();
+            assert_eq!(steps, vec![0, 1, 2, 3, 3]);
+        }
+
+        // Two-stage Heun and DPM++ SDE: primary and corrector evaluations of outer step 0 both
+        // stay on step_idx = 0, and subsequent pairs advance together without premature cutoff.
+        for sampler in [Some("heun"), Some("dpmpp_sde")] {
+            let steps: Vec<usize> = (0..8)
+                .map(|eval_idx| pag_step_index_for_eval(sampler, eval_idx, 4))
+                .collect();
+            assert_eq!(steps, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+            assert_eq!(pag_step_index_for_eval(sampler, 0, 0), 0);
+        }
 
         let turbo = qwen_image_2_1_turbo_pag_capability();
         let resolved = resolve_pag(

@@ -635,6 +635,8 @@ impl Pipeline {
             &native,
         )?;
         let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
 
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
@@ -643,6 +645,7 @@ impl Pipeline {
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, MODEL_ID)?;
 
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let mut eval_idx = 0usize;
             let latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
                 .to_dtype(DIT_DTYPE)?;
 
@@ -689,7 +692,13 @@ impl Pipeline {
                         }
                         None => pos.clone(),
                     };
-                    let step_idx = pipeline::pag_step_index_for_sigma(&sigmas, sigma);
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
                     let pag_scale =
                         resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
                     if pag_scale > 0.0 {

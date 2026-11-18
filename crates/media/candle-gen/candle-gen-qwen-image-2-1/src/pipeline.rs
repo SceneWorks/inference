@@ -14,7 +14,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
-use gen_core_family::qwen_image_2_1::pag::{pag_perturb_block_flags, pag_step_index_for_sigma};
+use gen_core_family::qwen_image_2_1::pag::{pag_perturb_block_flags, pag_step_index_for_eval};
 use gen_core_tokenizer::TextTokenizer;
 
 use crate::config::VAE_SCALE_FACTOR;
@@ -579,7 +579,8 @@ pub fn denoise_reported_with_pag(
     let references = inputs.references.as_ref();
     let total_steps = inputs.sigmas.len().saturating_sub(1);
     let num_blocks = transformer.num_blocks();
-    let sigmas = inputs.sigmas;
+    let sampler_name = inputs.sampler;
+    let mut eval_idx = 0usize;
     // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
     let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
     *report = DenoiseReport {
@@ -616,7 +617,9 @@ pub fn denoise_reported_with_pag(
             }
             None => velocity.clone(),
         };
-        let step_idx = pag_step_index_for_sigma(sigmas, sigma);
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = pag_step_index_for_eval(sampler_name, current_eval, total_steps);
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
             if let Some(perturb_blocks) =
