@@ -7,7 +7,6 @@ use mlx_rs::Dtype;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::models::Qwen35Config;
 use crate::primitives::{projection::QuantSpec, Weights};
 use crate::snapshot::is_projection;
 
@@ -17,49 +16,86 @@ pub(crate) fn manifest(bits: i32) -> Value {
         "packing":"uint32","scales":"bfloat16","biases":"bfloat16","routers":"float32"})
 }
 
-pub(crate) fn release_shards(
-    dir: &Path,
-    config: &Value,
-) -> Result<Option<Vec<std::path::PathBuf>>> {
+#[derive(Clone, Copy)]
+pub(crate) enum Tier {
+    Bf16,
+    Affine(QuantSpec),
+}
+
+impl Tier {
+    fn shards(self, dir: &Path) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::Bf16 => TARGET_SHARDS
+                .iter()
+                .map(|(name, _)| dir.join(name))
+                .collect(),
+            Self::Affine(_) => vec![dir.join("model.safetensors")],
+        }
+    }
+}
+
+pub(crate) fn tier(config: &Value) -> Result<Option<Tier>> {
     if SenseNovaLoop::from_config(config)
         .map_err(Error::Config)?
         .is_none()
     {
         return Ok(None);
     }
-    let stored = Qwen35Config::from_json(config)?.quantization;
-    let shards = if let Some(spec) = stored {
-        if spec.group_size != 64
-            || ![4, 8].contains(&spec.bits)
-            || config.get("sensenova_mlx") != Some(&manifest(spec.bits))
-        {
-            return Err(Error::Config("SenseNova-Loop-9B requires native MLX affine Q4/Q8 tier metadata with the exact source revision".into()));
+    for owner in [config, &config["text_config"]] {
+        for field in ["quantization_config", "compression_config", "quant_method"] {
+            if owner.get(field).is_some() {
+                return Err(Error::Config(format!(
+                    "SenseNova-Loop-9B: unsupported {field} metadata"
+                )));
+            }
         }
-        vec![dir.join("model.safetensors")]
-    } else {
-        if config.get("sensenova_mlx").is_some() || config.get("quantization_config").is_some() {
-            return Err(Error::Config(
-                "SenseNova-Loop-9B: incompatible stored quantization".into(),
-            ));
+    }
+    if config["text_config"].get("quantization").is_some() {
+        return Err(Error::Config(
+            "SenseNova-Loop-9B: unexpected nested quantization".into(),
+        ));
+    }
+    if let Some(block) = config.get("quantization") {
+        for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+            if *block == json!({"group_size":64,"bits":spec.bits})
+                && config.get("sensenova_mlx") == Some(&manifest(spec.bits))
+            {
+                return Ok(Some(Tier::Affine(spec)));
+            }
         }
-        TARGET_SHARDS
-            .iter()
-            .map(|(name, _)| dir.join(name))
-            .collect()
-    };
-    Ok(Some(shards))
+        return Err(Error::Config("SenseNova-Loop-9B requires native MLX affine Q4/Q8 tier metadata with the exact source revision".into()));
+    }
+    if config.get("sensenova_mlx").is_some() {
+        return Err(Error::Config(
+            "SenseNova-Loop-9B: incompatible stored quantization".into(),
+        ));
+    }
+    Ok(Some(Tier::Bf16))
+}
+
+pub(crate) fn release_shards(
+    dir: &Path,
+    config: &Value,
+) -> Result<Option<Vec<std::path::PathBuf>>> {
+    Ok(tier(config)?.map(|tier| tier.shards(dir)))
 }
 
 impl Weights {
     /// Load an HF directory with its wrapper configuration. Preserve the target
     /// shard set and check the native tier before materializing its tensors.
     pub fn from_configured_dir(dir: &Path, config: &Value) -> Result<Self> {
-        let Some(shards) = release_shards(dir, config)? else {
+        let Some(tier) = tier(config)? else {
             return Weights::from_dir(dir);
         };
         sensenova_loop::validate_sidecars(dir).map_err(Error::Config)?;
-        let stored = Qwen35Config::from_json(config)?.quantization;
-        let weights = Weights::from_shards(shards)?;
+        let stored = match tier {
+            Tier::Bf16 => {
+                sensenova_loop::validate_source_shards(dir).map_err(Error::Config)?;
+                None
+            }
+            Tier::Affine(spec) => Some(spec),
+        };
+        let weights = Weights::from_shards(tier.shards(dir))?;
         validate_layout(&weights, stored)?;
         Ok(weights)
     }
@@ -153,6 +189,33 @@ mod tests {
     }
 
     #[test]
+    fn sensenova_resolver_requires_one_native_packing_scheme() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let spec = core_llm::LoadSpec::dense(root.path().display().to_string());
+        let mut config: Value = serde_json::from_str(include_str!(
+            "../../../contracts/core-llm/src/sensenova_loop.json"
+        ))
+        .unwrap();
+        config["sensenova_mlx"] = manifest(4);
+        config["quantization"] = json!({"bits":4,"group_size":64});
+        std::fs::write(&path, config.to_string()).unwrap();
+        assert!(crate::provider::can_load(&spec));
+        assert!(crate::provider::weightless_vision(&spec));
+        config["quantization_config"] = json!({"quant_method":"awq"});
+        std::fs::write(&path, config.to_string()).unwrap();
+        assert!(!crate::provider::can_load(&spec));
+        assert!(!crate::provider::weightless_vision(&spec));
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("quantization_config");
+        config["quantization"]["storage"] = json!("ggml");
+        std::fs::write(&path, config.to_string()).unwrap();
+        assert!(!crate::provider::can_load(&spec));
+    }
+
+    #[test]
     fn sensenova_rejects_foreign_pack_and_selects_target_shards() {
         let mut config: Value = serde_json::from_str(include_str!(
             "../../../contracts/core-llm/src/sensenova_loop.json"
@@ -169,6 +232,16 @@ mod tests {
                 release_shards(root, &config).unwrap().unwrap(),
                 [root.join("model.safetensors")]
             );
+            for (path, field) in [
+                ("", "quantization_config"),
+                ("/text_config", "quantization"),
+                ("/quantization", "storage"),
+                ("/quantization", "mode"),
+            ] {
+                let mut ambiguous = config.clone();
+                ambiguous.pointer_mut(path).unwrap()[field] = json!("foreign");
+                assert!(release_shards(root, &ambiguous).is_err(), "{path}/{field}");
+            }
             config["sensenova_mlx"]["format"] = json!("foreign");
             assert!(release_shards(root, &config).is_err());
         }

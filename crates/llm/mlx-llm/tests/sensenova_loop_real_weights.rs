@@ -30,22 +30,40 @@ struct Case {
     thinking: bool,
     input_ids: Vec<i32>,
     image: Option<Image>,
+    image_grid_thw: Option<Vec<[i32; 3]>>,
+    image_processor_samples: Vec<PatchSample>,
+    image_processor_sample_abs_tolerance: Option<f32>,
     steps: Vec<Step>,
 }
 #[derive(Deserialize)]
+struct PatchSample {
+    patch: usize,
+    offset: usize,
+    value: f32,
+}
+#[derive(Deserialize, Default)]
 struct Image {
     width: u32,
     height: u32,
     rgb: [u8; 3],
+    split_x: Option<u32>,
+    split_y: Option<u32>,
+    quadrants: Option<[[u8; 3]; 4]>,
 }
 impl Image {
     fn pixels(&self) -> ImageRef {
-        ImageRef::new(
-            self.width,
-            self.height,
-            self.rgb.repeat(self.width as usize * self.height as usize),
-        )
-        .unwrap()
+        let pixels = if let Some(colors) = self.quadrants {
+            let (sx, sy) = (self.split_x.unwrap(), self.split_y.unwrap());
+            (0..self.height)
+                .flat_map(|y| {
+                    (0..self.width)
+                        .flat_map(move |x| colors[2 * usize::from(y >= sy) + usize::from(x >= sx)])
+                })
+                .collect()
+        } else {
+            self.rgb.repeat(self.width as usize * self.height as usize)
+        };
+        ImageRef::new(self.width, self.height, pixels).unwrap()
     }
 }
 #[derive(Deserialize)]
@@ -54,6 +72,35 @@ struct Step {
     token_ids: Vec<i32>,
     logits: Vec<f32>,
     max_abs_error: f32,
+    semantic_score: Option<SemanticScore>,
+}
+
+#[derive(Deserialize)]
+struct SemanticScore {
+    positive_token_ids: Vec<i32>,
+    negative_token_ids: Vec<i32>,
+    source_positive_margin: f32,
+}
+
+impl SemanticScore {
+    fn margin(&self, ids: &[i32], logits: &[f32]) -> f32 {
+        let maximum = |group: &[i32]| {
+            assert!(!group.is_empty());
+            group
+                .iter()
+                .map(|token| {
+                    let index = ids
+                        .iter()
+                        .position(|id| id == token)
+                        .expect("semantic token absent from reference");
+                    let value = logits[index];
+                    assert!(value.is_finite());
+                    value
+                })
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        maximum(&self.positive_token_ids) - maximum(&self.negative_token_ids)
+    }
 }
 
 fn request(prompt: &str, image: Option<&Image>) -> TextLlmRequest {
@@ -115,6 +162,7 @@ fn load_and_measure(dir: &Path, tier: &str) -> LlamaProvider {
                 width: 1536,
                 height: 1024,
                 rgb: [35, 70, 200],
+                ..Default::default()
             }),
         );
         req.max_new_tokens = 1;
@@ -130,7 +178,7 @@ fn load_and_measure(dir: &Path, tier: &str) -> LlamaProvider {
     });
     assert!(baseline > 0 && observed_peak >= baseline);
     println!(
-        "SENSENOVA_LOOP_MEMORY {}",
+        "\nSENSENOVA_LOOP_MEMORY {}",
         json!({"product":record,"process_baseline_bytes":baseline,"sampled_process_peak_bytes":observed_peak,"sample_interval_ms":50})
     );
     provider
@@ -180,10 +228,10 @@ fn production(dir: &Path, tier: &str, cases: &[Case]) {
         );
         let r = request(&case.prompt, case.image.as_ref());
         let out = provider.complete(&r).unwrap();
-        let expected = if case.id == "text" {
-            "91"
-        } else {
-            case.id.as_str()
+        let expected = match case.id.as_str() {
+            "text" => "91",
+            "quadrants" => "red",
+            color => color,
         };
         assert!(
             out.text
@@ -207,18 +255,25 @@ fn production(dir: &Path, tier: &str, cases: &[Case]) {
             json!({"tier":tier,"case":case.id,"answer":out.text,"prompt_tokens":out.usage.prompt_tokens,"generated_tokens":out.usage.generated_tokens,"metal_peak_bytes":mlx_rs::memory::get_peak_memory()})
         );
     }
-    let mut r = request("Return a JSON object with status set to ok.", None);
-    r.constraint = Some(Constraint::JsonSchema(
-        JsonSchema::compile(&json!({
-        "type":"object","properties":{"status":{"type":"string","enum":["ok"]}},
-        "required":["status"],"additionalProperties":false}))
-        .unwrap(),
-    ));
-    let out = provider.complete(&r).unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&out.text).unwrap(),
-        json!({"status":"ok"})
-    );
+    let schema = JsonSchema::compile(&json!({
+        "type":"object","properties":{"color":{"type":"string","enum":["red","blue","green","yellow"]}},
+        "required":["color"],"additionalProperties":false
+    })).unwrap();
+    for case in cases
+        .iter()
+        .filter(|c| matches!(c.id.as_str(), "blue" | "red"))
+    {
+        let mut r = request(
+            "What is the dominant color of the image? Return a JSON object with a color field.",
+            case.image.as_ref(),
+        );
+        r.constraint = Some(Constraint::JsonSchema(schema.clone()));
+        let out = provider.complete(&r).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out.text).unwrap(),
+            json!({"color":case.id})
+        );
+    }
     let mut r = request("What is 13 times 7? Explain your reasoning.", None);
     r.thinking = ThinkingMode::Enabled;
     r.max_new_tokens = 8;
@@ -294,6 +349,88 @@ fn centered_error(lhs: &[f32], rhs: &[f32]) -> f32 {
         .fold(0., f32::max)
 }
 
+/// Compare native packed matmul to CPU FP32 arithmetic over independently unpacked
+/// checkpoint words. Basis inputs cover word/group boundaries. The mixed input
+/// exercises signed reduction across those boundaries and both ends of each row.
+fn check_packed_projection(weights: &Weights, spec: mlx_llm::primitives::QuantSpec) {
+    use mlx_llm::primitives::projection::Projection;
+    let key = "model.language_model.layers.3.self_attn.k_proj";
+    let weight = weights.require(&format!("{key}.weight")).unwrap();
+    let rows = weight.shape()[0];
+    let take = |tensor: &Array| {
+        tensor
+            .take_axis(Array::from_slice(&[0, rows / 2, rows - 1], &[3]), 0)
+            .unwrap()
+    };
+    let packed = take(weight);
+    let scales = take(weights.require(&format!("{key}.scales")).unwrap());
+    let biases = take(weights.require(&format!("{key}.biases")).unwrap());
+    let words = packed.as_slice::<u32>();
+    let scales_f32 = scales.as_dtype(Dtype::Float32).unwrap();
+    let biases_f32 = biases.as_dtype(Dtype::Float32).unwrap();
+    let scales_fp32 = scales_f32.as_slice::<f32>();
+    let biases_fp32 = biases_f32.as_slice::<f32>();
+    let bits = spec.bits as usize;
+    let per_word = 32 / bits;
+    let group = spec.group_size as usize;
+    let width = scales.shape()[1] as usize * group;
+    let columns = [
+        0,
+        1,
+        per_word - 1,
+        per_word,
+        group - 1,
+        group,
+        width / 2 + 1,
+        width - 1,
+    ];
+    let mut inputs = vec![0f32; (columns.len() + 1) * width];
+    for (i, &column) in columns.iter().enumerate() {
+        inputs[i * width + column] = 1.;
+        inputs[columns.len() * width + column] = if i % 2 == 0 { 0.5 } else { -1. };
+    }
+    let projection =
+        Projection::from_quantized(packed.clone(), scales, biases, spec, Dtype::Bfloat16).unwrap();
+    let x = Array::from_slice(&inputs, &[(columns.len() + 1) as i32, width as i32])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let native = projection
+        .forward(&x)
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let outputs = native.as_slice::<f32>();
+    let mut max_error = 0f32;
+    for (i, input) in inputs.chunks_exact(width).enumerate() {
+        for row in 0..3 {
+            let mut reference = 0.;
+            let mut magnitude = 0.;
+            for &column in &columns {
+                let word = words[(row * width + column) / per_word];
+                let code = ((word >> ((column % per_word) * bits)) & ((1 << bits) - 1)) as f32;
+                let g = (row * width + column) / group;
+                let scaled = code * scales_fp32[g];
+                let bias = biases_fp32[g];
+                reference += input[column] * (scaled + bias);
+                magnitude += input[column].abs() * (scaled.abs() + bias.abs());
+            }
+            // Two BF16 ULPs on the contributing terms allow native dequantization
+            // and the BF16 result cast, including cancellation near zero.
+            let tolerance = magnitude * (2.0 / 128.0) + f32::EPSILON;
+            let error = (outputs[3 * i + row] - reference).abs();
+            assert!(
+                error <= tolerance,
+                "Q{bits} {key} input {i} row {row}: {error} > {tolerance}"
+            );
+            max_error = max_error.max(error);
+        }
+    }
+    println!(
+        "\nSENSENOVA_LOOP_PROJECTION {}",
+        json!({"bits":bits,"projection":key,"rows":3,"inputs":columns.len()+1,"max_abs_error":max_error})
+    );
+}
+
 fn forced_scores(dir: &Path, tier: &str, cases: &[Case]) {
     let config: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -307,6 +444,9 @@ fn forced_scores(dir: &Path, tier: &str, cases: &[Case]) {
             _ => None,
         }
     );
+    if let Some(spec) = cfg.quantization {
+        check_packed_projection(&weights, spec);
+    }
     let model = Qwen35Model::build_lazy(&weights, "model.language_model", cfg, None).unwrap();
     weights.materialize_groups(&model.param_groups()).unwrap();
     let tower = Qwen35VisionModel::from_sensenova_weights(
@@ -327,6 +467,26 @@ fn forced_scores(dir: &Path, tier: &str, cases: &[Case]) {
                     pixels.height as usize,
                 )
                 .unwrap();
+            assert_eq!(case.image_grid_thw.as_deref(), Some(grid.as_slice()));
+            let tolerance = if case.id == "quadrants" { 0.02 } else { 1e-5 };
+            assert_eq!(case.image_processor_sample_abs_tolerance, Some(tolerance));
+            assert!(!case.image_processor_samples.is_empty());
+            let [rows, width] = patches.shape() else {
+                panic!("expected a matrix of image patches")
+            };
+            let actual = patches.as_slice::<f32>();
+            for sample in &case.image_processor_samples {
+                assert!(sample.patch < *rows as usize && sample.offset < *width as usize);
+                let value = actual[sample.patch * *width as usize + sample.offset];
+                assert!(
+                    (value - sample.value).abs() <= tolerance,
+                    "{tier}/{} patch {} offset {}: {value} vs {}",
+                    case.id,
+                    sample.patch,
+                    sample.offset,
+                    sample.value
+                );
+            }
             let features = tower.forward(&patches, &grid).unwrap();
             Visual { features, grid }
         });
@@ -341,6 +501,21 @@ fn forced_scores(dir: &Path, tier: &str, cases: &[Case]) {
             assert_eq!(kv, vec![(Dtype::Bfloat16, Dtype::Bfloat16); 14]);
             assert!(cache.recurrent_bytes() > 0);
             let reference_error = centered_error(&actual, &step.logits);
+            if let Some(score) = &step.semantic_score {
+                let source = score.margin(&step.token_ids, &step.logits);
+                assert!(source > 0.);
+                assert_eq!(source, score.source_positive_margin);
+                let margin = score.margin(&step.token_ids, &actual);
+                assert!(
+                    margin > 0.,
+                    "{tier}/{} step {i}: semantic margin {margin}",
+                    case.id
+                );
+                println!(
+                    "\nSENSENOVA_LOOP_SEMANTIC {}",
+                    json!({"tier":tier.to_ascii_lowercase(),"case_id":case.id,"step":i,"margin":margin})
+                );
+            }
             let mut cold = model.new_cache();
             let cold_logits = prefill(&model, &ids, image.as_ref(), &mut cold).0;
             let cold_error = centered_error(&actual, &selected(&cold_logits, &step.token_ids));
@@ -379,14 +554,34 @@ fn forced_scores(dir: &Path, tier: &str, cases: &[Case]) {
 fn sensenova_loop_release_proof() {
     let path = std::env::var_os("SENSENOVA_LOOP_ORACLE").expect("SENSENOVA_LOOP_ORACLE");
     let bytes = std::fs::read(path).unwrap();
-    println!("SENSENOVA_LOOP_ORACLE_SHA256 {:x}", Sha256::digest(&bytes));
+    println!(
+        "\nSENSENOVA_LOOP_ORACLE_SHA256 {:x}",
+        Sha256::digest(&bytes)
+    );
     let oracle: Oracle = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(oracle.schema_version, 1);
     assert_eq!(oracle.hf_revision, core_llm::sensenova_loop::MODEL_REVISION);
     assert_eq!(oracle.source_inventory_sha256.len(), 64);
     let mut cases: Vec<_> = oracle.cases.iter().map(|c| c.id.as_str()).collect();
     cases.sort_unstable();
-    assert_eq!(cases, ["blue", "red", "text"]);
+    assert_eq!(cases, ["blue", "quadrants", "red", "text"]);
+    let image = oracle
+        .cases
+        .iter()
+        .find(|c| c.id == "quadrants")
+        .unwrap()
+        .image
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        (image.width, image.height, image.split_x, image.split_y),
+        (353, 249, Some(209), Some(155))
+    );
+    assert_eq!(image.rgb, [205, 35, 35]);
+    assert_eq!(
+        image.quadrants.unwrap(),
+        [[205, 35, 35], [35, 70, 200], [36, 174, 47], [232, 190, 40]]
+    );
     assert!(matches!(
         mlx_rs::Stream::task_local_or_default()
             .get_device()

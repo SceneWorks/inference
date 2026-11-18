@@ -46,8 +46,17 @@ pub fn validate_sidecars(root: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify the 11 source shards before assigning the frozen revision to a derived tier.
+/// Authenticate the target-only weight map for the pinned BF16 release.
+pub fn validate_source_index(root: &std::path::Path) -> Result<(), String> {
+    verify_digest(
+        &root.join("model.safetensors.index.json"),
+        "a478440d3817d761ef6a8088f063131e02197b0d8699262165d4626c5d577510",
+    )
+}
+
+/// Verify the immutable index and every indexed shard before using the BF16 target.
 pub fn validate_source_shards(root: &std::path::Path) -> Result<(), String> {
+    validate_source_index(root)?;
     for &(name, expected) in TARGET_SHARDS {
         verify_digest(&root.join(name), expected)?;
     }
@@ -64,6 +73,30 @@ fn verify_digest(path: &std::path::Path, expected: &str) -> Result<(), String> {
     let actual = format!("{:x}", digest.finalize());
     if actual != expected {
         return Err(format!("SenseNova-Loop-9B: {} SHA-256 {actual} differs from release {MODEL_REVISION} ({expected})", path.display()));
+    }
+    Ok(())
+}
+
+/// Apply the release template's typed content rules before a backend substitutes media tokens.
+pub fn validate_messages(messages: &[crate::Message]) -> Result<(), String> {
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != crate::Role::System {
+            continue;
+        }
+        if index != 0 {
+            return Err("System message must be at the beginning.".into());
+        }
+        for block in &message.content {
+            match block {
+                crate::Content::Image(_) => {
+                    return Err("System message cannot contain images.".into())
+                }
+                crate::Content::Video(_) => {
+                    return Err("System message cannot contain videos.".into())
+                }
+                _ => {}
+            }
+        }
     }
     Ok(())
 }
@@ -174,6 +207,44 @@ fn release_config() -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rejects_missing_or_forged_source_index() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = validate_source_shards(root.path()).unwrap_err();
+        assert!(missing.contains("model.safetensors.index.json"));
+        std::fs::write(root.path().join("model.safetensors.index.json"), b"{}").unwrap();
+        assert!(validate_source_shards(root.path())
+            .unwrap_err()
+            .contains("SHA-256"));
+    }
+
+    #[test]
+    fn preserves_template_system_media_errors() {
+        let image = crate::ImageRef::new(1, 1, vec![0; 3]).unwrap();
+        let video = crate::VideoRef::new(vec![image.clone()], vec![0.]).unwrap();
+        for (content, error) in [
+            (
+                crate::Content::Image(image),
+                "System message cannot contain images.",
+            ),
+            (
+                crate::Content::Video(video),
+                "System message cannot contain videos.",
+            ),
+        ] {
+            let mut system = crate::Message::system("instructions");
+            assert!(validate_messages(&[system.clone()]).is_ok());
+            system.content.push(content);
+            assert_eq!(validate_messages(&[system.clone()]), Err(error.into()));
+            assert_eq!(
+                validate_messages(&[crate::Message::user("question"), system.clone()]),
+                Err("System message must be at the beginning.".into())
+            );
+            system.role = crate::Role::User;
+            assert!(validate_messages(&[system]).is_ok());
+        }
+    }
 
     #[test]
     fn release_visits_and_yarn() {

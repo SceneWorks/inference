@@ -3201,6 +3201,10 @@ impl TextLlm for LlamaProvider {
     }
 
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
+        if self.descriptor.family == "sensenova_loop" {
+            core_llm::sensenova_loop::validate_messages(&req.messages)
+                .map_err(CoreError::InvalidRequest)?;
+        }
         self.descriptor
             .capabilities
             .validate_request(&self.descriptor.id, req)
@@ -6088,7 +6092,7 @@ fn can_load_value(v: &serde_json::Value) -> bool {
     if v.get("vision_config").is_some() && crate::joycaption::can_load_value(v) {
         return false;
     }
-    Architecture::from_config(v).is_ok()
+    Architecture::from_config(v).is_ok() && crate::sensenova_snapshot::tier(v).is_ok()
 }
 
 /// **Weightless** per-snapshot vision probe (sc-8077): does `mlx-llama` serve the snapshot at
