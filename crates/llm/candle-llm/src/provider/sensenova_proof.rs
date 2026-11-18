@@ -2,6 +2,17 @@
 //! tokenizer, image encoder, splice, positions and decoder. Manual proof only.
 use super::*;
 
+/// Build the same U32 embedding indices as generation. An out-of-vocabulary
+/// oracle token must fail before it reaches a device gather.
+fn proof_token_indices(ids: &[i32], vocab_size: i32, device: &Device) -> crate::Result<Tensor> {
+    if let Some(id) = ids.iter().copied().find(|id| !(0..vocab_size).contains(id)) {
+        return Err(crate::Error::Msg(format!(
+            "SenseNova proof token {id} is outside vocabulary 0..{vocab_size}"
+        )));
+    }
+    input_ids(ids, device)
+}
+
 impl LlamaProvider {
     /// Actual expanded prompt and last-position logits at prefill and each
     /// forced continuation. Each row is paired with a fresh all-token prefill.
@@ -48,7 +59,7 @@ impl LlamaProvider {
         };
         let prompt_ids = prepared.as_ref().map_or(ids, |p| p.expanded_ids.clone());
         let n = prompt_ids.len();
-        let input = |ids: &[i32]| Tensor::from_slice(ids, (1, ids.len()), device);
+        let input = |ids: &[i32]| proof_token_indices(ids, model.config().vocab_size, device);
         let mut cache = model.new_static_cache(n + forced.len() + 1, 0)?;
         let mut embeds = if let Some(p) = &prepared {
             p.embeds.clone()
@@ -112,5 +123,29 @@ impl LlamaProvider {
             rows.push((host(&logits)?, host(&cold)?));
         }
         Ok((prompt_ids, rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensenova_proof_uses_cuda_compatible_indices_for_prompt_and_forced_token() {
+        // Only build indices. Their dtype is independent of which device owns
+        // the storage and CUDA's index_select explicitly rejects I32 storage.
+        let vocab_size = 248_320;
+        for ids in [&[248_045, 17, 248_046][..], &[248_319][..]] {
+            let indices = proof_token_indices(ids, vocab_size, &Device::Cpu).unwrap();
+            assert_eq!(indices.dtype(), DType::U32);
+            assert_eq!(indices.dims(), &[1, ids.len()]);
+            assert_eq!(
+                indices.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+                ids.iter().map(|&id| id as u32).collect::<Vec<_>>()
+            );
+        }
+        for id in [-1, vocab_size] {
+            assert!(proof_token_indices(&[id], vocab_size, &Device::Cpu).is_err());
+        }
     }
 }

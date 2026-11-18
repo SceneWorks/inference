@@ -215,9 +215,14 @@ fn sensenova_loop_release_proof() {
             assert_eq!(steps.len(), 3);
             let forced: Vec<_> = steps[..2]
                 .iter()
-                .map(|s| s["token_id"].as_i64().unwrap() as i32)
+                .map(|s| {
+                    i32::try_from(s["token_id"].as_u64().unwrap())
+                        .expect("oracle token must fit i32")
+                })
                 .collect();
-            let (ids, rows) = model.sensenova_proof_logits(&req, &forced).unwrap();
+            let (ids, rows) = model
+                .sensenova_proof_logits(&req, &forced)
+                .unwrap_or_else(|error| panic!("{tier}/{id} teacher-forced scoring: {error}"));
             assert_eq!(
                 ids,
                 serde_json::from_value::<Vec<i32>>(case["input_ids"].clone()).unwrap()
