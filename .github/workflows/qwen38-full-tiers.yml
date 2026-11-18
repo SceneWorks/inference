@@ -1,0 +1,248 @@
+name: Qwen3.8-27B full tiers (convert and publish)
+
+# SW-7202 (feature SW-F374). Dispatch-only: never part of PR or push CI, and it runs no model. One
+# dispatch converts ONE model's fully quantized tiers on ONE backend with SW-7201's
+# `prepare_snapshot` recipes `q8-full` / `q4-full` and publishes them to the SceneWorks re-host:
+#
+# * model `describer`: huihui-ai/Huihui-Qwen3.8-27B-abliterated @739e3c5b (bf16) to
+#   SceneWorks/qwen3.8-27b-abliterated-mlx (backend mlx) or -candle (backend candle),
+#   folders `q8-full/` and `q4-full/`;
+# * model `expander`: MiniMaxAI/MiniMax-H3-Image-PE @35603d4b (NVFP4, dequantized to a bf16 scratch
+#   intermediate on the CPU) to SceneWorks/minimax-h3-image-pe, folders `q8-full/` / `q4-full/`
+#   (mlx) or `candle-q8-full/` / `candle-q4-full/` (candle).
+#
+# The plain `q8/` / `q4/` (`candle-q8/` / `candle-q4/`) folders are left untouched, so installs
+# pinned to earlier revisions keep working. Each tier folder carries SOURCE_REVISION.json and a
+# README naming the source revision, the recipe and this run's inference SHA. The publication
+# report (artifact `qwen38-full-tiers-<model>-<backend>`) holds the resulting commit and every file's
+# size and sha256: the SceneWorks manifest pins are filled from it.
+#
+# MLX runs on the Mac the `mac_runner` input names, and the job refuses any other runner name before
+# doing any work. `nax-macos` (label `rw-starvector`, Michael's dev Mac) is the default ONLY while
+# nax-macos-2's model disk is full: Michael approved that loan for SW-7202 on 2026-11-18. Its
+# task-owned weights root is on /Volumes/Models (~1.4 TB free), never the internal disk. Switch the
+# default back to `nax-macos-2` (`rw-llm`, weights root under $HOME) once its new drive is fitted. Candle conversion is CPU-only on the
+# Windows CUDA real-weights box. Uploads use the runner's own Hugging Face login, as the SW-7104
+# publication lanes do. Each job checks free disk before every write and removes only its own
+# run-scoped scratch. `publish: false` converts and reports sizes without uploading.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: describer (Qwen3.8-27B abliterated) or expander (MiniMax-H3-Image-PE)
+        required: true
+        type: choice
+        options: [describer, expander]
+      backend:
+        description: mlx (the Mac `mac_runner` names) or candle (Windows CUDA real-weights box, CPU conversion)
+        required: true
+        type: choice
+        options: [mlx, candle]
+      mac_runner:
+        description: MLX runner. nax-macos (dev Mac, approved loan while nax-macos-2's disk is full) or nax-macos-2
+        required: true
+        type: choice
+        options: [nax-macos, nax-macos-2]
+        default: nax-macos
+      publish:
+        description: Upload the converted tiers to the SceneWorks re-host
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx:
+    name: Convert and publish the ${{ inputs.model }} MLX full tiers
+    if: inputs.backend == 'mlx'
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"]
+    timeout-minutes: 720
+    # One writer per box: the conversion and the upload share its disk.
+    concurrency:
+      group: qwen38-full-tiers-mlx
+      cancel-in-progress: false
+    env:
+      QWEN38_FULL_TIERS_MODEL: ${{ inputs.model }}
+      MAC_RUNNER: ${{ inputs.mac_runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Refuse any runner but the selected Mac
+        run: |
+          echo "runner: $RUNNER_NAME (selected: $MAC_RUNNER)"
+          [[ "$RUNNER_NAME" == "$MAC_RUNNER" ]] || { echo "::error::this run selected $MAC_RUNNER but landed on $RUNNER_NAME; nothing was started"; exit 1; }
+      - name: Prepare the run
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          if [[ "${{ inputs.publish }}" == true ]]; then
+            PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 -c 'from huggingface_hub import HfApi; n = HfApi().whoami().get("name"); assert n, "no Hugging Face login on this runner"; print("Hugging Face identity:", n)'
+          fi
+          # nax-macos keeps model data on /Volumes/Models; nax-macos-2 under $HOME.
+          if [[ "$MAC_RUNNER" == nax-macos ]]; then
+            [[ -d /Volumes/Models && -w /Volumes/Models ]] || { echo "::error::/Volumes/Models is not a writable volume on $RUNNER_NAME"; exit 1; }
+            lane_root="/Volumes/Models/sceneworks-rw-weights"
+          else
+            lane_root="$HOME/sceneworks-rw-weights"
+          fi
+          if [[ -L "$lane_root" ]]; then
+            echo "task-owned weights root must be an internal directory: $lane_root" >&2; exit 1
+          fi
+          mkdir -p "$lane_root/hub"
+          python3.12 scripts/ci/qwen21_weights_root.py "$lane_root"
+          scratch="$lane_root/sw-7202-full-tiers-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf "$scratch"
+          mkdir -p "$scratch" "$RUNNER_TEMP/qwen38-full-tiers-reports"
+          df -h "$lane_root"
+          {
+            echo "LANE_HUB=$lane_root/hub"
+            echo "LANE_ROOT=$lane_root"
+            echo "PUBLISH_SCRATCH=$scratch"
+            echo "PUBLISH_REPORTS=$RUNNER_TEMP/qwen38-full-tiers-reports"
+            echo "PYTHONPATH=$RUNNER_TEMP/huggingface-hub"
+            echo "HF_HUB_DISABLE_XET=1"
+          } >> "$GITHUB_ENV"
+      - name: Set up the MLX build environment
+        run: |
+          source scripts/ci/real-weights/mlx-minimax-h3-image-publish/set-up-the-mlx-build-environment.sh
+          # The release target (tens of GB) lives in this run's scratch on the weights volume, not
+          # the runner's internal disk; it is removed with the scratch.
+          mkdir -p "$PUBLISH_SCRATCH/cargo-target"
+          echo "CARGO_TARGET_DIR=$PUBLISH_SCRATCH/cargo-target" >> "$GITHUB_ENV"
+      - name: Build the converters
+        run: |
+          cargo build --locked --release -p mlx-llm --example prepare_snapshot
+          if [[ "$QWEN38_FULL_TIERS_MODEL" == expander ]]; then
+            cargo build --locked --release -p candle-llm --example modelopt_nvfp4_to_bf16
+          fi
+      - name: Materialize the pinned source
+        run: |
+          # The describer source is QWEN38_DESCRIBER_BF16_SNAPSHOT (~55.6 GB bf16); the expander
+          # source is MINIMAX_PE_SNAPSHOT (~17.9 GB NVFP4). Both land in the task-owned hub.
+          if [[ "$QWEN38_FULL_TIERS_MODEL" == describer ]]; then
+            python3.12 scripts/ci/qwen38_full_tiers.py materialize --model describer --hub "$LANE_HUB" --env-name QWEN38_DESCRIBER_BF16_SNAPSHOT --need-gb 56
+          else
+            python3.12 scripts/ci/qwen38_full_tiers.py materialize --model expander --hub "$LANE_HUB" --env-name MINIMAX_PE_SNAPSHOT --need-gb 18
+          fi
+      - name: Require disk headroom for the tiers
+        run: |
+          # q8-full ~30 GB + q4-full ~18 GB; the expander also writes its 54.7 GB bf16 intermediate.
+          need=$([[ "$QWEN38_FULL_TIERS_MODEL" == expander ]] && echo 105 || echo 50)
+          python3.12 scripts/ci/qwen38_full_tiers.py headroom --path "$PUBLISH_SCRATCH" --need-gb "$need"
+      - name: Convert the q8-full and q4-full tiers
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
+        run: python3.12 scripts/ci/qwen38_full_tiers.py convert --model "$QWEN38_FULL_TIERS_MODEL" --backend mlx --scratch "$PUBLISH_SCRATCH" --bin-dir "$CARGO_TARGET_DIR/release/examples"
+      - name: Publish the tiers
+        if: inputs.publish
+        run: python3.12 scripts/ci/qwen38_full_tiers.py publish --model "$QWEN38_FULL_TIERS_MODEL" --backend mlx --scratch "$PUBLISH_SCRATCH" --reports "$PUBLISH_REPORTS"
+      - name: Keep the publication report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-full-tiers-${{ inputs.model }}-mlx
+          path: ${{ runner.temp }}/qwen38-full-tiers-reports
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Remove this run's scratch
+        if: always()
+        run: |
+          if [[ -n "${PUBLISH_SCRATCH:-}" && "$PUBLISH_SCRATCH" == */sw-7202-full-tiers-* ]]; then
+            rm -rf "$PUBLISH_SCRATCH"
+          fi
+
+  candle:
+    name: Convert and publish the ${{ inputs.model }} Candle full tiers
+    if: inputs.backend == 'candle'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 720
+    concurrency:
+      group: qwen38-full-tiers-candle
+      cancel-in-progress: false
+    env:
+      QWEN38_FULL_TIERS_MODEL: ${{ inputs.model }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      PUBLISH_SCRATCH: D:\sceneworks-terminal\weights\sw-7202-full-tiers-${{ github.run_id }}-${{ github.run_attempt }}
+      HF_HUB_DISABLE_XET: "1"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Prepare the run
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          >>"%GITHUB_ENV%" echo PYTHONPATH=%RUNNER_TEMP%\huggingface-hub
+          set "PUBLISH_REPORTS=%RUNNER_TEMP%\qwen38-full-tiers-reports"
+          >>"%GITHUB_ENV%" echo PUBLISH_REPORTS=%PUBLISH_REPORTS%
+          if "${{ inputs.publish }}"=="true" (
+            set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+            "%REVIEWED_PYTHON%" -c "from huggingface_hub import HfApi; n = HfApi().whoami().get('name'); assert n, 'no Hugging Face login on this runner'; print('Hugging Face identity:', n)" || exit /b 1
+          )
+          if exist "%PUBLISH_SCRATCH%" rmdir /s /q "%PUBLISH_SCRATCH%"
+          mkdir "%PUBLISH_SCRATCH%" || exit /b 1
+          if exist "%PUBLISH_REPORTS%" rmdir /s /q "%PUBLISH_REPORTS%"
+          mkdir "%PUBLISH_REPORTS%" || exit /b 1
+      - uses: ./.github/actions/setup-rust
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Build the converters
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo build --locked --release -p candle-llm --example prepare_snapshot --example modelopt_nvfp4_to_bf16 || exit /b 1
+      - name: Materialize the pinned source
+        shell: cmd
+        run: |
+          rem The describer source is QWEN38_DESCRIBER_BF16_SNAPSHOT (~55.6 GB bf16); the expander
+          rem source is MINIMAX_PE_SNAPSHOT (~17.9 GB NVFP4). Both land in the runner's hub.
+          if "%QWEN38_FULL_TIERS_MODEL%"=="describer" (
+            "%REVIEWED_PYTHON%" scripts\ci\qwen38_full_tiers.py materialize --model describer --hub "%CANDLE_GEN_MODELS_ROOT%" --env-name QWEN38_DESCRIBER_BF16_SNAPSHOT --need-gb 56 || exit /b 1
+          ) else (
+            "%REVIEWED_PYTHON%" scripts\ci\qwen38_full_tiers.py materialize --model expander --hub "%CANDLE_GEN_MODELS_ROOT%" --env-name MINIMAX_PE_SNAPSHOT --need-gb 18 || exit /b 1
+          )
+      - name: Require disk headroom for the tiers
+        shell: cmd
+        run: |
+          rem q8-full ~31 GB + q4-full ~18 GB; the expander also writes its 54.7 GB bf16 intermediate.
+          set NEED=50
+          if "%QWEN38_FULL_TIERS_MODEL%"=="expander" set NEED=105
+          "%REVIEWED_PYTHON%" scripts\ci\qwen38_full_tiers.py headroom --path "%PUBLISH_SCRATCH%" --need-gb %NEED% || exit /b 1
+      - name: Convert the q8-full and q4-full tiers
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts\ci\qwen38_full_tiers.py convert --model %QWEN38_FULL_TIERS_MODEL% --backend candle --scratch "%PUBLISH_SCRATCH%" --bin-dir "%CARGO_TARGET_DIR%\release\examples"'
+      - name: Publish the tiers
+        if: inputs.publish
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts\ci\qwen38_full_tiers.py publish --model %QWEN38_FULL_TIERS_MODEL% --backend candle --scratch "%PUBLISH_SCRATCH%" --reports "%PUBLISH_REPORTS%"'
+      - name: Keep the publication report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen38-full-tiers-${{ inputs.model }}-candle
+          path: ${{ runner.temp }}\qwen38-full-tiers-reports
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Remove this run's scratch
+        if: always()
+        shell: cmd
+        run: if exist "%PUBLISH_SCRATCH%" rmdir /s /q "%PUBLISH_SCRATCH%"
