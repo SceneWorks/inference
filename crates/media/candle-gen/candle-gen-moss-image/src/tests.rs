@@ -124,6 +124,15 @@ fn descriptors_keep_acceleration_explicit() {
         assert!(descriptor.capabilities.supports_lora);
         assert!(descriptor.capabilities.supports_lokr);
         assert!(descriptor.capabilities.supports_prompt_batch);
+        assert!(descriptor.capabilities.supports_sequential_offload);
+        assert_eq!(
+            descriptor.capabilities.pag,
+            Some(moss_image_pag_capability())
+        );
+        let pag_cap = descriptor.capabilities.pag.as_ref().unwrap();
+        assert_eq!(pag_cap.num_blocks, 42);
+        assert_eq!(pag_cap.default_layers, vec![20]);
+        assert!(candle_gen::gen_core::registry::model_descriptor_errors(&descriptor).is_empty());
     }
     let request = GenerationRequest {
         steps: Some(8),
@@ -135,6 +144,27 @@ fn descriptors_keep_acceleration_explicit() {
             .acceleration,
         MossImageAcceleration::Off
     );
+    let pag_zero = GenerationRequest {
+        pag: Some(candle_gen::gen_core::pag::PagConfig {
+            scale: 0.0,
+            layers: Some(vec![20]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(MossImageResolved::resolve(MossImageVariant::Sft, &pag_zero)
+        .unwrap()
+        .pag
+        .is_none());
+    let pag_invalid = GenerationRequest {
+        pag: Some(candle_gen::gen_core::pag::PagConfig {
+            scale: 2.0,
+            layers: Some(vec![42]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(MossImageResolved::resolve(MossImageVariant::Sft, &pag_invalid).is_err());
 }
 
 #[test]
@@ -1203,6 +1233,36 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     report.references.reverse();
     report.validate().unwrap();
     assert_eq!(report.references[0], slots[3]);
+    let resolved_pag = candle_gen::gen_core::pag::resolve_pag(
+        Some(&moss_image_pag_capability()),
+        "moss_image_sft",
+        Some(&candle_gen::gen_core::pag::PagConfig {
+            scale: 2.25,
+            stop: Some(0.75),
+            ..Default::default()
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let active_pag = resolved_pag.execution_report(report.base.data().resolved.steps);
+    let mut pag_base = report.base.data().clone();
+    pag_base.pag = Some(active_pag.clone());
+    assert!(
+        MossImageExecutionReport::new(pag_base.clone()).is_err(),
+        "receipt pag report without matching resolved.pag must fail validation"
+    );
+    pag_base.resolved.pag = Some(resolved_pag);
+    let mut pag_edit = report.clone();
+    pag_edit.base = MossImageExecutionReport::new(pag_base).unwrap();
+    assert!(
+        pag_edit.validate().is_err(),
+        "mismatched base/edit pag reports must fail validation"
+    );
+    pag_edit.pag = Some(active_pag);
+    pag_edit.validate().unwrap();
+    let roundtrip_pag: MossImageEditExecutionReport =
+        serde_json::from_value(serde_json::to_value(&pag_edit).unwrap()).unwrap();
+    assert_eq!(roundtrip_pag, pag_edit);
     let generator = synthetic_generator();
     // A valid sealed ordinary receipt remains empty even with custom provider reports.
     assert!(report.base.data().adapter_reports.is_empty());

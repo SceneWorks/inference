@@ -336,6 +336,7 @@ fn reference_latent(vae: &Flux2Vae, image: &Tensor, cancel: &CancelFlag) -> Resu
     Ok(latent)
 }
 /// Source CFG and Euler use FP32 even when network predictions are BF16.
+#[cfg(test)]
 fn cfg_euler_step(
     current: &Tensor,
     conditional: &Tensor,
@@ -343,10 +344,34 @@ fn cfg_euler_step(
     guidance: f32,
     delta: f32,
 ) -> Result<Tensor> {
-    let mut prediction = conditional.to_dtype(DType::F32)?;
+    cfg_pag_euler_step(
+        current,
+        conditional,
+        unconditional,
+        None,
+        guidance,
+        0.0,
+        delta,
+    )
+}
+fn cfg_pag_euler_step(
+    current: &Tensor,
+    conditional: &Tensor,
+    unconditional: Option<&Tensor>,
+    perturbed: Option<&Tensor>,
+    guidance: f32,
+    pag_scale: f32,
+    delta: f32,
+) -> Result<Tensor> {
+    let cond_f32 = conditional.to_dtype(DType::F32)?;
+    let mut prediction = cond_f32.clone();
     if let Some(negative) = unconditional {
         let negative = negative.to_dtype(DType::F32)?;
         prediction = negative.add(&((&prediction - &negative)? * f64::from(guidance))?)?;
+    }
+    if let Some(perturbed) = perturbed.filter(|_| pag_scale > 0.0) {
+        let perturbed = perturbed.to_dtype(DType::F32)?;
+        prediction = prediction.add(&((&cond_f32 - &perturbed)? * f64::from(pag_scale))?)?;
     }
     Ok(current
         .to_dtype(DType::F32)?
@@ -385,15 +410,22 @@ impl EditSampling<'_> {
             self.resolved.shift,
             self.resolved.training_shift,
         )?;
+        let total_steps = sigmas.len() - 1;
         let mut latents = noise.to_dtype(DType::F32)?;
         for (index, pair) in sigmas.windows(2).enumerate() {
+            let pag_scale = self.resolved.pag_step_scale(index, total_steps);
+            let pag_layers = self
+                .resolved
+                .pag
+                .as_ref()
+                .map_or(&[][..], |pag| pag.step_layers(index, total_steps));
             let mut outputs = Vec::new();
             for sample in 0..latents.dim(0)? {
                 check(cancel)?;
                 let row = sample / self.images_per_prompt;
                 let current = latents.narrow(0, sample, 1)?;
-                let predict = |context: &Tensor| {
-                    self.transformer.forward_edit(
+                let predict = |context: &Tensor, layers: &[u32]| {
+                    self.transformer.forward_edit_with_pag(
                         &current,
                         pair[0],
                         crate::transformer::EditConditioning {
@@ -401,20 +433,28 @@ impl EditSampling<'_> {
                             references: self.references,
                             cache: cache.as_ref(),
                         },
+                        layers,
                         cancel,
                     )
                 };
-                let prediction = predict(&self.positive[row])?;
+                let prediction = predict(&self.positive[row], &[])?;
                 let negative = if self.resolved.guidance != 1. {
-                    Some(predict(&self.negative[row])?)
+                    Some(predict(&self.negative[row], &[])?)
                 } else {
                     None
                 };
-                let next = cfg_euler_step(
+                let perturbed = if pag_scale > 0.0 {
+                    Some(predict(&self.positive[row], pag_layers)?)
+                } else {
+                    None
+                };
+                let next = cfg_pag_euler_step(
                     &current,
                     &prediction,
                     negative.as_ref(),
+                    perturbed.as_ref(),
                     self.resolved.guidance,
+                    pag_scale,
                     pair[1] - pair[0],
                 )?;
                 #[cfg(test)]
@@ -439,7 +479,7 @@ impl EditSampling<'_> {
             check(cancel)?;
             progress(Progress::Step {
                 current: index as u32 + 1,
-                total: sigmas.len() as u32 - 1,
+                total: total_steps as u32,
             });
         }
         check(cancel)?;
