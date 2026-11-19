@@ -57,9 +57,9 @@ def install(root, backend, arm, tier):
 }
 """
     else:
-        start = "let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {\n        if cancel.is_cancelled()"
-        replace_once(root, path, start, start.replace("        if cancel.", "        pair_observe(x, sigma);\n        if cancel."))
         if arm == "head":
+            start = "let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {\n                if cancel.is_cancelled()"
+            replace_once(root, path, start, start.replace("                if cancel.", "                pair_observe(x, sigma);\n                if cancel."))
             end = '''    if state.next_step() != sigmas.len().saturating_sub(1) {
         return Err(CandleError::from(gen_core::Error::Unsupported(
             "sampler spans do not cover the executed schedule".into(),
@@ -69,6 +69,8 @@ def install(root, backend, arm, tier):
 }'''
             replace_once(root, path, end, end.replace("    Ok(out)", "    pair_observe(&out, 0.0);\n    Ok(out)"))
         else:
+            start = "let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {\n        if cancel.is_cancelled()"
+            replace_once(root, path, start, start.replace("        if cancel.", "        pair_observe(x, sigma);\n        if cancel."))
             end = """    sampler
         .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(CandleError::from)

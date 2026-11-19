@@ -231,7 +231,7 @@ fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<Var
 /// Resize `image` to `width`×`height` and convert to an NCHW `[1, 3, H, W]` tensor in `[-1, 1]` at
 /// `dtype` on `device` — the VAE-encode input for the control image (the same normalization the noise
 /// path uses for decode).
-fn preprocess_control(
+pub(crate) fn preprocess_control(
     image: &Image,
     width: u32,
     height: u32,
@@ -336,7 +336,7 @@ fn validate_control_spec(
     Ok(())
 }
 
-fn control_descriptor() -> ModelDescriptor {
+pub(crate) fn control_descriptor() -> ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
     crate::add_conditioned_native_aliases(&mut descriptor);
     descriptor.id = "flux1_dev_control";
@@ -355,7 +355,26 @@ fn control_descriptor() -> ModelDescriptor {
     ]));
     descriptor.capabilities.conditioning = vec![candle_gen::gen_core::ConditioningKind::Control];
     descriptor.capabilities.max_count = 1;
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
+}
+
+pub(crate) fn compile_control_feature_route(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> candle_gen::gen_core::Result<Option<RenderPlan>> {
+    let descriptor = control_descriptor();
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if !matches!(req.conditioning.as_slice(), [Conditioning::Control { .. }])
+        || spec.control.is_none()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "flux1_dev_control requires a Control conditioning input and control weights".into(),
+        ));
+    }
+    crate::compile_conditioned_plan(Variant::Dev, &descriptor, spec, req).map(Some)
 }
 
 fn typed_control_request(

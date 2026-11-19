@@ -265,6 +265,7 @@ pub struct MlxRequestScopeCore {
     cleanup: CleanupAction,
     state: LifecycleState,
     decode_authorization_armed: bool,
+    recorded_render_phases: Vec<(MemoryPhase, crate::gen_core::render::RenderPhaseIdentity)>,
 }
 
 impl MlxRequestScopeCore {
@@ -292,7 +293,15 @@ impl MlxRequestScopeCore {
             cleanup,
             state: LifecycleState::Active,
             decode_authorization_armed: false,
+            recorded_render_phases: Vec::new(),
         }
+    }
+
+    /// Recorded `(MemoryPhase, RenderPhaseIdentity)` entries observed by this scope (`MEM-5`).
+    pub fn recorded_render_phases(
+        &self,
+    ) -> &[(MemoryPhase, crate::gen_core::render::RenderPhaseIdentity)] {
+        &self.recorded_render_phases
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -341,6 +350,41 @@ impl MlxRequestScopeCore {
             self.config.geometry.frames,
             self.config.geometry.reference_count
         )))
+    }
+
+    fn validate_render_phase_geometry(
+        &self,
+        phase: MemoryPhase,
+        geometry: MemoryGeometry,
+    ) -> Result<()> {
+        if phase == MemoryPhase::Denoise {
+            if geometry.width > 0
+                && geometry.width <= self.config.geometry.width
+                && geometry.height > 0
+                && geometry.height <= self.config.geometry.height
+                && geometry.frames == self.config.geometry.frames
+                && geometry.reference_count == self.config.geometry.reference_count
+                && geometry.batch > 0
+                && geometry.batch <= self.config.geometry.batch
+            {
+                return Ok(());
+            }
+            return Err(Error::Unsupported(format!(
+                "{}: denoise phase geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
+                self.config.provider_id,
+                geometry.width,
+                geometry.height,
+                geometry.batch,
+                geometry.frames,
+                geometry.reference_count,
+                self.config.geometry.width,
+                self.config.geometry.height,
+                self.config.geometry.batch,
+                self.config.geometry.frames,
+                self.config.geometry.reference_count
+            )));
+        }
+        self.validate_geometry(geometry)
     }
 }
 
@@ -444,7 +488,8 @@ impl MemoryRequestScope for MlxRequestScopeCore {
         phase: MemoryPhase,
         identity: &gen_core::render::RenderPhaseIdentity,
     ) -> Result<()> {
-        self.validate_geometry(identity.geometry)?;
+        self.validate_render_phase_geometry(phase, identity.geometry)?;
+        self.recorded_render_phases.push((phase, *identity));
         self.enter_phase(phase)
     }
 
@@ -1348,5 +1393,105 @@ mod tests {
         };
         scope.configure_request(&mut request).unwrap();
         scope.finish(MemoryRunOutcome::Complete).unwrap();
+    }
+
+    #[test]
+    fn mem5_mlx_request_scope_records_two_phase_low_res_start_identities_and_keeps_rungs() {
+        let mut cfg = MlxRequestScopeConfig::new(
+            "flux1_dev",
+            MemoryGeometry {
+                width: 1024,
+                height: 1024,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            Some(GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                decode_tile_edge: Some(512),
+                decode_overlap: Some(64),
+                attention_chunk_size: Some(256),
+                transformer_window_size: Some(1),
+                ..Default::default()
+            }),
+            false,
+            57,
+            |_use_pid, edge, overlap| {
+                (edge == 512 && overlap == 64)
+                    .then_some(())
+                    .ok_or_else(|| Error::Unsupported("wrong decode tile".into()))
+            },
+        )
+        .unwrap();
+        cfg.attention_chunk_size = Some(256);
+        cfg.transformer_window = Some(1);
+
+        let desc = crate::gen_core::ModelDescriptor {
+            id: "flux1_dev",
+            backend: "mlx",
+            family: "flux",
+            modality: crate::gen_core::Modality::Image,
+            capabilities: crate::gen_core::Capabilities {
+                min_size: 256,
+                max_size: 2048,
+                ..Default::default()
+            },
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&crate::gen_core::FLUX1_LATENT_SPACE),
+            control_kinds: None,
+            required_components: &[],
+        };
+        let mut req = GenerationRequest {
+            prompt: "mlx two-phase scope trace".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(8),
+            low_res_start: Some(crate::gen_core::LowResStartSpec::new(4, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = crate::gen_core::RenderPlan::base_image(
+            &desc,
+            &req,
+            crate::gen_core::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 3.5,
+                sigmas: vec![1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0],
+                executed_steps: 8,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+
+        let mut scope = MlxRequestScopeCore::with_cleanup(cfg, MlxScopeCleanup::None);
+        scope.configure_request(&mut req).unwrap();
+        let events = crate::gen_core::trace_planned_low_res_scope_lifecycle(
+            &plan,
+            &req.cancel,
+            &mut scope,
+            Some(256),
+            Some((0, 1)),
+            Some((512, 64)),
+        )
+        .unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(
+            scope
+                .recorded_render_phases()
+                .iter()
+                .map(|(p, id)| (*p, id.pass, id.phase, id.geometry.width, id.geometry.height))
+                .collect::<Vec<_>>(),
+            vec![
+                (MemoryPhase::Conditioning, 0, 0, 1024, 1024),
+                (MemoryPhase::Denoise, 0, 0, 512, 512),
+                (MemoryPhase::Denoise, 0, 1, 1024, 1024),
+                (MemoryPhase::Decode, 0, 0, 1024, 1024),
+            ]
+        );
     }
 }

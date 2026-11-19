@@ -223,15 +223,70 @@ impl<L: Clone> MomentumBuffer<L> {
         }
     }
 
+    /// Clear accumulated APG momentum history across a geometry-changing or re-noise phase boundary (`PIPE-3`).
+    pub fn reset(&mut self) {
+        self.running = None;
+    }
+
+    /// Whether the momentum accumulator currently has no stored running state.
+    pub fn is_empty(&self) -> bool {
+        self.running.is_none()
+    }
+
+    /// Borrow the current running momentum tensor, if any.
+    pub fn running(&self) -> Option<&L> {
+        self.running.as_ref()
+    }
+
+    /// Compute `diff + momentum·running` read-only without mutating the stored accumulator (`PIPE-3`, `PIPE-4`).
+    pub fn preview_update<G: GuidanceOps<Latent = L>>(&self, g: &G, diff: &L) -> Result<L> {
+        match &self.running {
+            Some(r) => g.axpy(1.0, diff, self.momentum, r),
+            None => Ok(diff.clone()),
+        }
+    }
+
     /// `running = diff + momentum·running`; the first call (running = 0) returns `diff` unchanged.
     pub fn update<G: GuidanceOps<Latent = L>>(&mut self, g: &G, diff: &L) -> Result<L> {
-        let ra = match &self.running {
-            Some(r) => g.axpy(1.0, diff, self.momentum, r)?,
-            None => diff.clone(),
-        };
+        let ra = self.preview_update(g, diff)?;
         self.running = Some(ra.clone());
         Ok(ra)
     }
+}
+
+/// Read-only single-condition APG evaluation for boundary endpoint clean-estimate evaluation (`PIPE-3`, `PIPE-4`):
+/// computes `uncond + scale · normalize_diff(cond − uncond, base = cond)` using [`MomentumBuffer::preview_update`]
+/// so the persistent `MomentumBuffer` state is left completely untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn normalized_guidance_readonly<G: GuidanceOps>(
+    g: &G,
+    cond: &G::Latent,
+    uncond: &G::Latent,
+    scale: f32,
+    buf: Option<&MomentumBuffer<G::Latent>>,
+    eta: f32,
+    norm_threshold: f32,
+    shape: &[usize],
+    axes: &[i32],
+) -> Result<G::Latent> {
+    let diff = g.sub(cond, uncond)?;
+    let mut diff = match buf {
+        Some(b) => b.preview_update(g, &diff)?,
+        None => diff,
+    };
+    if norm_threshold > 0.0 {
+        let dn = g.norm_over(&diff, shape, axes)?;
+        let num = const_like(g, &dn, norm_threshold)?;
+        let scale_clamp = g.clamp_max(&g.div(&num, &dn)?, 1.0)?;
+        diff = g.mul(&diff, &scale_clamp)?;
+    }
+    let bn = g.clamp_min(&g.norm_over(cond, shape, axes)?, NORMALIZE_EPS)?;
+    let v1 = g.div(cond, &bn)?;
+    let coeff = g.dot_over(&diff, &v1, shape, axes)?;
+    let parallel = g.mul(&coeff, &v1)?;
+    let orthogonal = g.sub(&diff, &parallel)?;
+    let nd = g.axpy(1.0, &orthogonal, eta, &parallel)?;
+    g.axpy(1.0, uncond, scale, &nd)
 }
 
 /// The APG core: momentum → norm-clamp → orthogonal/parallel projection against `base`, returning

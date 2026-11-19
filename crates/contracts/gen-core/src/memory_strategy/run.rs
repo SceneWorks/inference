@@ -151,6 +151,14 @@ macro_rules! delegate_memory_request_scope {
             self.$field.enter_phase(phase)
         }
 
+        fn enter_render_phase(
+            &mut self,
+            phase: $crate::MemoryPhase,
+            identity: &$crate::render::RenderPhaseIdentity,
+        ) -> $crate::Result<()> {
+            self.$field.enter_render_phase(phase, identity)
+        }
+
         fn leave_phase(&mut self, phase: $crate::MemoryPhase) -> $crate::Result<()> {
             self.$field.leave_phase(phase)
         }

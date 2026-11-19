@@ -229,9 +229,13 @@ impl RuntimeCatalog {
                 .media
                 .generators()
                 .map(|registration| {
-                    GeneratorCapabilitySnapshot::from_descriptor(&(registration.descriptor)())
+                    GeneratorCapabilitySnapshot::from_registry_descriptor(
+                        &self.media,
+                        &(registration.descriptor)(),
+                    )
                 })
                 .collect(),
+            features: self.media.all_route_feature_applicability(),
             transform_ids: self
                 .media
                 .transforms()
@@ -284,9 +288,13 @@ impl RuntimeCatalog {
             audio_generator_capabilities: self
                 .audio
                 .iter()
-                .flat_map(|audio| audio.registry.generators())
-                .map(|registration| {
-                    GeneratorCapabilitySnapshot::from_descriptor(&(registration.descriptor)())
+                .flat_map(|audio| {
+                    audio.registry.generators().map(move |registration| {
+                        GeneratorCapabilitySnapshot::from_registry_descriptor(
+                            &audio.registry,
+                            &(registration.descriptor)(),
+                        )
+                    })
                 })
                 .collect(),
             audio_voice_embedder_ids: self
@@ -567,10 +575,36 @@ pub struct GeneratorCapabilitySnapshot {
     pub schedulers: Vec<String>,
     pub supported_guidance_methods: Vec<String>,
     pub pag: Option<gen_core::PagCapability>,
+    pub features: std::collections::BTreeMap<String, gen_core::FeatureApplicability>,
 }
 
 impl GeneratorCapabilitySnapshot {
-    fn from_descriptor(descriptor: &ModelDescriptor) -> Self {
+    pub fn from_descriptor(descriptor: &ModelDescriptor) -> Self {
+        Self::from_descriptor_with_plan(descriptor, None)
+    }
+
+    pub fn from_descriptor_with_plan(
+        descriptor: &ModelDescriptor,
+        render_plan: Option<&gen_core::RenderPlanRegistration>,
+    ) -> Self {
+        let route =
+            gen_core::FeatureRouteStructure::from_descriptor_and_plan(descriptor, render_plan);
+        let features = gen_core::FeatureRegistry::standard().evaluate_route(&route);
+        Self::from_descriptor_and_features(descriptor, features)
+    }
+
+    pub fn from_registry_descriptor(
+        registry: &ProviderRegistry,
+        descriptor: &ModelDescriptor,
+    ) -> Self {
+        let features = registry.generator_feature_applicability(descriptor);
+        Self::from_descriptor_and_features(descriptor, features)
+    }
+
+    fn from_descriptor_and_features(
+        descriptor: &ModelDescriptor,
+        features: std::collections::BTreeMap<String, gen_core::FeatureApplicability>,
+    ) -> Self {
         Self {
             id: descriptor.id.to_string(),
             family: descriptor.family.to_string(),
@@ -615,10 +649,16 @@ impl GeneratorCapabilitySnapshot {
                 .map(|value| (*value).to_string())
                 .collect(),
             pag: descriptor.capabilities.pag.clone(),
+            features,
         }
     }
 
-    fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(&self) -> serde_json::Value {
+        let features_json: serde_json::Map<String, serde_json::Value> = self
+            .features
+            .iter()
+            .map(|(id, app)| (id.clone(), app.to_json()))
+            .collect();
         let mut object = serde_json::json!({
             "id": self.id,
             "family": self.family,
@@ -633,6 +673,7 @@ impl GeneratorCapabilitySnapshot {
             "samplers": self.samplers,
             "schedulers": self.schedulers,
             "supported_guidance_methods": self.supported_guidance_methods,
+            "features": serde_json::Value::Object(features_json),
         });
         if let Some(pag) = &self.pag {
             object["pag"] = serde_json::to_value(pag).expect("PagCapability serializes");
@@ -791,6 +832,12 @@ pub struct RuntimeCatalogSnapshot {
     pub generator_ids: Vec<String>,
     /// Generator descriptor capabilities, in the same stable order as `generator_ids`.
     pub generator_capabilities: Vec<GeneratorCapabilitySnapshot>,
+    /// Computed structural Feature applicability across all registered generators and conditioned
+    /// routes in this catalog (`route_id -> feature_id -> FeatureApplicability`, SW-6938).
+    pub features: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, gen_core::FeatureApplicability>,
+    >,
     /// Standalone transform ids (empty at this release).
     pub transform_ids: Vec<String>,
     /// Trainer ids — each a `load_trainer` key.
@@ -847,11 +894,23 @@ pub struct RuntimeCatalogSnapshot {
 impl RuntimeCatalogSnapshot {
     /// JSON representation consumed by release tooling and external smoke projects.
     pub fn to_json(&self) -> serde_json::Value {
+        let route_features: serde_json::Map<String, serde_json::Value> = self
+            .features
+            .iter()
+            .map(|(route_id, feature_map)| {
+                let per_feature: serde_json::Map<String, serde_json::Value> = feature_map
+                    .iter()
+                    .map(|(feature_id, app)| (feature_id.clone(), app.to_json()))
+                    .collect();
+                (route_id.clone(), serde_json::Value::Object(per_feature))
+            })
+            .collect();
         serde_json::json!({
             "platform": self.platform,
             "backend": self.backend,
             "generator_ids": self.generator_ids,
             "generator_capabilities": self.generator_capabilities.iter().map(GeneratorCapabilitySnapshot::to_json).collect::<Vec<_>>(),
+            "features": serde_json::Value::Object(route_features),
             "transform_ids": self.transform_ids,
             "trainer_ids": self.trainer_ids,
             "trainer_capabilities": self.trainer_capabilities.iter().map(TrainerCapabilitySnapshot::to_json).collect::<Vec<_>>(),
@@ -1856,5 +1915,161 @@ mod tests {
         assert!(error
             .to_string()
             .contains("LLM 'test-llm' uses backend 'candle' in the 'mlx' runtime"));
+    }
+
+    #[test]
+    fn runtime_catalog_exports_computed_feature_applicability_and_flips_when_precondition_removed()
+    {
+        fn base_descriptor() -> gen_core::ModelDescriptor {
+            gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: Some(&gen_core::FLUX1_LATENT_SPACE),
+                control_kinds: None,
+                required_components: &[],
+                id: "flux1_dev",
+                family: "flux",
+                backend: "mlx",
+                modality: gen_core::Modality::Image,
+                capabilities: gen_core::Capabilities {
+                    min_size: 256,
+                    max_size: 2048,
+                    max_count: 8,
+                    supports_guidance: true,
+                    conditioning: vec![gen_core::ConditioningKind::Reference],
+                    samplers: vec!["euler"],
+                    schedulers: vec!["linear"],
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn compile_base_probe(
+            _spec: &gen_core::LoadSpec,
+            req: &gen_core::GenerationRequest,
+        ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+            let sigmas: Vec<f32> = (0..=25).map(|i| 1.0 - (i as f32 / 25.0)).collect();
+            gen_core::RenderPlan::base_image(
+                &base_descriptor(),
+                req,
+                gen_core::render::PackedImagePass {
+                    pixel_stride: 16,
+                    token_width: 64,
+                    sampler: "euler",
+                    guidance: 3.5,
+                    sigmas,
+                    executed_steps: 25,
+                    capture_sigma: 0.0,
+                },
+            )
+            .map(Some)
+        }
+
+        let media_with_plan = gen_core::ProviderRegistryBuilder::new()
+            .register_generator(gen_core::ModelRegistration {
+                descriptor: base_descriptor,
+                load: never_load_generator,
+                footprint: None,
+            })
+            .register_render_plan(gen_core::RenderPlanRegistration {
+                provider_id: "flux1_dev",
+                compile: compile_base_probe,
+            })
+            .build();
+        let catalog = RuntimeCatalog::try_new(
+            "macos",
+            "mlx",
+            media_with_plan,
+            empty_text(),
+            mlx_preparers(),
+        )
+        .unwrap();
+        let json = catalog.snapshot().to_json();
+        let entry = &json["generator_capabilities"][0];
+        let low_res = entry
+            .get("features")
+            .and_then(|f| f.get("low_res_start"))
+            .expect("GeneratorCapabilitySnapshot exports features.low_res_start");
+        assert_eq!(low_res["applicable"], true);
+        assert_eq!(low_res["supported"], true);
+        assert_eq!(low_res["available"], true);
+        assert_eq!(low_res["class"], "recipe");
+        assert_eq!(low_res["version"], 1);
+        assert_eq!(low_res["parameter_schema"]["version"], 1);
+        assert_eq!(low_res["parameter_schema"]["k"]["min"], 1);
+        assert_eq!(
+            low_res["parameter_schema"]["k"]["max_exclusive"],
+            "executed_steps"
+        );
+        assert_eq!(low_res["parameter_schema"]["k"]["max"], 24);
+        assert_eq!(low_res["parameter_schema"]["scale"]["min"], 0.25);
+        assert_eq!(low_res["parameter_schema"]["scale"]["max"], 0.9);
+        assert_eq!(low_res["parameter_schema"]["scale"]["default"], 0.5);
+        assert!(low_res["conflicts"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("phases")));
+        assert_eq!(
+            json["features"]["flux1_dev"]["low_res_start"]["applicable"],
+            true
+        );
+
+        // Removing a structural precondition (no RenderPlanRegistration, or removing the packed latent
+        // space from the descriptor) flips availability in the export with zero table edits.
+        let media_without_plan = gen_core::ProviderRegistryBuilder::new()
+            .register_generator(gen_core::ModelRegistration {
+                descriptor: base_descriptor,
+                load: never_load_generator,
+                footprint: None,
+            })
+            .build();
+        let catalog_no_plan = RuntimeCatalog::try_new(
+            "macos",
+            "mlx",
+            media_without_plan,
+            empty_text(),
+            mlx_preparers(),
+        )
+        .unwrap();
+        let json_no_plan = catalog_no_plan.snapshot().to_json();
+        let low_res_no_plan =
+            &json_no_plan["generator_capabilities"][0]["features"]["low_res_start"];
+        assert_eq!(low_res_no_plan["applicable"], false);
+        assert!(low_res_no_plan["inapplicability_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("missing_render_plan")));
+
+        fn unpackable_descriptor() -> gen_core::ModelDescriptor {
+            let mut d = base_descriptor();
+            d.denoiser_output_latent_space = None;
+            d
+        }
+        let media_without_latent = gen_core::ProviderRegistryBuilder::new()
+            .register_generator(gen_core::ModelRegistration {
+                descriptor: unpackable_descriptor,
+                load: never_load_generator,
+                footprint: None,
+            })
+            .register_render_plan(gen_core::RenderPlanRegistration {
+                provider_id: "flux1_dev",
+                compile: compile_base_probe,
+            })
+            .build();
+        let catalog_no_latent = RuntimeCatalog::try_new(
+            "macos",
+            "mlx",
+            media_without_latent,
+            empty_text(),
+            mlx_preparers(),
+        )
+        .unwrap();
+        let json_no_latent = catalog_no_latent.snapshot().to_json();
+        let low_res_no_latent =
+            &json_no_latent["generator_capabilities"][0]["features"]["low_res_start"];
+        assert_eq!(low_res_no_latent["applicable"], false);
+        assert!(low_res_no_latent["inapplicability_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("missing_spatial_unpack_repack")));
     }
 }

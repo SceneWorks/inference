@@ -449,6 +449,16 @@ pub struct Capabilities {
     /// means this model/backend does not support PAG, and the shared request floor rejects any
     /// `Some` [`GenerationRequest::pag`] as [`Error::Unsupported`].
     pub pag: Option<crate::PagCapability>,
+    /// Whether this model route honours [`GenerationRequest::phases`] multi-phase denoise
+    /// (SW-6938). `Default` is `false`, and the shared floor refuses any `Some` `phases` on a
+    /// non-supporting route with [`Error::Unsupported`] rather than letting a provider silently
+    /// ignore it and render a single-phase trajectory.
+    pub supports_phases: bool,
+    /// Whether this model route honours [`GenerationRequest::low_res_start`] two-phase low-res
+    /// start denoising (SW-6939). `Default` is `false`, and the shared floor refuses any `Some`
+    /// `low_res_start` on a non-supporting route with [`Error::Unsupported`] rather than letting
+    /// an unmigrated provider silently ignore it and render a single-phase full-resolution trajectory.
+    pub supports_low_res_start: bool,
 }
 
 /// The one typed refusal for an **adapter-bearing** request against a descriptor whose advertised
@@ -750,6 +760,25 @@ impl Capabilities {
             return Err(Error::Unsupported(format!(
                 "{id}: Perturbed-Attention Guidance (PAG) is not supported by this model"
             )));
+        }
+        if let Some(phases) = &req.phases {
+            if !self.supports_phases && id != "krea_2_raw" {
+                return Err(Error::Unsupported(format!(
+                    "{id}: multi-phase denoise (phases) is not supported by this model (supported on krea_2_raw only)"
+                )));
+            }
+            if phases.is_empty() {
+                return Err(Error::Msg(format!(
+                    "{id}: phases must contain at least one phase"
+                )));
+            }
+            for (i, phase) in phases.iter().enumerate() {
+                if phase.steps == 0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: phase {i} must run at least one step"
+                    )));
+                }
+            }
         }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
         // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
@@ -1488,6 +1517,52 @@ impl Capabilities {
                     return Err(Error::Msg(format!(
                         "{id}: conversation history has no assistant turn to synthesize (a turn with \
                          audio: None)"
+                    )));
+                }
+            }
+        }
+        if let Some(spec) = &req.low_res_start {
+            if !self.supports_low_res_start {
+                return Err(Error::Unsupported(format!(
+                    "{id}: low_res_start is not supported by this model route"
+                )));
+            }
+            spec.validate_parameters(id)?;
+            if req.phases.is_some() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: low_res_start conflicts with multi-phase denoise (phases)"
+                )));
+            }
+            if !req.conditioning.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: low_res_start conflicts with pass-0 edit/reference/control conditioning"
+                )));
+            }
+        }
+        if let Some(source) = &req.source_image {
+            if !self.supports_low_res_start {
+                return Err(Error::Unsupported(format!(
+                    "{id}: source_image is not supported by this model route"
+                )));
+            }
+            let expected = u64::from(source.width)
+                .checked_mul(u64::from(source.height))
+                .and_then(|p| p.checked_mul(3))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!("{id}: source_image geometry overflows"))
+                })?;
+            if source.width == 0 || source.height == 0 || source.pixels.len() as u64 != expected {
+                return Err(Error::Unsupported(format!(
+                    "{id}: source_image buffer len {} does not match {}x{}x3",
+                    source.pixels.len(),
+                    source.width,
+                    source.height
+                )));
+            }
+            if let Some(s) = req.strength {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: img2img strength {s} must lie in 0.0..=1.0"
                     )));
                 }
             }

@@ -220,6 +220,18 @@ pub fn run_curated_sampler(
     )
 }
 
+/// Phase-transition callback invoked between consecutive denoise spans (`phase` -> `phase + 1`)
+/// at boundary step `boundary_step = span.end` (`SW-6939`: `PIPE-3`, `PIPE-4`, `PIPE-5`, `HOOK-5`).
+pub type CandlePhaseTransitionFn<'a> = dyn FnMut(
+        usize,
+        usize,
+        &CandleLatentOps,
+        &dyn gen_core::sampling::ModelSampling,
+        &Tensor,
+        &mut gen_core::sampling::SolverRunState<CandleLatentOps>,
+    ) -> Result<Tensor>
+    + 'a;
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_curated_sampler_spans(
     sampler_name: Option<&str>,
@@ -234,7 +246,46 @@ pub fn run_curated_sampler_spans(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    run_curated_sampler_with_phase_transition_spans(
+        sampler_name,
+        ms,
+        sigmas,
+        spans,
+        phase_scope,
+        first_phase_active,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+        None,
+    )
+}
+
+/// Unified multi-phase curated sampler driver with an optional phase-transition callback (`SW-6939`).
+///
+/// Both inactive (`on_phase_boundary = None`, single span `0..M`) and active (`on_phase_boundary = Some(..)`,
+/// two spans `0..K` and `K..M`) execute this exact implementation so inactive hooks are byte-identical
+/// with zero per-step overhead (`HOOK-5`, `E2`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_curated_sampler_with_phase_transition_spans(
+    sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    // The provider entered phase 0 before preparing its device tensors. The driver still closes it.
+    first_phase_active: bool,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+    mut on_phase_boundary: Option<&mut CandlePhaseTransitionFn<'_>>,
 ) -> Result<Tensor> {
     use gen_core::sampling::{denoise as gc_denoise, SolverRunState};
 
@@ -245,6 +296,11 @@ pub fn run_curated_sampler_spans(
     let sampler = solver.boxed::<CandleLatentOps>();
     let mut state = SolverRunState::new(sampler.solver(), sigmas);
     if let Some(run) = phase_scope {
+        if let Some(low_res_plan) = run.plan().low_res_start() {
+            state
+                .configure_low_res_start(low_res_plan)
+                .map_err(CandleError::from)?;
+        }
         // A planned render iterates its plan's seeds, not `for_each_image_seed`, so its
         // per-image initial-noise draw is recorded here, before this output's runtime and
         // schedule, as `for_each_image_seed` does: output index = seed - plan base seed.
@@ -258,24 +314,6 @@ pub fn run_curated_sampler_spans(
     // driver actually integrates. `None` allocates nothing and adds no per-eval work.
     let previews = preview.map(|hook| (hook, PreviewCounter::new(sigmas)));
 
-    let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {
-        if cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        // Progress as the count of schedule nodes already descended past — robust to the multi-eval
-        // solvers (heun / dpmpp_sde call this twice per step; the count stays monotone and ≤ total).
-        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
-        on_progress(Progress::Step { current, total });
-        // Best-effort preview of the RUNNING latent (not the c_in-scaled `x_in` gc_denoise builds).
-        // The counter drops the multi-eval repeat the progress line above deliberately emits twice.
-        if let Some((hook, counter)) = &previews {
-            hook.emit(counter, sigmas, sigma, x);
-        }
-        gc_denoise(&ops, ms, x, sigma, |xin, t| {
-            predict(xin, t).map_err(Into::into)
-        })
-    };
-
     let mut out = latents;
     for (phase, span) in spans.iter().enumerate() {
         if let Some(run) = phase_scope {
@@ -283,20 +321,128 @@ pub fn run_curated_sampler_spans(
                 run.begin_denoise_phase(phase).map_err(CandleError::from)?;
             }
         }
-        out = sampler
-            .sample_span(
-                &ops,
-                ms,
-                &mut denoise_fn,
-                out,
-                sigmas,
-                seed,
-                span.clone(),
-                &mut state,
-            )
-            .map_err(CandleError::from)?;
+        {
+            let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {
+                if cancel.is_cancelled() {
+                    return Err(gen_core::Error::Canceled);
+                }
+                // Progress as the count of schedule nodes already descended past — robust to the multi-eval
+                // solvers (heun / dpmpp_sde call this twice per step; the count stays monotone and ≤ total).
+                let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+                on_progress(Progress::Step { current, total });
+                // Best-effort preview of the RUNNING latent (not the c_in-scaled `x_in` gc_denoise builds).
+                // The counter drops the multi-eval repeat the progress line above deliberately emits twice.
+                if let Some((hook, counter)) = &previews {
+                    hook.emit(counter, sigmas, sigma, x);
+                }
+                gc_denoise(&ops, ms, x, sigma, |xin, t| {
+                    predict(xin, t).map_err(Into::into)
+                })
+            };
+            out = sampler
+                .sample_span(
+                    &ops,
+                    ms,
+                    &mut denoise_fn,
+                    out,
+                    sigmas,
+                    seed,
+                    span.clone(),
+                    &mut state,
+                )
+                .map_err(CandleError::from)?;
+        }
         if let Some(run) = phase_scope {
             run.end_denoise_phase(phase).map_err(CandleError::from)?;
+        }
+        if phase + 1 < spans.len() {
+            if let Some(transition) = on_phase_boundary.as_deref_mut() {
+                out = transition(phase, span.end, &ops, ms, &out, &mut state)?;
+            } else if let Some(run) = phase_scope {
+                if let Some(low_res_plan) = run.plan().low_res_start().copied() {
+                    if span.end == low_res_plan.k {
+                        if cancel.is_cancelled() {
+                            return Err(CandleError::Canceled);
+                        }
+                        let sigma_k = sigmas[span.end];
+                        let boundary_state = match low_res_plan.estimate_source {
+                            gen_core::EstimateSource::EndpointEvaluation => {
+                                let x0_low = gc_denoise(&ops, ms, &out, sigma_k, |xin, t| {
+                                    predict(xin, t).map_err(Into::into)
+                                })
+                                .map_err(CandleError::from)?;
+                                gen_core::BoundaryState::CleanEstimate {
+                                    latent: x0_low,
+                                    source: gen_core::EstimateSource::EndpointEvaluation,
+                                }
+                            }
+                            gen_core::EstimateSource::PreviousEvaluation => {
+                                let captured = state
+                                    .take_captured_primary_estimate(span.end - 1)
+                                    .map_err(CandleError::from)?;
+                                gen_core::BoundaryState::CleanEstimate {
+                                    latent: captured.latent,
+                                    source: gen_core::EstimateSource::PreviousEvaluation,
+                                }
+                            }
+                        };
+                        let (x0_low, source) = boundary_state
+                            .into_clean_estimate()
+                            .map_err(CandleError::from)?;
+                        let (b_sz, _low_tokens, packed_channels) = x0_low.dims3()?;
+                        let patch_size = 2usize;
+                        let vae_spatial_scale = 8usize;
+                        let channels = packed_channels / (patch_size * patch_size);
+                        let packed_f32: Vec<f32> = x0_low
+                            .to_dtype(candle_core::DType::F32)?
+                            .flatten_all()?
+                            .to_vec1()?;
+                        let base_seed = run.plan().base_seed();
+                        let output_index = seed.wrapping_sub(base_seed) as u32;
+                        let pass_index = run.plan().pass_index();
+                        let repacked = gen_core::transition_packed_clean_estimate_f32(
+                            gen_core::BoundaryState::CleanEstimate {
+                                latent: &packed_f32,
+                                source,
+                            },
+                            b_sz,
+                            channels,
+                            patch_size as u32,
+                            vae_spatial_scale as u32,
+                            &low_res_plan,
+                            sigma_k,
+                            ms,
+                            base_seed,
+                            output_index,
+                            pass_index,
+                            0,
+                        )
+                        .map_err(CandleError::from)?;
+                        let full_tokens = ((low_res_plan.full_height as usize)
+                            / (vae_spatial_scale * patch_size))
+                            * ((low_res_plan.full_width as usize)
+                                / (vae_spatial_scale * patch_size));
+                        let transitioned = Tensor::from_vec(
+                            repacked,
+                            (b_sz, full_tokens, packed_channels),
+                            x0_low.device(),
+                        )?;
+                        out = if x0_low.dtype() == candle_core::DType::F32 {
+                            transitioned
+                        } else {
+                            transitioned.to_dtype(x0_low.dtype())?
+                        };
+                        state.note_geometry_change(
+                            (low_res_plan.low_width, low_res_plan.low_height),
+                            (low_res_plan.full_width, low_res_plan.full_height),
+                        );
+                        state.note_renoise_transition();
+                        state
+                            .apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)
+                            .map_err(CandleError::from)?;
+                    }
+                }
+            }
         }
     }
     if state.next_step() != sigmas.len().saturating_sub(1) {
@@ -361,9 +507,42 @@ pub fn run_flow_sampler_spans(
     preview: Option<&PreviewHook<'_>>,
     predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
+    run_flow_sampler_with_phase_transition_spans(
+        sampler_name,
+        conv,
+        sigmas,
+        spans,
+        phase_scope,
+        first_phase_active,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler_with_phase_transition_spans(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    first_phase_active: bool,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+    on_phase_boundary: Option<&mut CandlePhaseTransitionFn<'_>>,
+) -> Result<Tensor> {
     crate::execution::policy("flow_timestep_convention", format!("{conv:?}").into());
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler_spans(
+    run_curated_sampler_with_phase_transition_spans(
         sampler_name,
         &ms,
         sigmas,
@@ -376,6 +555,7 @@ pub fn run_flow_sampler_spans(
         on_progress,
         preview,
         predict,
+        on_phase_boundary,
     )
 }
 

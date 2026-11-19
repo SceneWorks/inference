@@ -195,5 +195,8 @@ pub use profile::*;
 mod evidence;
 pub use evidence::*;
 
+mod pricing;
+pub use pricing::*;
+
 #[cfg(test)]
 mod tests;

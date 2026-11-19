@@ -748,6 +748,7 @@ impl Flux3Klein {
                 warnings: Vec::new(),
                 prefix_kv_cache: None,
                 pag: pag_report,
+                low_res_start: None,
             },
         )
     }
