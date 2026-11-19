@@ -50,7 +50,8 @@
 //!
 //! # The training adapter
 //!
-//! `TrainingConfig::training_adapter` names a frozen de-distill LoRA (the shipped one is
+//! `TrainingConfig::training_adapter` names a frozen de-distill LoRA (ai-toolkit's
+//! `ostris/minimax_h3_training_adapter` image adapter, or
 //! `ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter`): H3-Image is six-step distilled, and a
 //! plain flow-matching fine-tune un-distills it. The adapter is installed on the training DiT
 //! through the inference install as a frozen residual at strength 1.0, before the trainable factors
@@ -107,8 +108,9 @@ use candle_gen::train::schedule::schedule_updates;
 use candle_gen::{CandleError as Error, Result};
 
 use gen_core_train::h3_image::{
-    adapter_surface, target_block, trainer_descriptor, training_canvas, training_step,
-    ADAPTER_PROVENANCE, EDIT_ADAPTER_MARKER, TRAINER_ID,
+    adapter_surface, refiner_block, target_block, trainer_descriptor, training_canvas,
+    training_step, trains_refiner, ADAPTER_PROVENANCE, EDIT_ADAPTER_MARKER, REFINER_BLOCKS_PREFIX,
+    TRAINER_ID,
 };
 
 use crate::dit::model::{image_modulation, ImageModulation};
@@ -126,7 +128,7 @@ use memory::{
     admit_training, budget_of, contract_and_tier, plan_block_residency, BlockResidency,
     TrainingItemShape, TrainingRunShape,
 };
-use step::{loss_and_grads, noised_rows, StepInputs};
+use step::{loss_and_grads, noised_rows, StepInputs, StepText};
 
 /// The streamed window: one block (and one text-encoder layer) at a time.
 const WINDOW: u32 = 1;
@@ -235,11 +237,13 @@ fn resolve_target_paths(dit_cfg: &MiniMaxH3DitConfig, cfg: &TrainingConfig) -> R
     )?)
 }
 
-/// `(out_features, in_features)` of a block leaf on `cfg`.
+/// `(out_features, in_features)` of a DiT-block or token-refiner-block leaf on `cfg` (the refiner
+/// blocks have the DiT blocks' widths).
 fn leaf_shape(cfg: &MiniMaxH3DitConfig, path: &str) -> Result<(usize, usize)> {
     let inner = cfg.num_attention_heads * cfg.attention_head_dim;
     let leaf = path
         .strip_prefix("transformer_blocks.")
+        .or_else(|| path.strip_prefix(REFINER_BLOCKS_PREFIX))
         .and_then(|rest| rest.split_once('.'))
         .map_or("", |(_, leaf)| leaf);
     Ok(match leaf {
@@ -249,25 +253,38 @@ fn leaf_shape(cfg: &MiniMaxH3DitConfig, path: &str) -> Result<(usize, usize)> {
         "ff.net.2" => (cfg.hidden_size, cfg.ffn_dim),
         _ => {
             return Err(Error::Msg(format!(
-                "{TRAINER_ID} trainer: {path} is not a DiT block leaf"
+                "{TRAINER_ID} trainer: {path} is not a DiT or token-refiner block leaf"
             )))
         }
     })
 }
 
-/// `(trainable elements, largest block's LoKr intermediate, all LoKr intermediates)` for `paths`
-/// under `cfg` — exact, from the leaf shapes (LoRA `rank·(in + out)`; LoKr `w1` plus a full or
-/// low-rank `w2` by PEFT's `use_w2` rule, exactly as [`build_adapt_lokr_targets_peft`] sizes them).
-/// Candle's trainable LoKr never forms the `[out, in]` delta: its residual is the Kronecker
-/// vec-trick `w1 · X · w2ᵀ`, whose one intermediate is `[S, in_a, out_b]`, so the LoKr figures are
-/// that intermediate's elements **per sequence row** (`Σ in_a · out_b`).
+/// The trainable figures of a run's targets, from [`adapter_elements`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AdapterElements {
+    /// Trainable factor elements over every target.
+    trainable: u64,
+    /// LoKr intermediate elements per row: the largest DiT block's, every target's (DiT and
+    /// refiner), and the refiner leaves' alone.
+    lokr_block_max: u64,
+    lokr_total: u64,
+    lokr_refiner: u64,
+}
+
+/// The trainable figures for `paths` under `cfg` — exact, from the leaf shapes (LoRA
+/// `rank·(in + out)`; LoKr `w1` plus a full or low-rank `w2` by PEFT's `use_w2` rule, exactly as
+/// [`build_adapt_lokr_targets_peft`] sizes them). Candle's trainable LoKr never forms the
+/// `[out, in]` delta: its residual is the Kronecker vec-trick `w1 · X · w2ᵀ`, whose one
+/// intermediate is `[S, in_a, out_b]`, so the LoKr figures are that intermediate's elements **per
+/// row** (`Σ in_a · out_b`) — sequence rows for a DiT block, caption rows for a refiner block.
 fn adapter_elements(
     dit_cfg: &MiniMaxH3DitConfig,
     paths: &[String],
     cfg: &TrainingConfig,
-) -> Result<(u64, u64, u64)> {
+) -> Result<AdapterElements> {
     let rank = cfg.rank as u64;
     let mut total = 0u64;
+    let mut refiner = 0u64;
     let mut per_block = std::collections::BTreeMap::<usize, u64>::new();
     for path in paths {
         let (out_f, in_f) = leaf_shape(dit_cfg, path)?;
@@ -286,17 +303,37 @@ fn adapter_elements(
         };
         total += elements;
         if cfg.network_type == NetworkType::Lokr {
-            *per_block
-                .entry(target_block(path).unwrap_or(0))
-                .or_default() += {
+            let rows = {
                 let (_, out_b) = factorization(out_f, cfg.decompose_factor);
                 let (in_a, _) = factorization(in_f, cfg.decompose_factor);
                 (in_a * out_b) as u64
             };
+            match (target_block(path), refiner_block(path)) {
+                (Some(block), _) => *per_block.entry(block).or_default() += rows,
+                (None, Some(_)) => refiner += rows,
+                (None, None) => {
+                    return Err(Error::Msg(format!(
+                        "{TRAINER_ID} trainer: {path} is not a DiT or token-refiner block leaf"
+                    )))
+                }
+            }
         }
     }
-    let block_max = per_block.values().copied().max().unwrap_or(0);
-    Ok((total, block_max, per_block.values().sum()))
+    Ok(AdapterElements {
+        trainable: total,
+        lokr_block_max: per_block.values().copied().max().unwrap_or(0),
+        lokr_total: per_block.values().sum::<u64>() + refiner,
+        lokr_refiner: refiner,
+    })
+}
+
+/// Token-refiner blocks `paths` train (distinct block indices).
+fn refiner_layers(paths: &[String]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| refiner_block(p))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64
 }
 
 /// f32 optimizer-state elements per trainable element: AdamW/Adam two, Rose none, Prodigy four
@@ -368,6 +405,9 @@ struct RunPlan<'r> {
     req: &'r TrainingRequest,
     edit: bool,
     target_paths: Vec<String>,
+    /// A token-refiner leaf is a target: every step refines the caption from its cached
+    /// `context_embedder` rows under autograd, instead of refining it once.
+    refine_per_step: bool,
     compute_dtype: DType,
     checkpointed: bool,
     sample_prompts: Vec<String>,
@@ -391,8 +431,9 @@ struct CachedItem {
 /// The dataset as the train phase reads it.
 struct Cache {
     entries: Vec<CachedItem>,
-    /// Per item, the caption's layer-50 context `[1, T, 5120]` — replaced by its refined text rows
-    /// once the DiT trunk is on the device.
+    /// Per item, the caption's layer-50 context `[1, T, 5120]` — replaced, once the DiT trunk is
+    /// on the device, by its frozen `context_embedder` rows (a trained refiner refines them every
+    /// step) or by its refined text rows (a constant refiner).
     text: Vec<Tensor>,
 }
 
@@ -600,6 +641,7 @@ impl MiniMaxH3ImageTrainer {
         Ok(RunPlan {
             req,
             edit: req.items.iter().any(TrainingItem::is_edit_pair),
+            refine_per_step: trains_refiner(&target_paths),
             target_paths,
             compute_dtype,
             checkpointed: cfg.gradient_checkpointing,
@@ -633,8 +675,7 @@ impl MiniMaxH3ImageTrainer {
             });
         }
         let cfg = &plan.req.config;
-        let (trainable, block_max, total) =
-            adapter_elements(&self.dit_cfg, &plan.target_paths, cfg)?;
+        let elements = adapter_elements(&self.dit_cfg, &plan.target_paths, cfg)?;
         let preview = match plan.sample_prompts.is_empty() {
             true => None,
             false => {
@@ -653,10 +694,12 @@ impl MiniMaxH3ImageTrainer {
             items,
             edges: plan.edges.len() as u32,
             width: plan.compute_dtype.size_in_bytes() as u64,
-            trainable_elements: trainable,
+            trainable_elements: elements.trainable,
             optimizer_state_per_element: optimizer_state_per_element(&cfg.optimizer),
-            lokr_rows_block_max: block_max,
-            lokr_rows_total: total,
+            lokr_rows_block_max: elements.lokr_block_max,
+            lokr_rows_total: elements.lokr_total,
+            refiner_layers: refiner_layers(&plan.target_paths),
+            lokr_rows_refiner: elements.lokr_refiner,
             packed_base: crate::tier::MiniMaxH3TierPaths::staged_bits(self.generator.dit_dir())?
                 .is_some(),
             training_adapter: training_adapter::training_adapter_bytes(
@@ -919,9 +962,15 @@ impl MiniMaxH3ImageTrainer {
         on_progress(TrainingProgress::LoadingModel);
         let mut cache = self.cache(&plan, on_progress)?;
         let (dit, modulation, set) = self.build_dit(&plan, residency, &device)?;
-        // The caption rows are constants of every step: refine each item's once.
+        // `context_embedder` is frozen, so its rows are constants of every step. The refiner is
+        // too unless one of its leaves is a target: then every step refines the cached rows under
+        // autograd (SW-F369); otherwise each item's caption is refined once, here.
         for text in &mut cache.text {
-            *text = dit.embed_context(text)?;
+            *text = if plan.refine_per_step {
+                dit.embed_context_rows(text)?
+            } else {
+                dit.embed_context(text)?
+            };
         }
 
         let mut opt = TrainOptimizer::from_config(
@@ -976,6 +1025,7 @@ impl MiniMaxH3ImageTrainer {
                 step,
                 entry,
                 &cache.text[entry.item],
+                plan.refine_per_step,
                 mae,
                 plan.checkpointed,
                 &device,
@@ -1122,7 +1172,8 @@ fn micro_step(
     cfg: &TrainingConfig,
     step: u32,
     entry: &CachedItem,
-    text_rows: &Tensor,
+    text: &Tensor,
+    refine: bool,
     mae: bool,
     checkpointed: bool,
     device: &Device,
@@ -1158,7 +1209,7 @@ fn micro_step(
         modulation,
         &set.vars,
         &StepInputs {
-            text_rows,
+            text: StepText::of(text, refine),
             layout: &entry.layout,
             packed: &packed,
             target: &target,

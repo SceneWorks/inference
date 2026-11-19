@@ -49,7 +49,7 @@ use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::gen_core::{AdapterKind, AdapterSpec, LoadSpec};
 use mlx_gen::{Error, Result};
 
-use gen_core_train::h3_image::{target_block, TrainingAdapterBytes, TRAINER_ID};
+use gen_core_train::h3_image::{refiner_block, target_block, TrainingAdapterBytes, TRAINER_ID};
 
 use crate::adapters::apply_minimax_h3_image_adapters;
 use crate::dit::config::MiniMaxH3ImageDitConfig;
@@ -91,6 +91,26 @@ impl FrozenResiduals {
     ) -> MlxResult<()> {
         for (path, frozen) in &self.by_path {
             if block.is_some_and(|b| target_block(path) != Some(b)) {
+                continue;
+            }
+            let lin = host.adaptable_mut(&segments(path)).ok_or_else(|| {
+                Exception::custom(format!(
+                    "{TRAINER_ID} trainer: training adapter target {path} does not resolve"
+                ))
+            })?;
+            let mut stack = lin.adapters().to_vec();
+            stack.extend(frozen.iter().cloned());
+            lin.set_training_adapters(stack);
+        }
+        Ok(())
+    }
+
+    /// [`Self::reattach`] for the token-refiner target leaves alone (SW-F369): the trunk's refiner
+    /// after a trainable install of the refiner factors, which `reattach(.., Some(block))` skips
+    /// (a refiner path names no DiT block).
+    pub(crate) fn reattach_refiner<H: AdaptableHost>(&self, host: &mut H) -> MlxResult<()> {
+        for (path, frozen) in &self.by_path {
+            if refiner_block(path).is_none() {
                 continue;
             }
             let lin = host.adaptable_mut(&segments(path)).ok_or_else(|| {

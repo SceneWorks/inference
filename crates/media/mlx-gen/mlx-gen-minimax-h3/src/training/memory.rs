@@ -83,6 +83,9 @@ pub struct TrainingRunShape {
     pub optimizer_state_per_element: u64,
     pub lokr_delta_block_max: u64,
     pub lokr_delta_total: u64,
+    /// Token-refiner blocks the run trains (SW-F369): their forward over the caption rows is
+    /// retained for the backward every step. `0` when no refiner leaf is a target.
+    pub refiner_layers: u64,
     /// The frozen training adapter's footprint (zero when none is configured): unified memory
     /// holds every factor for the whole run.
     pub training_adapter: TrainingAdapterBytes,
@@ -253,6 +256,7 @@ pub fn estimate_training(
             } else {
                 geometry.heads
             },
+            refiner_layers: run.refiner_layers,
         };
         let bytes = train_step_bytes(&geometry, &weights, &s);
         let seq = s.sequence();
@@ -421,10 +425,37 @@ mod tests {
             optimizer_state_per_element: 2,
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
+            refiner_layers: 0,
             training_adapter: TrainingAdapterBytes::default(),
             checkpointed,
             chunked_attention: true,
             preview: None,
+        }
+    }
+
+    /// A trained refiner (SW-F369) adds the shared envelope's retained refiner forward to the
+    /// step: exactly, streamed (where the step's terms set the phase), and never less, resident
+    /// (where the AdaLN precompute can still be the phase's larger term).
+    #[test]
+    fn a_trained_refiner_adds_its_retained_caption_forward() {
+        let c = contract();
+        let facts = ImageMemoryFacts::derived(Some(4));
+        let t = tier(Some(Quant::Q4));
+        for checkpointed in [true, false] {
+            let frozen = run(checkpointed);
+            let trained = TrainingRunShape {
+                refiner_layers: 2,
+                ..frozen.clone()
+            };
+            let a = estimate_training(&c, &facts, &facts, t, &frozen).unwrap();
+            let b = estimate_training(&c, &facts, &facts, t, &trained).unwrap();
+            let shared = b.step.retained - a.step.retained;
+            assert!(shared > 0);
+            if checkpointed {
+                assert_eq!(b.train - a.train, shared);
+            } else {
+                assert!(b.train >= a.train);
+            }
         }
     }
 

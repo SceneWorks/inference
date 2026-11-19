@@ -95,8 +95,8 @@ use mlx_gen::{
 };
 
 use gen_core_train::h3_image::{
-    adapter_surface, target_block, trainer_descriptor, training_canvas, training_step,
-    ADAPTER_PROVENANCE, EDIT_ADAPTER_MARKER, TRAINER_ID,
+    adapter_surface, refiner_block, target_block, trainer_descriptor, training_canvas,
+    training_step, ADAPTER_PROVENANCE, EDIT_ADAPTER_MARKER, TRAINER_ID,
 };
 
 use crate::dit::config::MiniMaxH3ImageDitConfig;
@@ -252,6 +252,9 @@ fn adapter_elements(
         };
         total += elements.max(0) as u64;
         if cfg.network_type == NetworkType::Lokr {
+            // A refiner leaf's dense delta is installed on the trunk for the whole step, beside
+            // whichever block is live, so it is priced with block 0's (an upper bound on the live
+            // window: the shared envelope doubles the largest block's).
             *per_block
                 .entry(target_block(path).unwrap_or(0))
                 .or_default() += (out_f * in_f).max(0) as u64;
@@ -261,8 +264,47 @@ fn adapter_elements(
     Ok((total, block_max, per_block.values().sum()))
 }
 
-/// Per block, an adapter over that block's targets (bookkeeping only — the live factors come from
-/// `params` under the same keys) and the factor keys it reads.
+/// An adapter over `local`'s targets (bookkeeping only — the live factors come from `params` under
+/// the same keys) and the factor keys it reads; no adapter when `local` is empty.
+fn trainables_for(
+    dit: &mut MiniMaxH3ImageDit,
+    local: &[String],
+    params: &LoraParams,
+    cfg: &TrainingConfig,
+) -> Result<BlockTrainables> {
+    if local.is_empty() {
+        return Ok(BlockTrainables {
+            adapter: None,
+            keys: Vec::new(),
+        });
+    }
+    let adapter = match cfg.network_type {
+        NetworkType::Lora => TrainAdapter::Lora {
+            targets: build_lora_targets(dit, local, cfg.rank as i32, 0)?.0,
+        },
+        NetworkType::Lokr => TrainAdapter::Lokr {
+            targets: build_lokr_targets(dit, local, cfg.rank as i32, cfg.decompose_factor, 0)?.0,
+        },
+    };
+    let mut keys: Vec<Rc<str>> = params
+        .keys()
+        .filter(|key| {
+            local.iter().any(|path| {
+                key.strip_prefix(path.as_str())
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .is_some_and(|factor| !factor.contains('.'))
+            })
+        })
+        .cloned()
+        .collect();
+    keys.sort();
+    Ok(BlockTrainables {
+        adapter: Some(adapter),
+        keys,
+    })
+}
+
+/// Per block, the trainables of that block's targets ([`trainables_for`]).
 fn block_trainables(
     dit: &mut MiniMaxH3ImageDit,
     paths: &[String],
@@ -276,40 +318,33 @@ fn block_trainables(
             .filter(|p| target_block(p) == Some(index))
             .cloned()
             .collect();
-        if local.is_empty() {
-            out.push(BlockTrainables {
-                adapter: None,
-                keys: Vec::new(),
-            });
-            continue;
-        }
-        let adapter = match cfg.network_type {
-            NetworkType::Lora => TrainAdapter::Lora {
-                targets: build_lora_targets(dit, &local, cfg.rank as i32, 0)?.0,
-            },
-            NetworkType::Lokr => TrainAdapter::Lokr {
-                targets: build_lokr_targets(dit, &local, cfg.rank as i32, cfg.decompose_factor, 0)?
-                    .0,
-            },
-        };
-        let mut keys: Vec<Rc<str>> = params
-            .keys()
-            .filter(|key| {
-                local.iter().any(|path| {
-                    key.strip_prefix(path.as_str())
-                        .and_then(|rest| rest.strip_prefix('.'))
-                        .is_some_and(|factor| !factor.contains('.'))
-                })
-            })
-            .cloned()
-            .collect();
-        keys.sort();
-        out.push(BlockTrainables {
-            adapter: Some(adapter),
-            keys,
-        });
+        out.push(trainables_for(dit, &local, params, cfg)?);
     }
     Ok(out)
+}
+
+/// The token-refiner targets' trainables (SW-F369), installed on the trunk's refiner every step.
+fn refiner_trainables(
+    dit: &mut MiniMaxH3ImageDit,
+    paths: &[String],
+    params: &LoraParams,
+    cfg: &TrainingConfig,
+) -> Result<BlockTrainables> {
+    let local: Vec<String> = paths
+        .iter()
+        .filter(|p| refiner_block(p).is_some())
+        .cloned()
+        .collect();
+    trainables_for(dit, &local, params, cfg)
+}
+
+/// Token-refiner blocks `paths` train (distinct block indices).
+fn refiner_layers(paths: &[String]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| refiner_block(p))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64
 }
 
 /// The request-derived setup every phase of one run reads.
@@ -411,6 +446,7 @@ impl MiniMaxH3ImageTrainer {
             optimizer_state_per_element: optimizer_state_per_element(&cfg.optimizer),
             lokr_delta_block_max: block_max,
             lokr_delta_total: total,
+            refiner_layers: refiner_layers(&plan.target_paths),
             training_adapter: training_adapter_bytes(&self.spec, cfg.training_adapter.as_deref())?,
             checkpointed: plan.checkpointed,
             chunked_attention: true,
@@ -610,6 +646,7 @@ impl MiniMaxH3ImageTrainer {
 
         let (adapter, params) = build_adapter(&mut dit, &plan.target_paths, cfg)?;
         let blocks = block_trainables(&mut dit, &plan.target_paths, &params, cfg)?;
+        let refiner = refiner_trainables(&mut dit, &plan.target_paths, &params, cfg)?;
         let identity = checkpoint::ResumeIdentity {
             config: cfg,
             request_fingerprint: &admission.fingerprint,
@@ -624,6 +661,7 @@ impl MiniMaxH3ImageTrainer {
             adapter: &adapter,
             frozen: &frozen,
             blocks: &blocks,
+            refiner: &refiner,
             alpha: cfg.alpha,
             rank: cfg.rank as f32,
             mae: mae_loss(&cfg.loss_type, LossTypeFold::Normalized),

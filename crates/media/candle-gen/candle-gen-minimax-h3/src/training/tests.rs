@@ -6,11 +6,21 @@ fn cfg() -> MiniMaxH3DitConfig {
     MiniMaxH3DitConfig::image()
 }
 
+/// ai-toolkit's surface: every DiT-block and token-refiner-block leaf, so a default run refines
+/// the caption every step.
 #[test]
-fn the_default_targets_are_every_block_leaf() {
+fn the_default_targets_are_every_dit_and_refiner_block_leaf() {
     let paths = resolve_target_paths(&cfg(), &TrainingConfig::default()).unwrap();
-    assert_eq!(paths.len(), 50 * 6);
-    assert!(paths.iter().all(|p| target_block(p).is_some()));
+    assert_eq!(paths.len(), (50 + 2) * 6);
+    assert_eq!(
+        paths.iter().filter(|p| target_block(p).is_some()).count(),
+        300
+    );
+    assert_eq!(refiner_layers(&paths), 2);
+    assert!(trains_refiner(&paths));
+    for p in &paths {
+        leaf_shape(&cfg(), p).unwrap();
+    }
 }
 
 /// The trainer resolves its targets over exactly the surface the SW-7096 install addresses, so
@@ -92,18 +102,21 @@ fn adapter_elements_count_what_the_install_trains() {
         rank: 16,
         ..TrainingConfig::default()
     };
-    let (n, _, _) = adapter_elements(&c, &paths, &lora).unwrap();
+    let e = adapter_elements(&c, &paths, &lora).unwrap();
+    // 50 DiT blocks and 2 refiner blocks, the same six leaves at the same widths.
     assert_eq!(
-        n,
-        50 * 16 * (3 * (5376 + 7168) + (7168 + 5376) + (5376 + 2 * 14336) + (14336 + 5376))
+        e.trainable,
+        52 * 16 * (3 * (5376 + 7168) + (7168 + 5376) + (5376 + 2 * 14336) + (14336 + 5376))
     );
+    assert_eq!((e.lokr_block_max, e.lokr_total, e.lokr_refiner), (0, 0, 0));
     let lokr = TrainingConfig {
         rank: 16,
         network_type: NetworkType::Lokr,
         ..TrainingConfig::default()
     };
-    let (n, block_max, total) = adapter_elements(&c, &paths, &lokr).unwrap();
-    assert!(n > 0);
+    let e = adapter_elements(&c, &paths, &lokr).unwrap();
+    let (block_max, total) = (e.lokr_block_max, e.lokr_total);
+    assert!(e.trainable > 0);
     // Per row, each leaf's vec-trick intermediate `in_a · out_b` — never the dense `[out, in]`.
     let row = |out_f: usize, in_f: usize| -> u64 {
         let (_, out_b) = factorization(out_f, -1);
@@ -111,14 +124,34 @@ fn adapter_elements_count_what_the_install_trains() {
         (in_a * out_b) as u64
     };
     let block = 3 * row(7168, 5376) + row(5376, 7168) + row(2 * 14336, 5376) + row(5376, 14336);
+    // The refiner's intermediates are per caption row, counted apart from the DiT blocks' maximum
+    // and inside the total.
     assert_eq!(block_max, block);
-    assert_eq!(total, 50 * block);
+    assert_eq!(e.lokr_refiner, 2 * block);
+    assert_eq!(total, 52 * block);
     assert!(block < 7168 * 5376);
     assert_eq!(
         leaf_shape(&c, "transformer_blocks.3.ff.net.0.proj").unwrap(),
         (2 * 14336, 5376)
     );
+    assert_eq!(
+        leaf_shape(&c, "token_refiner.refiner_blocks.1.attn.to_out.0").unwrap(),
+        (5376, 7168)
+    );
     assert!(leaf_shape(&c, "proj_in").is_err());
+    // A block-only target list leaves the refiner constant: nothing refined per step.
+    let blocks_only: Vec<String> = paths
+        .iter()
+        .filter(|p| target_block(p).is_some())
+        .cloned()
+        .collect();
+    assert_eq!(refiner_layers(&blocks_only), 0);
+    assert_eq!(
+        adapter_elements(&c, &blocks_only, &lokr)
+            .unwrap()
+            .lokr_refiner,
+        0
+    );
 }
 
 /// The six heads a step trains through are the render's six steps: the published sigma grid and

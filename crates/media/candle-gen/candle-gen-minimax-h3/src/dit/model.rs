@@ -472,6 +472,13 @@ impl MiniMaxH3Dit {
     ///
     /// `context` is `[1, num_text_tokens, text_dim]`, the text encoder's select-layer hidden state.
     pub fn embed_context(&self, context: &Tensor) -> Result<Tensor> {
+        self.refine_text(&self.embed_context_rows(context)?)
+    }
+
+    /// `context_embedder` alone, cast to the stream dtype — the first half of
+    /// [`Self::embed_context`]. A trainer that differentiates the token refiner (SW-F369) caches
+    /// these frozen rows once per item and runs [`Self::refine_text`] every step.
+    pub(crate) fn embed_context_rows(&self, context: &Tensor) -> Result<Tensor> {
         let s = context.dims();
         if s.len() != 3 || s[0] != 1 || s[2] != self.cfg.text_dim {
             return Err(CandleError::Msg(format!(
@@ -479,8 +486,17 @@ impl MiniMaxH3Dit {
                 self.cfg.text_dim
             )));
         }
-        let embedded = self.projections.context_embedder.forward(context)?;
-        self.refiner.forward(&embedded.to_dtype(self.dtype)?)
+        Ok(self
+            .projections
+            .context_embedder
+            .forward(context)?
+            .to_dtype(self.dtype)?)
+    }
+
+    /// The token refiner over [`Self::embed_context_rows`]'s output — the second half of
+    /// [`Self::embed_context`].
+    pub(crate) fn refine_text(&self, embedded: &Tensor) -> Result<Tensor> {
+        self.refiner.forward(embedded)
     }
 
     /// The timestep MLP, as the closure [`AdaLnCache::precompute`] consumes.

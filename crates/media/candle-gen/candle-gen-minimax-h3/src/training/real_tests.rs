@@ -19,7 +19,7 @@ use candle_gen::gen_core::CancelFlag;
 
 use gen_core_train::h3_image::distilled_step;
 
-use super::step::{diagnostics, loss_and_grads, noised_rows, StepInputs};
+use super::step::{diagnostics, loss_and_grads, noised_rows, StepInputs, StepText};
 use super::{install_adapters, LoraSet};
 use crate::dit::model::image_modulation;
 use crate::dit::MiniMaxH3Dit;
@@ -87,14 +87,18 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         .timesteps()
         .to_vec();
 
-    // Two blocks' attention query and FFN output projections, rank 4, the up factors moved off
-    // zero so every factor has a gradient.
+    // Two blocks' attention query and FFN output projections, and the same two leaves of both
+    // token-refiner blocks (SW-F369: the step refines the caption under autograd, and the
+    // checkpointed chain hands the refiner its gradient through the stack-input cotangent), rank 4,
+    // the up factors moved off zero so every factor has a gradient.
     let paths: Vec<String> = [0usize, 1]
         .iter()
         .flat_map(|i| {
             [
                 format!("transformer_blocks.{i}.attn.to_q"),
                 format!("transformer_blocks.{i}.ff.net.2"),
+                format!("token_refiner.refiner_blocks.{i}.attn.to_q"),
+                format!("token_refiner.refiner_blocks.{i}.ff.net.2"),
             ]
         })
         .collect();
@@ -128,16 +132,16 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
     let x0 = normal(&[1, rows, 96], 2, 1.0, &device);
     let noise = normal(&[1, rows, 96], 3, 1.0, &device);
     let (packed, target) = noised_rows(&x0, &noise, step).unwrap();
-    let text_s = streamed.embed_context(&context).unwrap();
+    let text_s = streamed.embed_context_rows(&context).unwrap();
     fn inputs<'a>(
-        text_rows: &'a Tensor,
+        embedded: &'a Tensor,
         layout: &'a ImageLayout,
         packed: &'a Tensor,
         target: &'a Tensor,
         step: gen_core_train::h3_image::TrainingStep,
     ) -> StepInputs<'a> {
         StepInputs {
-            text_rows,
+            text: StepText::Embedded(embedded),
             layout,
             packed,
             target,
@@ -320,7 +324,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
     let set_r = install_adapters(&mut resident, &paths, &cfg, &device).unwrap();
     assign(&set_r, &params);
     let modulation_r = image_modulation(&mut resident, &timesteps, false, &cancel).unwrap();
-    let text_r = resident.embed_context(&context).unwrap();
+    let text_r = resident.embed_context_rows(&context).unwrap();
     let (loss_r, grads_r) = loss_and_grads(
         &resident,
         &modulation_r,

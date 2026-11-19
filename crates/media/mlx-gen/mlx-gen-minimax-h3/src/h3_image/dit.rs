@@ -280,6 +280,13 @@ impl MiniMaxH3ImageDit {
     /// `context_embedder` then the token refiner: the text rows of the packed sequence.
     /// `context` is `[1, num_text_tokens, text_dim]`, the text encoder's layer-50 hidden state.
     pub fn embed_context(&self, context: &Array) -> Result<Array> {
+        self.refine_text(&self.embed_context_rows(context)?)
+    }
+
+    /// `context_embedder` alone, cast to the stream dtype — the first half of
+    /// [`Self::embed_context`]. A trainer that differentiates the token refiner (SW-F369) computes
+    /// these frozen rows once per step and runs [`Self::refine_text`] under the trace.
+    pub(crate) fn embed_context_rows(&self, context: &Array) -> Result<Array> {
         let s = context.shape();
         if s.len() != 3 || s[0] != 1 || s[2] != self.cfg.base.text_dim {
             return Err(Error::Msg(format!(
@@ -287,8 +294,17 @@ impl MiniMaxH3ImageDit {
                 self.cfg.base.text_dim
             )));
         }
-        let embedded = self.projections.context_embedder.forward(context)?;
-        self.refiner.forward(&embedded.as_dtype(self.dtype)?)
+        Ok(self
+            .projections
+            .context_embedder
+            .forward(context)?
+            .as_dtype(self.dtype)?)
+    }
+
+    /// The token refiner over [`Self::embed_context_rows`]'s output — the second half of
+    /// [`Self::embed_context`].
+    pub(crate) fn refine_text(&self, embedded: &Array) -> Result<Array> {
+        self.refiner.forward(embedded)
     }
 }
 
