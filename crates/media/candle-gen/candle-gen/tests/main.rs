@@ -61,6 +61,9 @@ mod nvfp4_linear_gpu;
 #[path = "nvfp4_w4a4_ondevice_gpu.rs"]
 mod nvfp4_w4a4_ondevice_gpu;
 
+#[path = "quantized_workspace_graph.rs"]
+mod quantized_workspace_graph;
+
 #[path = "rung4_block_streaming_spike.rs"]
 mod rung4_block_streaming_spike;
 

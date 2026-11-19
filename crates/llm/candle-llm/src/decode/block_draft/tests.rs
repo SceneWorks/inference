@@ -231,6 +231,70 @@ fn greedy_block_draft_is_the_plain_loop() {
     println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_block_draft_is_the_plain_loop");
 }
 
+/// SW-7197 (the DSpine greedy defect): a greedy block draft drafts exactly the same with the
+/// CUDA-graph runner on as with it off — the same tokens, and the same target passes, proposed and
+/// accepted counts (the draft runs eager either way, so a difference means a replay wrote memory
+/// the draft reads). The 27B defect: the cold request captured its verify step while the target's
+/// quantized matmuls read the shared, grows-only Q8_1 scratch workspace; a later eager call (the
+/// draft's first wide commit) grew it and freed the slice the graph kept, and every replay then
+/// wrote its activations over whatever the allocator put there next. The fixture follows that
+/// order: a Q8_0 target (its verify graph runs the quantized kernels), a Q8_0 draft that taps all
+/// four target layers (its input projection reads 4 × 64 columns, twice any target projection),
+/// a two-token prompt (the warm-up projects two rows) and depth 5, so the first commits after the
+/// capture run the request's widest quantized matmul. Graphs on runs first. The direct proof of the
+/// mechanism is `candle-gen`'s `quantized_workspace_graph`; this one holds the product path. A
+/// `cuda` build only: without one there is no graph runner and the two runs are the same run.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off() {
+    let (_guard, device) = proof_device();
+    let model = crate::models::block_draft::tests::tiny_target_quantized_on(
+        &device,
+        true,
+        Some(crate::primitives::projection::QuantSpec::q8()),
+    );
+    let prompt = [3, 9];
+    let cfg = config(40, 7);
+    for format in BlockDraftFormat::ALL {
+        let mut draft_cfg = tiny_config(format);
+        draft_cfg.target_layer_ids = vec![0, 1, 2, 3];
+        let draft = tiny_draft_on(draft_cfg, Some(BlockDraftPrecision::Q8), &device);
+        let target = TappedQwen35::for_draft(&model, &draft);
+        let run = |graphs: bool| {
+            let _scope = crate::decode::cuda_graphs_scope(Some(graphs));
+            let mut proposer = BlockDraftProposer::new(&draft, &model);
+            run_block(&target, &mut proposer, &prompt, &cfg, 5, None).0
+        };
+        let on = run(true);
+        let off = run(false);
+        let label = format!("{format:?}");
+        assert_eq!(on.output.tokens, off.output.tokens, "{label}: the tokens");
+        let counts = |r: &SpeculativeRun| {
+            (
+                r.record.verify_steps,
+                r.record.proposed_tokens,
+                r.record.accepted_tokens,
+            )
+        };
+        assert_eq!(
+            counts(&on),
+            counts(&off),
+            "{label}: (target passes, proposed, accepted) with graphs on against off"
+        );
+        assert!(on.record.proposed_tokens > 0, "{label}: the draft proposes");
+        assert_eq!(off.record.cuda_graphs.replayed, 0, "{label}: graphs off");
+        assert!(
+            on.record.cuda_graphs.replayed > 0,
+            "{label}: the verify steps replay ({:?})",
+            on.record.cuda_graphs
+        );
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off");
+}
+
 /// A non-causal draft runs its trained block whatever the depth, shortened only at the token
 /// budget's end; a causal one runs the anchor and the rows it proposes.
 #[test]
