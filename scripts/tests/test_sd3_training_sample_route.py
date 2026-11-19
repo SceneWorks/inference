@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -130,9 +131,12 @@ class Sd3TrainingSampleRoute(unittest.TestCase):
         binding = assets.selected_binding(SELECTION)
         self.assertEqual(binding, assets.selected_binding(SELECTION.replace("/trainer_", "/integration/trainer_")))
         self.assertEqual(set(binding), {"SD35_MEDIUM_TRAIN_SNAPSHOT", "SD35_MEDIUM_SAMPLE_SNAPSHOT"})
-        self.assertEqual(binding["SD35_MEDIUM_TRAIN_SNAPSHOT"], assets.snapshot(
-            "stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80"))
-        self.assertEqual(binding["SD35_MEDIUM_SAMPLE_SNAPSHOT"], assets.snapshot(
+        models = {row["key"]: row for row in tomllib.loads(
+            (ROOT / "release/real-weight-models.toml").read_text(encoding="utf-8"))["models"]}
+        train, sample = binding["SD35_MEDIUM_TRAIN_SNAPSHOT"], binding["SD35_MEDIUM_SAMPLE_SNAPSHOT"]
+        self.assertEqual((models[train.model]["repository"], models[train.model]["revision"], train.path), (
+            "stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80", ""))
+        self.assertEqual((models[sample.model]["repository"], models[sample.model]["revision"], sample.path), (
             "SceneWorks/sd3.5-medium-mlx", "5413e962bb326db248be2026a93b147c323392b6", "bf16"))
         for selection in ("candle-gen-sd3", "all", SELECTION.replace("medium", "large")):
             with self.assertRaises(ValueError):
@@ -147,9 +151,12 @@ class Sd3TrainingSampleRoute(unittest.TestCase):
             (train / "metadata-fixture.safetensors").write_bytes(b"metadata fixture only")
             export = root / "github-env"
             binding = {"SD35_MEDIUM_TRAIN_SNAPSHOT": train, "SD35_MEDIUM_SAMPLE_SNAPSHOT": sample}
+            inputs = {name: assets.Input(name.lower()) for name in binding}
             environment = {"MODEL_PROOF_REQUEST": json.dumps({"selection": SELECTION, "configuration": "fixed_cuda"}),
                            "GITHUB_ENV": str(export)}
-            with patch.dict(assets.BINDINGS, {SELECTION: binding}, clear=True), patch.dict(os.environ, environment):
+            # The runner-cache materialization is stubbed to these directories; no download happens.
+            with patch.dict(assets.BINDINGS, {SELECTION: inputs}, clear=True), patch.dict(os.environ, environment), \
+                    patch.object(assets, "materialize", lambda selected: {name: binding[name] for name in selected}):
                 with self.assertRaisesRegex(ValueError, "SD35_MEDIUM_SAMPLE_SNAPSHOT"):
                     assets.main()
                 self.assertFalse(export.exists())

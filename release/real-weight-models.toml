@@ -3626,3 +3626,868 @@ download_files = [
     "tokenizer_config.json",
     "video_preprocessor_config.json",
 ]
+
+# SW-7217 — the pinned inputs of the explicit Windows CUDA model-inference proofs
+# (`.github/workflows/model-inference-proofs.yml` asset setups bespoke-training, cohort-training,
+# krea-native-nvfp4-pose and krea-training; the bindings live in
+# scripts/ci/prepare_{bespoke_training,cohort_training,krea}_proof_assets.py). Each row lists only
+# the files its reader opens, so a missing input is fetched as that slice into the runner's hub
+# cache and a complete one transfers nothing.
+
+[[models]]
+# the base DiT, Qwen3 0.6B encoder and VAE (candle-gen-anima/src/loader.rs:32-33,352,402,406);
+# tokenizers are compiled in (src/tokenizer.rs:20-22); the other six DiT checkpoints are not read
+key = "anima-base-train-proof"
+repository = "circlestone-labs/Anima"
+revision = "53eec3898af698b2cf2a11379021fc9c5465d228"
+license = "Circlestone Labs Non-Commercial License"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["ANIMA_TRAIN_SNAPSHOT"]
+download_files = [
+    "split_files/diffusion_models/anima-base-v1.0.safetensors",
+    "split_files/text_encoders/qwen_3_06b_base.safetensors",
+    "split_files/vae/qwen_image_vae.safetensors",
+]
+expected_files = [
+    "split_files/diffusion_models/anima-base-v1.0.safetensors",
+    "split_files/text_encoders/qwen_3_06b_base.safetensors",
+    "split_files/vae/qwen_image_vae.safetensors",
+]
+
+[[models]]
+# the bf16 transformer only (candle-gen-mage/src/lib.rs:112, src/training.rs:897); its encoder and
+# VAE come from the components row below
+key = "mage-flow-base-bf16-train-proof"
+repository = "SceneWorks/Mage-Flow-Base"
+revision = "d642341926fcdb450c17c8fbda03759e8f731c9b"
+license = "MIT"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["MAGE_BASE_TRAIN_SNAPSHOT"]
+download_files = [
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# bf16/text_encoder and bf16/vae (candle-gen-mage/src/text_encoder.rs:67,110, src/vae.rs:531,
+# candle-gen-boogu/src/loader.rs:184)
+key = "mage-flow-components-bf16-train-proof"
+repository = "SceneWorks/Mage-Flow-Components-mlx"
+revision = "c936de2a107ee8d0869137e73943f6414f23adaa"
+license = "MIT"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["MAGE_TRAIN_TEXT_ENCODER", "MAGE_TRAIN_VAE"]
+download_files = [
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/text_encoder/tokenizer.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/text_encoder/tokenizer.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the Base transformer; every other component comes from the SFT row (candle-gen-moss-
+# image/src/loader.rs:395-417, tests/real_weights.rs:52-58)
+key = "moss-image-base-transformer-proof"
+repository = "OpenMOSS-Team/MOSS-Image-Base"
+revision = "1ceede80badddd6a7812069619edaa5633587192"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["MOSS_BASE_SNAPSHOT"]
+download_files = [
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+]
+expected_files = [
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+]
+
+[[models]]
+# the shared encoder, tokenizer, scheduler and VAE the test hash-pins (gen-
+# core/src/moss_image.rs:982-1000, candle-gen-moss-image/tests/real_weights.rs:75-79)
+key = "moss-image-sft-shared-proof"
+repository = "OpenMOSS-Team/MOSS-Image-SFT"
+revision = "fc5de0d56fc910cbca6f6625a70f5f582b26deb1"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["MOSS_SHARED_SNAPSHOT"]
+download_files = [
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/model-00001-of-00004.safetensors",
+    "text_encoder/model-00002-of-00004.safetensors",
+    "text_encoder/model-00003-of-00004.safetensors",
+    "text_encoder/model-00004-of-00004.safetensors",
+    "tokenizer/tokenizer.json",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/model-00001-of-00004.safetensors",
+    "text_encoder/model-00002-of-00004.safetensors",
+    "text_encoder/model-00003-of-00004.safetensors",
+    "text_encoder/model-00004-of-00004.safetensors",
+    "tokenizer/tokenizer.json",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the package's root DiT and autoencoder plus its bundled encoder, each identity-hashed (gen-core-
+# flux3/src/lib.rs:76,93,823-857, src/training/identity.rs:55-56,136-147); transformer/, vae/ and
+# variants/ are not read
+key = "flux3-image-klein-base-proof"
+repository = "black-forest-labs/flux-3-image-klein-base"
+revision = "1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4"
+requires_auth = true
+license = "FLUX Kommunity License v1.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["FLUX3_BASE_PACKAGE_DIR"]
+download_files = [
+    "config.json",
+    "model.safetensors",
+    "ae.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/chat_template.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+]
+expected_files = [
+    "config.json",
+    "model.safetensors",
+    "ae.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/chat_template.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+]
+
+[[models]]
+# the generation export (candle-gen-iris/src/train/mod.rs:169-172, gen-core-iris/src/lib.rs:177)
+key = "iris-3b-generation-proof"
+repository = "speridlabs/iris-3b"
+revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["IRIS_WEIGHTS_DIR"]
+download_files = ["config.yaml", "model.safetensors"]
+expected_files = ["config.yaml", "model.safetensors"]
+
+[[models]]
+# the depth export alone; no root export or text encoder (candle-gen-
+# iris/src/train/depth.rs:127,150-161)
+key = "iris-3b-depth-proof"
+repository = "speridlabs/iris-3b"
+revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["IRIS_DEPTH_DIR"]
+download_files = [
+    "depth/config.yaml",
+    "depth/model.safetensors",
+    "depth/empty_prompt.safetensors",
+]
+expected_files = [
+    "depth/config.yaml",
+    "depth/model.safetensors",
+    "depth/empty_prompt.safetensors",
+]
+
+[[models]]
+# the restoration export alone (candle-gen-iris/src/restoration_train.rs:1503-1510)
+key = "iris-3b-upscaler-proof"
+repository = "speridlabs/iris-3b"
+revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["IRIS_UPSCALER_DIR"]
+download_files = [
+    "upscaler/config.yaml",
+    "upscaler/model.safetensors",
+    "upscaler/empty_prompt.safetensors",
+]
+expected_files = [
+    "upscaler/config.yaml",
+    "upscaler/model.safetensors",
+    "upscaler/empty_prompt.safetensors",
+]
+
+[[models]]
+# the diffusers components the control trainer globs (candle-gen-
+# krea/src/control_trainer.rs:172,177,236, src/config.rs:92,108, src/lib.rs:146); the root
+# turbo.safetensors is not read
+key = "krea-2-turbo-control-train-proof"
+repository = "krea/Krea-2-Turbo"
+revision = "1161245028ef398cd0a951101b2bbf486464f841"
+requires_auth = true
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["KREA_CONTROL_BASE_DIR"]
+download_files = [
+    "model_index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "tokenizer/tokenizer.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "model_index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "tokenizer/tokenizer.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the one imported native NVFP4 DiT file (candle-gen-krea/src/loader.rs:302-311)
+key = "krea-2-comfy-turbo-nvfp4-proof"
+repository = "Comfy-Org/Krea-2"
+revision = "952f49d49653cb42e7d6cf7cbfad74738073ec7d"
+license = "Krea 2 Community License"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["KREA_IMPORTED_DIT"]
+download_files = ["diffusion_models/krea2_turbo_nvfp4.safetensors"]
+expected_files = ["diffusion_models/krea2_turbo_nvfp4.safetensors"]
+
+[[models]]
+# the base around an imported DiT: no bf16 transformer shards, whose weights come from the
+# imported file (candle-gen-krea/src/control_provider.rs:360,580,619,654-656,676-683,
+# src/config.rs:92,108)
+key = "krea-2-turbo-mlx-bf16-pose-proof"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["KREA_BASE_SNAPSHOT"]
+download_files = [
+    "bf16/model_index.json",
+    "bf16/transformer/config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "bf16/model_index.json",
+    "bf16/transformer/config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the step-5000 pose branch; its sidecar json is not read (candle-gen-krea/src/control.rs:428-447)
+key = "krea2-pose-controlnet-beta-proof"
+repository = "SceneWorks/krea2-pose-controlnet-beta"
+revision = "cb3a0ac7590f5ec594a4eeb43b95ee1da0b5a0ac"
+license = "SceneWorks experimental research-only (Hub tag `other`)"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["KREA_CONTROL_BRANCH"]
+download_files = ["control_step5000.safetensors"]
+expected_files = ["control_step5000.safetensors"]
+
+[[models]]
+# the trainer and adapter reload (candle-gen-krea/src/training.rs:655-664,759-760,
+# src/config.rs:92,108); the index proves the three shards; the root raw.safetensors is not read
+key = "krea-2-raw-train-proof"
+repository = "krea/Krea-2-Raw"
+revision = "4ad9f4b627a647fad78b3dfeebb09f2654aeb494"
+requires_auth = true
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["KREA_RAW_DIR"]
+download_files = [
+    "model_index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "tokenizer/tokenizer.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "model_index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "tokenizer/tokenizer.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# every *.safetensors of each component is globbed, so all three encoder shards (candle-gen-
+# lens/src/training.rs:615-629,755-760, src/lib.rs:226-238)
+key = "lens-base-train-proof"
+repository = "SceneWorks/Lens"
+revision = "5c5521d4417a3cae55816929ece69319d1e7712a"
+license = "MIT"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["LENS_BASE_SNAPSHOT"]
+download_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/config.json",
+    "text_encoder/model-00000-of-00002.safetensors",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "transformer/lens_bf16.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/config.json",
+    "text_encoder/model-00000-of-00002.safetensors",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "transformer/lens_bf16.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the trainer and adapter render (candle-gen-z-image/src/training.rs:361-367,629-640,
+# src/pipeline.rs:90-104,1094-1143)
+key = "z-image-turbo-train-proof"
+repository = "Tongyi-MAI/Z-Image-Turbo"
+revision = "f332072aa78be7aecdf3ee76d5c247082da564a6"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["Z_IMAGE_SNAPSHOT"]
+download_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/config.json",
+    "text_encoder/model-00001-of-00003.safetensors",
+    "text_encoder/model-00002-of-00003.safetensors",
+    "text_encoder/model-00003-of-00003.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/config.json",
+    "text_encoder/model-00001-of-00003.safetensors",
+    "text_encoder/model-00002-of-00003.safetensors",
+    "text_encoder/model-00003-of-00003.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# both experts are trained and rendered (candle-gen-
+# wan/src/training.rs:830-840,900-970,1156-1159,1283-1311, src/wan14b.rs:393-400)
+key = "wan2.2-t2v-a14b-train-proof"
+repository = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+revision = "5be7df9619b54f4e2667b2755bc6a756675b5cd7"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["WAN_T2V_14B_SNAPSHOT"]
+download_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/model-00001-of-00003.safetensors",
+    "text_encoder/model-00002-of-00003.safetensors",
+    "text_encoder/model-00003-of-00003.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00004-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00005-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00006-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00007-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00008-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00009-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00010-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00011-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00012-of-00012.safetensors",
+    "transformer_2/config.json",
+    "transformer_2/diffusion_pytorch_model-00001-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00002-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00003-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00004-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00005-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00006-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00007-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00008-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00009-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00010-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00011-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00012-of-00012.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/model-00001-of-00003.safetensors",
+    "text_encoder/model-00002-of-00003.safetensors",
+    "text_encoder/model-00003-of-00003.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00004-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00005-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00006-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00007-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00008-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00009-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00010-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00011-of-00012.safetensors",
+    "transformer/diffusion_pytorch_model-00012-of-00012.safetensors",
+    "transformer_2/config.json",
+    "transformer_2/diffusion_pytorch_model-00001-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00002-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00003-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00004-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00005-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00006-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00007-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00008-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00009-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00010-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00011-of-00012.safetensors",
+    "transformer_2/diffusion_pytorch_model-00012-of-00012.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the single expert, z48 VAE and encoder (candle-gen-
+# wan/src/training.rs:830-834,900-944,1158-1163, src/lib.rs:303-420)
+key = "wan2.2-ti2v-5b-train-proof"
+repository = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+revision = "b8fff7315c768468a5333511427288870b2e9635"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["WAN_TI2V_5B_TRAIN_SNAPSHOT"]
+download_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/model-00001-of-00003.safetensors",
+    "text_encoder/model-00002-of-00003.safetensors",
+    "text_encoder/model-00003-of-00003.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00004-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00005-of-00005.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "tokenizer/tokenizer.json",
+    "text_encoder/model-00001-of-00003.safetensors",
+    "text_encoder/model-00002-of-00003.safetensors",
+    "text_encoder/model-00003-of-00003.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00004-of-00005.safetensors",
+    "transformer/diffusion_pytorch_model-00005-of-00005.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the q4 tier without its audio VAE/vocoder, and the Gemma shards/tokenizer (candle-gen-
+# ltx/src/tier.rs:125-160,258-264, src/training.rs:3480-3500, src/lib.rs:738-780,2229)
+key = "ltx-2.3-mlx-q4-train-proof"
+repository = "SceneWorks/ltx-2.3-mlx"
+revision = "254989c3ca7ee691187647f350b112c0c448789d"
+license = "LTX-2 Community License"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["LTX_TRAINING_TIER", "LTX_GEMMA_DIR"]
+download_files = [
+    "q4/split_model.json",
+    "q4/quantize_config.json",
+    "q4/transformer.safetensors",
+    "q4/connector.safetensors",
+    "q4/vae_decoder.safetensors",
+    "q4/vae_encoder.safetensors",
+    "q4/upsampler.safetensors",
+    "gemma/model-00001-of-00005.safetensors",
+    "gemma/model-00002-of-00005.safetensors",
+    "gemma/model-00003-of-00005.safetensors",
+    "gemma/model-00004-of-00005.safetensors",
+    "gemma/model-00005-of-00005.safetensors",
+    "gemma/tokenizer.json",
+]
+expected_files = [
+    "q4/split_model.json",
+    "q4/quantize_config.json",
+    "q4/transformer.safetensors",
+    "q4/connector.safetensors",
+    "q4/vae_decoder.safetensors",
+    "q4/vae_encoder.safetensors",
+    "q4/upsampler.safetensors",
+    "gemma/model-00001-of-00005.safetensors",
+    "gemma/model-00002-of-00005.safetensors",
+    "gemma/model-00003-of-00005.safetensors",
+    "gemma/model-00004-of-00005.safetensors",
+    "gemma/model-00005-of-00005.safetensors",
+    "gemma/tokenizer.json",
+]
+
+[[models]]
+# the dev q4 bundle, whose validation requires all twelve components (candle-gen-
+# ltx/src/tier.rs:943-958,1107-1131, src/training.rs:2102-2110,3591-3595); no other tier
+key = "ltx-2.5-mlx-dev-q4-train-proof"
+repository = "SceneWorks/ltx-2.5-mlx"
+revision = "081658ce6886cacba20817ce0359bbefef706ff2"
+license = "LTX-2 Community License Agreement"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["LTX25_TRAINING_TIER"]
+download_files = [
+    "dev/q4/split_model.json",
+    "dev/q4/transformer.safetensors",
+    "dev/q4/text_encoder.safetensors",
+    "dev/q4/connector.safetensors",
+    "dev/q4/vae_decoder.safetensors",
+    "dev/q4/vae_encoder.safetensors",
+    "dev/q4/diffusion_vae_encoder.safetensors",
+    "dev/q4/vae_diffusion_decoder.safetensors",
+    "dev/q4/audio_vae.safetensors",
+    "dev/q4/vocoder.safetensors",
+    "dev/q4/spatial_upsampler.safetensors",
+    "dev/q4/temporal_upsampler.safetensors",
+    "dev/q4/duration_head.safetensors",
+]
+expected_files = [
+    "dev/q4/split_model.json",
+    "dev/q4/transformer.safetensors",
+    "dev/q4/text_encoder.safetensors",
+    "dev/q4/connector.safetensors",
+    "dev/q4/vae_decoder.safetensors",
+    "dev/q4/vae_encoder.safetensors",
+    "dev/q4/diffusion_vae_encoder.safetensors",
+    "dev/q4/vae_diffusion_decoder.safetensors",
+    "dev/q4/audio_vae.safetensors",
+    "dev/q4/vocoder.safetensors",
+    "dev/q4/spatial_upsampler.safetensors",
+    "dev/q4/temporal_upsampler.safetensors",
+    "dev/q4/duration_head.safetensors",
+]
+
+[[models]]
+# the fp16 U-Net and encoders only (candle-gen-sdxl/src/training.rs:185,191,609,
+# src/pipeline.rs:381-385,1534,1566); the VAE comes from the fp16-fix row, and no
+# fp32/onnx/openvino/flax variant is fetched
+key = "sdxl-base-1.0-fp16-train-proof"
+repository = "stabilityai/stable-diffusion-xl-base-1.0"
+revision = "462165984030d82259a11f4367a4eed129e94a7b"
+license = "CreativeML Open RAIL++-M"
+size_class = "large"
+profiles = ["model-inference-proofs"]
+environment = ["SDXL_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "unet/config.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.fp16.safetensors",
+    "text_encoder_2/config.json",
+    "text_encoder_2/model.fp16.safetensors",
+]
+expected_files = [
+    "model_index.json",
+    "unet/config.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.fp16.safetensors",
+    "text_encoder_2/config.json",
+    "text_encoder_2/model.fp16.safetensors",
+]
+
+[[models]]
+# the tokenizer only (candle-gen-sdxl/src/pipeline.rs:258, src/training.rs:163)
+key = "clip-vit-large-patch14-tokenizer-proof"
+repository = "openai/clip-vit-large-patch14"
+revision = "32bd64288804d66eefd0ccbe215aa642df71cc41"
+license = "MIT"
+size_class = "small"
+profiles = ["model-inference-proofs"]
+environment = ["SDXL_TOKENIZER_CLIP_L_DIR"]
+download_files = ["tokenizer.json"]
+expected_files = ["tokenizer.json"]
+
+[[models]]
+# the tokenizer only (candle-gen-sdxl/src/pipeline.rs:258, src/training.rs:163)
+key = "clip-vit-bigg-14-laion2b-tokenizer-proof"
+repository = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
+revision = "743c27bd53dfe508a0ade0f50698f99b39d03bec"
+license = "MIT"
+size_class = "small"
+profiles = ["model-inference-proofs"]
+environment = ["SDXL_TOKENIZER_CLIP_BIGG_DIR"]
+download_files = ["tokenizer.json"]
+expected_files = ["tokenizer.json"]
+
+[[models]]
+# the diffusers VAE file (candle-gen-sdxl/src/pipeline.rs:169,267,960, src/training.rs:950)
+key = "sdxl-vae-fp16-fix-train-proof"
+repository = "madebyollin/sdxl-vae-fp16-fix"
+revision = "207b116dae70ace3637169f1ddd2434b91b3a8cd"
+license = "MIT"
+size_class = "small"
+profiles = ["model-inference-proofs"]
+environment = ["SDXL_VAE_FP16_FIX_DIR"]
+download_files = ["diffusion_pytorch_model.safetensors"]
+expected_files = ["diffusion_pytorch_model.safetensors"]
+
+[[models]]
+# the fp16 encoder, U-Net and VAE (candle-gen-kolors/src/trainer.rs:552-605,
+# src/memory_strategy.rs:1075,1135); upstream has no tokenizer.json, so the setup overlays the
+# derived one from the row below
+key = "kolors-diffusers-fp16-train-proof"
+repository = "Kwai-Kolors/Kolors-diffusers"
+revision = "7e091c75199e910a26cd1b51ed52c28de5db3711"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["KOLORS_TRAIN_SNAPSHOT"]
+download_files = [
+    "text_encoder/config.json",
+    "text_encoder/model.fp16-00001-of-00003.safetensors",
+    "text_encoder/model.fp16-00002-of-00003.safetensors",
+    "text_encoder/model.fp16-00003-of-00003.safetensors",
+    "unet/config.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "vae/diffusion_pytorch_model.fp16.safetensors",
+]
+expected_files = [
+    "text_encoder/config.json",
+    "text_encoder/model.fp16-00001-of-00003.safetensors",
+    "text_encoder/model.fp16-00002-of-00003.safetensors",
+    "text_encoder/model.fp16-00003-of-00003.safetensors",
+    "unet/config.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "vae/diffusion_pytorch_model.fp16.safetensors",
+]
+
+[[models]]
+# the derived fast ChatGLM3 tokenizer the worker overlays into a Kolors snapshot's tokenizer/
+# (crates/media/mlx-gen/tools/build_kolors_tokenizer.py, candle-gen-
+# kolors/src/tokenizer.rs:49-50); the same blob as SceneWorks/kolors-mlx
+# bf16/tokenizer/tokenizer.json
+key = "kolors-chatglm3-tokenizer-proof"
+repository = "SceneWorks/kolors-chatglm3-tokenizer"
+revision = "4001e09f10ef05845457b976bbf1d28d54319886"
+license = "Kolors license (Hub tag `other`)"
+size_class = "small"
+profiles = ["model-inference-proofs"]
+environment = ["KOLORS_TRAIN_SNAPSHOT"]
+download_files = ["tokenizer.json"]
+expected_files = ["tokenizer.json"]
+
+[[models]]
+# the diffusers layout's full-precision encoders (no fp16 T5 set, gen-core-
+# family/src/sd3_encoder_artifacts.rs:93-215), tokenizers and MMDiT (candle-gen-
+# sd3/src/training.rs:520-574, src/pipeline.rs:446-495, src/conditioning.rs:161-176,294-318); not
+# sd3.5_medium.safetensors or text_encoders/
+key = "sd3.5-medium-train-proof"
+repository = "stabilityai/stable-diffusion-3.5-medium"
+revision = "b940f670f0eda2d07fbb75229e779da1ad11eb80"
+requires_auth = true
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["SD35_MEDIUM_TRAIN_SNAPSHOT"]
+download_files = [
+    "text_encoder/model.safetensors",
+    "text_encoder_2/model.safetensors",
+    "text_encoder_3/config.json",
+    "text_encoder_3/model.safetensors.index.json",
+    "text_encoder_3/model-00001-of-00002.safetensors",
+    "text_encoder_3/model-00002-of-00002.safetensors",
+    "tokenizer/vocab.json",
+    "tokenizer/merges.txt",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer_2/vocab.json",
+    "tokenizer_2/merges.txt",
+    "tokenizer_2/tokenizer_config.json",
+    "tokenizer_3/tokenizer.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "text_encoder/model.safetensors",
+    "text_encoder_2/model.safetensors",
+    "text_encoder_3/config.json",
+    "text_encoder_3/model.safetensors.index.json",
+    "text_encoder_3/model-00001-of-00002.safetensors",
+    "text_encoder_3/model-00002-of-00002.safetensors",
+    "tokenizer/vocab.json",
+    "tokenizer/merges.txt",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer_2/vocab.json",
+    "tokenizer_2/merges.txt",
+    "tokenizer_2/tokenizer_config.json",
+    "tokenizer_3/tokenizer.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the bf16 tier, whose load receipt requires its exact 32-file inventory (candle-gen-
+# sd3/src/memory_strategy.rs:28-60,454-523); no q4/q8 tier
+key = "sd3.5-medium-mlx-bf16-sample-proof"
+repository = "SceneWorks/sd3.5-medium-mlx"
+revision = "5413e962bb326db248be2026a93b147c323392b6"
+license = "Stability AI Community License"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["SD35_MEDIUM_SAMPLE_SNAPSHOT"]
+download_files = ["bf16/*"]
+expected_files = [
+    "bf16/LICENSE.md",
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.fp16.safetensors",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/text_encoder_2/config.json",
+    "bf16/text_encoder_2/model.fp16.safetensors",
+    "bf16/text_encoder_2/model.safetensors",
+    "bf16/text_encoder_3/config.json",
+    "bf16/text_encoder_3/model-00001-of-00002.safetensors",
+    "bf16/text_encoder_3/model-00002-of-00002.safetensors",
+    "bf16/text_encoder_3/model.fp16-00001-of-00002.safetensors",
+    "bf16/text_encoder_3/model.fp16-00002-of-00002.safetensors",
+    "bf16/text_encoder_3/model.safetensors.index.fp16.json",
+    "bf16/text_encoder_3/model.safetensors.index.json",
+    "bf16/tokenizer/merges.txt",
+    "bf16/tokenizer/special_tokens_map.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/tokenizer/vocab.json",
+    "bf16/tokenizer_2/merges.txt",
+    "bf16/tokenizer_2/special_tokens_map.json",
+    "bf16/tokenizer_2/tokenizer_config.json",
+    "bf16/tokenizer_2/vocab.json",
+    "bf16/tokenizer_3/special_tokens_map.json",
+    "bf16/tokenizer_3/spiece.model",
+    "bf16/tokenizer_3/tokenizer.json",
+    "bf16/tokenizer_3/tokenizer_config.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# the trainer and adapter render (candle-gen-qwen-image-2-1/src/loader.rs:101-176,249-309,363-367,
+# src/training.rs:1027-1046)
+key = "qwen-image-2-1-train-proof"
+repository = "Qwen/Qwen-Image-2.1"
+revision = "790c92633540aa0cb11d9abf19eb46d861714758"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/preprocessor_config.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model-00001-of-00004.safetensors",
+    "text_encoder/model-00002-of-00004.safetensors",
+    "text_encoder/model-00003-of-00004.safetensors",
+    "text_encoder/model-00004-of-00004.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+expected_files = [
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/preprocessor_config.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model-00001-of-00004.safetensors",
+    "text_encoder/model-00002-of-00004.safetensors",
+    "text_encoder/model-00003-of-00004.safetensors",
+    "text_encoder/model-00004-of-00004.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
