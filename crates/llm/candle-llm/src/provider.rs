@@ -1309,6 +1309,11 @@ pub struct LoadRecord {
     /// budget clamped to the headroom admission left. `None` for a provider assembled without a
     /// load.
     pub prefix_cache_bytes: Option<u64>,
+    /// What the **target** decoder's own projections hold (SW-7200), taken from its census before
+    /// a predictor's joins it ([`record_predictor`](Self::record_predictor)): the tier `auto`'s
+    /// block-draft decision is keyed by. A companion MTP head stored MLX-affine Q4 is re-packed to
+    /// Q8_0 and would otherwise make a Q4_K target mixed. `None` without a census.
+    pub target_quantization: Option<core_llm::ResidentQuantization>,
 }
 
 /// Why a load whose CUDA-graph switch is on can never capture (sc-24441, E3): the device-and-build
@@ -1327,6 +1332,30 @@ fn graph_load_refusal(
 pub const CANDLE_MTP_HEAD_FALLBACK: &str = core_llm::COMPANION_MTP_FAMILY_REFUSAL;
 
 impl LoadRecord {
+    /// A record of the target decoder's own `census`, its resident quantization taken now — before
+    /// any predictor joins the census.
+    fn of_target(census: Option<WeightCensus>) -> Self {
+        Self {
+            target_quantization: census.map(|c| c.projections.resident_quantization()),
+            census,
+            ..Self::default()
+        }
+    }
+
+    /// Add a predictor's weights (a native or companion MTP head) to the census; the target's
+    /// resident quantization stays the target's.
+    fn record_predictor(&mut self, predictor: &WeightCensus) {
+        if let Some(census) = self.census.as_mut() {
+            census.merge(predictor);
+        }
+    }
+
+    /// The target's resident quantization (SW-7200); unknown without a census.
+    pub fn target_quantization(&self) -> core_llm::ResidentQuantization {
+        self.target_quantization
+            .unwrap_or(core_llm::ResidentQuantization::Unknown)
+    }
+
     /// The numeric policy a completed report binds: the resident weight format the census
     /// observed and the device, whenever a census exists — a dense load (`requested = None`)
     /// observes it too. `requested_quantization` is `null` for a load that requested none.
@@ -2264,9 +2293,8 @@ impl LlamaProvider {
         };
         match outcome {
             Ok(predictor) => {
-                if let Some(census) = self.load_record.census.as_mut() {
-                    census.merge(&predictor.weight_census());
-                }
+                self.load_record
+                    .record_predictor(&predictor.weight_census());
                 self.mtp = Some(predictor);
                 // The same backend-true depth a native head advertises (sc-24438): a companion
                 // head runs the identical one-layer predictor through the identical verify path.
@@ -2662,17 +2690,16 @@ impl LlamaProvider {
         }
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
-        let census = match &model {
-            Decoder::Qwen35(m) => {
-                let mut census = m.weight_census();
-                if let Some(mtp) = &mtp {
-                    census.merge(&mtp.weight_census());
-                }
-                Some(census)
-            }
-            // sc-24140: the llama family reports its census too (bits/param by projection kind).
-            Decoder::Causal(m) => Some(m.weight_census()),
-        };
+        // sc-24140: the llama family reports its census too (bits/param by projection kind). The
+        // target's own census is recorded first, so its resident tier is the target's (SW-7200).
+        let mut load_record = LoadRecord::of_target(Some(match &model {
+            Decoder::Qwen35(m) => m.weight_census(),
+            Decoder::Causal(m) => m.weight_census(),
+        }));
+        if let (Decoder::Qwen35(_), Some(mtp)) = (&model, &mtp) {
+            load_record.record_predictor(&mtp.weight_census());
+        }
+        load_record.fallbacks = load_fallbacks;
         descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Ok(Self {
             descriptor,
@@ -2694,13 +2721,7 @@ impl LlamaProvider {
             kv_family: kv_family_of(arch, &cfg_value),
             vision,
             gemma4,
-            load_record: LoadRecord {
-                requested: None,
-                census,
-                cuda_graphs: None,
-                fallbacks: load_fallbacks,
-                prefix_cache_bytes: None,
-            },
+            load_record,
         })
     }
 
@@ -2915,13 +2936,7 @@ impl LlamaProvider {
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
             // and llama.cpp GGUFs carry no vision embedder / audio projector tensors.
             gemma4: None,
-            load_record: LoadRecord {
-                requested: None,
-                census,
-                cuda_graphs: None,
-                fallbacks: Vec::new(),
-                prefix_cache_bytes: None,
-            },
+            load_record: LoadRecord::of_target(census),
         })
     }
 
@@ -3361,6 +3376,37 @@ mod tests;
 #[cfg(test)]
 mod numeric_policy_tests {
     use super::*;
+
+    /// SW-7200: `auto`'s block-draft tier is the target decoder's own — a companion MTP head
+    /// re-packed to Q8_0 beside a Q4_K target leaves the target Q4, though the whole census is
+    /// mixed.
+    #[test]
+    fn the_block_draft_tier_is_the_targets_before_a_predictor_joins() {
+        use core_llm::ResidentQuantization as R;
+        let ggml = |count: u64, q4: u64, q8: u64| {
+            let mut census = WeightCensus::default();
+            census.projections.ggml.count = count;
+            census.projections.ggml_4bit = q4;
+            census.projections.ggml_8bit = q8;
+            census.projections.dense.count = 1;
+            census
+        };
+        let mut record = LoadRecord::of_target(Some(ggml(4, 4, 0)));
+        assert_eq!(record.target_quantization(), R::Bits(4));
+        record.record_predictor(&ggml(2, 0, 2));
+        assert_eq!(record.target_quantization(), R::Bits(4));
+        assert_eq!(
+            record.census.unwrap().projections.resident_quantization(),
+            R::Unknown,
+            "the merged census is mixed"
+        );
+        assert_eq!(record.census.unwrap().projections.ggml.count, 6);
+        assert_eq!(
+            LoadRecord::of_target(None).target_quantization(),
+            R::Unknown
+        );
+        assert_eq!(LoadRecord::default().target_quantization(), R::Unknown);
+    }
 
     /// A dense load with a census binds its resident format and device; only a provider without a
     /// census (assembled from parts, or an uncensused architecture) leaves the policy unobserved.

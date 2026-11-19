@@ -4686,9 +4686,9 @@ fn the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model() {
         backend: "candle-cpu".into(),
         max_new_tokens: 12,
         options: vec![
-            Speculative::Off,
-            Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
-            Speculative::Auto,
+            Speculative::Off.into(),
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 4).into(),
+            Speculative::Auto.into(),
         ],
         warmup: false,
         sampling: core_llm::Sampling::greedy(),
@@ -5333,11 +5333,18 @@ fn an_unset_speculative_option_runs_the_providers_default() {
     core_llm_testkit::check_speculative_default(
         &provider,
         crate::device::decode_defaults(provider.model.device()).speculative,
+        provider.auto_prefers_block_draft(),
         prompt,
         8,
     );
     provider.set_speculative_default(core_llm::Speculative::Auto);
-    core_llm_testkit::check_speculative_default(&provider, core_llm::Speculative::Auto, prompt, 8);
+    core_llm_testkit::check_speculative_default(
+        &provider,
+        core_llm::Speculative::Auto,
+        provider.auto_prefers_block_draft(),
+        prompt,
+        8,
+    );
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");

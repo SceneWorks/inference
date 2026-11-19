@@ -195,6 +195,8 @@ pub struct DecodeRecord {
     /// Why the run's tree request verified linearly (feature SW-F328, E5), named in the report's
     /// `fallbacks`; `None` otherwise.
     pub tree_fallback: Option<&'static str>,
+    /// [`core_llm::DecodeReport::draft_time`] (SW-7200); `None` when no proposer call ran.
+    pub draft_time: Option<core_llm::DraftTime>,
 }
 
 impl DecodeRecord {
@@ -232,6 +234,7 @@ impl DecodeRecord {
             speculative_monitor: None,
             tree_verify: None,
             tree_fallback: None,
+            draft_time: None,
         }
     }
 
@@ -350,6 +353,7 @@ impl DecodeRecord {
             speculative_monitor: stats.monitor,
             tree_verify: stats.tree,
             tree_fallback: stats.tree_fallback,
+            draft_time: stats.draft_time,
         }
     }
 
@@ -448,6 +452,7 @@ impl DecodeRecord {
                 .into_iter()
                 .collect(),
             tree_verify: self.tree_verify,
+            draft_time: self.draft_time,
         }
     }
 }
@@ -730,6 +735,7 @@ mod tests {
                 monitor: Some(DECISION),
                 tree: None,
                 tree_fallback: None,
+                draft_time: None,
             },
             10,
             SpanCounters {

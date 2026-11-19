@@ -1848,6 +1848,9 @@ where
                 constraint: constraint.as_deref_mut(),
                 advanced: false,
             };
+            // Every MLX proposal (a draft list or a tree) is host tokens, so the call's wall time
+            // includes the draft's device work (SW-7200).
+            let draft_started = std::time::Instant::now();
             let proposed = if tree_rows > 0 {
                 let tree = proposer
                     .propose_tree(target, &ctx, &mut draft_sampler)?
@@ -1862,6 +1865,10 @@ where
             } else {
                 (proposer.propose(target, &ctx, &mut draft_sampler)?, None)
             };
+            stats
+                .draft_time
+                .get_or_insert_with(core_llm::DraftTime::default)
+                .record(draft_started.elapsed(), true);
             if draft_sampler.advanced {
                 if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), checkpoint) {
                     c.rewind(checkpoint);
@@ -2510,6 +2517,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
         prefix_cache: none(),
         fallbacks: Vec::new(),
         tree_verify: stats.tree,
+        draft_time: stats.draft_time,
     }
 }
 

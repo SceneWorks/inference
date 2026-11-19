@@ -50,6 +50,10 @@ Subcommands:
            every finished row; ``complete`` marks the summary and each row that ran to its end
   local    the whole lane on this host: create the epic and pre-epic worktrees under
            ``--work-dir``, apply the baseline driver mechanically, plan ``--matrix``, then ``run``
+  paths    read campaign directories and write the paired speculative-paths comparison (SW-7200):
+           per backend, tier and context, every path's full-request time, TTFT, decode rate,
+           accepted tokens per pass, draft overhead and peak memory, each against the ``off``
+           row of the same process, plus the inputs ``auto``'s block-draft decision reads
   compare  read campaign directories and write the E6 verdicts and the E5 defaults decisions
            (machine JSON + markdown); refuses incomplete or mismatched evidence. A row the
            campaign stopped during (``complete: false``) is set aside by name, never judged. A row id two
@@ -58,17 +62,33 @@ Subcommands:
            one listed as superseded
 
 The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
+(the one optional top-level key besides ``rows`` is ``"runner"``, ``"rw-starvector"`` (default, the
+owner's Mac) or ``"rw-llm"`` (nax-macos-2); it only selects the MLX job's runner in the workflow
+and is not part of the plan)
 
   id                  ``[a-z0-9][a-z0-9._-]{0,63}``, unique; the row's output directory
   snapshot            ``qwen38`` / ``bonsai-mlx`` (the repository-variable snapshots the
                       Qwen3.8 / Bonsai lanes use, via ``$DECODE_BENCH_SNAPSHOT_QWEN38`` /
-                      ``$DECODE_BENCH_SNAPSHOT_BONSAI_MLX``) or an absolute snapshot path
+                      ``$DECODE_BENCH_SNAPSHOT_BONSAI_MLX``), an absolute snapshot path, or a
+                      pinned Hub snapshot ``hub:<org>/<name>@<40-hex revision>[/<subfolder>]``
+                      (SW-7200): the plan binds it under ``$MODEL_PROOF_HUB_ROOT`` in the Hub cache
+                      layout and lists it in ``hub_snapshots``, which
+                      ``scripts/ci/stage_pinned_hub_snapshots.py --plan`` stages and authenticates
+                      before ``run`` (``draft`` and ``mtp_head`` take the same form)
   runs                subset of ``["epic", "baseline"]`` (default both)
   process_repeats     processes per run, alternating with the other run (default 3, at least 1)
   format              ``bf16`` (default) / ``q8`` / ``q4`` / ``nvfp4``: the projection format
                       quantized **at load**; ``bf16`` loads the snapshot as stored, so a packed or
                       prepared-Q4 snapshot keeps its own format (see below)
-  options             speculative options, the harness's wire form (default ``["off", "auto"]``)
+  options             speculative options, the harness's wire form (default ``["off", "auto"]``):
+                      ``"off"``, ``"auto"``, ``{"proposer", "depth": N}``, or a path
+                      ``{"proposer", "depth": N | "max" | "recommended", "verify": "linear" |
+                      {"tree": {"max_rows": N | "max"}}}`` whose ``"max"`` is the loaded model's
+                      advertised bound and ``"recommended"`` the depth ``auto`` runs (SW-7200,
+                      ``core_llm_testkit::BenchOption``)
+  memory_cap_gib      positive number (SW-7200): the row's external memory cap, substituted for
+                      ``{cap_gib}`` in ``--guard`` (a guard naming ``{cap_gib}`` refuses a row
+                      without one)
   sampling            ``"greedy"`` (default) or a sampling object
   thinking            ``default`` / ``off`` / ``on`` / ``xhigh`` / ``medium`` / ``low``
   new_tokens, repeats non-negative integers: tokens per request, in-process repeats (default:
@@ -119,6 +139,15 @@ SNAPSHOT_ALIASES = {
     "qwen38": "DECODE_BENCH_SNAPSHOT_QWEN38",
     "bonsai-mlx": "DECODE_BENCH_SNAPSHOT_BONSAI_MLX",
 }
+# SW-7200: a pinned Hub snapshot, bound under the stage script's hub root
+# (`scripts/ci/stage_pinned_hub_snapshots.py`, `MODEL_PROOF_HUB_ROOT`).
+HUB_ROOT_ENV = "MODEL_PROOF_HUB_ROOT"
+HUB_PIN = re.compile(
+    r"hub:(?P<repository>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"@(?P<revision>[0-9a-f]{40})(?:/(?P<subfolder>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*))?"
+)
+PROPOSERS = ("mtp", "prompt_lookup", "draft_model", "block_draft")
+PATHS_SCHEMA = "sceneworks.decode-speedups.paths/1"
 RUNS = ("epic", "baseline")
 FORMATS = ("bf16", "q8", "q4", "nvfp4")
 THINKING = ("default", "off", "on", "xhigh", "medium", "low")
@@ -163,6 +192,7 @@ ROW_KEYS = {
     "model",
     "switches",
     "without_mtp",
+    "memory_cap_gib",
 }
 ROW_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 MAX_ROWS = 64
@@ -238,6 +268,10 @@ LANES = {
 }
 
 
+# The MLX job's runner labels a matrix may select (`runs-on` reads the same key in the workflow).
+MATRIX_RUNNERS = ("rw-starvector", "rw-llm")
+
+
 class MatrixError(ValueError):
     """The matrix is not a plan this script will run."""
 
@@ -269,9 +303,83 @@ def _count(value: Any, what: str) -> int:
     return value
 
 
-def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
+def hub_pin(value: str, environ: dict[str, str], what: str) -> tuple[str, dict[str, str]] | None:
+    """A ``hub:<org>/<name>@<revision>[/<subfolder>]`` pin's runner path — where
+    ``stage_pinned_hub_snapshots.py`` stages it under ``$MODEL_PROOF_HUB_ROOT`` (``~`` expanded,
+    real path) in the Hub cache layout — and the pin; ``None`` for any other value."""
+    if not value.startswith("hub:"):
+        return None
+    match = HUB_PIN.fullmatch(value)
+    subfolder = (match.group("subfolder") or "") if match else ""
+    if not match or any(not part.strip(".") for part in subfolder.split("/") if subfolder):
+        raise MatrixError(
+            f"{what} must be hub:<org>/<name>@<40-hex revision>[/<subfolder>], got {value!r}"
+        )
+    root = environ.get(HUB_ROOT_ENV, "").strip()
+    if not root:
+        raise MatrixError(f"{what}: a Hub pin needs ${HUB_ROOT_ENV} (the runner's Hub root)")
+    repository, revision = match.group("repository"), match.group("revision")
+    base = Path(os.path.realpath(os.path.expanduser(root)))
+    path = base / ("models--" + repository.replace("/", "--")) / "snapshots" / revision
+    if subfolder:
+        path = path.joinpath(*subfolder.split("/"))
+    if not _absolute(str(path)):
+        raise MatrixError(f"{what}: ${HUB_ROOT_ENV} must be an absolute or ~ path, got {root!r}")
+    return str(path), {"repository": repository, "revision": revision, "subfolder": subfolder}
+
+
+def _option(option: Any, what: str) -> None:
+    """Refuse an option the harness would refuse (``core_llm_testkit::BenchOption``): a string
+    mode, a request-wire object, or a path object with a ``"max"``-able depth and a verify layout."""
+
+    def bound(value: Any, key: str) -> None:
+        named = ("max", "recommended") if key == "depth" else ("max",)
+        if value not in named and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise MatrixError(f"{what}: `{key}` must be a positive integer or one of {named}, got {value!r}")
+
+    if isinstance(option, str):
+        if option not in ("off", "auto"):
+            raise MatrixError(f"{what}: unknown option {option!r}")
+        return
+    if not isinstance(option, dict):
+        raise MatrixError(f"{what}: an option is a string or an object, got {option!r}")
+    if "mode" in option:
+        return  # the legacy `mtp` shape; the harness's request parser checks it
+    if option.get("proposer") not in PROPOSERS:
+        raise MatrixError(f"{what}: proposer must be one of {list(PROPOSERS)}, got {option!r}")
+    unknown = set(option) - {"proposer", "depth", "verify"}
+    if unknown:
+        raise MatrixError(f"{what}: option has unknown keys {sorted(unknown)}")
+    bound(option.get("depth"), "depth")
+    verify = option.get("verify", "linear")
+    if verify == "linear":
+        return
+    tree = verify.get("tree") if isinstance(verify, dict) and set(verify) == {"tree"} else None
+    if not isinstance(tree, dict) or set(tree) != {"max_rows"}:
+        raise MatrixError(
+            f"{what}: verify must be \"linear\" or {{\"tree\": {{\"max_rows\": N | \"max\"}}}}, "
+            f"got {verify!r}"
+        )
+    bound(tree["max_rows"], "max_rows")
+
+
+def _require_local(path: str, tag: str, field: str, *, file_ok: bool = False) -> None:
+    """Refuse a runner-local path that does not exist here: ``run`` would otherwise fail after the
+    cold release build (``snapshot_identity``: "is not a directory")."""
+    if not (Path(path).is_dir() or (file_ok and Path(path).is_file())):
+        kind = "file or directory" if file_ok else "directory"
+        raise MatrixError(f"{tag}: {field} {path!r} is not an existing {kind} on this runner")
+
+
+def plan_row(
+    row: Any, environ: dict[str, str], lane: Lane, require_local: bool = False
+) -> dict[str, Any]:
     """One validated row: its id, runs, process repeats, switches, and the environment each
-    process gets."""
+    process gets. ``require_local`` (the ``plan`` command, which runs on the runner before the
+    build) also refuses a non-``hub:`` snapshot, draft or MTP head path that does not exist;
+    ``hub:`` pins are staged after the plan, so they are not checked."""
     if not isinstance(row, dict):
         raise MatrixError(f"a row must be an object, got {row!r}")
     unknown = set(row) - ROW_KEYS
@@ -283,6 +391,12 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
     tag = f"row {row_id}"
 
     snapshot = _text(row.get("snapshot"), f"{tag}: snapshot")
+    pins: list[dict[str, str]] = []
+    pinned = hub_pin(snapshot, environ, f"{tag}: snapshot")
+    if pinned:
+        snapshot = pinned[0]
+        pins.append(pinned[1])
+    check_snapshot = require_local and not pinned
     if snapshot in SNAPSHOT_ALIASES:
         variable = SNAPSHOT_ALIASES[snapshot]
         resolved = environ.get(variable, "").strip()
@@ -291,6 +405,8 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
         snapshot = resolved
     if not _absolute(snapshot):
         raise MatrixError(f"{tag}: snapshot must be an alias or an absolute path, got {snapshot!r}")
+    if check_snapshot:
+        _require_local(snapshot, tag, "snapshot")
     prepare = None
     without_mtp = row.get("without_mtp", False)
     if not isinstance(without_mtp, bool):
@@ -337,6 +453,8 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
         options = row["options"]
         if not isinstance(options, list) or not options:
             raise MatrixError(f"{tag}: options must be a non-empty list, got {options!r}")
+        for option in options:
+            _option(option, f"{tag}: options")
         knobs["SPECULATIVE_BENCH_OPTIONS"] = json.dumps(options, separators=(",", ":"))
     if "sampling" in row:
         sampling = row["sampling"]
@@ -367,8 +485,14 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
     ):
         if key in row:
             path = _text(row[key], f"{tag}: {key}")
+            pinned = hub_pin(path, environ, f"{tag}: {key}")
+            if pinned:
+                path = pinned[0]
+                pins.append(pinned[1])
             if not _absolute(path):
                 raise MatrixError(f"{tag}: {key} must be an absolute path, got {path!r}")
+            if require_local and not pinned:
+                _require_local(path, tag, key, file_ok=key == "mtp_head")
             knobs[variable] = path
             epic_only.append(key)
     if "prefix_cache_bytes" in row:
@@ -400,36 +524,56 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
         "switches": dict(switches),
         "env": knobs,
     }
+    if "memory_cap_gib" in row:
+        cap = row["memory_cap_gib"]
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not 0 < cap <= 1024:
+            raise MatrixError(f"{tag}: memory_cap_gib must be a positive number of GiB, got {cap!r}")
+        planned["memory_cap_gib"] = cap
     if prepare:
         planned["prepare"] = prepare
+    if pins:
+        planned["hub"] = pins
     return planned
 
 
-def plan_matrix(text: str, environ: dict[str, str], lane: str = "cuda") -> dict[str, Any]:
-    """The validated plan of a matrix document for ``lane``."""
+def plan_matrix(
+    text: str, environ: dict[str, str], lane: str = "cuda", require_local: bool = False
+) -> dict[str, Any]:
+    """The validated plan of a matrix document for ``lane``; ``require_local`` is
+    :func:`plan_row`'s."""
     if lane not in LANES:
         raise MatrixError(f"lane must be one of {sorted(LANES)}, got {lane!r}")
     try:
         matrix = json.loads(text)
     except json.JSONDecodeError as error:
         raise MatrixError(f"the matrix is not JSON: {error}") from error
-    if not isinstance(matrix, dict) or set(matrix) != {"rows"}:
-        raise MatrixError('the matrix must be an object with exactly the key "rows"')
+    if not isinstance(matrix, dict) or not {"rows"} <= set(matrix) <= {"rows", "runner"}:
+        raise MatrixError('the matrix must be an object with the key "rows" and optionally "runner"')
+    if "runner" in matrix and matrix["runner"] not in MATRIX_RUNNERS:
+        raise MatrixError(f"runner must be one of {list(MATRIX_RUNNERS)}, got {matrix['runner']!r}")
     rows = matrix["rows"]
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ROWS:
         raise MatrixError(f"rows must be a list of 1..{MAX_ROWS} rows")
-    planned = [plan_row(row, environ, LANES[lane]) for row in rows]
+    planned = [plan_row(row, environ, LANES[lane], require_local) for row in rows]
     ids = [row["id"] for row in planned]
     duplicates = sorted({row_id for row_id in ids if ids.count(row_id) > 1})
     if duplicates:
         raise MatrixError(f"duplicate row ids {duplicates}")
-    return {
+    plan: dict[str, Any] = {
         "schema": CAMPAIGN_SCHEMA,
         "document_schema": SCHEMA,
         "lane": lane,
         "pre_epic_sha": PRE_EPIC_SHA,
         "rows": planned,
     }
+    # Every distinct Hub pin once, in first-use order, in the form the stage script reads.
+    pins: list[dict[str, str]] = []
+    for row in planned:
+        pins += [pin for pin in row.get("hub", []) if pin not in pins]
+    if pins:
+        plan["asset_setup"] = "hub-snapshots"
+        plan["hub_snapshots"] = {f"DECODE_BENCH_HUB_{i}": pin for i, pin in enumerate(pins, 1)}
+    return plan
 
 
 # -------------------------------------------------------------------------------------- checkouts
@@ -899,11 +1043,17 @@ def run_process(
     directory: Path,
     guard: list[str],
     sha_override: bool,
+    cap_gib: float | None = None,
 ) -> None:
-    """One benchmark process (under ``guard``); raises with the reason it does not count."""
+    """One benchmark process (under ``guard``, its ``{cap_gib}`` the row's cap); raises with the
+    reason it does not count."""
     output = directory / f"{name}.json"
     log = directory / f"{name}.log"
     process_env = {**environ, **knobs, "SPECULATIVE_BENCH_OUTPUT": str(output)}
+    if any("{cap_gib}" in part for part in guard):
+        if cap_gib is None:
+            raise CampaignError("the guard names {cap_gib} and the row sets no memory_cap_gib")
+        guard = [part.replace("{cap_gib}", f"{cap_gib:g}") for part in guard]
     with log.open("wb") as sink:
         result = subprocess.run(
             [*guard, cargo, *cargo_args(lane, run)],
@@ -929,6 +1079,26 @@ def run_process(
     )
 
 
+GUARD_SUMMARY = re.compile(r"^GUARD_SUMMARY (.*)$", re.MULTILINE)
+
+
+def guard_summary(log: Path) -> dict[str, Any] | None:
+    """The external memory guard's closing ``GUARD_SUMMARY key=value …`` line in a process log
+    (``scripts/ci/mlx_tree_guard.py``) as a dict — integers as integers — or ``None``."""
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = GUARD_SUMMARY.findall(text)
+    if not lines:
+        return None
+    out: dict[str, Any] = {}
+    for key, value in re.findall(r'(\w+)=("[^"]*"|\S+)', lines[-1]):
+        value = value.strip('"')
+        out[key] = int(value) if re.fullmatch(r"-?\d+", value) else value
+    return out
+
+
 def write_summary(output: Path, summary: dict[str, Any]) -> None:
     """Write ``summary.json`` atomically (a temporary file, then a rename): the runner rewrites
     it after every process, so a campaign stopped part-way — a job timeout kills the runner —
@@ -950,9 +1120,17 @@ def run_plan(
     cargo: str,
     guard: list[str],
     sha_override: bool,
+    stop_starting_after: float | None = None,
+    clock=None,
 ) -> int:
     """Check both checkouts, build them stamped, run every row (processes alternating between the
-    runs), and write ``summary.json``. Returns the exit code."""
+    runs), and write ``summary.json``. Returns the exit code.
+
+    ``stop_starting_after`` (seconds from the end of the builds) bounds a loaned host
+    (SW-7200): once it has passed, no further benchmark process starts — the one running is
+    never interrupted, since signalling a GPU process mid-command-buffer can hang the device —
+    the row it stopped in stays ``complete: false`` and the summary records why."""
+    clock = clock or __import__("time").monotonic
     if plan.get("schema") != CAMPAIGN_SCHEMA or plan.get("document_schema") != SCHEMA:
         print(f"::error::the plan is not a {CAMPAIGN_SCHEMA} plan over {SCHEMA}", file=sys.stderr)
         return 1
@@ -1007,6 +1185,8 @@ def run_plan(
             write_summary(output, summary)
             return 1
 
+    # The budget counts benchmark processes only: it starts once both builds are done.
+    started = clock()
     failed = []
     for row in plan["rows"]:
         directory = output / row["id"]
@@ -1041,6 +1221,17 @@ def run_plan(
         for index in range(1, row["process_repeats"] + 1):
             for run in row["runs"]:
                 name = f"{run}-{index}"
+                if stop_starting_after is not None and clock() - started > stop_starting_after:
+                    reason = (
+                        f"the time budget ({stop_starting_after / 60:.0f} min) passed before "
+                        f"{row['id']} {name} started; no further process ran"
+                    )
+                    summary["stopped"] = reason
+                    write_summary(output, summary)
+                    print(f"::error::{reason}", file=sys.stderr)
+                    for line in failed:
+                        print(line, file=sys.stderr)
+                    return 1
                 print(f"::group::{row['id']} {name}")
                 try:
                     run_process(
@@ -1055,6 +1246,7 @@ def run_plan(
                         directory=directory,
                         guard=guard,
                         sha_override=sha_override,
+                        cap_gib=row.get("memory_cap_gib"),
                     )
                     if snapshot_identity(snapshot)["sha256"] != identity:
                         raise CampaignError("the snapshot's content changed during the process")
@@ -1073,6 +1265,7 @@ def run_plan(
                         "error": error,
                         "snapshot_identity": identity,
                         "switches": row["switches"],
+                        "guard": guard_summary(directory / f"{name}.log"),
                     }
                 )
                 write_summary(output, summary)
@@ -1092,7 +1285,7 @@ def guard_prefix(text: str | None) -> list[str]:
 def command_plan(args: argparse.Namespace) -> int:
     text = os.environ.get(MATRIX_ENV, "")
     try:
-        plan = plan_matrix(text, dict(os.environ), args.lane)
+        plan = plan_matrix(text, dict(os.environ), args.lane, require_local=True)
     except MatrixError as error:
         print(f"::error::{MATRIX_ENV}: {error}", file=sys.stderr)
         return 1
@@ -1106,17 +1299,27 @@ def command_plan(args: argparse.Namespace) -> int:
 
 def command_run(args: argparse.Namespace) -> int:
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    if args.pre_epic_root is None and any("baseline" in row["runs"] for row in plan["rows"]):
+        print("::error::a row runs the baseline: pass --pre-epic-root", file=sys.stderr)
+        return 1
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    roots = {"epic": Path(args.epic_root)}
+    if args.pre_epic_root is not None:
+        roots["baseline"] = Path(args.pre_epic_root)
     return run_plan(
         plan,
-        roots={"epic": Path(args.epic_root), "baseline": Path(args.pre_epic_root)},
+        roots=roots,
         target_dirs={"epic": args.epic_target_dir, "baseline": args.pre_epic_target_dir},
         epic_sha=args.epic_sha,
         output=output,
         cargo=args.cargo,
         guard=guard_prefix(args.guard),
         sha_override=args.allow_sha_override,
+        stop_starting_after=(
+            None if args.stop_starting_after_minutes is None
+            else args.stop_starting_after_minutes * 60
+        ),
     )
 
 
@@ -2205,6 +2408,416 @@ def compare_campaigns(
     }
 
 
+# ------------------------------------------------------------------------------------------ paths
+#
+# SW-7200: the paired speculative-paths comparison. Every path of one campaign row runs in the same
+# process on the same prompts, seeds and budgets, so each path is read against the `off` row of its
+# own document (the in-process pair); rows that measured the same target, tier and context in one
+# host session (a DSpine process and a DFlash2 process, say) meet through those `off` ratios.
+
+_TIERS = re.compile(r"q\d+|bf16|nvfp4")
+
+
+def path_label(row: dict[str, Any]) -> str:
+    """The path a document row measured, from what it asked for: ``off``, ``auto``, the proposer
+    (``mtp``, ``prompt_lookup``, ``draft_model``), and for a block draft its format (from the
+    report's ``draft``) and verify layout — ``block_draft:dspine:tree``. A path that asked for a
+    tree says so whatever the proposer; one asked at the recommended depth (the depth ``auto``
+    runs) ends ``@recommended``."""
+    requested = row.get("requested")
+    if isinstance(requested, str):
+        return requested
+    proposer = (requested or {}).get("proposer") or (requested or {}).get("mode") or "?"
+    verify = row.get("verify") or (requested or {}).get("verify") or "linear"
+    tree = isinstance(verify, dict) and "tree" in verify
+    suffix = "@recommended" if (requested or {}).get("depth") == "recommended" else ""
+    if proposer == "block_draft":
+        fmt = (row.get("draft") or {}).get("format") or "unloaded"
+        return f"block_draft:{fmt}:{'tree' if tree else 'linear'}{suffix}"
+    return f"{proposer}:tree{suffix}" if tree else f"{proposer}{suffix}"
+
+
+def row_tier(process: Process) -> str:
+    """The target's tier: the load-time format, else (a prepared snapshot loaded as stored) the
+    snapshot's tier folder (``…/q4``), else ``bf16``."""
+    fmt = process.row_entry.get("format") or "bf16"
+    if fmt != "bf16":
+        return fmt
+    path = str((process.row_entry.get("snapshot") or {}).get("path") or "")
+    leaf = re.split(r"[/\\]", path.rstrip("/\\"))[-1] if path else ""
+    return leaf if _TIERS.fullmatch(leaf) else "bf16"
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _geomean(values: list[float]) -> float | None:
+    values = [v for v in values if v > 0]
+    return math.exp(sum(math.log(v) for v in values) / len(values)) if values else None
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def path_measurement(row: dict[str, Any], context: str) -> dict[str, Any] | None:
+    """One document row's measurement over its ``context`` samples (``cold``: the prefill ran the
+    whole prompt; ``reused``: the cross-turn prefix cache restored most of it, :func:`_is_hit`), or
+    ``None`` when no sample is of that context."""
+    prompt_tokens = row.get("prompt_tokens")
+    samples = [
+        sample
+        for sample in row.get("samples") or []
+        if (
+            isinstance(prompt_tokens, int)
+            and isinstance(sample.get("prefix_hit_tokens"), int)
+            and _is_hit(sample, prompt_tokens)
+        )
+        == (context == "reused")
+    ]
+    if not samples:
+        return None
+
+    def values(key: str) -> list[float]:
+        return [v for v in (_number(sample.get(key)) for sample in samples) if v is not None]
+
+    verify_steps = _number(row.get("verify_steps"))
+    generated = _number(row.get("generated_tokens"))
+    draft_time = row.get("draft_time") or {}
+    tree = row.get("tree_verify") or {}
+    decode_ms = _mean(values("decode_ms"))
+    draft_ms = _mean(values("draft_ms"))
+    added = [
+        peak - before
+        for peak, before in (
+            (_number(s.get("peak_memory_bytes")), _number(s.get("memory_before_bytes")))
+            for s in samples
+        )
+        if peak is not None and before is not None
+    ]
+    return {
+        "samples": len(samples),
+        "wall_ms": _mean(values("wall_ms")),
+        "ttft_ms": _mean(values("ttft_ms")),
+        "decode_tok_s": _mean(values("decode_tok_s")),
+        "accepted_per_pass": _number(row.get("mean_accepted_length")),
+        "tokens_per_pass": generated / verify_steps if generated and verify_steps else None,
+        "accepted_per_tree_pass": _number(tree.get("accepted_per_tree_pass")),
+        "rows_per_pass": _number(tree.get("rows_per_pass")),
+        "draft_ms": draft_ms,
+        "draft_ms_per_pass": _number(draft_time.get("per_call_ms")),
+        "draft_share_of_decode": draft_ms / decode_ms if draft_ms is not None and decode_ms else None,
+        "draft_time_host_synchronized": (
+            draft_time.get("calls") == draft_time.get("host_synchronized_calls")
+            if draft_time
+            else None
+        ),
+        "peak_memory_bytes": max(values("peak_memory_bytes"), default=None),
+        "memory_added_bytes": max(added, default=None),
+    }
+
+
+def paths_report(directories: list[Path]) -> dict[str, Any]:
+    """The paired speculative-paths report over campaign ``directories`` (epic documents only):
+    one entry per (campaign row, path, prompt, context) with its measurement and its ratios to
+    the same document's ``off`` row; a summary per (backend, tier, context, path) over prompts;
+    and the block-draft inputs ``auto``'s decision reads (each block-draft path's decode-rate and
+    full-request ratios to ``off`` and to MTP, the MTP ratio taken from a process of the same
+    tier and context — both normalized by their own process's ``off``)."""
+    refusals: list[str] = []
+    incomplete: list[str] = []
+    entries: list[dict[str, Any]] = []
+    for directory in directories:
+        summary, processes, refused, stopped = load_campaign(directory)
+        refusals += refused
+        incomplete += stopped
+        for process in processes:
+            if process.run != "epic":
+                continue
+            document = process.document
+            env = process.row_entry.get("env") or {}
+            group = {
+                "backend": document.get("backend"),
+                "model": family_label(process),
+                "tier": row_tier(process),
+                "max_new_tokens": document.get("max_new_tokens"),
+                "thinking": (document.get("thinking") or {}).get("setting"),
+                "sampling": document.get("sampling"),
+                "prefix_cache_bytes": env.get("SPECULATIVE_BENCH_PREFIX_CACHE_BYTES", "0"),
+            }
+            load = document.get("load") or {}
+            offs = {
+                row.get("prompt_id"): row
+                for row in document.get("rows") or []
+                if row.get("requested") == "off"
+            }
+            for row in document.get("rows") or []:
+                for context in ("cold", "reused"):
+                    measured = path_measurement(row, context)
+                    if measured is None:
+                        continue
+                    off = offs.get(row.get("prompt_id"))
+                    off_measured = path_measurement(off, context) if off else None
+                    ratios = {}
+                    if off_measured:
+                        for key, higher_better in (("decode_tok_s", True), ("wall_ms", False)):
+                            a, b = measured[key], off_measured[key]
+                            if a and b:
+                                ratios[key] = a / b if higher_better else b / a
+                    entries.append(
+                        {
+                            "campaign": process.campaign,
+                            "row": process.row,
+                            "process": process.index,
+                            "group": group,
+                            "context": context,
+                            "draft_source": (load.get("draft") or {}).get("source"),
+                            "draft_refusal": (load.get("draft") or {}).get("refusal"),
+                            "path": path_label(row),
+                            "requested": row.get("requested"),
+                            "speculative": row.get("speculative"),
+                            "verify": row.get("verify"),
+                            "ran": row.get("proposer"),
+                            "draft": row.get("draft"),
+                            "prompt_id": row.get("prompt_id"),
+                            "class": row.get("class"),
+                            "fallbacks": row.get("fallbacks") or [],
+                            "measurement": measured,
+                            "speedup_vs_off": ratios,
+                        }
+                    )
+    return {
+        "schema": PATHS_SCHEMA,
+        "campaigns": [str(d) for d in directories],
+        "refusals": refusals,
+        "incomplete": incomplete,
+        "entries": entries,
+        "summary": summarize_paths(entries),
+        "auto_inputs": auto_inputs(entries),
+    }
+
+
+def _group_key(entry: dict[str, Any]) -> str:
+    return json.dumps({**entry["group"], "context": entry["context"]}, sort_keys=True)
+
+
+def summarize_paths(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per (group, context, path): the mean of each measurement over its prompts and processes,
+    the geometric mean of the ``off`` ratios over all prompts and per prompt class, every distinct
+    fallback, and whether every prompt ran the path it asked for."""
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for entry in entries:
+        buckets.setdefault((_group_key(entry), entry["path"]), []).append(entry)
+    out = []
+    for (key, path), bucket in sorted(buckets.items()):
+        first = bucket[0]
+
+        def mean_of(field: str, bucket=bucket) -> float | None:
+            return _mean([e["measurement"][field] for e in bucket if e["measurement"][field] is not None])
+
+        ratios: dict[str, Any] = {}
+        for metric in ("decode_tok_s", "wall_ms"):
+            ratios[metric] = {
+                "all": _geomean([e["speedup_vs_off"][metric] for e in bucket if metric in e["speedup_vs_off"]]),
+                **{
+                    cls: _geomean(
+                        [
+                            e["speedup_vs_off"][metric]
+                            for e in bucket
+                            if e["class"] == cls and metric in e["speedup_vs_off"]
+                        ]
+                    )
+                    for cls in ("predictable", "open_ended")
+                },
+            }
+        out.append(
+            {
+                "group": first["group"],
+                "context": first["context"],
+                "path": path,
+                "prompts": len({e["prompt_id"] for e in bucket}),
+                "processes": len({(e["campaign"], e["row"], e["process"]) for e in bucket}),
+                "ran": sorted({str(e["ran"]) for e in bucket}),
+                "draft": first["draft"],
+                "draft_refusal": first["draft_refusal"],
+                "fallbacks": sorted({f for e in bucket for f in e["fallbacks"]}),
+                **{
+                    field: mean_of(field)
+                    for field in (
+                        "wall_ms",
+                        "ttft_ms",
+                        "decode_tok_s",
+                        "accepted_per_pass",
+                        "tokens_per_pass",
+                        "accepted_per_tree_pass",
+                        "rows_per_pass",
+                        "draft_ms_per_pass",
+                        "draft_share_of_decode",
+                    )
+                },
+                "draft_time_host_synchronized": all(
+                    e["measurement"]["draft_time_host_synchronized"] is not False for e in bucket
+                ),
+                "peak_memory_bytes": max(
+                    (e["measurement"]["peak_memory_bytes"] for e in bucket if e["measurement"]["peak_memory_bytes"] is not None),
+                    default=None,
+                ),
+                "memory_added_bytes": max(
+                    (e["measurement"]["memory_added_bytes"] for e in bucket if e["measurement"]["memory_added_bytes"] is not None),
+                    default=None,
+                ),
+                "speedup_vs_off": ratios,
+            }
+        )
+    return out
+
+
+AUTO_MTP_PATH = "mtp@recommended"
+
+
+def auto_inputs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per (backend, tier, context, block draft at its recommended depth, linear — what ``auto``
+    would run): the decode-rate and full-request ratios to ``off`` (geometric means over prompts)
+    and to MTP at its recommended depth in the same group (:data:`AUTO_MTP_PATH`; each path's ratio
+    over its own process's ``off``, prompt by prompt), and whether it beat MTP on every prompt —
+    the measured inputs for ``core_llm::AUTO_BLOCK_DRAFT_DECISIONS``. The ``"max"`` rows answer
+    another question (the most a path can do) and are left out. A decision is the reader's, not
+    this report's."""
+    by_group: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        key = _group_key(entry)
+        meta[key] = {"group": entry["group"], "context": entry["context"]}
+        prompts = by_group.setdefault(key, {}).setdefault(entry["path"], {})
+        bucket = prompts.setdefault(entry["prompt_id"], {})
+        for metric, ratio in entry["speedup_vs_off"].items():
+            bucket.setdefault(metric, [])
+            bucket[metric].append(ratio)
+    out = []
+    for key, paths in sorted(by_group.items()):
+        # What `auto` would choose between: MTP and each block draft at their recommended
+        # depths, linear (auto never turns a tree on).
+        mtp = paths.get(AUTO_MTP_PATH, {})
+        for path, prompts in sorted(paths.items()):
+            if not (path.startswith("block_draft:") and path.endswith(":linear@recommended")):
+                continue
+            item: dict[str, Any] = {**meta[key], "path": path}
+            for metric in ("decode_tok_s", "wall_ms"):
+                vs_off = {p: _mean(r.get(metric, [])) for p, r in prompts.items()}
+                vs_mtp = {
+                    p: ratio / _mean(mtp[p][metric])
+                    for p, ratio in vs_off.items()
+                    if ratio and p in mtp and _mean(mtp[p].get(metric, []))
+                }
+                item[metric] = {
+                    "vs_off": _geomean([v for v in vs_off.values() if v]),
+                    "vs_mtp": _geomean(list(vs_mtp.values())),
+                    "vs_mtp_min": min(vs_mtp.values(), default=None),
+                    "beats_mtp_on_every_prompt": bool(vs_mtp)
+                    and len(vs_mtp) == len(vs_off)
+                    and all(v > 1 for v in vs_mtp.values()),
+                }
+            out.append(item)
+    return out
+
+
+def paths_markdown(report: dict[str, Any]) -> str:
+    """The report's summary as one table per (backend, tier, context)."""
+    gib = 1024**3
+    lines = [
+        "# Speculative paths (SW-7200)",
+        "",
+        "Every ratio is against the `off` row of the same process. `draft ms/pass` is the "
+        "proposer's host wall time per call: where the proposal comes back on the host it waited "
+        "for the draft's device work and anything still queued ahead of it (the previous verify), "
+        "so it is an upper bound on the draft's own cost; rows marked `enqueue-only` left their "
+        "drafts on the device (Candle greedy MTP / draft model), so it is a lower bound. Peak "
+        "GiB is the backend's reading (MLX allocator high-water; CUDA device-used at tokens, a "
+        "lower bound) and `+request` what the request added over its start.",
+        "",
+    ]
+    for item in report["refusals"]:
+        lines.append(f"- refused: {item}")
+    for item in report["incomplete"]:
+        lines.append(f"- not judged: {item}")
+    tables: dict[str, list[dict[str, Any]]] = {}
+    for entry in report["summary"]:
+        group = entry["group"]
+        title = (
+            f"{group['backend']} · {group['model']} · {group['tier']} · {entry['context']} context · "
+            f"{group['max_new_tokens']} tokens · thinking {group['thinking']}"
+        )
+        tables.setdefault(title, []).append(entry)
+    for title, rows in tables.items():
+        lines += [
+            "",
+            f"## {title}",
+            "",
+            "| path | ran | decode tok/s | ×off decode (pred / open) | full request ms | ×off request "
+            "| TTFT ms | accepted/pass | draft ms/pass (share) | peak GiB (+request) | fallbacks |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for row in rows:
+            decode = row["speedup_vs_off"]["decode_tok_s"]
+            wall = row["speedup_vs_off"]["wall_ms"]
+            accepted = _fmt(row["accepted_per_pass"], 2)
+            if row["accepted_per_tree_pass"] is not None:
+                accepted += f" (tree {_fmt(row['accepted_per_tree_pass'], 2)})"
+            share = row["draft_share_of_decode"]
+            draft = _fmt(row["draft_ms_per_pass"], 2)
+            if share is not None:
+                draft += f" ({share:.0%})"
+            if not row["draft_time_host_synchronized"]:
+                draft += " enqueue-only"
+            peak = row["peak_memory_bytes"]
+            added = row["memory_added_bytes"]
+            memory = "—" if peak is None else f"{peak / gib:.1f}"
+            if added is not None:
+                memory += f" (+{added / gib:.2f})"
+            fallbacks = "; ".join(row["fallbacks"]) or (row["draft_refusal"] or "")
+            lines.append(
+                f"| {row['path']} | {','.join(row['ran'])} | {_fmt(row['decode_tok_s'])} | "
+                f"{_fmt(decode['all'], 2)} ({_fmt(decode['predictable'], 2)} / "
+                f"{_fmt(decode['open_ended'], 2)}) | {_fmt(row['wall_ms'], 0)} | "
+                f"{_fmt(wall['all'], 2)} | {_fmt(row['ttft_ms'], 0)} | {accepted} | {draft} | "
+                f"{memory} | {fallbacks} |"
+            )
+    if report["auto_inputs"]:
+        lines += [
+            "",
+            "## Block-draft inputs for `auto`",
+            "",
+            f"Each block draft at its recommended depth, linear, against `{AUTO_MTP_PATH}` of "
+            "the same backend, tier and context.",
+            "",
+            "| backend | tier | context | path | decode ×off | decode ×MTP (min) | request ×MTP | "
+            "beats MTP on every prompt (decode / request) |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for item in report["auto_inputs"]:
+            d, w = item["decode_tok_s"], item["wall_ms"]
+            lines.append(
+                f"| {item['group']['backend']} | {item['group']['tier']} | {item['context']} | "
+                f"{item['path']} | {_fmt(d['vs_off'], 2)} | {_fmt(d['vs_mtp'], 2)} "
+                f"({_fmt(d['vs_mtp_min'], 2)}) | {_fmt(w['vs_mtp'], 2)} | "
+                f"{d['beats_mtp_on_every_prompt']} / {w['beats_mtp_on_every_prompt']} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def command_paths(args: argparse.Namespace) -> int:
+    report = paths_report([Path(d) for d in args.campaign])
+    with Path(args.json).open("x", encoding="utf-8") as sink:
+        json.dump(report, sink, indent=2)
+        sink.write("\n")
+    with Path(args.markdown).open("x", encoding="utf-8") as sink:
+        sink.write(paths_markdown(report))
+    for line in report["refusals"]:
+        print(f"::error::{line}", file=sys.stderr)
+    return 1 if report["refusals"] or not report["entries"] else 0
+
+
 def command_compare(args: argparse.Namespace) -> int:
     try:
         report = compare_campaigns(
@@ -2258,9 +2871,17 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--epic-root", required=True, help="checkout of the measured commit")
     run.add_argument("--epic-sha", required=True, help="the measured commit")
     run.add_argument("--epic-target-dir", help="CARGO_TARGET_DIR of the epic build")
-    run.add_argument("--pre-epic-root", required=True, help=f"checkout of {PRE_EPIC_SHA}")
-    run.add_argument("--pre-epic-target-dir", required=True)
+    run.add_argument(
+        "--pre-epic-root", help=f"checkout of {PRE_EPIC_SHA} (needed when a row runs the baseline)"
+    )
+    run.add_argument("--pre-epic-target-dir")
     run.add_argument("--output", required=True, help="run-scoped evidence directory")
+    run.add_argument(
+        "--stop-starting-after-minutes",
+        type=float,
+        help="start no benchmark process once this many minutes have passed since the builds "
+        "finished; the running one finishes (a loaned host's budget)",
+    )
     run_options(run)
 
     local = commands.add_parser("local", help="the whole lane on this host, worktrees included")
@@ -2284,11 +2905,17 @@ def main(argv: list[str] | None = None) -> int:
         help="a clone holding every campaign's epic commit (orders re-measured rows)",
     )
 
+    paths = commands.add_parser("paths", help="the paired speculative-paths report (SW-7200)")
+    paths.add_argument("--campaign", action="append", required=True, help="campaign directory")
+    paths.add_argument("--json", required=True, help="report path (must not exist)")
+    paths.add_argument("--markdown", required=True, help="report path (must not exist)")
+
     args = parser.parse_args(argv)
     return {
         "plan": command_plan,
         "run": command_run,
         "local": command_local,
+        "paths": command_paths,
         "compare": command_compare,
     }[args.command](args)
 

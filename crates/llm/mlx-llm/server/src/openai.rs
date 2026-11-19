@@ -321,6 +321,14 @@ pub fn x_decode(report: &DecodeReport) -> Value {
             "peak_workspace_bytes": tree.peak_workspace_bytes,
         });
     }
+    // Present only on a request whose proposer ran and was timed (SW-7200).
+    if let Some(draft) = report.draft_time {
+        v["draft_time"] = json!({
+            "calls": draft.calls,
+            "host_synchronized_calls": draft.host_synchronized_calls,
+            "total_ms": draft.total.as_secs_f64() * 1e3,
+        });
+    }
     v
 }
 
