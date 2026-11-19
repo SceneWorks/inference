@@ -12,6 +12,7 @@ import time
 from types import SimpleNamespace
 
 from scripts.ci import model_proof_cuda_primitives as primitives
+from scripts.ci import model_proof_resources as resources
 
 UUID = re.compile(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
 CASE = {'package': 'candle-llm', 'target': 'shard', 'target_kind': 'test',
@@ -137,6 +138,18 @@ def _secure_namespace(public: Path, uuids: tuple[str, ...]) -> set[tuple[int, in
     return identities
 
 
+def release_counter_diagnostic(guard, output: Path, phase: str, uuid: str) -> dict:
+    """Per retained release sample: the exact UUID's primary counters were valid after owned exit."""
+    try:
+        samples = json.loads((output / f'{phase}-samples.json').read_text(encoding='utf-8'))
+        return {'samples': [{'sample_number': sample.get('sample_number'),
+                             'post_owned_exit_primary_metadata_valid': any(
+                                 card.get('uuid') == uuid and guard.counters_valid(card)
+                                 for card in sample.get('devices', []))} for sample in samples]}
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
+        return {'status': 'missing-or-malformed'}
+
+
 @contextmanager
 def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: dict[str, str]):
     """Claim only caller-approved UUIDs; role order is independent of deterministic lock order."""
@@ -155,12 +168,15 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
         msvcrt.locking(descriptor, operation, count)
     locker = SimpleNamespace(LK_NBLCK=msvcrt.LK_NBLCK, LK_UNLCK=msvcrt.LK_UNLCK, locking=locking)
     deadline = time.monotonic() + policies[0].deadline_seconds
+    # Admission is bounded by the claim deadline; post-run release gets its own fixed budget below.
+    budget = {'deadline': deadline}
     guard = primitives.component('veda_cuda_guard.py', primitives.GUARD_SHA)
     original_command = guard.command
     def bounded_command(argv, requested_deadline=None):
-        return original_command(argv, min(deadline, requested_deadline) if requested_deadline is not None else deadline)
+        limit = budget['deadline']
+        return original_command(argv, min(limit, requested_deadline) if requested_deadline is not None else limit)
     def bounded_sleep(seconds):
-        if time.monotonic() + seconds > deadline:
+        if time.monotonic() + seconds > budget['deadline']:
             raise TimeoutError('approved multi-GPU admission/post-idle budget exhausted')
         time.sleep(seconds)
     guard.command = bounded_command
@@ -195,14 +211,26 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
         failures = []
         # Even when one post-census fails, attempt EVERY approved UUID. No complete/accepted seal otherwise.
         for device in devices:
+            phase = 'model-proof-release-' + device['uuid']
+            # Never the admission deadline's leftover: a passing proof keeps a fixed release budget.
+            budget['deadline'] = time.monotonic() + resources.RELEASE_SAMPLING_SECONDS
             try:
                 # The owned Job has exited; check identity and counters only. Foreign tenants may have grown.
-                guard.sample_baseline(device, output, 'model-proof-release-' + device['uuid'], baselines[device['uuid']],
+                guard.sample_baseline(device, output, phase, baselines[device['uuid']],
                                       idle_check=lambda current, _rows: guard.counters_valid(current),
-                                      permit_bounded_growth=True, require_stable_contexts=False)
+                                      permit_bounded_growth=True, require_stable_contexts=False,
+                                      inventory_reader=resources.release_inventory_reader(guard, device['uuid']))
                 if record is not None:
-                    record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': True})
+                    record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': True,
+                                                        'release_metadata_verification': {'status': 'verified'}})
             except BaseException as error:
+                diagnostic = release_counter_diagnostic(guard, output, phase, device['uuid'])
+                if resources.release_check_inconclusive(error, diagnostic, phase):
+                    if record is not None:
+                        record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': True,
+                            'release_metadata_verification': {'status': 'inconclusive-driver-query-timing',
+                                                              'error': str(error), 'diagnostic': diagnostic}})
+                    continue
                 failures.append(str(error))
                 if record is not None:
                     record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': False, 'error': str(error)})

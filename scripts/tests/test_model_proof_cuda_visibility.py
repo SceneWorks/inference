@@ -365,7 +365,7 @@ class ChildCudaVisibility(unittest.TestCase):
     def test_only_timing_failures_with_valid_retained_metadata_are_inconclusive(self):
         valid = {'samples': [{'post_owned_exit_primary_metadata_valid': True}]}
         invalid = {'samples': [{'post_owned_exit_primary_metadata_valid': False}]}
-        overrun = RuntimeError(resources.RELEASE_WINDOW_OVERRUN)
+        overrun = RuntimeError(resources.release_window_overrun('model-proof-release'))
         self.assertTrue(resources.release_check_inconclusive(overrun, valid))
         self.assertTrue(resources.release_check_inconclusive(TimeoutError('slow'), {'status': 'missing-or-malformed'}))
         self.assertFalse(resources.release_check_inconclusive(overrun, invalid))
