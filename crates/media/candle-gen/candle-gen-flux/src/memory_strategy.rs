@@ -1727,7 +1727,10 @@ mod tests {
         fixture.request.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
 
         let plan = crate::compile_base_plan(crate::Variant::Dev, &fixture.request).unwrap();
-        let low_res = plan.low_res_start().copied().expect("low_res_start resolved");
+        let low_res = plan
+            .low_res_start()
+            .copied()
+            .expect("low_res_start resolved");
         assert_eq!((low_res.low_width, low_res.low_height), (512, 512));
         assert_eq!((low_res.full_width, low_res.full_height), (1024, 1024));
 

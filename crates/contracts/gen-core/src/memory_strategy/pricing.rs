@@ -1048,16 +1048,14 @@ pub fn evaluate_low_res_transition_admission(
         });
     };
 
-    let six_buffer = LowResTransitionSixBufferCeiling::compute(
-        plan,
-        batch,
-        latent_channels,
-        vae_spatial_scale,
-    )
-    .map_err(|e| LowResTransitionAdmissionRefusal::IncompleteCoverageProof {
-        route_id: route_id.to_owned(),
-        reason: e.to_string(),
-    })?;
+    let six_buffer =
+        LowResTransitionSixBufferCeiling::compute(plan, batch, latent_channels, vae_spatial_scale)
+            .map_err(
+                |e| LowResTransitionAdmissionRefusal::IncompleteCoverageProof {
+                    route_id: route_id.to_owned(),
+                    reason: e.to_string(),
+                },
+            )?;
 
     let (transition_delta_bytes, required_peak_bytes) = match posture {
         LowResTransitionPricingPosture::UnqualifiedRealEvidence => {
@@ -1100,12 +1098,14 @@ pub fn evaluate_low_res_transition_admission(
                     reason: "coverage trace geometry, ordinary peak, or estimate_source does not match the resolved low_res_start plan".to_owned(),
                 });
             }
-            let delta = trace.total_incremental_bytes_above_ordinary().map_err(|e| {
-                LowResTransitionAdmissionRefusal::IncompleteCoverageProof {
-                    route_id: route_id.to_owned(),
-                    reason: e.to_string(),
-                }
-            })?;
+            let delta = trace
+                .total_incremental_bytes_above_ordinary()
+                .map_err(
+                    |e| LowResTransitionAdmissionRefusal::IncompleteCoverageProof {
+                        route_id: route_id.to_owned(),
+                        reason: e.to_string(),
+                    },
+                )?;
             let req_peak = trace.total_bounded_peak_bytes().map_err(|e| {
                 LowResTransitionAdmissionRefusal::IncompleteCoverageProof {
                     route_id: route_id.to_owned(),
@@ -1181,12 +1181,8 @@ pub fn qualify_flux1_low_res_transition_bound(
                 .into(),
         ));
     }
-    let six_buffer_ceiling = LowResTransitionSixBufferCeiling::compute(
-        plan,
-        batch,
-        latent_channels,
-        vae_spatial_scale,
-    )?;
+    let six_buffer_ceiling =
+        LowResTransitionSixBufferCeiling::compute(plan, batch, latent_channels, vae_spatial_scale)?;
     let pixel_stride = vae_spatial_scale
         .checked_mul(patch_size)
         .filter(|&s| s > 0)
@@ -1556,7 +1552,8 @@ pub fn trace_planned_low_res_scope_lifecycle(
                             active_scope.configure_attention(chunk)?;
                         }
                         if let Some((first_block, block_count)) = transformer_window {
-                            active_scope.materialize_transformer_window(first_block, block_count)?;
+                            active_scope
+                                .materialize_transformer_window(first_block, block_count)?;
                         }
                         Ok(())
                     })?;

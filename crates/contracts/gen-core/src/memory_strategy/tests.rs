@@ -3107,16 +3107,25 @@ fn mem3_concurrent_streams_and_joint_workspace_are_summed_aliases_deduped_and_do
     // Shared trunk weights aliased by both video and audio streams in DeviceVram must count ONCE,
     // while concurrent video stream activations, audio stream activations, and joint workspace are
     // SUMMED (never maxed), and HostRam / UnifiedMemory remain separate.
-    let shared_trunk_a =
-        PricedAllocation::new("trunk_view_video", MemoryBudgetDomain::DeviceVram, 1_000_000)
-            .with_alias_group("shared_joint_trunk");
-    let shared_trunk_b =
-        PricedAllocation::new("trunk_view_audio", MemoryBudgetDomain::DeviceVram, 1_000_000)
-            .with_alias_group("shared_joint_trunk");
+    let shared_trunk_a = PricedAllocation::new(
+        "trunk_view_video",
+        MemoryBudgetDomain::DeviceVram,
+        1_000_000,
+    )
+    .with_alias_group("shared_joint_trunk");
+    let shared_trunk_b = PricedAllocation::new(
+        "trunk_view_audio",
+        MemoryBudgetDomain::DeviceVram,
+        1_000_000,
+    )
+    .with_alias_group("shared_joint_trunk");
     let host_staging =
         PricedAllocation::new("host_pinned_stage", MemoryBudgetDomain::HostRam, 500_000);
-    let unified_pool =
-        PricedAllocation::new("unified_metal_heap", MemoryBudgetDomain::UnifiedMemory, 750_000);
+    let unified_pool = PricedAllocation::new(
+        "unified_metal_heap",
+        MemoryBudgetDomain::UnifiedMemory,
+        750_000,
+    );
 
     let op0 = PhaseOperationLiveSet {
         operation_id: "denoise_phase_0".into(),
@@ -3264,8 +3273,8 @@ fn mem3_concurrent_streams_and_joint_workspace_are_summed_aliases_deduped_and_do
 }
 
 #[test]
-fn mem3_evidence_peak_basis_prevents_double_counting_whole_request_high_water_and_rejects_ambiguous()
-{
+fn mem3_evidence_peak_basis_prevents_double_counting_whole_request_high_water_and_rejects_ambiguous(
+) {
     let basis = EvidencePeakBasis::classify_phase_peaks(
         Some(CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES),
         Some(CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES),
@@ -3542,7 +3551,9 @@ fn b4_six_buffer_ceiling_exact_fit_one_byte_under_and_fail_closed_real_evidence_
         8,
         &LowResTransitionPricingPosture::UnqualifiedRealEvidence,
     )
-    .expect("ordinary T2I admission must remain completely unchanged under UnqualifiedRealEvidence");
+    .expect(
+        "ordinary T2I admission must remain completely unchanged under UnqualifiedRealEvidence",
+    );
     assert!(!ordinary_receipt.low_res_active);
     assert_eq!(
         ordinary_receipt.required_peak_bytes,
@@ -3739,28 +3750,32 @@ fn mem5_scope_lifecycle_records_phase_transitions_and_keeps_rungs_across_phases(
 
     // Verify phase 0 and phase 1 have distinct RenderPhaseIdentity values and phase 0 never reuses
     // the final-phase (1024x1024, phase 1) identity.
-    assert!(events.contains(&RecordedScopeLifecycleEvent::EnterRenderPhase {
-        phase: MemoryPhase::Denoise,
-        pass_index: 0,
-        phase_index: 0,
-        geometry: MemoryGeometry {
-            width: 512,
-            height: 512,
-            batch: 1,
-            frames: 1,
-            reference_count: 0,
-        },
-    }));
-    assert!(events.contains(&RecordedScopeLifecycleEvent::EnterRenderPhase {
-        phase: MemoryPhase::Denoise,
-        pass_index: 0,
-        phase_index: 1,
-        geometry: MemoryGeometry {
-            width: 1024,
-            height: 1024,
-            batch: 1,
-            frames: 1,
-            reference_count: 0,
-        },
-    }));
+    assert!(
+        events.contains(&RecordedScopeLifecycleEvent::EnterRenderPhase {
+            phase: MemoryPhase::Denoise,
+            pass_index: 0,
+            phase_index: 0,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+        })
+    );
+    assert!(
+        events.contains(&RecordedScopeLifecycleEvent::EnterRenderPhase {
+            phase: MemoryPhase::Denoise,
+            pass_index: 0,
+            phase_index: 1,
+            geometry: MemoryGeometry {
+                width: 1024,
+                height: 1024,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+        })
+    );
 }
