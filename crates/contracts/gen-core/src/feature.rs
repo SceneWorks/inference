@@ -4546,9 +4546,9 @@ mod tests {
         assert_eq!((plan.low_width, plan.low_height), (256, 256));
         assert_eq!((plan.full_width, plan.full_height), (512, 512));
 
-        let flow_ms = FlowModelSampling::new(TimestepConvention::Sigma);
-        let edm_ms = EdmModelSampling::new(PredictionType::Eps, 0.002, 80.0, 1.0);
-        let discrete_ms =
+        let flow_sampling = FlowModelSampling::new(TimestepConvention::Sigma);
+        let edm_sampling = EdmModelSampling::new(PredictionType::Eps, 0.002, 80.0, 1.0);
+        let discrete_sampling =
             DiscreteModelSampling::sdxl(&AlphaSchedule::scaled_linear(1000, 0.00085, 0.012));
 
         // 1. BoundaryState::XSigma and RouteSpecific are refused with a typed Error::Unsupported.
@@ -4563,7 +4563,7 @@ mod tests {
                 8,
                 &plan,
                 0.5,
-                &flow_ms,
+                &flow_sampling,
                 42,
                 0,
                 0,
@@ -4584,7 +4584,7 @@ mod tests {
                 8,
                 &plan,
                 0.5,
-                &flow_ms,
+                &flow_sampling,
                 42,
                 0,
                 0,
@@ -4650,14 +4650,14 @@ mod tests {
             8,
             &plan,
             sigma_k,
-            &flow_ms,
+            &flow_sampling,
             &constant_eps,
         )
         .unwrap();
         let expected_flow = (1.0 - sigma_k) * 2.0 + sigma_k * 0.5;
         assert!(flow_out.iter().all(|&v| (v - expected_flow).abs() < 1e-6));
 
-        for ve_ms in [&edm_ms as &dyn ModelSampling, &discrete_ms] {
+        for ve_sampling in [&edm_sampling as &dyn ModelSampling, &discrete_sampling] {
             let ve_out = transition_packed_clean_estimate_with_noise_f32(
                 BoundaryState::CleanEstimate {
                     latent: &constant_x0,
@@ -4669,7 +4669,7 @@ mod tests {
                 8,
                 &plan,
                 sigma_k,
-                ve_ms,
+                ve_sampling,
                 &constant_eps,
             )
             .unwrap();
