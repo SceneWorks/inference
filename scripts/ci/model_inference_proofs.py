@@ -53,6 +53,10 @@ NAX_ROUTES = {
 }
 POLICY_BACKENDS = {'mlx': 'darwin-mlx', 'candle-metal': 'darwin-mlx',
                    'candle-cpu': 'linux-cpu', 'candle-cuda': 'windows-cuda'}
+SENSENOVA_PROOFS = {
+    'mlx': 'mlx-llm/integration/sensenova_loop_real_weights::sensenova_loop_release_proof',
+    'candle-cuda': 'candle-llm/sensenova_loop_real_weights/sensenova_loop_release_proof',
+}
 IRIS_QUANT_PROOFS = frozenset(
     f'{package}/integration/quant_real_weights::{test}'
     for package in ('mlx-gen-iris', 'candle-gen-iris')
@@ -608,6 +612,9 @@ def select(rows: tuple[dict, ...], selection: str, backend: str, configuration: 
     if candidates and all(row.get('parent_only_helper') for row in candidates):
         raise ValueError('parent-only helper is not a standalone proof; select its registered parent cases')
     candidates = tuple(row for row in candidates if not row.get('parent_only_helper'))
+    # These cases require the paired source-oracle stage; package/all selectors do not have it.
+    candidates = tuple(row for row in candidates
+                       if identity(row) not in SENSENOVA_PROOFS.values() or selection == identity(row))
     if configuration is not None and not any('configurations' in row for row in candidates):
         raise ValueError('selected cases declare no named configurations')
     effective = tuple(configured_case(row, configuration) for row in candidates)
@@ -636,7 +643,8 @@ def request(raw: str, backend: str) -> dict:
     value = json.loads(raw)
     if (not isinstance(value, dict) or not {'selection', 'policy'} <= set(value)
             or not set(value) <= {'selection', 'policy', 'runner', 'configuration', 'training_comparison', 'download_missing',
-                                  'hub_snapshots'} | multi_cuda.FIELDS):
+                                  'hub_snapshots', 'sensenova_reference_policy', 'sensenova_publish',
+                                  'sensenova_source_sha'} | multi_cuda.FIELDS):
         raise ValueError('request requires selection and explicit resource policy; only declared runner/configuration/comparison/resource options may be optional')
     if 'configuration' in value and (not isinstance(value['configuration'], str) or not NAME.fullmatch(value['configuration'])):
         raise ValueError('configuration must select one fixed declared name')
@@ -655,6 +663,20 @@ def request(raw: str, backend: str) -> dict:
     policy = value['policy']
     if not isinstance(policy, dict) or policy.get('backend') != POLICY_BACKENDS[backend]:
         raise ValueError('resource policy backend must match the fixed workflow lane')
+    if value.get('selection') == SENSENOVA_PROOFS.get(backend):
+        if not isinstance(value.get('sensenova_source_sha'), str) or not re.fullmatch(
+            r'[0-9a-f]{40}', value['sensenova_source_sha']
+        ):
+            raise ValueError('SenseNova proof requires an explicit exact inference SHA')
+        reference = value.get('sensenova_reference_policy')
+        if not isinstance(reference, dict) or reference.get('backend') != 'windows-cuda':
+            raise ValueError('SenseNova proof requires an explicit Windows CUDA reference resource policy')
+        if backend == 'mlx' and value.get('runner') not in NAX_ROUTES:
+            raise ValueError('SenseNova MLX proof requires an explicit provisioned Mac route')
+        if type(value.get('sensenova_publish', False)) is not bool:
+            raise ValueError('SenseNova publication selection requires an explicit boolean')
+    elif {'sensenova_reference_policy', 'sensenova_publish', 'sensenova_source_sha'} & value.keys():
+        raise ValueError('SenseNova reference and publication options require one exact SenseNova proof binding')
     multi_cuda.validate_request(value, backend)
     return value
 
@@ -1816,6 +1838,8 @@ def main() -> int:
                 raise ValueError('explicit fixed backend is required')
             raw = args.request if args.request_env is None else os.environ.get(args.request_env, '')
             value = request(raw, args.backend)
+        if 'sensenova_source_sha' in value and value['sensenova_source_sha'] != args.expected_sha:
+            raise ValueError('dispatched inference SHA differs from the requested SenseNova source')
         rows = select(load_registry(args.registry), value['selection'], args.backend, value.get('configuration'))
         multi_cuda.bind_rows(rows, value, args.backend)
         comparison_plan = None
@@ -1841,6 +1865,10 @@ def main() -> int:
                     extra_path = Path(directory) / f'cuda-policy-role-{role}.json'
                     write_json(extra_path, secondary)
                     load_policy(extra_path)
+                if 'sensenova_reference_policy' in value:
+                    reference_policy = Path(directory) / 'sensenova-reference-policy.json'
+                    write_json(reference_policy, value['sensenova_reference_policy'])
+                    load_policy(reference_policy)
             runner = NAX_ROUTES[value['runner']]['labels'] if value.get('runner') in NAX_ROUTES else RUNNERS[args.backend]
             iris_route = ((args.backend == 'mlx' and value.get('runner') == 'nax')
                           or args.backend == 'candle-cuda')
@@ -1871,6 +1899,10 @@ def main() -> int:
                     and rows[0]['package'] == 'candle-gen-krea'
                     and rows[0]['fqn'] == 'imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose'):
                 asset_setup = 'krea-native-nvfp4-pose'
+            if value.get('selection') == SENSENOVA_PROOFS.get(args.backend):
+                if args.binding_env is None:
+                    raise ValueError('dispatch SenseNova through the real-weights model-inference-proofs bridge')
+                asset_setup = 'sensenova-loop'
             plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
                     'bindings': [identity(row) for row in rows]}
             if hub_snapshots:

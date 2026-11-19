@@ -82,6 +82,8 @@ pub struct Flux2ControlRequest {
     /// registered descriptor. Default is inert, and an inert sink makes a seeded render
     /// byte-identical to one with no preview at all.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance configuration for control-conditioned FLUX.2-dev.
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -101,6 +103,7 @@ impl Default for Flux2ControlRequest {
             seed: 0,
             use_pid: false,
             preview: PreviewSink::default(),
+            pag: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -131,13 +134,16 @@ pub struct Flux2Control {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
-fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+pub fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
     descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
     descriptor
 }
 
 impl Flux2Control {
+    pub fn descriptor(&self) -> candle_gen::gen_core::ModelDescriptor {
+        control_report_descriptor()
+    }
     /// Load the dev base (CPU-stage → quantize-onto-GPU when `quant` is set; dense otherwise — fixture
     /// only, the 32B does not fit dense), the Fun-Controlnet-Union control overlay (dense on the device
     /// → quantized in place), and the VAE with its encoder. `quant` (Q4/Q8) is required in practice for
@@ -374,13 +380,32 @@ impl Flux2Control {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        crate::complete_bespoke_image(
+        crate::complete_bespoke_image_with_pag(
             &control_report_descriptor(),
             &req.cancel,
             "flux2/control_provider/generate",
             "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
-            || self.generate(req, control_image, &mut report_progress),
+            || {
+                let pag = resolve_control_pag_report(req)?;
+                let image = self.generate(req, control_image, &mut report_progress)?;
+                Ok((image, pag))
+            },
         )
+    }
+
+    pub fn generate_with_report(
+        &self,
+        req: &Flux2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<candle_gen::gen_core::GenerationReport> {
+        let pag = resolve_control_pag_report(req)?;
+        let image = self.generate(req, control_image, on_progress)?;
+        let mut report = candle_gen::gen_core::GenerationReport::from_output(
+            candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+        );
+        report.pag = pag;
+        Ok(report)
     }
 
     pub fn generate(
@@ -421,12 +446,21 @@ impl Flux2Control {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        crate::complete_bespoke_image(
+        crate::complete_bespoke_image_with_pag(
             &control_report_descriptor(),
             &req.cancel,
             "flux2/control_provider/generate_with_memory_context",
             "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
-            || self.generate_with_memory_context(context, req, control_image, &mut report_progress),
+            || {
+                let pag = resolve_control_pag_report(req)?;
+                let image = self.generate_with_memory_context(
+                    context,
+                    req,
+                    control_image,
+                    &mut report_progress,
+                )?;
+                Ok((image, pag))
+            },
         )
     }
 
@@ -586,6 +620,15 @@ impl Flux2Control {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        let pag = resolve_control_pag(req)?;
+        candle_gen::execution::policy(
+            "flux2.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let total_steps = sigmas.len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         // The driver does cancel + progress + the integrator step. The control forward lives inside the
         // predict closure so a multi-eval solver re-runs it. dev is guidance-distilled: a single forward
         // feeding the embedded guidance scalar (no negative pass). FLUX.2 embeds σ×1000.
@@ -600,8 +643,18 @@ impl Flux2Control {
             Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
-                Ok(transformer
-                    .forward_with_memory(
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let step_pag = pag
+                    .as_ref()
+                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                let pos = transformer
+                    .forward_with_memory_pag(
                         latents,
                         &prompt_embeds,
                         &img_ids,
@@ -613,8 +666,33 @@ impl Flux2Control {
                         attention_plan,
                         transformer_window,
                         &req.cancel,
+                        None,
                     )
-                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                if step_pag > 0.0 {
+                    let pag_layers = pag
+                        .as_ref()
+                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                    let pert = transformer
+                        .forward_with_memory_pag(
+                            latents,
+                            &prompt_embeds,
+                            &img_ids,
+                            &txt_ids,
+                            ts,
+                            Some(req.guidance),
+                            &control_context,
+                            req.control_scale,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                            Some(pag_layers),
+                        )
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    Ok((&pos + ((&pos - &pert)? * step_pag as f64)?)?)
+                } else {
+                    Ok(pos)
+                }
             },
         )?;
 
@@ -860,6 +938,27 @@ fn validate_memory_request(context: &MemoryRunContext, req: &Flux2ControlRequest
     Ok(())
 }
 
+fn resolve_control_pag(
+    req: &Flux2ControlRequest,
+) -> Result<Option<candle_gen::gen_core::PagResolved>> {
+    let desc = control_report_descriptor();
+    let pag_req = candle_gen::gen_core::GenerationRequest {
+        pag: req.pag.clone(),
+        ..Default::default()
+    };
+    desc.capabilities
+        .resolve_pag(desc.id, &pag_req)
+        .map_err(CandleError::from)
+}
+
+fn resolve_control_pag_report(
+    req: &Flux2ControlRequest,
+) -> Result<Option<candle_gen::gen_core::PagExecutionReport>> {
+    let total_steps = u32::try_from(req.steps)
+        .map_err(|_| CandleError::Msg("flux2 control: step count overflow".into()))?;
+    Ok(resolve_control_pag(req)?.map(|p| p.execution_report(total_steps)))
+}
+
 /// Validate the seed-independent request knobs before any tensor work. The empty-prompt guard
 /// (sc-8987, the sc-8646 bug class) mirrors the registered txt2img `validate` and the flux1 control
 /// provider: `gen_core::TextTokenizer::tokenize("")` short-circuits to a (1, 0) encoding BEFORE the
@@ -869,6 +968,7 @@ fn validate_request(req: &Flux2ControlRequest) -> Result<()> {
     if req.prompt.trim().is_empty() {
         return Err(CandleError::Msg("flux2 control: prompt is required".into()));
     }
+    resolve_control_pag(req)?;
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(CandleError::Msg(format!(
             "flux2 control: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1134,5 +1234,57 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("steps"));
+    }
+
+    #[test]
+    fn control_pag_validation_report_and_completion_preserve_dev_contract() {
+        use candle_gen::gen_core::PagConfig;
+
+        let valid = Flux2ControlRequest {
+            prompt: "a dancer".into(),
+            steps: 4,
+            pag: Some(PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(&valid).is_ok());
+        let report = resolve_control_pag_report(&valid)
+            .unwrap()
+            .expect("active pag report");
+        assert_eq!(report.layers, vec![28]);
+        assert_eq!(report.active_steps, 4);
+        assert_eq!(report.total_steps, 4);
+
+        let completed = crate::complete_bespoke_image_with_pag(
+            &control_report_descriptor(),
+            &CancelFlag::default(),
+            "flux2/control_provider/test",
+            "test-missing",
+            || {
+                Ok((
+                    Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    },
+                    Some(report.clone()),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.generation.pag, Some(report));
+
+        let invalid_layer = Flux2ControlRequest {
+            prompt: "a dancer".into(),
+            pag: Some(PagConfig {
+                scale: 1.5,
+                layers: Some(vec![56]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(&invalid_layer).is_err());
     }
 }

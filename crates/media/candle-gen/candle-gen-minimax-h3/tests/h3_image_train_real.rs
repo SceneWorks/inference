@@ -163,15 +163,24 @@ fn tensors(path: &Path) -> HashMap<String, Tensor> {
 }
 
 /// The saved file is the PEFT layout the H3-Image install reads: a down/up pair and an alpha for
-/// every block leaf, the reload stamps, and at least one trained (non-zero) up factor.
+/// every DiT-block and token-refiner-block leaf (SW-F369, ai-toolkit's surface), the reload stamps,
+/// and a trained (non-zero) up factor in a DiT block and in the refiner.
 fn check_layout(path: &Path, edit: bool) -> usize {
     let w = tensors(path);
     let meta = candle_gen::gen_core::weightsmeta::safetensors_file_metadata(path).unwrap();
     let downs: Vec<&String> = w.keys().filter(|k| k.ends_with(".lora_A.weight")).collect();
-    assert_eq!(downs.len(), 50 * 6, "every block leaf");
+    assert_eq!(
+        downs.len(),
+        (50 + 2) * 6,
+        "every DiT and refiner block leaf"
+    );
     for down in &downs {
         let stem = down.trim_end_matches(".lora_A.weight");
-        assert!(stem.starts_with("transformer_blocks."), "{stem}");
+        assert!(
+            stem.starts_with("transformer_blocks.")
+                || stem.starts_with("token_refiner.refiner_blocks."),
+            "{stem}"
+        );
         assert!(w.contains_key(&format!("{stem}.lora_B.weight")), "{stem}");
         assert!(w.contains_key(&format!("{stem}.alpha")), "{stem}");
     }
@@ -184,16 +193,24 @@ fn check_layout(path: &Path, edit: bool) -> usize {
         meta.get("trainingMode").map(String::as_str),
         edit.then_some("edit")
     );
-    let up = w["transformer_blocks.0.attn.to_q.lora_B.weight"]
-        .to_dtype(DType::F32)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    assert!(up > 0.0, "the up factor never moved off its zero init");
+    for key in [
+        "transformer_blocks.0.attn.to_q.lora_B.weight",
+        "token_refiner.refiner_blocks.0.attn.to_q.lora_B.weight",
+    ] {
+        let up = w[key]
+            .to_dtype(DType::F32)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            up > 0.0,
+            "{key}: the up factor never moved off its zero init"
+        );
+    }
     downs.len()
 }
 

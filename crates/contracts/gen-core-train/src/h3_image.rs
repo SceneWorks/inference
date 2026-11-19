@@ -7,9 +7,10 @@
 //! * the **trainer identity** — [`TRAINER_ID`], [`trainer_descriptor`], the adapter provenance
 //!   ([`ADAPTER_PROVENANCE`], [`EDIT_ADAPTER_MARKER`]) and the run defaults
 //!   ([`default_training_config`]: 2048², gradient checkpointing on);
-//! * the **trainable surface** — [`resolve_target_paths`]: the six leaves of every DiT block by
-//!   default, suffix-matched like PEFT's `target_modules`, with a typed refusal for the modules a
-//!   distilled H3-Image run computes once per request and therefore cannot train;
+//! * the **trainable surface** — [`resolve_target_paths`]: the six leaves of every DiT block and
+//!   of every token-refiner block by default (ai-toolkit's transformer-only surface for this
+//!   architecture), suffix-matched like PEFT's `target_modules`, with a typed refusal for the
+//!   modules a distilled H3-Image run computes once per request or keeps frozen;
 //! * the **flow-matching training contract** — [`training_step`] and [`training_mix`], the noise
 //!   level, head and regression target one micro-step trains on;
 //! * the **training canvas** — [`training_canvas`]: every target keeps its aspect at about the
@@ -60,8 +61,15 @@ pub const DEFAULT_TRAINING_RESOLUTION: u32 = 2048;
 /// patch — the generator's own [`SIZE_STRIDE`].
 pub const TRAINING_CANVAS_STRIDE: u32 = SIZE_STRIDE;
 
-/// The leaves of every DiT block a default run trains — the block's four attention projections and
-/// its SwiGLU pair, in the published diffusers spelling the H3-Image LoRA loader addresses.
+/// The leaves of every DiT block — and of every token-refiner block — a default run trains: the
+/// block's four attention projections and its SwiGLU pair, in the published diffusers spelling the
+/// H3-Image LoRA loader addresses.
+///
+/// The default surface is ai-toolkit's for `minimax_h3_image` (`transformer_only` over the
+/// transformer's `blocks`, which matches both `blocks.{i}` and `token_refiner.blocks.{i}`, with
+/// `adaln_proj` ignored): every linear inside those blocks, and nothing outside them. The
+/// refiner's leaves carry the caption rows, so training them lets the adapter bind its trigger
+/// text, as an ai-toolkit run of the same architecture does.
 pub const BLOCK_TARGETS: [&str; 6] = [
     "attn.to_q",
     "attn.to_k",
@@ -71,10 +79,12 @@ pub const BLOCK_TARGETS: [&str; 6] = [
     "ff.net.2",
 ];
 
-/// The adapter-addressable modules (SW-7096) a training run cannot train, and why. Each runs once
-/// per request, before the per-step forward, from inputs every step shares — the six timesteps or
-/// the caption — so its output is a constant of the step's graph and no gradient reaches it.
-pub const UNTRAINABLE_MODULES: [(&str, &str); 7] = [
+/// The adapter-addressable modules (SW-7096) a training run cannot train, and why. The first three
+/// run once per request, before the per-step forward, from the six timesteps every step shares, so
+/// their outputs are constants of the step's graph and no gradient reaches them. The rest sit
+/// outside the transformer and refiner blocks, which is the surface ai-toolkit trains for this
+/// architecture too.
+pub const UNTRAINABLE_MODULES: [(&str, &str); 6] = [
     (
         "adaln_proj",
         "each block's AdaLN projection is precomputed once over the six timesteps and evicted",
@@ -86,10 +96,6 @@ pub const UNTRAINABLE_MODULES: [(&str, &str); 7] = [
     (
         "norm_out",
         "the final AdaLN projection is precomputed with the blocks'",
-    ),
-    (
-        "token_refiner",
-        "the caption rows are refined once per item",
     ),
     (
         "context_embedder",
@@ -245,13 +251,21 @@ pub fn adapter_surface(
     v
 }
 
-/// Why `path` cannot be trained, or `None` for a trainable block leaf.
+/// The leaf of a DiT-block or refiner-block path (`…blocks.{i}.<leaf>` → `<leaf>`), when `path`
+/// is one of [`BLOCK_TARGETS`] under either container.
+fn trainable_block_leaf(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("transformer_blocks.")
+        .or_else(|| path.strip_prefix(REFINER_BLOCKS_PREFIX))?;
+    let (index, leaf) = rest.split_once('.')?;
+    index.parse::<usize>().ok()?;
+    BLOCK_TARGETS.contains(&leaf).then_some(leaf)
+}
+
+/// Why `path` cannot be trained, or `None` for a trainable block or refiner-block leaf.
 fn untrainable_reason(path: &str) -> Option<&'static str> {
-    if let Some(rest) = path.strip_prefix("transformer_blocks.") {
-        let leaf = rest.split_once('.').map_or("", |(_, leaf)| leaf);
-        if BLOCK_TARGETS.contains(&leaf) {
-            return None;
-        }
+    if trainable_block_leaf(path).is_some() {
+        return None;
     }
     UNTRAINABLE_MODULES
         .iter()
@@ -261,7 +275,8 @@ fn untrainable_reason(path: &str) -> Option<&'static str> {
 }
 
 /// Resolve `cfg.lora_target_modules` to full dotted paths on `surface` ([`adapter_surface`]), in
-/// block order. Empty: every block's [`BLOCK_TARGETS`]. Otherwise each entry suffix-matches
+/// surface order (the DiT blocks, then the refiner blocks). Empty: [`BLOCK_TARGETS`] of every DiT
+/// block and every refiner block. Otherwise each entry suffix-matches
 /// anywhere, PEFT's `target_modules` rule, over the trainable block leaves; an entry that matches
 /// only modules the run cannot train ([`UNTRAINABLE_MODULES`]) is a typed refusal naming them and
 /// the reason, and a list that matches nothing is refused too — never a silently smaller adapter.
@@ -304,7 +319,7 @@ pub fn resolve_target_paths(
     if !refused.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "{TRAINER_ID} trainer: lora_target_modules {:?} select module(s) a MiniMax-H3-Image run \
-             cannot train: {}; target the DiT block leaves ({}) instead",
+             cannot train: {}; target the DiT or token-refiner block leaves ({}) instead",
             cfg.lora_target_modules,
             refused.join("; "),
             BLOCK_TARGETS.join(", ")
@@ -321,13 +336,33 @@ pub fn resolve_target_paths(
     Ok(paths)
 }
 
-/// The DiT block a block-leaf path belongs to (`transformer_blocks.{i}.…` → `i`).
+/// The DiT block a block-leaf path belongs to (`transformer_blocks.{i}.…` → `i`); `None` for a
+/// refiner-block or trunk path.
 pub fn target_block(path: &str) -> Option<usize> {
     path.strip_prefix("transformer_blocks.")?
         .split_once('.')?
         .0
         .parse()
         .ok()
+}
+
+/// The container prefix of a token-refiner block path.
+pub const REFINER_BLOCKS_PREFIX: &str = "token_refiner.refiner_blocks.";
+
+/// The token-refiner block a refiner-leaf path belongs to
+/// (`token_refiner.refiner_blocks.{i}.…` → `i`).
+pub fn refiner_block(path: &str) -> Option<usize> {
+    path.strip_prefix(REFINER_BLOCKS_PREFIX)?
+        .split_once('.')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Whether any resolved target is a token-refiner leaf — the run then differentiates the caption's
+/// refiner forward every step instead of refining each caption once.
+pub fn trains_refiner(paths: &[String]) -> bool {
+    paths.iter().any(|p| refiner_block(p).is_some())
 }
 
 /// The frozen **training adapter**'s footprint on the training DiT ([`TrainingConfig::training_adapter`]):
@@ -599,6 +634,10 @@ pub struct TrainStepShape {
     /// attention recomputes each chunk in the backward, so no call ever holds more than one chunk's
     /// scores (E20).
     pub attention_heads_per_chunk: u64,
+    /// Token-refiner blocks the step differentiates ([`trains_refiner`]): their forward over the
+    /// caption rows is retained whole for the backward (it is not checkpointed). `0` when no
+    /// refiner leaf is a target and the caption rows are a constant of the step.
+    pub refiner_layers: u64,
 }
 
 impl TrainStepShape {
@@ -702,6 +741,16 @@ pub fn train_step_bytes(
     } else {
         geometry.layers * (block_saved + saved_scores)
     };
+    // A trained refiner's forward over the caption rows, retained for the backward: each refiner
+    // block's saved tensors at the text rows (the refiner blocks have the DiT blocks' widths) and
+    // its attention's saved scores, live across the whole step.
+    let t = shape.text_rows;
+    let refiner_block_saved = (ATTENTION_SAVED_HIDDEN * t * geometry.inner()
+        + FFN_SAVED_HIDDEN * t * geometry.hidden
+        + FFN_SAVED_WIDE * t * geometry.ffn)
+        * a
+        + SCORE_ARRAYS_PER_ATTENTION_VJP * geometry.heads * t * t * a;
+    let retained = retained.saturating_add(shape.refiner_layers * refiner_block_saved);
     let image = shape.reference_rows + shape.image_rows;
     TrainStepBytes {
         weights: weights_bytes,
@@ -735,27 +784,51 @@ mod tests {
         adapter_surface(50, 2, 6)
     }
 
+    /// ai-toolkit's surface for this architecture: every leaf of the 50 DiT blocks, then every leaf
+    /// of the 2 refiner blocks — nothing outside a block. Mutation: drop the refiner prefix from
+    /// [`trainable_block_leaf`] ⇒ the default is 300 paths and the count assert fails.
     #[test]
-    fn the_default_targets_are_every_block_leaf_in_block_order() {
+    fn the_default_targets_are_every_dit_and_refiner_block_leaf() {
         let paths = resolve_target_paths(&surface(), &cfg(&[])).unwrap();
-        assert_eq!(paths.len(), 50 * 6);
+        assert_eq!(paths.len(), (50 + 2) * 6);
         assert_eq!(paths[0], "transformer_blocks.0.attn.to_q");
         assert_eq!(paths[299], "transformer_blocks.49.ff.net.2");
-        // Block order: every path's block is non-decreasing.
-        let blocks: Vec<usize> = paths.iter().map(|p| target_block(p).unwrap()).collect();
+        assert_eq!(paths[300], "token_refiner.refiner_blocks.0.attn.to_q");
+        assert_eq!(paths[311], "token_refiner.refiner_blocks.1.ff.net.2");
+        // Surface order: the DiT blocks non-decreasing, then the refiner blocks non-decreasing.
+        let blocks: Vec<usize> = paths[..300]
+            .iter()
+            .map(|p| target_block(p).unwrap())
+            .collect();
         assert!(blocks.windows(2).all(|w| w[0] <= w[1]));
-        assert!(!paths.iter().any(|p| p.starts_with("token_refiner")));
+        let refiner: Vec<usize> = paths[300..]
+            .iter()
+            .map(|p| refiner_block(p).unwrap())
+            .collect();
+        assert!(refiner.windows(2).all(|w| w[0] <= w[1]));
+        assert!(trains_refiner(&paths));
+        // Nothing outside a block.
+        assert!(paths
+            .iter()
+            .all(|p| target_block(p).is_some() || refiner_block(p).is_some()));
+        assert!(!paths.iter().any(|p| p.contains("adaln_proj")));
     }
 
     #[test]
     fn an_explicit_suffix_matches_block_leaves_only_where_trainable() {
         let q = resolve_target_paths(&surface(), &cfg(&["to_q"])).unwrap();
-        assert_eq!(q.len(), 50, "the refiner's to_q is not trained");
-        // A suffix that lands on the refiner is refused, naming why.
-        let err = resolve_target_paths(&surface(), &cfg(&["refiner_blocks.0.attn.to_q"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("refined once per item"), "{err}");
+        assert_eq!(q.len(), 50 + 2, "the DiT's and the refiner's to_q");
+        assert!(trains_refiner(&q));
+        // A suffix that lands on the refiner alone trains it alone.
+        let r = resolve_target_paths(&surface(), &cfg(&["refiner_blocks.0.attn.to_q"])).unwrap();
+        assert_eq!(
+            r,
+            vec!["token_refiner.refiner_blocks.0.attn.to_q".to_owned()]
+        );
+        // A suffix only the DiT blocks carry leaves the refiner constant.
+        let d = resolve_target_paths(&surface(), &cfg(&["transformer_blocks.3.ff.net.2"])).unwrap();
+        assert_eq!(d.len(), 1);
+        assert!(!trains_refiner(&d));
         for (target, why) in [
             ("adaln_proj.linear", "precomputed once"),
             ("time_embedder.linear_1", "timestep MLP"),
@@ -925,6 +998,32 @@ mod tests {
             checkpointed,
             resident_blocks: false,
             attention_heads_per_chunk: 56,
+            refiner_layers: 0,
+        }
+    }
+
+    /// A trained refiner adds its retained forward over the caption rows — each block's saved
+    /// tensors at `T` rows plus its scores — to every residency, and nothing else.
+    #[test]
+    fn a_trained_refiner_retains_its_forward_over_the_caption_rows() {
+        let g = DitGeometry::SHIPPED;
+        let w = weights();
+        let t = 256u64;
+        let per_block = (14 * t * 7168 + 3 * t * 5376 + 4 * t * 14336) * 2 + 6 * 56 * t * t * 2;
+        for checkpointed in [true, false] {
+            let frozen = train_step_bytes(&g, &w, &shape(checkpointed));
+            let trained = train_step_bytes(
+                &g,
+                &w,
+                &TrainStepShape {
+                    refiner_layers: 2,
+                    ..shape(checkpointed)
+                },
+            );
+            assert_eq!(trained.retained - frozen.retained, 2 * per_block);
+            assert_eq!(trained.total() - frozen.total(), 2 * per_block);
+            assert_eq!(trained.block_backward, frozen.block_backward);
+            assert_eq!(trained.weights, frozen.weights);
         }
     }
 

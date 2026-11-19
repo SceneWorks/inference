@@ -364,6 +364,37 @@ impl FluxTransformer {
         attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::FluxBlockWindow<'_>>,
     ) -> Result<Array> {
+        self.forward_injected_memory_windowed_pag(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            attention,
+            window,
+            None,
+        )
+    }
+
+    /// Clean-base request-scoped forward with optional block windows and sorted PAG block indices.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_injected_memory_windowed_pag(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        attention: AttentionPlan<'_>,
+        window: Option<crate::block_stream::FluxBlockWindow<'_>>,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Array> {
         self.forward_inner(
             hidden_states,
             prompt_embeds,
@@ -376,6 +407,7 @@ impl FluxTransformer {
             None,
             attention,
             window,
+            pag_layers,
         )
     }
 
@@ -404,6 +436,34 @@ impl FluxTransformer {
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Array], f32)>,
     ) -> Result<Array> {
+        self.forward_control_pag(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            control,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_control_pag(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Array], f32)>,
+        pag_layers: Option<&[u32]>,
+    ) -> Result<Array> {
         self.forward_inner(
             hidden_states,
             prompt_embeds,
@@ -416,6 +476,7 @@ impl FluxTransformer {
             control,
             AttentionPlan::UNBOUNDED,
             None,
+            pag_layers,
         )
     }
 
@@ -437,6 +498,7 @@ impl FluxTransformer {
         control: Option<(&[Array], f32)>,
         attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::FluxBlockWindow<'_>>,
+        pag_layers: Option<&[u32]>,
     ) -> Result<Array> {
         let hidden = self.x_embedder.forward(hidden_states)?;
         let encoder = self.context_embedder.forward(prompt_embeds)?;
@@ -451,11 +513,18 @@ impl FluxTransformer {
             (width / 16) as usize,
         )?;
         let scaled_control = self.scale_control(control)?;
+        let num_double = self
+            .block_stream
+            .as_ref()
+            .map_or(self.blocks.len(), |s| s.joint_blocks());
         let stage = BlockStage {
             text_embeddings: &text_embeddings,
             rope: &rope,
             injector,
             attention,
+            pag_layers,
+            txt_seq: encoder.shape()[1],
+            num_double,
         };
 
         let (encoder, hidden) = match window {
@@ -509,7 +578,11 @@ impl FluxTransformer {
         Ok(match control {
             Some((res, scale)) => {
                 let s = scalar(scale);
-                let interval = control_residual_interval(self.blocks.len(), res.len());
+                let num_double = self
+                    .block_stream
+                    .as_ref()
+                    .map_or(self.blocks.len(), |st| st.joint_blocks());
+                let interval = control_residual_interval(num_double, res.len());
                 Some((
                     res.iter()
                         .map(|r| Ok(multiply(r, &s)?))
@@ -546,6 +619,7 @@ impl FluxTransformer {
                 stage.rope,
                 stage.injector.map(|inj| (inj, i)),
                 stage.attention,
+                stage.perturbs_double(i),
             )?;
             encoder = e;
             hidden = inject_after_double(stage.injector, i, h)?;
@@ -603,6 +677,7 @@ impl FluxTransformer {
                             stage.rope,
                             stage.injector.map(|inj| (inj, i)),
                             stage.attention,
+                            stage.perturbs_double(i),
                         )
                         .map_err(|error| {
                             mlx_gen::Error::Msg(format!(
@@ -637,7 +712,14 @@ impl FluxTransformer {
         idx: (&Array, &Array),
     ) -> Result<Array> {
         for (i, block) in self.single_blocks.iter().enumerate() {
-            joint = block.forward(&joint, stage.text_embeddings, stage.rope, stage.attention)?;
+            let pag_txt_seq = stage.perturbs_single(i).then_some(stage.txt_seq);
+            joint = block.forward_pag(
+                &joint,
+                stage.text_embeddings,
+                stage.rope,
+                stage.attention,
+                pag_txt_seq,
+            )?;
             joint = inject_after_single(stage.injector, i, joint, idx)?;
         }
         Ok(joint)
@@ -663,8 +745,15 @@ impl FluxTransformer {
                 active_single_window.set((start, end));
                 for i in range {
                     let block = source.materialize_single(view, i)?;
+                    let pag_txt_seq = stage.perturbs_single(i).then_some(stage.txt_seq);
                     joint = block
-                        .forward(&joint, stage.text_embeddings, stage.rope, stage.attention)
+                        .forward_pag(
+                            &joint,
+                            stage.text_embeddings,
+                            stage.rope,
+                            stage.attention,
+                            pag_txt_seq,
+                        )
                         .map_err(|error| {
                             mlx_gen::Error::Msg(format!(
                                 "flux1 block stream: single window {start}..{end} block {i} forward: {error}"
@@ -943,12 +1032,21 @@ impl JointBlock {
         emb: &Array,
         rope: &RopeTable,
     ) -> Result<(Array, Array)> {
-        self.forward_with_ip(hidden, encoder, emb, rope, None, AttentionPlan::UNBOUNDED)
+        self.forward_with_ip(
+            hidden,
+            encoder,
+            emb,
+            rope,
+            None,
+            AttentionPlan::UNBOUNDED,
+            false,
+        )
     }
 
     /// As [`forward`], but consulting the XLabs IP-Adapter image-query seam
     /// ([`DitImageInjector::double_block_ip`]) inside the joint attention. `ip = None` is identical
     /// to [`forward`].
+    #[allow(clippy::too_many_arguments)]
     fn forward_with_ip(
         &self,
         hidden: &Array,
@@ -957,6 +1055,7 @@ impl JointBlock {
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
         plan: AttentionPlan<'_>,
+        perturb_img: bool,
     ) -> Result<(Array, Array)> {
         let (norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.norm1.forward_six(hidden, emb)?;
@@ -964,7 +1063,7 @@ impl JointBlock {
             self.norm1_context.forward_six(encoder, emb)?;
         let (attn_hidden, attn_context, ip_residual) =
             self.attn
-                .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip, plan)?;
+                .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip, plan, perturb_img)?;
         let hidden = apply_norm_ff(
             hidden,
             &attn_hidden,
@@ -1027,9 +1126,20 @@ impl SingleBlock {
         rope: &RopeTable,
         plan: AttentionPlan<'_>,
     ) -> Result<Array> {
+        self.forward_pag(hidden, emb, rope, plan, None)
+    }
+
+    fn forward_pag(
+        &self,
+        hidden: &Array,
+        emb: &Array,
+        rope: &RopeTable,
+        plan: AttentionPlan<'_>,
+        pag_txt_seq: Option<i32>,
+    ) -> Result<Array> {
         let residual = hidden;
         let (normed, gate) = self.norm.forward_three(hidden, emb)?;
-        let attn = self.attn.forward(&normed, rope, plan)?;
+        let attn = self.attn.forward_pag(&normed, rope, plan, pag_txt_seq)?;
         let ff = gelu_ffn(&self.proj_mlp.forward(&normed)?)?;
         let out = concatenate_axis(&[&attn, &ff], 2)?;
         let proj = self.proj_out.forward(&out)?;
@@ -1095,6 +1205,7 @@ impl JointAttention {
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
         plan: AttentionPlan<'_>,
+        perturb_img: bool,
     ) -> Result<(Array, Array, Option<Array>)> {
         let (q, k, v) = process_qkv(
             hidden,
@@ -1119,13 +1230,19 @@ impl JointAttention {
         let k = concatenate_axis(&[&ek, &k], 2)?;
         let v = concatenate_axis(&[&ev, &v], 2)?;
         let (q, k) = apply_rope(&q, &k, rope)?;
-        let out = attention(&q, &k, &v, plan)?;
         let txt_seq = encoder.shape()[1];
-        // `out` is `[txt ; img]` along the sequence axis; split at `txt_seq` (a contiguous slice)
-        // rather than gathering two aranges (F-111). `out_txt` is consumed by `to_add_out` below.
-        let out_parts = out.split_axis(&[txt_seq], 1)?;
-        let out_txt = &out_parts[0];
-        let attn_img = self.to_out.forward(&out_parts[1])?;
+        let (out_txt, out_img) = if perturb_img {
+            pag_joint_attention_bhsd(&q, &k, &v, txt_seq, plan)?
+        } else {
+            // `out` is `[txt ; img]` along the sequence axis; split at `txt_seq` (a contiguous slice)
+            // rather than gathering two aranges (F-111). `out_txt` is consumed by `to_add_out` below.
+            let out = attention(&q, &k, &v, plan)?;
+            let mut out_parts = out.split_axis(&[txt_seq], 1)?;
+            let out_img = out_parts.swap_remove(1);
+            let out_txt = out_parts.swap_remove(0);
+            (out_txt, out_img)
+        };
+        let attn_img = self.to_out.forward(&out_img)?;
         // The IP residual is computed here but returned separately — the block adds it raw to the
         // final output (after gate_msa + FF), per diffusers. Folding it into `attn_img` (which is
         // then gated by `gate_msa` and fed into the FF input) would both suppress it where the gate
@@ -1139,7 +1256,7 @@ impl JointAttention {
             )?,
             None => None,
         };
-        Ok((attn_img, self.to_add_out.forward(out_txt)?, ip_residual))
+        Ok((attn_img, self.to_add_out.forward(&out_txt)?, ip_residual))
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -1175,6 +1292,16 @@ impl SingleAttention {
     }
 
     fn forward(&self, hidden: &Array, rope: &RopeTable, plan: AttentionPlan<'_>) -> Result<Array> {
+        self.forward_pag(hidden, rope, plan, None)
+    }
+
+    fn forward_pag(
+        &self,
+        hidden: &Array,
+        rope: &RopeTable,
+        plan: AttentionPlan<'_>,
+        pag_txt_seq: Option<i32>,
+    ) -> Result<Array> {
         let (q, k, v) = process_qkv(
             hidden,
             &self.to_q,
@@ -1184,7 +1311,13 @@ impl SingleAttention {
             &self.norm_k,
         )?;
         let (q, k) = apply_rope(&q, &k, rope)?;
-        attention(&q, &k, &v, plan)
+        match pag_txt_seq {
+            Some(txt_seq) => {
+                let (out_txt, out_img) = pag_joint_attention_bhsd(&q, &k, &v, txt_seq, plan)?;
+                Ok(concatenate_axis(&[&out_txt, &out_img], 1)?)
+            }
+            None => attention(&q, &k, &v, plan),
+        }
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -1314,8 +1447,8 @@ pub(crate) struct FluxRope {
 }
 
 pub(crate) struct RopeTable {
-    cos: Array,
-    sin: Array,
+    pub(crate) cos: Array,
+    pub(crate) sin: Array,
 }
 
 impl FluxRope {
@@ -1393,6 +1526,30 @@ fn attention(q: &Array, k: &Array, v: &Array, plan: AttentionPlan<'_>) -> Result
     let b = q.shape()[0];
     let y = sdpa_budgeted_bhsd(q, k, v, (HEAD_DIM as f32).powf(-0.5), None, plan)?;
     Ok(y.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, -1, DIM])?)
+}
+
+/// Perturbed-attention guidance over FLUX.1 `[txt, img]` joint BHSD tensors:
+/// `Q_txt` (`0..txt_seq`) attends normally over full `[K_txt, K_img]` / `[V_txt, V_img]`, while
+/// `Q_img` (`txt_seq..`) bypasses SDPA and receives `V_img` directly.
+pub(crate) fn pag_joint_attention_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    txt_seq: i32,
+    plan: AttentionPlan<'_>,
+) -> Result<(Array, Array)> {
+    let sh = v.shape();
+    let (b, heads, _, head_dim) = (sh[0], sh[1], sh[2], sh[3]);
+    let q_parts = q.split_axis(&[txt_seq], 2)?;
+    let v_parts = v.split_axis(&[txt_seq], 2)?;
+    let out_txt = sdpa_budgeted_bhsd(&q_parts[0], k, v, (head_dim as f32).powf(-0.5), None, plan)?
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[b, txt_seq, heads * head_dim])?;
+    let out_img = v_parts[1]
+        .transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[b, -1, heads * head_dim])?
+        .as_dtype(out_txt.dtype())?;
+    Ok((out_txt, out_img))
 }
 
 fn apply_rope(q: &Array, k: &Array, rope: &RopeTable) -> Result<(Array, Array)> {
@@ -1643,6 +1800,22 @@ struct BlockStage<'a> {
     rope: &'a RopeTable,
     injector: Option<&'a dyn DitImageInjector>,
     attention: AttentionPlan<'a>,
+    pag_layers: Option<&'a [u32]>,
+    txt_seq: i32,
+    num_double: usize,
+}
+
+impl BlockStage<'_> {
+    fn perturbs_double(&self, block_idx: usize) -> bool {
+        self.pag_layers
+            .is_some_and(|layers| layers.binary_search(&(block_idx as u32)).is_ok())
+    }
+
+    fn perturbs_single(&self, single_idx: usize) -> bool {
+        let global = (self.num_double + single_idx) as u32;
+        self.pag_layers
+            .is_some_and(|layers| layers.binary_search(&global).is_ok())
+    }
 }
 
 /// The post-double-block residual seam (PuLID): `hidden + r` when the injector returns one.
@@ -2619,5 +2792,65 @@ mod tests {
         .is_err());
         crate::model_inference_device::record_model_inference_device();
         println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::scale_zero_noop_mixed_stack_and_strict");
+    }
+
+    #[test]
+    fn pag_joint_attention_replaces_only_img_queries_with_v_img() {
+        let (b, h, txt_seq, img_seq, d) = (1i32, 2i32, 3i32, 4i32, 4i32);
+        let total = txt_seq + img_seq;
+        let elems = (b * h * total * d) as usize;
+        let q_vals: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.31 + 0.1).sin()).collect();
+        let k_vals: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.17 - 0.3).cos()).collect();
+        let v_vals: Vec<f32> = (0..elems).map(|i| i as f32 * 0.25 + 1.0).collect();
+        let q = Array::from_slice(&q_vals, &[b, h, total, d]);
+        let k = Array::from_slice(&k_vals, &[b, h, total, d]);
+        let v = Array::from_slice(&v_vals, &[b, h, total, d]);
+
+        let (o_txt, o_img) =
+            pag_joint_attention_bhsd(&q, &k, &v, txt_seq, AttentionPlan::UNBOUNDED).unwrap();
+        assert_eq!(o_txt.shape(), &[b, txt_seq, h * d]);
+        assert_eq!(o_img.shape(), &[b, img_seq, h * d]);
+
+        let full = sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            (d as f32).powf(-0.5),
+            None,
+            AttentionPlan::UNBOUNDED,
+        )
+        .unwrap()
+        .transpose_axes(&[0, 2, 1, 3])
+        .unwrap()
+        .reshape(&[b, total, h * d])
+        .unwrap();
+        let full_parts = full.split_axis(&[txt_seq], 1).unwrap();
+        let txt_diff = o_txt
+            .subtract(&full_parts[0])
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            txt_diff < 1e-6,
+            "Q_txt must match full SDPA, diff={txt_diff}"
+        );
+
+        let want_img = v
+            .split_axis(&[txt_seq], 2)
+            .unwrap()
+            .swap_remove(1)
+            .transpose_axes(&[0, 2, 1, 3])
+            .unwrap()
+            .reshape(&[b, img_seq, h * d])
+            .unwrap();
+        assert!(
+            mlx_rs::ops::array_eq(&o_img, &want_img, false)
+                .unwrap()
+                .item::<bool>(),
+            "Q_img must equal V_img exactly"
+        );
     }
 }

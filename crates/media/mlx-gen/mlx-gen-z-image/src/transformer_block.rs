@@ -213,6 +213,20 @@ impl ZImageTransformerBlock {
         extra_bytes: u64,
         then: impl FnOnce(Array) -> Result<Array>,
     ) -> Result<Array> {
+        self.forward_quantum_with_pag(x, freqs_cis, t_emb, plan, None, extra_bytes, then)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_quantum_with_pag(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        t_emb: &Array,
+        plan: AttentionPlan<'_>,
+        pag_x_len: Option<i32>,
+        extra_bytes: u64,
+        then: impl FnOnce(Array) -> Result<Array>,
+    ) -> Result<Array> {
         let scratch = if mlx_gen::ios_quantum::enabled() {
             self.quantum_scratch(x, freqs_cis, plan, mlx_gen::ios_quantum::Backend::current())
         } else {
@@ -221,7 +235,7 @@ impl ZImageTransformerBlock {
         mlx_gen::ios_quantum::run(
             crate::quantum::DIT_BLOCK,
             scratch.saturating_add(extra_bytes),
-            || then(self.forward_budgeted(x, freqs_cis, t_emb, plan)?),
+            || then(self.forward_budgeted_with_pag(x, freqs_cis, t_emb, plan, pag_x_len)?),
         )
     }
 
@@ -240,6 +254,19 @@ impl ZImageTransformerBlock {
         t_emb: &Array,
         plan: AttentionPlan<'_>,
     ) -> Result<Array> {
+        self.forward_budgeted_with_pag(x, freqs_cis, t_emb, plan, None)
+    }
+
+    /// [`Self::forward_budgeted`] with optional Perturbed-Attention Guidance (PAG) applied to the
+    /// leading `pag_x_len` image tokens while preserving caption attention.
+    pub fn forward_budgeted_with_pag(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        t_emb: &Array,
+        plan: AttentionPlan<'_>,
+        pag_x_len: Option<i32>,
+    ) -> Result<Array> {
         // adaLN modulation: (1, 4*dim) -> (1, 1, 4*dim) -> 4 × (1, 1, dim)
         let modulation = self.ada_ln.forward(t_emb)?.expand_dims(1)?;
         // Dtype-following `1`: a hard f32 scalar would promote the whole modulated stream back to
@@ -253,7 +280,9 @@ impl ZImageTransformerBlock {
 
         // Modulated attention residual.
         let s1 = multiply(&rms_norm(x, &self.attention_norm1, self.eps)?, &scale_msa)?;
-        let attn_out = self.attention.forward_budgeted(&s1, freqs_cis, plan)?;
+        let attn_out = self
+            .attention
+            .forward_budgeted_with_pag(&s1, freqs_cis, plan, pag_x_len)?;
         let attn_normed = rms_norm(&attn_out, &self.attention_norm2, self.eps)?;
         let x1 = gated(x, &gate_msa, &attn_normed)?;
         // iOS: the attention half is materialized before the MLP half is built, so the block's

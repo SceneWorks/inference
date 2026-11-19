@@ -803,6 +803,42 @@ impl FluxControlTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_composed_with_memory_pag(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            pooled,
+            guidance,
+            control_cond,
+            control_scale,
+            injector,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_composed_with_memory_pag(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        control_cond: &Tensor,
+        control_scale: f64,
+        injector: Option<&dyn DitImageInjector>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> candle_gen::Result<Tensor> {
         let residuals = self.branch.forward_with_memory(
             img,
             control_cond,
@@ -815,7 +851,7 @@ impl FluxControlTransformer {
             attention_plan,
             cancel,
         )?;
-        self.base.forward_control_with_memory(
+        self.base.forward_control_with_memory_pag(
             img,
             img_ids,
             txt,
@@ -828,6 +864,7 @@ impl FluxControlTransformer {
             attention_plan,
             transformer_window,
             cancel,
+            pag_layers,
         )
     }
 }

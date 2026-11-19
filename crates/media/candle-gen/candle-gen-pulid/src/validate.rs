@@ -213,6 +213,7 @@ fn real_weight_pulid() {
         // (`tests/preview_real_weights.rs`, sc-16956). An inert sink leaves the seeded render
         // byte-identical to what this row measured before the field existed.
         preview: candle_gen::gen_core::PreviewSink::default(),
+        pag: None,
         cancel: CancelFlag::new(),
     };
     // The no-id ablation (id_weight 0.0 ⇒ plain FLUX, same seed/prompt).

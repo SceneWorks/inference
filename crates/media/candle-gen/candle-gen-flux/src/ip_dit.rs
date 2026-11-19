@@ -146,17 +146,50 @@ pub(crate) fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
     (fr0.broadcast_mul(&x0)? + fr1.broadcast_mul(&x1)?)?.reshape(dims.to_vec())
 }
 
-pub(crate) fn attention_planned(
+/// Perturbed-attention guidance over FLUX.1 `[txt, img]` joint post-RoPE BHSD tensors:
+/// `Q_txt` (`0..txt_seq`) runs normal SDPA over full `[K_txt, K_img]` / `[V_txt, V_img]`, while
+/// `Q_img` (`txt_seq..`) receives `V_img` directly.
+pub(crate) fn pag_joint_attention_post_rope(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    txt_seq: usize,
+    plan: AttentionPlan<'_>,
+) -> candle_gen::Result<(Tensor, Tensor)> {
+    let total_seq = v.dim(2)?;
+    let img_seq = total_seq - txt_seq;
+    let q_txt = q.narrow(2, 0, txt_seq)?.contiguous()?;
+    let out_txt = scaled_dot_product_attention_planned(&q_txt, k, v, plan)?
+        .transpose(1, 2)?
+        .flatten_from(2)?;
+    let out_img = v
+        .narrow(2, txt_seq, img_seq)?
+        .transpose(1, 2)?
+        .flatten_from(2)?
+        .to_dtype(out_txt.dtype())?;
+    Ok((out_txt, out_img))
+}
+
+pub(crate) fn attention_planned_pag(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     pe: &Tensor,
     plan: AttentionPlan<'_>,
+    pag_txt_seq: Option<usize>,
 ) -> candle_gen::Result<Tensor> {
     let q = apply_rope(q, pe)?.contiguous()?;
     let k = apply_rope(k, pe)?.contiguous()?;
-    let x = scaled_dot_product_attention_planned(&q, &k, v, plan)?;
-    Ok(x.transpose(1, 2)?.flatten_from(2)?)
+    match pag_txt_seq {
+        Some(txt_seq) => {
+            let (out_txt, out_img) = pag_joint_attention_post_rope(&q, &k, v, txt_seq, plan)?;
+            Ok(Tensor::cat(&[&out_txt, &out_img], 1)?)
+        }
+        None => {
+            let x = scaled_dot_product_attention_planned(&q, &k, v, plan)?;
+            Ok(x.transpose(1, 2)?.flatten_from(2)?)
+        }
+    }
 }
 
 pub(crate) fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result<Tensor> {
@@ -492,6 +525,7 @@ impl DoubleStreamBlock {
     /// the decoupled-cross-attention residual and the block adds it **raw (ungated)** to the image
     /// stream's block output (after the gated FF) — diffusers `hidden_states = hidden_states +
     /// ip_attn_output`. `ip = None` is byte-identical to upstream.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         img: &Tensor,
@@ -500,6 +534,7 @@ impl DoubleStreamBlock {
         pe: &Tensor,
         ip: Option<(&FluxIpInjector, usize)>,
         attention_plan: AttentionPlan<'_>,
+        perturb_img: bool,
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         let (img_mod1, img_mod2) = self.img_mod.forward(vec_)?; // shift, scale, gate
         let (txt_mod1, txt_mod2) = self.txt_mod.forward(vec_)?; // shift, scale, gate
@@ -518,9 +553,17 @@ impl DoubleStreamBlock {
         let k = Tensor::cat(&[txt_k, img_k], 2)?;
         let v = Tensor::cat(&[txt_v, img_v], 2)?;
 
-        let attn = attention_planned(&q, &k, &v, pe, attention_plan)?;
-        let txt_attn = attn.narrow(1, 0, txt.dim(1)?)?;
-        let img_attn = attn.narrow(1, txt.dim(1)?, attn.dim(1)? - txt.dim(1)?)?;
+        let txt_seq = txt.dim(1)?;
+        let attn = attention_planned_pag(
+            &q,
+            &k,
+            &v,
+            pe,
+            attention_plan,
+            perturb_img.then_some(txt_seq),
+        )?;
+        let txt_attn = attn.narrow(1, 0, txt_seq)?;
+        let img_attn = attn.narrow(1, txt_seq, attn.dim(1)? - txt_seq)?;
 
         let img = (img + img_mod1.gate(&self.img_attn.proj.forward(&img_attn)?))?;
         let img = (&img
@@ -593,6 +636,7 @@ impl SingleStreamBlock {
         vec_: &Tensor,
         pe: &Tensor,
         attention_plan: AttentionPlan<'_>,
+        pag_txt_seq: Option<usize>,
     ) -> candle_gen::Result<Tensor> {
         let mod_ = self.modulation.forward(vec_)?;
         let x_mod = mod_.scale_shift(&__model_proof_output!(xs.apply(&self.pre_norm))?)?;
@@ -606,7 +650,7 @@ impl SingleStreamBlock {
         let mlp = x_mod.narrow(D::Minus1, 3 * self.h_sz, self.mlp_sz)?;
         let q = __model_proof_output!(q.apply(&self.norm.query_norm))?;
         let k = __model_proof_output!(k.apply(&self.norm.key_norm))?;
-        let attn = attention_planned(&q, &k, &v, pe, attention_plan)?;
+        let attn = attention_planned_pag(&q, &k, &v, pe, attention_plan, pag_txt_seq)?;
         let output = self
             .linear2
             .forward(&Tensor::cat(&[attn, mlp.gelu()?], 2)?)?;
@@ -890,9 +934,11 @@ impl IpFlux {
             transformer_window,
             cancel,
             None,
+            None,
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_prepared_with_memory(
         &self,
@@ -911,6 +957,44 @@ impl IpFlux {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_prepared_with_memory_pag(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            ip,
+            injector,
+            control,
+            prepared,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory_pag(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> candle_gen::Result<Tensor> {
         self.forward_core(
             img,
             img_ids,
@@ -926,6 +1010,7 @@ impl IpFlux {
             transformer_window,
             cancel,
             Some(prepared),
+            pag_layers,
         )
     }
 
@@ -971,6 +1056,7 @@ impl IpFlux {
             usize::MAX,
             &candle_gen::gen_core::CancelFlag::default(),
             None,
+            None,
         )
         .map_err(|error| match error {
             candle_gen::CandleError::Candle(error) => error,
@@ -979,7 +1065,7 @@ impl IpFlux {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_injected_with_memory(
+    pub(crate) fn forward_injected_with_memory_pag(
         &self,
         img: &Tensor,
         img_ids: &Tensor,
@@ -992,6 +1078,7 @@ impl IpFlux {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
     ) -> candle_gen::Result<Tensor> {
         self.forward_core(
             img,
@@ -1008,6 +1095,7 @@ impl IpFlux {
             transformer_window,
             cancel,
             None,
+            pag_layers,
         )
     }
 
@@ -1059,6 +1147,7 @@ impl IpFlux {
             usize::MAX,
             &candle_gen::gen_core::CancelFlag::default(),
             None,
+            None,
         )
         .map_err(|error| match error {
             candle_gen::CandleError::Candle(error) => error,
@@ -1082,6 +1171,40 @@ impl IpFlux {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        self.forward_control_with_memory_pag(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            injector,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_control_with_memory_pag(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+        pag_layers: Option<&[u32]>,
+    ) -> candle_gen::Result<Tensor> {
         self.forward_core(
             img,
             img_ids,
@@ -1097,6 +1220,7 @@ impl IpFlux {
             transformer_window,
             cancel,
             None,
+            pag_layers,
         )
     }
 
@@ -1134,6 +1258,7 @@ impl IpFlux {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
         prepared: Option<&PreparedConditioning>,
+        pag_layers: Option<&[u32]>,
     ) -> candle_gen::Result<Tensor> {
         if txt.rank() != 3 {
             return Err(candle_gen::CandleError::Msg(format!(
@@ -1206,6 +1331,8 @@ impl IpFlux {
                         .collect::<candle_gen::Result<Vec<_>>>()?;
                     for (index, block) in &blocks {
                         candle_gen::check_cancel(cancel)?;
+                        let perturb_img = pag_layers
+                            .is_some_and(|layers| layers.binary_search(&(*index as u32)).is_ok());
                         (img, txt) = block.forward(
                             &img,
                             &txt,
@@ -1213,6 +1340,7 @@ impl IpFlux {
                             &pe,
                             ip.map(|inj| (inj, *index)),
                             attention_plan,
+                            perturb_img,
                         )?;
                         if let Some(inj) = injector {
                             if let Some(r) = inj.after_double(*index, &img)? {
@@ -1247,7 +1375,11 @@ impl IpFlux {
                         .collect::<candle_gen::Result<Vec<_>>>()?;
                     for (index, block) in &blocks {
                         candle_gen::check_cancel(cancel)?;
-                        joint = block.forward(&joint, &vec_, &pe, attention_plan)?;
+                        let global = (config.depth + *index) as u32;
+                        let pag_txt_seq = pag_layers
+                            .is_some_and(|layers| layers.binary_search(&global).is_ok())
+                            .then_some(txt_len);
+                        joint = block.forward(&joint, &vec_, &pe, attention_plan, pag_txt_seq)?;
                         if let Some(inj) = injector {
                             if inj.injects_after_single(*index) {
                                 let seq = joint.dim(1)?;
@@ -1278,8 +1410,11 @@ impl IpFlux {
         // the post-block `injector` residual and then the control residual are added to the image stream
         // afterwards. Each seam is inert when its argument is `None`, so a single-seam caller reduces to
         // exactly its former body.
+        let num_double = double_blocks.len();
         for (i, block) in double_blocks.iter().enumerate() {
             candle_gen::check_cancel(cancel)?;
+            let perturb_img =
+                pag_layers.is_some_and(|layers| layers.binary_search(&(i as u32)).is_ok());
             (img, txt) = block.forward(
                 &img,
                 &txt,
@@ -1287,6 +1422,7 @@ impl IpFlux {
                 &pe,
                 ip.map(|inj| (inj, i)),
                 attention_plan,
+                perturb_img,
             )?;
             // Identity injector (PuLID / IP-Adapter) first — composes with control below.
             if let Some(inj) = injector {
@@ -1311,7 +1447,11 @@ impl IpFlux {
         let mut joint = Tensor::cat(&[&txt, &img], 1)?;
         for (i, block) in single_blocks.iter().enumerate() {
             candle_gen::check_cancel(cancel)?;
-            joint = block.forward(&joint, &vec_, &pe, attention_plan)?;
+            let global = (num_double + i) as u32;
+            let pag_txt_seq = pag_layers
+                .is_some_and(|layers| layers.binary_search(&global).is_ok())
+                .then_some(txt_len);
+            joint = block.forward(&joint, &vec_, &pe, attention_plan, pag_txt_seq)?;
             if let Some(inj) = injector {
                 if inj.injects_after_single(i) {
                     let seq = joint.dim(1)?;

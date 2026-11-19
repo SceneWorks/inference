@@ -3395,3 +3395,26 @@ fn resident_quant_is_the_stored_or_load_time_spec() {
     assert!(model.is_quantized());
     assert_eq!(model.resident_quant().map(|q| q.bits), Some(4));
 }
+
+#[test]
+fn sensenova_refuses_foreign_cache_with_same_virtual_depth() {
+    let cfg = Qwen35Config::from_json(
+        &serde_json::from_str(include_str!(
+            "../../../../../contracts/core-llm/src/sensenova_loop.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let layers = (0..cfg.visit_count())
+        .map(|_| Qwen35LayerCache::Delta(DeltaNetCache::new()))
+        .collect();
+    let foreign = Qwen35Cache {
+        layers,
+        loop_plan: None,
+    };
+    assert!(foreign
+        .check_plan(&cfg)
+        .unwrap_err()
+        .to_string()
+        .contains("cache execution plan"));
+}

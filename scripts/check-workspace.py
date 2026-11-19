@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 133
+EXPECTED_MEMBER_COUNT = 134
 INTERNAL_PACKAGES = {
     "sceneworks-gen-cv",
     "candle-audio",
@@ -43,6 +43,7 @@ INTERNAL_PACKAGES = {
     "sceneworks-gen-core-memory-wan",
     "sceneworks-gen-core-moss-image",
     "sceneworks-gen-core-moss-image-policy",
+    "sceneworks-gen-core-pag-policy",
     "sceneworks-gen-core-telemetry",
     "sceneworks-gen-core-tokenizer",
     "sceneworks-gen-core-train",

@@ -2,11 +2,54 @@
 
 use super::*;
 
+/// ai-toolkit's surface: every DiT-block and token-refiner-block leaf (SW-F369).
 #[test]
-fn the_default_targets_are_every_block_leaf() {
+fn the_default_targets_are_every_dit_and_refiner_block_leaf() {
     let paths = resolve_target_paths(&TrainingConfig::default()).unwrap();
-    assert_eq!(paths.len(), 50 * 6);
-    assert!(paths.iter().all(|p| target_block(p).is_some()));
+    assert_eq!(paths.len(), (50 + 2) * 6);
+    assert_eq!(
+        paths.iter().filter(|p| target_block(p).is_some()).count(),
+        300
+    );
+    assert_eq!(
+        paths.iter().filter(|p| refiner_block(p).is_some()).count(),
+        12
+    );
+    assert_eq!(refiner_layers(&paths), 2);
+}
+
+/// The refiner re-attach touches the refiner's leaves only: never a block leaf, which the block
+/// installs re-attach themselves. Mutation: drop the refiner filter ⇒ the block-leaf assert fails.
+#[test]
+fn the_frozen_adapter_reattaches_on_the_refiner_alone() {
+    use mlx_gen::adapters::{AdaptableLinear, Adapter};
+    let q0 = ["transformer_blocks", "0", "attn", "to_q"];
+    let r0 = ["token_refiner", "refiner_blocks", "0", "attn", "to_q"];
+    let weight = Array::from_slice(&[0.5f32, -1.0, 2.0, 0.25, 1.5, -0.5], &[3, 2]);
+    let mut host = Leaves(
+        [q0.as_slice(), r0.as_slice()]
+            .iter()
+            .map(|p| (p.join("."), AdaptableLinear::dense(weight.clone(), None)))
+            .collect(),
+    );
+    let frozen = Adapter::Lora {
+        a: Array::from_slice(&[1.0f32, 2.0], &[2, 1]),
+        b: Array::from_slice(&[0.5f32, -0.5, 1.0], &[1, 3]),
+        scale: 1.0,
+    };
+    let residuals = super::training_adapter::FrozenResiduals::from_paths(
+        [q0.as_slice(), r0.as_slice()]
+            .iter()
+            .map(|p| (p.join("."), vec![frozen.clone()]))
+            .collect(),
+    );
+    residuals.reattach_refiner(&mut host).unwrap();
+    assert_eq!(host.adaptable_mut(&r0).unwrap().adapters().len(), 1);
+    assert_eq!(host.adaptable_mut(&q0).unwrap().adapters().len(), 0);
+    // A block re-attach never touches the refiner.
+    residuals.reattach(&mut host, Some(0)).unwrap();
+    assert_eq!(host.adaptable_mut(&r0).unwrap().adapters().len(), 1);
+    assert_eq!(host.adaptable_mut(&q0).unwrap().adapters().len(), 1);
 }
 
 #[test]

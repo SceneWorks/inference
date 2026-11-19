@@ -20,6 +20,7 @@ run_gate() {
 # utils env::enable_tf32), which makes the near-hard block-49 attention (logits ~5e3) jitter by
 # ~1e-3 in the loss; the gate asserts IEEE float32 GEMMs before it measures anything.
 MLX_ENABLE_TF32=0 run_gate --lib training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4
+MLX_ENABLE_TF32=0 run_gate --lib training::real_tests::refiner_gradients_match_resident_and_finite_differences_q4
 run_gate "--test integration" h3_image_train_real::h3_image_train_t2i_saves_reproduces_and_resumes_q4
 run_gate "--test integration" h3_image_train_real::h3_image_train_edit_saves_and_reproduces_q4
 rm -rf "${MINIMAX_H3_IMAGE_TIERS_ROOT:?}"

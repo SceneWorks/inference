@@ -438,10 +438,17 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         step,
     };
     let no_training_adapter = super::training_adapter::FrozenResiduals::default();
+    // DiT-block targets only: this gate checks the block walk; the refiner's own gradient path is
+    // the `refiner_` gate below.
+    let no_refiner = super::step::BlockTrainables {
+        adapter: None,
+        keys: Vec::new(),
+    };
     let spec = |streamed: bool| LossSpec {
         adapter: &adapter,
         frozen: &no_training_adapter,
         blocks: &blocks,
+        refiner: &no_refiner,
         alpha: cfg.alpha,
         rank: cfg.rank as f32,
         mae: false,
@@ -754,4 +761,160 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4");
+}
+
+/// SW-F369: the trained token refiner's gradients. The streamed path reaches the refiner factors
+/// through a separate `vjp` of the stack input against `dL/dh_0` (after the block walk), the
+/// resident path through one whole-graph autodiff that refines the caption inside the trace — two
+/// independent computations that must agree per factor. The Richardson arbiter then asserts the
+/// refiner-only gradient direction at B = 0 (the standard init, where the main gate's verdict is
+/// asserted too). Two DiT-block leaves train beside the refiner's, so the block walk and the
+/// refiner's `vjp` run in the same step.
+#[test]
+#[ignore = "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident"]
+fn refiner_gradients_match_resident_and_finite_differences_q4() {
+    let root = std::env::var("MINIMAX_H3_IMAGE_TIERS_ROOT").unwrap_or_default();
+    assert!(!root.is_empty(), "MINIMAX_H3_IMAGE_TIERS_ROOT must be set");
+    let dir = std::path::Path::new(&root)
+        .join("q4")
+        .join(IMAGE_DIT_COMPONENT);
+    let _eager = crate::dit::layers::EagerSwigluScope::enter();
+    let cancel = CancelFlag::new();
+    let mut streamed = MiniMaxH3ImageDit::load_dir_deferred(&dir, Dtype::Float32).unwrap();
+    let modulation_s = streamed
+        .training_modulation(false, Some((1, &cancel)))
+        .unwrap();
+    let mut paths = vec![
+        "transformer_blocks.0.attn.to_q".to_string(),
+        "transformer_blocks.49.ff.net.2".to_string(),
+    ];
+    for i in 0..2 {
+        paths.push(format!("token_refiner.refiner_blocks.{i}.attn.to_q"));
+        paths.push(format!("token_refiner.refiner_blocks.{i}.ff.net.2"));
+    }
+    let cfg = TrainingConfig {
+        rank: 4,
+        alpha: 4.0,
+        seed: 3690,
+        ..TrainingConfig::default()
+    };
+    let (adapter, mut params) = build_adapter(&mut streamed, &paths, &cfg).unwrap();
+    let mut keys: Vec<_> = params.keys().cloned().collect();
+    keys.sort();
+    for (i, key) in keys.iter().enumerate() {
+        if key.ends_with("lora_b") {
+            let shape = params[key].shape().to_vec();
+            params.insert(key.clone(), normal(&shape, 300 + i as u64, 0.02));
+        }
+    }
+    let blocks = block_trainables(&mut streamed, &paths, &params, &cfg).unwrap();
+    let refiner = super::refiner_trainables(&mut streamed, &paths, &params, &cfg).unwrap();
+    assert_eq!(
+        refiner.keys.len(),
+        4 * 2,
+        "two refiner leaves per refiner block, A and B"
+    );
+
+    let patch = streamed.config().base.patch_size;
+    let layout = ImageLayout::t2i(16, 32, 32, patch).unwrap();
+    let rows = layout.num_packed_image_rows();
+    let context = normal(&[1, 16, 5120], 1, 1.0)
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let step = distilled_step(0);
+    let x0 = normal(&[1, rows, 96], 2, 1.0);
+    let noise = normal(&[1, rows, 96], 3, 1.0);
+    let (packed, target) = noised_rows(&x0, &noise, step).unwrap();
+    let inputs = StepInputs {
+        context: &context,
+        layout: &layout,
+        packed: &packed,
+        target: &target,
+        step,
+    };
+    let no_training_adapter = super::training_adapter::FrozenResiduals::default();
+    let spec = |streamed: bool| LossSpec {
+        adapter: &adapter,
+        frozen: &no_training_adapter,
+        blocks: &blocks,
+        refiner: &refiner,
+        alpha: cfg.alpha,
+        rank: cfg.rank as f32,
+        mae: false,
+        lora_dtype: None,
+        streamed,
+        chunked_attention: true,
+    };
+
+    let (loss_s, grads_s) =
+        loss_and_grads(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
+    assert!(loss_s.is_finite());
+    assert_eq!(grads_s.len(), params.len(), "every factor has a gradient");
+    let mut resident = MiniMaxH3ImageDit::load_dir_materialized(&dir, Dtype::Float32).unwrap();
+    let modulation_r = resident.training_modulation(false, None).unwrap();
+    let (loss_r, grads_r) =
+        loss_and_grads(&mut resident, &modulation_r, &params, &spec(false), &inputs).unwrap();
+    drop(resident);
+    mlx_gen::residency::drain_allocator_cache();
+    let mut worst = 0f32;
+    for key in &keys {
+        let (gs, gr) = (&grads_s[key], &grads_r[key]);
+        let rel = rel_l2(gs, gr);
+        println!(
+            "[sw-f369 mlx] refiner gate factor {key}: |g_s| {:.6e}, |g_s|/|g_r| {:.6}, cosine {:.6}, rel L2 {rel:.3e}",
+            norm(gs),
+            norm(gs) / norm(gr).max(1e-30),
+            cosine(gs, gr)
+        );
+        assert!(norm(gs) > 0.0, "{key}: no gradient reached it");
+        worst = worst.max(rel);
+    }
+    let loss_rel = (loss_s - loss_r).abs() / loss_r.abs().max(1e-12);
+    println!("[sw-f369 mlx] refiner gate streamed vs resident: loss {loss_s:.6e} / {loss_r:.6e} (rel {loss_rel:.3e}), worst grad rel L2 {worst:.3e}");
+    assert!(loss_rel <= LOSS_REL_TOL, "loss rel {loss_rel}");
+    assert!(worst <= GRAD_REL_L2_TOL, "grad rel L2 {worst}");
+
+    // The refiner-only gradient direction at B = 0, Richardson-asserted.
+    let zeroed: LoraParams = params
+        .iter()
+        .map(|(k, v)| {
+            let kept = if k.ends_with("lora_b") {
+                Array::zeros::<f32>(v.shape()).unwrap()
+            } else {
+                v.clone()
+            };
+            (k.clone(), kept)
+        })
+        .collect();
+    let (_, grads_z) =
+        loss_and_grads(&mut streamed, &modulation_s, &zeroed, &spec(true), &inputs).unwrap();
+    let dir = restrict(&grads_z, "token_refiner.");
+    assert!(
+        dot(&dir, &dir) > 0.0,
+        "the refiner gradient at B = 0 is zero"
+    );
+    let mut loss_at = |p: &LoraParams| {
+        streamed_loss(&mut streamed, &modulation_s, p, &spec(true), &inputs).unwrap()
+    };
+    let l0 = loss_at(&zeroed);
+    let floor = (loss_at(&zeroed) - l0)
+        .abs()
+        .max(l0.abs() * 8.0 * f32::EPSILON);
+    let r = richardson(
+        "refiner, B = 0, along g[token_refiner.*]",
+        &zeroed,
+        &grads_z,
+        &dir,
+        l0,
+        floor,
+        first_step(&zeroed, &grads_z, &dir, floor),
+        &mut loss_at,
+    );
+    let rel = verdict("refiner, B = 0, along g[token_refiner.*]", r);
+    assert!(
+        rel <= FD_REL_TOL,
+        "refiner B = 0: Richardson finite difference rel {rel} exceeds {FD_REL_TOL}"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED training::real_tests::refiner_gradients_match_resident_and_finite_differences_q4");
 }

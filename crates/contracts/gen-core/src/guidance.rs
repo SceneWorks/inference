@@ -136,6 +136,49 @@ pub fn cfg<G: GuidanceOps>(
 }
 
 // =================================================================================================
+// Perturbed-Attention Guidance (PAG) combine (SW-7173).
+// =================================================================================================
+
+/// Perturbed-Attention Guidance (PAG) tensor-neutral combine:
+/// `eps_base + pag_scale · (eps_cond − eps_perturbed)`.
+///
+/// - **2-pass (guidance-distilled / CFG=1 / DMD):** pass `eps_base = eps_cond`, yielding
+///   `eps_cond + pag_scale · (eps_cond − eps_perturbed)`.
+/// - **3-pass (CFG + PAG):** pass `eps_base = eps_cfg`, yielding
+///   `eps_cfg + pag_scale · (eps_cond − eps_perturbed)`.
+/// - **Zero-scale identity:** `pag_scale == 0.0` returns `eps_base.clone()` directly.
+pub fn pag_apply<L: LatentOps>(
+    ops: &L,
+    eps_base: &L::Latent,
+    eps_cond: &L::Latent,
+    eps_perturbed: &L::Latent,
+    pag_scale: f32,
+) -> Result<L::Latent> {
+    if !pag_scale.is_finite() || pag_scale < 0.0 {
+        return Err(crate::Error::Msg(format!(
+            "pag_apply: pag_scale must be finite and >= 0 (got {pag_scale})"
+        )));
+    }
+    if pag_scale == 0.0 {
+        return Ok(eps_base.clone());
+    }
+    let diff = ops.sub(eps_cond, eps_perturbed)?;
+    ops.axpy(1.0, eps_base, pag_scale, &diff)
+}
+
+/// Pure FP32 slice Perturbed-Attention Guidance combine:
+/// `eps_base + pag_scale · (eps_cond − eps_perturbed)`.
+pub fn pag_apply_slice(
+    eps_base: &[f32],
+    eps_cond: &[f32],
+    eps_perturbed: &[f32],
+    pag_scale: f32,
+) -> Result<Vec<f32>> {
+    gen_core_pag_policy::pag_apply_slice(eps_base, eps_cond, eps_perturbed, pag_scale)
+        .map_err(|e| crate::Error::Msg(e.to_string()))
+}
+
+// =================================================================================================
 // cfg_rescale — Lin et al. norm-rescaled CFG (port of mlx-gen-lens/src/schedule.rs:58-74).
 // =================================================================================================
 
@@ -180,15 +223,70 @@ impl<L: Clone> MomentumBuffer<L> {
         }
     }
 
+    /// Clear accumulated APG momentum history across a geometry-changing or re-noise phase boundary (`PIPE-3`).
+    pub fn reset(&mut self) {
+        self.running = None;
+    }
+
+    /// Whether the momentum accumulator currently has no stored running state.
+    pub fn is_empty(&self) -> bool {
+        self.running.is_none()
+    }
+
+    /// Borrow the current running momentum tensor, if any.
+    pub fn running(&self) -> Option<&L> {
+        self.running.as_ref()
+    }
+
+    /// Compute `diff + momentum·running` read-only without mutating the stored accumulator (`PIPE-3`, `PIPE-4`).
+    pub fn preview_update<G: GuidanceOps<Latent = L>>(&self, g: &G, diff: &L) -> Result<L> {
+        match &self.running {
+            Some(r) => g.axpy(1.0, diff, self.momentum, r),
+            None => Ok(diff.clone()),
+        }
+    }
+
     /// `running = diff + momentum·running`; the first call (running = 0) returns `diff` unchanged.
     pub fn update<G: GuidanceOps<Latent = L>>(&mut self, g: &G, diff: &L) -> Result<L> {
-        let ra = match &self.running {
-            Some(r) => g.axpy(1.0, diff, self.momentum, r)?,
-            None => diff.clone(),
-        };
+        let ra = self.preview_update(g, diff)?;
         self.running = Some(ra.clone());
         Ok(ra)
     }
+}
+
+/// Read-only single-condition APG evaluation for boundary endpoint clean-estimate evaluation (`PIPE-3`, `PIPE-4`):
+/// computes `uncond + scale · normalize_diff(cond − uncond, base = cond)` using [`MomentumBuffer::preview_update`]
+/// so the persistent `MomentumBuffer` state is left completely untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn normalized_guidance_readonly<G: GuidanceOps>(
+    g: &G,
+    cond: &G::Latent,
+    uncond: &G::Latent,
+    scale: f32,
+    buf: Option<&MomentumBuffer<G::Latent>>,
+    eta: f32,
+    norm_threshold: f32,
+    shape: &[usize],
+    axes: &[i32],
+) -> Result<G::Latent> {
+    let diff = g.sub(cond, uncond)?;
+    let mut diff = match buf {
+        Some(b) => b.preview_update(g, &diff)?,
+        None => diff,
+    };
+    if norm_threshold > 0.0 {
+        let dn = g.norm_over(&diff, shape, axes)?;
+        let num = const_like(g, &dn, norm_threshold)?;
+        let scale_clamp = g.clamp_max(&g.div(&num, &dn)?, 1.0)?;
+        diff = g.mul(&diff, &scale_clamp)?;
+    }
+    let bn = g.clamp_min(&g.norm_over(cond, shape, axes)?, NORMALIZE_EPS)?;
+    let v1 = g.div(cond, &bn)?;
+    let coeff = g.dot_over(&diff, &v1, shape, axes)?;
+    let parallel = g.mul(&coeff, &v1)?;
+    let orthogonal = g.sub(&diff, &parallel)?;
+    let nd = g.axpy(1.0, &orthogonal, eta, &parallel)?;
+    g.axpy(1.0, uncond, scale, &nd)
 }
 
 /// The APG core: momentum → norm-clamp → orthogonal/parallel projection against `base`, returning
@@ -613,5 +711,53 @@ mod tests {
             .map(|i| uncond[i] + 2.0 * (p0[i] - uncond[i]) + 1.5 * (p1[i] - p0[i]))
             .collect();
         assert!(max_abs(&got, &want) < 1e-4, "chain != sequential terms");
+    }
+
+    #[test]
+    fn pag_apply_two_pass_three_pass_and_zero_scale_identity() {
+        let cond = ramp(8, 1);
+        let uncond = ramp(8, 2);
+        let perturbed = ramp(8, 5);
+
+        // 2-pass (CFG=1 / distilled / DMD): eps_base == eps_cond
+        let two_pass = pag_apply(&OPS, &cond, &cond, &perturbed, 2.5).unwrap();
+        let want_two_pass: Vec<f32> = cond
+            .iter()
+            .zip(&perturbed)
+            .map(|(&c, &p)| c + 2.5 * (c - p))
+            .collect();
+        assert!(max_abs(&two_pass, &want_two_pass) < 1e-6);
+        assert_eq!(
+            pag_apply_slice(&cond, &cond, &perturbed, 2.5).unwrap(),
+            want_two_pass
+        );
+
+        // 3-pass (CFG + PAG): eps_base == eps_cfg
+        let eps_cfg = cfg(&OPS, &cond, &uncond, 4.0).unwrap();
+        let three_pass = pag_apply(&OPS, &eps_cfg, &cond, &perturbed, 1.75).unwrap();
+        let want_three_pass: Vec<f32> = (0..8)
+            .map(|i| eps_cfg[i] + 1.75 * (cond[i] - perturbed[i]))
+            .collect();
+        assert!(max_abs(&three_pass, &want_three_pass) < 1e-6);
+        assert_eq!(
+            pag_apply_slice(&eps_cfg, &cond, &perturbed, 1.75).unwrap(),
+            want_three_pass
+        );
+
+        // pag_scale == 0.0 is an exact identity on eps_base
+        assert_eq!(
+            pag_apply(&OPS, &eps_cfg, &cond, &perturbed, 0.0).unwrap(),
+            eps_cfg
+        );
+        assert_eq!(
+            pag_apply_slice(&eps_cfg, &cond, &perturbed, 0.0).unwrap(),
+            eps_cfg
+        );
+
+        // Negative / non-finite pag_scale is rejected
+        for bad in [-0.1_f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(pag_apply(&OPS, &eps_cfg, &cond, &perturbed, bad).is_err());
+            assert!(pag_apply_slice(&eps_cfg, &cond, &perturbed, bad).is_err());
+        }
     }
 }

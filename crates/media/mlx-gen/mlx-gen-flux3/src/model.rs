@@ -115,6 +115,7 @@ pub fn descriptor() -> ModelDescriptor {
                 gen_core::ConditioningKind::ReferenceRgba,
                 gen_core::ConditioningKind::MultiReference,
             ],
+            pag: Some(gen_core_flux3::flux3_pag_capability(true)),
             ..Default::default()
         },
     }
@@ -128,6 +129,7 @@ pub fn descriptor_base() -> ModelDescriptor {
     // CFG uses the standard guidance axis; the separate true_cfg control is not consumed.
     descriptor.capabilities.supports_true_cfg = false;
     descriptor.capabilities.supports_negative_prompt = true;
+    descriptor.capabilities.pag = Some(gen_core_flux3::flux3_pag_capability(false));
     descriptor
 }
 
@@ -516,7 +518,8 @@ impl Flux3Klein {
             |progress|self.effective_params(req,progress),
             |te:&Flux3TextEncoder,params:GenerationParams| ->Result<(TextConditioning,Option<TextConditioning>,GenerationParams)> {
                 let text=te.encode(&params.prompt)?;
-                let negative=if params.guidance.is_some(){Some(te.encode(&params.negative_prompt)?)}else{None};
+                let encode_neg=gen_core_flux3::base_requires_negative_prompt(params.guidance,params.pag.as_ref());
+                let negative=if encode_neg{Some(te.encode(&params.negative_prompt)?)}else{None};
                 Ok((text,negative,params))
             },
             |encoded:Option<&(TextConditioning,Option<TextConditioning>,GenerationParams)>| {
@@ -656,7 +659,11 @@ impl Flux3Klein {
              params: GenerationParams|
              -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
                 let text = te.encode(&params.prompt)?;
-                let negative = if params.guidance.is_some() {
+                let encode_neg = gen_core_flux3::base_requires_negative_prompt(
+                    params.guidance,
+                    params.pag.as_ref(),
+                );
+                let negative = if encode_neg {
                     Some(te.encode(&params.negative_prompt)?)
                 } else {
                     None
@@ -723,6 +730,16 @@ impl Flux3Klein {
             },
         )?
         };
+        let resolved_steps = req.steps.unwrap_or(if self.config.dit.flow_map {
+            self.config.sampler.steps
+        } else {
+            gen_core_flux3::BASE_DEFAULT_STEPS
+        });
+        let pag_report = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?
+            .map(|p| p.execution_report(resolved_steps));
         checked_completion(
             &req.cancel,
             GenerationReport {
@@ -730,6 +747,8 @@ impl Flux3Klein {
                 artifacts: None,
                 warnings: Vec::new(),
                 prefix_kv_cache: None,
+                pag: pag_report,
+                low_res_start: None,
             },
         )
     }

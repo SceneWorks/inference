@@ -35,8 +35,9 @@ pub use loader::{
     load_t5_tokenizer, load_transformer, load_vae, load_vae_from_weights,
 };
 pub use model::{
-    descriptor_dev, descriptor_for, descriptor_schnell, load_dev, load_schnell, Flux1,
-    SIZE_MULTIPLE,
+    compile_trajectory_for, descriptor_dev, descriptor_for, descriptor_schnell,
+    execute_flux_denoise_trajectory, load_dev, load_schnell, transition_mlx_flux_boundary_state,
+    Flux1, SIZE_MULTIPLE,
 };
 pub use model_control::{descriptor_dev_control, load_dev_control, Flux1DevControl};
 pub use pipeline::{
@@ -73,6 +74,33 @@ pub fn register_providers(
         .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
             provider_id: FLUX1_DEV_CONTROL_ID,
             compile: model_control::compile_control,
+        })
+        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
+            route_id: "flux1_schnell_ip_adapter",
+            parent_provider_id: Some(FLUX1_SCHNELL_ID),
+            descriptor: model::descriptor_schnell_ip_adapter,
+            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
+                provider_id: "flux1_schnell_ip_adapter",
+                compile: |spec, req| model::compile_ip_adapter(FluxVariant::Schnell, spec, req),
+            }),
+        })
+        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
+            route_id: "flux1_dev_ip_adapter",
+            parent_provider_id: Some(FLUX1_DEV_ID),
+            descriptor: model::descriptor_dev_ip_adapter,
+            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
+                provider_id: "flux1_dev_ip_adapter",
+                compile: |spec, req| model::compile_ip_adapter(FluxVariant::Dev, spec, req),
+            }),
+        })
+        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
+            route_id: FLUX1_DEV_CONTROL_ID,
+            parent_provider_id: Some(FLUX1_DEV_ID),
+            descriptor: model_control::descriptor_dev_control,
+            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
+                provider_id: FLUX1_DEV_CONTROL_ID,
+                compile: model_control::compile_control,
+            }),
         })
         .register_generator(model::SCHNELL_REGISTRATION)
         .register_memory_strategy(model::SCHNELL_MEMORY_REGISTRATION)
@@ -153,6 +181,111 @@ mod explicit_registry_tests {
             explicit,
             ["flux1_schnell", "flux1_dev", "flux1_dev_control"]
         );
+    }
+
+    #[test]
+    fn migrated_flux1_routes_export_feature_applicability_and_refuse_phases() {
+        use mlx_gen::gen_core::{
+            Conditioning, ControlKind, Error, FeatureInapplicabilityCode, GenerationPhase,
+            GenerationRequest, Image, LoadSpec, OffloadPolicy, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all = registry.all_route_feature_applicability();
+
+        for (route_id, expected_default_steps, expected_max_k) in
+            [("flux1_schnell", 4u32, 3u64), ("flux1_dev", 25u32, 24u64)]
+        {
+            let app = &all[route_id]["low_res_start"];
+            assert!(app.applicable, "{route_id} must support low_res_start");
+            let json = app.to_json();
+            assert_eq!(json["class"], "recipe");
+            assert_eq!(json["version"], 1);
+            assert_eq!(json["parameter_schema"]["version"], 1);
+            assert_eq!(json["parameter_schema"]["k"]["min"], 1);
+            assert_eq!(
+                json["parameter_schema"]["k"]["default_executed_steps"],
+                expected_default_steps
+            );
+            assert_eq!(json["parameter_schema"]["k"]["max"], expected_max_k);
+            assert_eq!(json["parameter_schema"]["scale"]["min"], 0.25);
+            assert_eq!(json["parameter_schema"]["scale"]["max"], 0.9);
+            assert_eq!(json["parameter_schema"]["scale"]["default"], 0.5);
+        }
+
+        let control_app = &all["flux1_dev_control"]["low_res_start"];
+        assert!(!control_app.applicable);
+        assert!(control_app
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
+
+        for ip_route in ["flux1_dev_ip_adapter", "flux1_schnell_ip_adapter"] {
+            let ip_app = &all[ip_route]["low_res_start"];
+            assert!(!ip_app.applicable, "{ip_route} must refuse low_res_start");
+            assert!(ip_app
+                .reasons
+                .iter()
+                .any(|r| r.code
+                    == FeatureInapplicabilityCode::ConflictsWithPass0ReferenceConditioning));
+        }
+
+        // Unsupported `phases` must return a typed refusal (`Error::Unsupported`) on every migrated route.
+        let base_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let phased_req = GenerationRequest {
+            prompt: "a phased test".into(),
+            width: 512,
+            height: 512,
+            phases: Some(vec![GenerationPhase {
+                steps: 4,
+                guidance: Some(3.5),
+                adapters: vec![],
+            }]),
+            ..Default::default()
+        };
+        for id in ["flux1_schnell", "flux1_dev"] {
+            assert!(matches!(
+                registry.compile_render_plan(id, &base_spec, &phased_req),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        let img = Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0; 16 * 16 * 3],
+        };
+        let ip_spec = base_spec
+            .clone()
+            .with_ip_adapter(WeightsSource::Dir("/nonexistent/ip".into()));
+        let ip_phased = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img.clone(),
+                strength: Some(0.7),
+            }],
+            ..phased_req.clone()
+        };
+        for variant in [super::FluxVariant::Schnell, super::FluxVariant::Dev] {
+            assert!(matches!(
+                super::model::compile_ip_adapter(variant, &ip_spec, &ip_phased),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        let control_spec = base_spec.with_control(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ));
+        let control_phased = GenerationRequest {
+            conditioning: vec![Conditioning::Control {
+                image: img,
+                kind: ControlKind::Pose,
+                scale: Some(0.7),
+            }],
+            ..phased_req
+        };
+        assert!(matches!(
+            registry.compile_render_plan("flux1_dev_control", &control_spec, &control_phased),
+            Err(Error::Unsupported(_))
+        ));
     }
 }
 

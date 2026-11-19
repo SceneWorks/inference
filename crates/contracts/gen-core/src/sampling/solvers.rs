@@ -97,6 +97,7 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
                 &x,
             ));
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) {
                 x = x0;
                 ops.observe_solver(SolverObservation::update(
@@ -170,6 +171,7 @@ impl<L: LatentOps> Sampler<L> for Heun {
                 &x,
             ));
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) {
                 x = x0;
                 ops.observe_solver(SolverObservation::update(
@@ -263,6 +265,7 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
                 .history(old_x0.as_ref(), None, None),
             );
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) {
                 // Degenerate leading σ==0 (no real schedule starts here): land on x0, avoid the
                 // λ(0)/coeff_x = s_next/σ division. Mirrors every sibling solver's leading guard.
@@ -383,6 +386,7 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
                 &x,
             ));
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) {
                 x = x0;
                 ops.observe_solver(SolverObservation::update(
@@ -510,6 +514,7 @@ impl<L: LatentOps> Sampler<L> for UniPc {
                 .history(prev_x0.as_ref(), None, last_sample.as_ref()),
             );
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
 
             // Corrector: refine x_i (predicted at step i-1) using the fresh x0_i. Order-2 corrector
             // is the trapezoidal blend 0.5·(x0_{i-1} + x0_i).
@@ -601,6 +606,7 @@ impl<L: LatentOps> Sampler<L> for Lcm {
                 &x,
             ));
             let x0 = denoise(&x, sigmas[i])?;
+            state.record_primary_estimate_if_targeted(i, sigmas[i], &x0);
             x = x0;
             let s_next = sigmas[i + 1];
             if s_next > 0.0 {
@@ -665,6 +671,7 @@ impl<L: LatentOps> Sampler<L> for Ddim {
                 &x,
             ));
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) {
                 x = x0;
                 ops.observe_solver(SolverObservation::update(
@@ -782,6 +789,7 @@ impl<L: LatentOps> Sampler<L> for ErSde {
                 }),
             );
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) || s_next == 0.0 {
                 // Terminal (or degenerate leading σ==0): land on the denoised estimate, no noise.
                 x = x0.clone();
@@ -964,6 +972,7 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
                 .scalar_history(h_last.is_some()),
             );
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) || s_next == 0.0 {
                 // Terminal (or degenerate leading σ==0): land on the denoised estimate, no noise.
                 x = x0.clone();
@@ -1107,6 +1116,22 @@ impl Solver {
             self,
             Self::EulerAncestral | Self::DpmppSde | Self::Lcm | Self::ErSde | Self::Dpmpp2mSde
         )
+    }
+
+    /// Nominal model evaluations per non-terminal solver step (`1` for 1-stage solvers,
+    /// `2` for 2-stage solvers `Heun` and `DpmppSde`).
+    pub const fn stages_per_step(self) -> u32 {
+        match self {
+            Self::Heun | Self::DpmppSde => 2,
+            Self::Euler
+            | Self::EulerAncestral
+            | Self::Dpmpp2m
+            | Self::UniPc
+            | Self::Lcm
+            | Self::Ddim
+            | Self::ErSde
+            | Self::Dpmpp2mSde => 1,
+        }
     }
 
     /// Smallest complete transition sequence that reaches this default factory's warm-up,

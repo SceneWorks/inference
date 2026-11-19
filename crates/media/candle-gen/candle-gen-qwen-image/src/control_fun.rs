@@ -94,10 +94,10 @@ pub struct QwenFunControlRequest {
     pub cancel: CancelFlag,
     /// Per-step latent-preview sink (epic 16948, sc-16952) — the bespoke-request twin of
     /// [`gen_core::GenerationRequest::preview`](candle_gen::gen_core::GenerationRequest::preview),
-    /// carried as a field because this lane is a bespoke provider the worker drives by name rather
-    /// than through the registry. The [`Default`] is inert, and an inert sink is
-    /// seeded-byte-identical to a render with no preview at all.
+    /// The frames are of the **target** image only (no control image).
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance (PAG) configuration (SW-7179).
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
 }
 
 impl Default for QwenFunControlRequest {
@@ -116,6 +116,7 @@ impl Default for QwenFunControlRequest {
             seed: 0,
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
+            pag: None,
         }
     }
 }
@@ -290,16 +291,38 @@ impl QwenFunControl {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
-            candle_gen::execution::unobserved_adapters(
-                self.unobserved_adapter_count,
-                "QwenFunControl",
-            );
-            candle_gen::execution::policy("direct_route", "qwen-image/control_fun/generate".into());
-            let image = self
-                .generate(req, control, &mut report_progress)
-                .map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        candle_gen::execution::capture_direct_report(
+            &control_report_descriptor(),
+            &req.cancel,
+            || {
+                candle_gen::execution::unobserved_adapters(
+                    self.unobserved_adapter_count,
+                    "QwenFunControl",
+                );
+                candle_gen::execution::policy(
+                    "direct_route",
+                    "qwen-image/control_fun/generate".into(),
+                );
+                self.generate_with_report(req, control, &mut report_progress)
+            },
+        )
+    }
+
+    /// Structural-control generation returning [`GenerationReport`](candle_gen::gen_core::GenerationReport).
+    pub fn generate_with_report(
+        &self,
+        req: &QwenFunControlRequest,
+        control: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationReport> {
+        let (image, pag) = self
+            .generate_inner(req, control, on_progress)
+            .map_err(candle_gen::gen_core::Error::from)?;
+        Ok(candle_gen::gen_core::GenerationReport {
+            pag,
+            ..candle_gen::gen_core::GenerationReport::from_output(
+                candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+            )
         })
     }
 
@@ -309,11 +332,36 @@ impl QwenFunControl {
         control: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        self.generate_inner(req, control, on_progress)
+            .map(|(image, _)| image)
+    }
+
+    fn generate_inner(
+        &self,
+        req: &QwenFunControlRequest,
+        control: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Image, Option<candle_gen::gen_core::PagExecutionReport>)> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let resolved_pag = candle_gen::gen_core::resolve_pag(
+            Some(&crate::pag_capability()),
+            "qwen_image_control",
+            req.pag.as_ref(),
+        )
+        .map_err(|err| match err.kind() {
+            candle_gen::gen_core::PagPolicyErrorKind::Unsupported => {
+                CandleError::Unsupported(err.to_string())
+            }
+            candle_gen::gen_core::PagPolicyErrorKind::Invalid => {
+                CandleError::Msg(format!("qwen_image_control: {err}"))
+            }
+        })?;
+        crate::record_pag_policy("qwen_image_control/pag", resolved_pag.as_ref());
         require_prompt(&req.prompt)?;
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
+        let num_blocks = self.transformer.block_count();
 
         let pos = self.encode(&req.prompt)?;
         let guidance = candle_gen::execution::f32_policy("qwen/direct_guidance", req.guidance);
@@ -356,6 +404,10 @@ impl QwenFunControl {
             req.steps,
             &native,
         )?;
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 
@@ -376,6 +428,8 @@ impl QwenFunControl {
             on_progress,
             Some(&preview),
             |latents, sigma| -> Result<Tensor> {
+                let control_scale =
+                    candle_gen::execution::f32_policy("qwen/control_scale", req.control_scale);
                 let pos_v = self.transformer.forward_fun_control(
                     latents,
                     &pos,
@@ -383,9 +437,9 @@ impl QwenFunControl {
                     lat_h,
                     lat_w,
                     Some((&self.controlnet, &control_cond)),
-                    candle_gen::execution::f32_policy("qwen/control_scale", req.control_scale),
+                    control_scale,
                 )?;
-                match &neg {
+                let guided = match &neg {
                     Some(neg) => {
                         let neg_v = self.transformer.forward_fun_control(
                             latents,
@@ -394,26 +448,61 @@ impl QwenFunControl {
                             lat_h,
                             lat_w,
                             Some((&self.controlnet, &control_cond)),
-                            candle_gen::execution::f32_policy(
-                                "qwen/control_scale",
-                                req.control_scale,
-                            ),
+                            control_scale,
                         )?;
-                        Ok(pipeline::compute_guided_noise(
-                            &pos_v,
-                            &neg_v,
-                            req.guidance,
-                        )?)
+                        pipeline::compute_guided_noise(&pos_v, &neg_v, req.guidance)?
                     }
-                    None => Ok(pos_v),
+                    None => pos_v.clone(),
+                };
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_scale = resolved_pag
+                    .as_ref()
+                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                if pag_scale > 0.0 {
+                    if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(
+                        resolved_pag.as_ref(),
+                        num_blocks,
+                        step_idx,
+                        total_steps,
+                    ) {
+                        let perturbed_v = self.transformer.forward_fun_control_pag(
+                            latents,
+                            &pos,
+                            sigma,
+                            lat_h,
+                            lat_w,
+                            Some((&self.controlnet, &control_cond)),
+                            control_scale,
+                            Some(&perturb_mask),
+                        )?;
+                        return Ok(pipeline::combine_pag_guidance(
+                            &guided,
+                            &pos_v,
+                            &perturbed_v,
+                            pag_scale,
+                        )?);
+                    }
                 }
+                Ok(guided)
             },
         )?;
 
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
         let decoded = self.vae.decode(&lat)?;
-        control_common::to_image(&decoded)
+        let image = control_common::to_image(&decoded)?;
+        Ok((
+            image,
+            resolved_pag
+                .as_ref()
+                .map(|p| p.execution_report(total_steps as u32)),
+        ))
     }
 }
 

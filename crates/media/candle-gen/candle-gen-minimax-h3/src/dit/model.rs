@@ -472,6 +472,13 @@ impl MiniMaxH3Dit {
     ///
     /// `context` is `[1, num_text_tokens, text_dim]`, the text encoder's select-layer hidden state.
     pub fn embed_context(&self, context: &Tensor) -> Result<Tensor> {
+        self.refine_text(&self.embed_context_rows(context)?)
+    }
+
+    /// `context_embedder` alone, cast to the stream dtype — the first half of
+    /// [`Self::embed_context`]. A trainer that differentiates the token refiner (SW-F369) caches
+    /// these frozen rows once per item and runs [`Self::refine_text`] every step.
+    pub(crate) fn embed_context_rows(&self, context: &Tensor) -> Result<Tensor> {
         let s = context.dims();
         if s.len() != 3 || s[0] != 1 || s[2] != self.cfg.text_dim {
             return Err(CandleError::Msg(format!(
@@ -479,8 +486,17 @@ impl MiniMaxH3Dit {
                 self.cfg.text_dim
             )));
         }
-        let embedded = self.projections.context_embedder.forward(context)?;
-        self.refiner.forward(&embedded.to_dtype(self.dtype)?)
+        Ok(self
+            .projections
+            .context_embedder
+            .forward(context)?
+            .to_dtype(self.dtype)?)
+    }
+
+    /// The token refiner over [`Self::embed_context_rows`]'s output — the second half of
+    /// [`Self::embed_context`].
+    pub(crate) fn refine_text(&self, embedded: &Tensor) -> Result<Tensor> {
+        self.refiner.forward(embedded)
     }
 
     /// The timestep MLP, as the closure [`AdaLnCache::precompute`] consumes.
@@ -606,6 +622,7 @@ impl MiniMaxH3Dit {
             veda,
             cancel,
             None,
+            None,
         )?;
         // 3. The shared output norm, then the two heads over their own rows. Gathering before
         //    projecting is bit-identical to the reference's project-then-gather (both heads are
@@ -652,6 +669,7 @@ impl MiniMaxH3Dit {
         blocks: BlockModulation<'_>,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
         cancel: Option<&CancelFlag>,
+        pag_perturbation: Option<(&[u32], usize)>,
         mut observe: Option<&mut LayerObserver<'_>>,
     ) -> Result<Tensor> {
         // The AdaLN index bounds-check runs ONCE here rather than per block: it is a blocking D2H
@@ -679,8 +697,11 @@ impl MiniMaxH3Dit {
                         return Err(CandleError::Canceled);
                     }
                 }
+                let pag_prefix = pag_perturbation.and_then(|(layers, prefix_len)| {
+                    layers.contains(&(layer as u32)).then_some(prefix_len)
+                });
                 x = match blocks {
-                    BlockModulation::Cached(cache) => block.forward_veda(
+                    BlockModulation::Cached(cache) => block.forward_pag(
                         &x,
                         cache.modulation(layer)?,
                         adaln_indices,
@@ -688,8 +709,9 @@ impl MiniMaxH3Dit {
                         tables,
                         veda.map(|(runtime, step)| (runtime, layer, step)),
                         cancel,
+                        pag_prefix,
                     )?,
-                    BlockModulation::Temb(temb) => block.forward_veda(
+                    BlockModulation::Temb(temb) => block.forward_pag(
                         &x,
                         &block.modulation(temb)?,
                         adaln_indices,
@@ -697,8 +719,9 @@ impl MiniMaxH3Dit {
                         tables,
                         veda.map(|(runtime, step)| (runtime, layer, step)),
                         cancel,
+                        pag_prefix,
                     )?,
-                    BlockModulation::CurveCoords(coords) => block.forward_veda(
+                    BlockModulation::CurveCoords(coords) => block.forward_pag(
                         &x,
                         &block.curve_modulation(coords)?,
                         adaln_indices,
@@ -706,6 +729,7 @@ impl MiniMaxH3Dit {
                         tables,
                         veda.map(|(runtime, step)| (runtime, layer, step)),
                         cancel,
+                        pag_prefix,
                     )?,
                 };
                 if let Some(observe) = observe.as_mut() {
@@ -834,7 +858,24 @@ impl MiniMaxH3Dit {
         norm_out: &NormOutModulation,
         pdd_step: usize,
         cancel: Option<&CancelFlag>,
+        trace: Option<&mut ImageDitTrace>,
+    ) -> Result<Tensor> {
+        self.forward_image_pag_traced(packed, blocks, norm_out, pdd_step, cancel, trace, None)
+    }
+
+    /// [`Self::forward_image_traced`] with optional PAG perturbation `(perturbed_layers, prefix_len)`
+    /// (SW-7175), applying the exact same `pdd_proj_out.{pdd_step}` head while perturbing only
+    /// target-image self-attention (`prefix_len..seq_len`) on `perturbed_layers`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_image_pag_traced(
+        &self,
+        packed: &ImageForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        pdd_step: usize,
+        cancel: Option<&CancelFlag>,
         mut trace: Option<&mut ImageDitTrace>,
+        pag_perturbation: Option<(&[u32], usize)>,
     ) -> Result<Tensor> {
         if self.cfg.has_audio() {
             return Err(CandleError::Msg(
@@ -843,8 +884,24 @@ impl MiniMaxH3Dit {
                     .into(),
             ));
         }
+        if let Some((layers, prefix_len)) = pag_perturbation {
+            let num_blocks = self.blocks.len();
+            if let Some(&bad) = layers.iter().find(|&&l| (l as usize) >= num_blocks) {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 dit: PAG layer {bad} is outside 0..{num_blocks}"
+                )));
+            }
+            let seq_len = packed.text_indices.len() + packed.image_indices.len();
+            if prefix_len > seq_len {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 dit: PAG prefix_len {prefix_len} exceeds packed seq_len {seq_len}"
+                )));
+            }
+        }
         // Resolve the head FIRST: a step past the last head is refused before 50 blocks run.
         let head = self.projections.output_head(Some(pdd_step))?;
+        candle_gen::execution::runtime(&self.device, self.dtype);
+        candle_gen::execution::runtime(packed.text_rows.device(), packed.text_rows.dtype());
         let x = self.image_stack_input(
             packed.image_rows,
             packed.text_rows,
@@ -866,6 +923,7 @@ impl MiniMaxH3Dit {
             blocks,
             None,
             cancel,
+            pag_perturbation,
             Some(&mut record),
         )?;
         let x = self
@@ -1513,6 +1571,7 @@ pub struct ImageDit {
     token_tags: Vec<u32>,
     text_indices: Vec<u32>,
     image_indices: Vec<u32>,
+    conditioning_rows: usize,
     released_bytes: usize,
     timesteps: Vec<f32>,
     has_references: bool,
@@ -1639,6 +1698,19 @@ impl ImageDit {
         }
         let device = dit.device.clone();
         let tables = dit.rope.tables_from_rows(layout.position_ids(), &device)?;
+        debug_assert!(
+            layout
+                .text_indices()
+                .iter()
+                .copied()
+                .eq(0..layout.num_text_tokens() as u32)
+                && layout
+                    .image_indices()
+                    .iter()
+                    .copied()
+                    .eq(layout.num_text_tokens() as u32..layout.seq_len() as u32),
+            "ImageLayout must pack [text | references | generated] contiguously"
+        );
         Ok(Self {
             dit,
             tables,
@@ -1650,6 +1722,7 @@ impl ImageDit {
             token_tags: layout.token_tags().to_vec(),
             text_indices: layout.text_indices().to_vec(),
             image_indices: layout.image_indices().to_vec(),
+            conditioning_rows: layout.num_conditioning_rows(),
             released_bytes,
             timesteps,
             has_references,
@@ -1764,7 +1837,24 @@ impl ImageDit {
         image_rows: &Tensor,
         trace: &mut ImageDitTrace,
     ) -> Result<Tensor> {
-        self.forward_inner(step, image_rows, Some(trace))
+        self.forward_inner(step, image_rows, Some(trace), None)
+    }
+
+    /// Second conditional velocity pass for Perturbed-Attention Guidance (SW-7175) at sampling step
+    /// `step`: projects through the exact same `pdd_proj_out.{step}` head while perturbing only
+    /// target-image self-attention (`self.conditioning_rows..seq_len`) on `perturbed_layers`.
+    pub fn forward_perturbed(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            step,
+            image_rows,
+            None,
+            Some((perturbed_layers, self.conditioning_rows)),
+        )
     }
 
     fn forward_inner(
@@ -1772,6 +1862,7 @@ impl ImageDit {
         step: usize,
         image_rows: &Tensor,
         trace: Option<&mut ImageDitTrace>,
+        pag_perturbation: Option<(&[u32], usize)>,
     ) -> Result<Tensor> {
         self.forwards += 1;
         let device = self.dit.device.clone();
@@ -1791,13 +1882,14 @@ impl ImageDit {
             text_indices: &self.text_indices,
             image_indices: &self.image_indices,
         };
-        self.dit.forward_image_traced(
+        self.dit.forward_image_pag_traced(
             &packed,
             BlockModulation::Cached(&self.cache),
             &self.norm_out,
             step,
             self.cancel.as_ref(),
             trace,
+            pag_perturbation,
         )
     }
 }
@@ -1928,7 +2020,16 @@ pub(crate) fn image_modulation(
 
 impl crate::image_pipeline::ImageVelocity for ImageDit {
     fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor> {
-        self.forward_inner(step, image_rows, None)
+        self.forward_inner(step, image_rows, None, None)
+    }
+
+    fn forward_perturbed(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        ImageDit::forward_perturbed(self, step, image_rows, perturbed_layers)
     }
 }
 
@@ -2771,3 +2872,7 @@ mod veda_controls_tests {
         println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention");
     }
 }
+
+#[cfg(test)]
+#[path = "pag_tests.rs"]
+mod pag_tests;

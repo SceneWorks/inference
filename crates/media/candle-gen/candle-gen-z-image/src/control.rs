@@ -81,6 +81,7 @@ fn control_report_descriptor(base: bool) -> candle_gen::gen_core::ModelDescripto
     } else {
         "z_image_turbo_control"
     };
+    descriptor.capabilities.pag = None;
     descriptor
 }
 

@@ -234,15 +234,20 @@ impl MossImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
         self.run_with_execution(request, inputs, edit, on_progress)
-            .map(|(output, _)| output)
+            .map(|(output, _, _)| output)
     }
+    #[allow(clippy::type_complexity)]
     fn run_with_execution(
         &self,
         request: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
         edit: Option<MossImageEditInputs<'_>>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<(MossImageAdvancedOutput, ExecutionIdentity)> {
+    ) -> gen_core::Result<(
+        MossImageAdvancedOutput,
+        Option<PagExecutionReport>,
+        ExecutionIdentity,
+    )> {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
         state.edit_report = None;
@@ -260,7 +265,7 @@ impl MossImageGenerator {
             };
             self.run_locked(&mut state, request, inputs, edit, on_progress, admission)
         })();
-        let result = result.and_then(|output| {
+        let result = result.and_then(|(output, pag)| {
             transformer::check_cancel(&request.cancel)?;
             let mut execution = gen_core_moss_image::execution::completed_identity(
                 state.report.as_ref(),
@@ -272,7 +277,7 @@ impl MossImageGenerator {
                 &self.sources.spec.adapters,
                 &state.apply_reports,
             )?;
-            Ok((output, execution))
+            Ok((output, pag, execution))
         });
         // Edit renderers and reference K/V never survive a request. CUDA drops enqueue frees:
         // synchronize after release so the next admission sees the recovered driver budget.
@@ -304,7 +309,7 @@ impl MossImageGenerator {
         edit: Option<MossImageEditInputs<'_>>,
         on_progress: &mut dyn FnMut(Progress),
         admission: Option<MemoryRunContext>,
-    ) -> gen_core::Result<MossImageAdvancedOutput> {
+    ) -> gen_core::Result<(MossImageAdvancedOutput, Option<PagExecutionReport>)> {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
@@ -524,12 +529,17 @@ impl MossImageGenerator {
             .synchronize()
             .map_err(candle_gen::CandleError::from)?;
         transformer::check_cancel(&req.cancel)?;
+        let actual_steps = match &sampled.sampling {
+            MossImageSamplingReceipt::Euler { sigmas } => sigmas.len().saturating_sub(1) as u32,
+            MossImageSamplingReceipt::Dmd { step_codes, .. } => step_codes.len() as u32,
+        };
+        let pag_report = r.pag.as_ref().map(|pag| pag.execution_report(actual_steps));
         #[cfg(feature = "test-support")]
         if self.sources.is_fixture() {
             // Synthetic CPU fixtures execute the actual graph but cannot attest published assets.
             state.report = None;
             state.apply_reports = apply_reports;
-            return Ok(output);
+            return Ok((output, pag_report));
         }
         let conditioning = positive
             .receipts
@@ -564,6 +574,7 @@ impl MossImageGenerator {
             output_kind: inputs.output,
             component_dtypes: component_dtypes(r.acceleration, self.device.is_cpu()),
             adapter_reports,
+            pag: pag_report.clone(),
         })?;
         transformer::check_cancel(&req.cancel)?;
         if let (Some(edit), Some(assets), Some((_, references))) =
@@ -582,6 +593,7 @@ impl MossImageGenerator {
                 references,
                 reference_max_edge: edit.reference_max_edge,
                 use_kv_cache: edit.use_kv_cache,
+                pag: pag_report.clone(),
             };
             receipt.validate()?;
             transformer::check_cancel(&req.cancel)?;
@@ -595,7 +607,7 @@ impl MossImageGenerator {
             state.report = Some(report);
         }
         state.apply_reports = apply_reports;
-        Ok(output)
+        Ok((output, pag_report))
     }
 }
 impl MossImageAdvancedGenerator for MossImageGenerator {
@@ -614,26 +626,32 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedMossImageAdvanced> {
-        let (output, execution) = self.run_with_execution(request, inputs, None, on_progress)?;
+        let (output, _, execution) = self.run_with_execution(request, inputs, None, on_progress)?;
         CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
 }
 impl Generator for MossImageGenerator {
+    fn generate_with_report(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
+        self.generate_with_execution_report(request, on_progress)
+            .map(|completed| completed.generation)
+    }
     fn generate_with_execution_report(
         &self,
         request: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedGeneration> {
-        let (output, execution) =
+        let (output, pag, execution) =
             self.run_with_execution(request, MossImageAdvancedInputs::default(), None, progress)?;
         let MossImageAdvancedOutput::Images(images) = output else {
             unreachable!("default image output")
         };
-        CompletedGeneration::new(
-            GenerationReport::from_output(GenerationOutput::Images(images)),
-            execution,
-            &self.descriptor,
-        )
+        let mut report = GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = pag;
+        CompletedGeneration::new(report, execution, &self.descriptor)
     }
     fn generate_moss_image_edit_with_execution_report(
         &self,
@@ -641,7 +659,7 @@ impl Generator for MossImageGenerator {
         inputs: MossImageEditInputs<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedMossImageEdit> {
-        let (output, execution) =
+        let (output, _, execution) =
             self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
         CompletedMossImageEdit::new(output, execution, &self.descriptor)
     }
@@ -801,6 +819,7 @@ fn descriptor(v: MossImageVariant) -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
+            pag: Some(moss_image_pag_capability()),
             ..Default::default()
         },
     }

@@ -579,3 +579,15 @@ pub struct AudioEmbedderRegistration {
     pub descriptor: fn() -> AudioEmbedderDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn AudioEmbedder>>,
 }
+
+/// Provider-owned feature-applicability route registration for a conditioned or platform-composed
+/// route (for example `flux1_dev_ip_adapter`, `flux1_schnell_ip_adapter`, `flux1_dev_control`,
+/// or `flux1_dev_pulid`) whose structural applicability and pre-load plan contract are computed
+/// alongside ordinary generators (SW-6938).
+#[derive(Clone, Copy)]
+pub struct FeatureRouteRegistration {
+    pub route_id: &'static str,
+    pub parent_provider_id: Option<&'static str>,
+    pub descriptor: fn() -> ModelDescriptor,
+    pub render_plan: Option<crate::RenderPlanRegistration>,
+}

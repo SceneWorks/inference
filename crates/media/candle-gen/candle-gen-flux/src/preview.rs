@@ -270,6 +270,26 @@ pub fn hook(sink: &PreviewSink, width: u32, height: u32) -> PreviewHook<'_> {
     })
 }
 
+/// Phase-geometry-aware preview hook for planned FLUX.1 renders (`SW-6939`): projects Phase-0
+/// packed tokens at `(low_w, low_h)` and Phase-1 packed tokens at `(full_w, full_h)` when
+/// `low_res_start` is active, and at `(full_w, full_h)` throughout when inactive.
+pub fn hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    let (phase0_w, phase0_h) = plan.phase_output_size(0);
+    let phase0_tokens = plan.phase_packed_tokens(0);
+    let (full_w, full_h) = plan.output_size();
+    PreviewHook::new(sink, move |tokens: &Tensor| {
+        let (width, height) = if tokens.dims().get(1).copied() == Some(phase0_tokens) {
+            (phase0_w, phase0_h)
+        } else {
+            (full_w, full_h)
+        };
+        project_packed_tokens(tokens, width, height)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

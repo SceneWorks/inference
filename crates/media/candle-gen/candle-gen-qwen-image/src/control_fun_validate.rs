@@ -69,6 +69,7 @@ fn real_weight_fun_control() {
         seed: 12345,
         cancel: CancelFlag::new(),
         preview: PreviewSink::default(),
+        pag: None,
     };
 
     let mut noop = |_p: Progress| {};

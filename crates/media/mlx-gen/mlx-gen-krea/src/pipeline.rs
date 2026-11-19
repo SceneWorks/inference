@@ -313,6 +313,7 @@ pub struct KreaHeavy {
 pub struct T2iPlan {
     pub(crate) sigmas: Option<Vec<f32>>,
     pub(crate) guidance: f32,
+    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     prep_pos: JointPrep,
     prep_neg: Option<JointPrep>,
 }
@@ -325,7 +326,7 @@ pub struct T2iPlan {
 /// drives the phases in order, threading the latent across the shared-boundary sigmas.
 pub struct MultiPhasePlan {
     dit: Krea2Transformer,
-    plan: T2iPlan,
+    pub(crate) plan: T2iPlan,
     guidance: f32,
     slice: PhaseSlice,
 }
@@ -335,6 +336,7 @@ pub struct MultiPhasePlan {
 pub struct Img2ImgPlan {
     pub(crate) sigmas: Option<Vec<f32>>,
     pub(crate) guidance: f32,
+    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     prep_pos: JointPrep,
     prep_neg: Option<JointPrep>,
     clean: Array,
@@ -345,8 +347,39 @@ pub struct Img2ImgPlan {
 /// [`KreaHeavy::prepare_edit_plan`].
 pub struct EditPlan {
     pub(crate) sigmas: Option<Vec<f32>>,
+    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     prep_pos: EditPrep,
     prep_neg: Option<EditPrep>,
+}
+
+/// Active per-step Perturbed-Attention Guidance parameters resolved against the executed schedule
+/// (SW-7176). `None` outside `[start, stop)` or when `pag` is unset / `scale == 0.0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PagStep<'a> {
+    pub(crate) scale: f32,
+    pub(crate) layers: &'a [u32],
+}
+
+impl<'a> PagStep<'a> {
+    pub(crate) fn for_step(
+        pag: Option<&'a mlx_gen::gen_core::PagResolved>,
+        step_index: usize,
+        total_steps: usize,
+    ) -> Option<Self> {
+        let pag = pag?;
+        if total_steps == 0 {
+            return None;
+        }
+        let scale = pag.step_scale(step_index, total_steps);
+        if scale <= 0.0 {
+            return None;
+        }
+        let layers = pag.step_layers(step_index, total_steps);
+        if layers.is_empty() {
+            return None;
+        }
+        Some(Self { scale, layers })
+    }
 }
 
 /// Count-invariant pose-control render state (F-073): the step-invariant text prep + the pose skeleton
@@ -368,17 +401,31 @@ impl KreaHeavy {
         positive: &JointPrep,
         negative: Option<&JointPrep>,
         guidance: f32,
+        pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        match negative {
-            Some(negative) => {
+        match (negative, pag_step) {
+            (Some(negative), Some(pag)) => {
+                let (cond, uncond, perturbed) = dit.forward_prepared_cfg_pag_windowed_budgeted(
+                    latent, timestep, positive, negative, pag.layers, window, attention,
+                )?;
+                let cfg_out = krea_cfg_combine(&cond, &uncond, guidance)?;
+                krea_pag_combine(&cfg_out, &cond, &perturbed, pag.scale)
+            }
+            (None, Some(pag)) => {
+                let (cond, perturbed) = dit.forward_prepared_pag_pair_windowed_budgeted(
+                    latent, timestep, positive, pag.layers, window, attention,
+                )?;
+                krea_pag_combine(&cond, &cond, &perturbed, pag.scale)
+            }
+            (Some(negative), None) => {
                 let (positive, negative) = dit.forward_prepared_pair_windowed_budgeted(
                     latent, timestep, positive, negative, window, attention,
                 )?;
                 krea_cfg_combine(&positive, &negative, guidance)
             }
-            None => dit
+            (None, None) => dit
                 .forward_prepared_windowed_budgeted(latent, timestep, positive, window, attention),
         }
     }
@@ -398,17 +445,20 @@ impl KreaHeavy {
             timestep,
             plan,
             guidance,
+            None,
             window,
             mlx_gen::attention::AttentionPlan::UNBOUNDED,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn base_t2i_velocity_budgeted(
         dit: &Krea2Transformer,
         latent: &Array,
         timestep: &Array,
         plan: &T2iPlan,
         guidance: f32,
+        pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
@@ -419,6 +469,7 @@ impl KreaHeavy {
             &plan.prep_pos,
             plan.prep_neg.as_ref(),
             guidance,
+            pag_step,
             window,
             attention,
         )
@@ -439,24 +490,27 @@ impl KreaHeavy {
             timestep,
             plan,
             guidance,
+            None,
             window,
             mlx_gen::attention::AttentionPlan::UNBOUNDED,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn multiphase_velocity_budgeted(
         dit: &Krea2Transformer,
         latent: &Array,
         timestep: &Array,
         plan: &T2iPlan,
         guidance: f32,
+        pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let negative = if guidance != 0.0 {
+        let negative = if krea_uses_cfg(guidance) {
             Some(plan.prep_neg.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
-                    "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                    "krea_2 multi-phase: a CFG phase requires the \
                      unconditional prep, but the plan was built without one"
                         .into(),
                 )
@@ -471,6 +525,7 @@ impl KreaHeavy {
             &plan.prep_pos,
             negative,
             guidance,
+            pag_step,
             window,
             attention,
         )
@@ -491,17 +546,20 @@ impl KreaHeavy {
             timestep,
             plan,
             guidance,
+            None,
             window,
             mlx_gen::attention::AttentionPlan::UNBOUNDED,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn base_img2img_velocity_budgeted(
         dit: &Krea2Transformer,
         latent: &Array,
         timestep: &Array,
         plan: &Img2ImgPlan,
         guidance: f32,
+        pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
@@ -512,6 +570,7 @@ impl KreaHeavy {
             &plan.prep_pos,
             plan.prep_neg.as_ref(),
             guidance,
+            pag_step,
             window,
             attention,
         )
@@ -532,22 +591,50 @@ impl KreaHeavy {
             timestep,
             plan,
             guidance,
+            None,
             window,
             mlx_gen::attention::AttentionPlan::UNBOUNDED,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn edit_velocity_budgeted(
         dit: &Krea2Transformer,
         latent: &Array,
         timestep: &Array,
         plan: &EditPlan,
         guidance: f32,
+        pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        match &plan.prep_neg {
-            Some(negative) => {
+        match (&plan.prep_neg, pag_step) {
+            (Some(negative), Some(pag)) => {
+                let (cond, uncond, perturbed) = dit
+                    .forward_prepared_edit_cfg_pag_windowed_budgeted(
+                        latent,
+                        timestep,
+                        &plan.prep_pos,
+                        negative,
+                        pag.layers,
+                        window,
+                        attention,
+                    )?;
+                let cfg_out = krea_cfg_combine(&cond, &uncond, guidance)?;
+                krea_pag_combine(&cfg_out, &cond, &perturbed, pag.scale)
+            }
+            (None, Some(pag)) => {
+                let (cond, perturbed) = dit.forward_prepared_edit_pag_pair_windowed_budgeted(
+                    latent,
+                    timestep,
+                    &plan.prep_pos,
+                    pag.layers,
+                    window,
+                    attention,
+                )?;
+                krea_pag_combine(&cond, &cond, &perturbed, pag.scale)
+            }
+            (Some(negative), None) => {
                 let (positive, negative) = dit.forward_prepared_edit_pair_windowed_budgeted(
                     latent,
                     timestep,
@@ -558,7 +645,7 @@ impl KreaHeavy {
                 )?;
                 krea_cfg_combine(&positive, &negative, guidance)
             }
-            None => dit.forward_prepared_edit_windowed_budgeted(
+            (None, None) => dit.forward_prepared_edit_windowed_budgeted(
                 latent,
                 timestep,
                 &plan.prep_pos,
@@ -650,6 +737,7 @@ impl KreaHeavy {
         Ok(T2iPlan {
             sigmas: None,
             guidance: 0.0,
+            pag: None,
             prep_pos,
             prep_neg,
         })
@@ -679,6 +767,10 @@ impl KreaHeavy {
         let attention = opts.attention_plan(cancel);
         mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
@@ -689,6 +781,14 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
                 let v = Self::prepared_cfg_velocity(
                     &self.dit,
                     x,
@@ -696,6 +796,7 @@ impl KreaHeavy {
                     &plan.prep_pos,
                     plan.prep_neg.as_ref(),
                     plan.guidance,
+                    pag_step,
                     block_window,
                     attention,
                 )?;
@@ -981,6 +1082,7 @@ impl KreaHeavy {
         Ok(Img2ImgPlan {
             sigmas: None,
             guidance: 0.0,
+            pag: None,
             prep_pos,
             prep_neg,
             clean,
@@ -1022,6 +1124,10 @@ impl KreaHeavy {
         let attention = opts.attention_plan(cancel);
         mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
@@ -1032,6 +1138,14 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
                 let v = Self::prepared_cfg_velocity(
                     &self.dit,
                     x,
@@ -1039,6 +1153,7 @@ impl KreaHeavy {
                     &plan.prep_pos,
                     plan.prep_neg.as_ref(),
                     plan.guidance,
+                    pag_step,
                     block_window,
                     attention,
                 )?;
@@ -1117,6 +1232,10 @@ impl KreaHeavy {
         let attention = opts.attention_plan(cancel);
         mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
@@ -1127,12 +1246,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
                 let v = Self::base_t2i_velocity_budgeted(
                     &self.dit,
                     x,
                     &t,
                     plan,
                     guidance,
+                    pag_step,
                     block_window,
                     attention,
                 )?;
@@ -1161,6 +1289,8 @@ impl KreaHeavy {
         dit: &Krea2Transformer,
         plan: &T2iPlan,
         guidance: f32,
+        phase_step_offset: usize,
+        full_total_steps: usize,
         sub_sigmas: &[f32],
         sampler: Option<&str>,
         transformer_window_size: Option<usize>,
@@ -1172,6 +1302,9 @@ impl KreaHeavy {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let block_window = dit.block_window(transformer_window_size, cancel)?;
+        let phase_steps = sub_sigmas.len().saturating_sub(1);
+        let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler);
+        let mut eval_idx = 0usize;
         run_krea_sampler(
             sampler,
             sub_sigmas,
@@ -1182,12 +1315,22 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = phase_step_offset
+                    + mlx_gen::gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        phase_steps,
+                    );
+                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, full_total_steps);
                 let v = Self::multiphase_velocity_budgeted(
                     dit,
                     x,
                     &t,
                     plan,
                     guidance,
+                    pag_step,
                     block_window,
                     attention,
                 )?;
@@ -1233,10 +1376,10 @@ impl KreaHeavy {
             let dit = self.dit.clone_for_multiphase(&specs)?;
             // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
             let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
-            let prep_neg = if phase.guidance != 0.0 {
+            let prep_neg = if krea_uses_cfg(phase.guidance) {
                 let neg = ctx_neg.ok_or_else(|| {
                     mlx_gen::Error::Msg(
-                        "krea_2 multi-phase: a CFG phase (guidance > 0) needs a negative context, \
+                        "krea_2 multi-phase: a CFG phase needs a negative context, \
                          but none was encoded"
                             .into(),
                     )
@@ -1250,6 +1393,7 @@ impl KreaHeavy {
                 plan: T2iPlan {
                     sigmas: None,
                     guidance: 0.0,
+                    pag: None,
                     prep_pos,
                     prep_neg,
                 },
@@ -1285,6 +1429,7 @@ impl KreaHeavy {
         let previews = KreaPreview::new(preview, full);
         let attention = opts.attention_plan(cancel);
         mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
+        let full_total_steps = full.len().saturating_sub(1);
         for mp in plans {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
@@ -1293,6 +1438,8 @@ impl KreaHeavy {
                 &mp.dit,
                 &mp.plan,
                 mp.guidance,
+                start,
+                full_total_steps,
                 sub,
                 opts.sampler.as_deref(),
                 opts.transformer_window_size,
@@ -1387,6 +1534,10 @@ impl KreaHeavy {
         mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
 
         let previews = KreaPreview::new(preview, sigmas);
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
@@ -1397,12 +1548,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
                 let v = Self::base_img2img_velocity_budgeted(
                     &self.dit,
                     x,
                     &t,
                     plan,
                     guidance,
+                    pag_step,
                     block_window,
                     attention,
                 )?;
@@ -1498,6 +1658,7 @@ impl KreaHeavy {
         };
         Ok(EditPlan {
             sigmas: None,
+            pag: None,
             prep_pos,
             prep_neg,
         })
@@ -1545,6 +1706,10 @@ impl KreaHeavy {
         let attention = opts.attention_plan(cancel);
         mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
+        let total_steps = sigmas.len().saturating_sub(1);
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(opts.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
             sigmas,
@@ -1555,12 +1720,21 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, total_steps);
                 let v = Self::edit_velocity_budgeted(
                     &self.dit,
                     x,
                     &t,
                     plan,
                     guidance,
+                    pag_step,
                     block_window,
                     attention,
                 )?;
@@ -1852,7 +2026,7 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let ctx_pos = self.text.encode(prompt)?;
-        let ctx_neg = if guidance != 0.0 {
+        let ctx_neg = if krea_uses_cfg(guidance) {
             Some(self.text.encode(negative_prompt)?)
         } else {
             None
@@ -1910,7 +2084,7 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let ctx_pos = self.text.encode(prompt)?;
-        let ctx_neg = if guidance != 0.0 {
+        let ctx_neg = if krea_uses_cfg(guidance) {
             Some(self.text.encode(negative_prompt)?)
         } else {
             None
@@ -1977,7 +2151,7 @@ impl KreaPipeline {
         // (F-073).
         let gv = self.text.run_vision(sources)?;
         let ctx_pos = self.text.encode_grounded_from_vision(&gv, prompt)?;
-        let ctx_neg = if guidance != 0.0 {
+        let ctx_neg = if krea_uses_cfg(guidance) {
             Some(
                 self.text
                     .encode_grounded_from_vision(&gv, negative_prompt)?,
@@ -2027,17 +2201,45 @@ pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&s
     resolve_flow_schedule(scheduler, mu as f32, steps, &native)
 }
 
+/// Whether classifier-free guidance (an unconditional branch) is active for Krea 2 (SW-7176).
+///
+/// Krea's CFG formula `v = v_cond + guidance·(v_cond − v_uncond)` is offset by one from standard
+/// CFG, so `guidance == 0.0` is CFG-off (`v = v_cond`, 1-pass baseline / 2-pass PAG), whereas
+/// `guidance != 0.0` (including `guidance == 1.0`, `v = 2·v_cond − v_uncond`) runs active true CFG
+/// (2-pass baseline / 3-pass CFG + PAG), matching [`gen_core_family::krea_multiphase::phase_uses_cfg`].
+pub fn krea_uses_cfg(guidance: f32) -> bool {
+    gen_core_family::krea_multiphase::phase_uses_cfg(guidance)
+}
+
 /// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`
 /// `v = v_cond + guidance·(v_cond − v_uncond)`, **NOT** the standard `v_uncond + g·Δ`. Krea's guidance
 /// is offset by one: the standard form applies one full step LESS guidance, and at `guidance = 1.0`
 /// collapses to exactly `v_cond` (zero effective CFG). Single source of truth so the Raw inference path
 /// and the trainer preview (`training::render_sample`) can never drift again (sc-10009). The caller runs
-/// this only for `guidance > 0` (a single conditional forward otherwise, matching `cfg = guidance > 0`).
+/// this only when [`krea_uses_cfg`] holds (a single conditional forward otherwise).
 pub(crate) fn krea_cfg_combine(v_cond: &Array, v_uncond: &Array, guidance: f32) -> Result<Array> {
     Ok(add(
         v_cond,
         &multiply(&subtract(v_cond, v_uncond)?, scalar(guidance))?,
     )?)
+}
+
+/// Perturbed-Attention Guidance velocity combine (`v_base + pag_scale · (v_cond − v_perturbed)`,
+/// SW-7176), delegating to the shared [`mlx_gen::gen_core::guidance::pag_apply`] contract.
+pub(crate) fn krea_pag_combine(
+    v_base: &Array,
+    v_cond: &Array,
+    v_perturbed: &Array,
+    pag_scale: f32,
+) -> Result<Array> {
+    mlx_gen::gen_core::guidance::pag_apply(
+        &mlx_gen::sampler::MlxLatentOps,
+        v_base,
+        v_cond,
+        v_perturbed,
+        pag_scale,
+    )
+    .map_err(Into::into)
 }
 
 /// The GPU-validated-safe range for [`gen_core::GenerationRequest::text_style_gain`] — the sc-8596 A/B
@@ -2503,6 +2705,7 @@ mod tests {
             Ok(T2iPlan {
                 sigmas: None,
                 guidance: 0.0,
+                pag: None,
                 prep_pos: dit.prepare(&positive_context, None, &latent)?,
                 prep_neg: with_negative
                     .then(|| dit.prepare(&negative_context, None, &latent))
@@ -2514,6 +2717,7 @@ mod tests {
         let cfg_img2img = Img2ImgPlan {
             sigmas: None,
             guidance: 0.0,
+            pag: None,
             prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
             prep_neg: Some(dit.prepare(&negative_context, None, &latent).unwrap()),
             clean: latent.clone(),
@@ -2521,6 +2725,7 @@ mod tests {
         let plain_img2img = Img2ImgPlan {
             sigmas: None,
             guidance: 0.0,
+            pag: None,
             prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
             prep_neg: None,
             clean: latent.clone(),
@@ -2533,6 +2738,7 @@ mod tests {
         );
         let cfg_edit = EditPlan {
             sigmas: None,
+            pag: None,
             prep_pos: dit
                 .prepare_edit(
                     &positive_context,
@@ -2553,6 +2759,7 @@ mod tests {
         };
         let plain_edit = EditPlan {
             sigmas: None,
+            pag: None,
             prep_pos: dit
                 .prepare_edit(&positive_context, None, &latent, &[reference])
                 .unwrap(),
@@ -2691,6 +2898,226 @@ mod tests {
             KreaHeavy::edit_velocity(&dit, &latent, &timestep, &plain_edit, guidance, window)
         );
 
+        let pag_layers = [1_u32];
+        let pag_step = Some(PagStep {
+            scale: 1.5,
+            layers: &pag_layers,
+        });
+        let (cond_pag, pert_pag) = dit
+            .forward_prepared_pag_pair_windowed_budgeted(
+                &latent,
+                &timestep,
+                &plain_t2i.prep_pos,
+                &pag_layers,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+            .unwrap();
+        let expected_t2i_pag_2pass =
+            krea_pag_combine(&cond_pag, &cond_pag, &pert_pag, 1.5).unwrap();
+        let expected_t2i_pag_3pass =
+            krea_pag_combine(&expected_cfg, &expected_positive, &pert_pag, 1.5).unwrap();
+        let (edit_cond_pag, edit_pert_pag) = dit
+            .forward_prepared_edit_pag_pair_windowed_budgeted(
+                &latent,
+                &timestep,
+                &plain_edit.prep_pos,
+                &pag_layers,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+            .unwrap();
+        let expected_edit_pag_2pass =
+            krea_pag_combine(&edit_cond_pag, &edit_cond_pag, &edit_pert_pag, 1.5).unwrap();
+        let expected_edit_pag_3pass = krea_pag_combine(
+            &expected_edit_cfg,
+            &expected_edit_positive,
+            &edit_pert_pag,
+            1.5,
+        )
+        .unwrap();
+        let expected_cfg_one =
+            krea_cfg_combine(&expected_positive, &expected_negative, 1.0).unwrap();
+        let expected_t2i_pag_3pass_one =
+            krea_pag_combine(&expected_cfg_one, &expected_positive, &pert_pag, 1.5).unwrap();
+        let expected_edit_cfg_one =
+            krea_cfg_combine(&expected_edit_positive, &expected_edit_negative, 1.0).unwrap();
+        let expected_edit_pag_3pass_one = krea_pag_combine(
+            &expected_edit_cfg_one,
+            &expected_edit_positive,
+            &edit_pert_pag,
+            1.5,
+        )
+        .unwrap();
+        assert_route!(
+            "base t2i 2-pass PAG",
+            &expected_t2i_pag_2pass,
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_t2i,
+                0.0,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_t2i,
+                0.0,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+        assert_route!(
+            "multi-phase 2-pass PAG (g=0.0)",
+            &expected_t2i_pag_2pass,
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                0.0,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                0.0,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+        assert_route!(
+            "base t2i 3-pass CFG+PAG",
+            &expected_t2i_pag_3pass,
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                guidance,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::base_t2i_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                guidance,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+        assert_route!(
+            "multi-phase 3-pass CFG+PAG (g=1.0)",
+            &expected_t2i_pag_3pass_one,
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                1.0,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::multiphase_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_t2i,
+                1.0,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+        assert_route!(
+            "edit 2-pass PAG",
+            &expected_edit_pag_2pass,
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_edit,
+                0.0,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &plain_edit,
+                0.0,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+        assert_route!(
+            "edit 3-pass CFG+PAG",
+            &expected_edit_pag_3pass,
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_edit,
+                guidance,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_edit,
+                guidance,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+        assert_route!(
+            "edit 3-pass CFG+PAG (g=1.0)",
+            &expected_edit_pag_3pass_one,
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_edit,
+                1.0,
+                pag_step,
+                None,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            ),
+            KreaHeavy::edit_velocity_budgeted(
+                &dit,
+                &latent,
+                &timestep,
+                &cfg_edit,
+                1.0,
+                pag_step,
+                window,
+                mlx_gen::attention::AttentionPlan::UNBOUNDED,
+            )
+        );
+
         let cancelled = CancelFlag::new();
         cancelled.cancel();
         let bounded_attention = || {
@@ -2718,6 +3145,7 @@ mod tests {
                 &cfg_t2i,
                 guidance,
                 None,
+                None,
                 bounded_attention(),
             )
         );
@@ -2729,6 +3157,7 @@ mod tests {
                 &timestep,
                 &plain_t2i,
                 guidance,
+                None,
                 None,
                 bounded_attention(),
             )
@@ -2742,6 +3171,7 @@ mod tests {
                 &cfg_t2i,
                 guidance,
                 None,
+                None,
                 bounded_attention(),
             )
         );
@@ -2753,6 +3183,7 @@ mod tests {
                 &timestep,
                 &plain_t2i,
                 0.0,
+                None,
                 None,
                 bounded_attention(),
             )
@@ -2766,6 +3197,7 @@ mod tests {
                 &cfg_img2img,
                 guidance,
                 None,
+                None,
                 bounded_attention(),
             )
         );
@@ -2777,6 +3209,7 @@ mod tests {
                 &timestep,
                 &plain_img2img,
                 guidance,
+                None,
                 None,
                 bounded_attention(),
             )
@@ -2790,6 +3223,7 @@ mod tests {
                 &cfg_edit,
                 guidance,
                 None,
+                None,
                 bounded_attention(),
             )
         );
@@ -2801,6 +3235,7 @@ mod tests {
                 &timestep,
                 &plain_edit,
                 guidance,
+                None,
                 None,
                 bounded_attention(),
             )
@@ -3122,6 +3557,103 @@ mod tests {
         job_local2.push(lora());
         assert_eq!(job_local2.adapters().len(), 1);
         assert_eq!(resident.adapters().len(), 1);
+    }
+
+    #[test]
+    fn pag_step_window_and_combine_cover_noop_2pass_3pass_and_multiphase() {
+        use mlx_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+        use mlx_gen::gen_core::PagConfig;
+
+        // 8-step Turbo schedule with default window [0.0, 0.75): steps 0..6 active (2-pass),
+        // steps 6..8 inactive (1-pass), across both Euler and two-stage solvers (`heun`, `dpmpp_sde`).
+        let turbo_cap = crate::model::turbo_pag_capability();
+        let turbo_pag = turbo_cap
+            .resolve(Some(&PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }))
+            .unwrap();
+        let euler = canonical_solver_or_euler(None);
+        let active_turbo: Vec<usize> = (0..8)
+            .filter(|&eval_idx| {
+                let step_idx = step_index_for_eval(euler, eval_idx, 8);
+                PagStep::for_step(Some(&turbo_pag), step_idx, 8).is_some()
+            })
+            .collect();
+        assert_eq!(active_turbo, vec![0, 1, 2, 3, 4, 5]);
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            let active_evals: Vec<usize> = (0..16)
+                .filter(|&eval_idx| {
+                    let step_idx = step_index_for_eval(solver, eval_idx, 8);
+                    PagStep::for_step(Some(&turbo_pag), step_idx, 8).is_some()
+                })
+                .collect();
+            assert_eq!(active_evals, (0..12).collect::<Vec<_>>());
+        }
+        assert_eq!(PagStep::for_step(None, 0, 8), None);
+        let turbo_report = turbo_pag.execution_report(8);
+        assert_eq!(turbo_report.active_steps, 6);
+        assert_eq!(turbo_report.total_steps, 8);
+        assert_eq!(turbo_report.layers, vec![14]);
+
+        // `krea_uses_cfg` follows `phase_uses_cfg` (guidance != 0.0): 0.0 is CFG-off (2-pass PAG),
+        // whereas 1.0 and 3.5 both run active true CFG (3-pass CFG + PAG).
+        assert!(!krea_uses_cfg(0.0));
+        assert!(krea_uses_cfg(1.0));
+        assert!(krea_uses_cfg(3.5));
+
+        // 2-pass (`cond + scale * (cond - perturbed)`) vs 3-pass (`cfg + scale * (cond - perturbed)`).
+        let cond = Array::from_slice(&[3.0f32, -1.0], &[2]);
+        let uncond = Array::from_slice(&[1.0f32, 0.5], &[2]);
+        let perturbed = Array::from_slice(&[2.0f32, -2.0], &[2]);
+        let two_pass = krea_pag_combine(&cond, &cond, &perturbed, 1.5).unwrap();
+        // [3 + 1.5*(3-2), -1 + 1.5*(-1 - -2)] = [4.5, 0.5]
+        assert_eq!(two_pass.as_slice::<f32>(), &[4.5, 0.5]);
+
+        // At guidance == 1.0, Krea CFG is active: cond + 1.0*(cond - uncond) = [5.0, -2.5],
+        // and 3-pass PAG adds 1.5*(cond - perturbed) = [1.5, 1.5] -> [6.5, -1.0].
+        let cfg_one = krea_cfg_combine(&cond, &uncond, 1.0).unwrap();
+        let three_pass_one = krea_pag_combine(&cfg_one, &cond, &perturbed, 1.5).unwrap();
+        assert_eq!(three_pass_one.as_slice::<f32>(), &[6.5, -1.0]);
+
+        let cfg = krea_cfg_combine(&cond, &uncond, 3.5).unwrap();
+        // Krea CFG: cond + 3.5*(cond - uncond) = [3 + 7.0, -1 + 3.5*(-1.5)] = [10.0, -6.25]
+        let three_pass = krea_pag_combine(&cfg, &cond, &perturbed, 1.5).unwrap();
+        // [10.0 + 1.5*1.0, -6.25 + 1.5*1.0] = [11.5, -4.75]
+        assert_eq!(three_pass.as_slice::<f32>(), &[11.5, -4.75]);
+
+        // Zero scale is an exact identity no-op.
+        let noop = krea_pag_combine(&cfg, &cond, &perturbed, 0.0).unwrap();
+        assert_eq!(noop.as_slice::<f32>(), cfg.as_slice::<f32>());
+
+        // Multiphase global schedule [4 + 4 = 8 steps] with PAG window [0.25, 0.75):
+        // phase 0 runs steps 0..4 (active at 2, 3), phase 1 runs steps 4..8 (active at 4, 5).
+        let raw_cap = crate::model::raw_pag_capability();
+        let mp_pag = raw_cap
+            .resolve(Some(&PagConfig {
+                scale: 1.5,
+                start: Some(0.25),
+                stop: Some(0.75),
+                ..Default::default()
+            }))
+            .unwrap();
+        let heun = canonical_solver_or_euler(Some("heun"));
+        let p0_active: Vec<usize> = (0..8)
+            .filter(|&eval_idx| {
+                let step_idx = step_index_for_eval(heun, eval_idx, 4);
+                PagStep::for_step(Some(&mp_pag), step_idx, 8).is_some()
+            })
+            .collect();
+        let p1_active: Vec<usize> = (0..8)
+            .filter(|&eval_idx| {
+                let step_idx = 4 + step_index_for_eval(heun, eval_idx, 4);
+                PagStep::for_step(Some(&mp_pag), step_idx, 8).is_some()
+            })
+            .collect();
+        assert_eq!(p0_active, vec![4, 5, 6, 7]); // phase-0 steps 2, 3 (both Heun evals)
+        assert_eq!(p1_active, vec![0, 1, 2, 3]); // global steps 4, 5 (both Heun evals)
+        assert_eq!(mp_pag.execution_report(8).active_steps, 4);
     }
 }
 

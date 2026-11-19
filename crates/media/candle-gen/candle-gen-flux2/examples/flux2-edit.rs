@@ -332,6 +332,7 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
         // an inert sink is byte-identical to a render with no preview at all.
         preview: PreviewSink::default(),
+        pag: None,
         cancel: CancelFlag::new(),
     };
 
@@ -536,6 +537,7 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
         // an inert sink is byte-identical to a render with no preview at all.
         preview: PreviewSink::default(),
+        pag: None,
         cancel: CancelFlag::new(),
     };
     let mut prog = step_progress("edit");

@@ -64,6 +64,9 @@ pub struct GenerationRequest {
     /// does not advertise it refuses a `Some` on the shared floor rather than ignoring it. Both
     /// bounds join the finiteness floor and must satisfy `lo < hi`.
     pub cfg_interval: Option<(f32, f32)>,
+    /// Perturbed-Attention Guidance (PAG) controls (SW-7173). `None` (or `scale == 0.0`) is a
+    /// strict zero-pass no-op. Gated per model by [`Capabilities::pag`].
+    pub pag: Option<crate::PagConfig>,
     /// A **prompt batch** (epic sc-25678): when non-empty, these prompts are rendered together as one
     /// batched denoise (upstream `generate(prompts=[…])`), one image per prompt, repeated `count`
     /// times — `prompt_batch.len() × count` images in prompt-minor order. `prompt` must then be empty
@@ -385,6 +388,14 @@ pub struct GenerationRequest {
     /// Qwen-Image 2.1 transparency is prompt-driven (upstream ships no flag); this field only
     /// decides whether the decoder's alpha reaches the caller or is composited over white first.
     pub output_channels: OutputChannels,
+
+    // --- Two-phase low-resolution start recipe (SW-6939: FEAT-1, PIPE-2) ---
+    /// Optional pass-0 two-phase low-resolution start specification (`low_res_start`).
+    /// `None` leaves the inactive hook completely absent and byte-identical.
+    pub low_res_start: Option<crate::LowResStartSpec>,
+    /// Optional ordinary single-source img2img input image (`§6.13`, `FEAT-1`), distinct from
+    /// pass-0 edit, reference/identity, and control conditioning.
+    pub source_image: Option<Image>,
 }
 
 impl Default for GenerationRequest {
@@ -410,6 +421,7 @@ impl Default for GenerationRequest {
             guidance_momentum: None,
             guidance_norm_threshold: None,
             cfg_interval: None,
+            pag: None,
             prompt_batch: Vec::new(),
             caption_overflow: None,
             conditioning: Vec::new(),
@@ -455,6 +467,8 @@ impl Default for GenerationRequest {
             // RGB. Like `hdr`, a default that must never drift: an unasked-for alpha channel
             // reaching a consumer that indexes RGB triples is a corrupted image, not a bonus.
             output_channels: OutputChannels::Rgb,
+            low_res_start: None,
+            source_image: None,
         }
     }
 }
@@ -581,6 +595,8 @@ impl GenerationRequest {
             flux3_layout: _,
             flux3_layout_bindings: _,
             cfg_interval,
+            // PAG sub-block floats join the floor through its exhaustive helper below.
+            pag,
             conditioning,
             frames: _,
             fps: _,
@@ -621,6 +637,10 @@ impl GenerationRequest {
             hdr: _,
             // An enum with two unit variants — no float to check (sc-24111).
             output_channels: _,
+            // Two-phase low-resolution start recipe: `scale` is checked below (SW-6939).
+            low_res_start,
+            // Ordinary single-source img2img pixel buffer: integer dims + u8 pixels, no floats.
+            source_image: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -650,6 +670,20 @@ impl GenerationRequest {
         }
         if let Some(nonfinite) = h3_image_sampler.and_then(|v| v.first_nonfinite_float()) {
             return Some(nonfinite);
+        }
+        if let Some(nonfinite) = pag.as_ref().and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
+        if let Some(crate::LowResStartSpec {
+            version: _,
+            k: _,
+            scale: Some(scale),
+            estimate_source: _,
+        }) = low_res_start
+        {
+            if !scale.is_finite() {
+                return Some(("low_res_start.scale", *scale));
+            }
         }
         let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),
@@ -982,6 +1016,21 @@ impl GenerationRequest {
             return Err(Error::Msg(format!("{field} must be finite (got {value})")));
         }
         Ok(())
+    }
+
+    /// Return the single effective [`PagConfig`](crate::PagConfig) across top-level [`Self::pag`]
+    /// and [`MossImageOptions::pag`](crate::moss_image::MossImageOptions::pag), rejecting
+    /// conflicting specifications when both are present and unequal (SW-7173).
+    pub fn effective_pag(&self) -> Result<Option<&crate::PagConfig>> {
+        let moss_pag = self.moss_image.as_ref().and_then(|m| m.pag.as_ref());
+        match (self.pag.as_ref(), moss_pag) {
+            (None, None) => Ok(None),
+            (Some(p), None) | (None, Some(p)) => Ok(Some(p)),
+            (Some(a), Some(b)) if a == b => Ok(Some(a)),
+            (Some(_), Some(_)) => Err(Error::Msg(
+                "conflicting top-level pag and moss_image.pag controls".into(),
+            )),
+        }
     }
 
     /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.

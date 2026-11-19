@@ -72,6 +72,7 @@ fn real_weight_control() {
         // (`tests/preview_real_weights.rs`, sc-16956). An inert sink leaves the seeded render
         // byte-identical to what this row measured before the field existed.
         preview: candle_gen::gen_core::PreviewSink::default(),
+        pag: None,
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};

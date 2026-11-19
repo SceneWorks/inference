@@ -937,6 +937,8 @@ impl Generator for Yue2Generator {
             artifacts,
             warnings,
             prefix_kv_cache: None,
+            pag: None,
+            low_res_start: None,
         })
     }
 }

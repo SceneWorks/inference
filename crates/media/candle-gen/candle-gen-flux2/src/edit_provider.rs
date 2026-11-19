@@ -85,6 +85,8 @@ pub struct Flux2EditRequest {
     /// The frames project the **target** token stream only: the reference tokens are concatenated
     /// inside the predict closure and sliced back off, so they are never part of the running latent.
     pub preview: PreviewSink,
+    /// Optional Perturbed-Attention Guidance configuration for reference-conditioned edit.
+    pub pag: Option<candle_gen::gen_core::PagConfig>,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -108,6 +110,7 @@ impl Default for Flux2EditRequest {
             prompt_enhancement: PromptEnhancementSink::default(),
             use_pid: false,
             preview: PreviewSink::default(),
+            pag: None,
             cancel: CancelFlag::default(),
         }
     }
@@ -143,7 +146,7 @@ pub struct Flux2Edit {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
-fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelDescriptor {
+pub fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelDescriptor {
     let mut descriptor = match variant {
         Flux2Variant::Klein9b => crate::descriptor_klein(),
         Flux2Variant::Dev => crate::descriptor_dev(),
@@ -156,6 +159,10 @@ fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelD
 }
 
 impl Flux2Edit {
+    pub fn descriptor(&self) -> candle_gen::gen_core::ModelDescriptor {
+        edit_report_descriptor(self.variant)
+    }
+
     fn variant_descriptor(&self) -> candle_gen::gen_core::ModelDescriptor {
         edit_report_descriptor(self.variant)
     }
@@ -476,13 +483,32 @@ impl Flux2Edit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        crate::complete_bespoke_image(
+        crate::complete_bespoke_image_with_pag(
             &self.variant_descriptor(),
             &req.cancel,
             "flux2/edit_provider/generate",
             "candle-gen-flux2/src/edit_provider.rs: loaded reference/adapter and decoder choices have no complete execution receipt",
-            || self.generate(req, references, &mut report_progress),
+            || {
+                let pag = resolve_edit_pag_report(req, self.variant)?;
+                let image = self.generate(req, references, &mut report_progress)?;
+                Ok((image, pag))
+            },
         )
+    }
+
+    pub fn generate_with_report(
+        &self,
+        req: &Flux2EditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<candle_gen::gen_core::GenerationReport> {
+        let pag = resolve_edit_pag_report(req, self.variant)?;
+        let image = self.generate(req, references, on_progress)?;
+        let mut report = candle_gen::gen_core::GenerationReport::from_output(
+            candle_gen::gen_core::GenerationOutput::Images(vec![image]),
+        );
+        report.pag = pag;
+        Ok(report)
     }
 
     pub fn generate(
@@ -521,12 +547,21 @@ impl Flux2Edit {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        crate::complete_bespoke_image(
+        crate::complete_bespoke_image_with_pag(
             &self.variant_descriptor(),
             &req.cancel,
             "flux2/edit_provider/generate_with_memory_context",
             "candle-gen-flux2/src/edit_provider.rs: loaded reference/adapter and decoder choices have no complete execution receipt",
-            || self.generate_with_memory_context(context, req, references, &mut report_progress),
+            || {
+                let pag = resolve_edit_pag_report(req, self.variant)?;
+                let image = self.generate_with_memory_context(
+                    context,
+                    req,
+                    references,
+                    &mut report_progress,
+                )?;
+                Ok((image, pag))
+            },
         )
     }
 
@@ -779,6 +814,15 @@ impl Flux2Edit {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        let pag = resolve_edit_pag(req, self.variant)?;
+        candle_gen::execution::policy(
+            "flux2.pag",
+            serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
+        );
+        let canonical_solver =
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let total_steps = sigmas.len().saturating_sub(1);
+        let mut eval_idx = 0usize;
         // The driver does cancel + progress + the integrator step. The joint `[target, refs]` concat,
         // the transformer forward, the target-slice, and the guidance>1 CFG blend all live inside the
         // predict closure so a multi-eval solver re-runs them. FLUX.2 uses the Sigma convention but the
@@ -794,11 +838,24 @@ impl Flux2Edit {
             Some(&preview),
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let step_pag = pag
+                    .as_ref()
+                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                let pag_layers = pag
+                    .as_ref()
+                    .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
                 // Joint image stream [target, refs] — references re-concatenated with the current target.
                 let hidden = Tensor::cat(&[latents, &ref_tokens], 1)?;
                 if embedded_guidance {
                     // dev: a single forward feeding the embedded guidance scalar to the DiT.
-                    return self.velocity(
+                    let pos = self.velocity(
                         transformer,
                         &hidden,
                         &prompt_embeds,
@@ -810,7 +867,26 @@ impl Flux2Edit {
                         attention_plan,
                         transformer_window,
                         &req.cancel,
-                    );
+                        None,
+                    )?;
+                    if step_pag > 0.0 {
+                        let pert = self.velocity(
+                            transformer,
+                            &hidden,
+                            &prompt_embeds,
+                            &img_ids,
+                            &txt_ids,
+                            ts,
+                            Some(guidance),
+                            target_seq,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                            Some(pag_layers),
+                        )?;
+                        return Ok((&pos + ((&pos - &pert)? * step_pag as f64)?)?);
+                    }
+                    return Ok(pos);
                 }
                 // klein: distilled (CFG-free) or true-CFG via a negative pass when guidance > 1.
                 let v = self.velocity(
@@ -825,8 +901,9 @@ impl Flux2Edit {
                     attention_plan,
                     transformer_window,
                     &req.cancel,
+                    None,
                 )?;
-                match &negative {
+                let base = match &negative {
                     Some(neg) => {
                         let vn = self.velocity(
                             transformer,
@@ -840,11 +917,31 @@ impl Flux2Edit {
                             attention_plan,
                             transformer_window,
                             &req.cancel,
+                            None,
                         )?;
                         // vn + guidance·(v − vn)
-                        Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
+                        (&vn + ((&v - &vn)? * guidance as f64)?)?
                     }
-                    None => Ok(v),
+                    None => v.clone(),
+                };
+                if step_pag > 0.0 {
+                    let v_pert = self.velocity(
+                        transformer,
+                        &hidden,
+                        &prompt_embeds,
+                        &img_ids,
+                        &txt_ids,
+                        ts,
+                        None,
+                        target_seq,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
+                        Some(pag_layers),
+                    )?;
+                    Ok((&base + ((&v - &v_pert)? * step_pag as f64)?)?)
+                } else {
+                    Ok(base)
                 }
             },
         );
@@ -906,9 +1003,10 @@ impl Flux2Edit {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &CancelFlag,
+        pag_layers: Option<&[u32]>,
     ) -> Result<Tensor> {
         let out = transformer
-            .forward_with_memory(
+            .forward_with_memory_pag(
                 hidden,
                 embeds,
                 img_ids,
@@ -918,6 +1016,7 @@ impl Flux2Edit {
                 attention_plan,
                 transformer_window,
                 cancel,
+                pag_layers.map(|layers| (layers, target_seq)),
             )
             .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
         Ok(out.narrow(1, 0, target_seq)?)
@@ -1107,6 +1206,29 @@ fn validate_memory_request(
     Ok(())
 }
 
+fn resolve_edit_pag(
+    req: &Flux2EditRequest,
+    variant: Flux2Variant,
+) -> Result<Option<candle_gen::gen_core::PagResolved>> {
+    let desc = edit_report_descriptor(variant);
+    let pag_req = candle_gen::gen_core::GenerationRequest {
+        pag: req.pag.clone(),
+        ..Default::default()
+    };
+    desc.capabilities
+        .resolve_pag(desc.id, &pag_req)
+        .map_err(CandleError::from)
+}
+
+fn resolve_edit_pag_report(
+    req: &Flux2EditRequest,
+    variant: Flux2Variant,
+) -> Result<Option<candle_gen::gen_core::PagExecutionReport>> {
+    let total_steps = u32::try_from(req.steps)
+        .map_err(|_| CandleError::Msg("flux2 edit: step count overflow".into()))?;
+    Ok(resolve_edit_pag(req, variant)?.map(|p| p.execution_report(total_steps)))
+}
+
 /// Validate the seed-independent request knobs before any tensor work. The empty-prompt guard
 /// (sc-8987, the sc-8646 bug class) mirrors the registered txt2img `validate` and the flux1 control
 /// provider: `gen_core::TextTokenizer::tokenize("")` short-circuits to a (1, 0) encoding BEFORE the
@@ -1116,6 +1238,7 @@ fn validate_request(req: &Flux2EditRequest, variant: Flux2Variant) -> Result<()>
     if req.prompt.trim().is_empty() {
         return Err(CandleError::Msg("flux2 edit: prompt is required".into()));
     }
+    resolve_edit_pag(req, variant)?;
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(CandleError::Msg(format!(
             "flux2 edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1559,5 +1682,112 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(r, vec![1.0, -1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn pag_capability_validation_and_report_cover_flux2_edit_and_control() {
+        use candle_gen::gen_core::PagConfig;
+
+        for (desc, blocks, layers, stop, rec) in [
+            (
+                crate::descriptor_klein(),
+                32u32,
+                vec![20u32],
+                0.75f32,
+                1.2f32,
+            ),
+            (
+                edit_report_descriptor(Flux2Variant::Klein9b),
+                32,
+                vec![20],
+                0.75,
+                1.2,
+            ),
+            (crate::descriptor_dev(), 56, vec![28], 1.0, 1.5),
+            (
+                edit_report_descriptor(Flux2Variant::Dev),
+                56,
+                vec![28],
+                1.0,
+                1.5,
+            ),
+            (
+                crate::control_provider::control_report_descriptor(),
+                56,
+                vec![28],
+                1.0,
+                1.5,
+            ),
+        ] {
+            let pag = desc.capabilities.pag.expect("pag capability");
+            assert_eq!(pag.num_blocks, blocks, "{}", desc.id);
+            assert_eq!(pag.block_domain.as_ref(), "flux2_blocks");
+            assert_eq!(pag.default_layers, layers);
+            assert_eq!((pag.default_start, pag.default_stop), (0.0, stop));
+            assert_eq!((pag.recommended_scale, pag.max_scale), (rec, 15.0));
+        }
+
+        let valid_klein = Flux2EditRequest {
+            prompt: "edit".into(),
+            steps: 4,
+            pag: Some(PagConfig {
+                scale: 1.2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(&valid_klein, Flux2Variant::Klein9b).is_ok());
+        let report = resolve_edit_pag_report(&valid_klein, Flux2Variant::Klein9b)
+            .unwrap()
+            .expect("active pag report");
+        assert_eq!(report.layers, vec![20]);
+        assert_eq!(report.active_steps, 3);
+        assert_eq!(report.total_steps, 4);
+
+        let completed = crate::complete_bespoke_image_with_pag(
+            &edit_report_descriptor(Flux2Variant::Klein9b),
+            &CancelFlag::default(),
+            "flux2/edit_provider/test",
+            "test-missing",
+            || {
+                Ok((
+                    Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    },
+                    Some(report.clone()),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.generation.pag, Some(report));
+
+        // Zero scale is a strict no-op (`None` execution report).
+        let noop = Flux2EditRequest {
+            prompt: "edit".into(),
+            pag: Some(PagConfig {
+                scale: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_edit_pag_report(&noop, Flux2Variant::Klein9b).unwrap(),
+            None
+        );
+
+        // Block 32 is out of range for Klein (32 blocks: 0..32) and valid for Dev (56 blocks: 0..56).
+        let layer32 = Flux2EditRequest {
+            prompt: "edit".into(),
+            pag: Some(PagConfig {
+                scale: 1.5,
+                layers: Some(vec![32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_request(&layer32, Flux2Variant::Klein9b).is_err());
+        assert!(validate_request(&layer32, Flux2Variant::Dev).is_ok());
     }
 }

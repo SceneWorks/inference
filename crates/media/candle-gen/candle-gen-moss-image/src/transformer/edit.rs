@@ -62,14 +62,60 @@ pub(super) fn text_attention(
         .transpose(1, 2)?
         .reshape((b, s, d))?)
 }
+pub(crate) fn edit_body_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    reference: &(Tensor, Tensor),
+    text: usize,
+    perturb_video: bool,
+) -> Result<Tensor> {
+    let seq_len = v.dim(2)?;
+    if text > seq_len {
+        return Err(CandleError::Msg(
+            "MOSS edit body text length exceeds sequence length".into(),
+        ));
+    }
+    let video_len = seq_len - text;
+    let insert = |body: &Tensor, ref_part: &Tensor| -> Result<Tensor> {
+        Ok(Tensor::cat(
+            &[
+                &body.narrow(2, 0, text)?,
+                ref_part,
+                &body.narrow(2, text, body.dim(2)? - text)?,
+            ],
+            2,
+        )?)
+    };
+    let k_all = insert(k, &reference.0)?;
+    let v_all = insert(v, &reference.1)?;
+    if !perturb_video {
+        return attention(q, &k_all, &v_all);
+    }
+    let v_video = v.narrow(2, text, video_len)?;
+    if text == 0 {
+        return Ok(v_video.contiguous()?);
+    }
+    let q_text = q.narrow(2, 0, text)?;
+    let attn_text = attention(&q_text, &k_all, &v_all)?;
+    Ok(Tensor::cat(&[&attn_text, &v_video], 2)?)
+}
+fn promoted_dtype(a: DType, b: DType) -> DType {
+    if a == DType::F32 || b == DType::F32 {
+        DType::F32
+    } else {
+        a
+    }
+}
 impl Block {
     fn edit_qkv(&self, x: &Tensor, rope: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let part = |i| m.i((.., i, ..))?.unsqueeze(1);
-        let y = self
-            .n1
-            .forward(x)?
-            .broadcast_mul(&(part(1)? + 1.0)?)?
-            .broadcast_add(&part(0)?)?
+        let norm1 = self.n1.forward(x)?;
+        let dtype = promoted_dtype(norm1.dtype(), m.dtype());
+        let y = norm1
+            .to_dtype(dtype)?
+            .broadcast_mul(&(part(1)?.to_dtype(dtype)? + 1.0)?)?
+            .broadcast_add(&part(0)?.to_dtype(dtype)?)?
             .to_dtype(self.q.dtype())?;
         let (b, s, d) = y.dims3()?;
         let shape = (b, s, self.heads, d / self.heads);
@@ -85,19 +131,34 @@ impl Block {
     fn edit_finish(&self, x: &Tensor, a: &Tensor, m: &Tensor) -> Result<Tensor> {
         let part = |i| m.i((.., i, ..))?.unsqueeze(1);
         let a = a.transpose(1, 2)?.reshape(x.shape())?;
-        let x = x.add(&self.o.forward(&a)?.broadcast_mul(&part(2)?)?)?;
-        let y = self
-            .n2
-            .forward(&x)?
-            .broadcast_mul(&(part(4)? + 1.0)?)?
-            .broadcast_add(&part(3)?)?
+        let projected = self.o.forward(&a)?;
+        let dtype = promoted_dtype(projected.dtype(), m.dtype());
+        let attn_residual = projected
+            .to_dtype(dtype)?
+            .broadcast_mul(&part(2)?.to_dtype(dtype)?)?;
+        let x_dtype = promoted_dtype(x.dtype(), attn_residual.dtype());
+        let x = x
+            .to_dtype(x_dtype)?
+            .add(&attn_residual.to_dtype(x_dtype)?)?;
+        let norm2 = self.n2.forward(&x)?;
+        let dtype = promoted_dtype(norm2.dtype(), m.dtype());
+        let y = norm2
+            .to_dtype(dtype)?
+            .broadcast_mul(&(part(4)?.to_dtype(dtype)? + 1.0)?)?
+            .broadcast_add(&part(3)?.to_dtype(dtype)?)?
             .to_dtype(self.q.dtype())?;
         let hg = self.up_gate.forward(&y)?;
         let f = hg.dim(2)? / 2;
         let y = self
             .down
             .forward(&edit_situ(&hg.narrow(2, 0, f)?, &hg.narrow(2, f, f)?)?)?;
-        Ok(x.add(&y.broadcast_mul(&part(5)?)?)?)
+        let dtype = promoted_dtype(y.dtype(), m.dtype());
+        let ffn_residual = y
+            .to_dtype(dtype)?
+            .broadcast_mul(&part(5)?.to_dtype(dtype)?)?;
+        let out_dtype = promoted_dtype(x.dtype(), ffn_residual.dtype());
+        Ok(x.to_dtype(out_dtype)?
+            .add(&ffn_residual.to_dtype(out_dtype)?)?)
     }
     fn edit_reference(
         &self,
@@ -113,6 +174,7 @@ impl Block {
         check_cancel(cancel)?;
         Ok((next, (k, v)))
     }
+    #[allow(clippy::too_many_arguments)]
     fn edit_body(
         &self,
         x: &Tensor,
@@ -120,25 +182,13 @@ impl Block {
         rope: &Tensor,
         m: &Tensor,
         text: usize,
+        perturb_video: bool,
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
         check_cancel(cancel)?;
         let (q, k, v) = self.edit_qkv(x, rope, m)?;
-        let insert = |body: &Tensor, reference: &Tensor| -> Result<Tensor> {
-            Ok(Tensor::cat(
-                &[
-                    &body.narrow(2, 0, text)?,
-                    reference,
-                    &body.narrow(2, text, body.dim(2)? - text)?,
-                ],
-                2,
-            )?)
-        };
-        let next = self.edit_finish(
-            x,
-            &attention(&q, &insert(&k, &reference.0)?, &insert(&v, &reference.1)?)?,
-            m,
-        )?;
+        let attended = edit_body_attention(&q, &k, &v, reference, text, perturb_video)?;
+        let next = self.edit_finish(x, &attended, m)?;
         x.device().synchronize()?;
         check_cancel(cancel)?;
         Ok(next)
@@ -311,11 +361,22 @@ impl Transformer {
         }
         Ok(EditCache { keys_values })
     }
+    #[cfg(test)]
     pub(crate) fn forward_edit(
         &self,
         latent: &Tensor,
         time: f32,
         conditioning: EditConditioning<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
+        self.forward_edit_with_pag(latent, time, conditioning, &[], cancel)
+    }
+    pub(crate) fn forward_edit_with_pag(
+        &self,
+        latent: &Tensor,
+        time: f32,
+        conditioning: EditConditioning<'_>,
+        pag_layers: &[u32],
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
         let EditConditioning {
@@ -334,6 +395,7 @@ impl Transformer {
             || h == 0
             || w == 0
             || cache.is_some_and(|c| c.keys_values.len() != self.layers.len())
+            || pag_layers.iter().any(|i| *i as usize >= self.layers.len())
         {
             return Err(CandleError::Msg(
                 "MOSS edit latent/context/cache shape mismatch".into(),
@@ -382,17 +444,26 @@ impl Transformer {
                 temporary = kv;
                 &temporary
             };
-            body = block.edit_body(&body, kv, &body_rope, &m, text_len, cancel)?;
+            body = block.edit_body(
+                &body,
+                kv,
+                &body_rope,
+                &m,
+                text_len,
+                pag_layers.contains(&(index as u32)),
+                cancel,
+            )?;
         }
-        let output = self
-            .norm
-            .forward(
-                &body
-                    .narrow(1, text_len, h * w)?
-                    .to_dtype(self.norm.0.dtype())?,
-            )?
-            .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)? + 1.)?)?
-            .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?)?;
+        let norm_out = self.norm.forward(
+            &body
+                .narrow(1, text_len, h * w)?
+                .to_dtype(self.norm.0.dtype())?,
+        )?;
+        let head_dtype = promoted_dtype(norm_out.dtype(), head.dtype());
+        let output = norm_out
+            .to_dtype(head_dtype)?
+            .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(head_dtype)? + 1.)?)?
+            .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(head_dtype)?)?;
         let output = self
             .final_linear
             .forward(&output.to_dtype(self.final_linear.dtype())?)?

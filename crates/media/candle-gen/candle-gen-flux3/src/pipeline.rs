@@ -25,12 +25,38 @@ use crate::text_encoder::TextConditioning;
 /// f32 state across the Euler steps), moved to `device`. Not bit-compatible with torch's (or the
 /// MLX twin's) RNG; parity is measured with injected noise.
 pub fn noise(seed: u64, h: usize, w: usize, channels: usize, device: &Device) -> Result<Tensor> {
+    candle_gen::execution::rng_scheme("candle-stdrng-box-muller-bf16-f32-v1");
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let values = candle_gen::seed::seeded_normal_vec(&mut rng, h * w * channels);
     Ok(Tensor::from_vec(values, (h * w, channels), &Device::Cpu)?
         .to_dtype(DType::BF16)?
         .to_dtype(DType::F32)?
         .to_device(device)?)
+}
+
+fn apply_pag_candle(
+    base: &Tensor,
+    cond: &Tensor,
+    pert: &Tensor,
+    step_pag: f32,
+    compute: DType,
+) -> Result<Tensor> {
+    let diff = to(
+        &cond
+            .to_dtype(DType::F32)?
+            .sub(&pert.to_dtype(DType::F32)?)?,
+        compute,
+    )?;
+    let scaled = to(
+        &diff.to_dtype(DType::F32)?.affine(step_pag as f64, 0.0)?,
+        compute,
+    )?;
+    to(
+        &base
+            .to_dtype(DType::F32)?
+            .add(&scaled.to_dtype(DType::F32)?)?,
+        compute,
+    )
 }
 
 /// `denoise_flow_map(dit, packed, schedule)` for one text-to-image sample: from `noise`
@@ -64,6 +90,23 @@ pub fn denoise_flow_map_with_references(
     schedule: &[f32],
     references: Option<&ReferenceConditioning>,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Tensor> {
+    denoise_flow_map_with_references_pag(
+        dit, text, noise, image_ids, schedule, references, None, cancel, on_step,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_flow_map_with_references_pag(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    noise: &Tensor,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    references: Option<&ReferenceConditioning>,
+    pag: Option<&candle_gen::gen_core::PagResolved>,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
 ) -> Result<Tensor> {
     if !dit.is_flow_map() {
@@ -81,16 +124,17 @@ pub fn denoise_flow_map_with_references(
     }
     let compute = dit.compute_dtype();
     let device = dit.device();
+    let total_steps = schedule.len() - 1;
     let mut x = to(&noise.to_device(device)?, DType::F32)?;
     let text_tokens = text.tokens.to_device(device)?;
-    for step in 0..schedule.len() - 1 {
+    for step in 0..total_steps {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
         let t = schedule[step];
         let dt = schedule[step + 1] - schedule[step];
         let target = schedule[step + 1];
-        let velocity = dit.forward(&[SampleTokens {
+        let sample = SampleTokens {
             text: &text_tokens,
             text_ids: &text.ids,
             image: &x,
@@ -98,7 +142,16 @@ pub fn denoise_flow_map_with_references(
             image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
             timestep: t,
             target_timestep: Some(target),
-        }])?;
+        };
+        let cond = dit.forward_pag(std::slice::from_ref(&sample), None)?;
+        let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
+        let velocity = if step_pag > 0.0 {
+            let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
+            let pert = dit.forward_pag(std::slice::from_ref(&sample), Some(layers))?;
+            apply_pag_candle(&cond, &cond, &pert, step_pag, compute)?
+        } else {
+            cond
+        };
         // torch: the Python-float `dt` is NOT rounded to bf16 first; the multiply runs at f32
         // opmath and only the product takes the velocity's dtype.
         let scaled = to(&to(&velocity, DType::F32)?.affine(dt as f64, 0.0)?, compute)?;
@@ -139,6 +192,35 @@ pub fn denoise_cfg_with_references(
     guidance: f32,
     references: Option<&ReferenceConditioning>,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Tensor> {
+    denoise_base_with_references_pag(
+        dit,
+        text,
+        Some(negative),
+        noise,
+        image_ids,
+        schedule,
+        guidance,
+        references,
+        None,
+        cancel,
+        on_step,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_base_with_references_pag(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    negative: Option<&TextConditioning>,
+    noise: &Tensor,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    guidance: f32,
+    references: Option<&ReferenceConditioning>,
+    pag: Option<&candle_gen::gen_core::PagResolved>,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
 ) -> Result<Tensor> {
     if dit.is_flow_map() || !guidance.is_finite() || guidance < 0.0 {
@@ -150,38 +232,97 @@ pub fn denoise_cfg_with_references(
         return Err(Error::Msg("flux3: CFG schedule needs two points".into()));
     }
     let compute = dit.compute_dtype();
+    let total_steps = schedule.len() - 1;
+    let cfg_off_with_pag = gen_core_flux3::base_cfg_off_with_pag(guidance, pag);
     let mut x = noise.to_device(dit.device())?.to_dtype(DType::F32)?;
-    for step in 0..schedule.len() - 1 {
+    let text_tokens = text.tokens.to_device(dit.device())?;
+    let neg_tokens = negative
+        .map(|n| n.tokens.to_device(dit.device()))
+        .transpose()?;
+    for step in 0..total_steps {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let samples = [negative, text].map(|conditioning| SampleTokens {
-            text: &conditioning.tokens,
-            text_ids: &conditioning.ids,
-            image: &x,
-            image_ids,
-            image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
-            timestep: schedule[step],
-            target_timestep: None,
-        });
-        let prediction = dit.forward(&samples)?;
-        let rows = x.dim(0)?;
-        let u = prediction.narrow(0, 0, rows)?;
-        let c = prediction.narrow(0, rows, rows)?;
-        let difference = to(
-            &c.to_dtype(DType::F32)?.sub(&u.to_dtype(DType::F32)?)?,
-            compute,
-        )?;
-        let scaled = to(
-            &difference
-                .to_dtype(DType::F32)?
-                .affine(guidance as f64, 0.0)?,
-            compute,
-        )?;
-        let velocity = to(
-            &u.to_dtype(DType::F32)?.add(&scaled.to_dtype(DType::F32)?)?,
-            compute,
-        )?;
+        let step_pag = pag.map_or(0.0, |p| p.step_scale(step, total_steps));
+        let layers = pag.map_or(&[][..], |p| p.step_layers(step, total_steps));
+        let velocity = if cfg_off_with_pag {
+            let pos_sample = SampleTokens {
+                text: &text_tokens,
+                text_ids: &text.ids,
+                image: &x,
+                image_ids,
+                image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                timestep: schedule[step],
+                target_timestep: None,
+            };
+            let cond = dit.forward_pag(std::slice::from_ref(&pos_sample), None)?;
+            if step_pag > 0.0 {
+                let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
+                apply_pag_candle(&cond, &cond, &pert, step_pag, compute)?
+            } else {
+                cond
+            }
+        } else {
+            let negative = negative.ok_or_else(|| {
+                Error::Unsupported(
+                    "flux3: base CFG needs independently encoded negative conditioning".into(),
+                )
+            })?;
+            let neg_tokens = neg_tokens.as_ref().expect("encoded negative tokens");
+            let samples = [
+                SampleTokens {
+                    text: neg_tokens,
+                    text_ids: &negative.ids,
+                    image: &x,
+                    image_ids,
+                    image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                    timestep: schedule[step],
+                    target_timestep: None,
+                },
+                SampleTokens {
+                    text: &text_tokens,
+                    text_ids: &text.ids,
+                    image: &x,
+                    image_ids,
+                    image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                    timestep: schedule[step],
+                    target_timestep: None,
+                },
+            ];
+            let prediction = dit.forward(&samples)?;
+            let rows = x.dim(0)?;
+            let u = prediction.narrow(0, 0, rows)?;
+            let c = prediction.narrow(0, rows, rows)?;
+            let difference = to(
+                &c.to_dtype(DType::F32)?.sub(&u.to_dtype(DType::F32)?)?,
+                compute,
+            )?;
+            let scaled = to(
+                &difference
+                    .to_dtype(DType::F32)?
+                    .affine(guidance as f64, 0.0)?,
+                compute,
+            )?;
+            let pred_cfg = to(
+                &u.to_dtype(DType::F32)?.add(&scaled.to_dtype(DType::F32)?)?,
+                compute,
+            )?;
+            if step_pag > 0.0 {
+                let pos_sample = SampleTokens {
+                    text: &text_tokens,
+                    text_ids: &text.ids,
+                    image: &x,
+                    image_ids,
+                    image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
+                    timestep: schedule[step],
+                    target_timestep: None,
+                };
+                let pert = dit.forward_pag(std::slice::from_ref(&pos_sample), Some(layers))?;
+                apply_pag_candle(&pred_cfg, &c, &pert, step_pag, compute)?
+            } else {
+                pred_cfg
+            }
+        };
         let dt = schedule[step + 1] - schedule[step];
         let update = to(
             &velocity.to_dtype(DType::F32)?.affine(dt as f64, 0.0)?,
@@ -240,34 +381,59 @@ pub fn denoise_one_with_references(
     let channels = dit.config().image_in_channels;
     let ids = image_ids(h, w, dit.config().image_rope_scale as f32);
     let z = noise(seed, h, w, channels, dit.device())?;
-    match params.guidance {
-        Some(guidance) => denoise_cfg_with_references(
+    let schedule = params.schedule()?;
+    let output = match params.guidance {
+        Some(guidance) => denoise_base_with_references_pag(
             dit,
             text,
-            negative.ok_or_else(|| {
-                Error::Unsupported(
-                    "flux3: base CFG needs independently encoded negative conditioning".into(),
-                )
-            })?,
+            negative,
             &z,
             &ids,
-            &params.schedule()?,
+            &schedule,
             guidance,
             references,
+            params.pag.as_ref(),
             cancel,
             on_step,
         ),
-        None => denoise_flow_map_with_references(
+        None => denoise_flow_map_with_references_pag(
             dit,
             text,
             &z,
             &ids,
-            &params.schedule()?,
+            &schedule,
             references,
+            params.pag.as_ref(),
             cancel,
             on_step,
         ),
+    }?;
+    candle_gen::execution::schedule(
+        if params.guidance.is_some() {
+            "flux3-euler-cfg-v1"
+        } else {
+            "flux3-flow-map-v1"
+        },
+        &schedule,
+        "native-timestep-and-target",
+    );
+    candle_gen::execution::runtime(dit.device(), dit.compute_dtype());
+    candle_gen::execution::policy(
+        "flux3.compute_dtype",
+        format!("{:?}", dit.compute_dtype()).into(),
+    );
+    candle_gen::execution::policy(
+        "flux3.reference_tokens",
+        serde_json::json!(references.is_some()),
+    );
+    candle_gen::execution::policy(
+        "flux3.pag",
+        serde_json::to_value(&params.pag).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(guidance) = params.guidance {
+        candle_gen::execution::f32_policy("flux3.guidance", guidance);
     }
+    Ok(output)
 }
 
 /// Render one image: [`denoise_one`] → decode → RGB8 (the caller reports `Decoding`).
@@ -299,6 +465,7 @@ pub fn generate_one(
 /// float image to RGB8 (`clamp(−1, 1)`, `(x + 1) · 127.5`, truncated to u8 — see
 /// [`float_image_to_rgb8`]).
 pub fn decode_tokens(ae: &Flux3AutoEncoder, tokens: &Tensor, h: usize, w: usize) -> Result<Image> {
+    candle_gen::execution::component_runtime("autoencoder", tokens.device(), DType::F32);
     let image = ae.decode(tokens, h, w)?;
     float_image_to_rgb8(&image)
 }
@@ -385,5 +552,38 @@ mod tests {
         assert_eq!(rgb.pixels[7], 255);
         assert_eq!(rgb.pixels[10], 127);
         assert!(float_image_to_rgb8(&image.reshape((1, 2, 2, 3)).unwrap()).is_err());
+    }
+
+    #[test]
+    fn base_cfg_off_shortcut_only_skips_negative_at_exact_guidance_one() {
+        let cap = gen_core_flux3::flux3_pag_capability(false);
+        let resolved = cap
+            .resolve(Some(&candle_gen::gen_core::PagConfig {
+                scale: 1.5,
+                ..Default::default()
+            }))
+            .unwrap();
+        for (guidance, expect_neg, expect_cfg_off) in [
+            (0.0_f32, true, false),
+            (0.5, true, false),
+            (1.0, false, true),
+            (3.5, true, false),
+        ] {
+            assert_eq!(
+                gen_core_flux3::base_requires_negative_prompt(Some(guidance), Some(&resolved)),
+                expect_neg,
+                "guidance={guidance}"
+            );
+            assert_eq!(
+                gen_core_flux3::base_cfg_off_with_pag(guidance, Some(&resolved)),
+                expect_cfg_off,
+                "guidance={guidance}"
+            );
+            assert!(
+                gen_core_flux3::base_requires_negative_prompt(Some(guidance), None),
+                "without PAG, base always encodes negative at guidance={guidance}"
+            );
+            assert!(!gen_core_flux3::base_cfg_off_with_pag(guidance, None));
+        }
     }
 }

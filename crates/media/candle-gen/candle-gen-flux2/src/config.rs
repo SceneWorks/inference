@@ -257,6 +257,33 @@ impl Flux2Variant {
         matches!(self, Self::Dev)
     }
 
+    /// Unified Perturbed-Attention Guidance capability for this FLUX.2 variant:
+    /// - `dev*`: `56` blocks (`0..8` double + `8..56` single), default `[28]` (single block `20`).
+    /// - `klein_9b*`: `32` blocks (`0..8` double + `8..32` single), default `[20]` (single block `12`).
+    pub fn pag_capability(self) -> candle_gen::gen_core::PagCapability {
+        if self.is_dev() {
+            candle_gen::gen_core::PagCapability {
+                num_blocks: 56,
+                block_domain: std::borrow::Cow::Borrowed("flux2_blocks"),
+                default_layers: vec![28],
+                default_start: 0.0,
+                default_stop: 1.0,
+                recommended_scale: 1.5,
+                max_scale: 15.0,
+            }
+        } else {
+            candle_gen::gen_core::PagCapability {
+                num_blocks: 32,
+                block_domain: std::borrow::Cow::Borrowed("flux2_blocks"),
+                default_layers: vec![20],
+                default_start: 0.0,
+                default_stop: 0.75,
+                recommended_scale: 1.2,
+                max_scale: 15.0,
+            }
+        }
+    }
+
     pub fn encoder_contract(self) -> candle_gen::gen_core::EncoderContract {
         if self.is_dev() {
             DEV_ENCODER_CONTRACT

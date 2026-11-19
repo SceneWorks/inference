@@ -1006,6 +1006,16 @@ impl Generator for Flux2 {
         mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_report_observed(req, on_progress)
+        })
+    }
+
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
         self.memory_strategy.as_ref()
     }
@@ -1100,8 +1110,7 @@ impl Generator for Flux2 {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_observed(req, &mut progress)
-                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+                self.generate_report_observed(req, &mut progress)
             },
         )
     }
@@ -1113,6 +1122,20 @@ impl Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        let report = self.generate_report_observed(req, on_progress)?;
+        report.output.ok_or_else(|| {
+            mlx_gen::gen_core::Error::Msg(format!(
+                "{}: generation completed without output",
+                self.descriptor.id
+            ))
+        })
+    }
+
+    fn generate_report_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
         // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
         let snapshot_root = match &self.loaded_spec.weights {
             WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
@@ -1208,7 +1231,7 @@ impl Flux2 {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<mlx_gen::gen_core::GenerationReport> {
         self.validate(req)?;
         let transformer_window = request_transformer_window(self.variant, &self.loaded_spec, req)?;
         mlx_gen::image_execution::policy_debug("flux2.transformer_window", &transformer_window);
@@ -1312,9 +1335,14 @@ impl Flux2 {
         (prompt_embeds, text_ids, negative): Flux2Encoded,
         request: Flux2RenderRequest<'_>,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<mlx_gen::gen_core::GenerationReport> {
         let req = request.req;
         let vae = &heavy.vae;
+        let pag = self
+            .descriptor
+            .capabilities
+            .resolve_pag(self.descriptor.id, req)?;
+        mlx_gen::image_execution::policy_debug("flux2.pag", &pag);
         let cond = self.prepare_conditioning(vae, req, request.steps)?;
         let mem = self.memory_config(&prompt_embeds, &cond, req);
         mlx_gen::image_execution::policy_debug("flux2.resolved_memory", &mem);
@@ -1332,6 +1360,7 @@ impl Flux2 {
                 .then_some(request.guidance),
             req,
             transformer_window: request.transformer_window,
+            pag: pag.as_ref(),
         };
         self.bind_kv_geometry(&cond);
 
@@ -1401,7 +1430,13 @@ impl Flux2 {
                 on_progress,
             )?);
         }
-        Ok(GenerationOutput::Images(images))
+        let executed_steps = cond.sched.sigmas[cond.start_step..keep]
+            .len()
+            .saturating_sub(1) as u32;
+        let mut report =
+            mlx_gen::gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.pag = pag.map(|p| p.execution_report(executed_steps));
+        Ok(report)
     }
 
     /// The seed-independent conditioning: the edit's reference tokens or the txt2img variant's
@@ -1651,6 +1686,7 @@ struct Flux2Render<'a> {
     embedded_guidance: Option<f32>,
     req: &'a GenerationRequest,
     transformer_window: Option<usize>,
+    pag: Option<&'a mlx_gen::gen_core::PagResolved>,
 }
 
 impl Flux2Render<'_> {
@@ -1659,6 +1695,7 @@ impl Flux2Render<'_> {
     /// `target_seq` tokens. txt2img has no ref, so the concat + slice are no-ops.
     /// `include_ref=false` drops the reference tokens (the 9b-kv cached step); `cache` threads the
     /// per-seed KV cache through the transformer.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         latents: &Array,
@@ -1667,6 +1704,7 @@ impl Flux2Render<'_> {
         ts: f32,
         include_ref: bool,
         cache: Option<&Flux2KvCache>,
+        pag_layers: Option<&[u32]>,
     ) -> Result<Array> {
         let target_seq = latents.shape()[1];
         let _sc20686 = mlx_gen::sc20686::reference_forward(
@@ -1679,7 +1717,7 @@ impl Flux2Render<'_> {
             ),
             _ => (latents.clone(), self.latent_ids.clone()),
         };
-        let out = self.transformer.forward_with_mem(
+        let out = self.transformer.forward_with_mem_pag(
             &Flux2ForwardInputs {
                 hidden_states: &hidden,
                 encoder_hidden_states: embeds,
@@ -1696,6 +1734,7 @@ impl Flux2Render<'_> {
                 crate::memory_strategy::attention_plan(self.req)
             },
             self.transformer_window.map(|size| (size, &self.req.cancel)),
+            pag_layers.map(|layers| (layers, target_seq)),
         )?;
         let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
         Ok(out.take_axis(&idx, 1)?)
@@ -1717,6 +1756,7 @@ impl Flux2Render<'_> {
     ) -> Result<(Array, Option<Flux2KvCfgCaches>)> {
         let config = &self.model.config;
         let req = self.req;
+        let total_steps = denoise_sigmas.len().saturating_sub(1);
         // The edit path always has a reference, so `num_ref > 0`.
         let kv_enabled = self.model.variant.is_kv() && self.reference.is_some();
         let num_ref = self
@@ -1741,38 +1781,94 @@ impl Flux2Render<'_> {
         // ref]` pass); later forwards run `[txt, target]` and splice that branch's cached ref K/V
         // back in. A multi-eval solver still extracts once. FLUX.2 feeds `sigma · 1000` as the
         // transformer timestep (Sigma convention).
+        let canonical_solver =
+            mlx_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+        let mut eval_idx = 0usize;
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             let ts = sigma * 1000.0;
+            let current_eval = eval_idx;
+            eval_idx += 1;
+            let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+                canonical_solver,
+                current_eval,
+                total_steps,
+            );
+            let step_pag = self
+                .pag
+                .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+            let pag_layers = self
+                .pag
+                .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
             if let Some(caches) = kv_caches.as_mut() {
-                return caches.velocity(g.guidance, |branch, include_ref, cache| {
-                    let (embeds, ids) = match (branch, g.negative) {
-                        (CfgBranch::Negative, Some((neg_embeds, neg_ids))) => (neg_embeds, neg_ids),
-                        _ => (prompt_embeds, text_ids),
-                    };
-                    self.forward(latents, embeds, ids, ts, include_ref, Some(cache))
-                });
+                return caches.velocity_with_pag(
+                    g.guidance,
+                    step_pag,
+                    pag_layers,
+                    |branch, include_ref, cache, branch_pag| {
+                        let (embeds, ids) = match (branch, g.negative) {
+                            (CfgBranch::Negative, Some((neg_embeds, neg_ids))) => {
+                                (neg_embeds, neg_ids)
+                            }
+                            _ => (prompt_embeds, text_ids),
+                        };
+                        self.forward(
+                            latents,
+                            embeds,
+                            ids,
+                            ts,
+                            include_ref,
+                            Some(cache),
+                            branch_pag,
+                        )
+                    },
+                );
             }
-            let v = self.forward(latents, prompt_embeds, text_ids, ts, true, None)?;
+            let v_cond = self.forward(latents, prompt_embeds, text_ids, ts, true, None, None)?;
             // sc-8273 spike: image-guidance CFG (non-kv edit only — the ref-dropped forward must run
             // without a KV cache in play). Recompute this step with the reference tokens dropped,
             // then extrapolate toward the with-reference prediction.
-            let v = match g.image_guidance {
+            let v_guided = match g.image_guidance {
                 Some(s) => {
-                    let v_img0 = self.forward(latents, prompt_embeds, text_ids, ts, false, None)?;
-                    add(&v_img0, &multiply(&subtract(&v, &v_img0)?, scalar(s))?)?
+                    if step_pag > 0.0 {
+                        eval([&v_cond])?;
+                    }
+                    let v_img0 =
+                        self.forward(latents, prompt_embeds, text_ids, ts, false, None, None)?;
+                    add(&v_img0, &multiply(&subtract(&v_cond, &v_img0)?, scalar(s))?)?
                 }
-                None => v,
+                None => v_cond.clone(),
             };
-            match g.negative {
+            let base = match g.negative {
                 Some((neg_embeds, neg_ids)) => {
-                    let vn = self.forward(latents, neg_embeds, neg_ids, ts, true, None)?;
+                    if step_pag > 0.0 {
+                        eval([&v_guided, &v_cond])?;
+                    }
+                    let vn = self.forward(latents, neg_embeds, neg_ids, ts, true, None, None)?;
                     // noise = neg + guidance·(pos − neg)
-                    Ok(add(
+                    add(
                         &vn,
-                        &multiply(&subtract(&v, &vn)?, scalar(g.guidance))?,
-                    )?)
+                        &multiply(&subtract(&v_guided, &vn)?, scalar(g.guidance))?,
+                    )?
                 }
-                None => Ok(v),
+                None => v_guided,
+            };
+            if step_pag > 0.0 {
+                eval([&base, &v_cond])?;
+                let v_pert = self.forward(
+                    latents,
+                    prompt_embeds,
+                    text_ids,
+                    ts,
+                    true,
+                    None,
+                    Some(pag_layers),
+                )?;
+                Ok(add(
+                    &base,
+                    &multiply(&subtract(&v_cond, &v_pert)?, scalar(step_pag))?,
+                )?)
+            } else {
+                Ok(base)
             }
         };
         // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in

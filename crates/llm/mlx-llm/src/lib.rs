@@ -80,6 +80,7 @@ pub mod provider;
 pub mod residency;
 #[cfg(feature = "campaign")]
 pub mod sc20676_evidence;
+mod sensenova_snapshot;
 pub mod snapshot;
 pub mod starvector_1b;
 pub mod starvector_8b;

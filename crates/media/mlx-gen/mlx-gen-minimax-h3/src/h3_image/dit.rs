@@ -280,6 +280,13 @@ impl MiniMaxH3ImageDit {
     /// `context_embedder` then the token refiner: the text rows of the packed sequence.
     /// `context` is `[1, num_text_tokens, text_dim]`, the text encoder's layer-50 hidden state.
     pub fn embed_context(&self, context: &Array) -> Result<Array> {
+        self.refine_text(&self.embed_context_rows(context)?)
+    }
+
+    /// `context_embedder` alone, cast to the stream dtype — the first half of
+    /// [`Self::embed_context`]. A trainer that differentiates the token refiner (SW-F369) computes
+    /// these frozen rows once per step and runs [`Self::refine_text`] under the trace.
+    pub(crate) fn embed_context_rows(&self, context: &Array) -> Result<Array> {
         let s = context.shape();
         if s.len() != 3 || s[0] != 1 || s[2] != self.cfg.base.text_dim {
             return Err(Error::Msg(format!(
@@ -287,8 +294,17 @@ impl MiniMaxH3ImageDit {
                 self.cfg.base.text_dim
             )));
         }
-        let embedded = self.projections.context_embedder.forward(context)?;
-        self.refiner.forward(&embedded.as_dtype(self.dtype)?)
+        Ok(self
+            .projections
+            .context_embedder
+            .forward(context)?
+            .as_dtype(self.dtype)?)
+    }
+
+    /// The token refiner over [`Self::embed_context_rows`]'s output — the second half of
+    /// [`Self::embed_context`].
+    pub(crate) fn refine_text(&self, embedded: &Array) -> Result<Array> {
+        self.refiner.forward(embedded)
     }
 }
 
@@ -452,6 +468,8 @@ pub struct ImageDenoiser {
     /// ([`crate::h3_image::memory::requested_bounded_attention`]).
     attention_budget: AttentionBudget,
     attention_axis: AttentionChunkAxis,
+    /// DiT forward passes evaluated so far (`1` per unperturbed step, `2` per active PAG step).
+    forwards: std::cell::Cell<usize>,
 }
 
 /// What [`ImageDenoiser`] shares between its resident and windowed constructors — and the trainer
@@ -650,6 +668,7 @@ impl ImageDenoiser {
             window_cancel: CancelFlag::default(),
             attention_budget: AttentionBudget::UNBOUNDED,
             attention_axis: AttentionChunkAxis::Heads,
+            forwards: std::cell::Cell::new(0),
         })
     }
 
@@ -705,6 +724,7 @@ impl ImageDenoiser {
             window_cancel: cancel,
             attention_budget: AttentionBudget::UNBOUNDED,
             attention_axis: AttentionChunkAxis::Heads,
+            forwards: std::cell::Cell::new(0),
         })
     }
 
@@ -745,6 +765,11 @@ impl ImageDenoiser {
     /// Steps the sampler runs.
     pub fn num_steps(&self) -> usize {
         self.schedule.num_evals()
+    }
+
+    /// DiT forward evaluations executed so far (`1` per unperturbed step, `2` per active PAG step).
+    pub fn forwards(&self) -> usize {
+        self.forwards.get()
     }
 
     /// Bytes of `adaln_proj` released by the eviction.
@@ -814,7 +839,20 @@ impl ImageDenoiser {
     /// reference rows first, then the generated rows; the result has the same shape, float32 (the
     /// heads are float32), exactly what the reference transformer returns.
     pub fn velocity(&self, step: usize, image_rows: &Array) -> Result<Array> {
-        self.velocity_inner(step, image_rows, None)
+        self.velocity_inner(step, image_rows, &[], None)
+    }
+
+    /// Perturbed-Attention Guidance (PAG, SW-7175) velocity at sampling step `step`, projected
+    /// through the identical `pdd_proj_out.{step}` head while perturbing only the trailing target
+    /// `generated` image tokens at `perturbed_layers` and keeping Qwen3-VL text/vision plus
+    /// `1..=16` `<Picture N>` reference latent rows unperturbed.
+    pub fn velocity_perturbed(
+        &self,
+        step: usize,
+        image_rows: &Array,
+        perturbed_layers: &[u32],
+    ) -> Result<Array> {
+        self.velocity_inner(step, image_rows, perturbed_layers, None)
     }
 
     /// [`Self::velocity`], also recording the stages `trace` asks for — the diagnostic twin the
@@ -825,15 +863,25 @@ impl ImageDenoiser {
         image_rows: &Array,
         trace: &mut ImageDitTrace,
     ) -> Result<Array> {
-        self.velocity_inner(step, image_rows, Some(trace))
+        self.velocity_inner(step, image_rows, &[], Some(trace))
     }
 
     fn velocity_inner(
         &self,
         step: usize,
         image_rows: &Array,
+        perturbed_layers: &[u32],
         mut trace: Option<&mut ImageDitTrace>,
     ) -> Result<Array> {
+        let num_layers = self.dit.num_layers();
+        if let Some(&bad) = perturbed_layers
+            .iter()
+            .find(|&&idx| idx as usize >= num_layers)
+        {
+            return Err(Error::Msg(format!(
+                "minimax-h3-image dit: PAG layer {bad} is outside 0..{num_layers}"
+            )));
+        }
         let head = self.dit.projections.pdd_heads.select(step)?;
         let adaln = self.adaln_indices.get(step).ok_or_else(|| {
             Error::Msg(format!(
@@ -849,6 +897,8 @@ impl ImageDenoiser {
                 image_rows.shape()
             )));
         }
+        self.forwards.set(self.forwards.get() + 1);
+        let prefix_len = self.layout.num_conditioning_rows();
         // The text stream sets the packed sequence's dtype, as in the reference.
         let stream = self.text_rows.dtype();
         let image = self
@@ -863,13 +913,18 @@ impl ImageDenoiser {
                 (None, None) => {
                     let mut x = x;
                     for (layer, block) in self.dit.blocks.iter().enumerate() {
-                        x = block.forward_bounded(
+                        let pag_prefix = perturbed_layers
+                            .contains(&(layer as u32))
+                            .then_some(prefix_len);
+                        x = block.forward_bounded_pag(
                             &x,
                             self.cache.modulation(layer)?,
                             adaln,
                             &self.dit.rope,
                             &self.tables,
                             self.bounded_attention(),
+                            None,
+                            pag_prefix,
                         )?;
                         if let Some(trace) = trace.as_deref_mut() {
                             if trace.layers.contains(&layer) {
@@ -887,13 +942,18 @@ impl ImageDenoiser {
                     |mut hidden: Array, view: &mut Weights, range: std::ops::Range<usize>| {
                         for layer in range {
                             let block = stream.materialize(view, layer)?;
-                            hidden = block.forward_bounded(
+                            let pag_prefix = perturbed_layers
+                                .contains(&(layer as u32))
+                                .then_some(prefix_len);
+                            hidden = block.forward_bounded_pag(
                                 &hidden,
                                 self.cache.modulation(layer)?,
                                 adaln,
                                 &self.dit.rope,
                                 &self.tables,
                                 self.bounded_attention(),
+                                None,
+                                pag_prefix,
                             )?;
                             // The block drops per iteration, not per window.
                             if let Some(trace) = trace.as_deref_mut() {
@@ -953,25 +1013,66 @@ impl ImageDenoiser {
         step: usize,
         image_rows: &Array,
     ) -> Result<Array> {
-        let v = self.velocity(step, image_rows)?;
+        self.step_with_pag(sampler, None, image_seed, step, image_rows)
+    }
+
+    /// [`Self::step_with`] with optional Perturbed-Attention Guidance (PAG, SW-7175).
+    ///
+    /// When `pag` yields `step_scale > 0.0` at `(step, num_steps)`, executes a 2-pass step (`cond`
+    /// then `perturbed`) through the identical `pdd_proj_out.{step}` head, combines the generated
+    /// velocity via [`mlx_gen::gen_core::pag_apply`], and advances [`sampler_step`] once (so LCM's
+    /// RNG draw count is identical to the 1-pass baseline). When `pag` is `None` or
+    /// `step_scale == 0.0`, runs a single conditional pass identically to [`Self::step_with`].
+    pub fn step_with_pag(
+        &self,
+        sampler: &H3ImageSampler,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
+        image_seed: u64,
+        step: usize,
+        image_rows: &Array,
+    ) -> Result<Array> {
+        let num_steps = self.num_steps();
         let timesteps = self.schedule.timesteps();
         velocity_euler_delta(timesteps, step)?;
-        let sigma = |i: usize| timesteps.get(i).map_or(0.0, |&t| 1.0 - t);
-        let x = image_rows.as_dtype(Dtype::Float32)?;
+        let step_pag_scale = pag.map_or(0.0, |p| p.step_scale(step, num_steps));
         let refs = self.layout.num_reference_rows();
         let all = self.layout.num_packed_image_rows();
+
+        let v_cond = self.velocity(step, image_rows)?;
+        let v_cond_gen = slice_axis(&v_cond.as_dtype(Dtype::Float32)?, 1, refs, all)?;
+        let v_gen = if step_pag_scale > 0.0 {
+            let layers = pag.map_or(&[][..], |p| p.step_layers(step, num_steps));
+            // Materialize Pass 1's generated velocity and release its 50-block lazy activation
+            // graph before building Pass 2 on resident loads.
+            mlx_rs::transforms::eval([&v_cond_gen])?;
+            drop(v_cond);
+            let v_perturbed = self.velocity_perturbed(step, image_rows, layers)?;
+            let v_perturbed_gen = slice_axis(&v_perturbed.as_dtype(Dtype::Float32)?, 1, refs, all)?;
+            mlx_gen::gen_core::pag_apply(
+                &mlx_gen::MlxLatentOps,
+                &v_cond_gen,
+                &v_cond_gen,
+                &v_perturbed_gen,
+                step_pag_scale,
+            )?
+        } else {
+            v_cond_gen
+        };
+
+        let sigma = |i: usize| timesteps.get(i).map_or(0.0, |&t| 1.0 - t);
+        let x = image_rows.as_dtype(Dtype::Float32)?;
         let generated = sampler_step(
             &mut MlxStepOps,
             sampler,
             SamplerStep {
                 step,
-                num_steps: self.num_steps(),
+                num_steps,
                 sigma: sigma(step),
                 sigma_next: sigma(step + 1),
                 image_seed,
             },
             &slice_axis(&x, 1, refs, all)?,
-            &slice_axis(&v.as_dtype(Dtype::Float32)?, 1, refs, all)?,
+            &v_gen,
         )?;
         if refs == 0 {
             return Ok(generated);
@@ -1012,12 +1113,25 @@ impl ImageDenoiser {
         cancel: &mlx_gen::CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
+        self.denoise_with_pag(sampler, None, image_seed, noise_rows, cancel, on_step)
+    }
+
+    /// [`Self::denoise_with`] with optional Perturbed-Attention Guidance (PAG, SW-7175).
+    pub fn denoise_with_pag(
+        &self,
+        sampler: &H3ImageSampler,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
+        image_seed: u64,
+        noise_rows: &Array,
+        cancel: &mlx_gen::CancelFlag,
+        on_step: &mut dyn FnMut(usize),
+    ) -> Result<Array> {
         let mut x = noise_rows.as_dtype(Dtype::Float32)?;
         for step in 0..self.num_steps() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            x = self.step_with(sampler, image_seed, step, &x)?;
+            x = self.step_with_pag(sampler, pag, image_seed, step, &x)?;
             mlx_rs::transforms::eval([&x])?;
             on_step(step + 1);
         }
@@ -1077,5 +1191,313 @@ mod tests {
         assert_eq!(image_row_classes(&layout), vec![0, 0, 0, 1, 1, 0]);
         let t2i = ImageLayout::t2i(2, 2, 2, [1, 2, 2]).unwrap();
         assert_eq!(image_row_classes(&t2i), vec![0, 0, 0]);
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn image_denoiser_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream() {
+        use mlx_gen::gen_core::h3_image::minimax_h3_image_pag_capability;
+        use mlx_gen::gen_core::{AdapterKind, AdapterSpec, PagConfig};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let save = |path: &Path, tensors: Vec<(String, Array)>, meta: &[(&str, &str)]| {
+            let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            let meta: std::collections::HashMap<String, String> = meta
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            Array::save_safetensors(refs, Some(&meta), path).unwrap();
+        };
+
+        let lora_path = scratch.path().join("pag_lora.safetensors");
+        save(
+            &lora_path,
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight".into(),
+                    Array::full::<f32>(&[2, 64], &Array::from_f32(0.01)).unwrap(),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight".into(),
+                    Array::full::<f32>(&[96, 2], &Array::from_f32(0.02)).unwrap(),
+                ),
+            ],
+            &[("alpha", "2")],
+        );
+        let lokr_path = scratch.path().join("pag_lokr.safetensors");
+        save(
+            &lokr_path,
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lokr_w1".into(),
+                    Array::full::<f32>(&[12, 8], &Array::from_f32(0.01)).unwrap(),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lokr_w2".into(),
+                    Array::full::<f32>(&[8, 8], &Array::from_f32(0.02)).unwrap(),
+                ),
+            ],
+            &[("networkType", "lokr")],
+        );
+        let adapters = vec![
+            AdapterSpec::new(lora_path, 0.5, AdapterKind::Lora),
+            AdapterSpec::new(lokr_path, 0.25, AdapterKind::Lokr),
+        ];
+
+        let stage_dir = |name: &str, bits: Option<i32>| -> std::path::PathBuf {
+            let dir = scratch.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let fixture = Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/dit_block.safetensors"
+            ));
+            let loaded = Array::load_safetensors(fixture).unwrap();
+            let mut tensors: Vec<(String, Array)> = loaded.into_iter().collect();
+            if let Some(bits) = bits {
+                let pos = tensors
+                    .iter()
+                    .position(|(k, _)| k == "transformer_blocks.0.attn.to_q.weight")
+                    .unwrap();
+                let dense = tensors.swap_remove(pos).1;
+                let (wq, scales, biases) =
+                    mlx_rs::ops::quantize(&dense, Some(64), Some(bits)).unwrap();
+                tensors.push(("transformer_blocks.0.attn.to_q.weight".into(), wq));
+                tensors.push(("transformer_blocks.0.attn.to_q.scales".into(), scales));
+                tensors.push(("transformer_blocks.0.attn.to_q.biases".into(), biases));
+            }
+            for head in 0..6 {
+                let vals: Vec<f32> = (0..96 * 64)
+                    .map(|i| ((i as f32 * 0.13 + head as f32 * 0.7).sin()) * 0.02)
+                    .collect();
+                let bias: Vec<f32> = (0..96)
+                    .map(|i| ((i + head) as f32 * 0.05).cos() * 0.005)
+                    .collect();
+                tensors.push((
+                    format!("pdd_proj_out.{head}.weight"),
+                    Array::from_slice(&vals, &[96, 64]),
+                ));
+                tensors.push((
+                    format!("pdd_proj_out.{head}.bias"),
+                    Array::from_slice(&bias, &[96]),
+                ));
+            }
+            save(&dir.join("model.safetensors"), tensors, &[]);
+            let mut cfg_json = serde_json::json!({
+                "_class_name": "MiniMaxH3ImageTransformer2DModel",
+                "num_attention_heads": 4,
+                "attention_head_dim": 24,
+                "hidden_size": 64,
+                "num_layers": 2,
+                "num_refiner_layers": 2,
+                "ffn_dim": 32,
+                "in_channels": 24,
+                "patch_size": [1, 2, 2],
+                "text_dim": 40,
+                "freq_dim": 16,
+                "time_embed_hidden_dim": 64,
+                "time_embed_dim": 48,
+                "rope_freq_dim": 2,
+                "rope_theta": 10000.0,
+                "norm_eps": 1e-5,
+                "qk_norm_eps": 1e-5,
+                "final_norm_eps": 1e-5,
+                "num_pdd_heads": 6
+            });
+            if let Some(bits) = bits {
+                cfg_json["quantization"] = serde_json::json!({
+                    "bits": bits,
+                    "group_size": 64
+                });
+            }
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_string_pretty(&cfg_json).unwrap(),
+            )
+            .unwrap();
+            dir
+        };
+
+        let schedule = SigmaSchedule::h3_image_distilled().unwrap();
+        let cap = minimax_h3_image_pag_capability();
+        let active_pag = cap
+            .resolve(Some(&PagConfig {
+                scale: 1.2,
+                layers: Some(vec![0]),
+                ..Default::default()
+            }))
+            .unwrap();
+        let zero_pag = cap
+            .resolve(Some(&PagConfig {
+                scale: 0.0,
+                layers: Some(vec![0]),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        let context = Array::from_slice(
+            &(0..3 * 40)
+                .map(|i| (i as f32 * 0.19).sin() * 0.4)
+                .collect::<Vec<_>>(),
+            &[1, 3, 40],
+        );
+        let edit_layout = ImageLayout::edit(&[1, 0, 1], &[(2, 2); 16], 4, 4, [1, 2, 2]).unwrap();
+        let edit_rows = Array::from_slice(
+            &(0..20 * 96)
+                .map(|i| (i as f32 * 0.31).cos() * 0.5)
+                .collect::<Vec<_>>(),
+            &[1, 20, 96],
+        );
+
+        // 1. Block-0 prefix preservation on 16-reference edit (`[text(3) | refs(16) | gen(4)]`).
+        let q4_dir = stage_dir("q4", Some(4));
+        let mut dit_q4 = MiniMaxH3ImageDit::load_dir(&q4_dir, Dtype::Float32).unwrap();
+        crate::adapters::apply_minimax_h3_image_adapters(&mut dit_q4, &adapters).unwrap();
+        let denoiser_edit =
+            ImageDenoiser::new(dit_q4, edit_layout.clone(), &context, schedule.clone()).unwrap();
+        assert!(denoiser_edit.released_adaln_bytes() > 0);
+        let mut trace_cond = ImageDitTrace {
+            layers: vec![0],
+            ..Default::default()
+        };
+        let mut trace_pert = ImageDitTrace {
+            layers: vec![0],
+            ..Default::default()
+        };
+        let _ = denoiser_edit
+            .velocity_traced(0, &edit_rows, &mut trace_cond)
+            .unwrap();
+        let _ = denoiser_edit
+            .velocity_inner(0, &edit_rows, &[0], Some(&mut trace_pert))
+            .unwrap();
+        let prefix = edit_layout.num_conditioning_rows();
+        let seq = edit_layout.seq_len();
+        let h_cond = &trace_cond.hidden[0].1;
+        let h_pert = &trace_pert.hidden[0].1;
+        let prefix_diff = mlx_gen::testing::max_abs_diff_f32(
+            &slice_axis(h_cond, 1, 0, prefix).unwrap(),
+            &slice_axis(h_pert, 1, 0, prefix).unwrap(),
+        );
+        let gen_diff = mlx_gen::testing::max_abs_diff_f32(
+            &slice_axis(h_cond, 1, prefix, seq).unwrap(),
+            &slice_axis(h_pert, 1, prefix, seq).unwrap(),
+        );
+        assert!(
+            prefix_diff < 1e-5,
+            "prefix (text + 16 refs) moved: {prefix_diff}"
+        );
+        assert!(
+            gen_diff > 1e-4,
+            "generated suffix was not perturbed: {gen_diff}"
+        );
+
+        // 2. Full 6-step denoise across dense / Q8 / Q4, LoRA + LoKr, AdaLN eviction, and rung-4
+        // `DitBlockStream` windowed execution on T2I and 16-reference edit.
+        let t2i_layout = ImageLayout::t2i(3, 4, 4, [1, 2, 2]).unwrap();
+        let x0_t2i = Array::from_slice(
+            &(0..4 * 96)
+                .map(|i| (i as f32 * 0.23).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[1, 4, 96],
+        );
+        for (label, bits) in [("dense", None), ("q8", Some(8)), ("q4", Some(4))] {
+            let dir = stage_dir(&format!("tier_{label}"), bits);
+            let run_t2i = |windowed: bool, pag: Option<&mlx_gen::gen_core::PagResolved>| {
+                let mut dit = if windowed {
+                    MiniMaxH3ImageDit::load_dir_deferred(&dir, Dtype::Float32).unwrap()
+                } else {
+                    MiniMaxH3ImageDit::load_dir(&dir, Dtype::Float32).unwrap()
+                };
+                crate::adapters::apply_minimax_h3_image_adapters(&mut dit, &adapters).unwrap();
+                dit.materialize_streamed_adapters().unwrap();
+                let denoiser = if windowed {
+                    ImageDenoiser::new_windowed(
+                        dit,
+                        t2i_layout.clone(),
+                        &context,
+                        schedule.clone(),
+                        1,
+                        CancelFlag::new(),
+                    )
+                    .unwrap()
+                } else {
+                    let d = ImageDenoiser::new(dit, t2i_layout.clone(), &context, schedule.clone())
+                        .unwrap();
+                    assert!(d.released_adaln_bytes() > 0);
+                    d
+                };
+                let out = denoiser
+                    .denoise_with_pag(
+                        &H3ImageSampler::Lcm {
+                            s_noise: 1.1,
+                            s_noise_end: 0.9,
+                            noise_clip_std: 0.0,
+                        },
+                        pag,
+                        17,
+                        &x0_t2i,
+                        &CancelFlag::new(),
+                        &mut |_| {},
+                    )
+                    .unwrap();
+                mlx_rs::transforms::eval([&out]).unwrap();
+                (denoiser.forwards(), out.as_slice::<f32>().to_vec())
+            };
+            let (f_none, out_none) = run_t2i(false, None);
+            let (f_zero, out_zero) = run_t2i(false, Some(&zero_pag));
+            assert_eq!(f_none, 6);
+            assert_eq!(f_zero, 6);
+            assert_eq!(out_none, out_zero);
+
+            let (f_res, out_res) = run_t2i(false, Some(&active_pag));
+            let (f_win, out_win) = run_t2i(true, Some(&active_pag));
+            assert_eq!(f_res, 10);
+            assert_eq!(f_win, 10);
+            assert_ne!(out_res, out_none);
+            let max_diff = out_res
+                .iter()
+                .zip(&out_win)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_diff < 1e-4,
+                "{label}: resident vs windowed PAG diff {max_diff}"
+            );
+        }
+
+        // Also run 6-step 16-reference edit on windowed Q8, verifying reference rows never move.
+        {
+            let q8_dir = stage_dir("edit_q8", Some(8));
+            let mut dit = MiniMaxH3ImageDit::load_dir_deferred(&q8_dir, Dtype::Float32).unwrap();
+            crate::adapters::apply_minimax_h3_image_adapters(&mut dit, &adapters).unwrap();
+            dit.materialize_streamed_adapters().unwrap();
+            let denoiser = ImageDenoiser::new_windowed(
+                dit,
+                edit_layout,
+                &context,
+                schedule,
+                1,
+                CancelFlag::new(),
+            )
+            .unwrap();
+            let packed_out = denoiser
+                .denoise_with_pag(
+                    &H3ImageSampler::Euler,
+                    Some(&active_pag),
+                    23,
+                    &edit_rows,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(denoiser.forwards(), 10);
+            let ref_diff = mlx_gen::testing::max_abs_diff_f32(
+                &slice_axis(&edit_rows, 1, 0, 16).unwrap(),
+                &slice_axis(&packed_out, 1, 0, 16).unwrap(),
+            );
+            assert_eq!(ref_diff, 0.0, "16 reference rows must ride unchanged");
+        }
+
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED h3_image::dit::tests::image_denoiser_pag_perturbs_only_generated_suffix_across_tiers_adapters_adaln_and_stream");
     }
 }

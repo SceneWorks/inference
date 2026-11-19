@@ -179,8 +179,14 @@ pub(crate) fn sample_graph(
     } else {
         z.clone()
     };
+    let total_steps = times.len();
     for (step, time) in times.iter().enumerate() {
         check_cancel(&req.cancel)?;
+        let pag_scale = resolved.pag_step_scale(step, total_steps);
+        let pag_layers = resolved
+            .pag
+            .as_ref()
+            .map_or(&[][..], |pag| pag.step_layers(step, total_steps));
         let input = if let Some((q, _)) = dataspace {
             dmd_input(&z, q, &x)?
         } else {
@@ -200,7 +206,7 @@ pub(crate) fn sample_graph(
             if dataspace.is_none() {
                 if resolved.guidance != 1.0 {
                     let neg = &negative.expect("validated CFG conditioning").rows[row];
-                    let active = resolved.skipping_active(step, times.len());
+                    let active = resolved.skipping_active(step, total_steps);
                     let skip = if active {
                         resolved.uncond_skip_layers.as_slice()
                     } else {
@@ -221,7 +227,7 @@ pub(crate) fn sample_graph(
                 if let Some(slg) = &resolved.slg {
                     if !slg.layers.is_empty()
                         && slg.scale > 0.0
-                        && resolved.skipping_active(step, times.len())
+                        && resolved.skipping_active(step, total_steps)
                     {
                         let skipped = transformer
                             .forward(&latent, *time, ctx, &mask, &slg.layers, &req.cancel)?
@@ -232,6 +238,12 @@ pub(crate) fn sample_graph(
                         v = v.add(&((&cond - &skipped)? * f64::from(slg.scale))?)?;
                     }
                 }
+            }
+            if pag_scale > 0.0 {
+                let perturbed = transformer
+                    .forward_with_pag(&latent, *time, ctx, &mask, &[], pag_layers, &req.cancel)?
+                    .to_dtype(DType::F32)?;
+                v = v.add(&((&cond - &perturbed)? * f64::from(pag_scale))?)?;
             }
             velocities.push(v);
         }

@@ -103,7 +103,14 @@ class ModelWorkflowRoutes(unittest.TestCase):
                 self.assertIn('${{ runner.temp }}', setup['env']['OWNED_PROOF_EVIDENCE'])
                 self.assertEqual(setup['env']['ACTUAL_RUNNER_ENVIRONMENT'], '${{ runner.environment }}')
                 validator = next(step for step in job['steps'] if step.get('id') == 'evidence')
-                upload = job['steps'][-1]
+                uploads = [
+                    step for step in job['steps']
+                    if step.get('uses', '').startswith('actions/upload-artifact@')
+                    and step.get('with', {}).get('path') == '${{ env.MODEL_PROOF_EVIDENCE }}'
+                ]
+                self.assertEqual(len(uploads), 1)
+                upload = uploads[0]
+                self.assertLess(job['steps'].index(validator), job['steps'].index(upload))
                 self.assertIn('--verify-artifacts', validator['run'])
                 self.assertIn("steps.evidence.outcome == 'success'", upload['if'])
 

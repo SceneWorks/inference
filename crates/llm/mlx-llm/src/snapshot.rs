@@ -62,11 +62,18 @@ struct StagedTensor {
 static STAGE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn create_stage_dir(out_dir: &Path) -> Result<PathBuf> {
+    if out_dir.exists() && (!out_dir.is_dir() || std::fs::read_dir(out_dir)?.next().is_some()) {
+        return Err(Error::Msg(format!(
+            "snapshot output already exists and is not empty: {}",
+            out_dir.display()
+        )));
+    }
     let name = out_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("snapshot");
     let parent = out_dir.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
     for _ in 0..128 {
         let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
         let stage = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
@@ -87,21 +94,23 @@ fn create_stage_dir(out_dir: &Path) -> Result<PathBuf> {
 pub(crate) fn write_streaming_snapshot(
     out_dir: &Path,
     keys: &[String],
+    config: Value,
+    tokenizer: &SnapshotTokenizer,
+    quantize: Option<QuantSpec>,
+    load: impl FnMut(&str) -> Result<Array>,
+) -> Result<SnapshotReport> {
+    write_streaming_snapshot_with_sidecars(out_dir, keys, config, tokenizer, quantize, load, None)
+}
+
+fn write_streaming_snapshot_with_sidecars(
+    out_dir: &Path,
+    keys: &[String],
     mut config: Value,
     tokenizer: &SnapshotTokenizer,
     quantize: Option<QuantSpec>,
     mut load: impl FnMut(&str) -> Result<Array>,
+    sidecars: Option<&Path>,
 ) -> Result<SnapshotReport> {
-    if out_dir.exists() {
-        if out_dir.is_dir() && std::fs::read_dir(out_dir)?.next().is_none() {
-            std::fs::remove_dir(out_dir)?;
-        } else {
-            return Err(Error::Msg(format!(
-                "snapshot output already exists and is not empty: {}",
-                out_dir.display()
-            )));
-        }
-    }
     if let Some(spec) = quantize {
         config
             .as_object_mut()
@@ -111,13 +120,17 @@ pub(crate) fn write_streaming_snapshot(
                 json!({"group_size": spec.group_size, "bits": spec.bits}),
             );
     }
-    std::fs::create_dir_all(out_dir.parent().unwrap_or_else(|| Path::new(".")))?;
     let stage = create_stage_dir(out_dir)?;
     let result = (|| {
         let mut staged = BTreeMap::new();
         let mut quantized_projections = 0;
         for (index, key) in keys.iter().enumerate() {
-            let arr = load(key)?.as_dtype(STORE_DTYPE)?;
+            let arr = load(key)?;
+            let arr = if config.get("sensenova_mlx").is_some() {
+                arr
+            } else {
+                arr.as_dtype(STORE_DTYPE)?
+            };
             let outputs = if let Some(spec) = quantize.filter(|_| is_projection(key)) {
                 let base = key.strip_suffix(".weight").unwrap();
                 let q = QuantizedLinear::quantize(&arr, spec.group_size, spec.bits, None)?;
@@ -179,6 +192,9 @@ pub(crate) fn write_streaming_snapshot(
         for tensor in staged.values() {
             std::fs::remove_file(&tensor.path)?;
         }
+        if let Some(source) = sidecars {
+            copy_snapshot_sidecars(source, &stage)?;
+        }
         std::fs::rename(&stage, out_dir)?;
         Ok(SnapshotReport {
             num_tensors: staged.len(),
@@ -201,6 +217,14 @@ fn array_payload(array: &Array) -> Result<(&'static str, Vec<u8>)> {
                 .as_slice::<bf16>()
                 .iter()
                 .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        )),
+        Dtype::Float32 => Ok((
+            "F32",
+            array
+                .as_slice::<f32>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
                 .collect(),
         )),
         Dtype::Uint32 => Ok((
@@ -849,12 +873,53 @@ ArtifactInput,
         }
     }
 
-    // Tokenizer files pass through verbatim (byte-identical) when present.
-    let tokenizer = SnapshotTokenizer {
-        tokenizer_json: read_to_string_if_exists(&source.join("tokenizer.json"))?,
-        tokenizer_config_json: read_to_string_if_exists(&source.join("tokenizer_config.json"))?,
+    let tokenizer = || -> Result<SnapshotTokenizer> {
+        Ok(SnapshotTokenizer {
+            tokenizer_json: read_to_string_if_exists(&source.join("tokenizer.json"))?,
+            tokenizer_config_json: read_to_string_if_exists(&source.join("tokenizer_config.json"))?,
+        })
     };
 
+    if crate::sensenova_snapshot::tier(&config)?.is_some() {
+        if config.get("quantization").is_some() || drop_native_mtp {
+            return Err(Error::Config(
+                "SenseNova-Loop-9B preparation requires the original BF16 target".into(),
+            ));
+        }
+        if quantize_remaining {
+            return Err(Error::Unsupported(
+                "SenseNova-Loop-9B has no fully quantized tier; prepare the native affine Q4 or Q8"
+                    .into(),
+            ));
+        }
+        if let Some(spec) = quantize {
+            if ![QuantSpec::q4(), QuantSpec::q8()].contains(&spec) {
+                return Err(Error::Unsupported(
+                    "SenseNova-Loop-9B requires the native affine Q4 or Q8 preparation scheme"
+                        .into(),
+                ));
+            }
+            let weights = Weights::from_configured_dir(source, &config)?;
+            config["sensenova_mlx"] = crate::sensenova_snapshot::manifest(spec.bits);
+            let mut inputs = weights.into_map();
+            let mut keys: Vec<_> = inputs.keys().cloned().collect();
+            keys.sort();
+            return write_streaming_snapshot_with_sidecars(
+                out_dir,
+                &keys,
+                config,
+                &tokenizer()?,
+                quantize,
+                |key| {
+                    inputs
+                        .remove(key)
+                        .ok_or_else(|| Error::MissingTensor(key.into()))
+                },
+                Some(source),
+            );
+        }
+        return copy_sensenova_bf16(source, out_dir, &config_text);
+    }
     let mut tensors = Weights::from_dir(source)?.into_map();
     if drop_native_mtp {
         tensors.retain(|key, _| !key.starts_with("mtp."));
@@ -863,7 +928,7 @@ ArtifactInput,
         out_dir,
         tensors,
         config,
-        &tokenizer,
+        &tokenizer()?,
         quantize,
         quantize_remaining,
     )?;
@@ -871,15 +936,59 @@ ArtifactInput,
     Ok(report)
 }
 
+/// A dense export keeps the release index loadable and authenticates the staged
+/// bytes before publishing. Auxiliary weights outside that index are excluded.
+fn copy_sensenova_bf16(source: &Path, out_dir: &Path, config_text: &str) -> Result<SnapshotReport> {
+    use core_llm::sensenova_loop::{
+        target_tensors, validate_sidecars, validate_source_shards, TARGET_SHARDS,
+    };
+    let stage = create_stage_dir(out_dir)?;
+    let result = (|| {
+        let copy = |name: &str| -> Result<()> {
+            let from = source.join(name);
+            std::fs::copy(&from, stage.join(name))
+                .map_err(|e| Error::Msg(format!("copy {}: {e}", from.display())))?;
+            Ok(())
+        };
+        copy("model.safetensors.index.json")?;
+        for name in ["tokenizer.json", "tokenizer_config.json"]
+            .into_iter()
+            .chain(SNAPSHOT_SIDECARS)
+        {
+            copy(name)?;
+        }
+        validate_sidecars(&stage).map_err(Error::Config)?;
+        for &(shard, _) in TARGET_SHARDS {
+            copy(shard)?;
+        }
+        validate_source_shards(&stage).map_err(Error::Config)?;
+        std::fs::write(stage.join("config.json"), config_text)?;
+        std::fs::rename(&stage, out_dir)?;
+        Ok(SnapshotReport {
+            out_dir: out_dir.to_path_buf(),
+            num_tensors: target_tensors().count(),
+            quantized: None,
+            quantized_projections: 0,
+            quantized_remaining: 0,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(stage);
+    }
+    result
+}
+
 /// Snapshot files besides `config.json`, the tokenizer files and the weights that the loader reads
 /// and that change what a loaded model does: `generation_config.json` carries the generation EOS
 /// set ([`crate::provider::eos_token_ids`] — Qwen3.6's `<|im_end|>` lives only there),
 /// `chat_template.jinja` the sidecar template that wins over the tokenizer config's, and
 /// `processor_config.json` the Gemma 4 multimodal front-end's geometry.
-pub const SNAPSHOT_SIDECARS: [&str; 3] = [
+pub const SNAPSHOT_SIDECARS: [&str; 5] = [
     "generation_config.json",
     "chat_template.jinja",
     "processor_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
 ];
 
 /// Copy every [`SNAPSHOT_SIDECARS`] file `source` has into `out_dir`, byte for byte, so a written
@@ -921,6 +1030,33 @@ path,
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn sensenova_dense_export_failure_preserves_the_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("source");
+        let dst = root.path().join("destination");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            include_bytes!("../../../contracts/core-llm/src/sensenova_loop.json"),
+        )
+        .unwrap();
+        let error = write_hf_snapshot(&src, &dst, None).unwrap_err();
+        assert!(error.to_string().contains("model.safetensors.index.json"));
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        std::fs::write(dst.join("preserve"), "original").unwrap();
+        assert!(write_hf_snapshot(&src, &dst, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not empty"));
+        assert_eq!(
+            std::fs::read_to_string(dst.join("preserve")).unwrap(),
+            "original"
+        );
+    }
 
     /// A quantized write of a ModelOpt-quantized source is refused before anything is written, and
     /// the refusal names `convert_snapshot_to_bf16`. Config-only: no tensor is read.

@@ -28,11 +28,22 @@
 //!
 //! The whole DiT is on the device and one `loss.backward()` walks the full forward, retaining every
 //! block's activations — the configuration the memory estimate refuses unless the device holds it.
+//!
+//! # A trained token refiner (SW-F369)
+//!
+//! When a refiner leaf is a target ([`StepText::Embedded`]), the caption's frozen
+//! `context_embedder` rows are refined inside the step, under autograd, so the stack input carries
+//! the refiner's graph. Resident, the one `backward()` reaches it. Checkpointed, the segmented VJP
+//! starts from the **detached** stack input and returns its cotangent; the surrogate
+//! `⟨stack input, cotangent⟩` then back-propagates through the retained refiner forward alone —
+//! the exact chain rule, the Z-Image and Qwen-Image 2.1 trainers' pre-block pattern.
 
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Tensor, Var};
 use candle_gen::train::flow_match::velocity_loss;
-use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
+use candle_gen::train::gradient_checkpoint::{
+    checkpointed_backward, checkpointed_backward_with_input_grad, Segment,
+};
 use candle_gen::{CandleError, Result};
 
 use gen_core_train::h3_image::{training_mix, TrainingStep};
@@ -44,10 +55,44 @@ use crate::dit::rope::MmRopeTables;
 use crate::dit::MiniMaxH3Dit;
 use crate::image_pipeline::ImageLayout;
 
+/// The caption's rows a step starts from.
+#[derive(Clone, Copy)]
+pub(crate) enum StepText<'a> {
+    /// The refined text rows `[1, T, hidden]` (`context_embedder` + `token_refiner`), a constant
+    /// of the step: no refiner leaf is trained.
+    Refined(&'a Tensor),
+    /// The frozen `context_embedder` rows `[1, T, hidden]`, refined inside the step so the
+    /// trained refiner leaves receive gradients.
+    Embedded(&'a Tensor),
+}
+
+impl<'a> StepText<'a> {
+    /// `rows` as the step reads them: refined in the step when `refine`, else already refined.
+    pub(crate) fn of(rows: &'a Tensor, refine: bool) -> Self {
+        if refine {
+            Self::Embedded(rows)
+        } else {
+            Self::Refined(rows)
+        }
+    }
+
+    /// The refined text rows, carrying the refiner's graph when they are refined here.
+    fn rows(self, dit: &MiniMaxH3Dit) -> Result<Tensor> {
+        match self {
+            Self::Refined(rows) => Ok(rows.clone()),
+            Self::Embedded(rows) => dit.refine_text(rows),
+        }
+    }
+
+    fn refined_here(self) -> bool {
+        matches!(self, Self::Embedded(_))
+    }
+}
+
 /// One micro-step's inputs.
 pub(crate) struct StepInputs<'a> {
-    /// The caption's refined text rows `[1, T, hidden]` (`context_embedder` + `token_refiner`).
-    pub(crate) text_rows: &'a Tensor,
+    /// The caption's rows ([`StepText`]).
+    pub(crate) text: StepText<'a>,
     pub(crate) layout: &'a ImageLayout,
     /// The packed image stream `[1, num_packed_image_rows, 96]`, float32: an edit's noised
     /// reference rows, then the noised target.
@@ -162,6 +207,33 @@ fn tail_loss(
     Ok(velocity_loss(&generated, inputs.target, mae)?)
 }
 
+/// `[text | proj_in(image)]` — the stack's input, the refined caption rows carrying the refiner's
+/// graph when the step refines them ([`StepText::Embedded`]).
+fn stack_input(dit: &MiniMaxH3Dit, inputs: &StepInputs<'_>) -> Result<Tensor> {
+    let text_rows = inputs.text.rows(dit)?;
+    dit.image_stack_input(
+        inputs.packed,
+        &text_rows,
+        inputs.layout.text_indices(),
+        inputs.layout.image_indices(),
+    )
+}
+
+/// Fold `extra`'s gradients of `vars` into `grads` (`+=`). The refiner's and the blocks' factors
+/// are disjoint, so this is a union in practice; summing keeps it exact either way.
+fn merge_grads(grads: &mut GradStore, extra: &GradStore, vars: &[Var]) -> Result<()> {
+    for var in vars {
+        if let Some(g) = extra.get(var.as_tensor()) {
+            let merged = match grads.get(var.as_tensor()) {
+                Some(prev) => (prev + g)?,
+                None => g.clone(),
+            };
+            grads.insert(var.as_tensor(), merged.detach());
+        }
+    }
+    Ok(())
+}
+
 /// One micro-step's `(loss, gradients)` for the adapter `vars` installed on `dit`: segmented and
 /// recomputed per block when `checkpointed` (whether the blocks are resident or streamed), else
 /// one `backward()` over the retained forward (which requires the resident stack).
@@ -180,12 +252,7 @@ pub(crate) fn loss_and_grads(
     }
     crate::nn::with_differentiable_attention(|| {
         let constants = StepConstants::new(dit, modulation, inputs)?;
-        let h0 = dit.image_stack_input(
-            inputs.packed,
-            inputs.text_rows,
-            inputs.layout.text_indices(),
-            inputs.layout.image_indices(),
-        )?;
+        let h0 = stack_input(dit, inputs)?;
         if checkpointed {
             let constants = &constants;
             let mut segments: Vec<Segment<'_>> = (0..dit.num_layers())
@@ -204,7 +271,27 @@ pub(crate) fn loss_and_grads(
                 )
                 .map_err(core)?])
             }));
-            checkpointed_backward(&segments, &[h0], vars)
+            if !inputs.text.refined_here() {
+                return checkpointed_backward(&segments, &[h0], vars);
+            }
+            // The chain starts from the detached stack input and hands back its cotangent; the
+            // surrogate `⟨h0, cot⟩` then carries it through the retained refiner forward.
+            let (loss, mut grads, cotangents) =
+                checkpointed_backward_with_input_grad(&segments, &[h0.detach()], vars)?;
+            drop(segments);
+            let cotangent = cotangents.into_iter().next().ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3-image trainer: no cotangent reached the stack input".into(),
+                )
+            })?;
+            let surrogate =
+                (h0.to_dtype(DType::F32)? * cotangent.detach().to_dtype(DType::F32)?)?.sum_all()?;
+            let refiner_grads =
+                candle_gen::train::profile::span("refiner_backward", dit.device(), || {
+                    surrogate.backward()
+                })?;
+            merge_grads(&mut grads, &refiner_grads, vars)?;
+            Ok((loss, grads))
         } else {
             let mut x = h0;
             for layer in 0..dit.num_layers() {
@@ -238,14 +325,7 @@ pub(crate) mod diagnostics {
     ) -> Result<Tensor> {
         crate::nn::with_differentiable_attention(|| {
             let constants = StepConstants::new(dit, modulation, inputs)?;
-            let mut x = dit
-                .image_stack_input(
-                    inputs.packed,
-                    inputs.text_rows,
-                    inputs.layout.text_indices(),
-                    inputs.layout.image_indices(),
-                )?
-                .detach();
+            let mut x = stack_input(dit, inputs)?.detach();
             for layer in 0..from {
                 x = run_block(dit, modulation, &constants, layer, &x)?.detach();
             }

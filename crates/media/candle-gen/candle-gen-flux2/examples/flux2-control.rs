@@ -251,6 +251,7 @@ fn main() -> Result<()> {
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
         // an inert sink is byte-identical to a render with no preview at all.
         preview: PreviewSink::default(),
+        pag: None,
         cancel: CancelFlag::new(),
     };
     let mut on_progress = |p: Progress| {

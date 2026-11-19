@@ -265,6 +265,47 @@ pub fn denoise_cfg_with_progress(
     )
 }
 
+fn finalize_cfg_and_pag<F>(
+    v_cond: &Array,
+    eps_base: Array,
+    step_idx: usize,
+    total_steps: usize,
+    pag: Option<&mlx_gen::gen_core::PagResolved>,
+    cfg_active: bool,
+    forward_perturbed: F,
+) -> Result<Array>
+where
+    F: FnOnce(crate::attention::PagStepContext<'_>) -> Result<Array>,
+{
+    let Some(resolved_pag) = pag else {
+        return Ok(eps_base);
+    };
+    let step_pag_scale = resolved_pag.step_scale(step_idx, total_steps);
+    if step_pag_scale <= 0.0 {
+        return Ok(eps_base);
+    }
+    // Materialize cond / CFG predictions before constructing the perturbed 30-block graph so
+    // MLX's lazy graph never holds two un-evaluated full DiT graphs simultaneously.
+    if cfg_active {
+        mlx_rs::transforms::eval([v_cond, &eps_base])?;
+    } else {
+        mlx_rs::transforms::eval([v_cond])?;
+    }
+    let pag_ctx = crate::attention::PagStepContext {
+        resolved: resolved_pag,
+        step_idx,
+        total_steps,
+    };
+    let v_perturbed = forward_perturbed(pag_ctx)?;
+    Ok(mlx_gen::gen_core::guidance::pag_apply(
+        &mlx_gen::MlxLatentOps,
+        &eps_base,
+        v_cond,
+        &v_perturbed,
+        step_pag_scale,
+    )?)
+}
+
 /// [`denoise_cfg_with_progress`] with decorative per-step latent previews.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfg_with_progress_and_preview(
@@ -283,6 +324,44 @@ pub fn denoise_cfg_with_progress_and_preview(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_cfg_with_progress_preview_and_pag(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        neg_cap_feats,
+        guidance,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        preview,
+        None,
+        on_progress,
+    )
+}
+
+/// [`denoise_cfg_with_progress_and_preview`] with optional Perturbed-Attention Guidance (PAG).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_progress_preview_and_pag(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    pag: Option<&mlx_gen::gen_core::PagResolved>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     mlx_gen::image_execution::scalar("guidance", guidance);
     // Cond (and, when CFG is active, uncond) patchify metadata + RoPE freqs depend only on the
     // loop-constant latent dims + caption — build each once and reuse across steps (F-042).
@@ -295,26 +374,54 @@ pub fn denoise_cfg_with_progress_and_preview(
     };
     let g = Array::from_slice(&[guidance], &[1]);
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
-    // Rung 4 covers BOTH CFG forwards — the uncond pass runs the same 30 blocks and would otherwise
-    // re-materialize the whole stack resident, leaving the bound half-applied.
+    // Rung 4 covers BOTH CFG forwards and any perturbed PAG forward — the uncond/perturbed passes
+    // run the same 30 blocks and would otherwise re-materialize the whole stack resident.
     let window = transformer.block_window(block_window, cancel)?;
+    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+    let sigmas = &scheduler.sigmas[start..];
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
-    // delta is the per-step CFG combine of two velocities.
+    // delta is the per-step CFG + PAG combine of velocities.
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
-        match &neg_prep {
+        let eps_base = match &neg_prep {
             Some(np) => {
                 let v_uncond = transformer.forward_with_rungs(np, x, timestep, plan, window)?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
-                Ok(v_uncond.add(&delta.multiply(&g)?)?)
+                v_uncond.add(&delta.multiply(&g)?)?
             }
-            None => Ok(v_cond),
-        }
+            None => v_cond.clone(),
+        };
+        finalize_cfg_and_pag(
+            &v_cond,
+            eps_base,
+            step_idx,
+            total_steps,
+            pag,
+            neg_prep.is_some(),
+            |pag_ctx| {
+                transformer.forward_with_rungs_with_pag(
+                    &prep,
+                    x,
+                    timestep,
+                    plan,
+                    window,
+                    Some(pag_ctx),
+                )
+            },
+        )
     };
-    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    let sigmas = &scheduler.sigmas[start..];
-    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
         SamplerRun {
             sampler_name,
@@ -523,6 +630,49 @@ pub fn denoise_control_cfg_with_progress_and_preview(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_control_cfg_with_progress_preview_and_pag(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        latents,
+        cap_feats,
+        neg_cap_feats,
+        guidance,
+        control_context,
+        control_context_scale,
+        start_step,
+        budget,
+        block_window,
+        cancel,
+        preview,
+        None,
+        on_progress,
+    )
+}
+
+/// [`denoise_control_cfg_with_progress_and_preview`] with optional Perturbed-Attention Guidance
+/// (PAG) applied to base transformer main layers while keeping ControlNet layers unperturbed.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_cfg_with_progress_preview_and_pag(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    pag: Option<&mlx_gen::gen_core::PagResolved>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     mlx_gen::image_execution::scalar("control_scale", control_context_scale);
     mlx_gen::image_execution::scalar("guidance", guidance);
     // Cond (and, when CFG is active, uncond) control prep — patchify metadata + RoPE freqs + the
@@ -541,10 +691,23 @@ pub fn denoise_control_cfg_with_progress_and_preview(
     let g = Array::from_slice(&[guidance], &[1]);
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
     let window = transformer.control_block_window(block_window, cancel)?;
+    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+    let sigmas = &scheduler.sigmas[start..];
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let mut eval_idx = 0usize;
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
     // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
     // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = mlx_gen::gen_core::sampling::step_index_for_eval(
+            canonical_solver,
+            current_eval,
+            total_steps,
+        );
         let v_cond = transformer.forward_with_control_rungs(
             &prep,
             x,
@@ -554,7 +717,7 @@ pub fn denoise_control_cfg_with_progress_and_preview(
             plan,
             window,
         )?;
-        match &neg_prep {
+        let eps_base = match &neg_prep {
             Some(np) => {
                 let v_uncond = transformer.forward_with_control_rungs(
                     np,
@@ -567,14 +730,31 @@ pub fn denoise_control_cfg_with_progress_and_preview(
                 )?;
                 // v = v_uncond + guidance·(v_cond − v_uncond).
                 let delta = v_cond.subtract(&v_uncond)?;
-                Ok(v_uncond.add(&delta.multiply(&g)?)?)
+                v_uncond.add(&delta.multiply(&g)?)?
             }
-            None => Ok(v_cond),
-        }
+            None => v_cond.clone(),
+        };
+        finalize_cfg_and_pag(
+            &v_cond,
+            eps_base,
+            step_idx,
+            total_steps,
+            pag,
+            neg_prep.is_some(),
+            |pag_ctx| {
+                transformer.forward_with_control_rungs_with_pag(
+                    &prep,
+                    x,
+                    timestep,
+                    control_context_scale,
+                    None,
+                    plan,
+                    window,
+                    Some(pag_ctx),
+                )
+            },
+        )
     };
-    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-    let sigmas = &scheduler.sigmas[start..];
-    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
         SamplerRun {
             sampler_name,
@@ -1586,5 +1766,105 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("multiple reference images"), "{err}");
+    }
+
+    #[test]
+    fn pag_step_index_and_finalize_cover_window_noop_two_pass_and_three_pass() {
+        use mlx_gen::gen_core::sampling::{canonical_solver_or_euler, step_index_for_eval};
+        let euler = canonical_solver_or_euler(None);
+        assert_eq!(
+            (0..3)
+                .map(|eval| step_index_for_eval(euler, eval, 3))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Two-stage solvers (`heun`, `dpmpp_sde`) keep both evaluations of outer step `i` on `i`.
+        for solver_name in ["heun", "dpmpp_sde"] {
+            let solver = canonical_solver_or_euler(Some(solver_name));
+            assert_eq!(
+                (0..6)
+                    .map(|eval| step_index_for_eval(solver, eval, 3))
+                    .collect::<Vec<_>>(),
+                vec![0, 0, 1, 1, 2, 2]
+            );
+        }
+
+        let cap = crate::model::turbo_pag_capability();
+        let resolved = mlx_gen::gen_core::resolve_pag(
+            Some(&cap),
+            "z_image_turbo",
+            Some(&mlx_gen::gen_core::PagConfig {
+                scale: 1.2,
+                start: Some(0.0),
+                stop: Some(0.75),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+
+        let v_cond = Array::from_slice(&[2.0f32, 4.0], &[2]);
+        let eps_cfg = Array::from_slice(&[3.0f32, 5.0], &[2]);
+        let v_perturbed = Array::from_slice(&[1.0f32, 2.0], &[2]);
+
+        // Step 2 (progress 2/3 < 0.75) -> perturbed pass runs (both 2-pass and 3-pass).
+        let mut called = 0usize;
+        let two_pass = finalize_cfg_and_pag(
+            &v_cond,
+            v_cond.clone(),
+            2,
+            3,
+            Some(&resolved),
+            false,
+            |ctx| {
+                called += 1;
+                assert_eq!(ctx.step_idx, 2);
+                assert_eq!(ctx.total_steps, 3);
+                assert_eq!(ctx.layer_x_len(15, 8), Some(8));
+                assert_eq!(ctx.layer_x_len(14, 8), None);
+                Ok(v_perturbed.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(called, 1);
+        mlx_rs::transforms::eval([&two_pass]).unwrap();
+        assert_eq!(two_pass.as_slice::<f32>(), &[3.2f32, 6.4]);
+
+        let mut called_cfg = 0usize;
+        let three_pass = finalize_cfg_and_pag(
+            &v_cond,
+            eps_cfg.clone(),
+            1,
+            3,
+            Some(&resolved),
+            true,
+            |_| {
+                called_cfg += 1;
+                Ok(v_perturbed.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(called_cfg, 1);
+        mlx_rs::transforms::eval([&three_pass]).unwrap();
+        assert_eq!(three_pass.as_slice::<f32>(), &[4.2f32, 7.4]);
+
+        // Step 3 on a 4-step schedule -> progress 0.75 >= 0.75 -> zero extra pass.
+        let mut skipped_calls = 0usize;
+        let out_of_window = finalize_cfg_and_pag(
+            &v_cond,
+            eps_cfg.clone(),
+            3,
+            4,
+            Some(&resolved),
+            true,
+            |_| {
+                skipped_calls += 1;
+                Ok(v_perturbed.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped_calls, 0);
+        mlx_rs::transforms::eval([&out_of_window]).unwrap();
+        assert_eq!(out_of_window.as_slice::<f32>(), &[3.0f32, 5.0]);
     }
 }

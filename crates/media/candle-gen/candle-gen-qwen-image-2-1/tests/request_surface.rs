@@ -1144,6 +1144,16 @@ fn assert_mirrors_base(turbo: &ModelDescriptor, base: &ModelDescriptor) {
     assert_eq!(capabilities.max_count, caps.max_count);
     assert_eq!(capabilities.size_floor, caps.size_floor);
     assert_eq!(capabilities.supported_quants, caps.supported_quants);
+    assert_eq!(
+        capabilities.pag,
+        Some(gen_core_family::qwen_image_2_1::pag::qwen_image_2_1_turbo_pag_capability()),
+        "turbo PAG defaults"
+    );
+    assert_eq!(
+        caps.pag,
+        Some(gen_core_family::qwen_image_2_1::pag::qwen_image_2_1_pag_capability()),
+        "base PAG defaults"
+    );
 
     // …and every other one, whatever it is.
     let (turbo_fields, base_fields) = (capability_fields(turbo), capability_fields(base));
@@ -1159,6 +1169,7 @@ fn assert_mirrors_base(turbo: &ModelDescriptor, base: &ModelDescriptor) {
         "min_size",
         "max_size",
         "size_floor",
+        "pag",
     ] {
         assert!(
             names.contains(&expected),
@@ -1170,6 +1181,9 @@ fn assert_mirrors_base(turbo: &ModelDescriptor, base: &ModelDescriptor) {
         turbo_fields.iter().zip(&base_fields)
     {
         assert_eq!(turbo_name, base_name);
+        if turbo_name == "pag" {
+            continue;
+        }
         assert_eq!(
             turbo_value, base_value,
             "capability `{base_name}` differs between the Turbo and the base descriptor"

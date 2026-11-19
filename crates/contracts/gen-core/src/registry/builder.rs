@@ -9,6 +9,7 @@ use super::*;
 pub struct ProviderRegistryBuilder {
     pub(super) generators: Vec<ModelRegistration>,
     pub(super) render_plans: Vec<crate::RenderPlanRegistration>,
+    pub(super) feature_routes: Vec<FeatureRouteRegistration>,
     pub(super) checkpoint_adapters: Vec<CheckpointAdapterRegistration>,
     pub(super) checkpoint_codecs: Vec<CheckpointCodecRegistration>,
     pub(super) encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
@@ -485,6 +486,11 @@ impl ProviderRegistryBuilder {
         crate::RenderPlanRegistration
     );
     builder_registration_method!(
+        register_feature_route,
+        feature_routes,
+        FeatureRouteRegistration
+    );
+    builder_registration_method!(
         register_checkpoint_adapter,
         checkpoint_adapters,
         CheckpointAdapterRegistration
@@ -630,6 +636,17 @@ impl ProviderRegistryBuilder {
                     "duplicate or unbound render-plan registration for {}",
                     planner.provider_id
                 )));
+            }
+        }
+        {
+            let mut feature_route_ids = std::collections::BTreeSet::new();
+            for route in &self.feature_routes {
+                if !is_registry_ident(route.route_id) || !feature_route_ids.insert(route.route_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate or malformed feature-route registration for '{}'",
+                        route.route_id
+                    )));
+                }
             }
         }
         {
@@ -855,6 +872,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             render_plans: self.render_plans.into_boxed_slice(),
+            feature_routes: self.feature_routes.into_boxed_slice(),
             checkpoint_adapters: self.checkpoint_adapters.into_boxed_slice(),
             checkpoint_codecs,
             imported_models: imported_models.into_boxed_slice(),
