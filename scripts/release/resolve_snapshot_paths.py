@@ -23,8 +23,11 @@ single variable is rewritten, and each variable can be flipped from absolute to 
 its own without a coordinated cutover or a window where the lane is red. It is also what
 leaves the Windows pool's `E:\\...` values alone.
 
-If a box stores its Hugging Face cache off the home volume, symlink `~/.cache/huggingface`
-at it rather than reintroducing an absolute per-machine value.
+Since SW-F375 the Hub snapshot variables are absolute again, under the fleet's Hugging Face
+cache (`/Volumes/Models/huggingface/hub` on every Mac, `E:\\HuggingFace\\hub` on every
+Windows box), which is the same path on every runner and where `ensure_model_snapshot.py`
+requires CI downloads to land. The `~/` form remains for the per-box assets that exist on no
+Hub (the Mage oracle seed, the MiniMax-H3 references).
 """
 
 from __future__ import annotations
