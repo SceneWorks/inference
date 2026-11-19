@@ -287,6 +287,44 @@ class ConditionalAssetInventory(unittest.TestCase):
                 self.assertFalse(other.exists())
             self.assertEqual([p.name for p in target.parent.iterdir()], ["w.safetensors"])
 
+    def test_fetch_accepts_a_concurrently_placed_identical_file_and_refuses_other_bytes(self):
+        # Run 44431653018: another job on the same host placed the destination mid-download.
+        class Racing:
+            """Places `placed` at the destination once this job's download has been fully read."""
+            def __init__(self, destination, body, placed):
+                self.destination, self.body, self.placed = destination, io.BytesIO(body), placed
+                self.headers = {"Content-Length": str(len(body))}
+            def read(self, size):
+                chunk = self.body.read(size)
+                if not chunk and not self.destination.exists():
+                    self.destination.write_bytes(self.placed)
+                return chunk
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+
+        class Opener:
+            def __init__(self, destination, placed):
+                self.destination, self.placed, self.linked_etag = destination, placed, None
+            def open(self, request, timeout):
+                return Racing(self.destination, b"weights", self.placed)
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp).resolve() / "snapshots" / ("a" * 40) / "w.safetensors"
+            target.parent.mkdir(parents=True)
+            size, sha, _ = assets.fetch_pinned("https://example/w", target, opener=Opener(target, b"weights"))
+            self.assertEqual((size, sha), (7, hashlib.sha256(b"weights").hexdigest()))
+            self.assertEqual(target.read_bytes(), b"weights")
+            self.assertEqual([p.name for p in target.parent.iterdir()], ["w.safetensors"])
+            other = target.with_name("x.safetensors")
+            for placed in (b"WEIGHTS", b"short"):
+                other.unlink(missing_ok=True)
+                with self.subTest(placed=placed), self.assertRaisesRegex(ValueError, "placed concurrently"):
+                    assets.fetch_pinned("https://example/x", other, opener=Opener(other, placed))
+                self.assertEqual(other.read_bytes(), placed)
+            self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ["w.safetensors", "x.safetensors"])
+
     def test_stage_fetches_only_missing_pinned_files_and_records_receipts(self):
         with TemporaryDirectory() as tmp:
             hub = Path(tmp).resolve() / "hub"

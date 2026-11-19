@@ -179,8 +179,13 @@ class SharedHeadroom(unittest.TestCase):
                 self.claim([valid, valid, error], body=lambda _: self.fail('primary timeout reached body'))
             self.assertIn(str(error), caught.exception.diagnostic['admission_error'])
             self.assertEqual(caught.exception.diagnostic['admission_samples']['sample_count'], 1)
-            with self.assertRaises(resources.CudaReleaseRejected):
-                self.claim([valid] * 7 + [error])
+            # Post-run: a slow driver query is retried, then recorded as inconclusive; the
+            # owned-Job exit still seals the passing proof (run 44431476698).
+            receipt, _ = self.claim([valid] * 7 + [error] * resources.RELEASE_QUERY_ATTEMPTS)
+            self.assertEqual(receipt['release_metadata_verification']['status'],
+                             'inconclusive-driver-query-timing')
+            receipt, _ = self.claim([valid] * 7 + [error] + [valid] * 4)
+            self.assertEqual(receipt['release_metadata_verification'], {'status': 'verified'})
 
     def test_memory_and_physical_identity_refusals_never_enter_body(self):
         # CI_IMPACT: pure snapshots exercise initial and later phase failures, not model computation.
@@ -297,13 +302,15 @@ class SharedHeadroom(unittest.TestCase):
             self.claim([valid] * 11, body=lambda receipt: held.append(receipt), unlock_failure=True)
         self.assertFalse(held[0]['post_execution_verified'])
         self.assertFalse(held[0]['lease_released'])
+        # The admission claim deadline expiring during the body is not a release failure: post-run
+        # sampling has its own fixed budget and the passing proof is sealed.
         with patch.object(resources.time, 'monotonic', return_value=100.) as clock:
             def expire(receipt):
                 held.append(receipt)
                 clock.return_value = 100. + POLICY.deadline_seconds
-            with self.assertRaisesRegex(resources.CudaReleaseRejected, 'deadline expired'):
-                self.claim([valid] * 6, body=expire)
-        self.assertFalse(held[-1]['post_execution_verified'])
+            receipt, _ = self.claim([valid] * 11, body=expire)
+        self.assertEqual(receipt['release_metadata_verification'], {'status': 'verified'})
+        self.assertTrue(held[-1]['post_execution_verified'])
         self.assertTrue(held[-1]['lease_released'])
 
     def test_legacy_profile_with_unselected_configuration_keeps_its_original_schema(self):
