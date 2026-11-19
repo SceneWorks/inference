@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,12 @@ GIB = 1024**3
 DISK_RESERVE_BYTES = 20 * GIB
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{name}"
 LOCK_POLL_SECONDS = 5
+# A holder may be downloading tens of GiB; say so periodically rather than going silent.
+LOCK_LOG_SECONDS = 180
+# Only these mean "another holder has it"; any other lock error (ENOLCK/ENOTSUP on a network
+# hub, EBADF, EINVAL) is raised instead of spinning forever.
+POSIX_LOCK_BUSY = frozenset((errno.EWOULDBLOCK, errno.EAGAIN))
+MSVCRT_LOCK_BUSY = frozenset((errno.EACCES, errno.EDEADLK))
 
 
 def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
@@ -50,8 +57,9 @@ def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
 
 
 def _try_lock(handle) -> bool:
+    windows = os.name == "nt"
     try:
-        if os.name == "nt":
+        if windows:
             import msvcrt
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -59,8 +67,10 @@ def _try_lock(handle) -> bool:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    except OSError:
-        return False
+    except OSError as error:
+        if error.errno in (MSVCRT_LOCK_BUSY if windows else POSIX_LOCK_BUSY):
+            return False
+        raise
 
 
 @contextmanager
@@ -75,9 +85,14 @@ def staging_lock(hub: Path, repository: str, revision: str, file: str):
             handle.write(b"0")
             handle.flush()
         if not _try_lock(handle):
+            started = logged = time.monotonic()
             print(f"waiting for another job staging {repository}@{revision}/{file}", flush=True)
             while not _try_lock(handle):
                 time.sleep(LOCK_POLL_SECONDS)
+                if time.monotonic() - logged >= LOCK_LOG_SECONDS:
+                    logged = time.monotonic()
+                    print(f"still waiting ({logged - started:.0f} s) for another job staging "
+                          f"{repository}@{revision}/{file}", flush=True)
         try:
             yield
         finally:
@@ -133,7 +148,7 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
                          f"but {hub} has {free / GIB:.1f} GiB free")
     receipt: dict[str, dict] = {}
     for name, pin, base, files, absent in plans:
-        fetched = []
+        fetched, placed_by_another_job = [], []
         for file in sorted(absent):
             with staging_lock(hub, pin["repository"], pin["revision"], file):
                 # Staged for an earlier slot of the same revision, or by another job on this host.
@@ -141,12 +156,13 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
                     continue
                 url = HF_RESOLVE.format(repo=pin["repository"], revision=pin["revision"], name=urllib.parse.quote(file))
                 print(f"staging {pin['repository']}@{pin['revision']}/{file} ({absent[file] / GIB:.2f} GiB)", flush=True)
-                fetch(url, base / file)
-                fetched.append(file)
+                _, _, _, placed = fetch(url, base / file)
+                (placed_by_another_job if placed else fetched).append(file)
         verified = verify(pin["repository"], pin["revision"], base, tuple(sorted(files)))
         path = base / pin["subfolder"] if pin["subfolder"] else base
         receipt[name] = {**pin, "path": str(path), "status": verified["status"], "fetched": fetched,
                          "kept_existing": sorted(set(files) - set(fetched)),
+                         "placed_by_another_job": placed_by_another_job,
                          "manifest_sha256": verified["manifest_sha256"], "files": verified["files"]}
     return receipt
 

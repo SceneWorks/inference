@@ -346,29 +346,43 @@ class ChildCudaVisibility(unittest.TestCase):
                 pass
         return claim, calls
 
-    def test_release_query_timeout_is_a_diagnostic_and_the_passing_proof_is_kept(self):
+    def test_release_query_timeout_after_a_valid_sample_is_a_diagnostic_and_the_proof_is_kept(self):
         # CI_IMPACT: mocked nvidia-smi timeouts only (run 44431476698); no driver, GPU or model.
-        def timeout(_card, _call):
+        def timeout_after_first(card, call):
+            if call == 1:
+                return [card], []
             raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
-        claim, calls = self._release_with(timeout)
+        claim, calls = self._release_with(timeout_after_first)
         self.assertTrue(claim['post_execution_verified'])
         self.assertTrue(claim['lease_released'])
         verification = claim['release_metadata_verification']
         self.assertEqual(verification['status'], 'inconclusive-driver-query-timing')
         self.assertIn('timed out', verification['error'])
+        self.assertEqual(verification['diagnostic']['sample_count'], 1)
         self.assertNotIn('release_utilization_percent', claim)
-        # Bounded retry, and each query had the fixed budget, not a leftover admission window.
-        self.assertEqual(len(calls), resources.RELEASE_QUERY_ATTEMPTS)
+        # One valid sample, then the bounded retry; each query had the fixed budget, not a leftover window.
+        self.assertEqual(len(calls), 1 + resources.RELEASE_QUERY_ATTEMPTS)
         self.assertTrue(all(resources.RELEASE_QUERY_SECONDS - 1 < budget <= resources.RELEASE_QUERY_SECONDS
                             for budget in calls))
 
+    def test_release_with_no_retained_sample_is_refused(self):
+        # CI_IMPACT: mocked nvidia-smi only. A driver hung after the run checked nothing: no seal.
+        def hung(_card, _call):
+            raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
+        with self.assertRaisesRegex(resources.CudaReleaseRejected, 'timed out'):
+            self._release_with(hung)
+
     def test_only_timing_failures_with_valid_retained_metadata_are_inconclusive(self):
         valid = {'samples': [{'post_owned_exit_primary_metadata_valid': True}]}
-        invalid = {'samples': [{'post_owned_exit_primary_metadata_valid': False}]}
+        invalid = {'samples': [{'post_owned_exit_primary_metadata_valid': True},
+                               {'post_owned_exit_primary_metadata_valid': False}]}
         overrun = RuntimeError(resources.release_window_overrun('model-proof-release'))
         self.assertTrue(resources.release_check_inconclusive(overrun, valid))
-        self.assertTrue(resources.release_check_inconclusive(TimeoutError('slow'), {'status': 'missing-or-malformed'}))
+        self.assertTrue(resources.release_check_inconclusive(TimeoutError('slow'), valid))
         self.assertFalse(resources.release_check_inconclusive(overrun, invalid))
+        for empty in ({'status': 'missing-or-malformed'}, {'samples': []}):
+            with self.subTest(diagnostic=empty):
+                self.assertFalse(resources.release_check_inconclusive(TimeoutError('slow'), empty))
         for error in (RuntimeError('supervisor-owned Windows Job completion is unverified; no release seal'),
                       RuntimeError('selected physical GPU UUID absent or ambiguous; no device fallback'),
                       OSError('driver failed')):
@@ -387,14 +401,39 @@ class ChildCudaVisibility(unittest.TestCase):
         self.assertEqual(claim['release_utilization_percent'], [0] * 5)
         self.assertEqual(len(calls), 6)
 
-    def test_release_timeout_after_invalid_metadata_still_rejects(self):
+    def test_invalid_release_metadata_is_refused_by_the_guard_before_any_timeout(self):
         # CI_IMPACT: mocked nvidia-smi only; a card whose total changed is evidence, not a timeout.
         def swapped_then_timeout(card, call):
             if call == 1:
                 return [dict(card, total_mib=48000, free_mib=46116)], []
             raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
-        with self.assertRaises(resources.CudaReleaseRejected):
+        with self.assertRaisesRegex(resources.CudaReleaseRejected, 'occupied'):
             self._release_with(swapped_then_timeout)
+
+    def test_a_timeout_after_a_retained_invalid_sample_is_refused_not_inconclusive(self):
+        # CI_IMPACT: mocked guard only. The release diagnostic, not the error type, decides: a timing
+        # error with any retained sample whose exact-card metadata is invalid still refuses.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        def retained_invalid_then_timeout(_card, output, _phase, _baseline, **_kwargs):
+            (output / 'model-proof-release-samples.json').write_text(json.dumps([
+                {'sample_number': 1, 'devices': [card], 'processes': []},
+                {'sample_number': 2, 'devices': [dict(card, total_mib=48000)], 'processes': []},
+            ]), encoding='utf-8')
+            raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            os_patch, lock_patch = self._fake_windows()
+            with os_patch, lock_patch, patch.object(guard, 'inventory', return_value=([card], [])), \
+                    patch.object(guard, 'verify_idle', side_effect=retained_invalid_then_timeout), \
+                    patch.object(guard.time, 'sleep'):
+                with self.assertRaisesRegex(resources.CudaReleaseRejected, 'timed out') as caught:
+                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, {'PUBLIC': str(output)},
+                                                   constraints={'required_cuda_physical_index': 1}) as claim:
+                        pass
+            self.assertFalse(claim['post_execution_verified'])
+            self.assertEqual([sample['post_owned_exit_primary_metadata_valid']
+                              for sample in caught.exception.diagnostic['samples']], [True, False])
 
     def test_unquiet_window_restarts_sampling_after_releasing_the_lock(self):
         # CI_IMPACT: mocked SMI snapshots; another tenant's burst refuses, then a quiet window admits.
