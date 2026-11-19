@@ -5455,10 +5455,11 @@ jobs:
   # both (the pre-epic one in its own persistent target directory beside the shared one) with the
   # commit and dirty flag stamped at compile time, so a stale binary is refused, not measured.
   #
-  # `CUDA_VISIBLE_DEVICES=1`: the box has two RTX PRO 6000s and CI's CUDA lanes use cuda:0, so the
-  # campaign takes the second card (candle-llm opens device 0 of the devices it can see).
-  # `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes CUDA number the cards as nvidia-smi does (the default
-  # FASTEST_FIRST order need not), so ordinal 1 is the inventory's GPU 1.
+  # The box has two RTX PRO 6000s and CI's CUDA lanes use cuda:0. The campaign card is bound by
+  # UUID (SW-7200): `Select the campaign card by UUID` sets CUDA_VISIBLE_DEVICES to
+  # DECODE_BENCH_CUDA_UUID through the trusted System32 nvidia-smi and refuses when it is absent,
+  # so candle-llm's device 0 is that card whatever its index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` keeps
+  # CUDA's numbering nvidia-smi's).
   #
   # `timeout-minutes: 600` is a runaway guard, not a budget: two cold `--release --features cuda`
   # builds, then every row's runs back to back. Re-size it from the first campaign that completes.
@@ -5478,10 +5479,10 @@ jobs:
       DECODE_BENCH_PRE_EPIC_TARGET: ${{ github.workspace }}/../cargo-target-pre-epic
       # SW-7200: where a matrix's `hub:` pins are bound and staged.
       MODEL_PROOF_HUB_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-      # SW-7200: the card the campaign is measured on (visible index 1, PCI bus order).
+      # SW-7200: the card the campaign is measured on, selected by UUID: the step below sets
+      # CUDA_VISIBLE_DEVICES to it (fail closed when it is absent), so no index is assumed.
       DECODE_BENCH_CUDA_UUID: GPU-e4b79931-7be6-f216-460a-f5405cfafffe
       CUDA_DEVICE_ORDER: PCI_BUS_ID
-      CUDA_VISIBLE_DEVICES: "1"
       # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -5530,14 +5531,10 @@ jobs:
       - name: Copy the baseline driver into the pre-epic checkout
         shell: cmd
         run: copy /Y crates\contracts\core-llm\core-llm-testkit\baseline\speculative_bench_baseline.rs ..\inference-pre-epic\crates\llm\candle-llm\tests\speculative_bench_baseline.rs || exit /b 1
-      # Report-only, like the same step on `candle-qwen-image-2-1`.
-      - name: Record the CUDA device inventory
-        continue-on-error: true
+      # Records every card's uuid / bus id and binds the campaign card by UUID, fail closed.
+      - name: Select the campaign card by UUID
         shell: cmd
-        run: call scripts\ci\real-weights\candle-decode-speedups-bench\record-the-cuda-device-inventory.cmd
-      - name: Require the campaign card at index 1
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-decode-speedups-bench\require-the-campaign-card-at-index-1.cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\select-the-campaign-card-by-uuid.cmd
       # The runner builds both checkouts first (stamped: `SPECULATIVE_BENCH_BUILD_GIT_SHA`), then
       # alternates the epic and baseline processes per row.
       - name: Build both checkouts and run every matrix row (epic and baseline alternating)

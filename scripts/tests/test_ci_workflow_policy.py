@@ -5479,8 +5479,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
             ("DECODE_BENCH_SNAPSHOT_QWEN38", "${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}"),
             ("DECODE_BENCH_SNAPSHOT_BONSAI_MLX", "${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}"),
-            ("CUDA_VISIBLE_DEVICES", "1"),
-            # CUDA numbers the cards as nvidia-smi does, so ordinal 1 is the inventory's GPU 1.
+            # SW-7200: the campaign card is bound by UUID at run time, never by a fixed index.
+            ("DECODE_BENCH_CUDA_UUID", "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"),
             ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
             ("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"),
         ):
@@ -5489,6 +5489,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for name in campaign.SNAPSHOT_ALIASES.values():
             if name not in env:
                 errors.append(f"snapshot alias variable {name} is not mapped")
+        if "CUDA_VISIBLE_DEVICES" in env:
+            errors.append("the job pins CUDA_VISIBLE_DEVICES instead of selecting the card by UUID")
+        select = next((s for s in job["steps"] if s.get("name") == "Select the campaign card by UUID"), {})
+        if ("decode_bench_select_cuda_card.py" not in select.get("run", "")
+                or "%DECODE_BENCH_CUDA_UUID%" not in select.get("run", "")
+                or select.get("continue-on-error")):
+            errors.append("the campaign card is not selected by UUID, fail closed")
         # The untrusted matrix reaches the job through `env:` only, never a step body or `with:`.
         steps = job["steps"]
         if "inputs.decode_bench_matrix" in json.dumps(steps):
@@ -5591,7 +5598,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         for mutate in (
             lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
-            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
+            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "1"}),
+            lambda job: job["env"].update({"DECODE_BENCH_CUDA_UUID": "GPU-00000000-0000-0000-0000-000000000000"}),
             lambda job: job["env"].pop("CUDA_DEVICE_ORDER"),
             lambda job: job.update({"timeout-minutes": 240}),
             lambda job: job["steps"][1]["with"].update({"ref": "main"}),
@@ -5679,14 +5687,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "Build both checkouts and run every matrix row (epic and baseline alternating)"
         ):
             errors.append("the CUDA lane does not stage the Hub pins before it runs")
-        card = "Require the campaign card at index 1"
-        if cuda.get("env", {}).get("DECODE_BENCH_CUDA_UUID") != "GPU-e4b79931-7be6-f216-460a-f5405cfafffe" or (
-            card not in names
-            or names.index(card)
-            > names.index("Build both checkouts and run every matrix row (epic and baseline alternating)")
-            or cuda["steps"][names.index(card)].get("continue-on-error")
+        card = "Select the campaign card by UUID"
+        if card not in names or names.index(card) > names.index(
+            "Build both checkouts and run every matrix row (epic and baseline alternating)"
         ):
-            errors.append("the CUDA lane does not refuse a card other than the campaign's")
+            errors.append("the CUDA lane does not select its card before it builds")
         return errors
 
     def test_mlx_decode_speedups_bench_is_dispatch_only_on_the_loaned_mac_and_bounded(self) -> None:

@@ -2342,3 +2342,48 @@ class MlxTreeGuardTests(unittest.TestCase):
         summary = campaign.guard_summary(log)
         self.assertEqual((summary["exit"], summary["cap_gib"]), (0, 1))
         self.assertGreater(summary["max_process_lifetime_max_bytes"], 0)
+
+
+class CudaCardSelectionTests(unittest.TestCase):
+    """SW-7200: the CUDA half binds its card by UUID and refuses when it is absent or ambiguous."""
+
+    def setUp(self) -> None:
+        path = REPOSITORY / "scripts" / "ci" / "decode_bench_select_cuda_card.py"
+        spec = importlib.util.spec_from_file_location("decode_bench_select_cuda_card", path)
+        self.select = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.select)
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    UUID = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+    INVENTORY = (
+        "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX PRO 6000, 97887, 1, 97886\n"
+        f"1, {UUID}, 00000000:41:00.0, RTX PRO 6000, 97887, 3, 97884\n"
+    )
+
+    def test_the_card_is_bound_by_uuid_and_recorded(self) -> None:
+        env_file = self.directory / "github_env"
+        with mock.patch.object(self.select, "query", return_value=self.INVENTORY), \
+                mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.select.main([self.UUID, str(self.directory)]), 0)
+        self.assertEqual(env_file.read_text(encoding="utf-8"), f"CUDA_VISIBLE_DEVICES={self.UUID}\n")
+        card = json.loads((self.directory / "cuda-selected-device.json").read_text(encoding="utf-8"))
+        self.assertEqual((card["index"], card["pci.bus_id"]), ("1", "00000000:41:00.0"))
+        inventory = (self.directory / "cuda-device-inventory.csv").read_text(encoding="utf-8")
+        self.assertTrue(inventory.startswith("index, uuid, pci.bus_id"))
+
+    def test_an_absent_duplicated_or_empty_inventory_is_refused(self) -> None:
+        other = "GPU-00000000-0000-0000-0000-000000000000"
+        for inventory in ("", self.INVENTORY.replace(self.UUID, other),
+                          self.INVENTORY + self.INVENTORY.splitlines()[1] + "\n", "1, broken\n"):
+            env_file = self.directory / "github_env"
+            env_file.unlink(missing_ok=True)
+            with self.subTest(inventory=inventory), \
+                    mock.patch.object(self.select, "query", return_value=inventory), \
+                    mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.select.main([self.UUID, str(self.directory)]), 1)
+                self.assertFalse(env_file.exists())
+        with mock.patch.dict(os.environ, {"GITHUB_ENV": str(self.directory / "e")}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.select.main(["GPU-1", str(self.directory)]), 1)
