@@ -19,10 +19,13 @@
 //! ```
 //!
 //! `CANDLE_LLM_BLOCK_DRAFT_PRECISION=q4` loads the draft at 4-bit (default 8-bit). Each run
-//! asserts the draft is resident, advertised and named at its precision, that a greedy
-//! `block_draft` request commits more than one token per target pass, and that a seeded sampled
-//! request runs the draft and reproduces; it prints the tokens per target pass and reports the
-//! first position where the greedy stream differs from the same provider with speculation off (a
+//! asserts the draft is resident, advertised and named at its precision; that a greedy
+//! `block_draft` request on a cold prompt, the same request again (its prompt prefix restored
+//! from the cross-turn cache) and a seeded sampled request each reach the acceptance floors
+//! ([`MIN_TOKENS_PER_PASS`], [`MIN_ACCEPTED_FRACTION`], set from the healthy MLX and Candle
+//! measurements); and that the sampled request reproduces. It prints each run's acceptance and
+//! reports the first position where the greedy stream differs from the same provider with
+//! speculation off (a
 //! multi-token verify rounds a few BF16 ULP differently from the single-token step, so real
 //! weights track rather than bit-match where a near-tie flips — exact agreement is proven on the
 //! tiny fixtures).
@@ -104,6 +107,10 @@ fn block_draft_on_the_27b(format: BlockDraftFormat, source_var: &str) {
     };
 
     let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+    // The first request prefills the prompt cold, so the draft's context starts with the prompt's
+    // tapped rows. The repeat restores the prompt's prefix from the cross-turn cache (when the
+    // load kept one) and the draft reads only the rows past it. Both are held to the floor: a
+    // context built from a cold prompt prefill must draft as well as one built from commits.
     let (ids, out) = generate(&provider, &request(block, Sampling::greedy()));
     let decode = out.decode.unwrap();
     assert_eq!(decode.proposer, ProposerKind::BlockDraft);
@@ -113,23 +120,24 @@ fn block_draft_on_the_27b(format: BlockDraftFormat, source_var: &str) {
         (named.format.as_str(), named.precision.as_str()),
         (format.label(), label)
     );
-    let per_pass =
-        (decode.accepted_tokens + decode.verify_steps) as f64 / decode.verify_steps as f64;
     println!(
-        "{} {label} depth {depth}: {} tokens, {} target passes, {per_pass:.2} tokens per target \
-         pass, {} accepted of {} proposed, graphs {:?}",
+        "{} {label} depth {depth}, graphs {:?}",
         format.label(),
-        ids.len(),
-        decode.verify_steps,
-        decode.accepted_tokens,
-        decode.proposed_tokens,
-        decode.cuda_graphs,
+        decode.cuda_graphs
     );
-    assert!(per_pass > 1.0, "the draft is accepted: {per_pass:.2}");
+    assert_accepts(&format!("{} greedy", format.label()), ids.len(), &decode);
 
     let (off, _) = generate(&provider, &request(Speculative::Off, Sampling::greedy()));
     let first = ids.iter().zip(&off).position(|(a, b)| a != b);
     println!("{}: first difference from off at {first:?}", format.label());
+
+    let (again, out) = generate(&provider, &request(block, Sampling::greedy()));
+    let decode = out.decode.unwrap();
+    assert_accepts(
+        &format!("{} greedy repeat", format.label()),
+        again.len(),
+        &decode,
+    );
 
     let sampled = Sampling {
         temperature: 0.7,
@@ -142,11 +150,46 @@ fn block_draft_on_the_27b(format: BlockDraftFormat, source_var: &str) {
     let decode = out.decode.unwrap();
     assert_eq!(decode.proposer, ProposerKind::BlockDraft);
     assert!(decode.draft.is_some());
+    assert_accepts(&format!("{} sampled", format.label()), a.len(), &decode);
+}
+
+/// The least tokens a greedy or sampled `block_draft` pass commits on this prompt at depth 4,
+/// draft and accepted together. The healthy measurements on these weights: MLX DSpine 2.09
+/// tokens per pass (99 of about 368 drafts accepted, 27%), MLX DFlash2 2.59, Candle DFlash2 2.36
+/// (110 of 317, 35%) and Candle DSpine sampled 2.10. 1.6 keeps 0.6 accepted drafts per pass, a
+/// little over half of the lowest healthy run's 1.08, as headroom for the backends' rounding
+/// (CUDA Q4_K against MLX affine 4-bit, BF16 reduction order); a draft that is right only by
+/// chance (the SW-7197 defect: 1.04, 7 of 726) fails it by fifteen times.
+const MIN_TOKENS_PER_PASS: f64 = 1.6;
+
+/// The least fraction of proposed drafts accepted: 15%, a little over half of the lowest healthy
+/// run's 27% (MLX DSpine), the same headroom as [`MIN_TOKENS_PER_PASS`].
+const MIN_ACCEPTED_FRACTION: f64 = 0.15;
+
+/// Print and check one run's acceptance against the floors.
+fn assert_accepts(what: &str, tokens: usize, decode: &core_llm::DecodeReport) {
+    let per_pass =
+        (decode.accepted_tokens + decode.verify_steps) as f64 / decode.verify_steps.max(1) as f64;
+    let fraction = decode.accepted_tokens as f64 / decode.proposed_tokens.max(1) as f64;
     println!(
-        "{} sampled: {} tokens, {:.2} tokens per target pass",
-        format.label(),
-        a.len(),
-        (decode.accepted_tokens + decode.verify_steps) as f64 / decode.verify_steps as f64,
+        "{what}: {tokens} tokens, {} target passes, {per_pass:.2} tokens per target pass, {} \
+         accepted of {} proposed ({:.1}%), prefix {} ({} restored tokens)",
+        decode.verify_steps,
+        decode.accepted_tokens,
+        decode.proposed_tokens,
+        fraction * 100.0,
+        decode.prefix_cache.path,
+        decode.prefix_hit_tokens,
+    );
+    assert!(
+        per_pass >= MIN_TOKENS_PER_PASS,
+        "{what}: {per_pass:.2} tokens per target pass, below {MIN_TOKENS_PER_PASS}"
+    );
+    assert!(
+        fraction >= MIN_ACCEPTED_FRACTION,
+        "{what}: {:.1}% of drafts accepted, below {:.0}%",
+        fraction * 100.0,
+        MIN_ACCEPTED_FRACTION * 100.0
     );
 }
 
