@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +45,45 @@ else:
 
 
 Download = Callable[..., Any]
+
+# Where the real-weight fleet keeps its Hugging Face home when the runner environment names none:
+# every Windows CUDA box uses `E:\HuggingFace`, every Mac `/Volumes/Models/huggingface`.
+FLEET_HUB_CACHE = {"nt": r"E:\HuggingFace\hub", "posix": "/Volumes/Models/huggingface/hub"}
+
+
+def runner_hub_cache(environ: dict | None = None, os_name: str | None = None) -> Path:
+    """Return the runner's Hugging Face hub cache, the one place real-weight downloads land.
+
+    Resolved the way `huggingface_hub` resolves it -- `HF_HUB_CACHE`, else `$HF_HOME/hub` -- and,
+    when the runner environment sets neither, the fleet's fixed root for this OS rather than the
+    library's `~/.cache/huggingface` default, which is not where any runner keeps its weights.
+    """
+    environ = os.environ if environ is None else environ
+    os_name = os.name if os_name is None else os_name
+    if environ.get("HF_HUB_CACHE"):
+        return Path(environ["HF_HUB_CACHE"]).expanduser()
+    if environ.get("HF_HOME"):
+        return Path(environ["HF_HOME"]).expanduser() / "hub"
+    return Path(FLEET_HUB_CACHE["nt" if os_name == "nt" else "posix"])
+
+
+def runner_cache_snapshot(model: dict, cache: Path) -> Path:
+    """Return the pinned snapshot's directory in a hub cache: `models--<org>--<name>/snapshots/<rev>`."""
+    repository_directory = "models--" + model["repository"].replace("/", "--")
+    return cache / repository_directory / "snapshots" / model["revision"]
+
+
+def export_environment(name: str, value: Path, environ: dict | None = None) -> None:
+    """Publish `name=value` to later steps of the job through `$GITHUB_ENV` (when running in one)."""
+    environ = os.environ if environ is None else environ
+    text = str(value)
+    if "\n" in text or "\r" in text:
+        raise RuntimeError(f"refusing to export a multi-line path for {name}: {text!r}")
+    github_env = environ.get("GITHUB_ENV")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as handle:
+            handle.write(f"{name}={text}\n")
+    print(f"{name}={text}", flush=True)
 
 
 def hf_cache_location(snapshot: Path) -> tuple[Path, str, str] | None:
@@ -529,7 +569,21 @@ def download_snapshot(**kwargs: Any) -> Any:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="model key in real-weight-models.toml")
-    parser.add_argument("--snapshot", required=True, type=snapshot_path)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--export",
+        metavar="NAME",
+        help=(
+            "materialize into the runner's Hugging Face hub cache (HF_HUB_CACHE, else "
+            "$HF_HOME/hub, else the fleet root) and export the snapshot path as NAME to later "
+            "steps through $GITHUB_ENV"
+        ),
+    )
+    target.add_argument(
+        "--snapshot",
+        type=snapshot_path,
+        help="materialize into this explicit directory (hand runs and non-cache lanes)",
+    )
     parser.add_argument(
         "--manifest",
         type=Path,
@@ -545,14 +599,29 @@ def main() -> int:
     )
     args = parser.parse_args()
     model = load_model(args.manifest, args.model)
-    downloaded = ensure_snapshot(
-        model,
-        args.snapshot,
-        download_snapshot,
-        require_materialization_provenance=args.require_materialization_provenance,
+    snapshot = (
+        runner_cache_snapshot(model, runner_hub_cache())
+        if args.export
+        else args.snapshot
     )
+    try:
+        downloaded = ensure_snapshot(
+            model,
+            snapshot,
+            download_snapshot,
+            require_materialization_provenance=args.require_materialization_provenance,
+        )
+    except RuntimeError as error:
+        print(
+            f"model snapshot: FAILED ({model['key']}@{model['revision']} at {snapshot}): {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     source = "downloaded" if downloaded else "cached"
-    print(f"model snapshot: OK ({model['key']}@{model['revision']}, {source})")
+    print(f"model snapshot: OK ({model['key']}@{model['revision']}, {source}, {snapshot})")
+    if args.export:
+        export_environment(args.export, snapshot)
     return 0
 
 
