@@ -830,6 +830,44 @@ class RunnerHubCacheTests(unittest.TestCase):
                 self.assertEqual(ensure_model_snapshot.main(), 0)
                 self.assertEqual(len(calls), 1)
 
+    def test_download_outside_the_runner_cache_is_refused_before_any_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elsewhere = root / "elsewhere" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+            calls = []
+            with self.assertRaisesRegex(RuntimeError, "outside this runner's Hugging Face hub cache"):
+                ensure_snapshot(
+                    MODEL, elsewhere, lambda **kwargs: calls.append(kwargs),
+                    download_root=root / "hub",
+                )
+            self.assertEqual(calls, [])
+
+    def test_complete_snapshot_outside_the_runner_cache_is_still_used(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elsewhere = root / "elsewhere" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+            (elsewhere / "weights").mkdir(parents=True)
+            (elsewhere / "config.json").write_text("{}", encoding="utf-8")
+            (elsewhere / "weights/model.safetensors").write_bytes(b"fixture")
+            self.assertFalse(
+                ensure_snapshot(MODEL, elsewhere, lambda **kwargs: None, download_root=root / "hub")
+            )
+
+    def test_download_through_a_symlinked_path_into_the_runner_cache_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "hub").mkdir()
+            (root / "alias").symlink_to(root / "hub")
+            snapshot = root / "alias" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+
+            def download(**kwargs) -> None:
+                target = runner_cache_snapshot(MODEL, Path(kwargs["cache_dir"]))
+                (target / "weights").mkdir(parents=True)
+                (target / "config.json").write_text("{}", encoding="utf-8")
+                (target / "weights/model.safetensors").write_bytes(b"fixture")
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, download, download_root=root / "hub"))
+
     def test_cli_failure_names_the_model_and_the_cache_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

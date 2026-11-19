@@ -77,6 +77,16 @@ def runner_cache_snapshot(model: dict, cache: Path) -> Path:
     return cache / repository_directory / "snapshots" / model["revision"]
 
 
+def _is_inside(path: Path, root: Path) -> bool:
+    """True when `path` lies inside `root` once both are resolved (symlinks, case on Windows)."""
+    resolved = os.path.normcase(os.path.realpath(path))
+    resolved_root = os.path.normcase(os.path.realpath(root))
+    try:
+        return os.path.commonpath([resolved, resolved_root]) == resolved_root
+    except ValueError:  # different Windows drives share no common path
+        return False
+
+
 def export_environment(name: str, value: Path, environ: dict | None = None) -> None:
     """Publish `name=value` to later steps of the job through `$GITHUB_ENV` (when running in one)."""
     environ = os.environ if environ is None else environ
@@ -414,8 +424,14 @@ def ensure_snapshot(
     download: Download,
     *,
     require_materialization_provenance: bool = False,
+    download_root: Path | None = None,
 ) -> bool:
-    """Return true after downloading, or false when an existing snapshot is valid."""
+    """Return true after downloading, or false when an existing snapshot is valid.
+
+    With `download_root`, a snapshot that needs any transfer must lie inside that directory (the
+    runner's Hugging Face hub cache); otherwise this refuses before a byte moves. A complete
+    snapshot elsewhere is still used as-is.
+    """
     try:
         verify_snapshot(
             model,
@@ -446,6 +462,12 @@ def ensure_snapshot(
     # fetch could not land them at this path. The staging projection below handles a cache-shaped
     # destination for them (see
     # `test_materialization_replaces_stale_destination_symlinks_and_extra_payload`).
+    if download_root is not None and not _is_inside(snapshot, download_root):
+        raise RuntimeError(
+            f"{model['key']} needs downloading, but its snapshot path {snapshot} is outside this "
+            f"runner's Hugging Face hub cache {download_root} (HF_HUB_CACHE, else $HF_HOME/hub, "
+            "else the fleet root). Point the lane's snapshot variable into that cache."
+        )
     location = hf_cache_location(snapshot)
     if location is not None and expected_materialization_receipt(model) is None:
         return _heal_in_cache(
@@ -603,17 +625,17 @@ def main() -> int:
     )
     args = parser.parse_args()
     model = load_model(args.manifest, args.model)
-    snapshot = (
-        runner_cache_snapshot(model, runner_hub_cache())
-        if args.export
-        else args.snapshot
-    )
+    hub_cache = runner_hub_cache()
+    snapshot = runner_cache_snapshot(model, hub_cache) if args.export else args.snapshot
     try:
         downloaded = ensure_snapshot(
             model,
             snapshot,
             download_snapshot,
             require_materialization_provenance=args.require_materialization_provenance,
+            # In a real-weight job every download lands in the runner's own cache; a hand run
+            # keeps writing wherever its operator pointed it.
+            download_root=hub_cache if os.environ.get("GITHUB_ACTIONS") == "true" else None,
         )
     except RuntimeError as error:
         print(
