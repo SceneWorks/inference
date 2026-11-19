@@ -115,6 +115,9 @@ mod real_breadth;
 #[path = "real_weights.rs"]
 mod real_weights;
 
+#[path = "sensenova_loop_real_weights.rs"]
+mod sensenova_loop_real_weights;
+
 #[path = "snapshot_hf.rs"]
 mod snapshot_hf;
 
@@ -138,6 +141,3 @@ mod thinking;
 
 #[path = "throughput_breakdown.rs"]
 mod throughput_breakdown;
-
-#[path = "sensenova_loop_real_weights.rs"]
-mod sensenova_loop_real_weights;
