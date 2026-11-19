@@ -4104,8 +4104,11 @@ impl LlamaProvider {
             &mut fallbacks,
         );
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
-        // will actually run, at the advertised row bound — else linear, by name. The multimodal
-        // paths prefill spliced embeddings and verify linearly.
+        // will actually run, at the advertised row bound — else linear, by name. An image or
+        // video request verifies its tree too (SW-7209): the candidates are text tokens after the
+        // prompt, at the anchor's M-RoPE text position (`mrope_delta`-shifted, all three axes
+        // equal) plus their depth, so the ancestor mask and the per-row recurrence are the text
+        // path's. Gemma 4 advertises no tree, which the resolution names.
         let tree = core_llm::resolve_tree_verify(
             req.speculative_verify,
             if route.width() == 0 {
@@ -4116,12 +4119,7 @@ impl LlamaProvider {
             &self.descriptor.capabilities,
         );
         fallbacks.extend(tree.fallback);
-        let tree_rows = if tree.max_rows > 0 && (multimodal || gemma4_mm_request) {
-            fallbacks.push(TREE_MULTIMODAL_LINEAR.into());
-            0
-        } else {
-            tree.max_rows as usize
-        };
+        let tree_rows = tree.max_rows as usize;
 
         // sc-20679: the request's KV cache, decided against the qualification table before any
         // K/V mutation — and, since sc-20682, before admission, so the estimate prices the cache
@@ -4465,6 +4463,7 @@ impl LlamaProvider {
                                         delivered: Some(&delivered),
                                         prefill_clock: clock,
                                         speculative_mode,
+                                        tree_rows,
                                         ..EngineOptions::default()
                                     },
                                 )
@@ -4517,6 +4516,7 @@ impl LlamaProvider {
                                         delivered: Some(&delivered),
                                         prefill_clock: clock,
                                         speculative_mode,
+                                        tree_rows,
                                         ..EngineOptions::default()
                                     },
                                 )
@@ -4556,6 +4556,7 @@ impl LlamaProvider {
                                     delivered: Some(&delivered),
                                     prefill_clock: clock,
                                     speculative_mode,
+                                    tree_rows,
                                     ..EngineOptions::default()
                                 },
                             )
@@ -4600,6 +4601,7 @@ impl LlamaProvider {
                             delivered: Some(&delivered),
                             prefill_clock: None,
                             speculative_mode,
+                            tree_rows,
                             ..EngineOptions::default()
                         },
                     )
@@ -5106,10 +5108,6 @@ fn recommended_depths() -> &'static core_llm::RecommendedDepths {
 fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
     core_llm::prompt_lookup_capabilities(max_depth, recommended_depths())
 }
-
-/// Why a multimodal request's tree verification ran linearly (feature SW-F328).
-const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not available on the \
-     multimodal decode path (its prompt is prefilled from spliced embeddings); verified linearly";
 
 /// Why a compressed-KV request's tree verification ran linearly (feature SW-F328): a compressed
 /// cache cannot keep an arbitrary accepted branch ([`KvCache::supports_tree_verify`]).

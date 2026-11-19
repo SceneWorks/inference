@@ -4865,6 +4865,228 @@ fn a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback() {
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback");
 }
 
+/// A constraint forbidding fixed ids, rewindable, recording what it accepted (SW-7209).
+struct ForbidIds {
+    allow: Vec<bool>,
+    accepted: Vec<i32>,
+}
+
+impl ConstraintMask for ForbidIds {
+    fn allowed(&mut self) -> &[bool] {
+        &self.allow
+    }
+    fn accept(&mut self, token: i32) {
+        self.accepted.push(token);
+    }
+}
+
+impl RewindableConstraintMask for ForbidIds {
+    fn checkpoint(&self) -> usize {
+        self.accepted.len()
+    }
+    fn rewind(&mut self, checkpoint: usize) {
+        self.accepted.truncate(checkpoint);
+    }
+}
+
+/// SW-7209 (Causal multimodal): the Qwen3-VL decoder's path — the [`synthetic_qwen3vl_provider`]
+/// `CausalLm` with interleaved M-RoPE, prefilled into its step cache with hand-built M-RoPE rows
+/// over an image run (`mrope_delta` −6) and a text tail whose trailing n-gram had two
+/// continuations, the cache shifted by the
+/// delta — runs prompt lookup's candidate trees at two depths, plain and constrained: each commits
+/// exactly the plain loop's greedy tokens (the prefill, then one step per token at its shifted
+/// text position), verifies branching trees with no tree fallback, and keeps only the accepted
+/// branch. Through the provider, a prompt-lookup image request under a 16-row tree bound on both
+/// image prompts decodes exactly `off`'s stream with tree verification and no tree fallback.
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop() {
+    use crate::decode::stream::GenerationConfig;
+    use crate::decode::{CancelFlag, StepModel, StepRequest};
+    use crate::primitives::sampler::SamplingParams;
+    use core_llm::{Sampling, Speculative, SpeculativeProposer, SpeculativeVerify};
+
+    let (_dir, provider) = synthetic_qwen3vl_provider();
+    let Decoder::Causal(model) = &provider.model else {
+        unreachable!("synthetic_qwen3vl_provider loads a CausalLm")
+    };
+    let device = model.device().clone();
+    let image = vl_special_ids(40).1 as i32;
+    let mut ids = vec![3, 9];
+    ids.extend([image; 9]);
+    // The trailing `11 3 9` was followed by both 4 and 6: the first lookup branches.
+    ids.extend([4, 11, 3, 9, 4, 11, 3, 9, 6, 11, 3, 9]);
+    let (t, h, w, delta) = model.mrope_positions(&ids, &[[1, 6, 6]], image, 2).unwrap();
+    assert_eq!(delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
+    let visual: Vec<bool> = ids.iter().map(|&id| id == image).collect();
+    let embeds = model
+        .embed_input_ids(&crate::primitives::input_ids(&ids, &device).unwrap())
+        .unwrap();
+    let (_, seq, hidden) = embeds.dims3().unwrap();
+    let shift: Vec<f32> = (0..seq * hidden)
+        .map(|i| {
+            let (row, col) = (i / hidden, i % hidden);
+            if visual[row] {
+                0.25 + ((row * 7 + col) % 13) as f32 * 0.02
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let shift = Tensor::from_vec(shift, (1, seq, hidden), &device)
+        .and_then(|t| t.to_dtype(embeds.dtype()))
+        .unwrap();
+    let embeds = (embeds + shift).unwrap();
+    let max_new = 24;
+    let prefill = |cache: &mut crate::primitives::StepKvCache| {
+        let logits = model
+            .step_prefill_mrope_deepstack(
+                &embeds,
+                [t.as_slice(), h.as_slice(), w.as_slice()],
+                cache,
+                &visual,
+                &[],
+            )
+            .unwrap();
+        cache.set_rope_delta(delta);
+        logits
+    };
+    let host = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let forbidden = [1usize, 9];
+    let mut tree_passes = 0;
+    for depth in [2usize, 5] {
+        for constrained in [false, true] {
+            let label = format!("qwen3-vl prompt lookup depth {depth} constrained {constrained}");
+            let allow: Vec<bool> = (0..40)
+                .map(|i| !constrained || !forbidden.contains(&i))
+                .collect();
+            let capacity = ids.len()
+                + max_new
+                + crate::decode::tree_extra_positions(
+                    depth,
+                    core_llm::tree_workspace_rows(ProposerKind::PromptLookup, 16),
+                );
+            // The plain loop: the prefill, then one greedy step per token.
+            let mut cache = model.new_cache_for(capacity, depth).unwrap();
+            let mut logits = prefill(&mut cache);
+            let mut expected = Vec::new();
+            loop {
+                let row = host(&logits);
+                let token = (0..row.len())
+                    .filter(|&i| allow[i])
+                    .fold(None, |b: Option<usize>, i| match b {
+                        Some(b) if row[b] >= row[i] => Some(b),
+                        _ => Some(i),
+                    })
+                    .unwrap() as i32;
+                expected.push(token);
+                if expected.len() == max_new {
+                    break;
+                }
+                logits = model
+                    .forward_step(&mut cache, StepRequest::last(&[token]))
+                    .unwrap()
+                    .logits;
+            }
+            let mut constraint = ForbidIds {
+                allow: allow.clone(),
+                accepted: Vec::new(),
+            };
+            let mut cache = model.new_cache_for(capacity, depth).unwrap();
+            let logits = prefill(&mut cache);
+            let run = crate::decode::generate_speculative_monitored(
+                model,
+                &mut crate::decode::NgramProposer::default(),
+                crate::decode::SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &ids,
+                    position_delta: delta,
+                    warm_proposer: true,
+                },
+                &GenerationConfig {
+                    max_new_tokens: max_new,
+                    sampling: SamplingParams::default(),
+                    seed: Some(7),
+                    stop_tokens: Vec::new(),
+                },
+                depth,
+                &CancelFlag::new(),
+                &mut |_| {},
+                constrained.then_some(&mut constraint as &mut dyn RewindableConstraintMask),
+                None,
+                None,
+                Speculative::Off,
+                16,
+            )
+            .unwrap();
+            assert_eq!(run.output.tokens, expected, "{label}");
+            if constrained {
+                assert_eq!(constraint.accepted, expected, "{label}: constraint");
+            }
+            assert_eq!(run.record.proposer, ProposerKind::PromptLookup, "{label}");
+            assert_eq!(run.record.tree_fallback, None, "{label}");
+            assert_eq!(
+                crate::primitives::DecodeCache::len(&cache) as usize,
+                ids.len() + expected.len() - 1,
+                "{label}: the accepted branch only"
+            );
+            let tree = run.record.tree_verify.expect("a tree run reports its tree");
+            assert_eq!(tree.passes, run.record.verify_steps, "{label}");
+            println!(
+                "QWEN3VL_PROMPT_LOOKUP_TREE {label}: passes={} tree_passes={} accepted={}",
+                tree.passes, tree.tree_passes, run.record.accepted_tokens
+            );
+            tree_passes += tree.tree_passes;
+        }
+    }
+    assert!(tree_passes > 0, "prompt lookup verified branching trees");
+
+    // Through the provider: the Qwen3-VL multimodal route under a tree bound.
+    let mut provider_tree_passes = 0;
+    for prompt in image_fixture_prompts() {
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 3);
+        let off =
+            core_llm_testkit::bench_request(&prompt, Speculative::Off, &Sampling::greedy(), 24);
+        let tree = core_llm::TextLlmRequest {
+            speculative_verify: SpeculativeVerify::Tree { max_rows: 16 },
+            ..core_llm_testkit::bench_request(&prompt, lookup, &Sampling::greedy(), 24)
+        };
+        let (off_events, _) = token_events(&provider, &off);
+        let (events, out) = token_events(&provider, &tree);
+        assert_eq!(events, off_events, "{}: the off stream", prompt.id);
+        let report = out.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::PromptLookup, "{}", prompt.id);
+        assert!(
+            report.fallbacks.iter().all(|f| !f.contains("tree")),
+            "{}: {:?}",
+            prompt.id,
+            report.fallbacks
+        );
+        let t = report
+            .tree_verify
+            .expect("the tree request reports its tree");
+        assert_eq!(t.passes, report.verify_steps, "{}", prompt.id);
+        provider_tree_passes += t.tree_passes;
+    }
+    println!("QWEN3VL_PROMPT_LOOKUP_TREE provider: {provider_tree_passes} branching tree passes");
+    assert!(
+        provider_tree_passes > 0,
+        "the provider verified branching trees"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop");
+}
+
 /// The report the output carries is the record's, with the provider's fallback reasons passed
 /// through verbatim and in order.
 #[test]

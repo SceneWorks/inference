@@ -7062,6 +7062,236 @@ fn qwen35_provider_with_block_draft(format: core_llm::BlockDraftFormat) -> Llama
     provider
 }
 
+/// [`qwen35_provider_with_block_draft`] made a Qwen3.5 VLM (SW-7209): the tiny target with room
+/// for an image's tokens, a one-block synthetic vision tower merging into its width, and the
+/// word tokenizer with the Qwen-VL specials (`<|vision_start|>`, `<|image_pad|>`,
+/// `<|vision_end|>`) as its last three ids — the Candle VLM fixture's shape.
+fn qwen35_vl_provider_with_block_draft(format: core_llm::BlockDraftFormat) -> LlamaProvider {
+    use crate::primitives::sampler::{SplitMix64, TokenRng};
+    let mut provider = qwen35_provider_with_block_draft(format);
+    let mut v = crate::models::qwen35::tests::cfg_json();
+    v["text_config"]["hidden_size"] = 64.into();
+    v["text_config"]["intermediate_size"] = 128.into();
+    v["text_config"]["max_position_embeddings"] = 512.into();
+    let cfg = Qwen35Config::from_json(&v).unwrap();
+    let weights = crate::models::qwen35::tests::synthetic_weights(&cfg);
+    let model = Qwen35Model::from_weights(&weights, "model.language_model", cfg).unwrap();
+    provider.descriptor.capabilities.max_context_tokens = 512;
+    provider.model = Decoder::Qwen35(Box::new(model));
+    let (hid, inter, positions, out) = (16i32, 32i32, 16i32, 64i32);
+    let mut rng = SplitMix64::new(0x0056_1510);
+    let mut tensors = std::collections::HashMap::new();
+    let mut put = |key: &str, dims: &[i32]| {
+        let n: i32 = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+        tensors.insert(
+            format!("model.visual.{key}"),
+            Array::from_slice(&data, dims),
+        );
+    };
+    put("patch_embed.proj.weight", &[hid, 3, 2, 16, 16]);
+    put("patch_embed.proj.bias", &[hid]);
+    put("pos_embed.weight", &[positions, hid]);
+    for (key, dims) in [
+        ("norm1.weight", vec![hid]),
+        ("norm1.bias", vec![hid]),
+        ("norm2.weight", vec![hid]),
+        ("norm2.bias", vec![hid]),
+        ("attn.qkv.weight", vec![3 * hid, hid]),
+        ("attn.qkv.bias", vec![3 * hid]),
+        ("attn.proj.weight", vec![hid, hid]),
+        ("attn.proj.bias", vec![hid]),
+        ("mlp.linear_fc1.weight", vec![inter, hid]),
+        ("mlp.linear_fc1.bias", vec![inter]),
+        ("mlp.linear_fc2.weight", vec![hid, inter]),
+        ("mlp.linear_fc2.bias", vec![hid]),
+    ] {
+        put(&format!("blocks.0.{key}"), &dims);
+    }
+    put("merger.norm.weight", &[hid]);
+    put("merger.norm.bias", &[hid]);
+    put("merger.linear_fc1.weight", &[4 * hid, 4 * hid]);
+    put("merger.linear_fc1.bias", &[4 * hid]);
+    put("merger.linear_fc2.weight", &[out, 4 * hid]);
+    put("merger.linear_fc2.bias", &[out]);
+    let vcfg = crate::models::Qwen35VisionConfig {
+        depth: 1,
+        hidden_size: hid,
+        num_heads: 2,
+        intermediate_size: inter,
+        in_channels: 3,
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        out_hidden_size: out,
+        num_position_embeddings: positions,
+        deepstack_visual_indexes: Vec::new(),
+    };
+    let tower = Qwen35VisionModel::from_weights(
+        &crate::primitives::Weights::from_map(tensors),
+        "model.visual",
+        vcfg,
+    )
+    .unwrap();
+    let vocab = 50usize;
+    let specials = [
+        (vocab - 3, "<|vision_start|>"),
+        (vocab - 2, "<|image_pad|>"),
+        (vocab - 1, "<|vision_end|>"),
+    ];
+    let piece = |i: usize| {
+        specials
+            .iter()
+            .find(|(id, _)| *id == i)
+            .map_or_else(|| format!("t{i}"), |(_, s)| s.to_string())
+    };
+    let entries: Vec<String> = (0..vocab)
+        .map(|i| format!("\"{}\": {i}", piece(i)))
+        .collect();
+    let added: Vec<String> = specials
+        .iter()
+        .map(|(id, content)| {
+            format!(
+                r#"{{"id": {id}, "content": "{content}", "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true}}"#
+            )
+        })
+        .collect();
+    provider.tokenizer = Tokenizer::from_json(&format!(
+        r#"{{"version": "1.0", "added_tokens": [{}], "normalizer": null,
+            "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null, "decoder": null,
+            "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+        added.join(", "),
+        entries.join(", ")
+    ))
+    .unwrap();
+    provider.vision = Some(Qwen35Vision {
+        tower,
+        processor: Qwen35ImageProcessor::default(),
+        image_token_id: (vocab - 2) as i32,
+        // No video placeholder occurs in these prompts.
+        video_token_id: (vocab - 4) as i32,
+        spatial_merge_size: 2,
+    });
+    provider.descriptor.capabilities.supports_vision = true;
+    provider
+}
+
+/// SW-7209 AC1 through the provider: a Qwen3.5 VLM with a resident draft of either format runs
+/// a greedy image + text `block_draft` request under a 16-row tree bound — the image at the head
+/// of the prompt and mid-prompt — that decodes exactly `off`'s stream, its report naming the
+/// draft, no tree or `block_draft` fallback, and the tree passes with their rows checked and
+/// accepted tokens; a seeded sampled tree request reproduces and verifies its trees too.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn a_block_draft_tree_verifies_an_image_request() {
+    use core_llm::{Content, ImageRef, Role, Speculative, SpeculativeVerify};
+    let (w, h) = (256u32, 256u32);
+    let pixels = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            [x as u8, y as u8, ((x + y) / 2) as u8]
+        })
+        .collect();
+    let image = Content::Image(ImageRef::new(w, h, pixels).unwrap());
+    let text = Content::text("t3 t7 t11 t2 t7 t11 t3 t7 t11 t2");
+    for format in core_llm::BlockDraftFormat::ALL {
+        let provider = qwen35_vl_provider_with_block_draft(format);
+        let mut tree_passes = 0;
+        for (id, content) in [
+            ("image_then_text", vec![image.clone(), text.clone()]),
+            ("text_then_image", vec![text.clone(), image.clone()]),
+        ] {
+            let label = format!("{} {id}", format.label());
+            let request = |speculative, sampling, verify| TextLlmRequest {
+                messages: vec![Message {
+                    role: Role::User,
+                    content: content.clone(),
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                }],
+                sampling,
+                max_new_tokens: 24,
+                seed: Some(3),
+                speculative: Some(speculative),
+                speculative_verify: verify,
+                ..Default::default()
+            };
+            let block = Speculative::proposer(SpeculativeProposer::BlockDraft, 3);
+            let tree = SpeculativeVerify::Tree { max_rows: 16 };
+            let (off, off_ids) = run(
+                &provider,
+                &request(
+                    Speculative::Off,
+                    Sampling::greedy(),
+                    SpeculativeVerify::Linear,
+                ),
+            );
+            assert!(
+                off.usage.prompt_tokens > 64,
+                "{label}: the image tokens are in the prompt"
+            );
+            let sampled = Sampling {
+                temperature: 1.0,
+                top_k: 6,
+                ..Sampling::greedy()
+            };
+            for (mode, sampling) in [("greedy", Sampling::greedy()), ("sampled", sampled)] {
+                let label = format!("{label} {mode}");
+                let (out, ids) = run(&provider, &request(block, sampling, tree));
+                if mode == "greedy" {
+                    assert_eq!(ids, off_ids, "{label}: the off stream");
+                } else {
+                    let (_, again) = run(&provider, &request(block, sampling, tree));
+                    assert_eq!(
+                        ids, again,
+                        "{label}: a seeded sampled tree request reproduces"
+                    );
+                }
+                let report = out.decode.unwrap();
+                assert_eq!(report.proposer, ProposerKind::BlockDraft, "{label}");
+                assert_eq!(
+                    report.draft.as_ref().map(|d| d.format.as_str()),
+                    Some(format.label())
+                );
+                assert!(
+                    report
+                        .fallbacks
+                        .iter()
+                        .all(|f| !f.contains("tree") && !f.contains("block_draft")),
+                    "{label}: {:?}",
+                    report.fallbacks
+                );
+                let t = report
+                    .tree_verify
+                    .expect("an image tree request reports its tree");
+                assert_eq!(t.max_rows, 16, "{label}");
+                assert_eq!(t.passes, report.verify_steps, "{label}: every pass counted");
+                assert_eq!(t.accepted_tokens, report.accepted_tokens, "{label}");
+                assert!(t.tree_passes == 0 || t.tree_rows_verified > t.tree_passes);
+                println!(
+                    "BLOCK_DRAFT_IMAGE_TREE {label}: passes={} tree_passes={} \
+                     rows_per_tree_pass={:.2} accepted_per_tree_pass={:.2}",
+                    t.passes,
+                    t.tree_passes,
+                    t.rows_per_tree_pass().unwrap_or(0.0),
+                    t.accepted_per_tree_pass().unwrap_or(0.0)
+                );
+                tree_passes += t.tree_passes;
+            }
+        }
+        assert!(
+            tree_passes > 0,
+            "{}: branching trees verified",
+            format.label()
+        );
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_block_draft_tree_verifies_an_image_request"
+    );
+}
+
 /// A `block_draft` request's activations — the target's tapped rows the draft reads among them —
 /// are priced at the target's compute element: an f32 element (a Prism target's priced compute)
 /// holds exactly twice a bf16 one's, and the provider passes its own geometry's element.

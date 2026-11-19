@@ -1,7 +1,7 @@
-//! Real-weight block-draft smokes (epic SW-F360, stories SW-7193, SW-7194, SW-7195 and SW-7196),
-//! `#[ignore]`d: the Qwen3.8-27B target with the DSpine or the DFlash2 draft resident beside it,
-//! through the provider, on a text request and on an image + text request (the image generated
-//! in the test).
+//! Real-weight block-draft smokes (epic SW-F360, stories SW-7193, SW-7194, SW-7195 and SW-7196;
+//! SW-7209), `#[ignore]`d: the Qwen3.8-27B target with the DSpine or the DFlash2 draft resident
+//! beside it, through the provider, on a text request and on an image + text request (the image
+//! generated in the test), linearly and under tree verification.
 //!
 //! It reads the pinned snapshots under the explicit models root `MLX_GEN_MODELS_ROOT` (a Hugging
 //! Face Hub-layout root holding `models--*/snapshots`; inference never derives a cache location,
@@ -235,6 +235,21 @@ fn generate_image(
     provider: &mlx_llm::LlamaProvider,
     speculative: Speculative,
 ) -> (Vec<u32>, core_llm::TextLlmOutput) {
+    generate_image_with(
+        provider,
+        speculative,
+        Sampling::greedy(),
+        SpeculativeVerify::Linear,
+    )
+}
+
+/// [`generate_image`] under `sampling` (seeded) and the verify layout `verify` (SW-7209).
+fn generate_image_with(
+    provider: &mlx_llm::LlamaProvider,
+    speculative: Speculative,
+    sampling: Sampling,
+    verify: SpeculativeVerify,
+) -> (Vec<u32>, core_llm::TextLlmOutput) {
     let (w, h) = (448u32, 448u32);
     let mut pixels = Vec::with_capacity((w * h * 3) as usize);
     for _ in 0..h {
@@ -259,11 +274,12 @@ fn generate_image(
             thinking: None,
             tool_calls: Vec::new(),
         }],
-        sampling: Sampling::greedy(),
+        sampling,
         max_new_tokens: 160,
         seed: Some(0),
         thinking: ThinkingMode::Disabled,
         speculative: Some(speculative),
+        speculative_verify: verify,
         ..Default::default()
     };
     let mut ids = Vec::new();
@@ -498,5 +514,187 @@ fn qwen38_27b_dflash2_tree_verifies_its_candidates() {
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dflash2_tree_verifies_its_candidates"
+    );
+}
+
+/// The least tokens a block-draft target pass commits on the image request, draft and accepted
+/// together: the Candle smokes' floor (`MIN_TOKENS_PER_PASS` in `candle-llm/tests/block_draft.rs`,
+/// set from the healthy MLX and Candle measurements: MLX DSpine 2.09, DFlash2 2.59 tokens per
+/// pass on text), with the same headroom for rounding.
+const MIN_TOKENS_PER_PASS: f64 = 1.6;
+
+/// The least fraction of the draft depth the accepted branch fills per pass: 15%, the Candle
+/// smokes' accepted-draft floor. A tree pass proposes up to 16 rows for at most `depth` accepted
+/// tokens, so its floor is taken against the `depth` a linear pass proposes, not the tree's rows.
+const MIN_ACCEPTED_FRACTION: f64 = 0.15;
+
+/// The greedy tokens a tree stream must share with the speculation-off stream before they may
+/// part (the Candle smokes' `MIN_GREEDY_AGREEMENT`): a multi-row verify rounds a few BF16 ULPs
+/// differently from the one-row step on a near-tie, but a committed draft the target did not
+/// verify parts them within the first few passes.
+const MIN_GREEDY_AGREEMENT: usize = 16;
+
+/// Load the pinned describer target with the block draft and run the image + text request under
+/// a 16-row tree, greedy and seeded sampled (SW-7209, AC1/AC2): each run verifies branching trees
+/// with no tree or `block_draft` fallback, names the draft as `format`, reports its rows checked
+/// and tokens accepted per pass and per tree pass, and holds [`MIN_TOKENS_PER_PASS`] and
+/// [`MIN_ACCEPTED_FRACTION`], and accepts at least as many drafts per pass as the same request
+/// verified linearly (both reported); the greedy tree stream agrees with speculation off for at
+/// least [`MIN_GREEDY_AGREEMENT`] tokens; the sampled run reproduces. Every arm runs and prints
+/// before any check fails.
+fn image_tree_verifies_block_draft_candidates(
+    target_var: &str,
+    source_var: &str,
+    precision_var: &str,
+    draft_snapshot: &str,
+    format: &str,
+    depth: u32,
+) {
+    let (provider, _, _) =
+        load_with_block_draft(target_var, source_var, precision_var, draft_snapshot);
+    let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+    let tree = SpeculativeVerify::Tree { max_rows: 16 };
+    let sampled = Sampling {
+        temperature: 0.7,
+        top_p: 0.95,
+        ..Sampling::greedy()
+    };
+    let mut failures = Vec::new();
+    let (off, _) = generate_image(&provider, Speculative::Off);
+    for (mode, sampling) in [("greedy", Sampling::greedy()), ("sampled", sampled)] {
+        let what = format!("{format} image {mode} tree depth {depth}");
+        let (ids, out) = generate_image_with(&provider, block, sampling, tree);
+        let decode = out.decode.unwrap();
+        let Some(report) = decode.tree_verify else {
+            failures.push(format!("{what}: the tree request ran no tree"));
+            continue;
+        };
+        let passes = decode.verify_steps.max(1) as f64;
+        let per_pass = (decode.accepted_tokens + decode.verify_steps) as f64 / passes;
+        let filled = decode.accepted_tokens as f64 / (passes * f64::from(depth));
+        println!(
+            "BLOCK_DRAFT_IMAGE_TREE {what}: {} tokens, {} target passes, {per_pass:.2} tokens per \
+             pass, {:.1}% of the depth accepted, tree_passes={} rows_verified_per_pass={:.2} \
+             accepted_per_pass={:.2} rows_per_tree_pass={:.2} accepted_per_tree_pass={:.2} \
+             max_rows_per_pass={} peak_workspace_bytes={} draft={:?} fallbacks={:?} text={:?}",
+            ids.len(),
+            decode.verify_steps,
+            filled * 100.0,
+            report.tree_passes,
+            report.rows_per_pass().unwrap_or(0.0),
+            report.accepted_per_pass().unwrap_or(0.0),
+            report.rows_per_tree_pass().unwrap_or(0.0),
+            report.accepted_per_tree_pass().unwrap_or(0.0),
+            report.max_rows_per_pass,
+            report.peak_workspace_bytes,
+            decode.draft,
+            decode.fallbacks,
+            out.text,
+        );
+        if decode.proposer != ProposerKind::BlockDraft
+            || decode.draft.as_ref().map(|d| d.format.as_str()) != Some(format)
+        {
+            failures.push(format!(
+                "{what}: ran {:?} with draft {:?}",
+                decode.proposer, decode.draft
+            ));
+        }
+        if let Some(f) = decode
+            .fallbacks
+            .iter()
+            .find(|f| f.contains("tree") || f.contains("block_draft"))
+        {
+            failures.push(format!("{what}: fell back: {f}"));
+        }
+        if report.max_rows != 16
+            || report.tree_passes == 0
+            || report.passes != decode.verify_steps
+            || report.accepted_tokens != decode.accepted_tokens
+            || report.tree_rows_verified <= report.tree_passes
+            || report.tree_accepted_tokens > report.accepted_tokens
+        {
+            failures.push(format!(
+                "{what}: the tree report disagrees with the run: {report:?}"
+            ));
+        }
+        // The same request verified linearly: the tree accepts at least as many drafts per pass.
+        let (_, linear) =
+            generate_image_with(&provider, block, sampling, SpeculativeVerify::Linear);
+        let linear = linear.decode.unwrap();
+        let tree_accepted = decode.accepted_tokens as f64 / passes;
+        let linear_accepted = linear.accepted_tokens as f64 / linear.verify_steps.max(1) as f64;
+        println!(
+            "{what}: accepted per pass {tree_accepted:.2} under the tree, {linear_accepted:.2} \
+             linear ({} linear passes, linear fallbacks {:?})",
+            linear.verify_steps, linear.fallbacks
+        );
+        if tree_accepted < linear_accepted {
+            failures.push(format!(
+                "{what}: {tree_accepted:.2} accepted per tree pass, below the linear run's \
+                 {linear_accepted:.2}"
+            ));
+        }
+        if per_pass < MIN_TOKENS_PER_PASS || filled < MIN_ACCEPTED_FRACTION {
+            failures.push(format!(
+                "{what}: {per_pass:.2} tokens per target pass and {:.1}% of the depth accepted, \
+                 below {MIN_TOKENS_PER_PASS} and {:.0}%",
+                filled * 100.0,
+                MIN_ACCEPTED_FRACTION * 100.0
+            ));
+        }
+        if mode == "greedy" {
+            let first = ids.iter().zip(&off).position(|(a, b)| a != b);
+            let agreed = first.unwrap_or(ids.len().min(off.len()));
+            println!("{what}: first difference from off at {first:?}");
+            if agreed < MIN_GREEDY_AGREEMENT.min(ids.len().min(off.len())) {
+                failures.push(format!(
+                    "{what}: parts from off at token {agreed}, inside the first \
+                     {MIN_GREEDY_AGREEMENT}: {ids:?} against {off:?}"
+                ));
+            }
+        } else {
+            let (again, _) = generate_image_with(&provider, block, sampling, tree);
+            if again != ids {
+                failures.push(format!(
+                    "{what}: a seeded sampled tree run does not reproduce"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+#[ignore = "needs the pinned Qwen3.8-27B target and DSpine draft under MLX_GEN_MODELS_ROOT"]
+fn qwen38_27b_dspine_tree_verifies_an_image_request() {
+    image_tree_verifies_block_draft_candidates(
+        "MLX_LLM_BLOCK_DRAFT_TARGET",
+        "MLX_LLM_BLOCK_DRAFT_SOURCE",
+        "MLX_LLM_BLOCK_DRAFT_PRECISION",
+        DRAFT_SNAPSHOT,
+        "dspine",
+        4,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dspine_tree_verifies_an_image_request"
+    );
+}
+
+#[test]
+#[ignore = "needs the pinned Qwen3.8-27B target and DFlash2 draft under MLX_GEN_MODELS_ROOT"]
+fn qwen38_27b_dflash2_tree_verifies_an_image_request() {
+    image_tree_verifies_block_draft_candidates(
+        "MLX_LLM_DFLASH2_TARGET",
+        "MLX_LLM_DFLASH2_SOURCE",
+        "MLX_LLM_DFLASH2_PRECISION",
+        DFLASH2_SNAPSHOT,
+        "dflash2",
+        // The advertised max (see `qwen38_27b_dflash2_accepts_more_than_one_token_per_pass`).
+        4,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED block_draft::qwen38_27b_dflash2_tree_verifies_an_image_request"
     );
 }

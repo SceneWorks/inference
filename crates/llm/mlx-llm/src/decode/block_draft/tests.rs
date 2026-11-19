@@ -549,6 +549,9 @@ fn sampled_block_draft_keeps_the_target_distribution() {
 /// The image placeholder id of the multimodal fixture (any non-mask id of the tiny vocabulary).
 const IMAGE: i32 = 7;
 
+/// The video placeholder id of the multimodal fixture (SW-7209).
+const VIDEO: i32 = 8;
+
 /// A fused image + text prompt over the tiny target, prepared as the provider prepares one
 /// (SW-7195, E10): `[3, 9, image × 9, 4, 11, 3]` with a `1 × 6 × 6` image grid merged by 2 — nine
 /// visual rows on a 3 × 3 M-RoPE grid, so the text after the image sits 6 positions below its
@@ -566,12 +569,35 @@ struct ImagePrompt {
 
 impl ImagePrompt {
     fn new(model: &Qwen35Model) -> Self {
+        let prompt = Self::visual(model, &[[1, 6, 6]], &[]);
+        assert_eq!(prompt.delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
+        prompt
+    }
+
+    /// A fused prompt `[3, 9, visuals…, 4, 11, 3]` over `images` (each a run of [`IMAGE`]) then
+    /// `videos` (each one run of [`VIDEO`] per frame, frames parted by a timestamp-like text
+    /// token, as the provider renders a clip), every grid merged by 2 (SW-7209): the visual
+    /// rows' embeddings shifted as encoder features would be, one DeepStack feature set fused
+    /// after layer 0, and the M-RoPE rows and `mrope_delta` of the shared position rule.
+    fn visual(model: &Qwen35Model, images: &[[i32; 3]], videos: &[[i32; 3]]) -> Self {
         let mut ids = vec![3, 9];
-        ids.extend([IMAGE; 9]);
+        for g in images {
+            ids.extend(std::iter::repeat_n(IMAGE, (g[1] * g[2] / 4) as usize));
+        }
+        for g in videos {
+            for frame in 0..g[0] {
+                if frame > 0 {
+                    ids.push(5);
+                }
+                ids.extend(std::iter::repeat_n(VIDEO, (g[1] * g[2] / 4) as usize));
+            }
+        }
         ids.extend([4, 11, 3]);
-        let (t, h, w, delta) = model.mrope_positions(&ids, &[[1, 6, 6]], IMAGE, 2).unwrap();
-        assert_eq!(delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
-        let visual: Vec<bool> = ids.iter().map(|&id| id == IMAGE).collect();
+        let (t, h, w, delta) =
+            crate::models::deepstack::mrope_positions_mm(&ids, images, IMAGE, videos, VIDEO, 2)
+                .unwrap();
+        let visual: Vec<bool> = ids.iter().map(|&id| id == IMAGE || id == VIDEO).collect();
+        let rows = visual.iter().filter(|&&v| v).count();
         let embeds = model.embed_input_ids(&input_ids(&ids)).unwrap();
         let shape = embeds.shape().to_vec();
         let hidden = shape[2] as usize;
@@ -587,10 +613,10 @@ impl ImagePrompt {
         let embeds = Array::from_slice(&values, &shape)
             .as_dtype(embeds.dtype())
             .unwrap();
-        let feature: Vec<f32> = (0..9 * hidden)
+        let feature: Vec<f32> = (0..rows * hidden)
             .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
             .collect();
-        let deepstack = vec![Array::from_slice(&feature, &[9, hidden as i32])];
+        let deepstack = vec![Array::from_slice(&feature, &[rows as i32, hidden as i32])];
         Self {
             ids,
             embeds,
@@ -1409,11 +1435,13 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
     );
 }
 
-/// A block-draft proposer that cancels the request as it hands over its tree, keeping the tree.
+/// A block-draft proposer that cancels the request as it hands over its tree, keeping the tree
+/// and the RoPE position the engine gave its anchor.
 struct CancelOnTree<'d, 'c> {
     inner: BlockDraftProposer<'d>,
     cancel: &'c CancelFlag,
     tree: Option<DraftTree>,
+    position: Option<i32>,
 }
 
 impl<'t> Proposer<TappedQwen35<'t>> for CancelOnTree<'_, '_> {
@@ -1448,6 +1476,7 @@ impl<'t> Proposer<TappedQwen35<'t>> for CancelOnTree<'_, '_> {
         let tree = self.inner.propose_tree(target, ctx, sampler)?;
         self.cancel.cancel();
         self.tree = Some(tree.clone());
+        self.position = Some(ctx.position);
         Ok(tree)
     }
     fn commit(
@@ -1505,6 +1534,7 @@ fn an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean() {
             inner: BlockDraftProposer::new(draft),
             cancel: &cancel,
             tree: None,
+            position: None,
         };
         let (run, cache) = run_block_tree(
             &target,
@@ -1572,5 +1602,768 @@ fn an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean() {
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean"
+    );
+}
+
+// ---- Tree verification on image prompts (SW-7209). ----
+
+/// The engine under a tree request of `tree_rows` candidate rows from the tapped multimodal
+/// prefill of `prompt` — the provider's image path: M-RoPE positions, DeepStack fusion, the
+/// continuation shifted by `mrope_delta` — unpipelined, so the cache ends at the committed length.
+#[allow(clippy::too_many_arguments)]
+fn run_image_block_tree<'t, P: Proposer<TappedQwen35<'t>> + ?Sized>(
+    target: &TappedQwen35<'t>,
+    proposer: &mut P,
+    prompt: &ImagePrompt,
+    config: &GenerationConfig,
+    depth: usize,
+    tree_rows: usize,
+    constraint: Option<&mut Forbid>,
+    cancel: &CancelFlag,
+) -> (SpeculativeRun, Qwen35Cache) {
+    let (mut cache, taps, logits) = prompt.prefill(target.model, &target.layers, target.keep);
+    let run = generate_speculative(
+        target,
+        proposer,
+        SpeculativePrompt::Prefilled {
+            cache: &mut cache,
+            logits,
+            hidden: Some(taps),
+            history: &prompt.ids,
+            position_delta: prompt.delta,
+        },
+        config,
+        depth,
+        cancel,
+        &mut |_| {},
+        EngineOptions {
+            constraint: constraint.map(|c| c as &mut dyn RewindableConstraintMask),
+            pipelining: Pipelining::Off,
+            tree_rows,
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    (run, cache)
+}
+
+/// SW-7209 AC1/AC2 (greedy): on the image + text prompt and on a two-frame video + text prompt
+/// with tree verification on, for each format at every draft precision (BF16, Q8, Q4), two
+/// depths, plain and constrained, the block
+/// draft's candidate trees commit exactly the plain loop's tokens over the same fused prompt (the
+/// constraint sees the same accepted sequence); the runs verify branching trees in one forward
+/// each at the M-RoPE-shifted text positions, accept and reject candidates, and report rows and
+/// accepted tokens per tree pass with no tree fallback.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn greedy_image_block_draft_tree_is_the_plain_loop() {
+    let model = tiny_target();
+    // An image, and a two-frame video (SW-7209 review): the frames sit at different temporal
+    // positions, so its `mrope_delta` is the video rule's, not the image's.
+    let prompts = [
+        ("image", ImagePrompt::new(&model)),
+        ("video", ImagePrompt::visual(&model, &[], &[[2, 6, 6]])),
+    ];
+    assert!(prompts[1].1.delta < 0 && prompts[1].1.delta != prompts[0].1.delta);
+    let mut totals: HashMap<&str, (u64, u64, u64)> = HashMap::new();
+    for precision in [
+        None,
+        Some(BlockDraftPrecision::Q8),
+        Some(BlockDraftPrecision::Q4),
+    ] {
+        for (format, draft) in tiny_drafts(precision) {
+            let target = TappedQwen35::for_draft(&model, &draft);
+            for (depth, (kind, prompt)) in [2usize, 5]
+                .into_iter()
+                .flat_map(|d| prompts.iter().map(move |p| (d, p)))
+            {
+                for constrained in [false, true] {
+                    let label = format!(
+                        "{format} {precision:?} depth {depth} constrained {constrained} {kind} tree"
+                    );
+                    let mut constraint = Forbid::new(&[1, 9]);
+                    let allow = constraint.allow.clone();
+                    let expected =
+                        plain_image(&model, prompt, 24, constrained.then_some(allow.as_slice()));
+                    let mut proposer = BlockDraftProposer::new(&draft);
+                    let (run, _) = run_image_block_tree(
+                        &target,
+                        &mut proposer,
+                        prompt,
+                        &config(24, 7),
+                        depth,
+                        16,
+                        constrained.then_some(&mut constraint),
+                        &CancelFlag::new(),
+                    );
+                    assert_eq!(run.output.tokens, expected, "{label}");
+                    if constrained {
+                        assert_eq!(constraint.accepted, expected, "{label}: constraint");
+                    }
+                    assert_eq!(run.report.proposer, ProposerKind::BlockDraft, "{label}");
+                    assert_eq!(run.report.replay_forwards, 0, "{label}");
+                    assert!(
+                        proposer.draft_forwards > 0
+                            && proposer.draft_forwards <= run.report.verify_steps,
+                        "{label}: at most one draft forward per target pass"
+                    );
+                    let tree = tree_report(&run, &label);
+                    println!(
+                        "BLOCK_DRAFT_IMAGE_TREE {label}: passes={} tree_passes={} \
+                         rows_per_tree_pass={:.2} accepted_per_tree_pass={:.2}",
+                        tree.passes,
+                        tree.tree_passes,
+                        tree.rows_per_tree_pass().unwrap_or(0.0),
+                        tree.accepted_per_tree_pass().unwrap_or(0.0)
+                    );
+                    let t = totals.entry(format).or_default();
+                    t.0 += tree.tree_passes;
+                    t.1 += run.report.proposed_tokens;
+                    t.2 += run.report.accepted_tokens;
+                }
+            }
+        }
+    }
+    assert_eq!(totals.len(), 2);
+    for (format, (tree_passes, proposed, accepted)) in totals {
+        assert!(tree_passes > 0, "{format}: verified branching trees");
+        assert!(
+            accepted > 0 && proposed > accepted,
+            "{format}: {proposed} proposed, {accepted} accepted"
+        );
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_image_block_draft_tree_is_the_plain_loop"
+    );
+}
+
+/// SW-7209 AC1 (state): after greedy and sampled image tree runs with accepted and rejected
+/// branches, the hybrid cache holds exactly the committed sequence — its next step at the
+/// M-RoPE text position is a fresh multimodal prefill's — and the draft's context is exactly the
+/// one a fresh draft builds from the target's rows for the committed sequence (the fused image
+/// rows, then the accepted branch's text rows): no rejected sibling's tapped row entered it.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn image_block_draft_tree_context_is_the_accepted_path() {
+    let model = tiny_target();
+    let prompt = ImagePrompt::new(&model);
+    let p = prompt.ids.len();
+    let mut sampled = config(20, 11);
+    sampled.sampling = SamplingParams {
+        temperature: 1.0,
+        top_k: 4,
+        top_p: 1.0,
+        ..SamplingParams::default()
+    };
+    for (format, draft) in tiny_drafts(Some(BlockDraftPrecision::Q8)) {
+        let target = TappedQwen35::for_draft(&model, &draft);
+        for (mode, cfg) in [("greedy", config(20, 7)), ("sampled", sampled.clone())] {
+            for depth in [2usize, 5] {
+                let label = format!("{format} {mode} depth {depth} image tree");
+                let mut proposer = BlockDraftProposer::new(&draft);
+                let (run, mut cache) = run_image_block_tree(
+                    &target,
+                    &mut proposer,
+                    &prompt,
+                    &cfg,
+                    depth,
+                    16,
+                    None,
+                    &CancelFlag::new(),
+                );
+                let tree = tree_report(&run, &label);
+                assert!(tree.tree_passes > 0, "{label}: branching trees verified");
+                assert!(
+                    run.report.proposed_tokens > run.report.accepted_tokens,
+                    "{label}: rejected candidates"
+                );
+                let fed = run.committed_cache_len as usize;
+                let mut committed = prompt.ids.clone();
+                committed.extend(&run.output.tokens);
+                assert_eq!(cache.offset() as usize, fed, "{label}");
+                assert_eq!(fed, committed.len() - 1, "{label}");
+
+                // Target: the next step on the committed cache is a fresh prefill's.
+                let last = *committed.last().unwrap();
+                let next = model
+                    .decode_logits(&input_ids(&[last]), &mut cache, fed as i32 + prompt.delta)
+                    .unwrap();
+                let (mut fresh, _, _) = prompt.prefill(&model, &target.layers, None);
+                model
+                    .decode_logits(
+                        &input_ids(&committed[p..fed]),
+                        &mut fresh,
+                        p as i32 + prompt.delta,
+                    )
+                    .unwrap();
+                let want = model
+                    .decode_logits(&input_ids(&[last]), &mut fresh, fed as i32 + prompt.delta)
+                    .unwrap();
+                assert_close(&next, &want, &format!("{label}: target logits"));
+
+                // Draft: the context of a draft that only ever saw the accepted path.
+                let context = proposer.context().unwrap();
+                assert_eq!(context.next_position() as usize, fed, "{label}");
+                let rebuilt = rebuilt_image_context(&target, &draft, &prompt, &committed, fed, 0);
+                assert_eq!(rebuilt.next_position(), context.next_position(), "{label}");
+                assert_eq!(rebuilt.rows(), context.rows(), "{label}");
+                for (i, (got, want)) in context.arrays().zip(rebuilt.arrays()).enumerate() {
+                    assert_close(got, want, &format!("{label}: context array {i}"));
+                }
+            }
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::image_block_draft_tree_context_is_the_accepted_path"
+    );
+}
+
+/// The exact target distribution of the token after the fused image `prompt` and the text
+/// `suffix` (decoded at its M-RoPE text positions), under the request's knobs and mask.
+fn image_target_dist(
+    model: &Qwen35Model,
+    prompt: &ImagePrompt,
+    suffix: &[i32],
+    params: SamplingParams,
+    mask: Option<&[bool]>,
+) -> Vec<(i32, f64)> {
+    let mut cache = model.new_cache();
+    let mut logits = model
+        .decode_logits_from_embeds_with_deepstack(
+            &prompt.embeds,
+            prompt.positions(),
+            &mut cache,
+            &prompt.visual,
+            &prompt.deepstack,
+        )
+        .unwrap();
+    if !suffix.is_empty() {
+        let at = prompt.ids.len() as i32 + prompt.delta;
+        logits = model
+            .decode_logits(&input_ids(suffix), &mut cache, at)
+            .unwrap();
+    }
+    let history: Vec<i32> = prompt.ids.iter().chain(suffix).copied().collect();
+    let mut sampler = MlxSampler::new(params, 0);
+    let dist = sampler.distribution(&logits, &history, mask).unwrap();
+    let total: f64 = dist.iter().map(|&(_, w)| f64::from(w)).sum();
+    dist.into_iter()
+        .filter(|&(_, w)| w > 0.0)
+        .map(|(t, w)| (t, f64::from(w) / total))
+        .collect()
+}
+
+/// A tiny draft of each format whose every matrix but the norms is scaled by a tenth, scoring 32
+/// candidates per row — the Candle `tiny_draft_damped_on` (SW-7198): its layers barely move its
+/// residual stream, the target's embedding of its block, so over [`tiny_target_biased`] its rows
+/// score like the target's and most of a sampled tree's drafts are accepted.
+///
+/// [`tiny_target_biased`]: crate::models::dspine::tests::tiny_target_biased
+fn tiny_damped_drafts(precision: Option<BlockDraftPrecision>) -> [(&'static str, BlockDraft); 2] {
+    let damped = |tensors: HashMap<String, Array>| {
+        let scaled = tensors
+            .into_iter()
+            .map(|(k, a)| {
+                let scale = a.dtype() == Dtype::Float32 && a.ndim() == 2 && !k.contains("norm");
+                let a = if scale {
+                    mlx_rs::ops::multiply(&a, Array::from_f32(0.1)).unwrap()
+                } else {
+                    a
+                };
+                (k, a)
+            })
+            .collect();
+        crate::primitives::Weights::from_map(scaled)
+    };
+    let mut dspine_cfg = dspine::tests::tiny_config();
+    dspine_cfg.head_topk = 32;
+    let mut dflash2_cfg = dflash2::tests::tiny_config();
+    dflash2_cfg.head_topk = 32;
+    let dspine = crate::models::DSpineDraft::from_weights(
+        &mut damped(dspine::tests::tiny_tensors(&dspine_cfg)),
+        dspine_cfg,
+        precision,
+    )
+    .unwrap();
+    let dflash2 = crate::models::DFlash2Draft::from_weights(
+        &mut damped(dflash2::tests::tiny_tensors(&dflash2_cfg)),
+        dflash2_cfg,
+        precision,
+    )
+    .unwrap();
+    [
+        ("dspine", BlockDraft::DSpine(dspine)),
+        ("dflash2", BlockDraft::DFlash2(dflash2)),
+    ]
+}
+
+/// The chi-square of `counts` over `n` runs against `expected` (cells expected fewer than 5 times
+/// pooled), its cell count, and the 99.9 % critical value with `cells - 1` degrees of freedom
+/// (Wilson–Hilferty).
+fn chi_square(
+    expected: &HashMap<[i32; 3], f64>,
+    counts: &HashMap<[i32; 3], u64>,
+    n: u64,
+) -> (f64, usize, f64) {
+    for key in counts.keys() {
+        assert!(
+            expected.contains_key(key),
+            "{key:?} has target probability 0"
+        );
+    }
+    let (mut chi2, mut cells, mut pooled_e, mut pooled_o) = (0.0f64, 0usize, 0.0f64, 0.0f64);
+    for (key, p) in expected {
+        let e = p * n as f64;
+        let o = *counts.get(key).unwrap_or(&0) as f64;
+        if e < 5.0 {
+            pooled_e += e;
+            pooled_o += o;
+        } else {
+            chi2 += (o - e).powi(2) / e;
+            cells += 1;
+        }
+    }
+    if pooled_e > 0.0 {
+        chi2 += (pooled_o - pooled_e).powi(2) / pooled_e.max(1e-9);
+        cells += 1;
+    }
+    let k = (cells - 1) as f64;
+    let critical = k * (1.0 - 2.0 / (9.0 * k) + 3.09 * (2.0 / (9.0 * k)).sqrt()).powi(3);
+    (chi2, cells, critical)
+}
+
+/// SW-7209 AC1 (sampled): on the image + text prompt, through the real tree verify at the
+/// M-RoPE-shifted positions, each format's candidate trees commit tokens that follow the target's
+/// distribution exactly: the joint law of the first three tokens over 2000 seeded runs (the second
+/// and third from one tree pass of depth 2) matches the target's chain rule over the fused prompt
+/// by a chi-square test — plain, under the constraint mask, and with repetition and presence
+/// penalties (each branch row scored against its own ancestor path, the image placeholders in the
+/// history). The target and the drafts lean on the same few ids ([`tiny_target_biased`],
+/// [`tiny_damped_drafts`]), so most committed tokens are accepted drafts and the law is sensitive
+/// to the `q` each was drawn from; the constrained arm forbids two of the leaned-on ids.
+///
+/// [`tiny_target_biased`]: crate::models::dspine::tests::tiny_target_biased
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn sampled_image_block_draft_tree_keeps_the_target_distribution() {
+    let model = crate::models::dspine::tests::tiny_target_biased();
+    let prompt = ImagePrompt::new(&model);
+    let plain_params = SamplingParams {
+        temperature: 1.0,
+        top_k: 6,
+        top_p: 1.0,
+        ..SamplingParams::default()
+    };
+    let penalized_params = SamplingParams {
+        repetition_penalty: 1.6,
+        repetition_context: 16,
+        presence_penalty: 0.6,
+        ..plain_params
+    };
+    for (format, draft) in tiny_damped_drafts(Some(BlockDraftPrecision::Q8)) {
+        let target = TappedQwen35::for_draft(&model, &draft);
+        for (forbidden, params) in [
+            (&[][..], plain_params),
+            (&[1usize, 9][..], plain_params),
+            (&[][..], penalized_params),
+        ] {
+            let label = format!(
+                "{format} forbidden {forbidden:?} penalties {}",
+                params.repetition_penalty != 1.0
+            );
+            // The constraint matters: without it the target puts real mass on the forbidden ids.
+            let unmasked: f64 = image_target_dist(&model, &prompt, &[], params, None)
+                .iter()
+                .filter(|&&(t, _)| forbidden.contains(&(t as usize)))
+                .map(|&(_, p)| p)
+                .sum();
+            assert!(
+                forbidden.is_empty() || unmasked > 0.1,
+                "{label}: the forbidden ids carry {unmasked:.3} of the unmasked mass"
+            );
+            let mask = Forbid::new(forbidden).allow;
+            let masked = (!forbidden.is_empty()).then_some(mask.as_slice());
+            let mut expected: HashMap<[i32; 3], f64> = HashMap::new();
+            for (x0, p0) in image_target_dist(&model, &prompt, &[], params, masked) {
+                for (x1, p1) in image_target_dist(&model, &prompt, &[x0], params, masked) {
+                    for (x2, p2) in image_target_dist(&model, &prompt, &[x0, x1], params, masked) {
+                        expected.insert([x0, x1, x2], p0 * p1 * p2);
+                    }
+                }
+            }
+            let n = 2000u64;
+            let mut counts: HashMap<[i32; 3], u64> = HashMap::new();
+            let (mut tree_passes, mut tree_accepted, mut proposed, mut accepted) =
+                (0u64, 0u64, 0u64, 0u64);
+            for seed in 0..n {
+                let mut cfg = config(4, seed);
+                cfg.sampling = params;
+                let mut constraint = Forbid::new(forbidden);
+                let mut proposer = BlockDraftProposer::new(&draft);
+                let (run, _) = run_image_block_tree(
+                    &target,
+                    &mut proposer,
+                    &prompt,
+                    &cfg,
+                    2,
+                    16,
+                    (!forbidden.is_empty()).then_some(&mut constraint),
+                    &CancelFlag::new(),
+                );
+                let t = &run.output.tokens;
+                assert!(t.iter().all(|&x| !forbidden.contains(&(x as usize))));
+                *counts.entry([t[0], t[1], t[2]]).or_default() += 1;
+                let report = tree_report(&run, &label);
+                tree_passes += report.tree_passes;
+                tree_accepted += report.tree_accepted_tokens;
+                proposed += run.report.proposed_tokens;
+                accepted += run.report.accepted_tokens;
+            }
+            assert!(tree_passes > 0, "{label}: branching trees verified");
+            let accepted_per_tree_pass = tree_accepted as f64 / tree_passes as f64;
+            assert!(
+                accepted_per_tree_pass >= 1.0,
+                "{label}: {accepted_per_tree_pass:.2} accepted per tree pass"
+            );
+            assert!(
+                accepted > 0 && proposed > accepted,
+                "{label}: {proposed} proposed, {accepted} accepted"
+            );
+            let (chi2, cells, critical) = chi_square(&expected, &counts, n);
+            println!(
+                "BLOCK_DRAFT_IMAGE_TREE_SAMPLED {label}: chi-square {chi2:.1} over {cells} cells \
+                 (critical {critical:.1}); {tree_passes} tree passes, \
+                 {accepted_per_tree_pass:.2} accepted per tree pass, {accepted}/{proposed} accepted"
+            );
+            assert!(
+                chi2 < critical,
+                "{label}: chi-square {chi2:.1} over {cells} cells (critical {critical:.1})"
+            );
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::sampled_image_block_draft_tree_keeps_the_target_distribution"
+    );
+}
+
+/// SW-7209 (abort / cancel): on a 64-row image prompt (`mrope_delta` −56), a request cancelled as
+/// its block-draft tree is handed over stops before any tree row reaches the target cache, with
+/// the draft's context still the warm-up's; that tree verified on the multimodal prefill at the
+/// RoPE position the engine handed its anchor — scoring as a linear step at the M-RoPE text
+/// position and measurably unlike one at the unshifted sequence position — and aborted returns
+/// the target cache to the step start bit for bit, while the draft context, which only a commit
+/// writes, is untouched.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean() {
+    let model = tiny_target();
+    // A 64-row image on an 8 × 8 grid: the text after it sits 56 positions below its sequence
+    // index, so a tree verified at the unshifted position scores measurably differently.
+    let prompt = ImagePrompt::visual(&model, &[[1, 16, 16]], &[]);
+    assert_eq!(prompt.delta, -56);
+    for (format, draft) in tiny_drafts(Some(BlockDraftPrecision::Q8)) {
+        let target = TappedQwen35::for_draft(&model, &draft);
+        let (prefilled, taps, _) = prompt.prefill(&model, &target.layers, target.keep);
+        let mut warmed = BlockDraftProposer::new(&draft);
+        warmed.warm(&target, &prompt.ids, Some(&taps)).unwrap();
+        let warm: Vec<Vec<f32>> = warmed.context().unwrap().arrays().map(host).collect();
+        let start = cache_states(&prefilled);
+
+        // Cancel while the tree is handed over.
+        let cancel = CancelFlag::new();
+        let mut proposer = CancelOnTree {
+            inner: BlockDraftProposer::new(&draft),
+            cancel: &cancel,
+            tree: None,
+            position: None,
+        };
+        let (run, cache) = run_image_block_tree(
+            &target,
+            &mut proposer,
+            &prompt,
+            &config(8, 7),
+            4,
+            16,
+            None,
+            &cancel,
+        );
+        assert_eq!(
+            run.output.finish_reason,
+            FinishReason::Cancelled,
+            "{format}"
+        );
+        assert_eq!(run.output.tokens.len(), 1, "{format}: the prefill's token");
+        assert_eq!(cache_states(&cache), start, "{format}: no tree row written");
+        let context: Vec<Vec<f32>> = proposer
+            .inner
+            .context()
+            .unwrap()
+            .arrays()
+            .map(host)
+            .collect();
+        assert_eq!(
+            context, warm,
+            "{format}: the draft context is the warm-up's"
+        );
+        let tree = proposer.tree.expect("the proposer built a tree");
+        assert!(!tree.is_chain(), "{format}: a branching tree");
+
+        // Verify that tree on the multimodal prefill at the RoPE position the engine gave its
+        // anchor (the engine's offset plumbing: its base plus the prompt's `position_delta`),
+        // then abort it.
+        let position = proposer
+            .position
+            .expect("the engine proposed at a position");
+        let (mut cache, _, logits) = prompt.prefill(&model, &target.layers, target.keep);
+        let anchor = mlx_rs::ops::indexing::argmax_axis(&logits, -1, None)
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()[0];
+        let base = cache.offset();
+        let inputs =
+            TreeInputs::new(&tree, anchor, base, position, target.tree_mask_dtype()).unwrap();
+        let verified = target.forward_tree(&mut cache, &inputs, true).unwrap();
+        assert_eq!(
+            verified.hidden.as_ref().unwrap().shape(),
+            &[1, tree.rows() as i32, draft.config().tap_width() as i32],
+            "{format}: every tree row's taps"
+        );
+        // The anchor row scores as the linear step at the shifted position, and measurably
+        // unlike one at the unshifted sequence position.
+        let step_at = |position: i32| {
+            let (mut linear, _, _) = prompt.prefill(&model, &target.layers, target.keep);
+            host(
+                &model
+                    .decode_logits(&input_ids(&[anchor]), &mut linear, position)
+                    .unwrap(),
+            )
+        };
+        let anchor_row = host(
+            &verified
+                .logits
+                .take_axis(Array::from_slice(&[0i32], &[1]), 1)
+                .unwrap(),
+        );
+        let moved = |want: &[f32]| {
+            anchor_row
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (shifted, unshifted) = (moved(&step_at(base + prompt.delta)), moved(&step_at(base)));
+        println!(
+            "{format}: anchor row moved {shifted} from the shifted step, {unshifted} unshifted"
+        );
+        assert!(
+            shifted * 4.0 < unshifted,
+            "{format}: the anchor row is at the M-RoPE text position ({shifted} against {unshifted})"
+        );
+        target.abort_tree(&mut cache, base).unwrap();
+        assert_eq!(cache.offset(), base, "{format}");
+        assert_eq!(
+            cache_states(&cache),
+            start,
+            "{format}: the aborted tree left nothing"
+        );
+        let context: Vec<Vec<f32>> = warmed.context().unwrap().arrays().map(host).collect();
+        assert_eq!(context, warm, "{format}: an abort never reaches the draft");
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean"
+    );
+}
+
+/// SW-7209 (prompt lookup): on the image + text prompt, prompt lookup's candidate trees over the
+/// image-expanded history — the bare hybrid as target, its multimodal prefill the provider's —
+/// commit exactly the plain loop's greedy tokens at two depths, plain and constrained, verifying
+/// branching trees at the M-RoPE-shifted text positions with no tree fallback.
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn greedy_image_prompt_lookup_tree_is_the_plain_loop() {
+    let model = tiny_target();
+    let prompt = ImagePrompt::new(&model);
+    let mut tree_passes = 0;
+    for depth in [2usize, 5] {
+        for constrained in [false, true] {
+            let label = format!("prompt lookup depth {depth} constrained {constrained} image tree");
+            let mut constraint = Forbid::new(&[1, 9]);
+            let allow = constraint.allow.clone();
+            let expected =
+                plain_image(&model, &prompt, 24, constrained.then_some(allow.as_slice()));
+            let mut cache = model.new_cache();
+            let logits = model
+                .decode_logits_from_embeds_with_deepstack(
+                    &prompt.embeds,
+                    prompt.positions(),
+                    &mut cache,
+                    &prompt.visual,
+                    &prompt.deepstack,
+                )
+                .unwrap();
+            let run = generate_speculative(
+                &model,
+                &mut crate::decode::NgramProposer::default(),
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &prompt.ids,
+                    position_delta: prompt.delta,
+                },
+                &config(24, 7),
+                depth,
+                &CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions {
+                    constraint: constrained
+                        .then_some(&mut constraint as &mut dyn RewindableConstraintMask),
+                    pipelining: Pipelining::Off,
+                    tree_rows: 16,
+                    ..EngineOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(run.output.tokens, expected, "{label}");
+            assert_eq!(run.report.proposer, ProposerKind::PromptLookup, "{label}");
+            let tree = tree_report(&run, &label);
+            println!(
+                "PROMPT_LOOKUP_IMAGE_TREE {label}: passes={} tree_passes={} accepted={}",
+                tree.passes, tree.tree_passes, run.report.accepted_tokens
+            );
+            tree_passes += tree.tree_passes;
+        }
+    }
+    assert!(tree_passes > 0, "prompt lookup verified branching trees");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_image_prompt_lookup_tree_is_the_plain_loop"
+    );
+}
+
+/// SW-7209 (Causal multimodal): the Qwen3-VL decoder's path — a llama-family `CausalLm` with
+/// interleaved M-RoPE ([`tiny_mrope_llama`]) prefilled with hand-built M-RoPE rows over an image
+/// run (`mrope_delta` −6) and a repetitive text tail — runs prompt lookup's candidate trees at
+/// two depths, plain and constrained: each commits exactly the plain loop's greedy tokens (the
+/// prefill, then one token per step at its shifted text position), verifies branching trees with
+/// no tree fallback, and keeps the accepted branch only.
+///
+/// [`tiny_mrope_llama`]: crate::decode::engine::tests::tiny_mrope_llama
+#[ignore = "model inference; explicit model-proof workflow"]
+#[test]
+fn greedy_qwen3vl_image_prompt_lookup_tree_is_the_plain_loop() {
+    use crate::models::CausalLm;
+    use crate::primitives::KvCache;
+    let model: CausalLm = crate::decode::engine::tests::tiny_mrope_llama(24);
+    let mut ids = vec![3, 9];
+    ids.extend([IMAGE; 9]);
+    ids.extend([4, 11, 3, 9, 4, 11, 3, 9, 4]);
+    let (t, h, w, delta) =
+        crate::models::deepstack::mrope_positions_mm(&ids, &[[1, 6, 6]], IMAGE, &[], VIDEO, 2)
+            .unwrap();
+    assert_eq!(delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
+    let visual: Vec<bool> = ids.iter().map(|&id| id == IMAGE).collect();
+    let embeds = model.embed(&input_ids(&ids)).unwrap();
+    let shape = embeds.shape().to_vec();
+    let hidden = shape[2] as usize;
+    let mut values = host(&embeds);
+    for (row, _) in visual.iter().enumerate().filter(|(_, &v)| v) {
+        for (i, x) in values[row * hidden..(row + 1) * hidden]
+            .iter_mut()
+            .enumerate()
+        {
+            *x += 0.25 + ((row * 7 + i) % 13) as f32 * 0.02;
+        }
+    }
+    let embeds = Array::from_slice(&values, &shape)
+        .as_dtype(embeds.dtype())
+        .unwrap();
+    let positions = [t.as_slice(), h.as_slice(), w.as_slice()];
+    let prefill = |cache: &mut crate::primitives::ContiguousKvCache| {
+        model
+            .decode_logits_from_embeds_mrope_deepstack(&embeds, positions, cache, &visual, &[])
+            .unwrap()
+    };
+    let mut tree_passes = 0;
+    for depth in [2usize, 5] {
+        for constrained in [false, true] {
+            let label = format!("qwen3-vl prompt lookup depth {depth} constrained {constrained}");
+            let forbidden = [1usize, 9];
+            // The plain loop: the prefill, then one greedy token per step at its text position.
+            let mut cache = model.new_cache();
+            let mut logits = prefill(&mut cache);
+            let mut sampler = MlxSampler::new(SamplingParams::default(), 0);
+            let mut expected = Vec::new();
+            while expected.len() < 24 {
+                let mut row = host(&logits);
+                if constrained {
+                    for &f in &forbidden {
+                        row[f] = f32::NEG_INFINITY;
+                    }
+                }
+                let row = Array::from_slice(&row, &[1, 1, row.len() as i32]);
+                let token = sampler.argmax_rows(&row).unwrap()[0];
+                expected.push(token);
+                let at = KvCache::offset(&cache) + delta;
+                logits = model
+                    .decode_logits(&input_ids(&[token]), &mut cache, at)
+                    .unwrap();
+            }
+            let mut constraint = Forbid {
+                allow: (0..24).map(|i| !forbidden.contains(&i)).collect(),
+                accepted: Vec::new(),
+            };
+            let mut cache = model.new_cache();
+            let logits = prefill(&mut cache);
+            let run = generate_speculative(
+                &model,
+                &mut crate::decode::NgramProposer::default(),
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &ids,
+                    position_delta: delta,
+                },
+                &config(24, 7),
+                depth,
+                &CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions {
+                    constraint: constrained
+                        .then_some(&mut constraint as &mut dyn RewindableConstraintMask),
+                    pipelining: Pipelining::Off,
+                    tree_rows: 16,
+                    ..EngineOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(run.output.tokens, expected, "{label}");
+            if constrained {
+                assert_eq!(constraint.accepted, expected, "{label}: constraint");
+            }
+            assert_eq!(run.report.proposer, ProposerKind::PromptLookup, "{label}");
+            assert_eq!(
+                KvCache::offset(&cache) as usize,
+                ids.len() + expected.len() - 1,
+                "{label}: the accepted branch only"
+            );
+            let tree = tree_report(&run, &label);
+            println!(
+                "QWEN3VL_PROMPT_LOOKUP_TREE {label}: passes={} tree_passes={} accepted={}",
+                tree.passes, tree.tree_passes, run.report.accepted_tokens
+            );
+            tree_passes += tree.tree_passes;
+        }
+    }
+    assert!(tree_passes > 0, "prompt lookup verified branching trees");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_qwen3vl_image_prompt_lookup_tree_is_the_plain_loop"
     );
 }
