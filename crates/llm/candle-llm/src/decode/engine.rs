@@ -984,34 +984,43 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 constraint: constraint.as_deref_mut(),
                 device_greedy,
             };
+            let draft_started = std::time::Instant::now();
             let tree = if tree_rows > 0 {
                 proposer.propose_tree(&ctx, &mut sampler)?
             } else {
                 None
             };
-            match tree.map(|t| t.pruned(k, tree_rows, |t| config.stop_tokens.contains(&t))) {
-                Some(tree) if !tree.is_chain() => (Proposal::default(), Some(tree)),
-                Some(chain) => (
-                    Proposal {
-                        drafts: Some(Drafts::Host(
-                            chain.nodes().iter().map(|n| n.token).collect(),
-                        )),
-                        dists: chain.nodes().iter().map_while(|n| n.dist.clone()).collect(),
-                    },
-                    None,
-                ),
-                // A one-branch proposer (MTP, a draft model): its linear proposal is the tree,
-                // capped at the row bound as MLX prunes it (`pruned(k, tree_rows, …)`), so a pass
-                // never verifies more candidate rows than the request allows.
-                None if tree_rows > 0 => {
-                    let capped = ProposeContext {
-                        max_drafts: k.min(tree_rows),
-                        ..ctx
-                    };
-                    (proposer.propose(&capped, &mut sampler)?, None)
-                }
-                None => (proposer.propose(&ctx, &mut sampler)?, None),
-            }
+            let proposed =
+                match tree.map(|t| t.pruned(k, tree_rows, |t| config.stop_tokens.contains(&t))) {
+                    Some(tree) if !tree.is_chain() => (Proposal::default(), Some(tree)),
+                    Some(chain) => (
+                        Proposal {
+                            drafts: Some(Drafts::Host(
+                                chain.nodes().iter().map(|n| n.token).collect(),
+                            )),
+                            dists: chain.nodes().iter().map_while(|n| n.dist.clone()).collect(),
+                        },
+                        None,
+                    ),
+                    // A one-branch proposer (MTP, a draft model): its linear proposal is the tree,
+                    // capped at the row bound as MLX prunes it (`pruned(k, tree_rows, …)`), so a pass
+                    // never verifies more candidate rows than the request allows.
+                    None if tree_rows > 0 => {
+                        let capped = ProposeContext {
+                            max_drafts: k.min(tree_rows),
+                            ..ctx
+                        };
+                        (proposer.propose(&capped, &mut sampler)?, None)
+                    }
+                    None => (proposer.propose(&ctx, &mut sampler)?, None),
+                };
+            // A proposal left on the device was timed only up to its enqueue (SW-7200).
+            let on_device = matches!(proposed.0.drafts, Some(Drafts::Device(_)));
+            stats
+                .draft_time
+                .get_or_insert_with(core_llm::DraftTime::default)
+                .record(draft_started.elapsed(), !on_device);
+            proposed
         };
         if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
             c.rewind(checkpoint);

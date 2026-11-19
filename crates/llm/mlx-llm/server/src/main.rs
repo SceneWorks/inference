@@ -1273,6 +1273,11 @@ mod tests {
                         },
                         fallbacks: vec!["speculative: x".into()],
                         tree_verify: None,
+                        draft_time: Some(core_llm::DraftTime {
+                            calls: 4,
+                            host_synchronized_calls: 4,
+                            total: std::time::Duration::from_millis(6),
+                        }),
                     }),
                     ..Default::default()
                 })
@@ -1330,6 +1335,7 @@ mod tests {
                 "prefix_cache": {"path": "hit", "reason": "why"},
                 "prefix_hit_tokens": 5,
                 "fallbacks": ["speculative: x"],
+                "draft_time": {"calls": 4, "host_synchronized_calls": 4, "total_ms": 6.0},
             })
         );
     }

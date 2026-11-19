@@ -5608,6 +5608,96 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 self.assertTrue(self.decode_speedups_bench_errors(mutated))
 
 
+    def mlx_decode_speedups_bench_errors(self, workflow: dict) -> list[str]:
+        """Everything the SW-7200 MLX campaign lane binds, as a list of findings."""
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "decode-speedups-bench-mlx" not in inputs["profile"]["options"]:
+            errors.append("`decode-speedups-bench-mlx` is not a dispatchable profile")
+        job = workflow["jobs"].get("mlx-decode-speedups-bench")
+        if job is None:
+            return errors + ["no `mlx-decode-speedups-bench` job"]
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench-mlx'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        # The loaned primary Mac, by its unique label.
+        if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "rw-starvector"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        shell = job.get("defaults", {}).get("run", {}).get("shell", "")
+        if "scripts/ci/inference_metal_launcher.py" not in shell:
+            errors.append("the lane does not run under the Metal lease launcher")
+        env = job.get("env", {})
+        for name, value in (
+            ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
+            ("MODEL_PROOF_HUB_ROOT", "${{ vars.MLX_GEN_MODELS_ROOT }}"),
+        ):
+            if env.get(name) != value:
+                errors.append(f"job env {name} is {env.get(name)!r}, expected {value!r}")
+        # The runner stops starting processes inside the loan; the job timeout is only a guard
+        # that must leave the last process time to finish.
+        budget = int(env.get("DECODE_BENCH_BUDGET_MINUTES", "0"))
+        if not 0 < budget <= 110 or job.get("timeout-minutes", 0) < budget + 60:
+            errors.append(f"budget {budget} / timeout {job.get('timeout-minutes')} out of bounds")
+        steps = job["steps"]
+        if "inputs.decode_bench_matrix" in json.dumps(steps):
+            errors.append("a step interpolates the untrusted matrix input")
+        # `real_weights_inline_text` restores each sourced step body inline.
+        bodies = {step.get("name"): step.get("run", "") for step in steps}
+        plan = bodies.get("Validate the matrix and initialize the run-scoped evidence directory", "")
+        if "speculative_bench_campaign.py plan --lane mlx " not in plan:
+            errors.append("the matrix is not planned for the mlx lane")
+        if "stage_pinned_hub_snapshots.py --plan" not in bodies.get("Stage the pinned Hub snapshots", ""):
+            errors.append("the matrix's Hub pins are not staged")
+        run = bodies.get("Build and run every matrix row", "")
+        for fragment in (
+            "speculative_bench_campaign.py run ",
+            '--epic-sha "$GITHUB_SHA"',
+            '--stop-starting-after-minutes "$DECODE_BENCH_BUDGET_MINUTES"',
+        ):
+            if fragment not in run:
+                errors.append(f"the run step lacks {fragment!r}")
+        if "--pre-epic-root" in run:
+            errors.append("the MLX lane measures epic rows only")
+        upload = next((s for s in steps if s.get("name") == "Keep the decode-speedups benchmark documents"), {})
+        if upload.get("if") != "always()" or upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("the documents upload must survive a failed row, a cancel and a timeout")
+        if upload.get("with", {}).get("path") != (
+            "${{ runner.temp }}/decode-speedups-bench-mlx-${{ github.run_id }}-${{ github.run_attempt }}"
+        ):
+            errors.append("the upload is not the run-scoped directory")
+        cuda = workflow["jobs"]["candle-decode-speedups-bench"]
+        names = [s.get("name") for s in cuda["steps"]]
+        if cuda.get("env", {}).get("MODEL_PROOF_HUB_ROOT") != "${{ vars.CANDLE_GEN_MODELS_ROOT }}":
+            errors.append("the CUDA lane does not bind Hub pins under its model root")
+        stage = "Stage the pinned Hub snapshots"
+        if stage not in names or names.index(stage) > names.index(
+            "Build both checkouts and run every matrix row (epic and baseline alternating)"
+        ):
+            errors.append("the CUDA lane does not stage the Hub pins before it runs")
+        return errors
+
+    def test_mlx_decode_speedups_bench_is_dispatch_only_on_the_loaned_mac_and_bounded(self) -> None:
+        """SW-7200: the paired speculative-paths campaign on MLX — dispatch-only, on the primary
+        Mac under the Metal lease, the untrusted matrix only through `env:`, its Hub pins staged,
+        a time budget inside the loan, and every document kept; the CUDA lane stages pins too."""
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.mlx_decode_speedups_bench_errors(workflow), [])
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench-mlx'"}),
+            lambda job: job.update({"runs-on": ["self-hosted", "macOS", "ARM64", "rw-llm"]}),
+            lambda job: job["env"].update({"DECODE_BENCH_BUDGET_MINUTES": "170"}),
+            lambda job: job.update({"timeout-minutes": 110}),
+            lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["defaults"]["run"].update({"shell": "bash"}),
+            lambda job: job["steps"][2].update({"run": job["steps"][2]["run"] + ' && echo "${{ inputs.decode_bench_matrix }}"'}),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["mlx-decode-speedups-bench"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.mlx_decode_speedups_bench_errors(mutated))
+
+
 class WindowsBashSelectionTests(unittest.TestCase):
     def test_every_self_hosted_windows_job_selects_git_bash_before_running_bash(self) -> None:
         """sc-24446: the decode-speedups lane's `dtolnay/rust-toolchain` ran WSL's bash. Every

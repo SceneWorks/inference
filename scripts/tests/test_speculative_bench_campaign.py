@@ -1883,3 +1883,358 @@ class WithoutMtpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------------------------- SW-7200 paths
+
+REV = "8e450d7faf38238b64580163a7d3dd7e44af759d"
+TARGET_PIN = f"hub:SceneWorks/qwen3.8-27b-abliterated-mlx@{'7' * 40}/q4"
+DSPINE_PIN = f"hub:SceneWorks/qwen3.8-27b-dspine-b16@{REV}"
+TREE = {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": "max"}}}
+LINEAR = {"proposer": "block_draft", "depth": "max", "verify": "linear"}
+
+
+class HubPinPlanTests(unittest.TestCase):
+    """SW-7200: a row names its target and draft as pinned Hub snapshots; the plan binds them
+    where the stage script puts them and lists each once for it."""
+
+    def setUp(self) -> None:
+        self.hub = Path(self.enterContext(tempfile.TemporaryDirectory())) / "hub"
+
+    def plan(self, rows, **environ):
+        return plan({"rows": rows}, {campaign.HUB_ROOT_ENV: str(self.hub), **environ}, "mlx")
+
+    def test_pins_bind_under_the_hub_root_and_are_listed_once_for_the_stage_script(self) -> None:
+        rows = [
+            {"id": "q4-dspine", "snapshot": TARGET_PIN, "draft": DSPINE_PIN, "runs": ["epic"],
+             "options": ["off", LINEAR, TREE]},
+            {"id": "q4-plain", "snapshot": TARGET_PIN, "runs": ["epic"]},
+        ]
+        planned = self.plan(rows)
+        root = Path(os.path.realpath(self.hub))
+        target = root / "models--SceneWorks--qwen3.8-27b-abliterated-mlx" / "snapshots" / ("7" * 40) / "q4"
+        draft = root / "models--SceneWorks--qwen3.8-27b-dspine-b16" / "snapshots" / REV
+        env = planned["rows"][0]["env"]
+        self.assertEqual(env["SPECULATIVE_BENCH_SNAPSHOT"], str(target))
+        self.assertEqual(env["SPECULATIVE_BENCH_DRAFT"], str(draft))
+        self.assertEqual(json.loads(env["SPECULATIVE_BENCH_OPTIONS"]), ["off", LINEAR, TREE])
+        self.assertEqual(planned["asset_setup"], "hub-snapshots")
+        self.assertEqual(
+            planned["hub_snapshots"],
+            {
+                "DECODE_BENCH_HUB_1": {"repository": "SceneWorks/qwen3.8-27b-abliterated-mlx",
+                                       "revision": "7" * 40, "subfolder": "q4"},
+                "DECODE_BENCH_HUB_2": {"repository": "SceneWorks/qwen3.8-27b-dspine-b16",
+                                       "revision": REV, "subfolder": ""},
+            },
+        )
+        # The stage script binds each pin to exactly the path the plan gave the row.
+        sys.path.insert(0, str(REPOSITORY))
+        try:
+            from scripts.ci import stage_pinned_hub_snapshots as stage
+        finally:
+            sys.path.remove(str(REPOSITORY))
+        with contextlib.redirect_stdout(io.StringIO()):
+            receipt = stage.stage(
+                planned["hub_snapshots"],
+                root,
+                manifest=lambda repository, revision: (
+                    None, None, {"config.json": {"size": 1}, "q4/config.json": {"size": 1}}
+                ),
+                fetch=lambda url, path: (None, None, None, False),
+                verify=lambda repository, revision, base, files: {
+                    "status": "ok", "manifest_sha256": "0", "files": []
+                },
+                free_bytes=lambda path: 1 << 50,
+            )
+        self.assertEqual(receipt["DECODE_BENCH_HUB_1"]["path"], str(target))
+        self.assertEqual(receipt["DECODE_BENCH_HUB_2"]["path"], str(draft))
+        # No pin, no staging keys.
+        self.assertNotIn("hub_snapshots", plan({"rows": [{"id": "r", "snapshot": "qwen38"}]}))
+
+    def test_a_malformed_pin_or_a_missing_hub_root_is_refused(self) -> None:
+        for bad in (
+            "hub:SceneWorks/qwen@main/q4",
+            f"hub:SceneWorks@{REV}",
+            f"hub:SceneWorks/qwen@{REV}/../q4",
+            f"hub:SceneWorks/qwen@{REV}/q4/",
+            f"hub:../qwen@{REV}",
+        ):
+            with self.subTest(pin=bad), self.assertRaises(campaign.MatrixError):
+                self.plan([{"id": "r", "snapshot": bad, "runs": ["epic"]}])
+        with self.assertRaisesRegex(campaign.MatrixError, campaign.HUB_ROOT_ENV):
+            plan({"rows": [{"id": "r", "snapshot": TARGET_PIN}]}, {}, "mlx")
+        with self.assertRaisesRegex(campaign.MatrixError, "draft"):
+            self.plan([{"id": "r", "snapshot": TARGET_PIN, "draft": "hub:x", "runs": ["epic"]}])
+
+    def test_path_options_are_checked_before_anything_builds(self) -> None:
+        good = [
+            "off", "auto", {"proposer": "mtp", "depth": 3}, {"mode": "auto"}, LINEAR, TREE,
+            {"proposer": "prompt_lookup", "depth": 4, "verify": {"tree": {"max_rows": 8}}},
+        ]
+        self.plan([{"id": "r", "snapshot": TARGET_PIN, "runs": ["epic"], "options": good}])
+        for bad in (
+            "sometimes",
+            7,
+            {"proposer": "medusa", "depth": 3},
+            {"proposer": "block_draft", "depth": 0},
+            {"proposer": "block_draft", "depth": "most"},
+            {"proposer": "block_draft", "depth": True},
+            {"proposer": "block_draft", "depth": "max", "format": "dspine"},
+            {"proposer": "block_draft", "depth": "max", "verify": "tree"},
+            {"proposer": "block_draft", "depth": "max", "verify": {"tree": {}}},
+            {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 0}}},
+            {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 4}, "x": 1}},
+        ):
+            with self.subTest(option=bad), self.assertRaises(campaign.MatrixError):
+                self.plan([{"id": "r", "snapshot": TARGET_PIN, "runs": ["epic"], "options": [bad]}])
+
+
+class EpicOnlyRunTests(unittest.TestCase):
+    """SW-7200: a plan whose rows run only the epic needs no pre-epic checkout."""
+
+    setUp = RunTests.setUp
+
+    def run_epic_only(self, rows, *, pre_epic: bool):
+        output = self.directory / "out"
+        write_snapshot(self.snapshot)
+        plan_path = self.directory / "plan.json"
+        plan_path.write_text(
+            json.dumps(plan({"rows": rows}, {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})),
+            encoding="utf-8",
+        )
+        args = ["run", "--plan", str(plan_path), "--epic-root", str(self.directory / "epic"),
+                "--epic-sha", EPIC_SHA, "--output", str(output), "--cargo", sys.executable]
+        if pre_epic:
+            args += ["--pre-epic-root", str(self.directory / "pre-epic")]
+        environ = {"FAKE_RECORD": str(self.record)}
+        with mock.patch.dict(os.environ, environ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(io.StringIO()):
+            return campaign.main(args)
+
+    def test_an_epic_only_plan_runs_without_the_pre_epic_checkout(self) -> None:
+        code = self.run_epic_only(
+            [{"id": "q", "snapshot": "qwen38", "runs": ["epic"], "process_repeats": 1}],
+            pre_epic=False,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.checked, [("epic", EPIC_SHA)])
+        code = self.run_epic_only(
+            [{"id": "q", "snapshot": "qwen38", "process_repeats": 1}], pre_epic=False
+        )
+        self.assertEqual(code, 1)
+
+
+def path_row(prompt, prompt_class, requested, *, tok_s, wall, proposer="none", draft=None,
+             verify="linear", hits=(0, 0), accepted=None, draft_ms=None, sync=True, tree=None,
+             fallbacks=()):
+    samples = [
+        {"ttft_ms": 100.0, "decode_tok_s": tok_s, "decode_ms": 256 / tok_s * 1e3,
+         "wall_ms": wall, "prefix_hit_tokens": hit, "draft_ms": draft_ms,
+         "memory_before_bytes": 20 << 30, "peak_memory_bytes": (21 << 30) + (1 << 20)}
+        for hit in hits
+    ]
+    return {
+        "prompt_id": prompt, "class": prompt_class, "requested": requested,
+        "speculative": requested, "verify": verify, "proposer": proposer,
+        "prompt_tokens": 100, "generated_tokens": 256,
+        "verify_steps": 256 if accepted is None else round(256 / (1 + accepted)),
+        "mean_accepted_length": accepted, "samples": samples, "draft": draft,
+        "draft_time": None if draft_ms is None else {
+            "calls": 50, "host_synchronized_calls": 50 if sync else 0,
+            "total_ms": draft_ms, "per_call_ms": draft_ms / 50},
+        "tree_verify": tree, "fallbacks": list(fallbacks),
+    }
+
+
+def paths_document(rows, *, draft_source="/hub/draft", refusal=None, model="qwen3.8-27b"):
+    return {
+        "schema": campaign.SCHEMA, "model": model, "backend": "mlx", "max_new_tokens": 256,
+        "sampling": {"temperature": 0.0}, "thinking": {"setting": "off"}, "warmup": True,
+        "repeats": 2, "options": [r["requested"] for r in rows],
+        "load": {"prefix_cache_bytes": 0,
+                 "draft": {"source": draft_source, "refusal": refusal}},
+        "provenance": {"git": {"sha": EPIC_SHA}}, "rows": rows,
+        "memory": {"source": "mlx_allocator", "peak": "backend_high_water"},
+    }
+
+
+class PathsReportTests(unittest.TestCase):
+    """SW-7200: the paired paths report reads every path against its own process's `off` row."""
+
+    def setUp(self) -> None:
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def campaign(self):
+        dspine = {"source": "/hub/dspine", "format": "dspine", "precision": "bf16"}
+        dflash = {"source": "/hub/dflash2", "format": "dflash2", "precision": "bf16"}
+        tree = {"accepted_per_tree_pass": 3.5, "rows_per_pass": 9.0}
+
+        def a(run, k):
+            return paths_document([
+                row
+                for prompt, cls, fast in (("code_edit", "predictable", 3.0), ("chat", "open_ended", 1.5))
+                for row in (
+                    path_row(prompt, cls, "off", tok_s=10.0, wall=26000.0),
+                    path_row(prompt, cls, {"proposer": "mtp", "depth": "max", "verify": "linear"},
+                             tok_s=15.0, wall=18000.0, proposer="mtp", accepted=1.0, draft_ms=500.0,
+                             sync=False),
+                    path_row(prompt, cls, LINEAR, tok_s=10.0 * fast, wall=26000.0 / fast,
+                             proposer="block_draft", draft=dspine, accepted=fast - 1, draft_ms=900.0),
+                    path_row(prompt, cls, TREE, tok_s=10.0 * fast * 1.1, wall=26000.0 / fast / 1.1,
+                             proposer="block_draft", draft=dspine, verify={"tree": {"max_rows": 16}},
+                             accepted=fast - 0.9, draft_ms=950.0, tree=tree),
+                )
+            ])
+
+        def b(run, k):
+            # A slower process: its own `off` is 8 tok/s, so its ratios stay paired.
+            return paths_document([
+                row
+                for prompt, cls in (("code_edit", "predictable"), ("chat", "open_ended"))
+                for row in (
+                    path_row(prompt, cls, "off", tok_s=8.0, wall=32000.0),
+                    path_row(prompt, cls, LINEAR, tok_s=8.0 * 1.2, wall=32000.0 / 1.2,
+                             proposer="block_draft", draft=dflash, accepted=0.4, draft_ms=600.0),
+                )
+            ], draft_source="/hub/dflash2")
+
+        def probe(run, k):
+            return paths_document(
+                [path_row("code_edit", "predictable",
+                          {"proposer": "draft_model", "depth": 4}, tok_s=10.0, wall=2000.0,
+                          fallbacks=["speculative: `draft_model` is not available"])],
+                refusal="draft model: its tokenizer vocabulary is not the target's",
+            )
+
+        def reused(run, k):
+            return paths_document([
+                path_row("chat", "open_ended", "off", tok_s=10.0, wall=6000.0, hits=(0, 90)),
+                path_row("chat", "open_ended", LINEAR, tok_s=20.0, wall=3000.0, hits=(90, 90),
+                         proposer="block_draft", draft=dspine, accepted=1.0, draft_ms=100.0),
+            ])
+
+        rows = [
+            {"id": "q4-dspine", "runs": ["epic"], "process_repeats": 1, "document": a,
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+            {"id": "q4-dflash2", "runs": ["epic"], "process_repeats": 1, "document": b,
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+            {"id": "q4-draft-model", "runs": ["epic"], "process_repeats": 1, "document": probe,
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+            {"id": "q4-reused", "runs": ["epic"], "process_repeats": 1, "document": reused,
+             "env": {"SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "default"},
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+        ]
+        return write_campaign(self.directory / "mlx", rows, lane="mlx")
+
+    def summary(self, report, path, context="cold", cache="0"):
+        (match,) = [
+            s for s in report["summary"]
+            if s["path"] == path and s["context"] == context
+            and s["group"]["prefix_cache_bytes"] == cache
+        ]
+        return match
+
+    def test_every_path_is_measured_against_its_own_processs_off_row(self) -> None:
+        report = campaign.paths_report([self.campaign()])
+        self.assertEqual(report["refusals"], [])
+        self.assertEqual(report["schema"], campaign.PATHS_SCHEMA)
+        dspine = self.summary(report, "block_draft:dspine:linear")
+        self.assertEqual(dspine["group"]["tier"], "q4")
+        self.assertAlmostEqual(dspine["speedup_vs_off"]["decode_tok_s"]["predictable"], 3.0)
+        self.assertAlmostEqual(dspine["speedup_vs_off"]["decode_tok_s"]["open_ended"], 1.5)
+        self.assertAlmostEqual(dspine["speedup_vs_off"]["wall_ms"]["all"], math_sqrt(4.5))
+        self.assertAlmostEqual(dspine["draft_ms_per_pass"], 18.0)
+        self.assertTrue(dspine["draft_time_host_synchronized"])
+        self.assertEqual(dspine["memory_added_bytes"], (1 << 30) + (1 << 20))
+        tree = self.summary(report, "block_draft:dspine:tree")
+        self.assertEqual(tree["accepted_per_tree_pass"], 3.5)
+        # DFlash2's process ran its own `off` at 8 tok/s: its ratio is 1.2, not 9.6 / 10.
+        dflash = self.summary(report, "block_draft:dflash2:linear")
+        self.assertAlmostEqual(dflash["speedup_vs_off"]["decode_tok_s"]["all"], 1.2)
+        # The MTP draft time was enqueue-only (drafts left on the device).
+        self.assertFalse(self.summary(report, "mtp")["draft_time_host_synchronized"])
+        # The draft-model path ran nothing, and says why.
+        probe = self.summary(report, "draft_model")
+        self.assertEqual(probe["ran"], ["none"])
+        self.assertIn("tokenizer vocabulary", probe["draft_refusal"])
+        # Reused-context samples are their own context.
+        reused = self.summary(report, "block_draft:dspine:linear", "reused", "default")
+        self.assertEqual(reused["prompts"], 1)
+        self.assertAlmostEqual(reused["speedup_vs_off"]["decode_tok_s"]["all"], 2.0)
+
+    def test_auto_inputs_compare_each_block_draft_with_mtp_through_off(self) -> None:
+        report = campaign.paths_report([self.campaign()])
+        inputs = {(i["path"], i["context"]): i for i in report["auto_inputs"]}
+        dspine = inputs[("block_draft:dspine:linear", "cold")]["decode_tok_s"]
+        # MTP is 1.5x off in process A; DSpine 3.0x / 1.5x: 2.0x / 1.0x over MTP.
+        self.assertAlmostEqual(dspine["vs_mtp"], math_sqrt(2.0))
+        self.assertAlmostEqual(dspine["vs_mtp_min"], 1.0)
+        self.assertFalse(dspine["beats_mtp_on_every_prompt"])
+        tree = inputs[("block_draft:dspine:tree", "cold")]["decode_tok_s"]
+        self.assertTrue(tree["beats_mtp_on_every_prompt"])
+        # DFlash2's process has no MTP row; its ratio meets MTP's through each process's `off`.
+        dflash = inputs[("block_draft:dflash2:linear", "cold")]["decode_tok_s"]
+        self.assertAlmostEqual(dflash["vs_mtp"], 0.8)
+        self.assertFalse(dflash["beats_mtp_on_every_prompt"])
+
+    def test_the_paths_command_writes_both_reports_and_fails_on_a_refusal(self) -> None:
+        directory = self.campaign()
+        out = self.directory / "report"
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.main(["paths", "--campaign", str(directory), "--json",
+                                  str(out.with_suffix(".json")), "--markdown",
+                                  str(out.with_suffix(".md"))])
+        self.assertEqual(code, 0)
+        markdown = out.with_suffix(".md").read_text(encoding="utf-8")
+        self.assertIn("| block_draft:dspine:tree | block_draft |", markdown)
+        self.assertIn("## Block-draft inputs for `auto`", markdown)
+        self.assertIn("enqueue-only", markdown)
+        summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        summary["rows"][0]["processes"][0]["status"] = "failed"
+        (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.main(["paths", "--campaign", str(directory), "--json",
+                                  str(self.directory / "again.json"), "--markdown",
+                                  str(self.directory / "again.md")])
+        self.assertEqual(code, 1)
+
+
+def math_sqrt(value: float) -> float:
+    import math
+
+    return math.sqrt(value)
+
+
+class TimeBudgetTests(unittest.TestCase):
+    """SW-7200: on a loaned host the runner starts no process once its budget has passed, and
+    never interrupts the one running."""
+
+    setUp = RunTests.setUp
+
+    def test_no_process_starts_after_the_budget_and_the_row_stays_incomplete(self) -> None:
+        output = self.directory / "out"
+        output.mkdir()
+        rows = [{"id": f"q{i}", "snapshot": "qwen38", "runs": ["epic"], "process_repeats": 2}
+                for i in (1, 2)]
+        planned = plan({"rows": rows}, {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})
+        ticks = iter([0.0, 10.0, 20.0, 400.0, 500.0])
+        with mock.patch.dict(os.environ, {"FAKE_RECORD": str(self.record)}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.run_plan(
+                planned, roots={"epic": self.directory / "epic"}, target_dirs={},
+                epic_sha=EPIC_SHA, output=output, cargo=sys.executable, guard=[],
+                sha_override=False, stop_starting_after=300.0, clock=lambda: next(ticks),
+            )
+        self.assertEqual(code, 1)
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertIn("time budget", summary["stopped"])
+        self.assertFalse(summary["complete"])
+        first, second = summary["rows"]
+        self.assertTrue(first["complete"])
+        self.assertEqual(len(first["processes"]), 2)
+        self.assertFalse(second["complete"])
+        self.assertEqual(second["processes"], [])
+        runs = [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(sum(not r["build"] for r in runs), 2)

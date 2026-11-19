@@ -123,6 +123,41 @@ pub struct DecodeDraft {
     pub precision: String,
 }
 
+/// The host wall time a generation's proposer spent producing drafts (SW-7200): every proposer
+/// call of the run, from the request for drafts to the proposal (or tree) in hand. A call whose
+/// drafts came back on the host waited for the draft's device work, so its time is the draft's
+/// whole cost; a call that left its drafts on the device (Candle's greedy MTP and draft-model
+/// proposers keep them there for the verify forward) is timed only up to its enqueue, so
+/// [`host_synchronized_calls`](Self::host_synchronized_calls) below
+/// [`calls`](Self::calls) says the total is a lower bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftTime {
+    /// Proposer calls the run made (one per verify pass that asked for drafts).
+    pub calls: u64,
+    /// The calls whose drafts came back on the host.
+    pub host_synchronized_calls: u64,
+    /// The summed wall time of every call.
+    pub total: std::time::Duration,
+}
+
+impl DraftTime {
+    /// Count one proposer call of `elapsed`; `host_synchronized` when its drafts came back on the
+    /// host.
+    pub fn record(&mut self, elapsed: std::time::Duration, host_synchronized: bool) {
+        self.calls += 1;
+        self.host_synchronized_calls += u64::from(host_synchronized);
+        self.total += elapsed;
+    }
+
+    /// Mean wall time per call, or `None` before any call.
+    pub fn per_call(&self) -> Option<std::time::Duration> {
+        u32::try_from(self.calls)
+            .ok()
+            .filter(|&calls| calls > 0)
+            .map(|calls| self.total / calls)
+    }
+}
+
 /// What tree verification did in one generation (feature SW-F328, E8): carried on
 /// [`DecodeReport::tree_verify`] whenever the request's tree resolved to run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -278,6 +313,9 @@ pub struct DecodeReport {
     /// Tree verification's part (feature SW-F328): `None` unless the request's tree resolved
     /// to run.
     pub tree_verify: Option<TreeVerifyReport>,
+    /// The proposer's wall time (SW-7200): `None` when no proposer call ran or the backend does
+    /// not time it.
+    pub draft_time: Option<DraftTime>,
 }
 
 impl DecodeReport {
@@ -507,6 +545,26 @@ impl DraftReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-7200: the proposer's time sums every call and counts the ones whose drafts came back
+    /// on the host, so a total timed partly at enqueue is visible as such.
+    #[test]
+    fn draft_time_sums_calls_and_counts_the_synchronized_ones() {
+        use std::time::Duration;
+        let mut time = DraftTime::default();
+        assert_eq!(time.per_call(), None);
+        time.record(Duration::from_millis(3), true);
+        time.record(Duration::from_millis(5), false);
+        assert_eq!(
+            time,
+            DraftTime {
+                calls: 2,
+                host_synchronized_calls: 1,
+                total: Duration::from_millis(8),
+            }
+        );
+        assert_eq!(time.per_call(), Some(Duration::from_millis(4)));
+    }
 
     #[test]
     fn a_backend_without_cuda_names_itself_in_every_refusal() {

@@ -1432,3 +1432,62 @@ fn greedy_is_the_point_mass_special_case() {
         Acceptance::Rejected(3)
     );
 }
+
+/// SW-7200: `auto` keeps its MTP-then-prompt-lookup order unless the caller passes a recorded
+/// block-draft preference; with it, an advertised block draft runs first at its recommended depth,
+/// and a model without one still falls through to MTP. No decision is recorded yet.
+#[test]
+fn auto_prefers_a_block_draft_only_when_asked() {
+    use crate::{
+        BlockDraftFormat, DecodeBackend, MtpCapabilities, ProposerCapabilities, Speculative,
+        SpeculativeProposer, TextLlmCapabilities,
+    };
+    let block = ProposerCapabilities {
+        proposer: SpeculativeProposer::BlockDraft,
+        max_depth: 4,
+        recommended_depth: 4,
+    };
+    let mtp = Some(MtpCapabilities {
+        max_draft_tokens: 5,
+        recommended_draft_tokens: 3,
+    });
+    let with_draft = TextLlmCapabilities {
+        mtp,
+        speculative: vec![block],
+        ..Default::default()
+    };
+    let without_draft = TextLlmCapabilities {
+        mtp,
+        ..Default::default()
+    };
+    let run = |proposer, depth| SpeculativePlan::Run { proposer, depth };
+
+    assert_eq!(
+        resolve_speculative(Speculative::Auto, &with_draft).plan,
+        run(SpeculativeProposer::Mtp, 3)
+    );
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &with_draft, false),
+        resolve_speculative(Speculative::Auto, &with_draft)
+    );
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &with_draft, true).plan,
+        run(SpeculativeProposer::BlockDraft, 4)
+    );
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &without_draft, true).plan,
+        run(SpeculativeProposer::Mtp, 3)
+    );
+    // The preference never changes an explicit option.
+    assert_eq!(
+        resolve_speculative_with(Speculative::Off, &with_draft, true),
+        SpeculativeResolution::default()
+    );
+    for backend in DecodeBackend::ALL {
+        for format in BlockDraftFormat::ALL {
+            for tier in ["q4", "q8", "bf16"] {
+                assert_eq!(auto_block_draft_decision(backend, format, tier), None);
+            }
+        }
+    }
+}

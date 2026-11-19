@@ -4686,9 +4686,9 @@ fn the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model() {
         backend: "candle-cpu".into(),
         max_new_tokens: 12,
         options: vec![
-            Speculative::Off,
-            Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
-            Speculative::Auto,
+            Speculative::Off.into(),
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 4).into(),
+            Speculative::Auto.into(),
         ],
         warmup: false,
         sampling: core_llm::Sampling::greedy(),

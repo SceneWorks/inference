@@ -155,15 +155,30 @@ pub fn resolve_speculative(
     mode: crate::Speculative,
     capabilities: &crate::TextLlmCapabilities,
 ) -> SpeculativeResolution {
+    resolve_speculative_with(mode, capabilities, false)
+}
+
+/// [`resolve_speculative`] with `auto`'s block-draft preference (SW-7200): when
+/// `auto_prefers_block_draft`, `auto` runs an advertised `block_draft` at its recommended depth
+/// before MTP and prompt lookup; otherwise it is exactly [`resolve_speculative`]. A provider
+/// passes the preference [`auto_block_draft_decision`] records for its backend, resident draft
+/// format and target tier — `false` wherever no decision is recorded, which today is everywhere.
+pub fn resolve_speculative_with(
+    mode: crate::Speculative,
+    capabilities: &crate::TextLlmCapabilities,
+    auto_prefers_block_draft: bool,
+) -> SpeculativeResolution {
     use crate::{Speculative, SpeculativeProposer};
     let run = |proposer, depth| SpeculativeResolution {
         plan: SpeculativePlan::Run { proposer, depth },
         fallback: None,
     };
+    let block_draft = auto_prefers_block_draft.then_some(SpeculativeProposer::BlockDraft);
     match mode {
         Speculative::Off => SpeculativeResolution::default(),
-        Speculative::Auto => [SpeculativeProposer::Mtp, SpeculativeProposer::PromptLookup]
+        Speculative::Auto => block_draft
             .into_iter()
+            .chain([SpeculativeProposer::Mtp, SpeculativeProposer::PromptLookup])
             .find_map(|p| capabilities.proposer(p))
             .map(|cap| {
                 run(
@@ -200,6 +215,41 @@ pub fn resolve_speculative(
             }
         },
     }
+}
+
+/// Whether `auto` runs a resident block draft ahead of MTP on one backend, block-draft format and
+/// target tier (SW-7200) — a decision the paired speculative-paths campaign
+/// (`scripts/release/speculative_bench_campaign.py paths`) measured, with the reason. A block draft
+/// is trained for one target model and the load refuses it on any other, so the format names the
+/// model; the tier is the target's resident projection format (`q4`, `q8`, `bf16`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoBlockDraftDecision {
+    /// The decode backend measured.
+    pub backend: crate::DecodeBackend,
+    /// The resident draft's format.
+    pub format: crate::BlockDraftFormat,
+    /// The target's resident tier (`q4`, `q8`, `bf16`).
+    pub tier: &'static str,
+    /// Whether `auto` runs the block draft ahead of MTP and prompt lookup.
+    pub prefer: bool,
+    /// The measured reason (the campaign row and the margins it showed).
+    pub reason: &'static str,
+}
+
+/// Every recorded [`AutoBlockDraftDecision`]. Empty until the SW-7200 campaign's numbers exist: no
+/// pair is preferred, so `auto` resolves as [`resolve_speculative`] always has.
+pub const AUTO_BLOCK_DRAFT_DECISIONS: &[AutoBlockDraftDecision] = &[];
+
+/// The recorded decision for `backend`, `format` and `tier`, or `None` (not measured — `auto` keeps
+/// its MTP-then-prompt-lookup order).
+pub fn auto_block_draft_decision(
+    backend: crate::DecodeBackend,
+    format: crate::BlockDraftFormat,
+    tier: &str,
+) -> Option<&'static AutoBlockDraftDecision> {
+    AUTO_BLOCK_DRAFT_DECISIONS
+        .iter()
+        .find(|d| d.backend == backend && d.format == format && d.tier == tier)
 }
 
 /// How an `auto` fallback with no runnable proposer begins; the reason follows in parentheses.
