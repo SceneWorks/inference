@@ -1,7 +1,7 @@
 # SW-7090 — provision the MiniMax-H3-Image DiT inputs and its diffusers first-step reference.
 # Runs only on a reference cache miss.
 #
-# Runs after the image VAE step in the same job, so the task-owned hub, the pinned
+# Runs after the image VAE step in the same job, so the snapshot path, the pinned
 # huggingface-hub install and the reviewed Mage reference venv already exist.
 # 1. Materialize `transformer_diffusers/` + `tokenizer/` of MiniMaxAI/MiniMax-H3-Image @492fd8c4
 #    (the `minimax-h3-image-dit` row, ~66 GB) into the same snapshot. Neither producer reads

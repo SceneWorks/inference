@@ -32,7 +32,7 @@ name: Real-weight validation
 #   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
 #   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
 #   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB   nax-macos-2
-#   rw-chroma   none stored; materializes from the Hub per run       ~0        BOTH boxes
+#   rw-chroma   none pinned; fetched once into the runner HF cache    unmeasd.  BOTH boxes
 #   rw-starvector StarVector 1B + 8B terminal snapshots              ~19 GiB   nax-macos
 #
 # `qwen38-bonsai-mlx` is the one campaign-local exception to this reusable weight-set scheme.
@@ -44,9 +44,10 @@ name: Real-weight validation
 # snapshots are a reusable provisioned set. The workflow-policy tests pin every part of this
 # exception and continue to reject `real-weights` on every other macOS job.
 #
-# `rw-chroma` carries no stored bytes, so it is registered on both boxes and its jobs land on
-# whichever is free — verified 2026-08-04 by mapping `runner_name` across the last 40 runs, where
-# all three `Chroma packed auxiliaries` matrix legs are observed on `nax-macos` AND `nax-macos-2`.
+# `rw-chroma` pins no weight set (its jobs fetch through the runner's Hugging Face cache), so it is
+# registered on both boxes and its jobs land on whichever is free — verified 2026-08-04 by mapping
+# `runner_name` across the last 40 runs, where all three `Chroma packed auxiliaries` matrix legs
+# are observed on `nax-macos` AND `nax-macos-2`.
 # This row read `nax-macos-2` until then, which understated the contention it adds to that box.
 #
 # ON DISK is GiB as `du -sh` reports it, summed over each set's `models--*` repo directories.
@@ -80,11 +81,11 @@ name: Real-weight validation
 # enforcement: it fails closed with a named error on a cache miss, so a box that quietly loses its
 # copy surfaces as a red `mlx-media`, never a wrong oracle.
 
-# `rw-sa3` materializes its SA3/SAME rows into `RUNNER_TEMP`, but SC-18315 also uses that label to
-# select `nax-macos`, where the large F3 Krea q4 base is operator-provisioned. The lane materializes
-# the manifest-pinned Krea license and standalone Wan z16 donor itself, then verifies the donor's
-# fixed SHA-256. Moving the label requires moving the q4 base and preserving Hub access. It also
-# needs the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
+# `rw-sa3` materializes its SA3/SAME rows into the runner's Hugging Face cache. SC-18315 also uses
+# the label to select `nax-macos`, where the large F3 Krea q4 base is operator-provisioned. The lane
+# materializes the manifest-pinned Krea license and standalone Wan z16 donor itself, then verifies
+# the donor's fixed SHA-256. Moving the label requires moving the q4 base and preserving Hub access.
+# It also needs the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
 #
 # The sc-17284 Qwen/FLUX set is the largest row here and it transferred almost nothing: all of it
 # but the two ~0.85 GB Lightning LoRAs was already resident. "Already there" is still not "free" —
@@ -597,7 +598,6 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
         run: source scripts/ci/real-weights/mlx-chroma-auxiliary/materialize-the-exact-shipped-bf16-source.sh
       - name: Build and validate packed q4/q8 tiers
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
@@ -606,7 +606,6 @@ jobs:
           SC16462_OUT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PACKED_ROOT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PAYLOAD_MANIFEST: ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462
         run: source scripts/ci/real-weights/mlx-chroma-auxiliary/build-and-validate-packed-q4-q8-tiers.sh
 
@@ -669,7 +668,6 @@ jobs:
           path: ${{ runner.temp }}/chroma-sc16462-validated-${{ matrix.model }}
       - name: Rebuild the validated payload from the immutable source
         env:
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-publish-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_BUILT: ${{ runner.temp }}/chroma-publish-built-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PACKED: ${{ runner.temp }}/chroma-publish-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_VALIDATED_MANIFEST: ${{ runner.temp }}/chroma-sc16462-validated-${{ matrix.model }}/chroma-sc16462-payload-sha256.json
@@ -727,7 +725,6 @@ jobs:
       - name: Materialize exact Kolors q4 snapshot
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-kolors-${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-kolors/materialize-exact-kolors-q4-snapshot.sh
       - name: Run production-latent quality admission
         env:
@@ -811,7 +808,6 @@ jobs:
       - name: Materialize exact SDXL-family q4 snapshot
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-sdxl/materialize-exact-sdxl-family-q4-snapshot.sh
       - name: Run production-latent quality admission
         env:
@@ -880,7 +876,6 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-chroma/materialize-exact-chroma-q4-snapshot.sh
       - name: Run production-latent quality admission
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
@@ -982,8 +977,8 @@ jobs:
         run: rustc --version && cargo --version && python3.12 --version
       # No `report_runner_disk_headroom.sh` step here, deliberately. That script reports on the
       # `~/`-relative snapshot VARIABLES a lane resolves through `resolve_snapshot_paths.py`, and
-      # this lane resolves none: like `chroma-auxiliary`, `rw-chroma` stores no Chroma bytes and
-      # materializes into `runner.temp` from the Hub per run. Reporting headroom without a
+      # this lane resolves none: like `chroma-auxiliary`, it materializes through the runner's own
+      # Hugging Face cache rather than a resolved variable. Reporting headroom without a
       # resolved path is what `test_every_resolving_lane_reports_what_it_costs` forbids.
       #
       # Validate the dispatch inputs BEFORE the download, so a typo costs seconds rather than a
@@ -995,9 +990,6 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          # Step-level, not job-level: `runner.temp` in a job `env:` block is refused by
-          # `test_mage_media_lane_requires_verified_operator_cpu_oracles`.
-          CHROMA_LADDER_ROOT: ${{ runner.temp }}/chroma-ladder-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
         run: source scripts/ci/real-weights/mlx-chroma-memory-ladder/materialize-the-pinned-chroma-snapshot.sh
       - name: Run the memory ladder
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
@@ -5178,12 +5170,10 @@ jobs:
         if: steps.machine.outputs.ok == 'true'
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
         run: source scripts/ci/real-weights/mlx-iris-depth-train/materialize-the-pinned-depth-export.sh
       - name: Run the guarded depth full fine-tune
         if: steps.machine.outputs.ok == 'true'
         env:
-          IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
           IRIS_OUT: ${{ runner.temp }}/iris-depth-train-evidence
           # The test's temp root (its 12 GB export), applied to the test process only.
           IRIS_TMPDIR: ${{ runner.temp }}
@@ -5194,9 +5184,6 @@ jobs:
           # unstripped, as `mlx-qwen-image-2-1` does.
           CARGO_PROFILE_RELEASE_STRIP: "none"
         run: source scripts/ci/real-weights/mlx-iris-depth-train/run-the-guarded-depth-full-fine-tune.sh
-      - name: Remove the materialized export
-        if: always()
-        run: rm -rf "$RUNNER_TEMP"/iris-3b-*
       - name: Upload depth-training evidence
         if: always() && steps.machine.outputs.ok == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -5401,7 +5388,7 @@ jobs:
   # dispatch exercises both backends. `rw-llm` (nax-macos-2; small weight sets, not the dev Mac's
   # `nax` label) materializes per run: the same three
   # revision pins (`supra2-img-cuda`, `flan-t5-base-cuda`, `sd-vae-ft-mse-cuda` — the keys are the
-  # pins, shared by both lanes) are materialized into the box's task-owned hub (~1.75 GB), converted
+  # pins, shared by both lanes) are materialized into the runner's Hugging Face cache (~1.75 GB), converted
   # by the install-time converter into RUNNER_TEMP (re-verifying every SHA-256), and the three
   # `#[ignore]`d `mlx-gen-supra2` real-weight tests run on the GPU against the committed torch
   # golden the Candle lane uses (`candle-gen-supra2/tests/fixtures/supra2_real_golden.safetensors`).
@@ -5875,7 +5862,7 @@ jobs:
   # `mlx-iris-restore-train`: `rw-chroma` is registered on both Macs, so the first step SKIPS (with
   # the reason in the log) unless it is nax-macos-2 with >= 128 GB of unified memory and no heavy
   # memory pressure. It materializes the generation backbone (repo root), Qwen3-VL-4B and the frozen
-  # REPA teacher (`facebook/dinov2-base`) into the runner's task-owned hub, then runs, each under the
+  # REPA teacher (`facebook/dinov2-base`) into the runner's Hugging Face cache, then runs, each under the
   # external phys_footprint guard: the release teacher against the committed upstream tokens (cap
   # 20 GB, 15 min) and the bounded curriculum — the shipped `stage1_256` preset with REPA for two
   # steps, then `stage2_512` (bucket shapes, full activation checkpointing) continuing it as a
@@ -6074,7 +6061,7 @@ jobs:
   # (`flux3-klein-mlx` profile; never `all`, never the schedule; nothing is gated on its numbers).
   # The host is the `rw-mage` weight set (nax-macos-2, which already stores the Qwen3-VL-4B
   # snapshot the package's text encoder duplicates); the first step SKIPS with the reason when it
-  # has < 48 GB of unified memory or heavy memory pressure. The GATED package (FLUX Kommunity License) is materialized into the box's task-owned
+  # has < 48 GB of unified memory or heavy memory pressure. The GATED package (FLUX Kommunity License) is materialized into the runner's Hugging Face
   # hub through the runner's own Hugging Face credential (`requires_auth = true` on the manifest
   # row); each case runs under the external phys_footprint guard (cap 64 GB, 30 min). The PNG, its
   # JSON record and every case log go in the evidence artifact. Run-scoped CARGO_TARGET_DIR,

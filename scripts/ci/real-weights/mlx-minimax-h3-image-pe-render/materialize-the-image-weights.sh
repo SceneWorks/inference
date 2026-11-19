@@ -1,20 +1,14 @@
 # SW-7104 (AT9) — the MiniMax-H3-Image inputs of the PE-expansion renders, materialized exactly as
 # the `mlx-minimax-h3-image` job does (without its diffusers references): `vae_diffusers/`,
 # `transformer_diffusers/` and `tokenizer/` of MiniMaxAI/MiniMax-H3-Image @492fd8c4 and MiniMax-H3's
-# text encoder shards 1-12, into this box's internal task-owned hub (plain HTTPS, two retries; a
+# text encoder shards 1-12, into the runner's Hugging Face cache (plain HTTPS, two retries; a
 # pinned, verified snapshot is a no-op). Exports both snapshot paths for the render step.
 set -o pipefail
 python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
 export HF_HUB_DISABLE_XET=1
-lane_root="$HOME/sceneworks-rw-weights"
-lane_hub="$lane_root/hub"
-if [[ -L "$lane_root" ]]; then
-  echo "task-owned weights root must be an internal directory: $lane_root" >&2; exit 1
-fi
-mkdir -p "$lane_hub"
-python3.12 scripts/ci/qwen21_weights_root.py "$lane_root"
-export MINIMAX_H3_IMAGE_SNAPSHOT="$lane_hub/models--MiniMaxAI--MiniMax-H3-Image/snapshots/492fd8c4eca666f1085f57e30738c1e0d86b3439"
-export MINIMAX_H3_SNAPSHOT="$lane_hub/models--MiniMaxAI--MiniMax-H3/snapshots/939557dc319dd91227e30195a763f272ba7f8765"
+hub="$(python3.12 scripts/release/runner_hub_cache.py)"
+export MINIMAX_H3_IMAGE_SNAPSHOT="$hub/models--MiniMaxAI--MiniMax-H3-Image/snapshots/492fd8c4eca666f1085f57e30738c1e0d86b3439"
+export MINIMAX_H3_SNAPSHOT="$hub/models--MiniMaxAI--MiniMax-H3/snapshots/939557dc319dd91227e30195a763f272ba7f8765"
 {
   echo "MINIMAX_H3_IMAGE_SNAPSHOT=$MINIMAX_H3_IMAGE_SNAPSHOT"
   echo "MINIMAX_H3_SNAPSHOT=$MINIMAX_H3_SNAPSHOT"

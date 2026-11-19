@@ -582,7 +582,20 @@ def ensure_snapshot(
     return True
 
 
+def default_xet_cache(cache: Path, environ: dict | None = None) -> None:
+    """Keep the Xet chunk cache beside the hub cache when the runner sets no `HF_HOME`.
+
+    `huggingface_hub` otherwise falls back to `~/.cache/huggingface/xet`, a download byproduct in
+    the user profile rather than in the runner's Hugging Face home. Must run before
+    `huggingface_hub` is imported: the library reads it into a constant at import time.
+    """
+    environ = os.environ if environ is None else environ
+    if not environ.get("HF_XET_CACHE") and not environ.get("HF_HOME"):
+        environ["HF_XET_CACHE"] = str(cache.parent / "xet")
+
+
 def download_snapshot(**kwargs: Any) -> Any:
+    default_xet_cache(Path(kwargs["cache_dir"]) if kwargs.get("cache_dir") else runner_hub_cache())
     try:
         from huggingface_hub import snapshot_download
     except ImportError as error:
@@ -590,6 +603,54 @@ def download_snapshot(**kwargs: Any) -> Any:
             "huggingface_hub is required only when a pinned snapshot is absent"
         ) from error
     return snapshot_download(**kwargs)
+
+
+def download_to_runner_cache(
+    *,
+    repo_id: str,
+    revision: str,
+    allow_patterns: list[str] | None = None,
+    token: bool = False,
+    cache: Path | None = None,
+) -> Path:
+    """Download a pinned snapshot (or an allow-listed slice of it) through the runner hub cache.
+
+    For lanes whose inputs have no manifest row. Returns the snapshot directory only after proving
+    it holds every Hub file the allow-list selects at that revision: when the Hub's repo-info call
+    fails, `snapshot_download` returns an existing `snapshots/<revision>` directory without checking
+    it is complete, so an interrupted earlier run (or another lane's narrower slice of the same
+    revision) would otherwise pass. The file listing is the check, so a Hub outage fails here.
+    """
+    cache = runner_hub_cache() if cache is None else cache
+    default_xet_cache(cache)
+    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub.utils import filter_repo_objects
+
+    root = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            allow_patterns=allow_patterns,
+            cache_dir=str(cache),
+            token=token,
+        )
+    )
+    expected = runner_cache_snapshot({"repository": repo_id, "revision": revision}, cache)
+    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.realpath(expected)):
+        raise RuntimeError(
+            f"{repo_id}@{revision} materialized at {root}, not the runner-cache snapshot {expected}"
+        )
+    files = HfApi().list_repo_files(repo_id, revision=revision, token=token)
+    wanted = sorted(filter_repo_objects(files, allow_patterns=allow_patterns))
+    if not wanted:
+        raise RuntimeError(f"{repo_id}@{revision} has no files matching {allow_patterns}")
+    missing = [name for name in wanted if not (root / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"{repo_id}@{revision} at {root} is incomplete: {len(missing)} of {len(wanted)} "
+            f"selected files are missing (first: {missing[0]})"
+        )
+    return root
 
 
 def main() -> int:

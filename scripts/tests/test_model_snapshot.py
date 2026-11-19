@@ -1273,3 +1273,71 @@ class CacheResidentSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DownloadToRunnerCacheTests(unittest.TestCase):
+    """Lanes without a manifest row download through the cache and prove the slice is complete."""
+
+    REPO = "example/sliced"
+    REVISION = "c" * 40
+    FILES = ["q4/transformer/a.safetensors", "q4/vae/b.safetensors", "q8/transformer/a.safetensors"]
+
+    def fake_hub(self, cache: Path, present: list[str]):
+        snapshot = runner_cache_snapshot({"repository": self.REPO, "revision": self.REVISION}, cache)
+        calls = []
+
+        def snapshot_download(**kwargs):
+            calls.append(kwargs)
+            for name in present:
+                (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
+                (snapshot / name).write_bytes(b"x")
+            return str(snapshot)
+
+        files = self.FILES
+
+        class HfApi:
+            def list_repo_files(self, repo_id, revision, token):
+                return files
+
+        def filter_repo_objects(items, allow_patterns=None):
+            import fnmatch
+            return [i for i in items if not allow_patterns or any(fnmatch.fnmatch(i, p) for p in allow_patterns)]
+
+        hub = mock.MagicMock(snapshot_download=snapshot_download, HfApi=HfApi)
+        utils = mock.MagicMock(filter_repo_objects=filter_repo_objects)
+        return snapshot, calls, {"huggingface_hub": hub, "huggingface_hub.utils": utils}
+
+    def test_complete_slice_is_returned_from_the_runner_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hub"
+            snapshot, calls, modules = self.fake_hub(cache, self.FILES[:2])
+            with mock.patch.dict("sys.modules", modules), mock.patch.dict(
+                ensure_model_snapshot.os.environ, {"HF_HOME": str(Path(temporary))}, clear=True
+            ):
+                root = ensure_model_snapshot.download_to_runner_cache(
+                    repo_id=self.REPO, revision=self.REVISION, allow_patterns=["q4/**"], cache=cache
+                )
+            self.assertEqual(root, snapshot)
+            self.assertEqual(Path(calls[0]["cache_dir"]), cache)
+            self.assertNotIn("local_dir", calls[0])
+
+    def test_incomplete_cached_slice_is_refused(self) -> None:
+        # The Hub-outage shape: snapshot_download hands back an existing but partial directory.
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hub"
+            _, _, modules = self.fake_hub(cache, self.FILES[:1])
+            with mock.patch.dict("sys.modules", modules), mock.patch.dict(
+                ensure_model_snapshot.os.environ, {"HF_HOME": str(Path(temporary))}, clear=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "incomplete: 1 of 2"):
+                    ensure_model_snapshot.download_to_runner_cache(
+                        repo_id=self.REPO, revision=self.REVISION, allow_patterns=["q4/**"], cache=cache
+                    )
+
+    def test_xet_cache_defaults_beside_the_hub_cache_only_without_hf_home(self) -> None:
+        environ: dict = {}
+        ensure_model_snapshot.default_xet_cache(Path("/v/huggingface/hub"), environ)
+        self.assertEqual(environ["HF_XET_CACHE"], str(Path("/v/huggingface/xet")))
+        environ = {"HF_HOME": "/h"}
+        ensure_model_snapshot.default_xet_cache(Path("/v/huggingface/hub"), environ)
+        self.assertNotIn("HF_XET_CACHE", environ)

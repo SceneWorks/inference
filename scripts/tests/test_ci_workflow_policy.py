@@ -3378,6 +3378,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn('allow_patterns=["bf16/**"]', job)
         self.assertIn("models--SceneWorks--scail2-mlx", job)
+        # The package lands in the runner's own Hugging Face cache, not the user-profile default.
+        self.assertIn("download_to_runner_cache(", job)
+        self.assertIn("cache=hub", job)
+        self.assertIn("hub = runner_hub_cache()", job)
+        self.assertNotIn("USERPROFILE", job)
         git_bash = job.index("Select Git Bash")
         validate_python = job.index("Validate runner-provisioned CPython 3.14 x64")
         toolchain = job.index("uses: ./.github/actions/setup-rust")

@@ -1,30 +1,10 @@
 python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-# As the Iris MLX lanes: plain HTTPS, into the box's internal task-owned hub (never the shared app
-# cache), retrying a transient failure twice; a pinned, verified snapshot is a no-op. Phase `device`
-# reads only the Veda predictor; `ab` / `all` also render, so they add the upstream MiniMax-H3 slice
+# As the Iris MLX lanes: plain HTTPS, into the runner's Hugging Face cache (the resolved
+# `MLX_GEN_MODELS_ROOT` paths), retrying a transient failure twice; a pinned, verified snapshot is a
+# no-op. Phase `device` reads only the Veda predictor; `ab` / `all` also render, so they add the upstream MiniMax-H3 slice
 # (VAEs, FL2VA audio VAE, tokenizer, TE index), the SceneWorks q4 DiT/TE tier and the turbo LoRAs.
 export HF_HUB_DISABLE_XET=1
-lane_root="$HOME/sceneworks-rw-weights"
-lane_hub="$lane_root/hub"
-if [[ -L "$lane_root" ]]; then
-  echo "task-owned weights root must be an internal directory: $lane_root" >&2; exit 1
-fi
-mkdir -p "$lane_hub"
-python3.12 scripts/ci/qwen21_weights_root.py "$lane_root"
-df -h "$lane_hub" | tee "$VEDA_OUT/lane-hub-df.txt"
-vars=(VEDA_AB_PREDICTOR_SNAPSHOT)
-if [[ "$VEDA_MLX_PHASE" != "device" ]]; then
-  vars+=(SCENEWORKS_MLX_MINIMAX_H3_BASE_DIR SCENEWORKS_MLX_MINIMAX_H3_TIER_DIR VEDA_AB_TURBO_SNAPSHOT)
-fi
-for v in "${vars[@]}"; do
-  tail_path="${!v#"$MLX_GEN_MODELS_ROOT"/}"
-  if [[ "$tail_path" == "${!v}" || "$tail_path" == *..* ]]; then
-    echo "snapshot must stay beneath the resolved hub: $v=${!v}" >&2; exit 1
-  fi
-  printf -v "$v" '%s' "$lane_hub/$tail_path"
-  export "$v"
-  echo "$v=${!v}" >> "$GITHUB_ENV"
-done
+df -h "$MLX_GEN_MODELS_ROOT" | tee "$VEDA_OUT/hub-df.txt"
 ensure() {
   # Anonymous Hub API calls are rate-limited (HTTP 429 seen on nax-macos-2), so back off longer.
   for attempt in 1 2 3 4 5; do
@@ -45,4 +25,4 @@ fi
 predictor="$VEDA_AB_PREDICTOR_SNAPSHOT/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"
 test -f "$predictor"
 echo "VEDA_PREDICTOR=$predictor" >> "$GITHUB_ENV"
-df -h "$lane_hub" | tee -a "$VEDA_OUT/lane-hub-df.txt"
+df -h "$MLX_GEN_MODELS_ROOT" | tee -a "$VEDA_OUT/hub-df.txt"

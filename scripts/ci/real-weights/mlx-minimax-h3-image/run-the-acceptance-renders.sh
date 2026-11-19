@@ -5,7 +5,7 @@
 # applies). Runs after the earlier steps, so the image snapshot, MiniMax-H3's text encoder, the
 # pinned huggingface-hub install, the run-scoped CARGO_TARGET_DIR and the prebuilt libmlx are in
 # place. Materializes the community LoRAs (the `minimax-h3-image-community-lora-*` rows) into the
-# same task-owned hub. Each gate is name-selected with `--exact`, built with the registered
+# runner's Hugging Face cache. Each gate is name-selected with `--exact`, built with the registered
 # `model-inference-proof` feature, run with MODEL_INFERENCE_CASE_FQN set and checked by
 # verify_model_inference_log.py, so a rename cannot go vacuously green. Every gate runs and reports
 # even when an earlier one fails; the step fails at the end if any did. The PNGs and logs go to
@@ -15,7 +15,7 @@ out="$RUNNER_TEMP/minimax-h3-image-acceptance"
 mkdir -p "$out"
 export MINIMAX_H3_IMAGE_ACCEPTANCE_OUT="$out"
 export HF_HUB_DISABLE_XET=1
-lane_hub="$HOME/sceneworks-rw-weights/hub"
+hub="$(python3.12 scripts/release/runner_hub_cache.py)"
 loras=""
 # name:row:snapshot variable:repository:revision:file - each row's `environment` variable is
 # exported with its snapshot path.
@@ -26,7 +26,7 @@ for entry in \
   "pdmd:pdmd:MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT:linoyts/MiniMax-H3-Image-pDMD-2steps:c07d96e5635311ed007d44654c2f98cc8d6e0a1e:pytorch_lora_weights.safetensors" \
   "character-swap:character-swap:MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT:akhaliq/MiniMax-H3-Image-Character-Swap:0b7f918092f9e23c01ca62b63d7c17e4fce6faa9:lora/h3_image_character_swap_diffusers.safetensors"; do
   IFS=: read -r name row var repo rev file <<<"$entry"
-  snapshot="$lane_hub/models--${repo//\//--}/snapshots/$rev"
+  snapshot="$hub/models--${repo//\//--}/snapshots/$rev"
   export "$var=$snapshot"
   for attempt in 1 2 3; do
     PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
