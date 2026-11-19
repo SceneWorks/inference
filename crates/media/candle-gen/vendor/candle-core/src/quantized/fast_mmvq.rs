@@ -44,6 +44,12 @@ const MMVQ_MAX_BATCH: usize = 8;
 struct WorkspaceSlot {
     slice: CudaSlice<u8>,
     cap: usize,
+    /// Every slice this slot outgrew, kept alive for the process: a captured CUDA graph bakes in
+    /// the workspace's address at capture, and a replay after the slot grew still writes and reads
+    /// there. Freeing an outgrown slice hands that address to the allocator, so every later replay
+    /// scribbles over whatever it backs next (SW-7197: a block draft's context). The slot only
+    /// grows to the largest step's need, so this holds a few MB at most.
+    retired: Vec<CudaSlice<u8>>,
 }
 
 static WORKSPACE: OnceLock<Mutex<HashMap<DeviceId, WorkspaceSlot>>> = OnceLock::new();
@@ -66,14 +72,19 @@ fn workspace_ensure(
         std::collections::hash_map::Entry::Occupied(entry) => {
             let slot = entry.into_mut();
             if slot.cap < bytes {
-                slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
+                let grown = unsafe { dev.alloc::<u8>(bytes)? };
+                slot.retired.push(std::mem::replace(&mut slot.slice, grown));
                 slot.cap = bytes;
             }
             slot
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             let slice = unsafe { dev.alloc::<u8>(bytes)? };
-            entry.insert(WorkspaceSlot { slice, cap: bytes })
+            entry.insert(WorkspaceSlot {
+                slice,
+                cap: bytes,
+                retired: Vec::new(),
+            })
         }
     };
     let ptr = slot.slice.device_ptr(slot.slice.stream()).0;

@@ -135,6 +135,12 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
 struct WorkspaceSlot {
     slice: CudaSlice<u8>,
     cap: usize,
+    /// Every slice this slot outgrew, kept alive for the process: a captured CUDA graph bakes in
+    /// the workspace's address at capture, and a replay after the slot grew still writes and reads
+    /// there. Freeing an outgrown slice hands that address to the allocator, so every later replay
+    /// scribbles over whatever it backs next (SW-7197: a block draft's context). The slot only
+    /// grows to the largest step's need, so this holds a few MB at most.
+    retired: Vec<CudaSlice<u8>>,
 }
 
 type WsMap = Mutex<HashMap<DeviceId, &'static Mutex<WorkspaceSlot>>>;
@@ -158,6 +164,7 @@ fn workspace_ensure(
                 let leaked = Box::leak(Box::new(Mutex::new(WorkspaceSlot {
                     slice,
                     cap: bytes.max(1),
+                    retired: Vec::new(),
                 })));
                 guard.insert(device_key, leaked);
                 leaked
@@ -166,7 +173,9 @@ fn workspace_ensure(
     };
     let mut slot = device_mtx.lock().unwrap();
     if slot.cap < bytes {
-        slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
+        let grown = unsafe { dev.alloc::<u8>(bytes)? };
+        let slot = &mut *slot;
+        slot.retired.push(std::mem::replace(&mut slot.slice, grown));
         slot.cap = bytes;
     }
     let ptr = slot.slice.device_ptr(slot.slice.stream()).0;

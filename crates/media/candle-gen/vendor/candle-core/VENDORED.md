@@ -12,6 +12,13 @@ lifetime, refusing cap changes and current-pool replacement. A restart is requir
 to change or remove it. `candle-gen/tests/cuda_proof_pool.rs` is an ignored
 raw-allocation proof executed only by the separate explicit workflow.
 
+SW-7197 (2026-11-19): `src/quantized/fast_mmvq.rs` and `src/quantized/fast_mmq.rs` keep their
+per-device scratch workspaces' outgrown slices alive (`WorkspaceSlot::retired`) instead of freeing
+them on growth. A captured CUDA graph bakes in the workspace address; after a grow, freeing the old
+slice let every later replay write its Q8_1 activations over whatever the allocator placed there
+next (a Qwen3.8-27B DSpine block draft's context on its cold, graph-captured request). The
+retained slices total at most the slot's growth steps, a few MB.
+
 Dependency maintenance (2026-10-17): the standalone `Cargo.toml` now requires
 `zip = "9"` instead of `7.2.0` to address RUSTSEC-2026-0367, RUSTSEC-2026-0368,
 and RUSTSEC-2026-0369. Features remain disabled by default. `src/npy.rs` and
