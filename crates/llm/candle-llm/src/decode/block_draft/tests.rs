@@ -833,6 +833,9 @@ fn context_moved(got: &BlockDraftContext, want: &BlockDraftContext, label: &str)
 /// The image placeholder id of the multimodal fixture (any non-mask id of the tiny vocabulary).
 const IMAGE: i32 = 7;
 
+/// The video placeholder id of the multimodal fixture (SW-7209).
+const VIDEO: i32 = 8;
+
 /// A fused image + text prompt over the tiny target, prepared as the provider prepares one
 /// (MLX's SW-7195 fixture): `[3, 9, image × 9, 4, 11, 3]` with a `1 × 6 × 6` image grid merged
 /// by 2 — nine visual rows on a 3 × 3 M-RoPE grid, so the text after the image sits 6 positions
@@ -850,12 +853,35 @@ struct ImagePrompt {
 
 impl ImagePrompt {
     fn new(model: &Qwen35Model) -> Self {
+        let prompt = Self::visual(model, &[[1, 6, 6]], &[]);
+        assert_eq!(prompt.delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
+        prompt
+    }
+
+    /// A fused prompt `[3, 9, visuals…, 4, 11, 3]` over `images` (each a run of [`IMAGE`]) then
+    /// `videos` (each one run of [`VIDEO`] per frame, frames parted by a timestamp-like text
+    /// token, as the provider renders a clip), every grid merged by 2 (SW-7209): the visual
+    /// rows' embeddings shifted as encoder features would be, one DeepStack feature set fused
+    /// after layer 0, and the M-RoPE rows and `mrope_delta` of the shared position rule.
+    fn visual(model: &Qwen35Model, images: &[[i32; 3]], videos: &[[i32; 3]]) -> Self {
         let mut ids = vec![3, 9];
-        ids.extend([IMAGE; 9]);
+        for g in images {
+            ids.extend(std::iter::repeat_n(IMAGE, (g[1] * g[2] / 4) as usize));
+        }
+        for g in videos {
+            for frame in 0..g[0] {
+                if frame > 0 {
+                    ids.push(5);
+                }
+                ids.extend(std::iter::repeat_n(VIDEO, (g[1] * g[2] / 4) as usize));
+            }
+        }
         ids.extend([4, 11, 3]);
-        let (t, h, w, delta) = model.mrope_positions(&ids, &[[1, 6, 6]], IMAGE, 2).unwrap();
-        assert_eq!(delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
-        let visual: Vec<bool> = ids.iter().map(|&id| id == IMAGE).collect();
+        let (t, h, w, delta) =
+            crate::models::deepstack::mrope_positions_mm(&ids, images, IMAGE, videos, VIDEO, 2)
+                .unwrap();
+        let visual: Vec<bool> = ids.iter().map(|&id| id == IMAGE || id == VIDEO).collect();
+        let rows = visual.iter().filter(|&&v| v).count();
         let device = model.device();
         let embeds = model
             .embed_input_ids(&input_ids(&ids, device).unwrap())
@@ -875,10 +901,10 @@ impl ImagePrompt {
             .and_then(|t| t.to_dtype(embeds.dtype()))
             .unwrap();
         let embeds = (embeds + shift).unwrap();
-        let feature: Vec<f32> = (0..9 * hidden)
+        let feature: Vec<f32> = (0..rows * hidden)
             .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
             .collect();
-        let deepstack = vec![Tensor::from_vec(feature, (9, hidden), device).unwrap()];
+        let deepstack = vec![Tensor::from_vec(feature, (rows, hidden), device).unwrap()];
         Self {
             ids,
             embeds,
@@ -1854,8 +1880,9 @@ fn run_image_block_tree<P: Proposer + ?Sized>(
     (run, cache)
 }
 
-/// SW-7209 AC1/AC2 (greedy): on the image + text prompt with tree verification on, for each
-/// format at every draft precision (dense, Q8, Q4), two depths, plain and constrained, the block
+/// SW-7209 AC1/AC2 (greedy): on the image + text prompt and on a two-frame video + text prompt
+/// with tree verification on, for each format at every draft precision (dense, Q8, Q4), two
+/// depths, plain and constrained, the block
 /// draft's candidate trees commit exactly the plain loop's tokens over the same fused prompt (the
 /// constraint sees the same accepted sequence); the runs verify branching trees in one forward
 /// each at the M-RoPE-shifted text positions, accept and reject candidates, and report rows and
@@ -1865,7 +1892,13 @@ fn run_image_block_tree<P: Proposer + ?Sized>(
 fn greedy_image_block_draft_tree_is_the_plain_loop() {
     let (_guard, device) = proof_device();
     let model = tiny_target_on(&device, true);
-    let prompt = ImagePrompt::new(&model);
+    // An image, and a two-frame video (SW-7209 review): the frames sit at different temporal
+    // positions, so its `mrope_delta` is the video rule's, not the image's.
+    let prompts = [
+        ("image", ImagePrompt::new(&model)),
+        ("video", ImagePrompt::visual(&model, &[], &[[2, 6, 6]])),
+    ];
+    assert!(prompts[1].1.delta < 0 && prompts[1].1.delta != prompts[0].1.delta);
     let mut totals: HashMap<&str, (u64, u64, u64)> = HashMap::new();
     for precision in [
         None,
@@ -1874,21 +1907,24 @@ fn greedy_image_block_draft_tree_is_the_plain_loop() {
     ] {
         for (format, draft) in tiny_drafts(precision, &device) {
             let target = TappedQwen35::for_draft(&model, &draft);
-            for depth in [2usize, 5] {
+            for (depth, (kind, prompt)) in [2usize, 5]
+                .into_iter()
+                .flat_map(|d| prompts.iter().map(move |p| (d, p)))
+            {
                 for constrained in [false, true] {
                     let label = format!(
-                        "{format:?} {precision:?} depth {depth} constrained {constrained} image tree"
+                        "{format:?} {precision:?} depth {depth} constrained {constrained} {kind} tree"
                     );
                     let mut constraint = Forbid::new(&[1, 9]);
                     let allow = constraint.allow.clone();
                     let expected =
-                        plain_image(&model, &prompt, 24, constrained.then_some(allow.as_slice()));
+                        plain_image(&model, prompt, 24, constrained.then_some(allow.as_slice()));
                     let mut proposer = BlockDraftProposer::new(&draft, &model);
                     proposer.set_rope_delta(prompt.delta);
                     let (run, _) = run_image_block_tree(
                         &target,
                         &mut proposer,
-                        &prompt,
+                        prompt,
                         &config(24, 7),
                         depth,
                         16,
@@ -2221,7 +2257,10 @@ fn sampled_image_block_draft_tree_keeps_the_target_distribution() {
 fn an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean() {
     let (_guard, device) = proof_device();
     let model = tiny_target_on(&device, true);
-    let prompt = ImagePrompt::new(&model);
+    // A 64-row image on an 8 × 8 grid: the text after it sits 56 positions below its sequence
+    // index, so a tree verified at the unshifted position scores measurably differently.
+    let prompt = ImagePrompt::visual(&model, &[[1, 16, 16]], &[]);
+    assert_eq!(prompt.delta, -56);
     let depth = 4;
     let capacity = prompt.ids.len() + 8 + crate::decode::tree_extra_positions(depth, 16);
     for (format, draft) in tiny_drafts(Some(BlockDraftPrecision::Q8), &device) {
@@ -2308,8 +2347,10 @@ fn an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean() {
         println!(
             "{label}: anchor row moved {shifted} from the shifted step, {unshifted} unshifted"
         );
-        // On CUDA a multi-row forward rounds BF16 differently from the one-row step by more than
-        // the shift moves the tiny target's logits, so only the CPU's f32 separates them.
+        // The shift moves the tiny target's logits by about one BF16 ULP (measured 0.0103 on the
+        // CPU at this 56-position delta, against 0.0053 at the 6-position one), which a CUDA
+        // multi-row BF16 forward's rounding against the one-row step can match, so only the CPU's
+        // f32 separates them: the CPU configuration is this check's required companion.
         assert!(
             if device.is_cpu() {
                 shifted * 4.0 < unshifted

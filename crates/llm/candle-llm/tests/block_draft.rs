@@ -586,9 +586,11 @@ fn tree_depth_filled(what: &str, out: &TextLlmOutput, depth: u32) -> Option<Stri
 /// greedy and seeded sampled (SW-7209 AC1/AC2): each run verifies branching trees with no tree or
 /// `block_draft` fallback, its tree report consistent with the run's counts and its rows checked
 /// and tokens accepted per pass and per tree pass printed, runs each tree pass eager through the
-/// graph runner and holds [`MIN_TOKENS_PER_PASS`] and [`MIN_ACCEPTED_FRACTION`] of its depth; the
-/// greedy tree stream agrees with speculation off for at least [`MIN_GREEDY_AGREEMENT`] tokens;
-/// the sampled run reproduces. Every arm runs and prints before any check fails.
+/// graph runner, holds [`MIN_TOKENS_PER_PASS`] and [`MIN_ACCEPTED_FRACTION`] of its depth, and
+/// accepts at least as many drafts per pass as the same request verified linearly (both
+/// reported); the greedy tree stream agrees with speculation off for at least
+/// [`MIN_GREEDY_AGREEMENT`] tokens; the sampled run reproduces. Every arm runs and prints before
+/// any check fails.
 fn image_tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_var: &str) {
     let name = format.label();
     let (provider, depth, _) = load(source_var, None);
@@ -628,6 +630,30 @@ fn image_tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_v
             }
         }
         failures.extend(tree_depth_filled(&what, &out, depth));
+        // The same request verified linearly: the tree accepts at least as many drafts per pass.
+        let (_, linear) = generate(
+            &provider,
+            &TextLlmRequest {
+                speculative_verify: SpeculativeVerify::Linear,
+                ..image_request(block, sampling)
+            },
+        );
+        let per_pass = |out: &TextLlmOutput| {
+            out.decode.as_ref().map_or(0.0, |d| {
+                d.accepted_tokens as f64 / d.verify_steps.max(1) as f64
+            })
+        };
+        let (tree_accepted, linear_accepted) = (per_pass(&out), per_pass(&linear));
+        println!(
+            "{what}: accepted per pass {tree_accepted:.2} under the tree, {linear_accepted:.2} linear"
+        );
+        failures.extend(ran_as_asked(&format!("{what} (linear)"), &linear));
+        if tree_accepted < linear_accepted {
+            failures.push(format!(
+                "{what}: {tree_accepted:.2} accepted per tree pass, below the linear run's \
+                 {linear_accepted:.2}"
+            ));
+        }
         failures.extend(tree_ran_as_asked(&what, ids.len(), &out, 16));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

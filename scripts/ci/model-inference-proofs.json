@@ -117900,7 +117900,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -117957,7 +117957,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118027,7 +118027,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118097,7 +118097,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118167,7 +118167,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118237,7 +118237,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118307,7 +118307,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_is_the_plain_loop@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_is_the_plain_loop@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118377,7 +118377,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_draft_context_follows_the_target_positions@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_draft_context_follows_the_target_positions@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118447,7 +118447,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118517,7 +118517,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118587,7 +118587,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118657,7 +118657,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118727,7 +118727,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_tree_is_the_plain_loop@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_tree_is_the_plain_loop@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118797,7 +118797,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_block_draft_tree_context_is_the_accepted_path@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_block_draft_tree_context_is_the_accepted_path@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118867,7 +118867,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_image_block_draft_tree_keeps_the_target_distribution@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_image_block_draft_tree_keeps_the_target_distribution@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -118937,7 +118937,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -119007,7 +119007,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_prompt_lookup_tree_is_the_plain_loop@59b0eaf184c186374221e3c866a95327d18e35f4ae869d6a5e3059fdd8dda7f7",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_prompt_lookup_tree_is_the_plain_loop@1b8429cb01e0775d2359afa3103b4d25a126d44bde0d950e3d28ed060d9c1b2b",
       "requirements": []
     }
   },
@@ -119420,7 +119420,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119538,7 +119538,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119656,7 +119656,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_runs_on_an_image_request@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_runs_on_an_image_request@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119774,7 +119774,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_tree_verifies_its_candidates@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_tree_verifies_its_candidates@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119892,7 +119892,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_runs_on_an_image_request@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_runs_on_an_image_request@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -120010,7 +120010,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_tree_verifies_its_candidates@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_tree_verifies_its_candidates@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -120128,7 +120128,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_tree_verifies_an_image_request@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_tree_verifies_an_image_request@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -120246,7 +120246,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_tree_verifies_an_image_request@abcbad8f50a4ad359c51adca28632c68258b23dc812d32c423cb435bbc2ae33c",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_tree_verifies_an_image_request@03d549866a046675bfa42baf6707ab4be72f68adf4729286661282a645801154",
       "requirements": [
         {
           "slot": "target-weights",
@@ -126034,6 +126034,76 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop; source setup helpers=image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop",
       "requirements": []
     }
   },
@@ -285353,7 +285423,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@ed4f4a279429f6bc17828e37d1993dca24b66d32b896b934c516ff61fe08a9aa",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@ddcce1a46fd99322f978f9a4c82d680e73a62a27a4b4301c611c29636bc9b7b3",
       "requirements": []
     }
   },
@@ -285593,7 +285663,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_tree_is_the_plain_loop@724841ca0de5871be001765e65e40a6c585636a508bc77bebae69202f0d2dcb6",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_tree_is_the_plain_loop@830cc4d9f5a45a7a96afede4e14a3a12a4423bcc2997ae86b7a32183d0337a06",
       "requirements": []
     }
   },
@@ -285683,7 +285753,7 @@
     "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean@d52cbe30b215356fe1f8a691ff73b3b7747469955084e7d50d6b494b1b98b930",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_image_block_draft_tree_leaves_both_caches_clean@160cc93d8e763b1d43c247497b7837856907a3c3920f1c4608d7620496f991ed",
       "requirements": []
     }
   },
@@ -285714,6 +285784,36 @@
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_prompt_lookup_tree_is_the_plain_loop@c19ab4887bef8c5d6181b6d227f0cf2ee56386dd3bb0fed7db9d462ac49479be",
+      "requirements": []
+    }
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::greedy_qwen3vl_image_prompt_lookup_tree_is_the_plain_loop",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "synthetic in-code arrays",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_qwen3vl_image_prompt_lookup_tree_is_the_plain_loop@6d4f05531f0851f96793111b9ae7f7217678852f142410d0f3546d6c635471be",
       "requirements": []
     }
   },

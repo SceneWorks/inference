@@ -538,9 +538,10 @@ const MIN_GREEDY_AGREEMENT: usize = 16;
 /// a 16-row tree, greedy and seeded sampled (SW-7209, AC1/AC2): each run verifies branching trees
 /// with no tree or `block_draft` fallback, names the draft as `format`, reports its rows checked
 /// and tokens accepted per pass and per tree pass, and holds [`MIN_TOKENS_PER_PASS`] and
-/// [`MIN_ACCEPTED_FRACTION`]; the greedy tree stream agrees with speculation off for at least
-/// [`MIN_GREEDY_AGREEMENT`] tokens; the sampled run reproduces. Every arm runs and prints before
-/// any check fails.
+/// [`MIN_ACCEPTED_FRACTION`], and accepts at least as many drafts per pass as the same request
+/// verified linearly (both reported); the greedy tree stream agrees with speculation off for at
+/// least [`MIN_GREEDY_AGREEMENT`] tokens; the sampled run reproduces. Every arm runs and prints
+/// before any check fails.
 fn image_tree_verifies_block_draft_candidates(
     target_var: &str,
     source_var: &str,
@@ -614,6 +615,23 @@ fn image_tree_verifies_block_draft_candidates(
         {
             failures.push(format!(
                 "{what}: the tree report disagrees with the run: {report:?}"
+            ));
+        }
+        // The same request verified linearly: the tree accepts at least as many drafts per pass.
+        let (_, linear) =
+            generate_image_with(&provider, block, sampling, SpeculativeVerify::Linear);
+        let linear = linear.decode.unwrap();
+        let tree_accepted = decode.accepted_tokens as f64 / passes;
+        let linear_accepted = linear.accepted_tokens as f64 / linear.verify_steps.max(1) as f64;
+        println!(
+            "{what}: accepted per pass {tree_accepted:.2} under the tree, {linear_accepted:.2} \
+             linear ({} linear passes, linear fallbacks {:?})",
+            linear.verify_steps, linear.fallbacks
+        );
+        if tree_accepted < linear_accepted {
+            failures.push(format!(
+                "{what}: {tree_accepted:.2} accepted per tree pass, below the linear run's \
+                 {linear_accepted:.2}"
             ));
         }
         if per_pass < MIN_TOKENS_PER_PASS || filled < MIN_ACCEPTED_FRACTION {
