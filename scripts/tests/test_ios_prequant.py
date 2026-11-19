@@ -43,6 +43,22 @@ class IosPrequantTests(unittest.TestCase):
             self.assertEqual(args[-3:], [str(Path("/out") / route), str(bits), "1024"])
             self.assertEqual(len(args), 5 if name.startswith("iris-") else 4)
 
+    def test_every_dispatch_materializes_only_the_route_paths_through_the_hub_cache(self):
+        calls = []
+        cache = Path("/runner/hub")
+        for route, patterns in (("anima-turbo", ["split_files/diffusion_models/anima-turbo-v1.0.safetensors",
+                                                 "split_files/text_encoders/qwen_3_06b_base.safetensors",
+                                                 "split_files/vae/qwen_image_vae.safetensors"]),
+                                ("sana-1600m", ["bf16/*"]), ("iris-depth", ["depth/*"]),
+                                ("iris-generation", ["config.yaml", "model.safetensors"]),
+                                ("iris-text-encoder", None)):
+            calls.clear()
+            MODULE.materialize_source(route, cache, download=lambda **kwargs: calls.append(kwargs))
+            owner, repo, revision, _ = MODULE.PINS[route]
+            expected = {"repo_id": f"{owner}/{repo}", "revision": revision, "cache": cache,
+                        "token": False, "allow_patterns": patterns}
+            self.assertEqual(calls, [expected], route)
+
     def test_header_budget_is_derived_without_payload_read(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "model.safetensors"

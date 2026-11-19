@@ -164,13 +164,18 @@ jobs:
       - name: Verify pinned Iris quant snapshots on the secondary Mac
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
         shell: bash
-        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          IRIS_PROOF_HF_HUB_PATH="$RUNNER_TEMP/huggingface-hub" python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
       - name: Verify pinned Iris quant snapshots on Windows
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
         shell: cmd
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "IRIS_PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda
       - name: Bind pinned provisioned bounded MLX training inputs
         if: matrix.asset_setup == 'mlx-training' && runner.os == 'macOS'
         shell: bash
@@ -178,9 +183,9 @@ jobs:
           MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
         run: |
           python3.12 -I scripts/ci/model_inference_proofs.py --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
-          # Opt-in (request "download_missing": true): the hash-pinned huggingface_hub the MLX
-          # real-weight lanes use, so a pinned snapshot no root holds is fetched whole at its revision.
-          if python3.12 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["request"].get("download_missing") is True else 1)' "$RUNNER_TEMP/model-proof-plan.json"; then
+          # Default (unless the request sets "download_missing": false): the hash-pinned huggingface_hub
+          # the MLX real-weight lanes use, so a pin no root holds is fetched whole into the runner's hub cache.
+          if python3.12 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["request"].get("download_missing", True) is True else 1)' "$RUNNER_TEMP/model-proof-plan.json"; then
             python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
             export MLX_PROOF_HF_HUB_PATH="$RUNNER_TEMP/huggingface-hub"
           fi

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.ci.model_inference_proofs import NAX_ROUTES, SENSENOVA_PROOFS, request, require_host
-from scripts.ci.sensenova_loop_assets import check_source_disk
+from scripts.ci.sensenova_loop_assets import check_source_disk, source_snapshot
 
 from scripts.ci.sensenova_loop_seal import (
     TIERS, verify_memory_endpoints, verify_oracle_marker, verify_semantic_margins,
@@ -134,6 +134,26 @@ class SenseNovaProvisioningTests(unittest.TestCase):
             with patch("scripts.ci.sensenova_loop_assets.shutil.disk_usage", return_value=SimpleNamespace(free=22)):
                 check_source_disk(snapshot, source, receipt)
             self.assertTrue(json.loads(receipt.read_bytes())["payload_fits_sampled_free_space"])
+
+    def test_missing_source_is_fetched_through_the_runner_hub_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / "hf-home"
+            calls = []
+
+            def refuse_after_recording(**kwargs):
+                calls.append(kwargs)
+                raise RuntimeError("no network in this test")
+
+            environment = {"HF_HOME": str(home), "GITHUB_ACTIONS": "true"}
+            with patch.dict("os.environ", environment, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "cache-correct fetch"):
+                    source_snapshot(download=refuse_after_recording)
+        # Through $HF_HOME/hub, the runner's cache, as a cache fetch (no local_dir); never the
+        # library's ~/.cache/huggingface/hub fallback.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["cache_dir"], str(home / "hub"))
+        self.assertEqual(calls[0]["repo_id"], "sensenova/SenseNova-Loop-9B")
+        self.assertNotIn("local_dir", calls[0])
 
 
 if __name__ == "__main__":

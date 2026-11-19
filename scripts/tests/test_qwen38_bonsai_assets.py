@@ -83,7 +83,22 @@ class AssetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'differs from frozen publisher identity'):
             assets.verify_inventory(self.model, inventory, closure)
 
-    def provision_fixture(self, admitted=True, current_available=2000):
+    def test_a_fetch_outside_the_runner_hub_cache_is_refused_before_any_transfer(self):
+        fetch = mock.Mock(side_effect=self.download)
+        with self.assertRaisesRegex(ValueError, "outside this runner's Hugging Face hub cache"):
+            assets.provision_snapshot(self.model, self.snapshot, [self.expected], fetch,
+                                      download_root=self.root / 'runner-cache')
+        fetch.assert_not_called()
+        rows = assets.provision_snapshot(self.model, self.snapshot, [self.expected], fetch,
+                                         download_root=self.root / 'hub')
+        self.assertEqual(fetch.call_count, 1)
+        # A complete snapshot needs no fetch, so it is reused wherever it lives.
+        fetch.reset_mock()
+        self.assertEqual(assets.provision_snapshot(self.model, self.snapshot, [self.expected], fetch,
+                                                   download_root=self.root / 'runner-cache'), rows)
+        fetch.assert_not_called()
+
+    def provision_fixture(self, admitted=True, current_available=2000, hub_cache=None):
         # Reuse the same independently validated preflight builder as the sealed evidence tests.
         builder = fixtures.TerminalEvidenceTests()
         builder.root = self.root
@@ -102,7 +117,9 @@ class AssetTests(unittest.TestCase):
         args = argparse.Namespace(platform='macos', runtime_sha=builder.runtime_sha,
                                   evidence_root=self.root, matrix=matrix, manifest=manifest, closure=closure)
         fetch = mock.Mock(side_effect=self.download)
-        with mock.patch.dict('os.environ', {'FIXTURE_SNAPSHOT': str(self.snapshot)}), \
+        environment = {'FIXTURE_SNAPSHOT': str(self.snapshot), 'GITHUB_ACTIONS': 'true',
+                       'HF_HUB_CACHE': str(hub_cache or self.root / 'hub')}
+        with mock.patch.dict('os.environ', environment), \
              mock.patch.dict('sys.modules', {'huggingface_hub': types.SimpleNamespace(hf_hub_download=fetch)}), \
              mock.patch.object(terminal, 'source_identity', return_value={}), \
              mock.patch.object(terminal, 'physical_memory', return_value=(2000, current_available, None)):
@@ -134,6 +151,13 @@ class AssetTests(unittest.TestCase):
         self.assertFalse(receipt['is_measured_peak'])
         self.assertFalse(receipt['filesystems'][0]['admitted'])
         self.assertEqual(receipt['filesystems'][0]['required_available_bytes'], 2 * len(self.payload))
+
+    def test_a_snapshot_outside_the_runner_cache_is_never_fetched_in_actions(self):
+        result, fetch = self.provision_fixture(hub_cache=self.root / 'runner-cache')
+        self.assertEqual(result, 1)
+        fetch.assert_not_called()
+        report = json.loads((self.root / 'provision-report.json').read_text(encoding='utf-8'))
+        self.assertIn("outside this runner's Hugging Face hub cache", report['models'][0]['error'])
 
     def test_rejected_preflight_never_downloads(self):
         result, fetch = self.provision_fixture(admitted=False)

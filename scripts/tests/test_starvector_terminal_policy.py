@@ -44,8 +44,8 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     if "runs-on: [self-hosted, macOS, ARM64, rw-starvector]" not in mlx:
         errors.append("MLX terminal lane does not target the provisioned StarVector weight set")
     for snapshot in (
-        "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b",
-        "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b",
+        "${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-1b-im2svg/snapshots/380ab95d25a8e9ab1dc825debe238b4953ae13b9",
+        "${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-8b-im2svg/snapshots/518beea8dcb5f7a37c5911e92d1d62a76beee7f9",
     ):
         if snapshot not in mlx:
             errors.append(f"MLX terminal snapshot path missing {snapshot}")
@@ -59,13 +59,15 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
             errors.append(f"MLX terminal command missing {name}")
     if mlx.count("--exact --ignored --nocapture") != 2:
         errors.append("MLX terminal command missing exact filters")
+    # A missing snapshot is downloaded into the runner's hub cache (and a cached one reused) BEFORE
+    # the exact-snapshot verification that produces the transferred inventories.
     for acquisition in (
-        "ensure_model_snapshot.py",
         "real-weights-huggingface-hub-macos-arm64-py312.txt",
-        "-m pip install",
+        "ensure_model_snapshot.py --model starvector-1b-im2svg --export STARVECTOR_1B_SNAPSHOT",
+        "ensure_model_snapshot.py --model starvector-8b-im2svg --export STARVECTOR_8B_SNAPSHOT",
     ):
-        if acquisition in mlx:
-            errors.append(f"MLX terminal lane may not acquire snapshots or Hub packages: {acquisition}")
+        if acquisition not in mlx or mlx.index(acquisition) > mlx.find("verify_model_snapshot.py --model"):
+            errors.append(f"MLX terminal lane does not materialize snapshots in the runner cache before verifying: {acquisition}")
     for artifact in (
         "inventory/starvector-1b-inventory.json",
         "inventory/starvector-8b-inventory.json",
@@ -83,8 +85,8 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     if "runs-on: [self-hosted, windows, cuda, real-weights]" not in candle:
         errors.append("Candle lane no longer uses authoritative CUDA")
     for snapshot in (
-        r"D:\\sceneworks-terminal\\weights\\models\\starvector-1b",
-        r"D:\\sceneworks-terminal\\weights\\models\\starvector-8b",
+        r"${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--starvector--starvector-1b-im2svg\snapshots\380ab95d25a8e9ab1dc825debe238b4953ae13b9",
+        r"${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--starvector--starvector-8b-im2svg\snapshots\518beea8dcb5f7a37c5911e92d1d62a76beee7f9",
     ):
         if snapshot not in candle:
             errors.append(f"Candle terminal snapshot path missing {snapshot}")
@@ -100,12 +102,12 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     if candle.count("--exact --ignored --nocapture") != 2:
         errors.append("Candle terminal command missing exact filters")
     for acquisition in (
-        "ensure_model_snapshot.py",
         "real-weights-huggingface-hub-windows-x64-py312.txt",
-        "-m pip install",
+        "ensure_model_snapshot.py --model starvector-1b-im2svg --export STARVECTOR_1B_SNAPSHOT",
+        "ensure_model_snapshot.py --model starvector-8b-im2svg --export STARVECTOR_8B_SNAPSHOT",
     ):
-        if acquisition in candle:
-            errors.append(f"Candle terminal lane may not acquire snapshots or Hub packages: {acquisition}")
+        if acquisition not in candle or candle.index(acquisition) > candle.find("verify_model_snapshot.py --model"):
+            errors.append(f"Candle terminal lane does not materialize snapshots in the runner cache before verifying: {acquisition}")
     for artifact in (
         "candle-cuda-starvector-1b.log",
         "candle-cuda-starvector-8b.log",
@@ -171,8 +173,8 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             (mutate(mlx_start, candle_start, "inputs.profile == 'starvector-terminal'"), "MLX terminal lane is not dispatch-only"),
             (mutate(candle_start, candle_end, ' --workflow-run-attempt "%GITHUB_RUN_ATTEMPT%"'), "workflow-run-attempt"),
             (mutate(mlx_start, candle_start, "verify_model_snapshot.py"), "MLX terminal command missing"),
-            (workflow[:mlx_start] + workflow[mlx_start:candle_start] + "\n          python3.12 scripts/release/ensure_model_snapshot.py\n" + workflow[candle_start:], "MLX terminal lane may not acquire snapshots"),
-            (workflow[:candle_start] + workflow[candle_start:candle_end] + "\n          %REVIEWED_PYTHON% -m pip install huggingface-hub\n" + workflow[candle_end:], "Candle terminal lane may not acquire snapshots"),
+            (mutate(mlx_start, candle_start, "--export STARVECTOR_8B_SNAPSHOT"), "MLX terminal lane does not materialize"),
+            (mutate(candle_start, candle_end, "--export STARVECTOR_1B_SNAPSHOT"), "Candle terminal lane does not materialize"),
         )
         for mutated, expected in cases:
             with self.subTest(expected=expected):

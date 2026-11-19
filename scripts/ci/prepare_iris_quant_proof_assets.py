@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Bind already provisioned, pinned Iris snapshots for an exact manual proof."""
+"""Bind pinned Iris snapshots for an exact manual proof, downloading a missing one into the
+runner's Hugging Face hub cache first."""
 
 from __future__ import annotations
 
@@ -7,12 +8,16 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pinned_hub_source import verify_pinned_hub_files
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.release.ensure_model_snapshot import download_snapshot, ensure_snapshot, runner_hub_cache  # noqa: E402
+from scripts.release.verify_model_snapshot import load_model  # noqa: E402
+
+MANIFEST = Path(__file__).resolve().parents[2] / "release" / "real-weight-models.toml"
 
 
 IRIS_REVISION = "7445443349bc9abe3c96f01ff793e2098ca012b3"
@@ -67,8 +72,8 @@ def snapshot_paths(backend: str, env: dict[str, str]) -> tuple[tuple[str, str, P
     if backend == "mlx":
         if env.get("RUNNER_OS") != "macOS" or env.get("RUNNER_NAME") != "nax-macos-2":
             raise ValueError("Iris MLX quant proofs require the provisioned secondary Mac")
-        # The existing Iris curricula/memory lanes use this runner-local internal hub.
-        root = Path.home() / "sceneworks-rw-weights" / "hub"
+        # The runner's own hub cache, where the other Iris MLX lanes now read and download too.
+        cache = runner_hub_cache(env)
         models = (("IRIS_WEIGHTS_DIR", "iris-3b-generation-mlx", "speridlabs--iris-3b", IRIS_REVISION),
                   ("IRIS_TEXT_ENCODER_DIR", "qwen3-vl-4b-instruct-mlx", "Qwen--Qwen3-VL-4B-Instruct", QWEN_REVISION))
     elif backend == "candle-cuda":
@@ -77,17 +82,16 @@ def snapshot_paths(backend: str, env: dict[str, str]) -> tuple[tuple[str, str, P
         value = env.get("CANDLE_GEN_MODELS_ROOT", "")
         if not value or not Path(value).is_absolute():
             raise ValueError("CANDLE_GEN_MODELS_ROOT must be an absolute, operator-provided Windows cache path")
-        root = Path(value)
+        cache = Path(value)
         models = (("IRIS_WEIGHTS_DIR", "iris-3b-cuda", "speridlabs--iris-3b", IRIS_REVISION),
                   ("IRIS_TEXT_ENCODER_DIR", "qwen3-vl-4b-instruct-cuda", "Qwen--Qwen3-VL-4B-Instruct", QWEN_REVISION))
     else:
         raise ValueError(f"unsupported Iris quant proof backend: {backend}")
-    if backend == "mlx" and root.parent.is_symlink():
-        raise ValueError(f"secondary Mac task-owned weights root must not be a symlink: {root.parent}")
-    if not root.is_dir():
-        raise ValueError(f"runner-local model hub is missing: {root}")
-    return tuple((name, model, root / f"models--{repository}" / "snapshots" / revision)
-                 for name, model, repository, revision in models)
+    paths = []
+    for name, model, repository, revision in models:
+        relative = Path(f"models--{repository}") / "snapshots" / revision
+        paths.append((name, model, cache / relative))
+    return tuple(paths)
 
 
 def main() -> int:
@@ -98,11 +102,15 @@ def main() -> int:
     if not github_env:
         raise ValueError("GitHub Actions environment file is required")
     paths = snapshot_paths(args.backend, os.environ)
-    verifier = Path(__file__).resolve().parents[1] / "release" / "verify_model_snapshot.py"
+    hub_path = os.environ.get("IRIS_PROOF_HF_HUB_PATH", "")
+    if hub_path:  # the pinned huggingface_hub, imported only when a snapshot needs downloading
+        sys.path.insert(0, hub_path)
+    # In Actions a download lands only in the runner's own hub cache; a complete snapshot is reused.
+    download_root = runner_hub_cache() if os.environ.get("GITHUB_ACTIONS") == "true" else None
     attestations = []
     for name, model, path in paths:
-        subprocess.run([sys.executable, "-I", str(verifier), "--model", model,
-                        "--snapshot", str(path)], check=True)
+        if ensure_snapshot(load_model(MANIFEST, model), path, download_snapshot, download_root=download_root):
+            print(f"{name} downloaded into {path}", flush=True)
         repository = "speridlabs/iris-3b" if name == "IRIS_WEIGHTS_DIR" else "Qwen/Qwen3-VL-4B-Instruct"
         revision = IRIS_REVISION if name == "IRIS_WEIGHTS_DIR" else QWEN_REVISION
         files = IRIS_FILES if name == "IRIS_WEIGHTS_DIR" else QWEN_FILES

@@ -4,10 +4,12 @@
 The explicit model-proof workflow binds no per-family snapshot environment for MLX rows on the
 provisioned Mac (nax-macos-2), so each bounded MLX training proof below names the exact pinned
 Hub snapshot(s) its test reads, and this setup resolves each one under the runner-local model
-roots, in order: `$MLX_GEN_MODELS_ROOT` (the repository variable, `~` expanded), the provisioned
+roots, in order: `$MLX_GEN_MODELS_ROOT` (the repository variable, `~` expanded), the runner's own
+Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else the fleet root), the provisioned
 `/Volumes/Models/huggingface/hub`, and the runner-local `~/sceneworks-rw-weights/hub`, each resolved
 to its real path (the runner's `~/.cache/huggingface/hub` is a symlink to its model store). The
-resolved snapshot paths are appended to `GITHUB_ENV`.
+resolved snapshot paths are appended to `GITHUB_ENV`. A pin no root holds is downloaded into the
+runner's hub cache unless the request sets `"download_missing": false`.
 
 This reads file metadata only: the production readers inside the ONE manual invocation still
 authenticate/load the actual inputs; a path is not runtime proof. When a pin is absent the setup
@@ -26,6 +28,9 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.release.ensure_model_snapshot import runner_hub_cache  # noqa: E402
 
 PROVISIONED_HUB = Path("/Volumes/Models/huggingface/hub")
 # The provisioned Macs a request routes to (model_inference_proofs.NAX_ROUTES) -> runner name.
@@ -158,6 +163,7 @@ def candidate_roots(env: dict[str, str], home: Path) -> list[tuple[str, Path]]:
         expanded = home / configured[2:] if configured.startswith("~/") else Path(configured)
         if os.path.isabs(expanded):
             roots.append(("MLX_GEN_MODELS_ROOT", expanded))
+    roots.append(("runner-cache", runner_hub_cache(env)))
     roots.append(("provisioned", PROVISIONED_HUB))
     roots.append(("runner-local", home / "sceneworks-rw-weights" / "hub"))
     unique, seen = [], set()
@@ -244,18 +250,6 @@ def inventory(pins: list[Pin], roots: list[tuple[str, Path]], also: tuple[str, .
     return report
 
 
-def primary_root(roots: list[tuple[str, Path]]) -> Path:
-    """Where a missing pin is downloaded: the resolved `MLX_GEN_MODELS_ROOT` target, else the first
-    existing root."""
-    for label, root in roots:
-        if label.startswith("MLX_GEN_MODELS_ROOT=") and root.is_dir():
-            return root
-    for _, root in roots:
-        if root.is_dir():
-            return root
-    raise ValueError("no existing runner-local model root to download into")
-
-
 def hub_download(pin: Pin, cache_dir: Path) -> None:
     """Fetch the WHOLE pinned repository revision into the Hub cache at `cache_dir` through the
     repository's existing helper (`ensure_model_snapshot.download_snapshot`, i.e.
@@ -269,13 +263,15 @@ def hub_download(pin: Pin, cache_dir: Path) -> None:
 
 
 def bind(bindings: dict[str, Pin], roots: list[tuple[str, Path]], download_missing: bool,
-         download=hub_download) -> tuple[dict[str, Path | None], list[dict]]:
+         download=hub_download, *, cache: Path) -> tuple[dict[str, Path | None], list[dict]]:
     """Resolve every binding; with `download_missing`, fetch each pinned revision that no root holds
-    (once per repository revision) into the primary root and resolve again."""
+    (once per repository revision) into `cache`, the runner's hub cache, and resolve again."""
     resolved = {name: resolve(pin, roots) for name, pin in bindings.items()}
     downloads: list[dict] = []
     if download_missing and any(path is None for path in resolved.values()):
-        target = primary_root(roots)
+        target = cache
+        if all(root != target for _, root in roots):
+            raise ValueError(f"runner hub cache {target} is not a candidate model root")
         fetched = set()
         for name, pin in bindings.items():
             if resolved[name] is not None or (pin.repository, pin.revision) in fetched:
@@ -319,7 +315,9 @@ def main() -> int:
         raise ValueError("GitHub Actions environment file is required")
     bindings = MLX_TRAINING_PROOFS[identities[0]]
     roots = candidate_roots(env, Path.home())
-    resolved, downloads = bind(bindings, roots, request.get("download_missing", False))
+    # Downloading is the default; only an explicit `"download_missing": false` keeps a run offline.
+    resolved, downloads = bind(bindings, roots, request.get("download_missing", True),
+                               cache=Path(os.path.realpath(runner_hub_cache(env))))
     missing = [name for name, path in resolved.items() if path is None]
     if missing:
         every = list({pin: None for case in MLX_TRAINING_PROOFS.values() for pin in case.values()})

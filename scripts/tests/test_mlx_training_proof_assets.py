@@ -94,7 +94,7 @@ class MlxTrainingAssets(unittest.TestCase):
             self.assertIn(f"-> {real}", roots[0][0])
             self.assertEqual(assets.resolve(pin, roots), real / pin.relative())
 
-    def test_download_missing_is_opt_in_and_fetches_only_absent_exact_revisions(self):
+    def test_download_missing_fetches_only_absent_exact_revisions_into_the_runner_cache(self):
         present = assets.Pin("org/present", "c" * 40, files=("config.json",))
         absent = assets.Pin("org/absent", "d" * 40, "tier", files=("config.json",))
         twin = assets.Pin("org/absent", "d" * 40, "other", files=("config.json",))
@@ -112,16 +112,49 @@ class MlxTrainingAssets(unittest.TestCase):
                     (cache_dir / same.relative()).mkdir(parents=True, exist_ok=True)
                     (cache_dir / same.relative() / "config.json").write_text("{}", encoding="utf-8")
 
-            resolved, downloads = assets.bind(bindings, roots, False, download=fake_download)
+            resolved, downloads = assets.bind(bindings, roots, False, download=fake_download, cache=primary)
             self.assertEqual(calls, [])
             self.assertEqual(downloads, [])
             self.assertIsNone(resolved["ABSENT"])
-            resolved, downloads = assets.bind(bindings, roots, True, download=fake_download)
+            resolved, downloads = assets.bind(bindings, roots, True, download=fake_download, cache=primary)
             self.assertEqual(calls, [("org/absent", "d" * 40, primary)])
             self.assertEqual(downloads, [{"repository": "org/absent", "revision": "d" * 40, "cache_dir": str(primary)}])
             self.assertEqual(resolved["ABSENT"], primary / absent.relative())
             self.assertEqual(resolved["TWIN"], primary / twin.relative())
             self.assertEqual(resolved["PRESENT"], primary / present.relative())
+
+    def test_the_runner_hub_cache_is_a_root_and_a_download_never_lands_outside_the_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            roots = assets.candidate_roots({"HF_HOME": str(home / "hf-home")}, home)
+            self.assertEqual(roots[0][1], Path(os.path.realpath(home / "hf-home" / "hub")))
+            self.assertTrue(roots[0][0].startswith("runner-cache="))
+            pin = assets.Pin("org/absent", "a" * 40, files=("config.json",))
+            with self.assertRaisesRegex(ValueError, "not a candidate model root"):
+                assets.bind({"ABSENT": pin}, roots, True, download=lambda *_: None, cache=home / "elsewhere")
+
+    def test_main_downloads_by_default_and_only_an_explicit_false_stays_offline(self):
+        identity = next(iter(assets.MLX_TRAINING_PROOFS))
+        for request, expected in (({"runner": "nax"}, True),
+                                  ({"runner": "nax", "download_missing": False}, False)):
+            with self.subTest(request=request), tempfile.TemporaryDirectory() as directory:
+                plan = Path(directory) / "plan.json"
+                plan.write_text(json.dumps({"backend": "mlx", "selected": 1, "bindings": [identity],
+                                            "request": request, "asset_setup": "mlx-training"}),
+                                encoding="utf-8")
+                cache = Path(directory).resolve() / "hf-home" / "hub"
+                env = {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2",
+                       "GITHUB_ENV": str(Path(directory) / "env"), "HF_HOME": str(cache.parent)}
+                seen = {}
+
+                def fake_bind(bindings, roots, download_missing, *, cache):
+                    seen.update(download_missing=download_missing, cache=cache)
+                    return {name: cache / name for name in bindings}, []
+
+                with patch.dict("os.environ", env, clear=True), patch("sys.argv", ["x", "--plan", str(plan)]), \
+                        patch.object(assets, "bind", fake_bind):
+                    self.assertEqual(assets.main(), 0)
+                self.assertEqual(seen, {"download_missing": expected, "cache": cache})
 
     def test_a_refused_download_is_recorded_and_the_pin_stays_missing(self):
         gated = assets.Pin("org/gated", "e" * 40, files=("config.json",))
@@ -132,7 +165,7 @@ class MlxTrainingAssets(unittest.TestCase):
             def refused(pin, cache_dir):
                 raise RuntimeError("403 Client Error\nCannot access gated repo")
 
-            resolved, downloads = assets.bind({"GATED": gated}, roots, True, download=refused)
+            resolved, downloads = assets.bind({"GATED": gated}, roots, True, download=refused, cache=primary)
             self.assertIsNone(resolved["GATED"])
             self.assertEqual(downloads[0]["error"], "RuntimeError: 403 Client Error")
 
@@ -148,7 +181,8 @@ class MlxTrainingAssets(unittest.TestCase):
                 (cache_dir / pin.relative() / "config.json").write_text("{}", encoding="utf-8")
                 raise RuntimeError("No space left on device (os error 28)")
 
-            resolved, downloads = assets.bind({"PARTIAL": partial}, roots, True, download=out_of_space)
+            resolved, downloads = assets.bind({"PARTIAL": partial}, roots, True, download=out_of_space,
+                                              cache=primary)
             self.assertFalse(assets.complete(primary / partial.relative(), partial))
             self.assertIsNone(resolved["PARTIAL"])
             self.assertIn("No space left on device", downloads[0]["error"])
@@ -185,6 +219,8 @@ class MlxTrainingAssets(unittest.TestCase):
         self.assertIn("matrix.asset_setup == 'mlx-training'", step["if"])
         self.assertIn("runner.os == 'macOS'", step["if"])
         command = step["run"]
+        # Absent means download; only an explicit false skips installing the Hub client.
+        self.assertIn('.get("download_missing", True) is True', command)
         self.assertLess(command.index("model_inference_proofs.py --plan"),
                         command.index("prepare_mlx_training_proof_assets.py"))
         self.assertIn("vars.MLX_GEN_MODELS_ROOT", step["env"]["MLX_GEN_MODELS_ROOT"])
