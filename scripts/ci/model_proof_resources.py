@@ -27,7 +27,6 @@ SHARED_CUDA_HEADROOM_ACTIVITY = 'non-isolated-correctness-headroom'
 RELEASE_QUERY_SECONDS = 30
 RELEASE_QUERY_ATTEMPTS = 3
 RELEASE_SAMPLING_SECONDS = 5 * (RELEASE_QUERY_SECONDS * RELEASE_QUERY_ATTEMPTS + 1)
-RELEASE_WINDOW_OVERRUN = 'physical GPU identity or sampling deadline changed during model-proof-release'
 
 
 class CudaClaimRejected(ValueError):
@@ -297,7 +296,13 @@ def release_inventory_reader(guard, uuid: str):
     return read
 
 
-def release_check_inconclusive(error: Exception, diagnostic: dict) -> bool:
+def release_window_overrun(phase: str) -> str:
+    """The guard's message when its five-sample window outlasts MAX_SAMPLING_SECONDS. A
+    selected-UUID reader already refuses an absent card, so for it this means only time."""
+    return f'physical GPU identity or sampling deadline changed during {phase}'
+
+
+def release_check_inconclusive(error: Exception, diagnostic: dict, phase: str = 'model-proof-release') -> bool:
     """A query timeout or sampling-time overrun is not evidence against the release.
 
     Only a retained sample whose exact selected-card metadata is invalid is. The owned-Job
@@ -305,7 +310,7 @@ def release_check_inconclusive(error: Exception, diagnostic: dict) -> bool:
     """
     timing = (isinstance(error, (subprocess.TimeoutExpired, TimeoutError))
               or (type(error) is RuntimeError and str(error) in (
-                  RELEASE_WINDOW_OVERRUN, 'CUDA settle deadline expired during model-proof-release')))
+                  release_window_overrun(phase), f'CUDA settle deadline expired during {phase}')))
     return timing and all(sample.get('post_owned_exit_primary_metadata_valid') is True
                           for sample in diagnostic.get('samples', []))
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -59,7 +60,7 @@ class MultiCudaResources(unittest.TestCase):
         with self.assertRaises(ValueError):
             multi.bind_rows((missing,), request(), 'candle-cuda')
 
-    def _claim(self, temporary, *, swapped=False, fail_post=None, raise_body=False):
+    def _claim(self, temporary, *, swapped=False, fail_post=None, raise_body=False, release_inventory=None):
         directory = Path(temporary).resolve()
         environment = {'PUBLIC': str(directory), 'CUDA_VISIBLE_DEVICES': ROLE0 + ',' + ROLE1,
                        'CUDA_DEVICE_ORDER': 'PCI_BUS_ID'}
@@ -78,7 +79,7 @@ class MultiCudaResources(unittest.TestCase):
         def baseline(device, out, phase, required_mib):
             self.assertTrue(locked)
             admitted[device['uuid']] = required_mib
-            return device, {'uuid': device['uuid'], 'MOCK': True}
+            return device, {'uuid': device['uuid'], 'MOCK': True, 'reserved_baseline_mib': 1000, 'process_identities': []}
         def verify(device, out, phase, before, **options):
             # Release checks identity/counters only; foreign tenants and their contexts may change.
             self.assertEqual(options['require_stable_contexts'], False)
@@ -93,6 +94,15 @@ class MultiCudaResources(unittest.TestCase):
         fake_guard = SimpleNamespace(command=lambda *_: None, inventory=inventory, has_headroom=lambda *_: True,
                                      counters_valid=real_guard.counters_valid,
                                      sample_headroom=baseline, sample_baseline=verify)
+        if release_inventory is not None:
+            # The real guard sampler over mocked selected-UUID nvidia-smi reads (no driver, GPU or model).
+            real_guard.time = SimpleNamespace(monotonic=time.monotonic, sleep=lambda _seconds: None)
+            def real_release(device, out, phase, before, **options):
+                post.append(device['uuid'])
+                return real_guard.sample_baseline(device, out, phase, before, **options)
+            fake_guard.sample_baseline = real_release
+            fake_guard.inventory = lambda *args, selected_uuid=None, **kwargs: (
+                release_inventory(*args, selected_uuid=selected_uuid, **kwargs) if selected_uuid else inventory(*args))
         original_resolve = primitives.resolve_binding
         def resolve(*args, **kwargs):
             self.assertEqual(len(locked), 2)
@@ -153,6 +163,45 @@ class MultiCudaResources(unittest.TestCase):
                 self.assertFalse(records[0]['post_execution_verified'])
                 self.assertEqual(set(post), {ROLE0, ROLE1})
                 self.assertFalse(locked)
+
+    def test_release_query_timeout_is_a_diagnostic_and_bad_counters_still_refuse(self):
+        # CI_IMPACT: mocked nvidia-smi only (run 44431476698 class); no driver, GPU or model.
+        card = lambda uuid, **changes: {'uuid': uuid, 'index': 0, 'total_mib': 98304, 'used_mib': 1000,
+                                        'free_mib': 97304, 'utilization_percent': None, **changes}
+        def timing_out(uuid):
+            budgets = []
+            def read(_out, _label, deadline=None, *, selected_uuid=None):
+                budgets.append(deadline - time.monotonic())
+                if selected_uuid == uuid:
+                    raise subprocess.TimeoutExpired(['nvidia-smi'], multi.resources.RELEASE_QUERY_SECONDS)
+                return [card(selected_uuid)], []
+            return read, budgets
+        for slow in (ROLE0, ROLE1):
+            with self.subTest(slow=slow), tempfile.TemporaryDirectory() as temporary:
+                read, budgets = timing_out(slow)
+                records, post, locked, error, _ = self._claim(temporary, release_inventory=read)
+                self.assertIsNone(error)
+                self.assertTrue(records[0]['post_execution_verified'])
+                statuses = {item['uuid']: item['release_metadata_verification']['status']
+                            for item in records[0]['post_idle_devices']}
+                self.assertEqual(statuses, {slow: 'inconclusive-driver-query-timing',
+                                            ({ROLE0, ROLE1} - {slow}).pop(): 'verified'})
+                self.assertEqual(len(budgets), 5 + multi.resources.RELEASE_QUERY_ATTEMPTS)
+                self.assertTrue(all(multi.resources.RELEASE_QUERY_SECONDS - 1 < budget
+                                    <= multi.resources.RELEASE_QUERY_SECONDS for budget in budgets))
+                self.assertFalse(locked)
+        with tempfile.TemporaryDirectory() as temporary:
+            calls = []
+            def bad_counters(_out, _label, deadline=None, *, selected_uuid=None):
+                calls.append(selected_uuid)
+                if selected_uuid == ROLE1 and calls.count(ROLE1) == 1:
+                    return [card(ROLE1, used_mib=-1)], []
+                return [card(selected_uuid)], []
+            records, _, locked, error, _ = self._claim(temporary, release_inventory=bad_counters)
+            self.assertIn('not every approved CUDA UUID', error)
+            self.assertIn('physical GPU occupied during model-proof-release-' + ROLE1, error)
+            self.assertFalse(records[0]['post_execution_verified'])
+            self.assertFalse(locked)
 
     def test_bounded_body_failure_keeps_case_unaccepted_and_releases_both_after_postchecks(self):
         with tempfile.TemporaryDirectory() as temporary:
