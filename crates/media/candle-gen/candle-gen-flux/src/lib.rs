@@ -396,10 +396,11 @@ impl Generator for FluxGenerator {
             req.use_pid,
             on_progress,
             // PiD's Gemma caption encode is text conditioning, and its engine arrives with the
-            // heavy bundle: a PiD request holds Conditioning open until `render_residency` has
-            // prepared the decoder.
+            // heavy bundle; an img2img `source_image` also runs its VAE encode inside
+            // `render_residency` once the heavy bundle is resident. Both hold Conditioning open
+            // until `render_residency` has finished their conditioning work.
             |text| {
-                if req.use_pid {
+                if req.use_pid || req.source_image.is_some() {
                     run.begin_conditioning()?;
                     self.pipe.encode_residency(text, &req.prompt)
                 } else {
@@ -1769,7 +1770,7 @@ mod execution_policy_tests {
                 |_| Ok::<_, candle_gen::CandleError>(state_full.img.clone()),
                 |seed, lat, prog| {
                     let mut eval_idx = 0usize;
-                    candle_gen::run_flow_sampler_spans(
+                    candle_gen::run_flow_sampler_with_phase_transition_spans(
                         Some(plan_off.sampler()),
                         TimestepConvention::Sigma,
                         plan_off.denoise_sigmas(),
@@ -1793,6 +1794,7 @@ mod execution_policy_tests {
                             ));
                             Ok((x_in * 0.15)?)
                         },
+                        None,
                     )
                 },
                 |_, lat, _| Ok(lat),
@@ -1897,6 +1899,19 @@ mod execution_policy_tests {
         assert_eq!(state_low.img_ids.dims(), &[1, 256, 3]);
         assert_eq!(state_full.img_ids.dims(), &[1, 1024, 3]);
 
+        let captured_previews =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, u32, u32, u32)>::new()));
+        let preview_capture = captured_previews.clone();
+        let mut active_req = active_req;
+        active_req.preview = gen_core::PreviewSink::new(move |frame: gen_core::PreviewFrame| {
+            candle_gen::lock_recover(&preview_capture).push((
+                frame.current,
+                frame.total,
+                frame.image.width,
+                frame.image.height,
+            ));
+        });
+
         let trace_on = RefCell::new(Vec::<(usize, u32, u32, usize)>::new());
         let mut progress_on = Vec::new();
         let run_on = RenderRun::new(&plan_on, &active_req.cancel, Some(&mut scope));
@@ -1933,6 +1948,17 @@ mod execution_policy_tests {
         scope.finish(MemoryRunOutcome::Complete).unwrap();
 
         assert_eq!(out_on.dims(), &[1, 1024, 64]);
+        // Preview frames track Phase-0 (256/8 = 32x32) and Phase-1 (512/8 = 64x64) geometries,
+        // and the read-only boundary endpoint evaluation does not emit an extra frame.
+        assert_eq!(
+            *candle_gen::lock_recover(&captured_previews),
+            vec![
+                (1, 4, 32, 32),
+                (2, 4, 32, 32),
+                (3, 4, 64, 64),
+                (4, 4, 64, 64),
+            ]
+        );
         assert_eq!(
             progress_on,
             vec![
