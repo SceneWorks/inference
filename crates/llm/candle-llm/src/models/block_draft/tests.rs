@@ -45,6 +45,16 @@ pub(crate) fn tiny_target() -> Qwen35Model {
 /// leaves every next-token distribution on a few evenly spaced ids — a sampled proof needs
 /// distributions a draft's candidates can overlap.
 pub(crate) fn tiny_target_on(device: &Device, random: bool) -> Qwen35Model {
+    tiny_target_quantized_on(device, random, None)
+}
+
+/// [`tiny_target_on`] with its large projections stored in `quant` (`None`: dense) — a target
+/// whose verify step runs the quantized matmul kernels (and their scratch workspaces).
+pub(crate) fn tiny_target_quantized_on(
+    device: &Device,
+    random: bool,
+    quant: Option<crate::primitives::projection::QuantSpec>,
+) -> Qwen35Model {
     let cfg = tiny_target_config();
     let mut tensors = synthetic_weights(&cfg).into_map();
     let mut rng = SplitMix64::new(0x7193_7A26);
@@ -62,7 +72,7 @@ pub(crate) fn tiny_target_on(device: &Device, random: bool) -> Qwen35Model {
         .map(|(k, t)| (k, t.to_device(device).unwrap()))
         .collect();
     let w = Weights::from_map(tensors, device.clone());
-    Qwen35Model::from_weights(&w, "model.language_model", cfg).unwrap()
+    Qwen35Model::from_weights_with(&w, "model.language_model", cfg, quant).unwrap()
 }
 
 /// The tiny target loaded as a Prism snapshot whose LM head (and every other matrix) stayed

@@ -114128,6 +114128,57 @@
     "package": "candle-gen",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "quantized_workspace_graph::a_captured_quantized_matmul_keeps_its_own_scratch",
+    "source": "crates/media/candle-gen/candle-gen/tests/quantized_workspace_graph.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Synthetic Q8_0 quantized-matmul weights and activations on explicit CUDA device, captured and replayed as a CUDA graph; crates/media/candle-gen/candle-gen/tests/quantized_workspace_graph.rs::quantized_workspace_graph::a_captured_quantized_matmul_keeps_its_own_scratch",
+    "configuration_source": "crates/media/candle-gen/candle-gen/tests/quantized_workspace_graph.rs::quantized_workspace_graph::a_captured_quantized_matmul_keeps_its_own_scratch",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/tests/quantized_workspace_graph.rs::quantized_workspace_graph::a_captured_quantized_matmul_keeps_its_own_scratch/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/tests/quantized_workspace_graph.rs::quantized_workspace_graph::a_captured_quantized_matmul_keeps_its_own_scratch",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "nvfp4_linear_gpu::nvfp4_linear_shares_one_cublaslt_workspace_across_layers",
     "source": "crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs",
     "cargo_target_metadata": {
@@ -117849,7 +117900,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@11282e0ba08e3e0561980b1eef2ba848fec7833715f9ffcf631eec2cc80bfd48",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@790b8c2665b11169e86104516454034cf4431a739f663a4075a6f38f8a044bc6",
       "requirements": []
     }
   },
@@ -117869,39 +117920,26 @@
       ]
     },
     "execution_role": "direct",
-    "backend": "candle-cpu",
-    "expected_devices": [
-      "candle-cpu"
-    ],
-    "cargo_features": [
-      "model-inference-proof"
-    ],
-    "fixture_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off; source setup helpers=proof_device,tiny_target_on,tiny_config,tiny_draft_on,run_block,config; source-bound asset/control facts below",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off; source setup helpers=proof_device,tiny_target_quantized_on,tiny_config,tiny_draft_on,run_block,config; source-bound asset/control facts below",
     "configuration_source": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_controls": [],
-    "default_configuration": "source-fixed-candle-cpu",
+    "configuration_controls": [
+      "CANDLE_LLM_CUDA_STREAM",
+      "CANDLE_LLM_DEVICE"
+    ],
+    "default_configuration": null,
     "configurations": {
-      "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off/source-fixed-candle-cpu",
-        "environment": {},
-        "cargo_features": [
-          "model-inference-proof"
-        ],
-        "backend": "candle-cpu",
-        "expected_devices": [
-          "candle-cpu"
-        ],
-        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
-        "required_work": [
-          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
-        ]
-      },
       "source-fixed-candle-cuda": {
         "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off/source-fixed-candle-cuda",
-        "environment": {},
+        "environment": {
+          "CANDLE_LLM_CUDA_STREAM": "own",
+          "CANDLE_LLM_DEVICE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -117916,10 +117954,10 @@
         ]
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@11282e0ba08e3e0561980b1eef2ba848fec7833715f9ffcf631eec2cc80bfd48",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off@790b8c2665b11169e86104516454034cf4431a739f663a4075a6f38f8a044bc6",
       "requirements": []
     }
   },
@@ -117989,7 +118027,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@11282e0ba08e3e0561980b1eef2ba848fec7833715f9ffcf631eec2cc80bfd48",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@790b8c2665b11169e86104516454034cf4431a739f663a4075a6f38f8a044bc6",
       "requirements": []
     }
   },
@@ -118059,7 +118097,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@11282e0ba08e3e0561980b1eef2ba848fec7833715f9ffcf631eec2cc80bfd48",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@790b8c2665b11169e86104516454034cf4431a739f663a4075a6f38f8a044bc6",
       "requirements": []
     }
   },
@@ -118129,7 +118167,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@11282e0ba08e3e0561980b1eef2ba848fec7833715f9ffcf631eec2cc80bfd48",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@790b8c2665b11169e86104516454034cf4431a739f663a4075a6f38f8a044bc6",
       "requirements": []
     }
   },
@@ -118199,7 +118237,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@11282e0ba08e3e0561980b1eef2ba848fec7833715f9ffcf631eec2cc80bfd48",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@790b8c2665b11169e86104516454034cf4431a739f663a4075a6f38f8a044bc6",
       "requirements": []
     }
   },
@@ -118269,7 +118307,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@0f4d9430c0788b0d51ff33a8157f9785c607c4c0e7c1e791ea30574d64cfab6f",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@7c2e7e4dbc66d5649ca55caa4e8ce2c32a6f6922fba1dcf4028266de5c8d4452",
       "requirements": []
     }
   },
@@ -118339,7 +118377,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@0f4d9430c0788b0d51ff33a8157f9785c607c4c0e7c1e791ea30574d64cfab6f",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@7c2e7e4dbc66d5649ca55caa4e8ce2c32a6f6922fba1dcf4028266de5c8d4452",
       "requirements": []
     }
   },
