@@ -500,10 +500,27 @@ pub fn graph_workspace_admission_bytes(
     total_positions: u64,
     max_step_tokens: u32,
 ) -> Option<u64> {
+    graph_workspace_admission_bytes_with_hidden_row(
+        geometry,
+        total_positions,
+        max_step_tokens,
+        geometry.hidden_size,
+    )
+}
+
+/// [`graph_workspace_admission_bytes`] for steps whose staged hidden output is `hidden_row`
+/// elements per token instead of `hidden_size`: a block draft's verify steps stage the outputs of
+/// its tapped layers, `layers × hidden` per row (SW-7197). `None` on overflow.
+pub fn graph_workspace_admission_bytes_with_hidden_row(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
+    max_step_tokens: u32,
+    hidden_row: u64,
+) -> Option<u64> {
     // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
     let n = u64::from(max_step_tokens);
     let rows = n.checked_mul(n.checked_add(1)?)? / 2;
-    graph_token_row_bytes(geometry, total_positions)?
+    graph_token_row_bytes(geometry, total_positions, hidden_row)?
         .checked_mul(rows)?
         .checked_mul(2)
 }
@@ -516,13 +533,15 @@ pub fn graph_demoted_step_admission_bytes(
     geometry: &core_llm::LlmMemoryGeometry,
     total_positions: u64,
 ) -> Option<u64> {
-    graph_token_row_bytes(geometry, total_positions)
+    graph_token_row_bytes(geometry, total_positions, geometry.hidden_size)
 }
 
-/// One captured token-row's working set (see [`graph_workspace_admission_bytes`]).
+/// One captured token-row's working set (see [`graph_workspace_admission_bytes`]), its staged
+/// hidden row `hidden_row` elements wide.
 fn graph_token_row_bytes(
     geometry: &core_llm::LlmMemoryGeometry,
     total_positions: u64,
+    hidden_row: u64,
 ) -> Option<u64> {
     let e = geometry.element_bytes;
     let chunk = candle_quant_kernels::DECODE_ATTN_CHUNK as u64;
@@ -550,7 +569,7 @@ fn graph_token_row_bytes(
         .checked_add(
             geometry
                 .vocab_size
-                .checked_add(geometry.hidden_size)?
+                .checked_add(hidden_row)?
                 .checked_mul(e)?,
         )?;
     Some(per_token)

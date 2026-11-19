@@ -1835,6 +1835,13 @@ pub struct Qwen35Model {
     /// ([`device_positions_default`](crate::primitives::device_positions_default)) — on CUDA, off
     /// on the CPU.
     device_positions: bool,
+    /// Whether this model was built from a Prism checkpoint (any projection, embedding or head
+    /// read from a Prism registry) — MLX's `is_prism`, which a DSpine draft refuses whatever the
+    /// head ended up as (SW-7197).
+    prism: bool,
+    /// The LM head's row access for a block draft's candidate scoring (SW-7197), built on first
+    /// use ([`Qwen35Model::head_rows`]).
+    head_rows: std::sync::OnceLock<crate::primitives::head_rows::HeadRows>,
 }
 
 /// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
@@ -2934,15 +2941,24 @@ impl Qwen35Model {
     /// cache and the static path stay one arithmetic); both keep the cache's host-side state
     /// identical.
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
-        self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()))
+        self.hidden_checked(
+            input_ids,
+            cache,
+            offset,
+            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
+        )
     }
 
+    /// [`Self::hidden`] with `check` before and after every decoder block and `tap` handed each
+    /// decoder layer's output with its index (a block draft's target taps, SW-F360).
     fn hidden_checked(
         &self,
         input_ids: &Tensor,
         cache: &mut Qwen35Cache,
         offset: i32,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
+        tap: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
     ) -> Result<Tensor> {
         check(input_ids)?;
         let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
@@ -2963,7 +2979,7 @@ impl Qwen35Model {
                 .device_rope
                 .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
             let mut h = h;
-            for (layer, slot) in self.layers.iter().zip(layers.iter_mut()) {
+            for (i, (layer, slot)) in self.layers.iter().zip(layers.iter_mut()).enumerate() {
                 check(&h)?;
                 h = layer.forward_with(
                     &h,
@@ -2975,13 +2991,14 @@ impl Qwen35Model {
                     None,
                 )?;
                 check(&h)?;
+                tap(i, &h)?;
             }
             return Ok(h);
         }
         let (cos, sin) = self
             .rope
             .cos_sin(s as i32, offset, self.dtype, &self.device)?;
-        self.hidden_from_embeds_checked(&h, &cos, &sin, cache, check)
+        self.hidden_from_embeds_checked(&h, &cos, &sin, cache, check, tap)
     }
 
     /// The step start a short cached step attends from with the length-aware decode attention
@@ -3010,7 +3027,14 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
-        self.hidden_from_embeds_checked(embeds, cos, sin, cache, &mut |_| Ok(()))
+        self.hidden_from_embeds_checked(
+            embeds,
+            cos,
+            sin,
+            cache,
+            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
+        )
     }
 
     fn hidden_from_embeds_checked(
@@ -3020,12 +3044,13 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
+        tap: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
     ) -> Result<Tensor> {
         check(embeds)?;
         let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
-        for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
             check(&h)?;
             h = layer.forward_with(
                 &h,
@@ -3037,6 +3062,7 @@ impl Qwen35Model {
                 decode_start.as_ref(),
             )?;
             check(&h)?;
+            tap(i, &h)?;
         }
         Ok(h)
     }
@@ -3106,7 +3132,7 @@ impl Qwen35Model {
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
     ) -> Result<Tensor> {
         let result = (|| {
-            let h = self.hidden_checked(input_ids, cache, offset, check)?;
+            let h = self.hidden_checked(input_ids, cache, offset, check, &mut |_, _| Ok(()))?;
             check(&h)?;
             let hidden = self.normalize(&h)?;
             check(&hidden)?;
@@ -3158,6 +3184,173 @@ impl Qwen35Model {
     ) -> Result<Tensor> {
         let h = self.hidden(input_ids, cache, offset)?;
         self.project_last(&h)
+    }
+
+    /// A block draft's target forward (SW-F360): the logits of `scope` and the outputs of decoder
+    /// `layers` (0-based, in that order) concatenated `[B, n, layers × hidden]`, at most the last
+    /// `keep` rows of them (the draft's context window — a long prefill never holds every prompt
+    /// row's taps). The cache advances exactly as [`Self::forward`]'s.
+    pub fn forward_tapped(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        layers: &[usize],
+        keep: Option<usize>,
+        scope: LogitsScope,
+    ) -> Result<(Tensor, Tensor)> {
+        // Each tapped layer's kept rows are copied straight into their column band of one
+        // `[B, n, layers × hidden]` buffer: the taps are held once (as the request pricing counts
+        // them), never as per-layer copies plus their concatenation. The buffer is allocated
+        // once per forward and filled by device copies, so a captured verify step stages its taps
+        // in its own fixed buffer.
+        let mut taps: Option<Tensor> = None;
+        let mut filled = vec![false; layers.len()];
+        let h = self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()), &mut |i, h| {
+            let (b, s, hidden) = h.dims3()?;
+            let n = keep.map_or(s, |k| k.min(s));
+            for (j, _) in layers.iter().enumerate().filter(|(_, &l)| l == i) {
+                let buffer = match &taps {
+                    Some(buffer) => buffer,
+                    // SAFETY: every column band is written below before the buffer is read (a
+                    // band left unwritten is refused after the forward).
+                    None => taps.insert(unsafe {
+                        Tensor::empty((b, n, layers.len() * hidden), h.dtype(), h.device())?
+                    }),
+                };
+                // `[B, n, hidden]` into columns `j·hidden..` of `[B, n, layers·hidden]`: one
+                // strided device copy per layer (the reshapes are views of the same storage).
+                let rows = h.narrow(1, s - n, n)?.contiguous()?;
+                buffer.reshape((b * n, layers.len() * hidden))?.slice_set(
+                    &rows.reshape((b * n, hidden))?,
+                    1,
+                    j * hidden,
+                )?;
+                filled[j] = true;
+            }
+            Ok(())
+        })?;
+        let taps = match taps {
+            Some(taps) if filled.iter().all(|&f| f) => taps,
+            _ => {
+                return Err(Error::Config(format!(
+                    "tapped layers {layers:?} outside this {}-layer target",
+                    self.layers.len()
+                )))
+            }
+        };
+        let logits = match scope {
+            LogitsScope::Last => self.project_last(&h)?,
+            LogitsScope::All => self.project(&h)?,
+        };
+        Ok((logits, taps))
+    }
+
+    /// The decoder layer count.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Whether this model was loaded from a Prism checkpoint — whatever its LM head is (a Prism
+    /// snapshot may keep a dense or tied head). MLX's `is_prism`.
+    pub fn is_prism(&self) -> bool {
+        self.prism
+    }
+
+    /// The LM head over already-normalized rows `[.., hidden]` → `[.., vocab]` (a block draft
+    /// scores its rows with the target's head).
+    pub fn lm_head(&self, normalized: &Tensor) -> Result<Tensor> {
+        self.project_normalized(normalized)
+    }
+
+    /// The LM head's row access (SW-7197): how [`Self::lm_head_scores`] reads only the rows it is
+    /// asked for — built once, on first use (a CUDA head uploads its row-address table then).
+    pub fn head_rows(&self) -> Result<&crate::primitives::head_rows::HeadRows> {
+        if let Some(rows) = self.head_rows.get() {
+            return Ok(rows);
+        }
+        let head = self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })?;
+        let built = crate::primitives::head_rows::HeadRows::new(head)?;
+        Ok(self.head_rows.get_or_init(|| built))
+    }
+
+    /// The LM head's logits of only `ids` `[groups, k]` (`U32`) for normalized `rows`
+    /// `[groups, senders, hidden]`: `[groups, senders, k]` f32 — the head's columns of those ids,
+    /// read without the rest of the vocabulary where the head's format allows
+    /// ([`Self::head_rows`]).
+    pub fn lm_head_scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let head = self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })?;
+        self.head_rows()?.scores(head, rows, ids)
+    }
+
+    /// [`StepModel::forward_step`] whose hidden rows, when asked for, are the outputs of `taps`'
+    /// layers (at most its last `keep` rows) instead of the final-normalized rows — the block
+    /// draft's target step (SW-F360). `None` is the ordinary step.
+    pub fn forward_step_tapped(
+        &self,
+        cache: &mut Qwen35Cache,
+        request: StepRequest<'_>,
+        taps: Option<(&[usize], Option<usize>)>,
+    ) -> Result<StepOutput> {
+        if request.is_empty()? {
+            return Err(Error::Msg(
+                "Qwen35Model::forward_step: empty token slice".into(),
+            ));
+        }
+        // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
+        let offset = cache.offset() + cache.rope_delta();
+        let ids = request.tokens.ids(&self.device)?;
+        if let Some(b) = request.snapshot_at {
+            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
+            // its first `b` tokens; the attention KV is narrowed there afterwards.
+            let n = request.len()?;
+            if !request.prefill || b == 0 || b >= n {
+                return Err(Error::Msg(format!(
+                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
+                     prefill step that continues past it"
+                )));
+            }
+            cache.capture_boundary(cache.offset() + b as i32);
+        }
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
+        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
+            Ok(match (request.scope, request.want_hidden, taps) {
+                (scope, true, Some((layers, keep))) => {
+                    let (logits, taps) =
+                        self.forward_tapped(&ids, cache, offset, layers, keep, scope)?;
+                    (logits, Some(taps))
+                }
+                (LogitsScope::Last, false, _) => (self.decode_logits(&ids, cache, offset)?, None),
+                (LogitsScope::Last, true, None) => {
+                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+                (LogitsScope::All, false, _) => (self.forward(&ids, cache, offset)?, None),
+                (LogitsScope::All, true, None) => {
+                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+            })
+        })();
+        let (logits, hidden) = match run {
+            Ok(out) => out,
+            Err(e) => {
+                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
+                // in the linear layers it never reached: drop it, so no later prefill on this
+                // cache captures a stale boundary.
+                cache.clear_boundary_capture();
+                return Err(e);
+            }
+        };
+        Ok(StepOutput { logits, hidden })
     }
 
     /// Embed token ids `[B, S]` → `[B, S, hidden]` in the compute dtype — the splice point where the
@@ -3647,6 +3840,8 @@ impl Qwen35Model {
             quantized: format.is_some() || prism.is_some(),
             step_kv_cache: KvCacheKind::Static,
             attn_formulation: AttnFormulation::Gqa,
+            prism: prism.is_some(),
+            head_rows: std::sync::OnceLock::new(),
         })
     }
 }
@@ -3784,53 +3979,9 @@ impl StepModel for Qwen35Model {
         cache: &mut Qwen35Cache,
         request: StepRequest<'_>,
     ) -> Result<StepOutput> {
-        if request.is_empty()? {
-            return Err(Error::Msg(
-                "Qwen35Model::forward_step: empty token slice".into(),
-            ));
-        }
-        // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
-        let offset = cache.offset() + cache.rope_delta();
-        let ids = request.tokens.ids(&self.device)?;
-        if let Some(b) = request.snapshot_at {
-            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
-            // its first `b` tokens; the attention KV is narrowed there afterwards.
-            let n = request.len()?;
-            if !request.prefill || b == 0 || b >= n {
-                return Err(Error::Msg(format!(
-                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
-                     prefill step that continues past it"
-                )));
-            }
-            cache.capture_boundary(cache.offset() + b as i32);
-        }
-        let _prefill = crate::primitives::prefill_scope(request.prefill);
-        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
-            Ok(match (request.scope, request.want_hidden) {
-                (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
-                (LogitsScope::Last, true) => {
-                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
-                    (logits, Some(hidden))
-                }
-                (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
-                (LogitsScope::All, true) => {
-                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
-                    (logits, Some(hidden))
-                }
-            })
-        })();
-        let (logits, hidden) = match run {
-            Ok(out) => out,
-            Err(e) => {
-                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
-                // in the linear layers it never reached: drop it, so no later prefill on this
-                // cache captures a stale boundary.
-                cache.clear_boundary_capture();
-                return Err(e);
-            }
-        };
-        Ok(StepOutput { logits, hidden })
+        self.forward_step_tapped(cache, request, None)
     }
+
     /// Every cache this model builds keeps a tree branch (feature SW-F328).
     fn tree_unsupported(&self, cache: &Qwen35Cache) -> Option<&'static str> {
         DecodeCache::tree_unsupported(cache)
@@ -4197,7 +4348,7 @@ pub(crate) mod tests {
         assert!((dense[0] - source[0]).abs() < 1e-6);
     }
 
-    fn cfg_json() -> Value {
+    pub(crate) fn cfg_json() -> Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.
         json!({
             "text_config": {
@@ -4439,7 +4590,7 @@ pub(crate) mod tests {
         Weights::from_map(m, Device::Cpu)
     }
 
-    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+    pub(crate) fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
         synthetic_weights_with_prefix(cfg, "model.language_model")
     }
 

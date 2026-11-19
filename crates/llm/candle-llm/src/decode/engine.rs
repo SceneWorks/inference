@@ -133,6 +133,9 @@ pub struct ProposeContext<'a> {
     /// At most this many drafts (already clamped to the remaining budget) — in a tree, the
     /// deepest a candidate may sit below `cur`.
     pub max_drafts: usize,
+    /// The most drafts the remaining token budget alone allows (`>= max_drafts`): a proposer whose
+    /// draft runs a fixed-size block shortens it only here (a non-causal block draft, SW-F360).
+    pub budget_drafts: usize,
     /// At most this many candidate rows in a tree proposal ([`Proposer::propose_tree`], feature
     /// SW-F328); `max_drafts` on a linear run.
     pub max_rows: usize,
@@ -193,6 +196,61 @@ impl DraftSampler<'_, '_> {
             }
         }
         Ok((draft, dist))
+    }
+
+    /// Sample one draft among `candidates` (distinct ids below `width`) scored `scores`, every
+    /// other id of the `width`-wide vocabulary at `-inf` — a block draft's scored row (SW-F360,
+    /// the MLX engine's rule). The draw is [`sample_draft`](Self::sample_draft)'s over that dense
+    /// host row, so the knobs, penalties and constraint apply and a stochastic draft's `q` is the
+    /// shaped distribution it was drawn from. A plain greedy run (no penalty, no constraint)
+    /// takes the row's argmax on the host — the lowest id among equal scores, as the dense argmax.
+    /// `None` when the constraint allows no candidate: the proposal stops there.
+    pub fn sample_among(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        draft_history: &[i32],
+    ) -> Result<Option<DraftSample>> {
+        if self.allowed_among(candidates).is_empty() {
+            return Ok(None);
+        }
+        if self.greedy() && self.constraint.is_none() && self.config.sampling.is_plain_greedy() {
+            let best =
+                candidates
+                    .iter()
+                    .zip(scores)
+                    .fold(None, |best: Option<(i32, f32)>, (&t, &s)| match best {
+                        Some((b, bs)) if s < bs || (s == bs && t > b) => best,
+                        _ => Some((t, s)),
+                    });
+            return Ok(best.map(|(t, _)| (t, None)));
+        }
+        let mut row = vec![f32::NEG_INFINITY; width];
+        for (&t, &s) in candidates.iter().zip(scores) {
+            if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
+                *slot = s;
+            }
+        }
+        let logits = Tensor::from_vec(row, (1, width), &candle_core::Device::Cpu)?;
+        self.sample_draft(&logits, draft_history).map(Some)
+    }
+
+    /// The `candidates` the constraint (if any) allows in its current state, in order.
+    pub fn allowed_among(&mut self, candidates: &[i32]) -> Vec<i32> {
+        match self.constraint.as_mut() {
+            Some(c) => {
+                let allowed = c.allowed();
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        usize::try_from(t).is_ok_and(|t| allowed.get(t).copied().unwrap_or(false))
+                    })
+                    .collect()
+            }
+            None => candidates.to_vec(),
+        }
     }
 }
 
@@ -843,6 +901,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 previous_hidden: previous_hidden.as_ref(),
                 position,
                 max_drafts: k,
+                budget_drafts: remaining.saturating_sub(1),
                 max_rows: if tree_rows > 0 { tree_rows } else { k },
             };
             let device_greedy = plain_greedy && constraint.is_none();
@@ -2714,6 +2773,7 @@ mod tests {
             previous_hidden: None,
             position: PROMPT.len() as i32,
             max_drafts: 4,
+            budget_drafts: 4,
             max_rows: 4,
         };
         let mut rng = SplitMix64::new(11);
@@ -4116,6 +4176,7 @@ mod tests {
                 previous_hidden: Some(&previous),
                 position,
                 max_drafts: 1,
+                budget_drafts: 1,
                 max_rows: 1,
             };
             let mut sampler = DraftSampler {

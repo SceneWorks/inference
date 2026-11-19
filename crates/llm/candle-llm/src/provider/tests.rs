@@ -5866,3 +5866,6 @@ fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell
         Ok(_) => panic!("a ModelOpt NVFP4 snapshot was re-quantized to Q8"),
     }
 }
+
+/// The block draft through the provider (SW-F360, SW-7197).
+mod block_draft;

@@ -22,6 +22,7 @@ pub mod decode_cache;
 pub mod device_positions;
 pub mod fused;
 pub mod gated_delta;
+pub mod head_rows;
 pub mod host_sync;
 pub mod kv_cache;
 pub mod moe;

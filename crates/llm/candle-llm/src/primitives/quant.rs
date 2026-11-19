@@ -341,6 +341,15 @@ impl QuantizedLinear {
         }
     }
 
+    /// The dense weight `QMatMul` expanded a float-typed GGUF matrix into, when it holds one and no
+    /// bias — its forward is then a plain dense matmul over these rows.
+    pub fn dense_weight(&self) -> Option<&Tensor> {
+        match (&self.inner, &self.bias) {
+            (QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)), None) => Some(t),
+            _ => None,
+        }
+    }
+
     /// The GGML block dtype the weight is stored in, when it is block-quantized.
     pub fn ggml_dtype(&self) -> Option<GgmlDType> {
         match &self.inner {

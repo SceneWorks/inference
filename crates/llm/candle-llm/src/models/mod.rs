@@ -5,6 +5,7 @@
 //! dimension later. The only mutable state in a forward pass is the KV cache, threaded in as
 //! `&mut dyn KvCache`.
 
+pub mod block_draft;
 pub mod deepstack;
 pub mod gemma4_mm;
 pub mod llama;
@@ -19,6 +20,7 @@ use crate::decode::stream::Decode;
 use crate::error::Result;
 use crate::primitives::kv_cache::KvCache;
 
+pub use block_draft::{BlockDraft, BlockDraftContext, DFlash2Draft, DSpineDraft, DraftSource};
 pub use deepstack::MropePositions;
 pub use gemma4_mm::{
     Gemma4AudioConfig, Gemma4AudioEmbedder, Gemma4Layout, Gemma4Mm, Gemma4MmConfig,
