@@ -454,6 +454,11 @@ pub struct Capabilities {
     /// non-supporting route with [`Error::Unsupported`] rather than letting a provider silently
     /// ignore it and render a single-phase trajectory.
     pub supports_phases: bool,
+    /// Whether this model route honours [`GenerationRequest::low_res_start`] two-phase low-res
+    /// start denoising (SW-6939). `Default` is `false`, and the shared floor refuses any `Some`
+    /// `low_res_start` on a non-supporting route with [`Error::Unsupported`] rather than letting
+    /// an unmigrated provider silently ignore it and render a single-phase full-resolution trajectory.
+    pub supports_low_res_start: bool,
 }
 
 /// The one typed refusal for an **adapter-bearing** request against a descriptor whose advertised
@@ -1517,6 +1522,11 @@ impl Capabilities {
             }
         }
         if let Some(spec) = &req.low_res_start {
+            if !self.supports_low_res_start {
+                return Err(Error::Unsupported(format!(
+                    "{id}: low_res_start is not supported by this model route"
+                )));
+            }
             spec.validate_parameters(id)?;
             if req.phases.is_some() {
                 return Err(Error::Unsupported(format!(

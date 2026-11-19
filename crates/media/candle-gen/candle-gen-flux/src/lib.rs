@@ -667,6 +667,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // sources and fails if the flag and the wiring ever disagree.
             supports_preview: true,
             pag: Some(variant.pag_capability()),
+            supports_low_res_start: true,
             ..Default::default()
         },
     }

@@ -1632,12 +1632,14 @@ pub fn compile_trajectory_for(
 pub(crate) fn descriptor_schnell_ip_adapter() -> ModelDescriptor {
     let mut descriptor = descriptor_schnell();
     descriptor.id = "flux1_schnell_ip_adapter";
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
 }
 
 pub(crate) fn descriptor_dev_ip_adapter() -> ModelDescriptor {
     let mut descriptor = descriptor_dev();
     descriptor.id = "flux1_dev_ip_adapter";
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
 }
 
@@ -1868,6 +1870,12 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
         }
     }
     if req.low_res_start.is_some() {
+        if !desc.capabilities.supports_low_res_start {
+            return Err(Error::Unsupported(format!(
+                "{}: low_res_start is not supported by this model route",
+                desc.id
+            )));
+        }
         let variant = if desc.id.contains("schnell") {
             FluxVariant::Schnell
         } else {

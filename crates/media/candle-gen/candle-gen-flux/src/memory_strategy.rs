@@ -703,6 +703,7 @@ impl FluxMemoryScope {
     }
 
     /// Recorded `(MemoryPhase, RenderPhaseIdentity)` entries observed by this scope (`MEM-5`).
+    #[cfg(test)]
     pub(crate) fn recorded_render_phases(
         &self,
     ) -> &[(MemoryPhase, gen_core::render::RenderPhaseIdentity)] {

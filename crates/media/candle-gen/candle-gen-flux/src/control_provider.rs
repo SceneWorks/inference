@@ -355,6 +355,7 @@ pub(crate) fn control_descriptor() -> ModelDescriptor {
     ]));
     descriptor.capabilities.conditioning = vec![candle_gen::gen_core::ConditioningKind::Control];
     descriptor.capabilities.max_count = 1;
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
 }
 

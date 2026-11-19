@@ -263,6 +263,7 @@ pub(crate) fn ip_descriptor(variant: Variant) -> ModelDescriptor {
     };
     descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
     descriptor.capabilities.max_count = 1;
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
 }
 

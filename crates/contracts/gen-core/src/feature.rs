@@ -519,8 +519,8 @@ impl ResolvedLowResStartPlan {
         let full_packed_latent_bytes = batch_u64 * full_tokens * token_width_u64 * dtype_u64;
         let low_f32_bytes = batch_u64 * low_tokens * token_width_u64 * 4;
         let full_f32_bytes = batch_u64 * full_tokens * token_width_u64 * 4;
-        // fp32 unpack (`low_f32`) + bilinear resize (`full_f32`) + transition noise (`full_f32`) + repack (`full_f32`)
-        let transition_f32_workspace_bytes = low_f32_bytes + 3 * full_f32_bytes;
+        // fp32 unpack (`low_f32`) + bilinear resize (`full_f32`) + transition noise (`full_f32`) + re-noised blend (`full_f32`) + repack (`full_f32`)
+        let transition_f32_workspace_bytes = low_f32_bytes + 4 * full_f32_bytes;
         let (retained_primary_estimate_bytes, boundary_eval_workspace_bytes) =
             match self.estimate_source {
                 EstimateSource::EndpointEvaluation => (0, low_packed_latent_bytes),
@@ -2421,6 +2421,7 @@ pub struct FeatureRouteStructure {
     pub default_executed_steps: Option<u32>,
     pub pixel_stride: Option<u32>,
     pub token_width: Option<u32>,
+    pub min_size: Option<u32>,
 }
 
 impl FeatureRouteStructure {
@@ -2576,6 +2577,8 @@ impl FeatureRouteStructure {
             && has_packed_image_trajectory
             && descriptor.capabilities.accepts(ConditioningKind::Reference);
         let supports_pag = descriptor.capabilities.pag.is_some();
+        let min_size =
+            (descriptor.capabilities.min_size > 0).then_some(descriptor.capabilities.min_size);
 
         Self {
             route_id: descriptor.id.to_string(),
@@ -2594,6 +2597,7 @@ impl FeatureRouteStructure {
             default_executed_steps,
             pixel_stride,
             token_width,
+            min_size,
         }
     }
 }
@@ -2821,6 +2825,13 @@ pub struct ComposedDenoisePhase {
     pub active_expert: Option<String>,
 }
 
+/// Resolved Perturbed-Attention Guidance settings carried on a [`ComposedPassPlan`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ComposedPagConfig {
+    pub scale: f32,
+    pub layers: Vec<u32>,
+}
+
 /// One pass inside a [`ComposedRenderPlan`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ComposedPassPlan {
@@ -2838,6 +2849,7 @@ pub struct ComposedPassPlan {
     pub phases: Vec<ComposedDenoisePhase>,
     pub transitions: Vec<ComposedPhaseTransition>,
     pub pag_active: bool,
+    pub pag: Option<ComposedPagConfig>,
     pub diagnostic_observers: Vec<String>,
 }
 
@@ -2907,6 +2919,7 @@ impl ComposedPassPlan {
             }],
             transitions: Vec::new(),
             pag_active: false,
+            pag: None,
             diagnostic_observers: Vec::new(),
         })
     }
@@ -3423,6 +3436,7 @@ impl FeatureSpec for LowResStartFeature {
             .first_mut()
             .ok_or_else(|| Error::Unsupported("composed plan has no pass 0".into()))?;
         let stride = pass0.pixel_stride.max(1);
+        let min_dim = route.min_size.unwrap_or(stride).max(stride);
         let resolved = LowResStartSpec::new(*k, *scale).resolve_geometry(
             &route.route_id,
             pass0.target_width,
@@ -3431,7 +3445,7 @@ impl FeatureSpec for LowResStartFeature {
             stride,
             1,
             stride,
-            stride,
+            min_dim,
         )?;
         pass0.insert_boundary_action(
             resolved.k,
@@ -4059,6 +4073,10 @@ impl FeatureSpec for PagFeature {
             .first_mut()
             .ok_or_else(|| Error::Unsupported("composed plan has no pass 0".into()))?;
         pass0.pag_active = true;
+        pass0.pag = Some(ComposedPagConfig {
+            scale: *scale,
+            layers: layers.clone(),
+        });
         Ok(())
     }
 }
@@ -4659,6 +4677,7 @@ mod tests {
             default_executed_steps: Some(20),
             pixel_stride: Some(16),
             token_width: Some(64),
+            min_size: Some(256),
         }
     }
 
@@ -6342,5 +6361,110 @@ mod tests {
                 "endpoint_evaluation_v1"
             );
         }
+
+        // 4. Regression tests for PR #1484 review items:
+        // - Unmigrated route (supports_low_res_start == false) rejects low_res_start at Capabilities::validate_request.
+        let unmigrated_desc = ModelDescriptor {
+            id: "flux3_dev",
+            family: "flux3",
+            backend: "candle",
+            modality: Modality::Image,
+            capabilities: Capabilities {
+                min_size: 256,
+                max_size: 2048,
+                max_count: 1,
+                supports_low_res_start: false,
+                ..Default::default()
+            },
+            ..flux_desc()
+        };
+        let low_res_req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        assert!(matches!(
+            unmigrated_desc
+                .capabilities
+                .validate_request(unmigrated_desc.id, &low_res_req),
+            Err(Error::Unsupported(ref msg)) if msg.contains("low_res_start is not supported")
+        ));
+
+        // - FeatureRegistry::compose enforces route.min_size on LowResStart (e.g. 512x512 with scale=0.25 -> 128x128 < min_size 256 is refused).
+        let route_min256 = synthetic_full_route();
+        assert_eq!(route_min256.min_size, Some(256));
+        let mut plan_512 = synthetic_base_plan(&route_min256, 8);
+        plan_512.passes[0].target_width = 512;
+        plan_512.passes[0].target_height = 512;
+        assert!(matches!(
+            FeatureRegistry::standard().compose(
+                &route_min256,
+                plan_512,
+                &[FeatureInvocation {
+                    feature_id: LowResStartFeature::ID.to_string(),
+                    parameters: FeatureParameters::LowResStart {
+                        k: 2,
+                        scale: Some(0.25),
+                    },
+                }],
+            ),
+            Err(Error::Unsupported(ref msg)) if msg.contains("min_dim=256")
+        ));
+
+        // - Transition memory profile includes the re-noised buffer (low_f32 + 4 * full_f32 = 262_144 + 4 * 1_048_576 = 4_456_448 B at 512->1024).
+        let plan_1024 = LowResStartSpec::new(2, Some(0.5))
+            .resolve_geometry("flux1_dev", 1024, 1024, 8, 8, 2, 16, 256)
+            .unwrap();
+        let mem_1024 = plan_1024.memory_profile(1, 16, 64, 2);
+        assert_eq!(
+            mem_1024.transition_f32_workspace_bytes,
+            262_144 + 4 * 1_048_576
+        );
+
+        // - Composed PAG plans preserve scale and layers so distinct PAG invocations produce distinct plans.
+        let pag_plan_a = FeatureRegistry::standard()
+            .compose(
+                &route_min256,
+                synthetic_base_plan(&route_min256, 8),
+                &[FeatureInvocation {
+                    feature_id: PagFeature::ID.to_string(),
+                    parameters: FeatureParameters::Pag {
+                        scale: 1.5,
+                        layers: vec![14],
+                    },
+                }],
+            )
+            .unwrap();
+        let pag_plan_b = FeatureRegistry::standard()
+            .compose(
+                &route_min256,
+                synthetic_base_plan(&route_min256, 8),
+                &[FeatureInvocation {
+                    feature_id: PagFeature::ID.to_string(),
+                    parameters: FeatureParameters::Pag {
+                        scale: 2.25,
+                        layers: vec![14, 28],
+                    },
+                }],
+            )
+            .unwrap();
+        assert_ne!(pag_plan_a, pag_plan_b);
+        assert_eq!(
+            pag_plan_a.passes[0].pag,
+            Some(ComposedPagConfig {
+                scale: 1.5,
+                layers: vec![14],
+            })
+        );
+        assert_eq!(
+            pag_plan_b.passes[0].pag,
+            Some(ComposedPagConfig {
+                scale: 2.25,
+                layers: vec![14, 28],
+            })
+        );
     }
 }

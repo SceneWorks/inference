@@ -482,13 +482,27 @@ impl TransitionOperationLiveSet {
     pub fn transition_peak_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
         let workspace_only =
             sum_deduplicated_live_bytes(domain, self.transition_workspaces.iter())?;
+        let total = sum_deduplicated_live_bytes(
+            domain,
+            self.resident_weights
+                .iter()
+                .chain(self.resident_overlays.iter())
+                .chain(self.transition_workspaces.iter())
+                .chain(self.live_handoff_buffers.iter()),
+        )?;
         if let TransitionMechanismKind::LearnedComponentTransition {
             learned_component_workspace_bytes,
         } = self.mechanism
         {
             let device_or_unified = domain == MemoryBudgetDomain::DeviceVram
                 || domain == MemoryBudgetDomain::UnifiedMemory;
+            let active_in_domain = total > 0
+                || (!self.resident_weights.iter().any(|a| a.bytes > 0)
+                    && !self.resident_overlays.iter().any(|a| a.bytes > 0)
+                    && !self.transition_workspaces.iter().any(|a| a.bytes > 0)
+                    && !self.live_handoff_buffers.iter().any(|a| a.bytes > 0));
             if device_or_unified
+                && active_in_domain
                 && (learned_component_workspace_bytes == 0
                     || workspace_only < learned_component_workspace_bytes)
             {
@@ -498,13 +512,7 @@ impl TransitionOperationLiveSet {
                 )));
             }
         }
-        let all = self
-            .resident_weights
-            .iter()
-            .chain(self.resident_overlays.iter())
-            .chain(self.transition_workspaces.iter())
-            .chain(self.live_handoff_buffers.iter());
-        sum_deduplicated_live_bytes(domain, all)
+        Ok(total)
     }
 }
 

@@ -1348,6 +1348,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
+    d.capabilities.supports_phases = true;
     d.capabilities.pag = Some(raw_pag_capability());
     // Raw img2img reference-guided latent-init (sc-10226, epic 8588): keep the single
     // `ConditioningKind::Reference` inherited from `descriptor` (Turbo). Raw serves it through the
@@ -1367,6 +1368,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
 pub fn edit_descriptor() -> ModelDescriptor {
     let mut d = raw_descriptor();
     d.id = KREA_2_EDIT_ID;
+    d.capabilities.supports_phases = false;
     d.capabilities.conditioning = vec![
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
