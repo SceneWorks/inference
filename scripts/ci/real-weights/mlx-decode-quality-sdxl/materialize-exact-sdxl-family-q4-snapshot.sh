@@ -6,14 +6,12 @@ QUALITY_ROOT="$(python3.12 - <<'PY'
 import os
 import sys
 sys.path.insert(0, "scripts/release")
-from ensure_model_snapshot import runner_hub_cache
-from huggingface_hub import snapshot_download
+from ensure_model_snapshot import download_to_runner_cache
 
-print(snapshot_download(
+print(download_to_runner_cache(
     repo_id=os.environ["QUALITY_REPOSITORY"],
     revision=os.environ["QUALITY_SOURCE_REVISION"],
     allow_patterns=["q4/**"],
-    cache_dir=str(runner_hub_cache()),
     token=False,
 ))
 PY
