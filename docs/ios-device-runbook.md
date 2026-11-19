@@ -372,8 +372,10 @@ gh workflow run real-weights.yml --ref FROZEN_REF -f profile=ios-prequant \
   -f ios_pricing_compile_binding='{"source_sha":"FROZEN_40_HEX_SHA","route":"iris-generation-q4"}'
 ```
 
-The runner needs the pinned snapshots in `~/.cache/huggingface/hub`, SDK 26.5,
-Rust 1.96, and free space on the cache volume. The workflow fetches the native
+The controller reads the pinned snapshots from the runner's Hugging Face hub cache
+(`HF_HUB_CACHE`, else `$HF_HOME/hub`, else `/Volumes/Models/huggingface/hub`) and
+downloads a route's missing inputs there first. The runner needs SDK 26.5, Rust 1.96,
+and free space on the cache volume. The workflow fetches the native
 MLX artifact for the exact pinned source/build cell and builds it from source
 when that release is unavailable; the controller verifies the linked artifact.
 Before conversion, it authenticates selected source bytes against the public

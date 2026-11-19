@@ -37,7 +37,8 @@ name: Real-weight validation
 #
 # `qwen38-bonsai-mlx` is the one campaign-local exception to this reusable weight-set scheme.
 # It is dispatch-only, selects the exact `nax` runner capability, verifies `runner.name ==
-# 'nax-macos'`, and then binds two SC-23935 preserved snapshot aliases before qualification. Those
+# 'nax-macos'`, and then binds two SC-23935 preserved snapshot aliases (when present; a missing one
+# keeps its runner-cache variable, where provisioning downloads it) before qualification. Those
 # frozen campaign paths are not a portable weight set, so assigning them a permanent `rw-*` label
 # would misrepresent their lifecycle. StarVector remains on `rw-starvector` because its terminal
 # snapshots are a reusable provisioned set. The workflow-policy tests pin every part of this
@@ -532,6 +533,9 @@ jobs:
             [[ "$rc" == 1 ]] || exit "$rc"
             echo 'IOS_PREQUANT_NATIVE_MODE=source' >> "$GITHUB_ENV"
           fi
+      - name: Install the pinned Hugging Face client for a missing source
+        shell: bash
+        run: source scripts/ci/real-weights/ios-prequant/install-the-pinned-hugging-face-client-for-a-missing-source.sh
       - name: Convert one pinned CPU tier with external limits
         shell: bash
         run: python3.12 -I scripts/ci/ios_prequant.py
@@ -1237,8 +1241,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, rw-starvector]
     timeout-minutes: 180
     env:
-      STARVECTOR_1B_SNAPSHOT: /Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b
-      STARVECTOR_8B_SNAPSHOT: /Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b
+      STARVECTOR_1B_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-1b-im2svg/snapshots/380ab95d25a8e9ab1dc825debe238b4953ae13b9
+      STARVECTOR_8B_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-8b-im2svg/snapshots/518beea8dcb5f7a37c5911e92d1d62a76beee7f9
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate immutable terminal corpus and receipt contract
@@ -1254,6 +1258,8 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
+      - name: Materialize exact native snapshots in the runner cache
+        run: source scripts/ci/real-weights/starvector-terminal-mlx/materialize-exact-native-snapshots-in-the-runner-cache.sh
       - name: Verify pre-provisioned exact native snapshots
         env:
           STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal-mlx
@@ -1277,8 +1283,8 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 180
     env:
-      STARVECTOR_1B_SNAPSHOT: D:\\sceneworks-terminal\\weights\\models\\starvector-1b
-      STARVECTOR_8B_SNAPSHOT: D:\\sceneworks-terminal\\weights\\models\\starvector-8b
+      STARVECTOR_1B_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--starvector--starvector-1b-im2svg\snapshots\380ab95d25a8e9ab1dc825debe238b4953ae13b9
+      STARVECTOR_8B_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--starvector--starvector-8b-im2svg\snapshots\518beea8dcb5f7a37c5911e92d1d62a76beee7f9
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -1299,6 +1305,9 @@ jobs:
       - name: Install reviewed CPython 3.12
         shell: cmd
         run: call scripts\ci\real-weights\starvector-terminal-candle\install-reviewed-cpython-3-12.cmd
+      - name: Materialize exact native snapshots in the runner cache
+        shell: cmd
+        run: call scripts\ci\real-weights\starvector-terminal-candle\materialize-exact-native-snapshots-in-the-runner-cache.cmd
       - name: Verify pre-provisioned exact native snapshots
         shell: cmd
         run: call scripts\ci\real-weights\starvector-terminal-candle\verify-pre-provisioned-exact-native-snapshots.cmd
@@ -5505,6 +5514,9 @@ jobs:
       - name: Validate the matrix and initialize the run-scoped evidence directory
         shell: cmd
         run: call scripts\ci\real-weights\candle-decode-speedups-bench\validate-the-matrix-and-initialize-the-run-scoped-evidence.cmd
+      - name: Materialize the matrix snapshots in the runner cache
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\materialize-the-matrix-snapshots-in-the-runner-cache.cmd
       # `dtolnay/rust-toolchain` runs its steps with `shell: bash`; on this runner a bare `bash` is
       # WSL's `C:\Windows\System32\bash.exe`, which has no distribution (sc-24446).
       - name: Select Git Bash
@@ -6536,13 +6548,18 @@ jobs:
       - name: Verify pinned Iris quant snapshots on the secondary Mac
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
         shell: bash
-        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          IRIS_PROOF_HF_HUB_PATH="$RUNNER_TEMP/huggingface-hub" python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
       - name: Verify pinned Iris quant snapshots on Windows
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
         shell: cmd
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "IRIS_PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda
       - name: Fetch same-run SenseNova reference receipt
         if: matrix.asset_setup == 'sensenova-loop'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

@@ -22,7 +22,7 @@ from scripts.ci.sensenova_loop_reference import validate_cuda_witness
 from scripts.media_campaign_supervisor import (
     SupervisionError, canonical, load_policy, run_guarded, validate_admission,
 )
-from scripts.release.ensure_model_snapshot import download_snapshot, ensure_snapshot
+from scripts.release.ensure_model_snapshot import download_snapshot, ensure_snapshot, runner_hub_cache
 from scripts.release.verify_model_snapshot import load_model, verify_snapshot
 
 MANIFEST = ROOT / "release/real-weight-models.toml"
@@ -81,9 +81,7 @@ def check_source_disk(snapshot: Path, source: dict, receipt: Path) -> None:
         )
 
 
-def source_snapshot(*, disk_receipt: Path | None = None):
-    from huggingface_hub.constants import HF_HUB_CACHE
-
+def source_snapshot(*, disk_receipt: Path | None = None, download=download_snapshot):
     source = json.loads(SOURCE.read_bytes())
     model = load_model(MANIFEST, MODEL_KEY)
     expected_files = [entry["path"] for entry in source["files"]]
@@ -91,11 +89,14 @@ def source_snapshot(*, disk_receipt: Path | None = None):
         model["repository"], model["revision"], model["expected_files"]
     ):
         raise ValueError("fixture manifest disagrees with pinned source bytes")
-    hub = Path(HF_HUB_CACHE).expanduser().resolve()
+    # The runner's own hub cache (HF_HUB_CACHE, else $HF_HOME/hub, else the fleet root), never the
+    # library's `~/.cache/huggingface/hub` fallback; in Actions a fetch may land nowhere else.
+    hub = runner_hub_cache().resolve()
     snapshot = hub / "models--sensenova--SenseNova-Loop-9B" / "snapshots" / source["revision"]
     if disk_receipt is not None:
         check_source_disk(snapshot, source, disk_receipt)
-    ensure_snapshot(model, snapshot, download_snapshot)
+    ensure_snapshot(model, snapshot, download,
+                    download_root=hub if os.environ.get("GITHUB_ACTIONS") == "true" else None)
     verify_snapshot(model, snapshot)
     observed = inventory([snapshot / name for name in expected_files], snapshot)
     if observed != source["files"]:

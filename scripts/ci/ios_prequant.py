@@ -30,6 +30,8 @@ _hub_spec = importlib.util.spec_from_file_location(
     "pinned_hub_source", Path(__file__).with_name("pinned_hub_source.py"))
 _hub = importlib.util.module_from_spec(_hub_spec)
 _hub_spec.loader.exec_module(_hub)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.release.ensure_model_snapshot import runner_hub_cache  # noqa: E402
 
 GIB = 1024**3
 MIB = 1024**2
@@ -71,6 +73,32 @@ def source_for(route, cache_root):
     return name, f"{owner}/{repo}@{revision}", source
 
 
+def download_patterns(name):
+    """The repository paths a route reads; `None` fetches the whole pinned revision."""
+    owner, repo, revision, suffix = PINS[name]
+    if name == "anima-turbo":
+        return [f"{suffix}/{path}" for path in ("diffusion_models/anima-turbo-v1.0.safetensors",
+                                                 "text_encoders/qwen_3_06b_base.safetensors",
+                                                 "vae/qwen_image_vae.safetensors")]
+    return [f"{suffix}/*"] if suffix else None
+
+
+def materialize_source(name, cache, download=None):
+    """Fetch a route's missing pinned source through the runner's hub cache (`cache_dir`)."""
+    owner, repo, revision, _ = PINS[name]
+    if download is None:
+        hub_path = os.environ.get("IOS_PREQUANT_HF_HUB_PATH", "")
+        if hub_path:
+            sys.path.insert(0, hub_path)
+        from scripts.release.ensure_model_snapshot import download_snapshot as download
+    kwargs = {"repo_id": f"{owner}/{repo}", "revision": revision, "cache_dir": str(cache), "token": False}
+    patterns = download_patterns(name)
+    if patterns is not None:
+        kwargs["allow_patterns"] = patterns
+    print(f"downloading {owner}/{repo}@{revision} into the runner's hub cache {cache}", flush=True)
+    download(**kwargs)
+
+
 def header_rows(path):
     """Bound each header read; payload checksums are streamed only after admission."""
     files = sorted(path.rglob("*.safetensors")) if path.is_dir() else [path]
@@ -95,17 +123,20 @@ def header_rows(path):
     return rows
 
 
-def input_headers(name, source):
+def input_paths(name, source):
     if name == "anima-turbo":
-        paths = [source / "diffusion_models/anima-turbo-v1.0.safetensors",
-                 source / "text_encoders/qwen_3_06b_base.safetensors",
-                 source / "vae/qwen_image_vae.safetensors"]
-    elif name.startswith("sana-"):
-        paths = [source / "transformer", source / "text_encoder"]
-    elif name == "iris-text-encoder":
-        paths = [source]
-    else:
-        paths = [source / "model.safetensors"]
+        return [source / "diffusion_models/anima-turbo-v1.0.safetensors",
+                source / "text_encoders/qwen_3_06b_base.safetensors",
+                source / "vae/qwen_image_vae.safetensors"]
+    if name.startswith("sana-"):
+        return [source / "transformer", source / "text_encoder"]
+    if name == "iris-text-encoder":
+        return [source / "model.safetensors.index.json"]
+    return [source / "model.safetensors"]
+
+
+def input_headers(name, source):
+    paths = [source] if name == "iris-text-encoder" else input_paths(name, source)
     return [row for path in paths for row in header_rows(path)]
 
 
@@ -337,12 +368,14 @@ def main():
             raise ValueError("checkout differs from frozen source")
         if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo, text=True).strip():
             raise ValueError("checkout is dirty")
-        cache = Path.home() / ".cache/huggingface/hub"
-        if not cache.is_dir():
-            raise ValueError("provisioned Hugging Face cache missing")
+        # The runner's own hub cache: HF_HUB_CACHE, else $HF_HOME/hub, else the fleet root.
+        cache = runner_hub_cache()
         name, source_revision, source = source_for(binding["route"], cache)
+        # A route's inputs, not its directory, decide: Iris routes share one snapshot root.
+        if not all(path.exists() for path in input_paths(name, source)):
+            materialize_source(name, cache)
         if not source.is_dir():
-            raise ValueError(f"pinned source missing: {source}")
+            raise ValueError(f"pinned source missing after download: {source}")
         receipt.update(source_revision=source_revision, source=str(source),
                        cache_realpath=str(cache.resolve()))
         headers = input_headers(name, source)

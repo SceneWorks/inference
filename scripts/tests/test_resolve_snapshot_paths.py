@@ -605,7 +605,7 @@ class WeightSetLabelTests(unittest.TestCase):
         workflow['jobs']['renamed-fixture-route'] = workflow['jobs'].pop('moss-edit-metal')
         self.assertEqual(weight_set_label_errors(workflow), [])
         source = (WORKFLOW.parents[2] / 'scripts/ci/ios_prequant.py').read_text(encoding='utf-8')
-        for marker in ('Path.home() / ".cache/huggingface/hub"',
+        for marker in ('cache = runner_hub_cache()',
                        'os.environ.get("RUNNER_NAME") != "nax-macos"',
                        'binding["source_sha"]', 'input_headers(name, source)',
                        'admit_memory(', 'run_guarded(', 'metal_trap_required'):

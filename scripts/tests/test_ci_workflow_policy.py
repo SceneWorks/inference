@@ -907,7 +907,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 49 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-publish` job;
         # 50 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-pe-render` job.
         # SW-7186 adds SenseNova provisioning on the secondary MLX runner.
-        MACOS_HUB_LOCK: 51,
+        # 54 since SW-7213 downloads missing snapshots in `starvector-terminal-mlx`, `ios-prequant`
+        # and the MLX Iris quant proof setup.
+        MACOS_HUB_LOCK: 54,
         # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
         # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
@@ -927,7 +929,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since SW-7104 added the dispatch-only `candle-minimax-h3-image-pe-render` job;
         # 28 since SW-7104's acceptance step installs it for the `minimax-h3-image-acceptance` profile.
         # SW-7186 adds separate Hub provisioning in the reference and native CUDA jobs.
-        WINDOWS_HUB_LOCK: 30,
+        # 33 since SW-7213 downloads missing snapshots in `starvector-terminal-candle`,
+        # `candle-decode-speedups-bench` and the Windows Iris quant proof setup.
+        WINDOWS_HUB_LOCK: 33,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1656,9 +1660,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # after SW-7104 added the tier publication pair (its Windows job installs the client to
         # publish and again in the PE lane's own materialization script); 50 / 27 after SW-7104
         # added the PE-expansion render pair; 50 / 28 after the Candle acceptance step installs it
-        # for the acceptance-only profile.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 51)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 30)
+        # for the acceptance-only profile; 54 / 33 after SW-7213 made StarVector, iOS prequant,
+        # the decode benchmark and the Iris quant proof setup download missing snapshots.
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 54)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 33)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_SENSENOVA_LOCK), 1)

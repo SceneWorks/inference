@@ -13,16 +13,36 @@ class IrisQuantProofAssets(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             hub = home / "sceneworks-rw-weights" / "hub"
-            hub.mkdir(parents=True)
+            iris = Path("models--speridlabs--iris-3b") / "snapshots" / assets.IRIS_REVISION
+            qwen = Path("models--Qwen--Qwen3-VL-4B-Instruct") / "snapshots" / assets.QWEN_REVISION
+            (hub / iris).mkdir(parents=True)
+            env = {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2", "HF_HUB_CACHE": str(home / "runner-hub")}
             with patch.object(Path, "home", return_value=home):
-                paths = assets.snapshot_paths("mlx", {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2"})
-                self.assertEqual(paths[0][2], hub / "models--speridlabs--iris-3b" / "snapshots" / assets.IRIS_REVISION)
-                self.assertEqual(paths[1][2], hub / "models--Qwen--Qwen3-VL-4B-Instruct" / "snapshots" / assets.QWEN_REVISION)
+                paths = assets.snapshot_paths("mlx", env)
+                # A snapshot the internal hub holds is bound there; one it lacks comes from (and is
+                # downloaded into) the runner's hub cache.
+                self.assertEqual(paths[0][2], hub / iris)
+                self.assertEqual(paths[1][2], home / "runner-hub" / qwen)
                 with self.assertRaisesRegex(ValueError, "secondary Mac"):
-                    assets.snapshot_paths("mlx", {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos"})
-                hub.rmdir()
-                with self.assertRaisesRegex(ValueError, "hub is missing"):
-                    assets.snapshot_paths("mlx", {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2"})
+                    assets.snapshot_paths("mlx", {**env, "RUNNER_NAME": "nax-macos"})
+
+    def test_a_missing_snapshot_is_downloaded_into_the_runner_hub_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary).resolve() / "hub"
+            path = cache / "models--speridlabs--iris-3b" / "snapshots" / assets.IRIS_REVISION
+            model = assets.load_model(assets.MANIFEST, "iris-3b-cuda")
+            calls = []
+
+            def refuse_after_recording(**kwargs):
+                calls.append(kwargs)
+                raise RuntimeError("no network in this test")
+
+            with self.assertRaisesRegex(RuntimeError, "cache-correct fetch"):
+                assets.ensure_snapshot(model, path, refuse_after_recording, download_root=cache)
+            self.assertEqual(calls[0]["cache_dir"], str(cache))
+            self.assertEqual(calls[0]["allow_patterns"], model["download_files"])
+            with self.assertRaisesRegex(RuntimeError, "outside this runner's Hugging Face hub cache"):
+                assets.ensure_snapshot(model, path, refuse_after_recording, download_root=cache / "other")
 
     def test_missing_windows_cache_root_fails_before_export(self):
         for root in ("", "relative-cache"):
