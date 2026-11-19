@@ -1753,6 +1753,8 @@ jobs:
           # directory name embeds the pid, every aborted run would leak another multi-GB quantized
           # Llama-3.1-8B onto rw-llm — on a lane whose whole point (sc-17250) is a disk budget.
           TMPDIR: ${{ runner.temp }}
+          # rust-lang/rust#157750: a fresh --release build mis-strips proc-macros (E0463).
+          CARGO_PROFILE_RELEASE_STRIP: "none"
         run: source scripts/ci/real-weights/mlx-llm-joycaption/run-joycaption-real-weight-vlm-gates.sh
 
   mlx-media:
