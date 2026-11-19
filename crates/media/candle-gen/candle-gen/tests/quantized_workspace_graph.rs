@@ -43,9 +43,9 @@ fn q8_matmul(n: usize, k: usize, seed: u64, device: &Device) -> Result<QMatMul> 
 /// Capture `rows` rows through a Q8_0 matmul, grow the shared workspace past it with an eager
 /// matmul of `grow_rows` rows over 32,768 columns, allocate sentinels, replay: the sentinels stay
 /// intact and the replay's output is the eager result.
-fn a_graph_keeps_its_own_scratch(rows: usize, grow_rows: usize) -> Result<()> {
+fn a_graph_keeps_its_own_scratch(device: &Device, rows: usize, grow_rows: usize) -> Result<()> {
     const SENTINEL: f32 = 7.25;
-    let device = Device::new_cuda_with_stream(0)?;
+    let device = device.clone();
     let cuda = device.as_cuda_device()?.clone();
     let (k, n) = (256usize, 128usize);
     let mm = q8_matmul(n, k, 0x7197_0001, &device)?;
@@ -119,8 +119,15 @@ fn a_graph_keeps_its_own_scratch(rows: usize, grow_rows: usize) -> Result<()> {
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn a_captured_quantized_matmul_keeps_its_own_scratch() -> Result<()> {
-    a_graph_keeps_its_own_scratch(5, 8)?;
-    a_graph_keeps_its_own_scratch(12, 64)?;
+    // The decode graph runner's device: its own capturable stream, cudarc's per-slice event
+    // tracking off (a wait on an event recorded before the capture would invalidate it). Every
+    // tensor below is issued through this one device, the contract that makes switching it off
+    // sound.
+    let device = Device::new_cuda_with_stream(0)?;
+    // SAFETY: the single-device contract above.
+    unsafe { device.as_cuda_device()?.disable_event_tracking() };
+    a_graph_keeps_its_own_scratch(&device, 5, 8)?;
+    a_graph_keeps_its_own_scratch(&device, 12, 64)?;
 
     #[cfg(feature = "model-inference-proof")]
     println!(

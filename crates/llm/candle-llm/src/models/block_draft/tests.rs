@@ -55,7 +55,19 @@ pub(crate) fn tiny_target_quantized_on(
     random: bool,
     quant: Option<crate::primitives::projection::QuantSpec>,
 ) -> Qwen35Model {
-    let cfg = tiny_target_config();
+    let cfg = if quant.is_some() {
+        // Every quantized matrix reads a multiple of the 32-column GGML block: the DeltaNet value
+        // width (heads × head dim, `out_proj`'s input) is 4 × 4 = 16 at the shared fixture's
+        // dims, so its head dims are 8 here (keys alike), a 32-wide value row.
+        let mut v = cfg_json();
+        v["text_config"]["hidden_size"] = 64.into();
+        v["text_config"]["intermediate_size"] = 128.into();
+        v["text_config"]["linear_key_head_dim"] = 8.into();
+        v["text_config"]["linear_value_head_dim"] = 8.into();
+        Qwen35Config::from_json(&v).unwrap()
+    } else {
+        tiny_target_config()
+    };
     let mut tensors = synthetic_weights(&cfg).into_map();
     let mut rng = SplitMix64::new(0x7193_7A26);
     for name in ["lm_head.weight", "model.language_model.embed_tokens.weight"] {

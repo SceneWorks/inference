@@ -118307,7 +118307,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@7c2e7e4dbc66d5649ca55caa4e8ce2c32a6f6922fba1dcf4028266de5c8d4452",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@05f29e32c3589951411e8535daf2ac4ffc82bc451d1eb6d31fc946b77375b059",
       "requirements": []
     }
   },
@@ -118377,7 +118377,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@7c2e7e4dbc66d5649ca55caa4e8ce2c32a6f6922fba1dcf4028266de5c8d4452",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@05f29e32c3589951411e8535daf2ac4ffc82bc451d1eb6d31fc946b77375b059",
       "requirements": []
     }
   },
