@@ -308,13 +308,28 @@ fn the_load_is_priced_by_the_groups_it_materializes() {
     }
 }
 
+/// The tapped rows, the context cache and the context projection are priced at the backend's
+/// compute element: an f32 request holds exactly twice a bf16 one's activations (taps among them),
+/// while the f32 logits and candidate table are the same at either.
+#[test]
+fn request_activations_are_priced_at_the_compute_element() {
+    let cfg = BlockDraftConfig::from_json(&dspine_b16()).unwrap();
+    let at = |element: u64| cfg.request_bytes(100, 256, 4, element).unwrap();
+    let fixed = at(0);
+    assert!(fixed > 0, "the f32 transients");
+    assert_eq!(at(4) - fixed, 2 * (at(2) - fixed));
+    let window = cfg.context_rows().map_or(100, |c| c.min(100)) as u64;
+    let taps = (window + 5) * cfg.tap_width() as u64;
+    assert!(at(2) - fixed >= taps * 2, "a bf16 request's taps");
+}
+
 #[test]
 fn request_bytes_stop_growing_past_the_draft_window() {
     let cfg = BlockDraftConfig::from_json(&dspine_b16()).unwrap();
-    let at = |prompt: usize| cfg.request_bytes(prompt, 256, 4).unwrap();
+    let at = |prompt: usize| cfg.request_bytes(prompt, 256, 4, 2).unwrap();
     assert!(at(100) < at(4_000));
     assert_eq!(at(20_000), at(200_000), "E5: the window caps every term");
-    let width_cost = cfg.request_bytes(100, 256, 15).unwrap() - at(100);
+    let width_cost = cfg.request_bytes(100, 256, 15, 2).unwrap() - at(100);
     assert!(width_cost > 0);
 }
 
@@ -589,7 +604,7 @@ fn the_dflash2_load_is_priced_by_the_groups_it_materializes() {
             cfg.resident_bytes(precision) + 2 * largest
         );
     }
-    let at = |prompt: usize| cfg.request_bytes(prompt, 256, 7).unwrap();
+    let at = |prompt: usize| cfg.request_bytes(prompt, 256, 7, 2).unwrap();
     assert!(at(100) < at(1_500));
     assert_eq!(
         at(5_000),

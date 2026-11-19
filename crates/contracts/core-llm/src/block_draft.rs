@@ -1082,18 +1082,21 @@ impl BlockDraftConfig {
     /// reads (the prompt's, capped at the window, plus a verify step's), the draft's context
     /// cache (capped at the window, E5), its context projection over the prompt rows, and a
     /// step's transients (the block's draft logits over the vocabulary and the format's candidate
-    /// table: DSpine's refinement, DFlash2's selector edges).
+    /// table: DSpine's refinement, DFlash2's selector edges). The tapped rows, the context cache
+    /// and the context projection are activations at `element_bytes` per element — the backend's
+    /// compute dtype (4 for f32, 2 for bf16 or f16); the logits and the candidate table are f32.
     pub fn request_bytes(
         &self,
         prompt_tokens: usize,
         max_new_tokens: u32,
         width: usize,
+        element_bytes: u64,
     ) -> Option<u64> {
         let cap = |rows: u64| match self.context_rows() {
             Some(c) => rows.min(c as u64),
             None => rows,
         };
-        let element = 2u64;
+        let element = element_bytes;
         let prompt = cap(u64::try_from(prompt_tokens).ok()?);
         let run = cap(u64::try_from(prompt_tokens)
             .ok()?

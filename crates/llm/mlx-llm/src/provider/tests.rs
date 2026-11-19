@@ -7062,6 +7062,35 @@ fn qwen35_provider_with_block_draft(format: core_llm::BlockDraftFormat) -> Llama
     provider
 }
 
+/// A `block_draft` request's activations — the target's tapped rows the draft reads among them —
+/// are priced at the target's compute element: an f32 element (a Prism target's priced compute)
+/// holds exactly twice a bf16 one's, and the provider passes its own geometry's element.
+#[test]
+fn a_block_draft_request_prices_its_rows_at_the_compute_element() {
+    let provider = qwen35_provider_with_block_draft(core_llm::BlockDraftFormat::DSpine);
+    let cfg = provider.block_draft.as_ref().unwrap().model.config();
+    let at = |element: u64| cfg.request_bytes(64, 32, 4, element).unwrap();
+    let (f32_element, bf16_element) = (
+        priced_compute_element_bytes(Dtype::Bfloat16, true),
+        priced_compute_element_bytes(Dtype::Bfloat16, false),
+    );
+    assert_eq!((f32_element, bf16_element), (4, 2));
+    let fixed = at(0);
+    assert_eq!(at(f32_element) - fixed, 2 * (at(bf16_element) - fixed));
+    let window = cfg.context_rows().map_or(64, |c| c.min(64)) as u64;
+    assert!(at(bf16_element) - fixed >= (window + 5) * cfg.tap_width() as u64 * 2);
+    let price = |route| {
+        provider
+            .speculative_request_bytes(route, None, 64, 32, 0)
+            .unwrap()
+    };
+    assert_eq!(
+        price(SpeculativeRoute::BlockDraft { width: 4 })
+            - price(SpeculativeRoute::PromptLookup { width: 4 }),
+        at(provider.model.memory_geometry().element_bytes)
+    );
+}
+
 /// AC3: admission prices a `block_draft` request as the target's verify overshoot plus the
 /// draft's own request (the shared [`core_llm::BlockDraftConfig::request_bytes`]); without a
 /// resident draft the route never forms.
@@ -7090,7 +7119,7 @@ fn a_block_draft_request_is_priced_beside_the_target() {
             .unwrap()
             .model
             .config()
-            .request_bytes(64, 32, 4)
+            .request_bytes(64, 32, 4, provider.model.memory_geometry().element_bytes)
             .unwrap();
         assert!(draft > 0);
         assert_eq!(
