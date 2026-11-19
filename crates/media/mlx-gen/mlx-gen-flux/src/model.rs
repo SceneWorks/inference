@@ -2418,9 +2418,15 @@ mod tests {
         );
         assert_eq!(
             model
+                .matches("let hold_conditioning = conditioning_started || req.use_pid || req.source_image.is_some();")
+                .count(),
+            1
+        );
+        assert_eq!(
+            model
                 .matches("let hold_conditioning = conditioning_started || req.use_pid;")
                 .count(),
-            2
+            1
         );
         let mut closures = 0;
         for (at, _) in
