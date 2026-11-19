@@ -138,13 +138,18 @@ def _secure_namespace(public: Path, uuids: tuple[str, ...]) -> set[tuple[int, in
     return identities
 
 
-def release_counter_diagnostic(guard, output: Path, phase: str, uuid: str) -> dict:
-    """Per retained release sample: the exact UUID's primary counters were valid after owned exit."""
+def release_metadata_valid(card: dict, admitted: dict) -> bool:
+    """Same exact UUID, physical index and memory total as admission, with valid counters."""
+    return resources.proof_cuda_shared_release(card, admitted['uuid'], admitted.get('index'), admitted.get('total_mib'))
+
+
+def release_counter_diagnostic(output: Path, phase: str, admitted: dict) -> dict:
+    """Per retained release sample: the exact admitted card's metadata was valid after owned exit."""
     try:
         samples = json.loads((output / f'{phase}-samples.json').read_text(encoding='utf-8'))
         return {'samples': [{'sample_number': sample.get('sample_number'),
                              'post_owned_exit_primary_metadata_valid': any(
-                                 card.get('uuid') == uuid and guard.counters_valid(card)
+                                 release_metadata_valid(card, admitted)
                                  for card in sample.get('devices', []))} for sample in samples]}
     except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
         return {'status': 'missing-or-malformed'}
@@ -215,16 +220,18 @@ def execution_claim(row: dict, policies: tuple, value: dict, output: Path, env: 
             # Never the admission deadline's leftover: a passing proof keeps a fixed release budget.
             budget['deadline'] = time.monotonic() + resources.RELEASE_SAMPLING_SECONDS
             try:
-                # The owned Job has exited; check identity and counters only. Foreign tenants may have grown.
+                # The owned Job has exited; check the admitted identity, memory total and counters.
+                # Foreign tenants may have grown.
                 guard.sample_baseline(device, output, phase, baselines[device['uuid']],
-                                      idle_check=lambda current, _rows: guard.counters_valid(current),
+                                      idle_check=lambda current, _rows, admitted=device: release_metadata_valid(
+                                          current, admitted),
                                       permit_bounded_growth=True, require_stable_contexts=False,
                                       inventory_reader=resources.release_inventory_reader(guard, device['uuid']))
                 if record is not None:
                     record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': True,
                                                         'release_metadata_verification': {'status': 'verified'}})
             except BaseException as error:
-                diagnostic = release_counter_diagnostic(guard, output, phase, device['uuid'])
+                diagnostic = release_counter_diagnostic(output, phase, device)
                 if resources.release_check_inconclusive(error, diagnostic, phase):
                     if record is not None:
                         record['post_idle_devices'].append({'uuid': device['uuid'], 'verified': True,

@@ -303,12 +303,12 @@ def _same_bytes(path, size, sha):
 def fetch_pinned(url, destination, token=None, opener=None):
     """Stream `url` to a temporary file beside `destination`, then place it without overwriting.
 
-    Returns (bytes, sha256, linked_etag). The temporary file is this process's own (a unique
+    Returns (bytes, sha256, linked_etag, placed_by_another_job). The temporary file is this process's own (a unique
     `mkstemp` name), so cleanup never touches another job's partial. An existing destination is
     never replaced (`os.link` on POSIX, `os.rename` on Windows both refuse it). When another job
     on the same host places the destination first (run 44431653018: several runner listeners
-    share one hub), this download is discarded if the placed file has the same size and SHA-256,
-    and refused otherwise.
+    share one hub), this download is discarded if the placed file has the same size and SHA-256
+    (`placed_by_another_job` is then True), and refused otherwise.
     """
     if probe(destination)["exists"]:
         raise FileExistsError(f"refusing to overwrite existing asset {destination}")
@@ -350,7 +350,8 @@ def fetch_pinned(url, destination, token=None, opener=None):
         except FileExistsError:
             if not _same_bytes(destination, size, sha):
                 raise ValueError(f"{destination} was placed concurrently with other bytes; not replaced")
-        return size, sha, etag or None
+            return size, sha, etag or None, True
+        return size, sha, etag or None, False
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -388,9 +389,9 @@ def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned):
                 receipt["action"] = "kept-existing"
             else:
                 progress(f"stage role={role} {repo}@{revision}/{file}")
-                size, sha, etag = fetch(url, destination, token=token)
-                receipt.update(action="fetched", bytes=size, sha256=sha,
-                               hub_lfs_sha256_verified=etag is not None)
+                size, sha, etag, placed_by_another_job = fetch(url, destination, token=token)
+                receipt.update(action="kept-existing-placed-by-another-job" if placed_by_another_job else "fetched",
+                               bytes=size, sha256=sha, hub_lfs_sha256_verified=etag is not None)
             receipts.append(receipt)
             if role == "pid_gemma" and file == "model.safetensors.index.json":
                 index = probe(destination, op="read", limit=MAX_GEMMA_INDEX_BYTES)

@@ -1,12 +1,16 @@
 """Registry-declared pinned Hub snapshots: slot contract, request binding, staging and the receipt
 the proof re-checks. Mock Hub and fetch only; no network, model payload or GPU work."""
 
+import errno
 import hashlib
 import io
+import os
 import json
 from pathlib import Path
 import tempfile
+import sys
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -125,12 +129,14 @@ class Staging(unittest.TestCase):
     def manifest(self, repository, revision):
         return "url", b"raw", {name: sibling(name, data) for name, data in self.FILES.items()}
 
-    def fetcher(self, calls):
+    def fetcher(self, calls, placed_by_another_job=False):
         def fetch(url, destination):
             self.assertFalse(destination.exists(), "an existing file is never replaced")
             calls.append(url)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(self.FILES[url.split(f"/resolve/{REV}/", 1)[1]])
+            data = self.FILES[url.split(f"/resolve/{REV}/", 1)[1]]
+            destination.write_bytes(data)
+            return len(data), hashlib.sha256(data).hexdigest(), None, placed_by_another_job
         return fetch
 
     def verify(self, repository, revision, snapshot, files):
@@ -184,7 +190,7 @@ class Staging(unittest.TestCase):
             def slow_fetch(url, destination):
                 first_fetching.set()
                 self.assertTrue(second_waiting.wait(10), "the second stager never waited on the lock")
-                fetch(url, destination)
+                return fetch(url, destination)
 
             real_try_lock = staging._try_lock
 
@@ -230,6 +236,56 @@ class Staging(unittest.TestCase):
                     / REV / "q8/model.safetensors.lock")
             self.assertTrue(lock.is_file())
             self.assertFalse(staging.snapshot_dir(hub, self.PIN["repository"], REV).exists())
+
+    def test_a_file_another_job_placed_mid_download_is_kept_not_fetched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary)
+            receipt = staging.stage({"PLAIN": self.PIN}, hub, manifest=self.manifest,
+                                    fetch=self.fetcher([], placed_by_another_job=True), verify=self.verify,
+                                    free_bytes=lambda path: 10**15)["PLAIN"]
+            self.assertEqual(receipt["fetched"], [])
+            self.assertEqual(receipt["placed_by_another_job"], ["q8/config.json", "q8/model.safetensors"])
+            self.assertEqual(receipt["kept_existing"], ["q8/config.json", "q8/model.safetensors"])
+            self.assertEqual(receipt["status"], "hub_content_verified")
+
+    def test_only_lock_contention_waits_and_other_lock_errors_are_raised(self):
+        def failing(code):
+            def flock(*_args):
+                raise OSError(code, os.strerror(code))
+            return flock
+        with tempfile.TemporaryDirectory() as temporary, open(Path(temporary) / "x.lock", "a+b") as handle:
+            for code in (errno.EWOULDBLOCK, errno.EAGAIN):
+                with self.subTest(posix_busy=code), patch("fcntl.flock", side_effect=failing(code)):
+                    self.assertFalse(staging._try_lock(handle))
+            for code in (errno.ENOLCK, errno.ENOTSUP, errno.EBADF, errno.EINVAL):
+                with self.subTest(posix_error=code), patch("fcntl.flock", side_effect=failing(code)), \
+                        self.assertRaises(OSError):
+                    staging._try_lock(handle)
+            for code, busy in ((errno.EACCES, True), (errno.EDEADLK, True), (errno.ENOLCK, False),
+                               (errno.EBADF, False)):
+                fake = SimpleNamespace(LK_NBLCK=2, locking=failing(code))
+                with self.subTest(msvcrt=code), patch.object(staging, "os", SimpleNamespace(name="nt")), \
+                        patch.dict(sys.modules, {"msvcrt": fake}):
+                    if busy:
+                        self.assertFalse(staging._try_lock(handle))
+                    else:
+                        with self.assertRaises(OSError):
+                            staging._try_lock(handle)
+
+    def test_a_long_wait_on_the_staging_lock_is_logged_periodically(self):
+        clock = {"now": 0.0}
+        attempts = iter([False] * 7 + [True])
+        def sleep(seconds):
+            clock["now"] += 60
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(staging, "_try_lock", side_effect=lambda _handle: next(attempts)), \
+                patch.object(staging.time, "monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(staging.time, "sleep", side_effect=sleep), patch("builtins.print") as printed:
+            with staging.staging_lock(Path(temporary), self.PIN["repository"], REV, "q8/model.safetensors"):
+                pass
+        lines = [call.args[0] for call in printed.call_args_list]
+        self.assertTrue(lines[0].startswith("waiting for another job staging"))
+        self.assertEqual([line.split(" (")[1].split(" s)")[0] for line in lines[1:]], ["180", "360"])
 
     def test_disk_shortfall_is_refused_before_any_fetch(self):
         with tempfile.TemporaryDirectory() as temporary:

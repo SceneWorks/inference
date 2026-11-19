@@ -305,14 +305,17 @@ def release_window_overrun(phase: str) -> str:
 def release_check_inconclusive(error: Exception, diagnostic: dict, phase: str = 'model-proof-release') -> bool:
     """A query timeout or sampling-time overrun is not evidence against the release.
 
-    Only a retained sample whose exact selected-card metadata is invalid is. The owned-Job
-    completion check (`shared_owned_completion`) stays the proof that this proof's process exited.
+    It is inconclusive only when at least one sample was retained after owned exit and every
+    retained sample shows valid exact-card metadata; with none (a hung driver) nothing was checked
+    and the release is refused. The owned-Job completion check (`shared_owned_completion`) stays
+    the proof that this proof's process exited.
     """
     timing = (isinstance(error, (subprocess.TimeoutExpired, TimeoutError))
               or (type(error) is RuntimeError and str(error) in (
                   release_window_overrun(phase), f'CUDA settle deadline expired during {phase}')))
-    return timing and all(sample.get('post_owned_exit_primary_metadata_valid') is True
-                          for sample in diagnostic.get('samples', []))
+    samples = diagnostic.get('samples') or []
+    return timing and bool(samples) and all(sample.get('post_owned_exit_primary_metadata_valid') is True
+                                            for sample in samples)
 
 
 def accepted_utilization_samples(output: Path, phase: str, uuid: str, physical_index: int,
