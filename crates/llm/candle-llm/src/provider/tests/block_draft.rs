@@ -451,12 +451,53 @@ fn tiny_vl_target_snapshot() -> tempfile::TempDir {
     super::write_vl_snapshot(&config, &tensors, vocab)
 }
 
+/// An image tree request's report (SW-7209): the block draft ran with no tree or `block_draft`
+/// fallback, and its tree report counts every pass, each tree pass feeding its anchor and at least
+/// one candidate. Returns the branching passes, after printing rows and acceptance per pass.
+fn image_tree_report(label: &str, report: &core_llm::DecodeReport) -> u64 {
+    assert_eq!(report.proposer, ProposerKind::BlockDraft, "{label}");
+    assert!(
+        report
+            .fallbacks
+            .iter()
+            .all(|f| !f.contains("tree") && !f.contains("block_draft")),
+        "{label}: {:?}",
+        report.fallbacks
+    );
+    let tree = report
+        .tree_verify
+        .expect("an image tree request reports its tree");
+    assert_eq!(tree.max_rows, 16, "{label}");
+    assert_eq!(
+        tree.passes, report.verify_steps,
+        "{label}: every pass counted"
+    );
+    assert_eq!(tree.accepted_tokens, report.accepted_tokens, "{label}");
+    assert!(
+        tree.tree_passes == 0 || tree.tree_rows_verified > tree.tree_passes,
+        "{label}"
+    );
+    println!(
+        "BLOCK_DRAFT_IMAGE_TREE {label}: passes={} tree_passes={} rows_per_pass={:.2} \
+         accepted_per_pass={:.2} rows_per_tree_pass={:.2} accepted_per_tree_pass={:.2}",
+        tree.passes,
+        tree.tree_passes,
+        tree.rows_per_pass().unwrap_or(0.0),
+        tree.accepted_per_pass().unwrap_or(0.0),
+        tree.rows_per_tree_pass().unwrap_or(0.0),
+        tree.accepted_per_tree_pass().unwrap_or(0.0),
+    );
+    tree.tree_passes
+}
+
 /// SW-7198 AC1 through the provider: a Qwen3.5 VLM with a resident draft of either format runs a
 /// greedy image + text `block_draft` request — the image at the head of the prompt and mid-prompt
 /// — that decodes exactly `off`'s stream: the provider prefills the fused prompt tapped at the
 /// draft's layers, warms the draft from those rows and shifts its positions by the prompt's
 /// M-RoPE delta, and the report names the draft with no `block_draft` fallback. The same request
-/// under a tree bound verifies linearly, by name (the multimodal rule), and is still `off`'s.
+/// under a 16-row tree bound verifies the draft's candidate trees (SW-7209) — no tree fallback,
+/// branching passes reported with their rows checked and accepted tokens — and is still `off`'s;
+/// a seeded sampled tree request reproduces and verifies its trees too.
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn a_block_draft_decodes_an_image_request_as_off_does() {
@@ -476,7 +517,7 @@ fn a_block_draft_decodes_an_image_request_as_off_does() {
             provider.draft_report
         );
         let block = Speculative::proposer(SpeculativeProposer::BlockDraft, 3);
-        let (mut proposed, mut accepted) = (0, 0);
+        let (mut proposed, mut accepted, mut tree_passes) = (0, 0, 0);
         for prompt in super::image_fixture_prompts() {
             let label = format!("{format:?} {}", prompt.id);
             let req = |speculative| {
@@ -507,19 +548,31 @@ fn a_block_draft_decodes_an_image_request_as_off_does() {
             };
             let (treed, out) = super::token_events(&provider, &tree);
             assert_eq!(treed, off, "{label}: under a tree bound");
-            let report = out.decode.unwrap();
-            assert_eq!(report.proposer, ProposerKind::BlockDraft, "{label}");
-            assert!(
-                report
-                    .fallbacks
-                    .iter()
-                    .any(|f| f == super::super::TREE_MULTIMODAL_LINEAR),
-                "{label}: {:?}",
-                report.fallbacks
-            );
+            tree_passes += image_tree_report(&label, &out.decode.unwrap());
+
+            let sampled = Sampling {
+                temperature: 1.0,
+                top_k: 6,
+                ..Sampling::greedy()
+            };
+            let sampled_tree = TextLlmRequest {
+                speculative_verify: SpeculativeVerify::Tree { max_rows: 16 },
+                ..core_llm_testkit::bench_request(&prompt, block, &sampled, 24)
+            };
+            let (a, out) = super::token_events(&provider, &sampled_tree);
+            let (b, _) = super::token_events(&provider, &sampled_tree);
+            assert_eq!(a, b, "{label}: a seeded sampled tree request reproduces");
+            tree_passes += image_tree_report(&format!("{label} sampled"), &out.decode.unwrap());
         }
         assert!(proposed > 0, "{format:?}: the draft proposed");
-        println!("{format:?}: {accepted} of {proposed} drafts accepted on the image prompts");
+        assert!(
+            tree_passes > 0,
+            "{format:?}: branching trees verified on the image prompts"
+        );
+        println!(
+            "{format:?}: {accepted} of {proposed} drafts accepted on the image prompts; \
+             {tree_passes} branching tree passes"
+        );
     }
 
     #[cfg(feature = "model-inference-proof")]

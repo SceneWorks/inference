@@ -1,8 +1,8 @@
-//! Real-weight block-draft smokes on Candle (epic SW-F360, stories SW-7197 and SW-7198),
+//! Real-weight block-draft smokes on Candle (epic SW-F360, stories SW-7197 and SW-7198; SW-7209),
 //! `#[ignore]`d: the Qwen3.8-27B Candle describer tier with the DSpine or the DFlash2 draft
 //! resident beside it, through the provider on the CUDA device, greedy and sampled — on a text
 //! request, on an image + text request (the image generated in the test), and with tree
-//! verification against the linear verifier on the same request.
+//! verification against the linear verifier on the same request and on the image request.
 //!
 //! The model-proof workflow stages the pinned snapshots and binds their paths:
 //!
@@ -559,4 +559,104 @@ fn qwen38_27b_dflash2_tree_verifies_its_candidates() {
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dflash2_tree_verifies_its_candidates");
+}
+
+/// Why a tree run fills less than [`MIN_ACCEPTED_FRACTION`] of its draft depth per pass (SW-7209):
+/// a tree pass proposes up to 16 rows for at most `depth` accepted tokens, so the accepted-draft
+/// floor is taken against the `depth` a linear pass proposes, not the tree's rows. `None`: it
+/// clears the floor.
+fn tree_depth_filled(what: &str, out: &TextLlmOutput, depth: u32) -> Option<String> {
+    let decode = out.decode.as_ref()?;
+    let filled =
+        decode.accepted_tokens as f64 / (decode.verify_steps.max(1) as f64 * f64::from(depth));
+    println!(
+        "{what}: {:.1}% of the depth accepted per pass",
+        filled * 100.0
+    );
+    (filled < MIN_ACCEPTED_FRACTION).then(|| {
+        format!(
+            "{what}: {:.1}% of the depth accepted per pass, below {:.0}%",
+            filled * 100.0,
+            MIN_ACCEPTED_FRACTION * 100.0
+        )
+    })
+}
+
+/// Load the 27B with the `format` draft and run the image + text request under a 16-row tree,
+/// greedy and seeded sampled (SW-7209 AC1/AC2): each run verifies branching trees with no tree or
+/// `block_draft` fallback, its tree report consistent with the run's counts and its rows checked
+/// and tokens accepted per pass and per tree pass printed, runs each tree pass eager through the
+/// graph runner and holds [`MIN_TOKENS_PER_PASS`] and [`MIN_ACCEPTED_FRACTION`] of its depth; the
+/// greedy tree stream agrees with speculation off for at least [`MIN_GREEDY_AGREEMENT`] tokens;
+/// the sampled run reproduces. Every arm runs and prints before any check fails.
+fn image_tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_var: &str) {
+    let name = format.label();
+    let (provider, depth, _) = load(source_var, None);
+    assert!(
+        provider.descriptor().capabilities.supports_vision,
+        "the describer tier loads its vision tower"
+    );
+    let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+    let tree = SpeculativeVerify::Tree { max_rows: 16 };
+    let sampled = Sampling {
+        temperature: 0.7,
+        top_p: 0.95,
+        ..Sampling::greedy()
+    };
+    let verified = |sampling: Sampling| TextLlmRequest {
+        speculative_verify: tree,
+        ..image_request(block, sampling)
+    };
+    let mut failures = Vec::new();
+    let (off, _) = generate(
+        &provider,
+        &image_request(Speculative::Off, Sampling::greedy()),
+    );
+    for (mode, sampling) in [("greedy", Sampling::greedy()), ("sampled", sampled)] {
+        let what = format!("{name} image {mode} tree depth {depth}");
+        let (ids, out) = generate(&provider, &verified(sampling));
+        println!("{what}: text {:?}", out.text);
+        failures.extend(ran_as_asked(&what, &out));
+        if mode == "greedy" {
+            failures.extend(agrees_with_off(&what, &ids, &off));
+        } else {
+            let (again, _) = generate(&provider, &verified(sampling));
+            if again != ids {
+                failures.push(format!(
+                    "{what}: a seeded sampled tree run does not reproduce"
+                ));
+            }
+        }
+        failures.extend(tree_depth_filled(&what, &out, depth));
+        failures.extend(tree_ran_as_asked(&what, ids.len(), &out, 16));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The 27B with the DSpine draft under tree verification on an image + text request on CUDA
+/// (SW-7209).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen38_27b_dspine_tree_verifies_an_image_request() {
+    image_tree_verifies_block_draft_candidates(
+        BlockDraftFormat::DSpine,
+        "CANDLE_LLM_DSPINE_SOURCE",
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dspine_tree_verifies_an_image_request");
+}
+
+/// The 27B with the DFlash2 draft under tree verification on an image + text request on CUDA
+/// (SW-7209).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen38_27b_dflash2_tree_verifies_an_image_request() {
+    image_tree_verifies_block_draft_candidates(
+        BlockDraftFormat::DFlash2,
+        "CANDLE_LLM_DFLASH2_SOURCE",
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dflash2_tree_verifies_an_image_request");
 }

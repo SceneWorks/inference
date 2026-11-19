@@ -264,8 +264,12 @@ impl TextLlm for LlamaProvider {
             .collect();
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
         // will actually run (a proposer on the engine), at the advertised row bound — else
-        // linear, by name. The multimodal paths prefill spliced embeddings and verify linearly
-        // (MLX's rule). Admission prices the tree's rows, mask and per-row states.
+        // linear, by name. An image or video request verifies its tree too (SW-7209): the
+        // candidates are text tokens after the prompt, at the anchor's M-RoPE text position (the
+        // cache's `rope_delta`, all three axes equal) plus their depth, so the ancestor mask and
+        // the per-row recurrence are the text path's. A decoder that cannot keep a tree branch
+        // (Gemma 4's sliding-window layers) advertises no tree, which the resolution names.
+        // Admission prices the tree's rows, mask and per-row states.
         let tree = core_llm::resolve_tree_verify(
             req.speculative_verify,
             match route {
@@ -279,12 +283,7 @@ impl TextLlm for LlamaProvider {
             &self.descriptor.capabilities,
         );
         fallbacks.extend(tree.fallback);
-        let tree_rows = if tree.max_rows > 0 && (multimodal || gemma4_mm_request) {
-            fallbacks.push(TREE_MULTIMODAL_LINEAR.into());
-            0
-        } else {
-            tree.max_rows as usize
-        };
+        let tree_rows = tree.max_rows as usize;
         let required = self
             .request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
             .and_then(|bytes| {

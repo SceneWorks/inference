@@ -44,6 +44,50 @@ pub(crate) fn tiny_random_target() -> Qwen35Model {
     Qwen35Model::from_weights(&Weights::from_map(tensors), "model.language_model", cfg).unwrap()
 }
 
+/// The ids [`tiny_target_biased`] boosts, most first.
+pub(crate) const BIASED_IDS: [usize; 6] = [1, 9, 3, 14, 22, 30];
+
+/// [`tiny_target`] with a random embedding and head, every embedding row carrying one shared
+/// direction and the head rows of [`BIASED_IDS`] aligned with it, by decreasing strength — the
+/// Candle fixture of the same name (SW-7198), ported for SW-7209. The direction rides the
+/// residual stream of the target and of a block draft (which embeds its block with the target's
+/// embedding and scores its rows with the target's head) alike, so both put most of their mass
+/// on those ids whatever the context: a draft that agrees with the target often, as a trained one
+/// does — what a sampled acceptance proof needs to be sensitive to the proposal distribution.
+pub(crate) fn tiny_target_biased() -> Qwen35Model {
+    let mut v = cfg_json();
+    v["text_config"]["hidden_size"] = 64.into();
+    v["text_config"]["intermediate_size"] = 128.into();
+    let cfg = Qwen35Config::from_json(&v).unwrap();
+    let hidden = 64usize;
+    let mut tensors = synthetic_weights(&cfg).into_map();
+    let mut rng = SplitMix64::new(0x7198_B1A5);
+    let direction = |i: usize| if i.is_multiple_of(2) { 0.25f32 } else { -0.25 };
+    let embed: Vec<f32> = (0..TINY_VOCAB * hidden)
+        .map(|i| (rng.next_f32() - 0.5) * 0.8 + 6.0 * direction(i % hidden))
+        .collect();
+    let head: Vec<f32> = (0..TINY_VOCAB * hidden)
+        .map(|i| {
+            let (row, col) = (i / hidden, i % hidden);
+            let boost = BIASED_IDS
+                .iter()
+                .position(|&id| id == row)
+                .map_or(0.0, |rank| 0.3 - 0.04 * rank as f32);
+            (rng.next_f32() - 0.5) * 0.8 + boost * direction(col)
+        })
+        .collect();
+    for (name, data) in [
+        ("model.language_model.embed_tokens.weight", embed),
+        ("lm_head.weight", head),
+    ] {
+        tensors.insert(
+            name.into(),
+            Array::from_slice(&data, &[TINY_VOCAB as i32, hidden as i32]),
+        );
+    }
+    Qwen35Model::from_weights(&Weights::from_map(tensors), "model.language_model", cfg).unwrap()
+}
+
 /// A DSpine config shaped like `Qwen3.8-27B-DSpine-b16` at toy size over [`tiny_target`]: two
 /// layers reading target layers 0 and 2, block 6, top-4 refinement and an 8-row sliding window,
 /// so a 12-token prompt already exercises the window (E5).

@@ -279,10 +279,6 @@ const TREE_VERIFY_CAPABILITIES: core_llm::TreeVerifyCapabilities =
         max_rows: core_llm::MAX_TREE_ROWS,
     };
 
-/// Why a multimodal request's tree verification ran linearly (feature SW-F328) — MLX's words.
-const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not available on the \
-     multimodal decode path (its prompt is prefilled from spliced embeddings); verified linearly";
-
 /// What a tree route adds to a request's admission price beyond its linear route (feature
 /// SW-F328, E6) on the engine with `drafts` drafts per verify step and a bound of `tree_rows`
 /// candidate rows: the static KV positions past the linear overshoot the tree writes
