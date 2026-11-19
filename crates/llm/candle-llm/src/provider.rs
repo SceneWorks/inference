@@ -281,6 +281,14 @@ const TREE_VERIFY_CAPABILITIES: core_llm::TreeVerifyCapabilities =
         max_rows: core_llm::MAX_TREE_ROWS,
     };
 
+/// The tree advertisement of a decoder whose own refusal is `unsupported`: none when it names one
+/// (the request then verifies linearly, by name), else [`TREE_VERIFY_CAPABILITIES`].
+fn tree_advertisement(
+    unsupported: Option<&'static str>,
+) -> Option<core_llm::TreeVerifyCapabilities> {
+    unsupported.is_none().then_some(TREE_VERIFY_CAPABILITIES)
+}
+
 /// What a tree route adds to a request's admission price beyond its linear route (feature
 /// SW-F328, E6) on the engine with `drafts` drafts per verify step and a bound of `tree_rows`
 /// candidate rows: the static KV positions past the linear overshoot the tree writes
@@ -448,15 +456,15 @@ impl Decoder {
         u64::try_from(crate::primitives::DevicePositions::BYTES.checked_add(workspace)?).ok()
     }
 
-    /// The tree advertisement a loaded decoder carries (feature SW-F328): the qwen3_5 hybrid and
-    /// every llama-family decoder without sliding-window or KV-sharing layers
-    /// ([`CausalLm::tree_unsupported`]) verify up to [`core_llm::MAX_TREE_ROWS`] candidate rows.
+    /// The tree advertisement a loaded decoder carries (feature SW-F328): the qwen3_5 hybrid but
+    /// SenseNova-Loop ([`Qwen35Config::tree_unsupported`]) and every llama-family decoder without
+    /// sliding-window or KV-sharing layers ([`CausalLm::tree_unsupported`]) verify up to
+    /// [`core_llm::MAX_TREE_ROWS`] candidate rows.
     fn tree_verify_capabilities(&self) -> Option<core_llm::TreeVerifyCapabilities> {
-        match self {
-            Decoder::Causal(m) => m.tree_unsupported().is_none(),
-            Decoder::Qwen35(_) => true,
-        }
-        .then_some(TREE_VERIFY_CAPABILITIES)
+        tree_advertisement(match self {
+            Decoder::Causal(m) => m.tree_unsupported(),
+            Decoder::Qwen35(m) => m.config().tree_unsupported(),
+        })
     }
 
     /// Whether the decoder's step can be captured as a CUDA graph at all
@@ -3433,6 +3441,45 @@ mod tests;
 #[cfg(test)]
 mod numeric_policy_tests {
     use super::*;
+
+    /// PR #1485 review: a SenseNova-Loop decoder has no tree forward, so it advertises no tree
+    /// and a tree request with a proposer resolves to linear verification by name; a plain
+    /// qwen3_5 hybrid still advertises the shared bound.
+    #[test]
+    fn a_sensenova_config_resolves_a_tree_request_to_linear() {
+        let release: Value = serde_json::from_str(include_str!(
+            "../../../contracts/core-llm/src/sensenova_loop.json"
+        ))
+        .unwrap();
+        let sensenova = Qwen35Config::from_json(&release).unwrap();
+        assert_eq!(
+            sensenova.tree_unsupported(),
+            Some(crate::models::qwen35::SENSENOVA_TREE_UNSUPPORTED)
+        );
+        let mut caps = core_llm::TextLlmCapabilities {
+            tree_verify: tree_advertisement(sensenova.tree_unsupported()),
+            ..Default::default()
+        };
+        assert_eq!(caps.tree_verify, None);
+        let request = core_llm::SpeculativeVerify::Tree { max_rows: 8 };
+        let plan = core_llm::SpeculativePlan::Run {
+            proposer: core_llm::SpeculativeProposer::PromptLookup,
+            depth: 4,
+        };
+        let tree = core_llm::resolve_tree_verify(request, plan, &caps);
+        assert_eq!(tree.max_rows, 0);
+        assert!(tree.fallback.as_deref().is_some_and(
+            |why| why.contains(core_llm::speculative::tree::TREE_VERIFY_NOT_ADVERTISED)
+        ));
+
+        let hybrid = Qwen35Config::from_json(&crate::models::qwen35::tests::cfg_json()).unwrap();
+        assert_eq!(hybrid.tree_unsupported(), None);
+        caps.tree_verify = tree_advertisement(hybrid.tree_unsupported());
+        assert_eq!(
+            core_llm::resolve_tree_verify(request, plan, &caps).max_rows,
+            8
+        );
+    }
 
     /// SW-7200: `auto`'s block-draft tier is the target decoder's own — a companion MTP head
     /// re-packed to Q8_0 beside a Q4_K target leaves the target Q4, though the whole census is

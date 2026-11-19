@@ -266,7 +266,20 @@ pub struct Qwen35Config {
     pub stored_overrides: std::collections::BTreeMap<String, QuantSpec>,
 }
 
+/// Why a SenseNova-Loop decoder cannot verify a candidate tree: its routed layers and its
+/// depthwise conv's activation-dtype rounding have no tree forward (PR #1485 review).
+pub const SENSENOVA_TREE_UNSUPPORTED: &str = "SenseNova-Loop: tree verification is not supported";
+
 impl Qwen35Config {
+    /// Why a decoder of this config cannot verify a candidate tree, or `None` when it can
+    /// (feature SW-F328): every qwen3_5 hybrid but SenseNova-Loop
+    /// ([`SENSENOVA_TREE_UNSUPPORTED`]).
+    pub fn tree_unsupported(&self) -> Option<&'static str> {
+        self.sensenova_loop
+            .is_some()
+            .then_some(SENSENOVA_TREE_UNSUPPORTED)
+    }
+
     /// Parse from a `config.json` value, descending into `text_config` for the VLM wrapper.
     pub fn from_json(v: &Value) -> Result<Self> {
         let sensenova_loop = SenseNovaLoop::from_config(v).map_err(Error::Config)?;
@@ -530,9 +543,7 @@ impl GatedDeltaNet {
             }
             // The tree conv does not reproduce the SenseNova wrapper's activation-dtype rounding.
             Some(_) if self.sensenova => {
-                return Err(Error::Unsupported(
-                    "SenseNova-Loop: tree verification is not supported".into(),
-                ))
+                return Err(Error::Unsupported(SENSENOVA_TREE_UNSUPPORTED.into()))
             }
             Some(plan) => {
                 let windows = plan.conv_windows(self.conv_kernel);
@@ -969,9 +980,7 @@ impl DecoderLayer {
         mask: &Tensor,
     ) -> Result<Tensor> {
         if self.routers.is_some() {
-            return Err(Error::Unsupported(
-                "SenseNova-Loop: tree verification is not supported".into(),
-            ));
+            return Err(Error::Unsupported(SENSENOVA_TREE_UNSUPPORTED.into()));
         }
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
@@ -4309,9 +4318,12 @@ impl StepModel for Qwen35Model {
         self.forward_step_tapped(cache, request, None)
     }
 
-    /// Every cache this model builds keeps a tree branch (feature SW-F328).
+    /// Every cache this model builds keeps a tree branch (feature SW-F328); a SenseNova-Loop
+    /// decoder has no tree forward ([`Qwen35Config::tree_unsupported`]).
     fn tree_unsupported(&self, cache: &Qwen35Cache) -> Option<&'static str> {
-        DecodeCache::tree_unsupported(cache)
+        self.cfg
+            .tree_unsupported()
+            .or_else(|| DecodeCache::tree_unsupported(cache))
     }
 
     /// The tree rows on the host path at the cache's position: each row at the RoPE position of

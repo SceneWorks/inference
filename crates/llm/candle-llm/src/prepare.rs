@@ -308,22 +308,14 @@ fn prepare_hf(spec: &PrepareSpec, quantize_remaining: bool) -> Result<PrepareRep
         num_tensors += tensors.len();
     }
 
-    stamp_quantization(&mut config, q, stored);
-    if REMAINING_MATRIX_SPEC.bits() != q.bits() {
-        if let Some(block) = config.get_mut("quantization").and_then(Json::as_object_mut) {
-            for key in &remaining_keys {
-                let stem = key.strip_suffix(".weight").unwrap_or(key);
-                block.insert(
-                    stem.to_string(),
-                    serde_json::json!({ "bits": REMAINING_MATRIX_SPEC.bits() }),
-                );
-            }
-        }
-    }
+    stamp_tier_config(
+        &mut config,
+        q,
+        stored,
+        &remaining_keys,
+        loop_model.is_some(),
+    );
     if loop_model.is_some() {
-        config["quantization"]["format"] = Json::from(crate::sensenova_loop::format_name(q));
-        config["quantization"]["source_revision"] =
-            Json::from(core_llm::sensenova_loop::MODEL_REVISION);
         for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
             copy_optional(src, &spec.out_dir, name)?;
         }
@@ -581,6 +573,49 @@ fn stamp_quantization(config: &mut Json, q: QuantSpec, stored: usize) {
     }
 }
 
+/// The prepared tier's `quantization` block: the tier's own `bits` / `storage`
+/// ([`stamp_quantization`]), a `{"bits": 8}` entry per remaining matrix stored at
+/// [`REMAINING_MATRIX_SPEC`] when the body is another width, and for a SenseNova-Loop tier the
+/// tier-level `format` and `source_revision` its loader requires (`sensenova_loop::tier`).
+fn stamp_tier_config(
+    config: &mut Json,
+    q: QuantSpec,
+    stored: usize,
+    remaining_keys: &[String],
+    sensenova_loop: bool,
+) {
+    stamp_quantization(config, q, stored);
+    if REMAINING_MATRIX_SPEC.bits() != q.bits() {
+        if let Some(block) = config.get_mut("quantization").and_then(Json::as_object_mut) {
+            for key in remaining_keys {
+                let stem = key.strip_suffix(".weight").unwrap_or(key);
+                block.insert(
+                    stem.to_string(),
+                    serde_json::json!({ "bits": REMAINING_MATRIX_SPEC.bits() }),
+                );
+            }
+        }
+    }
+    if sensenova_loop {
+        config["quantization"]["format"] = Json::from(crate::sensenova_loop::format_name(q));
+        config["quantization"]["source_revision"] =
+            Json::from(core_llm::sensenova_loop::MODEL_REVISION);
+    }
+}
+
+/// The `quantization` block's tier-level fields — never a per-tensor entry: the tier's own
+/// `bits` / `storage`, the SenseNova-Loop tier's `format` / `source_revision`
+/// ([`stamp_tier_config`]), and the MLX-affine `group_size` / `mode` a quantization block may
+/// carry.
+const TIER_METADATA_KEYS: [&str; 6] = [
+    "bits",
+    "storage",
+    "format",
+    "source_revision",
+    "group_size",
+    "mode",
+];
+
 /// The `quantization.storage` tag of a snapshot whose projections are stored GGML blocks.
 pub const GGML_STORAGE: &str = "ggml";
 
@@ -606,7 +641,7 @@ pub(crate) fn persisted_ggml_blocks(config: &Json) -> Option<QuantSpec> {
 }
 
 /// The per-tensor entries of a prepared tier's stored-block `quantization` block (SW-7201): each
-/// key other than `bits` / `storage` is a checkpoint tensor stem (`lm_head`,
+/// key other than the tier-level fields ([`TIER_METADATA_KEYS`]) is a checkpoint tensor stem (`lm_head`,
 /// `model.language_model.embed_tokens`) whose stored blocks are `{"bits": 4 | 8}` rather than the
 /// block's own `bits` — a 4-bit tier's Q8_0 head and embedding. Empty for any config
 /// [`persisted_ggml_blocks`] does not honour; an entry that is not `{"bits": 4 | 8}` is an error.
@@ -626,7 +661,7 @@ pub(crate) fn persisted_ggml_overrides(
         })
         .and_then(Json::as_object);
     for (key, entry) in block.into_iter().flatten() {
-        if matches!(key.as_str(), "bits" | "storage") {
+        if TIER_METADATA_KEYS.contains(&key.as_str()) {
             continue;
         }
         let spec = entry
@@ -1117,6 +1152,35 @@ mod tests {
         for bad in [serde_json::json!(8), serde_json::json!({"bits": 3})] {
             let block = serde_json::json!({"bits": 4, "storage": "ggml", "lm_head": bad});
             assert!(persisted_ggml_overrides(&with(block)).is_err());
+        }
+    }
+
+    /// PR #1485 review: a prepared SenseNova-Loop Q4 / Q8 tier's `quantization` block carries the
+    /// tier-level `format` and `source_revision` the preparer stamps; they are not per-tensor
+    /// overrides, so the config parses and the tier check accepts the block.
+    #[test]
+    fn sensenova_tier_metadata_is_not_a_per_tensor_override() {
+        let release: Json = serde_json::from_str(include_str!(
+            "../../../contracts/core-llm/src/sensenova_loop.json"
+        ))
+        .unwrap();
+        for q in [QuantSpec::q4(), QuantSpec::q8()] {
+            let mut config = release.clone();
+            stamp_tier_config(&mut config, q, 1, &[], true);
+            let mut keys: Vec<&str> = config["quantization"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["bits", "format", "source_revision", "storage"]);
+            assert!(persisted_ggml_overrides(&config).unwrap().is_empty());
+            let cfg = Qwen35Config::from_json(&config).unwrap();
+            assert!(cfg.sensenova_loop.is_some());
+            assert!(cfg.stored_overrides.is_empty());
+            let tier = crate::sensenova_loop::tier(&config, Some(&q.into())).unwrap();
+            assert_eq!(tier.map(|t| t.bits()), Some(q.bits()));
         }
     }
 

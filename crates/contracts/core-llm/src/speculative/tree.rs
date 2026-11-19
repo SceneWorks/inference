@@ -24,6 +24,7 @@
 //! for which the same rule accepts with probability `p_res(c)` and removes `c` from the residual —
 //! exact for any fixed list of distinct candidates.
 
+use std::collections::hash_map::{Entry, HashMap};
 use std::fmt;
 
 /// The most candidate rows (beyond the anchor) one tree verify pass carries on either backend:
@@ -360,32 +361,46 @@ pub fn accept_among_siblings(
         if uniform() < (p_t / q_t).min(1.0) {
             return SiblingAcceptance::Accepted(i);
         }
+        // `q` is normalized, so each token appears once: index it rather than scan it per
+        // residual token (a vocabulary-sized `q` would make the subtraction quadratic).
+        let q_weight: HashMap<i32, f32> = q.iter().copied().collect();
         let next: Vec<(i32, f32)> = residual
             .iter()
-            .map(|&(t, p)| (t, (p - weight_of(&q, t)).max(0.0)))
+            .map(|&(t, p)| (t, (p - q_weight.get(&t).copied().unwrap_or(0.0)).max(0.0)))
             .filter(|&(_, w)| w > 0.0)
             .collect();
         // An empty residual has probability zero (p_res == q accepts surely); on rounding noise
-        // keep the previous residual rather than drawing from nothing.
+        // keep the previous residual rather than drawing from nothing. `next` keeps the
+        // residual's unique tokens and only positive weights, so it needs no merge.
         if next.iter().map(|x| x.1).sum::<f32>() > 0.0 {
-            residual = normalized(&next);
+            residual = scaled_to_one(next);
         }
     }
     let fallback = residual.first().map_or(0, |x| x.0);
     SiblingAcceptance::Resampled(super::sample_weighted(&residual, uniform(), fallback))
 }
 
-/// `dist` with non-positive weights dropped, duplicate tokens merged and the rest normalized.
+/// `dist` with non-positive weights dropped, duplicate tokens merged and the rest normalized. Each
+/// token keeps its first position and sums its weights in input order, in one indexed pass.
 fn normalized(dist: &[(i32, f32)]) -> Vec<(i32, f32)> {
     let mut out: Vec<(i32, f32)> = Vec::with_capacity(dist.len());
+    let mut slot: HashMap<i32, usize> = HashMap::with_capacity(dist.len());
     for &(t, w) in dist {
         if w > 0.0 {
-            match out.iter_mut().find(|x| x.0 == t) {
-                Some(x) => x.1 += w,
-                None => out.push((t, w)),
+            match slot.entry(t) {
+                Entry::Occupied(at) => out[*at.get()].1 += w,
+                Entry::Vacant(at) => {
+                    at.insert(out.len());
+                    out.push((t, w));
+                }
             }
         }
     }
+    scaled_to_one(out)
+}
+
+/// `out` (unique tokens, positive weights) divided by its total.
+fn scaled_to_one(mut out: Vec<(i32, f32)>) -> Vec<(i32, f32)> {
     let total: f32 = out.iter().map(|x| x.1).sum();
     if total > 0.0 {
         for x in &mut out {

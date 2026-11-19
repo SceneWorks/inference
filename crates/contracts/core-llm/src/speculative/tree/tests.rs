@@ -612,3 +612,47 @@ fn only_a_tree_building_proposer_prices_tree_workspace() {
     assert!(!ProposerKind::from(SpeculativeProposer::Mtp).builds_trees());
     assert!(!ProposerKind::from(SpeculativeProposer::DraftModel).builds_trees());
 }
+
+/// PR #1485 review: a vocabulary-sized distribution (150k entries, every token of the first half
+/// listed twice) merges and normalizes exactly, and sibling sampling over it — a full-vocabulary
+/// `q`, one rejection, then a resample from the residual — lands where the arithmetic says.
+/// Quadratic merging would take ~10^10 steps here; this asserts only the results.
+#[test]
+fn vocabulary_sized_sibling_sampling_merges_and_normalizes() {
+    const V: i32 = 100_000;
+    const HALF: i32 = V / 2;
+    // p ∝ 2 on tokens < HALF (two entries of 1 each), 1 on the rest: 150k entries in all.
+    let target: Vec<(i32, f32)> = (0..V)
+        .map(|t| (t, 1.0))
+        .chain((0..HALF).map(|t| (t, 1.0)))
+        .collect();
+    assert_eq!(target.len(), 150_000);
+    let merged = normalized(&target);
+    assert_eq!(merged.len(), V as usize);
+    assert!(merged.iter().enumerate().all(|(i, &(t, _))| t == i as i32));
+    let (low, high) = (2.0 / (1.5 * V as f32), 1.0 / (1.5 * V as f32));
+    for &(t, w) in &merged {
+        let expected = if t < HALF { low } else { high };
+        assert!(
+            (w - expected).abs() <= expected * 1e-3,
+            "token {t}: {w} vs {expected}"
+        );
+    }
+
+    // q uniform over the vocabulary; the candidate (the last token) has p/q = 2/3 and is
+    // rejected by a draw of 0.9. The residual max(p - q, 0) is uniform over tokens < HALF, so
+    // the resample at u = 0.9 lands at ~0.9 · HALF.
+    let q: Vec<(i32, f32)> = (0..V).map(|t| (t, 1.0)).collect();
+    let mut draws = [0.9f32, 0.9].into_iter();
+    let outcome = accept_among_siblings(&target, &[(V - 1, Some(&q[..]))], &mut || {
+        draws.next().unwrap()
+    });
+    let SiblingAcceptance::Resampled(token) = outcome else {
+        panic!("the candidate is rejected: {outcome:?}");
+    };
+    let expected = (0.9 * HALF as f32) as i32;
+    assert!(
+        (token - expected).abs() <= HALF / 100,
+        "resampled {token}, expected ~{expected}"
+    );
+}
