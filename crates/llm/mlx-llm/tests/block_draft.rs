@@ -135,8 +135,9 @@ fn load_with_block_draft(
 }
 
 /// Load the pinned target with the block draft ([`load_with_block_draft`]) and assert the draft
-/// is named as `format` at its precision, and that a greedy `block_draft` request of `depth`
-/// drafts per step accepts more than one draft token per target pass.
+/// is named as `format` at its precision, that a greedy `block_draft` request of `depth` drafts
+/// per step runs unclamped (`depth` within the advertised range), and that it accepts more than
+/// one draft token per target pass.
 fn accepts_more_than_one_token_per_pass(
     target_var: &str,
     source_var: &str,
@@ -167,6 +168,11 @@ fn accepts_more_than_one_token_per_pass(
         off_ids.len(),
     );
     assert_eq!(decode.proposer, ProposerKind::BlockDraft);
+    assert!(
+        decode.fallbacks.iter().all(|f| !f.contains("block_draft")),
+        "{:?}",
+        decode.fallbacks
+    );
     let named = decode.draft.unwrap();
     assert_eq!(named.source, draft);
     assert_eq!(named.format, format);
@@ -210,9 +216,11 @@ fn qwen38_27b_dflash2_accepts_more_than_one_token_per_pass() {
         "MLX_LLM_DFLASH2_PRECISION",
         DFLASH2_SNAPSHOT,
         "dflash2",
-        // The trained block: the reference and Splash draft all 8 rows (anchor + 7) per step,
-        // and a non-causal block's rows read every mask row of it.
-        7,
+        // The advertised max: the draft is trained on 8-row blocks (7 drafts), but the 27B's
+        // verify bound on MLX is 4 drafts (gqa 6: the vector SDPA kernel verifies 5 rows in one
+        // call, sc-24438), and `block_draft` is advertised at the lower of the two. The
+        // non-causal draft still runs its whole 8-row block and proposes its first 4 rows.
+        4,
     );
     crate::model_inference_device::record_model_inference_device();
     println!(
@@ -345,7 +353,8 @@ fn qwen38_27b_dflash2_runs_on_an_image_request() {
         "MLX_LLM_DFLASH2_PRECISION",
         DFLASH2_SNAPSHOT,
         "dflash2",
-        7,
+        // The advertised max (see `qwen38_27b_dflash2_accepts_more_than_one_token_per_pass`).
+        4,
     );
     crate::model_inference_device::record_model_inference_device();
     println!(
@@ -386,8 +395,8 @@ fn generate_verified(
 /// Load the pinned target with the block draft and run the same greedy `block_draft` request of
 /// `depth` drafts linearly and under a 16-row tree (SW-7196). Prints committed tokens per target
 /// pass for both, and the tree run's rows verified and tokens accepted per pass; asserts the tree
-/// run verified branching trees with no linear fallback, reports its rows and acceptance per pass,
-/// and commits more than one token per target pass.
+/// run verified branching trees with no linear fallback and no `block_draft` clamp, reports its
+/// rows and acceptance per pass, and commits more than one token per target pass.
 fn tree_verifies_block_draft_candidates(
     target_var: &str,
     source_var: &str,
@@ -435,7 +444,9 @@ fn tree_verifies_block_draft_candidates(
     assert_eq!(tree.proposer, ProposerKind::BlockDraft);
     assert_eq!(tree.draft.unwrap().format, format);
     assert!(
-        tree.fallbacks.iter().all(|f| !f.contains("tree")),
+        tree.fallbacks
+            .iter()
+            .all(|f| !f.contains("tree") && !f.contains("block_draft")),
         "{:?}",
         tree.fallbacks
     );
@@ -481,7 +492,8 @@ fn qwen38_27b_dflash2_tree_verifies_its_candidates() {
         "MLX_LLM_DFLASH2_PRECISION",
         DFLASH2_SNAPSHOT,
         "dflash2",
-        7,
+        // The advertised max (see `qwen38_27b_dflash2_accepts_more_than_one_token_per_pass`).
+        4,
     );
     crate::model_inference_device::record_model_inference_device();
     println!(

@@ -283935,7 +283935,7 @@
     "source": "crates/llm/mlx-llm/tests/block_draft.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@e4069e4e267b3854e3947404e512a4b0a266d8b270fee501aad5ecdb2f4e2749",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@4f405a1c725e605c0e2bc4908fa50a236d773735cf290856f678c56244ba4970",
       "requirements": [
         {
           "slot": "model-weight-collections",
@@ -284023,7 +284023,7 @@
     "source": "crates/llm/mlx-llm/tests/block_draft.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_tree_verifies_its_candidates@45807a6ca9f55eb172059a0cdea80a1be24aa5ce0461e5138d940fb2151056ba",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_tree_verifies_its_candidates@b2e8dc16d34942b02432a8d7d1b2d693655743fcdb4f03bbcf7723f8006440da",
       "requirements": [
         {
           "slot": "model-weight-collections",
@@ -284111,7 +284111,7 @@
     "source": "crates/llm/mlx-llm/tests/block_draft.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_runs_on_an_image_request@8351dbf28de9215954b02cf7cbe94ca2e08bb5db4b93aabc2f9753010fabd2c0",
+      "source_identity": "crates/llm/mlx-llm/tests/block_draft.rs::block_draft::qwen38_27b_dflash2_runs_on_an_image_request@f6e97a7e6ea3771a5df51cd8bd967ccfe39cc891ce3831a3e458caf1b2401097",
       "requirements": [
         {
           "slot": "model-weight-collections",

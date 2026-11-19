@@ -1181,6 +1181,15 @@ fn sliding_window(
 /// The `block_draft` advertisement a provider carries while a compatible block draft is
 /// resident: up to the model's verify-depth bound (`verify_bound`) and the draft's own trained
 /// block (`draft_max`), recommending the backend row's depth or the bound when shallower.
+///
+/// The verify bound applies to block drafts as to every proposer (sc-24438): each draft is one
+/// more verify row, and `verify_bound` is the deepest verify the target's backend runs at a flat
+/// per-step cost ([`verify_depth_bound`](crate::verify_depth_bound)). So a draft trained on a
+/// longer block than the target verifies is advertised at the target's bound — on MLX the
+/// Qwen3.8-27B target (gqa 6) verifies 4 drafts, below DFlash2's 7 (an 8-row block) and DSpine's
+/// 15 — and a deeper request runs at that bound with the clamp named in the decode report's
+/// fallbacks ([`resolve_speculative`](crate::resolve_speculative)). A non-causal draft still runs
+/// its whole trained block and proposes its first `max_depth` rows.
 pub fn block_draft_capabilities(
     verify_bound: u32,
     draft_max: u32,
