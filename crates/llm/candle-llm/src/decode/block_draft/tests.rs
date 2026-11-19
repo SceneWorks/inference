@@ -430,6 +430,163 @@ fn the_rolled_back_state_is_the_committed_sequence() {
     println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence");
 }
 
+/// The largest absolute difference of `a` and `b` over the larger of 1 and `b`'s largest
+/// magnitude, after checking both are finite.
+fn relative(what: &str, a: &Tensor, b: &Tensor) -> f32 {
+    let host = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let (a, b) = (host(a), host(b));
+    assert!(
+        a.iter().chain(&b).all(|x| x.is_finite()),
+        "{what}: a non-finite element"
+    );
+    let scale = b.iter().fold(1f32, |m, x| m.max(x.abs()));
+    worst(&a, &b) / scale
+}
+
+/// SW-7197 (the DSpine greedy defect, the cold-prompt half): a real request's first proposal reads
+/// a context built from the prompt's rows in one cold prefill — the target's tapped rows of a
+/// many-token prefill step, appended to the draft in one many-row forward — while every later row
+/// comes from a verify step of at most `K + 1` rows. For each format at each precision, with a
+/// window wide enough to keep a 24-token prompt (so the warm-up runs the draft's projections over
+/// more than 16 rows): the cold prefill's tapped rows are the rows verify-sized steps tap; the
+/// context appended at once — its first row scaled to an attention-sink magnitude — is the context
+/// appended in verify-sized chunks, every element finite; and the proposals read from the two
+/// contexts agree.
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn a_cold_prompt_context_is_the_context_verify_steps_build() {
+    let (_guard, device) = proof_device();
+    let model = tiny_target_on(&device, false);
+    let tol = if device.is_cpu() { 1e-3 } else { 1e-1 };
+    let prompt: Vec<i32> = (0..24)
+        .map(|i| (i * 7 + 3) % (TINY_VOCAB as i32 - 1))
+        .collect();
+    let chunks = [4usize, 5, 1, 3, 5, 2, 4];
+    assert_eq!(chunks.iter().sum::<usize>(), prompt.len());
+    for precision in [
+        None,
+        Some(BlockDraftPrecision::Q8),
+        Some(BlockDraftPrecision::Q4),
+    ] {
+        for format in BlockDraftFormat::ALL {
+            let label = format!("{format:?} {precision:?}");
+            let mut cfg = tiny_config(format);
+            cfg.sliding_window = Some(64);
+            let draft = tiny_draft_on(cfg.clone(), precision, &device);
+            let layers = cfg.target_layer_ids.clone();
+            let keep = cfg.context_rows();
+
+            // The target: one cold prefill against a prefill of the first chunk, then verify-sized
+            // steps (the engine's cache, device positions on CUDA).
+            let mut cold_cache = model.new_cache_for(prompt.len() + 8, 5).unwrap();
+            let cold = model
+                .forward_step_tapped(
+                    &mut cold_cache,
+                    StepRequest::last(&prompt).with_hidden(true).as_prefill(),
+                    Some((&layers, keep)),
+                )
+                .unwrap()
+                .hidden
+                .unwrap();
+            let mut cache = model.new_cache_for(prompt.len() + 8, 5).unwrap();
+            let mut rows = Vec::new();
+            let mut at = 0;
+            for (i, &len) in chunks.iter().enumerate() {
+                let ids = &prompt[at..at + len];
+                let request = if i == 0 {
+                    StepRequest::last(ids).as_prefill()
+                } else {
+                    StepRequest::all(ids)
+                };
+                rows.push(
+                    model
+                        .forward_step_tapped(
+                            &mut cache,
+                            request.with_hidden(true),
+                            Some((&layers, keep)),
+                        )
+                        .unwrap()
+                        .hidden
+                        .unwrap(),
+                );
+                at += len;
+            }
+            let stepped = Tensor::cat(&rows, 1).unwrap();
+            assert_eq!(cold.dims(), stepped.dims(), "{label}");
+            let d = relative(&label, &cold, &stepped);
+            assert!(
+                d <= tol,
+                "{label}: the cold prefill's tapped rows moved {d}"
+            );
+
+            // The draft: the same rows, the first scaled to an attention-sink magnitude, appended
+            // at once and in verify-sized chunks.
+            let mut scale = vec![1f32; prompt.len()];
+            scale[0] = 512.0;
+            let scale = Tensor::from_vec(scale, (1, prompt.len(), 1), &device)
+                .and_then(|s| s.to_dtype(cold.dtype()))
+                .unwrap();
+            let taps = cold.broadcast_mul(&scale).unwrap();
+            let mut at_once = draft.new_context(0);
+            draft.append_context(&mut at_once, &taps).unwrap();
+            let mut chunked = draft.new_context(0);
+            let mut at = 0;
+            for &len in &chunks {
+                draft
+                    .append_context(&mut chunked, &taps.narrow(1, at, len).unwrap())
+                    .unwrap();
+                at += len;
+            }
+            assert_eq!(
+                at_once.rows(),
+                prompt.len(),
+                "{label}: the window keeps the prompt"
+            );
+            assert_eq!(at_once.next_position(), chunked.next_position(), "{label}");
+            for (i, (a, b)) in at_once.tensors().zip(chunked.tensors()).enumerate() {
+                let d = relative(&format!("{label}: context tensor {i}"), a, b);
+                assert!(d <= tol, "{label}: context tensor {i} moved {d}");
+            }
+            let anchor = 5;
+            let depth = 3;
+            let mut block = vec![anchor];
+            block.resize(
+                block_len(draft.causal(), cfg.block_size, depth, 100),
+                cfg.mask_token_id as i32,
+            );
+            let embeds = model
+                .embed_input_ids(&input_ids(&block, &device).unwrap())
+                .unwrap();
+            let (cand_a, table_a) = draft
+                .propose(&at_once, &embeds, depth, anchor, &model)
+                .unwrap();
+            let (cand_b, table_b) = draft
+                .propose(&chunked, &embeds, depth, anchor, &model)
+                .unwrap();
+            assert!(
+                table_a.iter().chain(&table_b).all(|x| x.is_finite()),
+                "{label}: a non-finite score"
+            );
+            let scale = table_b.iter().fold(1f32, |m, x| m.max(x.abs()));
+            let d = worst(&table_a, &table_b) / scale;
+            assert!(d <= tol, "{label}: the proposal's scores moved {d}");
+            if device.is_cpu() {
+                assert_eq!(cand_a, cand_b, "{label}: the candidates");
+            }
+        }
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build");
+}
+
 /// The exact target distribution of a token after `history`, under the request's knobs and mask.
 fn target_dist(
     model: &Qwen35Model,

@@ -449,6 +449,219 @@ fn the_selector_table_is_the_reference_edge_score() {
     println!("\nMODEL_INFERENCE_BODY_COMPLETED models::block_draft::tests::the_selector_table_is_the_reference_edge_score");
 }
 
+/// A target head in one of the formats the target loads it in, its refinement rows read through
+/// `rows` — the production row access, or the whole-head fallback.
+struct ProjectionHead {
+    head: Projection,
+    rows: crate::primitives::head_rows::HeadRows,
+}
+
+impl TargetHead for ProjectionHead {
+    fn logits(&self, rows: &Tensor) -> Result<Tensor> {
+        self.head.forward(rows)
+    }
+
+    fn scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        self.rows.scores(&self.head, rows, ids)
+    }
+}
+
+/// The candidate the greedy walk picks at each scored row of `table` (`[n, K, K]`, `k`
+/// candidates): row 0 scored for the anchor, row `i` for the column picked at row `i - 1` — the
+/// proposer's walk with the lowest id (the lowest column) winning a tie.
+fn greedy_walk(table: &[f32], n: usize, k: usize) -> Vec<usize> {
+    let mut sender = 0;
+    let mut walk = Vec::with_capacity(n);
+    for row in 0..n {
+        let scores = &table[(row * k + sender) * k..(row * k + sender + 1) * k];
+        let best = (0..k).fold(0, |b, j| if scores[j] > scores[b] { j } else { b });
+        walk.push(best);
+        sender = best;
+    }
+    walk
+}
+
+/// SW-7197 (the DSpine greedy defect): DSpine's exact-sender refinement table against a host
+/// recomputation of the reference's `sampled_table` (each row's candidates rescored for every
+/// candidate sender of the row before, the anchor for row 0), and the same table under every row
+/// access the target's head can take — the dense gather, the host GGML block gather or the CUDA
+/// indexed GEMV, the dequantized-forward Q8_0 head — against the whole head's columns: every score
+/// finite, close, and the greedy walk over the gathered table picks, row by row, a candidate the
+/// whole head scores as its best (exactly its best where the best two are not near-tied).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn the_dspine_table_is_the_reference_refinement_under_every_head_access() {
+    use crate::primitives::head_rows::HeadRows;
+    use crate::primitives::quant::QuantizedLinear;
+    use candle_core::quantized::GgmlDType;
+
+    let (_guard, device) = proof_device();
+    let dtype = crate::device::compute_dtype(&device);
+    let cfg = tiny_config(BlockDraftFormat::DSpine);
+    let BlockDraft::DSpine(draft) = tiny_draft_on(cfg.clone(), None, &device) else {
+        unreachable!()
+    };
+    let hidden = cfg.hidden_size;
+    let mut rng = SplitMix64::new(0x7197_D5B1);
+    let mut draw = |shape: (usize, usize, usize)| {
+        let n = shape.0 * shape.1 * shape.2;
+        let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+        Tensor::from_vec(data, shape, &Device::Cpu)
+            .and_then(|t| t.to_device(&device)?.to_dtype(dtype))
+            .unwrap()
+    };
+    let mut context = BlockDraftContext::new(0);
+    draft
+        .body
+        .append(
+            &draft.layers.iter().collect::<Vec<_>>(),
+            &mut context,
+            &draw((1, 6, cfg.tap_width())),
+        )
+        .unwrap();
+    let (t, anchor) = (5usize, 7i32);
+    let block = draft
+        .block(&context, &draw((1, t, hidden)), anchor)
+        .unwrap();
+    let n = t - 1;
+    let w: Vec<f32> = {
+        let mut rng = SplitMix64::new(0x7197_D5B2);
+        (0..TINY_VOCAB * hidden)
+            .map(|_| (rng.next_f32() - 0.5) * 0.8)
+            .collect()
+    };
+    let w_host = Tensor::from_vec(w.clone(), (TINY_VOCAB, hidden), &Device::Cpu).unwrap();
+    let w_dev = w_host.to_device(&device).unwrap();
+    let head = |name: &str| -> Projection {
+        match name {
+            "dense" => {
+                Projection::Dense(candle_nn::Linear::new(w_dev.to_dtype(dtype).unwrap(), None))
+            }
+            "q8_0" => Projection::Quantized(
+                QuantizedLinear::quantize(&w_dev, GgmlDType::Q8_0, None).unwrap(),
+            ),
+            _ => Projection::Quantized(
+                QuantizedLinear::quantize_dequantized(&w_dev, GgmlDType::Q8_0, None).unwrap(),
+            ),
+        }
+    };
+    let host =
+        |t: &Tensor| -> Vec<f32> { f32(t).unwrap().flatten_all().unwrap().to_vec1().unwrap() };
+    let tol = if device.is_cpu() { 1e-3f32 } else { 5e-2 };
+    for name in ["dense", "q8_0", "q8_0 dequantized forward"] {
+        let gathered = head(name);
+        let gathered = ProjectionHead {
+            rows: HeadRows::new(&gathered).unwrap(),
+            head: gathered,
+        };
+        assert!(
+            gathered.rows.is_gathered(),
+            "{name}: {}",
+            gathered.rows.label()
+        );
+        let whole = ProjectionHead {
+            rows: HeadRows::Full("test"),
+            head: head(name),
+        };
+        let (cand, table) = draft.table(&block, anchor, &gathered).unwrap();
+        let (whole_cand, whole_table) = draft.table(&block, anchor, &whole).unwrap();
+        let k = cand[0].len();
+        assert_eq!(
+            cand, whole_cand,
+            "{name}: the candidates are the whole head's top-{k}"
+        );
+        assert_eq!(table.len(), n * k * k, "{name}");
+        assert!(
+            table.iter().all(|x| x.is_finite()),
+            "{name}: a non-finite score"
+        );
+        for (i, (g, f)) in table.iter().zip(&whole_table).enumerate() {
+            assert!(
+                (g - f).abs() <= tol * f.abs().max(1.0),
+                "{name}: score {i}: gathered {g} against the whole head's {f}"
+            );
+        }
+        let walk = greedy_walk(&table, n, k);
+        let mut sender = 0;
+        for (row, &pick) in walk.iter().enumerate() {
+            let scores = &whole_table[(row * k + sender) * k..(row * k + sender + 1) * k];
+            let mut order: Vec<usize> = (0..k).collect();
+            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            let (best, second) = (scores[order[0]], scores[order[1]]);
+            assert!(
+                best - scores[pick] <= 2.0 * tol * best.abs().max(1.0),
+                "{name}: row {row} picks column {pick} ({}), the whole head's best is column {} \
+                 ({best})",
+                scores[pick],
+                order[0]
+            );
+            if best - second > 4.0 * tol * best.abs().max(1.0) {
+                assert_eq!(pick, order[0], "{name}: row {row}: the greedy draft");
+            }
+            sender = pick;
+        }
+        if name != "dense" {
+            continue;
+        }
+        // The reference's refinement, on the host in f32.
+        let b = &draft.bridge;
+        let (codebook, pg, prev, lw, bias) = (
+            host(&b.codebook),
+            host(&b.predecessor_gate_f32),
+            host(&b.prev_f32),
+            host(&b.last_write_f32),
+            host(&b.gate_bias),
+        );
+        let (query, raw, rms, norm_w) = (
+            host(&block.query),
+            host(&block.raw),
+            host(&block.rms),
+            host(&draft.body.norm),
+        );
+        let (c, r) = (draft.code_size, draft.bridge_rank);
+        let sqrt_c = (c as f32).sqrt();
+        let eps = cfg.rms_norm_eps;
+        let w_ref = host(&w_dev.to_dtype(dtype).unwrap());
+        for i in 0..n {
+            for s in 0..k {
+                let sender = if i == 0 { anchor } else { cand[i - 1][s] } as usize;
+                let e: Vec<f32> = (0..c).map(|x| codebook[sender * c + x] * sqrt_c).collect();
+                let message: Vec<f32> = (0..r)
+                    .map(|q| {
+                        let gate_in = query[i * r + q]
+                            + bias[q]
+                            + (0..c).map(|x| e[x] * pg[q * c + x]).sum::<f32>();
+                        let gate = 1.0 / (1.0 + (-gate_in).exp());
+                        gate * (0..c).map(|x| e[x] * prev[q * c + x]).sum::<f32>()
+                    })
+                    .collect();
+                let refined: Vec<f32> = (0..hidden)
+                    .map(|h| {
+                        raw[i * hidden + h]
+                            + rms[i] * (0..r).map(|q| message[q] * lw[h * r + q]).sum::<f32>()
+                    })
+                    .collect();
+                let norm =
+                    (refined.iter().map(|x| x * x).sum::<f32>() / hidden as f32 + eps).sqrt();
+                for j in 0..k {
+                    let id = cand[i][j] as usize;
+                    let want: f32 = (0..hidden)
+                        .map(|h| refined[h] / norm * norm_w[h] * w_ref[id * hidden + h])
+                        .sum();
+                    let got = table[(i * k + s) * k + j];
+                    assert!(
+                        (got - want).abs() <= tol * want.abs().max(1.0),
+                        "row {i} sender {s} candidate {j}: {got} against the reference {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access");
+}
+
 /// The grouped dynamic causal convolution against a host loop of the reference's
 /// `_grouped_dynamic_convolve`: output row `t`, channel `c` of group `g` is
 /// `Σ_o (base[o, c] + dynamic[t, o, g]) · hidden[t - o, c]`, zero before the block — including a

@@ -117849,7 +117849,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@83cf632fc09fee4553e6e9b06d62da1f85119c9e000400efdd83a95db983eb98",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@9b0f541d622717702a9fe983e1128a20740d0960afe5c76ef2033e24c51641d5",
       "requirements": []
     }
   },
@@ -117919,7 +117919,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@83cf632fc09fee4553e6e9b06d62da1f85119c9e000400efdd83a95db983eb98",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@9b0f541d622717702a9fe983e1128a20740d0960afe5c76ef2033e24c51641d5",
       "requirements": []
     }
   },
@@ -117989,7 +117989,77 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@83cf632fc09fee4553e6e9b06d62da1f85119c9e000400efdd83a95db983eb98",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@9b0f541d622717702a9fe983e1128a20740d0960afe5c76ef2033e24c51641d5",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build",
+    "source": "crates/llm/candle-llm/src/decode/block_draft/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build; source setup helpers=proof_device,tiny_target_on,tiny_config,tiny_draft_on,relative,worst,block_len; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@9b0f541d622717702a9fe983e1128a20740d0960afe5c76ef2033e24c51641d5",
       "requirements": []
     }
   },
@@ -118059,7 +118129,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@83cf632fc09fee4553e6e9b06d62da1f85119c9e000400efdd83a95db983eb98",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@9b0f541d622717702a9fe983e1128a20740d0960afe5c76ef2033e24c51641d5",
       "requirements": []
     }
   },
@@ -118129,7 +118199,77 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@0e7c4d25a84a2a1b198680631cda83f43f2099362459bb56680d4cfaf968235d",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@0f4d9430c0788b0d51ff33a8157f9785c607c4c0e7c1e791ea30574d64cfab6f",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access",
+    "source": "crates/llm/candle-llm/src/models/block_draft/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access; source setup helpers=proof_device,tiny_config,tiny_draft_on,ProjectionHead,greedy_walk; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@0f4d9430c0788b0d51ff33a8157f9785c607c4c0e7c1e791ea30574d64cfab6f",
       "requirements": []
     }
   },
@@ -118332,7 +118472,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@d602ec675711ffa2a1197aff1971ecc7d90ac6ded855ee3f7a83746ec9710587",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@efea23821f83c2c088b7dc7d5bec5338f6ca6f2fa8ce56f4237d302888b4703b",
       "requirements": [
         {
           "slot": "target-weights",
@@ -118450,7 +118590,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@d602ec675711ffa2a1197aff1971ecc7d90ac6ded855ee3f7a83746ec9710587",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@efea23821f83c2c088b7dc7d5bec5338f6ca6f2fa8ce56f4237d302888b4703b",
       "requirements": [
         {
           "slot": "target-weights",
