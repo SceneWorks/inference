@@ -674,6 +674,7 @@ pub(crate) struct FluxMemoryScope {
     transformer_window: Option<u32>,
     use_pid: bool,
     finished: bool,
+    recorded_render_phases: Vec<(MemoryPhase, gen_core::render::RenderPhaseIdentity)>,
 }
 
 impl FluxMemoryScope {
@@ -697,7 +698,15 @@ impl FluxMemoryScope {
                 .flatten(),
             use_pid: context.use_pid,
             finished: false,
+            recorded_render_phases: Vec::new(),
         }
+    }
+
+    /// Recorded `(MemoryPhase, RenderPhaseIdentity)` entries observed by this scope (`MEM-5`).
+    pub(crate) fn recorded_render_phases(
+        &self,
+    ) -> &[(MemoryPhase, gen_core::render::RenderPhaseIdentity)] {
+        &self.recorded_render_phases
     }
 
     fn ensure_active(&self) -> gen_core::Result<()> {
@@ -782,6 +791,7 @@ impl MemoryRequestScope for FluxMemoryScope {
         identity: &gen_core::render::RenderPhaseIdentity,
     ) -> gen_core::Result<()> {
         self.validate_render_phase_geometry(phase, identity.geometry)?;
+        self.recorded_render_phases.push((phase, *identity));
         self.enter_phase(phase)
     }
 
@@ -888,6 +898,63 @@ pub fn reference_backbone_request_scope(
     context: &MemoryRunContext,
 ) -> Box<dyn MemoryRequestScope> {
     Box::new(FluxMemoryScope::new(provider_id, device, contract, context))
+}
+
+/// Qualify the conservative transition bound for a Candle FLUX.1 (`flux1_schnell`, `flux1_dev`)
+/// `low_res_start` trajectory (`§6.12`, `E4`, `SW-6941`).
+///
+/// Uses the variant's exact T5 sequence length (`256` for `flux1_schnell`, `512` for `flux1_dev`),
+/// `16` latent channels, `/8` VAE spatial scale, `2x2` patch size, and `128` head dimension.
+pub fn qualify_candle_flux1_low_res_transition_bound(
+    variant: crate::Variant,
+    ordinary_t2i_peak_bytes: u64,
+    evidence_basis: gen_core::EvidencePeakBasis,
+    plan: &gen_core::ResolvedLowResStartPlan,
+    batch: u32,
+) -> gen_core::Result<gen_core::LowResTransitionCoverageTrace> {
+    gen_core::qualify_flux1_low_res_transition_bound(
+        ordinary_t2i_peak_bytes,
+        evidence_basis,
+        plan,
+        batch,
+        16,
+        8,
+        2,
+        variant.t5_max_len() as u32,
+        128,
+    )
+}
+
+/// Evaluate Candle FLUX.1 memory admission for a request with optional `low_res_start` (`§6.12`, `E4`, `SW-6941`).
+///
+/// - When `low_res_plan` is `None`, ordinary T2I admission is completely unchanged (`budget.fits(ordinary_t2i_peak_bytes)`).
+/// - Under `LowResTransitionPricingPosture::ConditionalSixBufferIncrement`, admits at exact equality
+///   (`17,651,074,970 + 4,718,592 = 17,655,793,562 B`) and refuses one byte below (`17,655,793,561 B`).
+/// - Under `LowResTransitionPricingPosture::UnqualifiedRealEvidence`, refuses `low_res_start` fail-closed
+///   with a typed reason before loading while ordinary T2I (`low_res_plan == None`) continues to admit unchanged.
+pub fn evaluate_candle_flux1_low_res_admission(
+    variant: crate::Variant,
+    ordinary_t2i_peak_bytes: u64,
+    evidence_basis: gen_core::EvidencePeakBasis,
+    budget: gen_core::MemoryBudget,
+    low_res_plan: Option<&gen_core::ResolvedLowResStartPlan>,
+    batch: u32,
+    posture: &gen_core::LowResTransitionPricingPosture,
+) -> std::result::Result<
+    gen_core::LowResTransitionAdmissionReceipt,
+    gen_core::LowResTransitionAdmissionRefusal,
+> {
+    gen_core::evaluate_low_res_transition_admission(
+        variant.model_id(),
+        ordinary_t2i_peak_bytes,
+        evidence_basis,
+        budget,
+        low_res_plan,
+        batch,
+        16,
+        8,
+        posture,
+    )
 }
 
 pub(crate) fn registered_safety_check(
@@ -1637,5 +1704,180 @@ mod tests {
         scope.materialize_transformer_window(56, 1).unwrap();
         scope.finish(MemoryRunOutcome::Complete).unwrap();
         assert!(scope.finish(MemoryRunOutcome::Complete).is_err());
+    }
+
+    #[test]
+    fn sw_6941_b4_candle_flux1_exact_fit_one_byte_under_fail_closed_and_two_phase_scope_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let contract = provider_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        let mut fixture = registered_valid_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        fixture.context.selection.parameters.transformer_window_size = Some(1);
+        fixture.request.prompt = "sw-6941 two-phase trace".into();
+        fixture.request.width = 1024;
+        fixture.request.height = 1024;
+        fixture.request.steps = Some(8);
+        fixture.request.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+
+        let plan = crate::compile_base_plan(crate::Variant::Dev, &fixture.request).unwrap();
+        let low_res = plan.low_res_start().copied().expect("low_res_start resolved");
+        assert_eq!((low_res.low_width, low_res.low_height), (512, 512));
+        assert_eq!((low_res.full_width, low_res.full_height), (1024, 1024));
+
+        // 1. Exact-fit (17,655,793,562 B) and 1-byte-under (17,655,793,561 B) against the
+        // SC-15823 Candle flux1_dev q4 1024x1024 T2I ordinary peak (17,651,074,970 B) + 4,718,592 B.
+        let basis = gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES;
+        let exact_budget = gen_core::MemoryBudget {
+            total_bytes: gen_core::CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        let exact_receipt = evaluate_candle_flux1_low_res_admission(
+            crate::Variant::Dev,
+            gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+            basis,
+            exact_budget,
+            Some(&low_res),
+            1,
+            &gen_core::LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+        )
+        .expect("exact fit at 17,655,793,562 B must admit");
+        assert_eq!(exact_receipt.required_peak_bytes, 17_655_793_562);
+
+        let one_under_budget = gen_core::MemoryBudget {
+            total_bytes: gen_core::CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES - 1,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            evaluate_candle_flux1_low_res_admission(
+                crate::Variant::Dev,
+                gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+                basis,
+                one_under_budget,
+                Some(&low_res),
+                1,
+                &gen_core::LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+            )
+            .unwrap_err(),
+            gen_core::LowResTransitionAdmissionRefusal::ExceedsEffectiveBudget {
+                route_id: crate::FLUX1_DEV_ID.into(),
+                required_peak_bytes: 17_655_793_562,
+                effective_budget_bytes: 17_655_793_561,
+                deficit_bytes: 1,
+            }
+        );
+
+        // 2. Real-evidence fail-closed posture: refuses the new unpriced cell for `low_res_start`
+        // before loading, while leaving ordinary T2I admission (`low_res_plan: None`) unchanged!
+        let large_budget = gen_core::MemoryBudget {
+            total_bytes: 24 * 1024 * 1024 * 1024,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert!(matches!(
+            evaluate_candle_flux1_low_res_admission(
+                crate::Variant::Dev,
+                gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+                basis,
+                large_budget,
+                Some(&low_res),
+                1,
+                &gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+            ),
+            Err(gen_core::LowResTransitionAdmissionRefusal::UnpricedTransitionIncrementsOnWholeRequestEvidence { .. })
+        ));
+        let ordinary_t2i = evaluate_candle_flux1_low_res_admission(
+            crate::Variant::Dev,
+            gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+            basis,
+            gen_core::MemoryBudget {
+                total_bytes: gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            None,
+            1,
+            &gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        )
+        .expect("ordinary T2I must remain completely unchanged");
+        assert!(!ordinary_t2i.low_res_active);
+        assert_eq!(
+            ordinary_t2i.required_peak_bytes,
+            gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES
+        );
+
+        // 3. Qualified conservative bound for both `flux1_dev` and `flux1_schnell`:
+        for variant in [crate::Variant::Dev, crate::Variant::Schnell] {
+            let trace = qualify_candle_flux1_low_res_transition_bound(
+                variant,
+                gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+                basis,
+                &low_res,
+                1,
+            )
+            .unwrap();
+            let bound = trace.total_bounded_peak_bytes().unwrap();
+            let posture =
+                gen_core::LowResTransitionPricingPosture::QualifiedConservativeBound(trace);
+            assert!(evaluate_candle_flux1_low_res_admission(
+                variant,
+                gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+                basis,
+                gen_core::MemoryBudget {
+                    total_bytes: bound,
+                    committed_bytes: 0,
+                    reclaimable_bytes: 0,
+                    reserved_headroom_bytes: 0,
+                },
+                Some(&low_res),
+                1,
+                &posture,
+            )
+            .is_ok());
+        }
+
+        // 4. MEM-5 two-phase scope identity lifecycle and rung persistence across phases:
+        let mut flux_scope = FluxMemoryScope::new(
+            crate::FLUX1_DEV_ID,
+            Device::Cpu,
+            &contract,
+            &fixture.context,
+        );
+        flux_scope.configure_request(&mut fixture.request).unwrap();
+        let events = gen_core::trace_planned_low_res_scope_lifecycle(
+            &plan,
+            &fixture.request.cancel,
+            &mut flux_scope,
+            Some(ATTENTION_CHUNK_SIZE),
+            Some((0, 1)),
+            Some((DECODE_TILE_EDGE, DECODE_OVERLAP)),
+        )
+        .unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(
+            flux_scope
+                .recorded_render_phases()
+                .iter()
+                .map(|(p, id)| (*p, id.pass, id.phase, id.geometry.width, id.geometry.height))
+                .collect::<Vec<_>>(),
+            vec![
+                (MemoryPhase::Conditioning, 0, 0, 1024, 1024),
+                (MemoryPhase::Denoise, 0, 0, 512, 512),
+                (MemoryPhase::Denoise, 0, 1, 1024, 1024),
+                (MemoryPhase::Decode, 0, 0, 1024, 1024),
+            ]
+        );
     }
 }

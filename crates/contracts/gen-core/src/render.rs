@@ -801,6 +801,18 @@ impl<'p, 's> RenderRun<'p, 's> {
         self.plan
     }
 
+    /// Invoke a closure with the active [`MemoryRequestScope`] when present (`MEM-5`).
+    pub fn with_active_scope<T>(
+        &self,
+        body: impl FnOnce(&mut dyn MemoryRequestScope) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let mut guard = self.scope.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(scope) => Ok(Some(body(scope)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Enter the next declared denoise span on the owner thread. A failed body leaves scope
     /// teardown to the owner, as in `phase`; the next image cannot start with an active span.
     pub fn begin_denoise_phase(&self, phase: usize) -> Result<()> {
