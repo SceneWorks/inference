@@ -5368,13 +5368,16 @@ impl LlamaProvider {
                 .checked_add(draft.promoted_request_bytes()?)?
             }
             // A block draft's request (SW-F360 E8): the tapped target rows it reads, its
-            // window-bounded context and a step's transients — the shared pricing.
-            (SpeculativeRoute::BlockDraft { width }, _) => self
-                .block_draft
-                .as_ref()?
-                .model
-                .config()
-                .request_bytes(prompt_tokens, max_new_tokens, width)?,
+            // window-bounded context and a step's transients — the shared pricing, its
+            // activations at the target's priced compute element.
+            (SpeculativeRoute::BlockDraft { width }, _) => {
+                self.block_draft.as_ref()?.model.config().request_bytes(
+                    prompt_tokens,
+                    max_new_tokens,
+                    width,
+                    self.model.memory_geometry().element_bytes,
+                )?
+            }
             _ => 0,
         };
         target.checked_add(draft)

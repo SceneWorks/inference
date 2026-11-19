@@ -118867,7 +118867,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_resident_block_draft_runs_block_draft_and_is_named@3872078373fa399c2aad081feac523941d676f647459e21e2a11963f0e60a7e7",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_resident_block_draft_runs_block_draft_and_is_named@da3e9c2d4b8749a938ec4e34225c7d02092b0e5b7b4d58e9c4f1efe0d54412b4",
       "requirements": []
     }
   },
@@ -118937,7 +118937,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does@3872078373fa399c2aad081feac523941d676f647459e21e2a11963f0e60a7e7",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does@da3e9c2d4b8749a938ec4e34225c7d02092b0e5b7b4d58e9c4f1efe0d54412b4",
       "requirements": []
     }
   },

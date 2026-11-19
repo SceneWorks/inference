@@ -320,10 +320,16 @@ fn tree_request_bytes(
         .checked_mul(g.element_bytes)?
         .checked_mul(2)?;
     let row = g.hidden_size.checked_add(g.vocab_size)?.checked_mul(4)?;
-    // The tree rows' tap buffer and the accepted branch's gathered copy.
+    // The tree rows' tap buffer and the accepted branch's gathered copy, at the target's compute
+    // dtype (the geometry's `element_bytes` is a flat f32 price; a block draft only ever taps the
+    // hybrid).
+    let tap_element = match model {
+        Decoder::Qwen35(m) => m.compute_dtype().size_in_bytes() as u64,
+        Decoder::Causal(_) => g.element_bytes,
+    };
     let taps = rows
         .checked_mul(tap_width)?
-        .checked_mul(g.element_bytes)?
+        .checked_mul(tap_element)?
         .checked_mul(2)?;
     let context = u64::try_from(prompt)
         .ok()?
@@ -1265,7 +1271,7 @@ fn block_draft_request_bytes(
         (core_llm::BlockDraftFormat::DSpine, None) => return None,
         (core_llm::BlockDraftFormat::DFlash2, _) => 0,
     };
-    cfg.request_bytes(prompt, max_new_tokens, width)?
+    cfg.request_bytes(prompt, max_new_tokens, width, act)?
         .checked_add(refined)
 }
 

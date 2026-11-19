@@ -232,7 +232,7 @@ fn a_block_draft_is_priced_at_its_precision() {
                 .is_err()
         );
         let draft = crate::models::block_draft::tests::tiny_draft(format_of(&config), None);
-        let shared = cfg.request_bytes(12, 16, 3).unwrap();
+        let shared = cfg.request_bytes(12, 16, 3, 2).unwrap();
         let target = tiny_target();
         let head = target.head_rows().unwrap();
         assert_eq!(head.label(), "dense");
@@ -366,6 +366,53 @@ fn an_eager_block_draft_route_prices_its_tapped_rows() {
         provider.request_bytes(route, 12, 16, 0),
         Some(target + beside)
     );
+}
+
+/// The draft's request and a block-draft tree are priced at the target's real compute dtype: an
+/// f32 target (Candle's CPU) holds exactly twice a bf16 target's tapped rows — the eager verify
+/// and prompt-window taps beside the target ([`block_draft_request_bytes`]) and every tree row's
+/// taps and their gathered copy ([`tree_request_bytes`]).
+#[test]
+fn an_f32_target_prices_twice_a_bf16_targets_tapped_rows() {
+    let config = dflash2_config_json();
+    let cfg = core_llm::BlockDraftConfig::from_json(&config).unwrap();
+    let draft = crate::models::block_draft::tests::tiny_draft(format_of(&config), None);
+    let tap = cfg.tap_width() as u64;
+    let f32_target = tiny_target();
+    assert_eq!(
+        f32_target.compute_dtype(),
+        DType::F32,
+        "the CPU's compute dtype"
+    );
+    let act = f32_target.compute_dtype().size_in_bytes() as u64;
+    let at = |element: u64| block_draft_request_bytes(&draft, None, element, 12, 16, 3).unwrap();
+    let fixed = cfg.request_bytes(12, 16, 3, 0).unwrap();
+    assert_eq!(at(act) - fixed, 2 * (at(2) - fixed));
+    // The 8-row window of the 12-token prompt, then a verify step of 4 rows, at 2 bytes.
+    assert!(at(2) - fixed >= (8 + 4) * tap * 2);
+
+    let bf16_target = {
+        let json = {
+            let mut v = crate::models::qwen35::tests::cfg_json();
+            v["text_config"]["hidden_size"] = 64.into();
+            v["text_config"]["intermediate_size"] = 128.into();
+            v
+        };
+        let qcfg = crate::models::Qwen35Config::from_json(&json).unwrap();
+        let w = crate::models::qwen35::tests::synthetic_weights(&qcfg);
+        Qwen35Model::from_weights_dtype(&w, "model.language_model", qcfg, None, DType::BF16)
+            .unwrap()
+    };
+    assert_eq!(bf16_target.compute_dtype(), DType::BF16);
+    let tree_taps = |model: Qwen35Model| {
+        let decoder = Decoder::Qwen35(model);
+        let block = ProposerKind::BlockDraft;
+        tree_request_bytes(&decoder, block, 4, 16, 100, 50, tap).unwrap()
+            - tree_request_bytes(&decoder, block, 4, 16, 100, 50, 0).unwrap()
+    };
+    let (f32_taps, bf16_taps) = (tree_taps(f32_target), tree_taps(bf16_target));
+    assert_eq!(bf16_taps, 17 * tap * 2 * 2);
+    assert_eq!(f32_taps, 2 * bf16_taps);
 }
 
 /// The tiny target ([`tiny_target_on`]'s random-head hybrid, 64 wide over 50 ids) with a
