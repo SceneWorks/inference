@@ -195,22 +195,24 @@ class MlxTrainingAssets(unittest.TestCase):
         for bad in ({"download_missing": "yes"}, {"download_missing": 1}, {"runner": "nax-3"}):
             with self.assertRaises(ValueError):
                 proofs.request(json.dumps({"selection": "x", "policy": policy, **bad}), "mlx")
-        self.assertEqual(proofs.NAX_ROUTES["nax-primary"]["name"], "nax-macos")
         self.assertIn("rw-starvector", proofs.NAX_ROUTES["nax-primary"]["labels"])
-        self.assertEqual(assets.NAX_RUNNERS, {k: v["name"] for k, v in proofs.NAX_ROUTES.items()})
+        # Routes are label sets; neither table names a machine.
+        self.assertEqual(assets.NAX_ROUTES, set(proofs.NAX_ROUTES))
+        self.assertTrue(all(set(route) == {"labels"} for route in proofs.NAX_ROUTES.values()))
 
-    def test_main_binds_only_the_exact_planned_case_on_the_provisioned_mac(self):
+    def test_main_binds_only_the_exact_planned_case_on_a_routed_mac(self):
         identity = next(iter(assets.MLX_TRAINING_PROOFS))
-        with tempfile.TemporaryDirectory() as directory:
-            plan = Path(directory) / "plan.json"
-            plan.write_text(json.dumps({"backend": "mlx", "selected": 1, "bindings": [identity],
-                                        "request": {"runner": "nax"}, "asset_setup": "mlx-training"}),
-                            encoding="utf-8")
-            github_env = Path(directory) / "env"
-            env = {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-1", "GITHUB_ENV": str(github_env)}
-            with patch.dict("os.environ", env, clear=True), patch("sys.argv", ["x", "--plan", str(plan)]):
-                with self.assertRaises(ValueError):
-                    assets.main()
+        for route, runner_os in (("nax", "Linux"), ("hosted", "macOS")):
+            with self.subTest(route=route, runner_os=runner_os), tempfile.TemporaryDirectory() as directory:
+                plan = Path(directory) / "plan.json"
+                plan.write_text(json.dumps({"backend": "mlx", "selected": 1, "bindings": [identity],
+                                            "request": {"runner": route}, "asset_setup": "mlx-training"}),
+                                encoding="utf-8")
+                github_env = Path(directory) / "env"
+                env = {"RUNNER_OS": runner_os, "RUNNER_NAME": "nax-macos-2", "GITHUB_ENV": str(github_env)}
+                with patch.dict("os.environ", env, clear=True), patch("sys.argv", ["x", "--plan", str(plan)]):
+                    with self.assertRaises(ValueError):
+                        assets.main()
 
     def test_plan_routes_bound_rows_and_workflow_runs_the_setup_on_macos(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/model-inference-proofs.yml").read_text(encoding="utf-8"))

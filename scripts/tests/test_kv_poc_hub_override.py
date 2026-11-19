@@ -203,7 +203,9 @@ class HubOverrideCleanupTests(unittest.TestCase):
         self.assertTrue(cleanup["if"].startswith("${{ always() && "), cleanup["if"])
         self.assertIn("needs.config.outputs.hf_hub_override != ''", cleanup["if"])
         self.assertEqual(cleanup["runs-on"], "${{ fromJSON(needs.config.outputs.runs_on) }}")
-        self.assertEqual(cleanup["env"]["KV_EXPECTED_RUNNER"], "${{ needs.config.outputs.runner_name }}")
+        # Affinity is to the runner the probe landed on, never a configured machine name.
+        self.assertEqual(cleanup["env"]["KV_EXPECTED_RUNNER"], "${{ needs.probe.outputs.runner_name }}")
+        self.assertNotIn("runner_name", jobs["config"]["outputs"])
         run = "\n".join(step.get("run", "") for step in cleanup["steps"])
         self.assertIn('bash .github/kv-poc/hub.sh cleanup "$KV_HF_HUB_OVERRIDE" "$HOME"', run)
         self.assertNotIn("rm ", run, "the only delete is hub.sh's guarded one")

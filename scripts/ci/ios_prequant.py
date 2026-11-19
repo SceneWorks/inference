@@ -362,8 +362,8 @@ def main():
     try:
         binding = parse_binding(os.environ["IOS_PREQUANT_BINDING"])
         receipt["binding"] = binding
-        if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or os.environ.get("RUNNER_NAME") != "nax-macos":
-            raise ValueError("requires manual dispatch on primary nax-macos")
+        if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise ValueError("requires manual dispatch")
         if os.environ.get("GITHUB_SHA") != binding["source_sha"]:
             raise ValueError("dispatch ref differs from frozen source")
         if platform.system() != "Darwin" or platform.machine() != "arm64":

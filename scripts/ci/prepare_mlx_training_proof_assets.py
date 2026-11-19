@@ -2,7 +2,7 @@
 """Bind provisioned, pinned snapshots for the bounded MLX training proofs (SW-7172).
 
 The explicit model-proof workflow binds no per-family snapshot environment for MLX rows on the
-provisioned Mac (nax-macos-2), so each bounded MLX training proof below names the exact pinned
+provisioned Macs, so each bounded MLX training proof below names the exact pinned
 Hub snapshot(s) its test reads, and this setup resolves each one under the runner-local model
 roots, in order: `$MLX_GEN_MODELS_ROOT` (the repository variable, `~` expanded), the runner's own
 Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else the fleet root), the provisioned
@@ -33,8 +33,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.release.ensure_model_snapshot import runner_hub_cache  # noqa: E402
 
 PROVISIONED_HUB = Path("/Volumes/Models/huggingface/hub")
-# The provisioned Macs a request routes to (model_inference_proofs.NAX_ROUTES) -> runner name.
-NAX_RUNNERS = {"nax": "nax-macos-2", "nax-primary": "nax-macos"}
+# The provisioned Mac routes a request may select (model_inference_proofs.NAX_ROUTES); labels
+# choose the Mac, so a route never names one.
+NAX_ROUTES = frozenset({"nax", "nax-primary"})
 LISTING_TIMEOUT_SECONDS = 20.0
 
 
@@ -141,7 +142,7 @@ INVENTORY_ALSO = ("microsoft/Mage-Flow-Base", "Kwai-Kolors/Kolors-diffusers", "S
 
 def exact_bindings(rows: list[dict], backend: str, runner: str | None) -> dict[str, Pin] | None:
     """The pinned bindings of ONE exact registered MLX training proof on the provisioned Mac."""
-    if backend != "mlx" or runner not in NAX_RUNNERS or len(rows) != 1:
+    if backend != "mlx" or runner not in NAX_ROUTES or len(rows) != 1:
         return None
     row = rows[0]
     if row.get("target_kind") not in ("test", "lib") or "selected_configuration" in row:
@@ -303,13 +304,13 @@ def main() -> int:
     request = plan.get("request", {})
     route = request.get("runner")
     if (plan.get("backend") != "mlx" or plan.get("selected") != 1 or len(identities) != 1
-            or identities[0] not in MLX_TRAINING_PROOFS or route not in NAX_RUNNERS
+            or identities[0] not in MLX_TRAINING_PROOFS or route not in NAX_ROUTES
             or plan.get("asset_setup") != "mlx-training"
             or type(request.get("download_missing", False)) is not bool):
         raise ValueError("MLX training asset setup requires one exact reviewed case on a provisioned Mac")
     env = dict(os.environ)
-    if env.get("RUNNER_OS") != "macOS" or env.get("RUNNER_NAME") != NAX_RUNNERS[route]:
-        raise ValueError(f"MLX training proofs on route {route} bind {NAX_RUNNERS[route]}'s model roots")
+    if env.get("RUNNER_OS") != "macOS":
+        raise ValueError(f"MLX training proofs on route {route} bind a Mac's model roots")
     github_env = env.get("GITHUB_ENV", "")
     if not github_env:
         raise ValueError("GitHub Actions environment file is required")

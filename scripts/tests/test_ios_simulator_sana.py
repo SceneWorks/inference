@@ -327,12 +327,13 @@ class SimulatorSanaTests(unittest.TestCase):
         self.assertNotIn('id=11111111-1111-1111-1111-111111111111', args)
         self.assertIn('xcrun simctl install "$SIMULATOR" "$APP"', source)
 
-    def test_dispatch_only_exact_runner(self):
+    def test_dispatch_only_any_named_macos_arm64_runner(self):
         good = dict(GITHUB_EVENT_NAME='workflow_dispatch', RUNNER_NAME='nax-macos',
                     RUNNER_OS='macOS', RUNNER_ARCH='ARM64')
-        sim.require_dispatch(good)
-        sim.require_dispatch({**good, 'RUNNER_NAME': 'nax-macos-2'})
-        for key, wrong in [('GITHUB_EVENT_NAME', 'push'), ('RUNNER_NAME', 'nax-macos-3'),
+        # Any Mac the labels select is acceptable; the name only binds the simulator receipt.
+        for name in ('nax-macos', 'nax-macos-2', 'any-other-mac'):
+            sim.require_dispatch({**good, 'RUNNER_NAME': name})
+        for key, wrong in [('GITHUB_EVENT_NAME', 'push'), ('RUNNER_NAME', ''),
                            ('RUNNER_OS', 'Linux'), ('RUNNER_ARCH', 'X64')]:
             with self.subTest(key=key), self.assertRaises(ValueError):
                 sim.require_dispatch({**good, key: wrong})

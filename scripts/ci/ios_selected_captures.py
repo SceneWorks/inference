@@ -44,11 +44,10 @@ def selection_from_binding(binding: str) -> str:
 
 
 def require_dispatch(env: dict[str, str]) -> None:
-    for key, expected in (("GITHUB_EVENT_NAME", "workflow_dispatch"),
-                          ("RUNNER_NAME", "nax-macos-2"), ("RUNNER_OS", "macOS"),
+    for key, expected in (("GITHUB_EVENT_NAME", "workflow_dispatch"), ("RUNNER_OS", "macOS"),
                           ("RUNNER_ARCH", "ARM64")):
         if env.get(key) != expected:
-            raise ValueError(f"{key} must be {expected}; no local/shared-dev-Mac capture")
+            raise ValueError(f"{key} must be {expected}; no local capture")
 
 
 def command(row: dict, discover: bool) -> list[str]:

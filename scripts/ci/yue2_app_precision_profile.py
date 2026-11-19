@@ -227,8 +227,6 @@ def preflight(backend: str, evidence: Path, label: str, held_lock=None, first: b
     )
 
     require(backend in ("cuda", "metal"), "unsupported backend")
-    if backend == "metal":
-        require(os.environ.get("RUNNER_NAME") == "nax-macos-2", "Metal must run on nax-macos-2")
     evidence.mkdir(parents=True, exist_ok=True)
     baseline_files = None
     if backend == "cuda":

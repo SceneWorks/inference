@@ -389,7 +389,6 @@ jobs:
           REFERENCE_RUN_ID: ${{ inputs.reference_run_id }}
         run: |
           set -euo pipefail
-          test "$RUNNER_NAME" = nax-macos-2
           [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$REFERENCE_RUN_ID" =~ ^[0-9]+$ ]]

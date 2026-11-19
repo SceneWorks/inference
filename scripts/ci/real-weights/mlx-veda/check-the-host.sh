@@ -1,5 +1,5 @@
-# sc-26214: the MLX Veda device gate and dense-vs-sparse A/B run only on nax-macos-2 with >= 128 GB
-# unified memory. Explicitly dispatched, so a wrong or too-small box FAILS here (before any build or
+# sc-26214: the MLX Veda device gate and dense-vs-sparse A/B run only on a Mac with >= 128 GB
+# unified memory. Explicitly dispatched, so a too-small box FAILS here (before any build or
 # GPU work) instead of reporting a green skip. The two dispatch inputs are untrusted and reach this
 # step only as environment variables; both are validated here so a bad value fails before the build.
 VEDA_OUT="$RUNNER_TEMP/veda-mlx-evidence"
@@ -24,10 +24,6 @@ free_pct="$(printf '%s\n' "$pressure" | sed -n 's/.*free percentage: \([0-9]*\)%
   echo "unified memory: $mem_gb GB; memory_pressure free ${free_pct:-?}%"
   echo "$pressure"
 } | tee "$VEDA_OUT/host.txt"
-if [[ "$RUNNER_NAME" != "nax-macos-2" ]]; then
-  echo "::error::the MLX Veda lane runs only on nax-macos-2 (landed on $RUNNER_NAME); nothing was started"
-  exit 1
-fi
 if (( mem_gb < 128 )); then
   echo "::error::only $mem_gb GB of unified memory (< 128 GB)"
   exit 1

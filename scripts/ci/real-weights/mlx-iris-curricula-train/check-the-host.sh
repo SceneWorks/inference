@@ -1,4 +1,4 @@
-# sc-25689: this lane runs only on nax-macos-2 with >= 128 GB unified memory and no heavy memory
+# sc-25689: this lane runs only on a Mac with >= 128 GB unified memory and no heavy memory
 # pressure; anywhere else it records why and skips (IRIS_CURRICULA_SKIP=1), it never queues work
 # onto a busy box.
 IRIS_OUT="$RUNNER_TEMP/iris-curricula-mlx-evidence"
@@ -17,9 +17,7 @@ free_gb=$(( mem_gb * ${free_pct:-0} / 100 ))
   vm_stat | head -12
 } | tee "$IRIS_OUT/host.txt"
 skip=""
-if [[ "$RUNNER_NAME" != "nax-macos-2" ]]; then
-  skip="runner $RUNNER_NAME is not nax-macos-2"
-elif (( mem_gb < 128 )); then
+if (( mem_gb < 128 )); then
   skip="only $mem_gb GB of unified memory (< 128 GB)"
 elif [[ -z "$free_pct" || "$free_pct" -lt 40 ]]; then
   skip="memory pressure too high (free ${free_pct:-unknown}% < 40%)"

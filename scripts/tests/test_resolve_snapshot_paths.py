@@ -275,20 +275,6 @@ KNOWN_WEIGHT_SET_LABELS = {
     "rw-chroma",
     "rw-starvector",
 }
-PRESERVED_LOCAL_JOB = "qwen38-bonsai-mlx"
-PRESERVED_LOCAL_RUNS_ON = ["self-hosted", "macOS", "ARM64", "nax", "real-weights"]
-PRESERVED_LOCAL_JOB_IF = (
-    "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'"
-)
-PRESERVED_LOCAL_STEP = "Select preserved local campaign snapshots"
-PRESERVED_LOCAL_SNAPSHOT_MARKERS = (
-    "/Volumes/Models/Codex-models/sc-23935/hf/hub/"
-    "models--prism-ml--Ternary-Bonsai-2-27B-gguf/snapshots/"
-    "6ed5e12bf84b7a63069882c91dd9e9218647d17b",
-    "/Volumes/Models/Codex-models/sc-23935/hf/hub/"
-    "models--Qwen--Qwen3-VL-8B-Instruct/snapshots/"
-    "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
-)
 
 
 # Reuse the source-preservation receipts for committed-fixture execution. These
@@ -328,18 +314,14 @@ def committed_fixture_route(job, platform):
 
 
 def primary_cpu_cache_route_errors(job):
-    """The pinned CPU converter consumes the primary cache, not an rw-* set."""
+    """The pinned CPU converter fetches into the runner cache of whichever Mac `rw-chroma` selects."""
     errors = []
-    if job.get('runs-on') != ['self-hosted', 'macOS', 'ARM64', 'nax', 'real-weights']:
-        errors.append('CPU cache conversion must select the primary Mac capability set')
+    if job.get('runs-on') != ['self-hosted', 'macOS', 'ARM64', 'nax', 'rw-chroma']:
+        errors.append('CPU cache conversion must select the rw-chroma label set')
     if job.get('if') != "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'":
         errors.append('CPU cache conversion must remain explicitly dispatched')
-    steps = job.get('steps', [])
-    guards = [i for i, step in enumerate(steps)
-              if '[[ "$RUNNER_NAME" == nax-macos ]]' in step.get('run', '')]
-    checkouts = [i for i, step in enumerate(steps) if 'checkout@' in step.get('uses', '')]
-    if len(guards) != 1 or not checkouts or guards[0] >= min(checkouts):
-        errors.append('primary cache identity must be checked before checkout')
+    if any('RUNNER_NAME' in step.get('run', '') for step in job.get('steps', [])):
+        errors.append('CPU cache conversion must not check which Mac it landed on')
     if job.get('env', {}).get('IOS_PREQUANT_BINDING') != '${{ inputs.ios_pricing_compile_binding }}':
         errors.append('CPU conversion lost its frozen source/route binding')
     return errors
@@ -373,8 +355,6 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
     }
     if not macos:
         return ["found no macOS jobs — the label scheme moved"]
-    if PRESERVED_LOCAL_JOB not in macos:
-        errors.append(f"{PRESERVED_LOCAL_JOB} is no longer an exact macOS route")
 
     for name, job in macos.items():
         runs_on = job.get("runs-on") or []
@@ -391,9 +371,8 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
                 errors.append(f"{name} changed its bounded weight-set dispatch route")
             continue
         if name == "mlx-minimax-h3-image-publish":
-            # SW-7104: nax-macos-2 (`rw-mage`) by default; exactly one dispatch-only profile picks
-            # `nax-macos` (`rw-starvector`) for Michael's one-time loan of his dev Mac (the `-nax-macos`
-            # profiles, both stages or `-pe` only).
+            # SW-7104: `rw-mage` by default; exactly one dispatch-only profile family picks
+            # `rw-starvector` (the `-nax-macos` profiles, both stages or `-pe` only).
             expected = ["self-hosted", "macOS", "ARM64",
                         "${{ startsWith(inputs.profile, 'minimax-h3-image-publish-mlx-nax-macos') && "
                         "'rw-starvector' || 'rw-mage' }}"]
@@ -407,28 +386,6 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
             ):
                 errors.append(f"{name} changed its bounded weight-set dispatch route")
             continue
-        if name == PRESERVED_LOCAL_JOB:
-            if runs_on != PRESERVED_LOCAL_RUNS_ON:
-                errors.append(f"{name} changed its exact local runner selector")
-            if job.get("if") != PRESERVED_LOCAL_JOB_IF:
-                errors.append(f"{name} is no longer dispatch-only for its exact profile")
-            selectors = [
-                step
-                for step in job.get("steps", [])
-                if step.get("name") == PRESERVED_LOCAL_STEP
-            ]
-            if len(selectors) != 1:
-                errors.append(f"{name} must carry exactly one {PRESERVED_LOCAL_STEP!r} step")
-                continue
-            selector = selectors[0]
-            if selector.get("if") != "runner.name == 'nax-macos'":
-                errors.append(f"{name} does not guard its aliases by exact runner identity")
-            command = selector.get("run", "")
-            for marker in PRESERVED_LOCAL_SNAPSHOT_MARKERS:
-                if marker not in command:
-                    errors.append(f"{name} no longer binds preserved snapshot {marker}")
-            continue
-
         if any(step.get('run', '').strip() == 'python3.12 -I scripts/ci/ios_prequant.py'
                for step in job.get('steps', [])):
             errors.extend(f'{name}: {error}' for error in primary_cpu_cache_route_errors(job))
@@ -451,7 +408,7 @@ class WeightSetLabelTests(unittest.TestCase):
     """Snapshot jobs select their weight set; other routes prove their asset contract.
 
     Snapshot lanes must identify their provisioned set. Primary-cache conversion
-    instead proves its exact host, frozen source and dispatch contract. Committed
+    instead proves its label set, frozen source and dispatch contract. Committed
     fixtures prove the reviewed commands without requiring a shared snapshot set.
     """
 
@@ -461,56 +418,20 @@ class WeightSetLabelTests(unittest.TestCase):
     def test_every_macos_job_selects_exactly_one_known_weight_set(self) -> None:
         self.assertEqual(weight_set_label_errors(self.workflow), [])
 
-    def test_preserved_local_route_exception_discriminates_mutations(self) -> None:
-        """The campaign route is an exact exception, not a second shared-label policy."""
+    def test_former_local_campaign_route_is_an_ordinary_weight_set_route(self) -> None:
+        """qwen38-bonsai-mlx lost its machine-pinned exception; the generic label rule governs it."""
         import copy
-
-        def doctor(mutate) -> dict:
-            workflow = copy.deepcopy(self.workflow)
-            job = workflow["jobs"][PRESERVED_LOCAL_JOB]
-            selector = next(
-                step
-                for step in job["steps"]
-                if step.get("name") == PRESERVED_LOCAL_STEP
-            )
-            mutate(workflow, job, selector)
-            return workflow
-
-        def remove_host(_workflow, job, _selector):
-            job["runs-on"].remove("nax")
-
-        def remove_platform(_workflow, job, _selector):
-            job["runs-on"].remove("macOS")
-
-        def widen_dispatch(_workflow, job, _selector):
-            job["if"] = "github.event_name == 'workflow_dispatch'"
-
-        def change_runner(_workflow, _job, selector):
-            selector["if"] = "runner.name == 'nax-macos-2'"
-
-        def change_snapshot_root(_workflow, _job, selector):
-            selector["run"] = selector["run"].replace(
-                "/Volumes/Models/Codex-models/sc-23935", "/tmp/sc-23935"
-            )
-
-        def copy_exception(workflow, job, _selector):
-            workflow["jobs"]["another-local-campaign"] = copy.deepcopy(job)
-
-        mutations = {
-            "exact host label removed": remove_host,
-            "macOS platform label removed": remove_platform,
-            "dispatch profile widened": widen_dispatch,
-            "runner identity changed": change_runner,
-            "frozen snapshot root changed": change_snapshot_root,
-            "exception copied to another job": copy_exception,
-        }
-        for mutation, mutate in mutations.items():
+        self.assertEqual(self.workflow["jobs"]["qwen38-bonsai-mlx"]["runs-on"],
+                         ["self-hosted", "macOS", "ARM64", "nax", "rw-llm"])
+        for mutation in ("rw-llm removed", "retired shared label added"):
             with self.subTest(mutation=mutation):
-                self.assertNotEqual(
-                    weight_set_label_errors(doctor(mutate)),
-                    [],
-                    f"the gate accepted a workflow where {mutation}",
-                )
+                workflow = copy.deepcopy(self.workflow)
+                runs_on = workflow["jobs"]["qwen38-bonsai-mlx"]["runs-on"]
+                if mutation == "rw-llm removed":
+                    runs_on.remove("rw-llm")
+                else:
+                    runs_on.append("real-weights")
+                self.assertTrue(weight_set_label_errors(workflow), mutation)
 
     def test_every_declared_label_is_documented_with_its_host(self) -> None:
         """The header table is the only record of which box stores which set — keep it honest."""
@@ -593,7 +514,8 @@ class WeightSetLabelTests(unittest.TestCase):
                     job['runs-on'].remove('macOS')
                 elif mutation == 'command':
                     if name == 'ios-prequant':
-                        job['steps'][0]['run'] = 'true'
+                        # A runner-name comparison is a machine pin, never a route contract.
+                        job['steps'][0]['run'] += '\n[[ "$RUNNER_NAME" == nax-macos ]]'
                     else:
                         job['steps'].append({'run': 'python read_snapshot.py'})
                 else:
@@ -606,7 +528,6 @@ class WeightSetLabelTests(unittest.TestCase):
         self.assertEqual(weight_set_label_errors(workflow), [])
         source = (WORKFLOW.parents[2] / 'scripts/ci/ios_prequant.py').read_text(encoding='utf-8')
         for marker in ('cache = runner_hub_cache()',
-                       'os.environ.get("RUNNER_NAME") != "nax-macos"',
                        'binding["source_sha"]', 'input_headers(name, source)',
                        'admit_memory(', 'run_guarded(', 'metal_trap_required'):
             self.assertIn(marker, source)

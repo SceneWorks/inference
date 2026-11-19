@@ -267,7 +267,7 @@ class NoiseFloorPhaseTests(unittest.TestCase):
     def test_workflow_runs_collects_and_uploads_nf_after_every_other_w1_phase(self):
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         job = workflow["jobs"]["nf"]
-        self.assertEqual(job["needs"], ["config", "build", "a1", "a3", "a2", "b"])
+        self.assertEqual(job["needs"], ["config", "probe", "build", "a1", "a3", "a2", "b"])
         self.assertIn("contains(needs.config.outputs.phases, ',nf,')", job["if"])
         for phase in ("a1", "a3", "a2", "b"):
             self.assertIn(f"needs.{phase}.outputs.stopped != 'true'", job["if"])

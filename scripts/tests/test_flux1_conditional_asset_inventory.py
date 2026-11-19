@@ -69,7 +69,7 @@ def no_listing():
 
 
 class ConditionalAssetInventory(unittest.TestCase):
-    def inventory(self, hub, runner="nax-macos-2", **kwargs):
+    def inventory(self, hub, runner="nax", **kwargs):
         guards = no_listing()
         for guard in guards:
             guard.start()
@@ -303,7 +303,7 @@ class ConditionalAssetInventory(unittest.TestCase):
                 destination.write_bytes(b"fetched")
                 return 7, hashlib.sha256(b"fetched").hexdigest(), None
 
-            receipts = assets.stage_pinned_assets(hub, "nax-macos-2", token="t", fetch=fetch)
+            receipts = assets.stage_pinned_assets(hub, "nax", token="t", fetch=fetch)
             self.assertEqual([(r["role"], r["action"]) for r in receipts], [("pulid", "fetched")])
             repo, name, revision = assets.PRODUCT_SOURCES["pulid"]
             self.assertEqual(calls, [(f"https://huggingface.co/{repo}/resolve/{revision}/{name}",
@@ -319,14 +319,14 @@ class ConditionalAssetInventory(unittest.TestCase):
             refs = put(hub, (assets.cache_dir(hub, control_repo) / "refs/main").relative_to(hub),
                        OTHER_REV.encode())
             calls.clear()
-            receipts = assets.stage_pinned_assets(hub, "nax-macos-2", fetch=fetch)
+            receipts = assets.stage_pinned_assets(hub, "nax", fetch=fetch)
             self.assertEqual([r["role"] for r in receipts], ["control"])
             self.assertEqual(calls[0][1], control)
             self.assertEqual(off_pin.read_bytes(), b"old")
             self.assertEqual(refs.read_bytes(), OTHER_REV.encode())
             # Nothing missing: nothing fetched.
             calls.clear()
-            self.assertEqual(assets.stage_pinned_assets(hub, "nax-macos-2", fetch=fetch), [])
+            self.assertEqual(assets.stage_pinned_assets(hub, "nax", fetch=fetch), [])
             self.assertEqual(calls, [])
 
     def test_stage_gemma_fetches_the_index_then_its_shards_and_keeps_existing_files(self):
@@ -345,7 +345,7 @@ class ConditionalAssetInventory(unittest.TestCase):
                 destination.write_bytes(body)
                 return len(body), hashlib.sha256(body).hexdigest(), None
 
-            receipts = assets.stage_pinned_assets(hub, "nax-macos-2", fetch=fetch)
+            receipts = assets.stage_pinned_assets(hub, "nax", fetch=fetch)
             actions = {r["file"]: r["action"] for r in receipts}
             self.assertEqual(actions["model.safetensors.index.json"], "fetched")
             self.assertEqual(actions[shards[1]], "fetched")
@@ -366,28 +366,36 @@ class ConditionalAssetInventory(unittest.TestCase):
                        "--request-env", "MODEL_PROOF_REQUEST", "--expected-sha", sha, "--output", str(output)]
             env = dict(os.environ, RUNNER_NAME="nax-macos-2", FLUX1_HUB=str(hub), FLUX1_PAIR_TIER="none",
                        MODEL_PROOF_REQUEST=json.dumps({"selection": "flux1-asset-inventory",
-                                                       "runner": "nax-macos-2"}))
+                                                       "runner": "nax"}))
             plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True,
                                   encoding="utf-8", check=True)
-            self.assertEqual(json.loads(plan.stdout)["selected_runner"], "nax-macos-2")
-            metadata_request = {"selection": "flux1-asset-inventory", "runner": "nax-macos-2",
+            self.assertEqual(json.loads(plan.stdout)["selected_runner"], "nax")
+            self.assertEqual(json.loads(plan.stdout)["runner"], ["self-hosted", "macOS", "ARM64", "rw-llm"])
+            # The pre-route request spelling still selects the same labels, not a machine.
+            legacy = assets.plan_request("mlx", {"selection": "flux1-asset-inventory",
+                                                 "runner": "nax-macos-2"}, sha, "none")
+            self.assertEqual((legacy["selected_runner"], legacy["runner"]),
+                             ("nax", ["self-hosted", "macOS", "ARM64", "rw-llm"]))
+            metadata_request = {"selection": "flux1-asset-inventory", "runner": "nax",
                                 "mode": "metadata"}
             self.assertEqual(assets.plan_request("mlx", metadata_request, sha, "none")["mode"], "metadata")
             with self.assertRaisesRegex(ValueError, "exact selection"):
                 assets.plan_request("mlx", {**metadata_request, "roots": ["flux1"]}, sha, "none")
             subprocess.run(command, env=env, check=True, capture_output=True)
             written = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(written["runner"], "nax-macos-2")
+            self.assertEqual(written["runner"], "nax")
+            self.assertEqual(written["runner_name"], "nax-macos-2")
             self.assertEqual(written["roles"]["control"]["status"], "unique")
+            # Either interchangeable Mac may run the macOS route; its name is only recorded.
             env["RUNNER_NAME"] = "nax-macos"
-            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True,
-                                               encoding="utf-8").returncode, 0)
+            subprocess.run(command, env=env, check=True, capture_output=True)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["runner_name"], "nax-macos")
             with self.assertRaisesRegex(ValueError, "backend and selected runner differ"):
                 assets.plan_request("candle-cuda", {"selection": "flux1-asset-inventory",
-                                                     "runner": "nax-macos-2"}, sha, "none")
+                                                     "runner": "nax"}, sha, "none")
             with self.assertRaisesRegex(ValueError, "flux1_pair=none"):
                 assets.plan_request("mlx", {"selection": "flux1-asset-inventory",
-                                            "runner": "nax-macos-2"}, sha, "conditional-tier1")
+                                            "runner": "nax"}, sha, "conditional-tier1")
             windows = assets.plan_request("candle-cuda", {"selection": "flux1-asset-inventory",
                                                          "runner": "cuda-windows-2"}, sha, "none")
             self.assertIn("cuda-windows-2", windows["runner"])

@@ -63,7 +63,7 @@ class SimulatorProjectToolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unexpected version'):
                 tool.probe(Path('/not-executed'))
 
-    def test_prerequisite_follows_checkout_and_preserves_both_unsigned_runners(self):
+    def test_prerequisite_follows_checkout_and_accepts_any_labelled_mac(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ios-simulator-sana.yml').read_text(encoding='utf-8'))
         job = workflow['jobs']['runtime-boundary']
         self.assertEqual(job['runs-on'], ['self-hosted', 'macOS', 'ARM64', 'nax'])
@@ -73,8 +73,9 @@ class SimulatorProjectToolTests(unittest.TestCase):
         self.assertLess(checkout, prerequisite)
         before = '\n'.join(step.get('run', '') for step in steps[:checkout])
         self.assertNotIn('command -v', before)
-        self.assertIn('nax-macos-2', before)
-        self.assertIn('nax-macos', before)
+        # The labels choose the Mac; the pre-checkout gate never names one.
+        self.assertNotIn('nax-macos', before)
+        self.assertIn('"$RUNNER_OS" == macOS && "$RUNNER_ARCH" == ARM64', before)
         self.assertIn('command -v python3.12', steps[prerequisite]['run'])
         self.assertNotIn('brew install', yaml.safe_dump(workflow))
         create = next(i for i, step in enumerate(steps) if 'ios_simulator_sana_device.py create' in step.get('run', ''))

@@ -58,10 +58,10 @@ jobs:
       CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
       CARGO_INCREMENTAL: '0'
     steps:
-      - name: Require an allowed Mac and exact simulator dispatch identity
+      - name: Require a macOS ARM64 runner and exact simulator dispatch identity
         shell: bash
         run: |
-          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ( "$RUNNER_NAME" == nax-macos || "$RUNNER_NAME" == nax-macos-2 ) && "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == ARM64 ]]
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && -n "$RUNNER_NAME" && "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == ARM64 ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" == "$GITHUB_SHA" ]]
           [[ "$SIMULATOR_SELECTOR" == iPhone\ * ]]
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

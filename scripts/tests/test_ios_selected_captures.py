@@ -52,9 +52,11 @@ class SelectedCaptures(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.select(value)
 
-    def test_only_dispatch_on_exact_second_host_is_allowed(self):
+    def test_only_dispatch_on_a_macos_arm64_runner_is_allowed(self):
         runner.require_dispatch(self.env)
-        for key in self.env:
+        # Either interchangeable Mac may run it; the runner name is never checked.
+        runner.require_dispatch(dict(self.env, RUNNER_NAME="any-mac"))
+        for key in ("GITHUB_EVENT_NAME", "RUNNER_OS", "RUNNER_ARCH"):
             env = dict(self.env, **{key: "other"})
             with self.assertRaises(ValueError):
                 runner.require_dispatch(env)
@@ -211,9 +213,10 @@ class SelectedCaptures(unittest.TestCase):
         self.assertIn('--binding "$IOS_CAPTURE_BINDING"', capture['steps'][2]['run'])
         self.assertNotIn('fromJSON(', json.dumps(capture))
         compile_env = workflow['jobs']['ios-pricing-compile-only']['env']
-        for key, value in {'SOURCE_SHA': 'source_sha', 'SOURCE_MANIFEST_SHA256': 'manifest_sha256',
-                           'COMPILE_HOST': 'host'}.items():
+        for key, value in {'SOURCE_SHA': 'source_sha', 'SOURCE_MANIFEST_SHA256': 'manifest_sha256'}.items():
             self.assertEqual(compile_env[key], '${{ fromJSON(inputs.ios_pricing_compile_binding).' + value + ' }}')
+        # The binding's legacy `host` field still names the artifact but no longer gates placement.
+        self.assertNotIn('COMPILE_HOST', compile_env)
         self.assertEqual(compile_env['COMPILE_PHASE'],
                          "${{ fromJSON(inputs.ios_pricing_compile_binding).phase || 'compile-only' }}")
         self.assertEqual(runner.selection_from_binding(default), 'iris')
@@ -247,12 +250,12 @@ class SelectedCaptures(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('capture prerequisite/validation failure', result.stderr)
 
-    def test_workflow_is_dispatch_only_and_host_enforced(self):
+    def test_workflow_is_dispatch_only_and_label_routed(self):
         text = (ROOT / '.github/workflows/real-weights.yml').read_text(encoding='utf-8')
         job = text.split('  ios-selected-captures:\n')[1].split('  ios-pricing-compile-only:\n')[0]
         self.assertIn("github.event_name == 'workflow_dispatch'", job)
         self.assertIn('runs-on: [self-hosted, macOS, ARM64, rw-llm]', job)
-        self.assertIn('[[ "$RUNNER_NAME" == nax-macos-2 ]]', job)
+        self.assertNotIn('RUNNER_NAME', job)
         self.assertIn('--binding "$IOS_CAPTURE_BINDING"', job)
         self.assertNotIn('campaign.py', job)
 

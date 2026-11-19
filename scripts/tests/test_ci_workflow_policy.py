@@ -1256,7 +1256,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("ios-prequant", dispatch["profile"]["options"])
         job = workflow["jobs"]["ios-prequant"]
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'")
-        self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "rw-chroma"])
         self.assertEqual(job["env"]["IOS_PREQUANT_BINDING"], "${{ inputs.ios_pricing_compile_binding }}")
         resolver = next(step["run"] for step in job["steps"] if step.get("name") == "Resolve matching MLX native artifact")
         self.assertIn("scripts/fetch-prebuilt-mlx.sh --target aarch64-apple-darwin --build-type Debug --github-env", resolver)
@@ -5118,7 +5118,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         cuda = jobs["qwen38-bonsai-candle"]
         aggregate = jobs["qwen38-bonsai-aggregate"]
         self.assertNotIn("qwen38-bonsai-candle-cpu", jobs)
-        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "rw-llm"])
         self.assertEqual(cuda["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
         self.assert_qwen38_candle_requires_successful_mlx(workflow)
         self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle"])
@@ -5729,7 +5729,7 @@ class WindowsBashSelectionTests(unittest.TestCase):
             "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"
         ):
             errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
-        # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
+        # The Qwen-Image weight-set label, never the privileged `real-weights` one.
         runner = inputs.get("qwen_image_2_1_lora_runner", {})
         if runner.get("type") != "choice" or runner.get("default") != "rw-mage" or runner.get("options") != ["rw-mage", "rw-starvector"]:
             errors.append("MLX LoRA runner must be bounded to rw-mage/rw-starvector, default rw-mage")

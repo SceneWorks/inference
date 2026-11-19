@@ -1,6 +1,6 @@
 name: YuE2 app stage-precision admission profile
 
-# Dispatch only, once per owned CUDA or nax-macos-2 window. This runs exactly
+# Dispatch only, once per owned CUDA or Mac window. This runs exactly
 # eight CUDA / seven Metal off-plan app profiles; old acceptance, corpus and quality are untouched.
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ on:
         type: boolean
         required: false
         default: false
-        description: Operator confirms a fresh nax-macos-2 resource window was approved
+        description: Operator confirms a fresh Mac resource window was approved
       idle_cuda_context_run_id:
         type: string
         required: false
@@ -240,7 +240,6 @@ jobs:
         run: |
           set -euo pipefail
           test "$METAL_RESOURCE_APPROVED" = true
-          test "$RUNNER_NAME" = nax-macos-2
           [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_APP_SHA" =~ ^[0-9a-f]{40}$ ]]

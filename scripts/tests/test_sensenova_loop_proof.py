@@ -86,16 +86,16 @@ class SenseNovaProvisioningTests(unittest.TestCase):
             "policy": {"backend": "darwin-mlx"},
             "sensenova_reference_policy": {"backend": "windows-cuda"},
         }
-        for route, name, label in (
-            ("nax", "nax-macos-2", "rw-llm"), ("nax-primary", "nax-macos", "rw-starvector"),
-        ):
+        for route, label in (("nax", "rw-llm"), ("nax-primary", "rw-starvector")):
             with self.subTest(route=route):
                 parsed = request(json.dumps({**value, "runner": route}), "mlx")
                 self.assertIn(label, NAX_ROUTES[parsed["runner"]]["labels"])
-                env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_OS": "macOS", "RUNNER_NAME": name}
-                require_host("mlx", env, route)
-                with self.assertRaisesRegex(ValueError, "must run on"):
-                    require_host("mlx", {**env, "RUNNER_NAME": "wrong Mac"}, route)
+                env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_OS": "macOS"}
+                # The labels choose the Mac; either interchangeable Mac satisfies either route.
+                for name in ("nax-macos", "nax-macos-2"):
+                    require_host("mlx", {**env, "RUNNER_NAME": name}, route)
+                with self.assertRaisesRegex(ValueError, "wrong proof host platform"):
+                    require_host("mlx", {**env, "RUNNER_OS": "Linux"}, route)
         with self.assertRaisesRegex(ValueError, "explicit provisioned Mac route"):
             request(json.dumps(value), "mlx")
         with self.assertRaisesRegex(ValueError, "explicit provisioned Mac route"):

@@ -70,8 +70,8 @@ def validate_receipt(value: dict, backend: str, expected_paths: dict[str, str] |
 
 def snapshot_paths(backend: str, env: dict[str, str]) -> tuple[tuple[str, str, Path], ...]:
     if backend == "mlx":
-        if env.get("RUNNER_OS") != "macOS" or env.get("RUNNER_NAME") != "nax-macos-2":
-            raise ValueError("Iris MLX quant proofs require the provisioned secondary Mac")
+        if env.get("RUNNER_OS") != "macOS":
+            raise ValueError("Iris MLX quant proofs require a macOS runner")
         # The runner's own hub cache, where the other Iris MLX lanes now read and download too.
         cache = runner_hub_cache(env)
         models = (("IRIS_WEIGHTS_DIR", "iris-3b-generation-mlx", "speridlabs--iris-3b", IRIS_REVISION),

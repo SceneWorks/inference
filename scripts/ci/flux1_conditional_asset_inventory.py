@@ -35,10 +35,16 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci.flux1_pair.conditional import CASES, require_pid_gemma_footprint
 from scripts.ci.flux1_pair.fs_probe import Unreachable, probe
 
-RUNNERS = {"nax-macos-2", "cuda-windows", "cuda-windows-2"}
-LANES = {"nax-macos-2": ["self-hosted", "macOS", "ARM64", "rw-llm"],
+# Routes a request may select, keyed by route. The macOS route is a label set: either
+# interchangeable Mac may carry `rw-llm`, and nothing compares the runner's name. Each Windows
+# route still names its exact CUDA listener.
+LANES = {"nax": ["self-hosted", "macOS", "ARM64", "rw-llm"],
          "cuda-windows": ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows"],
          "cuda-windows-2": ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows-2"]}
+RUNNERS = set(LANES)
+WINDOWS_ROUTES = {"cuda-windows", "cuda-windows-2"}
+# The request spelling used before routes were keyed by label; it selects the same `nax` labels.
+REQUEST_ALIASES = {"nax-macos-2": "nax"}
 MAX_HASH_BYTES = 120 * 1024**3
 MAX_SECONDS = 1_200
 MAX_METADATA_SECONDS = 300
@@ -234,7 +240,7 @@ def inventory(hub, runner, metadata_only=False):
     if not hub.is_dir():
         raise ValueError("configured model hub is not a directory")
     budget = Budget(MAX_METADATA_SECONDS if metadata_only else None)
-    backend = "mlx" if runner == "nax-macos-2" else "candle-cuda"
+    backend = "candle-cuda" if runner in WINDOWS_ROUTES else "mlx"
     needed = sorted({role for _, backends, roles in CASES.values() if backend in backends
                      for role in roles})
     roles = {role: role_inventory(role, hub, budget, metadata_only) for role in needed}
@@ -396,8 +402,8 @@ def plan_request(backend, request, expected_sha, tier):
     mode = request.get("mode", "hash")
     if mode not in {"hash", "metadata"}:
         raise ValueError("inventory mode must be hash or metadata")
-    runner = request["runner"]
-    if runner not in RUNNERS or backend != ("mlx" if runner == "nax-macos-2" else "candle-cuda"):
+    runner = REQUEST_ALIASES.get(request["runner"], request["runner"])
+    if runner not in RUNNERS or backend != ("candle-cuda" if runner in WINDOWS_ROUTES else "mlx"):
         raise ValueError("inventory backend and selected runner differ")
     if tier != "none":
         raise ValueError("asset inventory requires flux1_pair=none")
@@ -440,7 +446,7 @@ def main():
         return
     if args.output is None:
         parser.error("--output is required for inventory")
-    if os.environ.get("RUNNER_NAME") != plan["selected_runner"]:
+    if plan["selected_runner"] in WINDOWS_ROUTES and os.environ.get("RUNNER_NAME") != plan["selected_runner"]:
         parser.error("selected runner differs from actual runner")
     root = os.environ.get("FLUX1_HUB")
     if not root:
@@ -459,6 +465,7 @@ def main():
             signal.alarm(0)
     result["source_sha"] = plan["source_sha"]
     result["runner"] = plan["selected_runner"]
+    result["runner_name"] = os.environ.get("RUNNER_NAME")  # provenance only
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
