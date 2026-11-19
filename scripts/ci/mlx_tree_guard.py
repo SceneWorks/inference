@@ -57,7 +57,11 @@ def rusage(pid):
 def tree_pids(root):
     """`root` and every live descendant."""
     listing = subprocess.run(
-        ["/bin/ps", "-axo", "pid=,ppid="], capture_output=True, text=True, check=False
+        ["/bin/ps", "-axo", "pid=,ppid="],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
     ).stdout
     children = {}
     for line in listing.splitlines():
@@ -77,10 +81,18 @@ def tree_pids(root):
 def free_gib():
     """Free unified memory in GiB: `memory_pressure`'s free percentage of `hw.memsize`, or `None`."""
     pressure = subprocess.run(
-        ["/usr/bin/memory_pressure", "-Q"], capture_output=True, text=True, check=False
+        ["/usr/bin/memory_pressure", "-Q"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
     ).stdout
     memsize = subprocess.run(
-        ["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=False
+        ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
     ).stdout.strip()
     match = re.search(r"free percentage: (\d+)%", pressure)
     if not match or not memsize.isdigit():

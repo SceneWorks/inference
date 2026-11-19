@@ -2377,7 +2377,7 @@ class MlxTreeGuardTests(unittest.TestCase):
 
     def run_guard(self, *args):
         return subprocess.run([sys.executable, str(self.GUARD), *args], capture_output=True,
-                              text=True, check=False)
+                              text=True, encoding="utf-8", check=False)
 
     def test_no_headroom_refuses_before_starting(self) -> None:
         result = self.run_guard("100000", "60", "--", sys.executable, "-c", "print('ran')")
