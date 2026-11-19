@@ -190,6 +190,7 @@ fn qwen35_quantize_on_load_q8() {
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     })
     .expect("load q8");
     assert!(q8.is_quantized(), "Q8 load must report quantized");

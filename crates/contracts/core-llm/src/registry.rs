@@ -441,6 +441,7 @@ mod tests {
             mtp: None,
             speculative: Vec::new(),
             supported_constraints: constraints.iter().map(Constraint::kind).collect(),
+            tree_verify: None,
         }
     }
 

@@ -1196,6 +1196,7 @@ pub fn bench_load_spec(
         quantize: parse_bench_format(&format)?,
         mtp_head_source: var("SPECULATIVE_BENCH_MTP_HEAD"),
         draft_source: var("SPECULATIVE_BENCH_DRAFT"),
+        draft_quantize: None,
         prefix_cache_bytes,
         ..LoadSpec::dense(snapshot)
     })

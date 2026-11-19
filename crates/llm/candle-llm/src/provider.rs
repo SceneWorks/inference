@@ -28,11 +28,12 @@ use serde_json::Value;
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_monitored,
-    graph_demoted_step_admission_bytes, graph_workspace_admission_bytes, prefill_restored,
-    Boundary, ConstraintMask, CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer,
-    FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer,
-    NoProposer, PrefixCache, PrefixStats, Proposer, RequestSpan, RewindableConstraintMask,
-    SpeculativePrompt, StepModel, StreamEvent,
+    graph_demoted_step_admission_bytes, graph_workspace_admission_bytes_with_hidden_row,
+    prefill_restored, tree_extra_positions, BlockDraftProposer, Boundary, ConstraintMask,
+    CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason,
+    GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache,
+    PrefixStats, Proposer, RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel,
+    StreamEvent, TappedQwen35,
 };
 use crate::device::select_device;
 use crate::error::to_core;
@@ -178,6 +179,35 @@ impl DecodeRoute {
             DecodeRoute::Engine { drafts, .. } => drafts,
         }
     }
+
+    /// The proposer the route runs ([`ProposerKind::None`] on the reference loop).
+    fn proposer(self) -> ProposerKind {
+        match self {
+            DecodeRoute::Reference => ProposerKind::None,
+            DecodeRoute::Engine { proposer, .. } => proposer,
+        }
+    }
+}
+
+/// The pricing tests' untapped form of [`priced_request_bytes_tapped`].
+#[cfg(test)]
+fn priced_request_bytes(
+    model: &Decoder,
+    route: DecodeRoute,
+    admitted_prompt: usize,
+    max_new_tokens: u32,
+    vision_workspace: u64,
+    cuda_graphs: bool,
+) -> Option<u64> {
+    priced_request_bytes_tapped(
+        model,
+        route,
+        admitted_prompt,
+        max_new_tokens,
+        vision_workspace,
+        cuda_graphs,
+        None,
+    )
 }
 
 /// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens (the
@@ -195,15 +225,20 @@ impl DecodeRoute {
 ///
 /// Whenever the engine runs through the CUDA-graph runner (`cuda_graphs`, sc-24134) — with a
 /// proposer or without one — the graphs it may capture are priced too
-/// ([`graph_workspace_admission_bytes`] over the `1 ..= K + 1` step token counts), so a request
-/// that could not hold them fails closed at admission instead of at instantiation (sc-24140).
-fn priced_request_bytes(
+/// ([`engine_graph_workspace`] over the `1 ..= K + 1` step token counts), so a request that could
+/// not hold them fails closed at admission instead of at instantiation (sc-24140).
+///
+/// A `block_draft` route's verify steps stage the tapped layers' outputs, `tap_width`
+/// (`layers × hidden`) elements per row, not one hidden row (SW-7197); `None` prices them at
+/// `hidden_size`.
+fn priced_request_bytes_tapped(
     model: &Decoder,
     route: DecodeRoute,
     admitted_prompt: usize,
     max_new_tokens: u32,
     vision_workspace: u64,
     cuda_graphs: bool,
+    tap_width: Option<u64>,
 ) -> Option<u64> {
     let geometry = match route {
         DecodeRoute::Engine { drafts, .. } => model.step_memory_geometry(drafts as usize),
@@ -214,8 +249,15 @@ fn priced_request_bytes(
             let positions = u64::try_from(admitted_prompt)
                 .ok()?
                 .checked_add(u64::from(max_new_tokens))?;
-            let hidden_steps = proposer == ProposerKind::Mtp;
-            engine_graph_workspace(model, drafts, positions, cuda_graphs, hidden_steps)?
+            // An MTP head's and a block draft's steps ask for hidden rows (a block draft's: its
+            // tapped rows, `tap_width` wide), a captured shape of their own.
+            let hidden = model.step_memory_geometry(drafts as usize).hidden_size;
+            let hidden_row = match proposer {
+                ProposerKind::Mtp => Some(hidden),
+                ProposerKind::BlockDraft => Some(tap_width.unwrap_or(hidden)),
+                _ => None,
+            };
+            engine_graph_workspace(model, drafts, positions, cuda_graphs, hidden_row)?
                 .checked_add(model.device_step_bytes(drafts, positions)?)?
         }
         DecodeRoute::Reference => 0,
@@ -231,32 +273,116 @@ fn priced_request_bytes(
     )
 }
 
+/// The tree bound a decoder that verifies trees advertises (feature SW-F328).
+const TREE_VERIFY_CAPABILITIES: core_llm::TreeVerifyCapabilities =
+    core_llm::TreeVerifyCapabilities {
+        max_rows: core_llm::MAX_TREE_ROWS,
+    };
+
+/// Why a multimodal request's tree verification ran linearly (feature SW-F328) — MLX's words.
+const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not available on the \
+     multimodal decode path (its prompt is prefilled from spliced embeddings); verified linearly";
+
+/// What a tree route adds to a request's admission price beyond its linear route (feature
+/// SW-F328, E6) on the engine with `drafts` drafts per verify step and a bound of `tree_rows`
+/// candidate rows: the static KV positions past the linear overshoot the tree writes
+/// ([`tree_extra_positions`](crate::decode::tree_extra_positions)) and their logit and hidden
+/// rows, the ancestor mask over the whole context, and — on the hybrid — every row's transient
+/// recurrent state (one full state per linear layer per row, held until the branch is kept).
+/// Only a `proposer` that builds branching trees carries that workspace
+/// ([`core_llm::tree_workspace_rows`]); any other's one branch is capped at `drafts` candidates
+/// and verified on the linear path the linear route already prices. A block draft's eager tree
+/// forward also holds the tapped layer outputs of every tree row — the anchor and up to
+/// [`core_llm::MAX_TREE_ROWS`] candidates, `tap_width` elements each at the compute dtype — and
+/// the engine's gather of the accepted branch copies at most as many again (SW-7198; `tap_width`
+/// is `0` for any other proposer). `0` without a tree; `None` on overflow.
+#[allow(clippy::too_many_arguments)]
+fn tree_request_bytes(
+    model: &Decoder,
+    proposer: ProposerKind,
+    drafts: u32,
+    tree_rows: usize,
+    prompt: usize,
+    max_new_tokens: u32,
+    tap_width: u64,
+) -> Option<u64> {
+    let tree_rows = core_llm::tree_workspace_rows(proposer, tree_rows);
+    if drafts == 0 || tree_rows == 0 {
+        return Some(0);
+    }
+    let g = model.step_memory_geometry(drafts as usize);
+    let rows = u64::try_from(tree_rows.min(core_llm::MAX_TREE_ROWS as usize) + 1).ok()?;
+    let extra = u64::try_from(tree_extra_positions(drafts as usize, tree_rows)).ok()?;
+    let kv_position = g
+        .layers
+        .checked_mul(g.kv_heads)?
+        .checked_mul(g.head_dim)?
+        .checked_mul(g.element_bytes)?
+        .checked_mul(2)?;
+    let row = g.hidden_size.checked_add(g.vocab_size)?.checked_mul(4)?;
+    // The tree rows' tap buffer and the accepted branch's gathered copy, at the target's compute
+    // dtype (the geometry's `element_bytes` is a flat f32 price; a block draft only ever taps the
+    // hybrid).
+    let tap_element = match model {
+        Decoder::Qwen35(m) => m.compute_dtype().size_in_bytes() as u64,
+        Decoder::Causal(_) => g.element_bytes,
+    };
+    let taps = rows
+        .checked_mul(tap_width)?
+        .checked_mul(tap_element)?
+        .checked_mul(2)?;
+    let context = u64::try_from(prompt)
+        .ok()?
+        .checked_add(u64::from(max_new_tokens))?
+        .checked_add(extra)?;
+    let mask = rows
+        .checked_mul(context.checked_add(rows)?)?
+        .checked_mul(4)?;
+    let states = match model {
+        Decoder::Qwen35(m) => u64::try_from(m.recurrent_state_bytes(rows as usize)).ok()?,
+        Decoder::Causal(_) => 0,
+    };
+    extra
+        .checked_mul(kv_position.checked_add(row)?)?
+        .checked_add(mask)?
+        .checked_add(states)?
+        .checked_add(taps)
+}
+
 /// The CUDA-graph workspace admission charges a request on the engine with `drafts` drafts per
 /// verify step whose prompt and budget reach `positions` positions: every graph the runner may
-/// capture ([`graph_workspace_admission_bytes`] over the step geometry, the reach plus the verify
-/// overshoot, and the `1 ..= K + 1` step token counts — `1` with no proposer), or `0` when the
-/// runner is off (`cuda_graphs`). A route whose steps ask for hidden rows (`hidden_steps`: MTP)
-/// also prices the plain step it takes once `auto` demotes it (sc-24446,
-/// [`graph_demoted_step_admission_bytes`]) — whether a request is demoted is decided mid-request,
-/// so every MTP route carries it. `None` on overflow (the caller fails closed).
+/// capture ([`crate::decode::graph_workspace_admission_bytes`] over the step geometry, the reach
+/// plus the verify overshoot, and the `1 ..= K + 1` step token counts — `1` with no proposer), or
+/// `0` when the runner is off (`cuda_graphs`). A route whose steps ask for hidden rows
+/// (`hidden_row`: the staged row's width — `hidden_size` for MTP, the tapped layers'
+/// `layers × hidden` for a block draft, SW-7197) stages that row per token, and also prices the
+/// plain step it takes once `auto` demotes it (sc-24446, [`graph_demoted_step_admission_bytes`])
+/// — whether a request is demoted is decided mid-request, so every such route carries it. `None`
+/// on overflow (the caller fails closed).
 fn engine_graph_workspace(
     model: &Decoder,
     drafts: u32,
     positions: u64,
     cuda_graphs: bool,
-    hidden_steps: bool,
+    hidden_row: Option<u64>,
 ) -> Option<u64> {
     if !cuda_graphs {
         return Some(0);
     }
     let geometry = model.step_memory_geometry(drafts as usize);
     let reach = positions.checked_add(u64::from(drafts))?;
-    let demoted = if hidden_steps {
+    let demoted = if hidden_row.is_some() {
         graph_demoted_step_admission_bytes(&geometry, reach)?
     } else {
         0
     };
-    graph_workspace_admission_bytes(&geometry, reach, drafts.checked_add(1)?)?.checked_add(demoted)
+    graph_workspace_admission_bytes_with_hidden_row(
+        &geometry,
+        reach,
+        drafts.checked_add(1)?,
+        hidden_row.unwrap_or(geometry.hidden_size),
+    )?
+    .checked_add(demoted)
 }
 
 /// What the Gemma 4 soft-token splice re-admits once the expanded prompt (`capacity` = expanded
@@ -272,7 +398,7 @@ fn spliced_prompt_bytes(
 ) -> Option<u64> {
     let positions = u64::try_from(capacity).ok()?;
     // The Gemma 4 splice runs prompt lookup or no proposer: no hidden-row steps.
-    let graphs = engine_graph_workspace(model, drafts, positions, cuda_graphs, false)?;
+    let graphs = engine_graph_workspace(model, drafts, positions, cuda_graphs, None)?;
     let preallocated = capacity.checked_add(usize::try_from(drafts).ok()?)?;
     u64::try_from(model.static_kv_bytes(preallocated))
         .ok()?
@@ -322,6 +448,17 @@ impl Decoder {
             head_dim,
         );
         u64::try_from(crate::primitives::DevicePositions::BYTES.checked_add(workspace)?).ok()
+    }
+
+    /// The tree advertisement a loaded decoder carries (feature SW-F328): the qwen3_5 hybrid and
+    /// every llama-family decoder without sliding-window or KV-sharing layers
+    /// ([`CausalLm::tree_unsupported`]) verify up to [`core_llm::MAX_TREE_ROWS`] candidate rows.
+    fn tree_verify_capabilities(&self) -> Option<core_llm::TreeVerifyCapabilities> {
+        match self {
+            Decoder::Causal(m) => m.tree_unsupported().is_none(),
+            Decoder::Qwen35(_) => true,
+        }
+        .then_some(TREE_VERIFY_CAPABILITIES)
     }
 
     /// Whether the decoder's step can be captured as a CUDA graph at all
@@ -932,6 +1069,10 @@ pub struct LlamaProvider {
     /// then. A second decoder on the target's device, driven by the engine as a
     /// [`DraftModelProposer`] with its own static cache per request.
     draft: Option<ResidentDraft>,
+    /// The resident block draft for `block_draft` speculation (SW-F360, SW-7197), present iff the
+    /// load's named draft is a block draft (its `architectures`) that fits this Qwen3.5/3.8
+    /// target; `block_draft` is advertised exactly then.
+    block_draft: Option<ResidentBlockDraft>,
     /// What became of the load's named draft (resident, or refused with the reason), reported in
     /// [`TextLlm::load_report`]. `None` when no draft was named.
     draft_report: Option<DraftReport>,
@@ -983,6 +1124,74 @@ struct ResidentDraft {
     context: usize,
 }
 
+/// A block draft resident beside its Qwen3.5/3.8 target (SW-F360, SW-7197).
+struct ResidentBlockDraft {
+    model: crate::models::BlockDraft,
+    /// What the decode report names it by (E8).
+    report: core_llm::DecodeDraft,
+}
+
+/// The fallback a `block_draft` plan names on a provider with no resident block draft.
+const BLOCK_DRAFT_NOT_LOADED: &str = "speculative: `block_draft` has no block draft loaded \
+     beside this target; decoded without a proposer";
+
+/// The load estimate of a named block draft (SW-F360 E8), from the shared pricing at its
+/// requested precision: on the device its resident arrays plus twice its largest load group's
+/// window ([`core_llm::BlockDraftConfig::load_bytes`]) and the CUDA row padding of each GGML
+/// projection; on the host one group's BF16 sources and their f32 quantizer inputs. `None` when
+/// `spec.source` is not a block draft.
+fn block_draft_load_estimate(
+    spec: &LoadSpec,
+    cuda: bool,
+) -> Option<CoreResult<LoadMemoryEstimate>> {
+    let dir = Path::new(&spec.source);
+    core_llm::BlockDraftFormat::of_dir(dir)?;
+    let refused = |e: core_llm::BlockDraftRefusal| CoreError::Load(e.to_string());
+    Some((|| {
+        let cfg = core_llm::BlockDraftConfig::read(dir).map_err(refused)?;
+        let precision =
+            core_llm::BlockDraftPrecision::from_request(spec.draft_quantize).map_err(refused)?;
+        let padding = ggml_device_bytes(
+            0,
+            match precision {
+                core_llm::BlockDraftPrecision::Q8 => candle_core::quantized::GgmlDType::Q8_0,
+                core_llm::BlockDraftPrecision::Q4 => candle_core::quantized::GgmlDType::Q4K,
+            },
+        )
+        .unwrap_or(0);
+        let device = cfg
+            .load_bytes(precision)
+            .saturating_add(padding.saturating_mul(cfg.quantized_matrices().len() as u64));
+        let window = cfg
+            .load_groups()
+            .iter()
+            .map(|g| g.window)
+            .max()
+            .unwrap_or(0);
+        // DSpine's refinement reads the target head's candidate rows in place through one 8-byte
+        // address per vocabulary row (`HeadRows::Indexed`, SW-7197), uploaded beside the draft.
+        let device = match cfg.format {
+            core_llm::BlockDraftFormat::DSpine => {
+                device.saturating_add((cfg.vocab_size as u64).saturating_mul(8))
+            }
+            core_llm::BlockDraftFormat::DFlash2 => device,
+        };
+        // A host load holds the draft itself on the host too.
+        let host = window.saturating_mul(3) + if cuda { 0 } else { device };
+        let payload = core_llm::checkpoint_payload_bytes(dir)?;
+        Ok(LoadMemoryEstimate {
+            payload_bytes: payload,
+            host_required_bytes: host,
+            device_required_bytes: cuda.then_some(device),
+            prefix_cache_bytes: 0,
+            source_bytes: 0,
+            cast_copy_bytes: 0,
+            quantized_copy_bytes: 0,
+            graph_param_cache_bytes: 0,
+        })
+    })())
+}
+
 /// The load spec of a named draft (sc-24436): its own source, text-only, at the target's
 /// load-time tier and CUDA-graph policy, naming no draft itself.
 fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
@@ -994,6 +1203,7 @@ fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
         // A draft keeps no cross-turn prefix cache of its own (sc-24437), and no companion head.
         prefix_cache_bytes: Some(0),
         draft_source: None,
+        draft_quantize: spec.draft_quantize,
         mtp_head_source: None,
     }
 }
@@ -1028,6 +1238,41 @@ fn draft_request_bytes(
         1,
     )?
     .checked_add(draft.device_step_bytes(drafts, positions)?)
+}
+
+/// What a request's `block_draft` proposer holds beside the target (SW-F360 E8): the shared
+/// pricing ([`core_llm::BlockDraftConfig::request_bytes`] — the tapped rows it reads, its
+/// window-bounded context and a step's transients) plus what Candle's scoring adds: DSpine scores
+/// every refined `(row, sender)` pair against the row's `K` candidates through the target head's
+/// row access `head` ([`HeadRows::workspace_bytes`](crate::primitives::head_rows::HeadRows::workspace_bytes)
+/// — the gathered rows or the indexed GEMV's activation copy, and the `drafts × K × K` scores;
+/// the whole head's logits only where the head has no row access). `act` is the target's
+/// activation width in bytes. `None` on overflow.
+fn block_draft_request_bytes(
+    draft: &crate::models::BlockDraft,
+    head: Option<&crate::primitives::head_rows::HeadRows>,
+    act: u64,
+    prompt: usize,
+    max_new_tokens: u32,
+    drafts: u32,
+) -> Option<u64> {
+    let cfg = draft.config();
+    let width = usize::try_from(drafts).ok()?;
+    let refined = match (cfg.format, head) {
+        (core_llm::BlockDraftFormat::DSpine, Some(head)) => head.workspace_bytes(
+            width as u64,
+            cfg.head_topk as u64,
+            cfg.head_topk as u64,
+            cfg.vocab_size as u64,
+            cfg.hidden_size as u64,
+            act,
+        )?,
+        // A DSpine draft is attached only with its head access built.
+        (core_llm::BlockDraftFormat::DSpine, None) => return None,
+        (core_llm::BlockDraftFormat::DFlash2, _) => 0,
+    };
+    cfg.request_bytes(prompt, max_new_tokens, width, act)?
+        .checked_add(refined)
 }
 
 /// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
@@ -1481,6 +1726,10 @@ impl LlamaProvider {
                 proposer: SpeculativeProposer::DraftModel,
                 ..
             } if self.draft.is_none() => (plain, Some(core_llm::DRAFT_MODEL_NOT_LOADED.into())),
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::BlockDraft,
+                ..
+            } if self.block_draft.is_none() => (plain, Some(BLOCK_DRAFT_NOT_LOADED.into())),
             SpeculativePlan::Run { proposer, depth } => (
                 DecodeRoute::Engine {
                     proposer: proposer.into(),
@@ -1573,11 +1822,7 @@ impl LlamaProvider {
         let draft_estimate = match &draft {
             Some((draft_spec, None)) => {
                 // As a draft (never graph-wrapped), the price `admit_draft` admitted it at.
-                Some(Self::load_memory_estimate_as(
-                    draft_spec,
-                    device.is_cuda(),
-                    false,
-                )?)
+                Some(Self::draft_memory_estimate(draft_spec, device.is_cuda())?)
             }
             _ => None,
         };
@@ -1694,7 +1939,7 @@ impl LlamaProvider {
             return Ok(None);
         };
         let draft_spec = draft_load_spec(spec, source);
-        let refusal = match Self::load_memory_estimate_as(&draft_spec, cuda, false) {
+        let refusal = match Self::draft_memory_estimate(&draft_spec, cuda) {
             Err(e) => {
                 core_llm::admit_load_memory(host.0, host.1)?;
                 if let Some((required, available)) = device {
@@ -1721,6 +1966,99 @@ impl LlamaProvider {
         Ok(Some((draft_spec, refusal)))
     }
 
+    /// A named draft's load estimate: a block draft's own (its `architectures`, SW-F360,
+    /// [`block_draft_load_estimate`]), any other draft's as a model loaded without a graph runner.
+    fn draft_memory_estimate(spec: &LoadSpec, cuda: bool) -> CoreResult<LoadMemoryEstimate> {
+        block_draft_load_estimate(spec, cuda)
+            .unwrap_or_else(|| Self::load_memory_estimate_as(spec, cuda, false))
+    }
+
+    /// Load the block draft `spec` names (SW-F360, SW-7197) on the target's device in its compute
+    /// dtype and keep it only if it fits this target: its config is checked against the target
+    /// (hidden size, vocabulary, mask token, target layers, attention geometry — the shared
+    /// [`core_llm::BlockDraftConfig::mismatches`], as MLX checks it) and its stored tensors before
+    /// any weight is built, then it is loaded at the requested precision (E8). Resident —
+    /// `block_draft` advertised — or refused with every typed reason named in the load report,
+    /// the target unaffected either way (E1, AC2).
+    fn attach_block_draft(&mut self, spec: &LoadSpec, format: core_llm::BlockDraftFormat) {
+        let source = spec.source.clone();
+        let outcome = (|| -> std::result::Result<ResidentBlockDraft, String> {
+            let refused = |e: core_llm::BlockDraftRefusal| e.to_string();
+            let Decoder::Qwen35(target) = &self.model else {
+                return Err(core_llm::BlockDraftRefusal::TargetFamily(
+                    "block drafts read Qwen3.5/3.8 hybrid (qwen3_5) targets only".into(),
+                )
+                .to_string());
+            };
+            // The MLX rule (`is_prism`), kept so both backends accept the same drafts: DSpine's
+            // refinement scores candidates against the LM head's dense rows, and MLX refuses any
+            // Prism load — a Prism snapshot with a dense or tied head included.
+            if target.is_prism() && format == core_llm::BlockDraftFormat::DSpine {
+                return Err(core_llm::BlockDraftRefusal::TargetFamily(
+                    "a Prism target's packed LM head has no dense rows for the refinement".into(),
+                )
+                .to_string());
+            }
+            let cfg = core_llm::BlockDraftConfig::read(Path::new(&source)).map_err(refused)?;
+            let precision = core_llm::BlockDraftPrecision::from_request(spec.draft_quantize)
+                .map_err(refused)?;
+            let tcfg = target.config();
+            let mismatches = cfg.mismatches(&core_llm::BlockDraftTarget {
+                hidden_size: tcfg.hidden_size as usize,
+                num_layers: target.num_layers(),
+                vocab_size: tcfg.vocab_size as usize,
+                tokenizer_vocab: self.tokenizer.vocab_size(),
+            });
+            if !mismatches.is_empty() {
+                return Err(core_llm::block_draft_refusal_reason(&mismatches));
+            }
+            let label = cfg.format.label();
+            if format == core_llm::BlockDraftFormat::DSpine {
+                // The refinement's row access to the target's head (its CUDA address table), built
+                // now so a request never builds it; priced with the draft's load.
+                target.head_rows().map_err(|e| {
+                    core_llm::BlockDraftRefusal::TargetFamily(format!(
+                        "the target's LM head rows cannot be addressed: {e}"
+                    ))
+                    .to_string()
+                })?;
+            }
+            let model = crate::models::BlockDraft::load(
+                Path::new(&source),
+                cfg,
+                precision,
+                target.device(),
+                target.compute_dtype(),
+            )
+            .map_err(refused)?;
+            Ok(ResidentBlockDraft {
+                model,
+                report: core_llm::DecodeDraft {
+                    source: source.clone(),
+                    format: label.into(),
+                    precision: precision.label().into(),
+                },
+            })
+        })();
+        let report = match outcome {
+            Ok(draft) => {
+                let max_depth = core_llm::verify_depth_bound(&self.descriptor.capabilities);
+                self.descriptor
+                    .capabilities
+                    .speculative
+                    .push(core_llm::block_draft_capabilities(
+                        max_depth,
+                        draft.model.config().max_depth(),
+                        recommended_depths(self.model.device()),
+                    ));
+                self.block_draft = Some(draft);
+                DraftReport::resident(source)
+            }
+            Err(why) => DraftReport::refused(source, why).named_in(&mut self.load_record.fallbacks),
+        };
+        self.draft_report = Some(report);
+    }
+
     /// Load the draft `spec` names on the target's `device` and keep it only if it can propose
     /// for this target ([`core_llm::draft_compatibility`]): resident — `draft_model` advertised
     /// — or refused with the reason in the load report, the target unaffected either way
@@ -1731,6 +2069,9 @@ impl LlamaProvider {
         device: &Device,
         requested: Option<&ProjectionFormat>,
     ) {
+        if let Some(format) = core_llm::BlockDraftFormat::of_dir(Path::new(&spec.source)) {
+            return self.attach_block_draft(spec, format);
+        }
         let source = spec.source.clone();
         let path = Path::new(&source);
         let target_logits = self.model.memory_geometry().vocab_size as usize;
@@ -1780,6 +2121,15 @@ impl LlamaProvider {
         self.draft_report = Some(report);
     }
 
+    /// The tapped row width a `proposer`'s tree rows carry past the logit and hidden rows
+    /// ([`tree_request_bytes`]): a resident block draft's `layers × hidden` (SW-7198), else `0`.
+    fn tree_tap_width(&self, proposer: ProposerKind) -> u64 {
+        match (proposer, self.block_draft.as_ref()) {
+            (ProposerKind::BlockDraft, Some(d)) => d.model.config().tap_width() as u64,
+            _ => 0,
+        }
+    }
+
     /// What a request on `route` is admitted against before any preprocessing: the target's
     /// priced request ([`priced_request_bytes`]) and, on a `draft_model` route, the resident
     /// draft's beside it ([`draft_bytes`](Self::draft_bytes), E7). `None` on overflow.
@@ -1790,13 +2140,16 @@ impl LlamaProvider {
         max_new_tokens: u32,
         vision_workspace: u64,
     ) -> Option<u64> {
-        priced_request_bytes(
+        priced_request_bytes_tapped(
             &self.model,
             route,
             prompt,
             max_new_tokens,
             vision_workspace,
             cuda_graphs_enabled(),
+            self.block_draft
+                .as_ref()
+                .map(|d| d.model.config().tap_width() as u64),
         )?
         .checked_add(self.draft_bytes(route, prompt, max_new_tokens)?)
     }
@@ -1831,6 +2184,30 @@ impl LlamaProvider {
                 },
                 Some(draft),
             ) => draft_request_bytes(&draft.model, prompt, max_new_tokens, drafts),
+            (
+                DecodeRoute::Engine {
+                    proposer: ProposerKind::BlockDraft,
+                    drafts,
+                },
+                _,
+            ) => {
+                let Decoder::Qwen35(target) = &self.model else {
+                    return None;
+                };
+                let draft = &self.block_draft.as_ref()?.model;
+                // Built at the DSpine attach; a DFlash2 draft never reads it.
+                let head = (draft.config().format == core_llm::BlockDraftFormat::DSpine)
+                    .then(|| target.head_rows().ok())
+                    .flatten();
+                block_draft_request_bytes(
+                    draft,
+                    head,
+                    target.compute_dtype().size_in_bytes() as u64,
+                    prompt,
+                    max_new_tokens,
+                    drafts,
+                )
+            }
             _ => Some(0),
         }
     }
@@ -1950,7 +2327,11 @@ impl LlamaProvider {
         // Whether the load can run steps that ask for hidden rows — an MTP head, native (a
         // Qwen3.5 snapshot configuring one) or a companion — which the graph runner captures as
         // shapes of their own (sc-24446).
-        let mut hidden_steps = spec.mtp_head_source.is_some();
+        let mut hidden_steps = spec.mtp_head_source.is_some()
+            || spec
+                .draft_source
+                .as_deref()
+                .is_some_and(|d| core_llm::BlockDraftFormat::of_dir(Path::new(d)).is_some());
         let working = if crate::gguf::is_gguf_path(&spec.source) {
             if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(source).map_err(to_core)? {
                 // Prism GGUF: packed blocks the loader wraps, never re-quantized.
@@ -2292,6 +2673,7 @@ impl LlamaProvider {
             // sc-24140: the llama family reports its census too (bits/param by projection kind).
             Decoder::Causal(m) => Some(m.weight_census()),
         };
+        descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Ok(Self {
             descriptor,
             model,
@@ -2307,6 +2689,7 @@ impl LlamaProvider {
             )),
             speculative_default: crate::device::decode_defaults(device).speculative,
             draft: None,
+            block_draft: None,
             draft_report: None,
             kv_family: kv_family_of(arch, &cfg_value),
             vision,
@@ -2438,6 +2821,7 @@ impl LlamaProvider {
             } else {
                 None
             };
+            descriptor.capabilities.tree_verify = Some(TREE_VERIFY_CAPABILITIES);
             return Ok(Self {
                 descriptor,
                 model: Decoder::Qwen35(model),
@@ -2455,6 +2839,7 @@ impl LlamaProvider {
                 )),
                 speculative_default: crate::device::decode_defaults(device).speculative,
                 draft: None,
+                block_draft: None,
                 draft_report: None,
                 // The Prism/Bonsai hybrid has no table family.
                 kv_family: None,
@@ -2504,6 +2889,7 @@ impl LlamaProvider {
         descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
+        descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Ok(Self {
             descriptor,
             model,
@@ -2518,6 +2904,7 @@ impl LlamaProvider {
             )),
             speculative_default: crate::device::decode_defaults(device).speculative,
             draft: None,
+            block_draft: None,
             draft_report: None,
             // No table family: the HF identity is reconstructed from `general.architecture`, and
             // llama.cpp labels Mistral and other llama-shaped fine-tunes `"llama"` too, so a GGUF
@@ -2656,12 +3043,15 @@ impl LlamaProvider {
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         let backend = crate::device::decode_backend(model.device());
+        let model = Decoder::Causal(model);
+        let mut descriptor = provider_descriptor_on(backend);
+        descriptor.capabilities.tree_verify = model.tree_verify_capabilities();
         Self {
             // No config identity, so no table family: a Llama decoder assembled from parts cannot
             // be told from a Mistral or dense Qwen2 one (as MLX's `from_parts`).
             kv_family: None,
-            descriptor: provider_descriptor_on(backend),
-            model: Decoder::Causal(model),
+            descriptor,
+            model,
             mtp: None,
             tokenizer,
             template: Box::new(Llama3Template),
@@ -2673,6 +3063,7 @@ impl LlamaProvider {
             )),
             speculative_default: backend.defaults().speculative,
             draft: None,
+            block_draft: None,
             draft_report: None,
             constraint_table: OnceCell::new(),
             vision: None,

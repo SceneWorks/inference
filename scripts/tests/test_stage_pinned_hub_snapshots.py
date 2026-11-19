@@ -93,7 +93,7 @@ class RequestBinding(unittest.TestCase):
         proofs.request(json.dumps({"selection": "x", "policy": policy, "hub_snapshots": {"FULL": FULL}}), "mlx")
 
 
-class RegisteredQwen38Cases(unittest.TestCase):
+class RegisteredHubSnapshotCases(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.rows = {proofs.identity(item): item for item in json.loads(proofs.REGISTRY_PATH.read_text(encoding="utf-8"))}
@@ -114,6 +114,20 @@ class RegisteredQwen38Cases(unittest.TestCase):
         cuda = proofs.configured_case(item, "source-fixed-candle-cuda")
         self.assertEqual(proofs.lane(cuda), "candle-cuda")
         self.assertIn("cuda", cuda["cargo_features"])
+
+    def test_every_registered_slot_set_satisfies_the_slot_contract(self):
+        for binding, item in self.rows.items():
+            if "hub_snapshots" in item:
+                with self.subTest(binding=binding):
+                    proofs.validate_hub_snapshot_slots(item)
+
+    def test_dspine_smoke_binds_target_and_draft_by_fixed_pin(self):
+        item = self.rows["mlx-llm/integration/block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass"]
+        bound = proofs.bind_hub_snapshots((item,), {})
+        self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_TARGET"],
+                         {"repository": "SceneWorks/qwen3.8-27b-abliterated-mlx", "revision": REV, "subfolder": "q4"})
+        self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_SOURCE"]["repository"], "SceneWorks/qwen3.8-27b-dspine-b16")
+        self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_SOURCE"]["subfolder"], "")
 
     def test_the_nax_route_selects_only_the_rw_llm_mac(self):
         self.assertIn("rw-llm", proofs.NAX_ROUTES["nax"]["labels"])

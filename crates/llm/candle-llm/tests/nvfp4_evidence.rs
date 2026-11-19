@@ -453,6 +453,7 @@ origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     })
     .expect("provider NVFP4 load");
     let provider_load_secs = started.elapsed().as_secs_f64();
@@ -510,6 +511,7 @@ fn nvfp4_refused_on_cpu_for_the_real_snapshot() {
         cuda_graphs: None,
         mtp_head_source: None,
         prefix_cache_bytes: None,
+        draft_quantize: None,
         draft_source: None,
     }) {
         Err(core_llm::Error::Unsupported(msg)) => {

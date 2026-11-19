@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::cuda::{QCudaStorage, MATRIX_ROW_PADDING};
 use super::GgmlDType;
-use crate::cuda_backend::DeviceId;
+use crate::cuda_backend::{DeviceId, WrapErr};
 use crate::{backend::BackendStorage, CudaDevice, CudaStorage, DType, Result, Shape};
 
 use cudarc::driver::{CudaSlice, DevicePtr};
@@ -38,7 +38,7 @@ fn supports(dtype: GgmlDType) -> bool {
 const MMVQ_MAX_BATCH: usize = 8;
 
 // ---------------------------------------------------------------------------
-// Per-device Q8_1 scratch workspace (grows-only, reused across calls).
+// Per-device Q8_1 scratch workspace (grows-only, reused across eager calls).
 // ---------------------------------------------------------------------------
 
 struct WorkspaceSlot {
@@ -48,17 +48,47 @@ struct WorkspaceSlot {
 
 static WORKSPACE: OnceLock<Mutex<HashMap<DeviceId, WorkspaceSlot>>> = OnceLock::new();
 
-/// Returns a device pointer to the scratch workspace, growing it if needed.
-/// The returned `MutexGuard` must be held alive until the kernels using
-/// this pointer have been launched (all launches are on the device's
-/// default stream, so they are serialised).
+/// Whether `dev`'s stream is recording a CUDA graph (any capture status but `NONE`).
+pub(super) fn capturing(dev: &CudaDevice) -> Result<bool> {
+    use cudarc::driver::sys::CUstreamCaptureStatus;
+    let status = dev.cuda_stream().capture_status().w()?;
+    Ok(status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+}
+
+/// The scratch a call holds until its kernels are launched: the shared per-device workspace
+/// (an eager call), or, inside a CUDA graph capture, a buffer of the call's own.
+///
+/// A captured graph keeps the address of every buffer it touched. The shared workspace is
+/// grows-only and frees the slice it outgrows, so a graph that read it would, after a later eager
+/// call grew it, write its activations into freed memory on every replay — over whatever the
+/// allocator placed there next (SW-7197: a Qwen3.8-27B block draft's context). A capture therefore
+/// never touches the shared workspace: its scratch is a stream-ordered allocation recorded in the
+/// graph and freed inside it (a graph memory node), so the graph owns it and nothing outlives the
+/// graph. Nothing is retained, and the shared workspace never grows during a capture.
+#[allow(dead_code)] // each variant is held only for its `Drop`
+pub(super) enum Scratch<G> {
+    /// The shared workspace's lock, held until the launches are issued.
+    Shared(G),
+    /// This call's own buffer (a capture), freed when dropped — inside the capture.
+    Owned(CudaSlice<u8>),
+}
+
+/// Returns a device pointer to `bytes` of scratch and what keeps it valid: inside a capture a
+/// buffer of this call's own, otherwise the shared workspace, grown if needed. The returned
+/// [`Scratch`] must be held alive until the kernels using the pointer have been launched (all
+/// launches are on the device's stream, so they are serialised).
 fn workspace_ensure(
     dev: &CudaDevice,
     bytes: usize,
 ) -> Result<(
     u64,
-    std::sync::MutexGuard<'static, HashMap<DeviceId, WorkspaceSlot>>,
+    Scratch<std::sync::MutexGuard<'static, HashMap<DeviceId, WorkspaceSlot>>>,
 )> {
+    if capturing(dev)? {
+        let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
+        let ptr = slice.device_ptr(slice.stream()).0;
+        return Ok((ptr, Scratch::Owned(slice)));
+    }
     let map = WORKSPACE.get_or_init(|| Mutex::new(HashMap::new()));
     let device_key = dev.id();
     let mut guard = map.lock().unwrap();
@@ -77,7 +107,7 @@ fn workspace_ensure(
         }
     };
     let ptr = slot.slice.device_ptr(slot.slice.stream()).0;
-    Ok((ptr, guard))
+    Ok((ptr, Scratch::Shared(guard)))
 }
 
 // ---------------------------------------------------------------------------

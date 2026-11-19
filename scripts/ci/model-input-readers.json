@@ -418,6 +418,12 @@
         "reader-binding"
       ]
     },
+    "candle-llm::models::block_draft::BlockDraft::load": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
     "candle-llm::primitives::Weights::from_dir": {
       "role": "model-weights",
       "grades": [

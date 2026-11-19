@@ -1252,6 +1252,8 @@ fn a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded() {
         previous_hidden: None,
         position: PROMPT.len() as i32,
         max_drafts: 4,
+        budget_drafts: 4,
+        max_rows: 4,
     };
     let proposal = proposer.propose(&target, &ctx, &mut draft_sampler).unwrap();
     assert_eq!(proposal.drafts.len(), 4);
@@ -3849,6 +3851,8 @@ fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
             previous_hidden: Some(&previous),
             position,
             max_drafts: 1,
+            budget_drafts: 1,
+            max_rows: 1,
         };
         let mut sampler = DraftSampler {
             config: &config,
@@ -3887,6 +3891,8 @@ fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
             previous_hidden: Some(&previous),
             position: start + tokens.len() as i32,
             max_drafts: 3,
+            budget_drafts: 3,
+            max_rows: 3,
         };
         let mut draw = MlxSampler::from_config(&config);
         let mut sampler = DraftSampler {

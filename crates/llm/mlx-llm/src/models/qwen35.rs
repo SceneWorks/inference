@@ -31,7 +31,7 @@ use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, causal_depthwise_conv_traced_f32_accum, compute_g,
-    rms_norm_gated, ConvTrace, DeltaNetCache,
+    rms_norm_gated, tree_depthwise_conv, ConvTrace, DeltaNetCache, TreePlan,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -120,6 +120,16 @@ impl PrecisionProfile {
         } else {
             causal_depthwise_conv_traced(x, weight, state)
         }
+    }
+
+    fn convolve_tree(
+        self,
+        x: &Array,
+        weight: &Array,
+        state: &Array,
+        windows: &[Vec<i32>],
+    ) -> Result<(Array, Array)> {
+        tree_depthwise_conv(x, weight, state, windows, self == Self::MossFrozenHf)
     }
 
     fn silu(self, x: &Array) -> Result<Array> {
@@ -628,9 +638,26 @@ impl GatedDeltaNet {
             Some(cs) => cs.clone(),
             None => zeros3(b, self.conv_kernel - 1, self.conv_dim, dt)?,
         };
-        let (conv_out, conv_trace) =
-            self.precision
-                .convolve(&mixed, &self.conv_weight, &conv_state)?;
+        // A tree verify forward (feature SW-F328) convolves each row over its own branch.
+        let tree = cache.armed_tree();
+        let (conv_out, conv) = match &tree {
+            Some(plan) => {
+                let windows = plan.conv_windows(self.conv_kernel);
+                let (out, cat) = self.precision.convolve_tree(
+                    &mixed,
+                    &self.conv_weight,
+                    &conv_state,
+                    &windows,
+                )?;
+                (out, Err((cat, windows)))
+            }
+            None => {
+                let (out, trace) =
+                    self.precision
+                        .convolve(&mixed, &self.conv_weight, &conv_state)?;
+                (out, Ok(trace))
+            }
+        };
         let cp = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], 2)?;
         let qc = cp[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
         let kc = cp[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
@@ -648,14 +675,14 @@ impl GatedDeltaNet {
         let beta = sigmoid(&b_in)?;
         let g = self.precision.decay(&a_in, &self.a_log, &self.dt_bias)?;
         let f32 = Dtype::Float32;
-        let y = cache.advance(
-            conv_trace,
-            &qn.as_dtype(f32)?,
-            &kn.as_dtype(f32)?,
-            &vc.as_dtype(f32)?,
-            &g.as_dtype(f32)?,
-            &beta.as_dtype(f32)?,
-        )?;
+        let (q32, k32, v32) = (qn.as_dtype(f32)?, kn.as_dtype(f32)?, vc.as_dtype(f32)?);
+        let (g32, beta32) = (g.as_dtype(f32)?, beta.as_dtype(f32)?);
+        let y = match conv {
+            Ok(trace) => cache.advance(trace, &q32, &k32, &v32, &g32, &beta32)?,
+            Err((cat, windows)) => {
+                cache.advance_tree(cat, windows, &q32, &k32, &v32, &g32, &beta32)?
+            }
+        };
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = self.normalize_output(&y.as_dtype(dt)?, &z)?;
@@ -720,7 +747,12 @@ impl Qwen35Attention {
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
         let (k_all, v_all) = cache.update(&k, &v)?;
-        let out = sdpa_capped(&q, &k_all, &v_all, self.scale, None, AttnMask::Causal)?; // [B,H,S,hd]
+        // A tree verify forward (feature SW-F328) attends through its ancestor-only mask.
+        let mask = cache
+            .tree_mask
+            .as_ref()
+            .map_or(AttnMask::Causal, AttnMask::Additive);
+        let out = sdpa_capped(&q, &k_all, &v_all, self.scale, None, mask)?; // [B,H,S,hd]
         let merged =
             out.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
@@ -842,12 +874,15 @@ impl DecoderLayer {
 #[derive(Clone, Debug)]
 pub struct AttnKv {
     kv: ContiguousKvCache,
+    /// The additive ancestor-only mask of an armed tree verify forward (feature SW-F328).
+    tree_mask: Option<Array>,
 }
 
 impl Default for AttnKv {
     fn default() -> Self {
         Self {
             kv: ContiguousKvCache::new(1),
+            tree_mask: None,
         }
     }
 }
@@ -859,6 +894,7 @@ impl AttnKv {
     fn with_block_tokens(block: i32) -> Self {
         Self {
             kv: ContiguousKvCache::with_block_tokens(1, block),
+            tree_mask: None,
         }
     }
 
@@ -876,6 +912,7 @@ impl AttnKv {
     }
 
     fn reset(&mut self) -> Result<()> {
+        self.tree_mask = None;
         self.kv.reset()
     }
 
@@ -889,6 +926,7 @@ impl AttnKv {
     fn prefix(&self, len: i32) -> Result<Self> {
         Ok(Self {
             kv: self.kv.prefix(len)?,
+            tree_mask: None,
         })
     }
 }
@@ -1209,6 +1247,77 @@ impl Qwen35Cache {
         }
         async_eval(&restored)?;
         Ok(())
+    }
+
+    /// Verify the next forward's rows as a tree (feature SW-F328): every DeltaNet layer recurs
+    /// along each row's branch ([`DeltaNetCache::arm_tree`]) and every attention layer attends
+    /// through `mask`, the additive ancestor-only mask `[1, 1, rows, offset + rows]`. The forward
+    /// appends all rows to the attention KV and keeps the per-row recurrent states aside;
+    /// [`commit_tree`](Self::commit_tree) then keeps one branch, or
+    /// [`abort_tree`](Self::abort_tree) returns the cache to where it was.
+    pub fn arm_tree(&mut self, plan: std::sync::Arc<TreePlan>, mask: &Array) {
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.arm_tree(plan.clone()),
+                Qwen35LayerCache::Attn(a) => a.tree_mask = Some(mask.clone()),
+            }
+        }
+    }
+
+    /// Keep the tree branch `path` (its rows from the anchor, `path[0] == 0`) of the tree forward
+    /// that started at position `base`: the attention KV moves the branch's rows into place and
+    /// drops the rest, and every DeltaNet layer makes the branch's last row's state live — the
+    /// cache a linear decode of the branch would have left (feature SW-F328).
+    pub fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        let rows: Vec<i32> = path.iter().map(|&r| r as i32).collect();
+        let last = *path
+            .last()
+            .ok_or_else(|| Error::Msg("commit_tree: empty path".into()))?;
+        let mut kept = Vec::new();
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.commit_tree(last, rows.len() as i32)?;
+                    if let Some((conv, ssm)) = c.live_state() {
+                        kept.extend([conv.clone(), ssm.clone()]);
+                    }
+                }
+                Qwen35LayerCache::Attn(a) => {
+                    a.tree_mask = None;
+                    a.kv.compact_tail(base, &rows)?;
+                }
+            }
+        }
+        // Evaluate the kept states so the per-row states they were read from free now.
+        async_eval(&kept)?;
+        Ok(())
+    }
+
+    /// Undo a tree forward that started at position `base`, keeping nothing of it (a failed
+    /// forward or decision, feature SW-F328): the attention KV truncates back to `base` and the
+    /// DeltaNet layers drop the per-row states, their live state untouched.
+    pub fn abort_tree(&mut self, base: i32) -> Result<()> {
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.abort_tree(),
+                Qwen35LayerCache::Attn(a) => {
+                    a.tree_mask = None;
+                    a.truncate(base.min(a.offset()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes a pending tree forward's per-row recurrent states and conv inputs hold.
+    pub fn tree_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                Qwen35LayerCache::Delta(c) => c.tree_bytes() as u64,
+                Qwen35LayerCache::Attn(_) => 0,
+            })
+            .sum()
     }
 
     /// Bytes of recurrent state the DeltaNet layers hold: every live state plus the checkpoint
@@ -1729,6 +1838,128 @@ impl Qwen35Model {
         Ok(logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?)
     }
 
+    /// The decoder over `input_ids` with **hidden-state taps** (SW-F360 E2): the residual-stream
+    /// output of each decoder layer in `layers` (0-based, in order), concatenated on the feature
+    /// axis — `[B, rows, layers.len() · hidden]` — beside the logits (`all`: every position,
+    /// else the last, as [`Self::forward`] / [`Self::decode_logits`]). `keep` caps the tapped rows
+    /// at the **last** `keep` positions (a block draft's context window, E5), so a long prefill
+    /// never holds every prompt row's taps.
+    pub(crate) fn forward_tapped(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        layers: &[usize],
+        keep: Option<usize>,
+        all: bool,
+    ) -> Result<(Array, Array)> {
+        let h0 = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin(h0.shape()[1], offset, compute())?;
+        let (tapped, h) = self.tapped_layers(h0, &cos, &sin, cache, layers, keep, |_, h| Ok(h))?;
+        let logits = if all {
+            self.project(&h)?
+        } else {
+            self.project_last(&h)?
+        };
+        Ok((tapped, logits))
+    }
+
+    /// The tapped decoder over a fused multimodal prompt (SW-7195, E10): the prompt's decoder
+    /// input embeddings `[1, S, hidden]` — the vision encoder's rows already spliced in — run
+    /// under their explicit three-axis M-RoPE `positions` with the DeepStack features added
+    /// after the first layers, exactly as the multimodal prefill
+    /// ([`Self::prefill_hidden_and_last_logits_from_embeds_with_deepstack`]) runs them. Returns
+    /// the tapped rows of [`Self::forward_tapped`] — image positions included, the last `keep` of
+    /// them — and the last position's logits `[1, vocab]`. A layer's tap is the residual stream
+    /// the next layer reads, so a DeepStack layer's tap carries its fused features.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_tapped_from_embeds_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+        layers: &[usize],
+        keep: Option<usize>,
+    ) -> Result<(Array, Array)> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            compute(),
+        )?;
+        let h0 = embeds.as_dtype(compute())?;
+        let (tapped, h) =
+            self.tapped_layers(
+                h0,
+                &cos,
+                &sin,
+                cache,
+                layers,
+                keep,
+                |i, h| match deepstack.get(i) {
+                    Some(feature) => deepstack::add_visual_features(&h, visual_pos_mask, feature),
+                    None => Ok(h),
+                },
+            )?;
+        Ok((tapped, self.project_last(&h)?))
+    }
+
+    /// Run every decoder layer over `h0` roped by (`cos`, `sin`), `fuse` applied after each layer
+    /// (its index, its output), keeping the outputs of `layers` — their last `keep` rows —
+    /// concatenated on the feature axis. Returns the taps and the last layer's (fused) output.
+    #[allow(clippy::too_many_arguments)]
+    fn tapped_layers(
+        &self,
+        h0: Array,
+        cos: &Array,
+        sin: &Array,
+        cache: &mut Qwen35Cache,
+        layers: &[usize],
+        keep: Option<usize>,
+        mut fuse: impl FnMut(usize, Array) -> Result<Array>,
+    ) -> Result<(Array, Array)> {
+        let s = h0.shape()[1];
+        let rows = keep.map_or(s, |k| i32::try_from(k).unwrap_or(i32::MAX).min(s));
+        let mut taps: Vec<Option<Array>> = vec![None; layers.len()];
+        let mut h = h0;
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = fuse(i, layer.forward(&h, cos, sin, slot)?)?;
+            for (tap, _) in taps.iter_mut().zip(layers).filter(|(_, &l)| l == i) {
+                *tap = Some(if rows < s {
+                    let idx = Array::arange::<i32, i32>(s - rows, s, None)?;
+                    h.take_axis(&idx, 1)?
+                } else {
+                    h.clone()
+                });
+            }
+        }
+        let taps: Vec<Array> = taps.into_iter().collect::<Option<_>>().ok_or_else(|| {
+            Error::Config(format!(
+                "qwen3_5: tapped layers {layers:?} outside the {}-layer decoder",
+                self.layers.len()
+            ))
+        })?;
+        let refs: Vec<&Array> = taps.iter().collect();
+        Ok((concatenate_axis(&refs, 2)?, h))
+    }
+
+    /// Decoder layers (a block draft's `target_layer_ids` must fall inside them).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The LM head's rows for `ids` (any shape), dense in the compute dtype — a block draft's
+    /// refinement scores its candidates against them (SW-F360).
+    pub(crate) fn lm_head_rows(&self, ids: &Array) -> Result<Array> {
+        self.language_head()?.rows(ids)
+    }
+
+    /// The LM head over already-normalized rows `[.., hidden]` → `[.., vocab]`.
+    pub(crate) fn lm_head(&self, normalized: &Array) -> Result<Array> {
+        self.language_head()?.forward(normalized)
+    }
+
     /// Run the decoder over `input_ids` `[B, S]` at sequence `offset`, returning logits for **every**
     /// position `[B, S, vocab]`.
     pub fn forward(
@@ -1739,6 +1970,52 @@ impl Qwen35Model {
     ) -> Result<Array> {
         let h = self.hidden(input_ids, cache, offset)?;
         self.project(&h)
+    }
+
+    /// Verify a candidate tree in one forward (feature SW-F328): `input_ids` `[1, rows]` are the
+    /// anchor then the candidates in row order, `positions` each row's RoPE position (the
+    /// anchor's plus its depth), `plan` the tree's shape and `mask` its additive ancestor-only
+    /// mask over `[cache ‖ rows]`. Returns every row's logits `[1, rows, vocab]` and, when asked,
+    /// the final-normalized hidden rows. The cache keeps the per-row state until
+    /// [`Qwen35Cache::commit_tree`] or [`Qwen35Cache::abort_tree`].
+    pub fn forward_tree(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        positions: &[i32],
+        plan: std::sync::Arc<TreePlan>,
+        mask: &Array,
+        want_hidden: bool,
+    ) -> Result<(Array, Option<Array>)> {
+        cache.arm_tree(plan, mask);
+        let h = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin_at(positions, compute())?;
+        let h = self.hidden_from_embeds(&h, &cos, &sin, cache)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
+        let logits = self.language_head()?.forward(&normalized)?;
+        Ok((logits, want_hidden.then_some(normalized)))
+    }
+
+    /// [`Self::forward_tree`] with **hidden-state taps** (SW-7196): every row's logits
+    /// `[1, rows, vocab]` and the outputs of decoder `layers` for every row, concatenated —
+    /// `[1, rows, layers.len() · hidden]`, as [`Self::forward_tapped`]. Row `r`'s taps see only
+    /// the cached prefix and `r`'s ancestors, so after [`Qwen35Cache::commit_tree`] the accepted
+    /// branch's rows are the taps a linear forward of that branch returns — the rows a block
+    /// draft's context reads.
+    pub(crate) fn forward_tree_tapped(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        positions: &[i32],
+        plan: std::sync::Arc<TreePlan>,
+        mask: &Array,
+        layers: &[usize],
+    ) -> Result<(Array, Array)> {
+        cache.arm_tree(plan, mask);
+        let h0 = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin_at(positions, compute())?;
+        let (tapped, h) = self.tapped_layers(h0, &cos, &sin, cache, layers, None, |_, h| Ok(h))?;
+        Ok((self.project(&h)?, tapped))
     }
 
     /// Run the decoder and return logits for the **last** position only, `[B, vocab]` — the

@@ -26,6 +26,70 @@ fn actual_cpu_provider_exposes_its_owned_release_fence() {
     engine.synchronize_before_release().unwrap();
 }
 
+/// SW-F328 E5/E6 (constructors and pricing only, no forward): a loaded llama-family decoder
+/// advertises tree verification at the shared bound, and a tree route prices its extra rows,
+/// mask and states on top of the linear route; no tree, no proposer or no drafts prices nothing.
+#[test]
+fn a_loaded_decoder_advertises_tree_verification_and_a_tree_is_priced() {
+    let (cfg, weights) = tiny_llama_parts();
+    let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
+    let tokenizer = core_llm::Tokenizer::from_json(&synthetic_tokenizer_json(vocab)).unwrap();
+    let provider =
+        super::LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tokenizer, vec![]);
+    let caps = &provider.descriptor.capabilities;
+    assert_eq!(
+        caps.tree_verify,
+        Some(core_llm::TreeVerifyCapabilities {
+            max_rows: core_llm::MAX_TREE_ROWS
+        })
+    );
+    let lookup = ProposerKind::PromptLookup;
+    let tree = super::tree_request_bytes(&provider.model, lookup, 4, 16, 100, 50, 0).unwrap();
+    assert!(tree > 0);
+    assert!(super::tree_request_bytes(&provider.model, lookup, 4, 32, 100, 50, 0).unwrap() == tree);
+    assert_eq!(
+        super::tree_request_bytes(&provider.model, lookup, 4, 0, 100, 50, 0),
+        Some(0)
+    );
+    assert_eq!(
+        super::tree_request_bytes(&provider.model, lookup, 0, 16, 100, 50, 0),
+        Some(0)
+    );
+    // A one-branch proposer (a draft model, the MTP head) verifies at most `drafts` candidates on
+    // the linear path its route already prices: a tree request adds no tree workspace (E6).
+    for one_branch in [ProposerKind::DraftModel, ProposerKind::Mtp] {
+        assert_eq!(
+            super::tree_request_bytes(&provider.model, one_branch, 4, 16, 100, 50, 0),
+            Some(0),
+            "{}",
+            one_branch.label()
+        );
+    }
+    // A block draft builds branching trees (SW-7198): its tree is priced, and its eager tree
+    // forward also holds every tree row's tapped layer outputs.
+    let block = ProposerKind::BlockDraft;
+    let plain = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 0).unwrap();
+    let tapped = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 256).unwrap();
+    let element = provider.model.step_memory_geometry(4).element_bytes;
+    assert_eq!(plain, tree);
+    // Every tree row's taps — the anchor and 16 candidates — and the accepted branch's copy.
+    assert_eq!(tapped - plain, 17 * 256 * element * 2);
+    // The request resolves against the advertisement: a tree needs a running proposer.
+    let verify = core_llm::SpeculativeVerify::Tree { max_rows: 40 };
+    let run = core_llm::resolve_tree_verify(
+        verify,
+        core_llm::SpeculativePlan::Run {
+            proposer: core_llm::SpeculativeProposer::PromptLookup,
+            depth: 4,
+        },
+        caps,
+    );
+    assert_eq!(run.max_rows, core_llm::MAX_TREE_ROWS);
+    assert!(run.fallback.is_some(), "the clamp is named");
+    let off = core_llm::resolve_tree_verify(verify, core_llm::SpeculativePlan::Off, caps);
+    assert_eq!(off.max_rows, 0);
+}
+
 #[test]
 fn partial_load_failure_fences_after_drop_and_preserves_primary_error() {
     use std::{cell::RefCell, rc::Rc};
@@ -1383,6 +1447,7 @@ fn nvfp4_spec(source: &str) -> core_llm::LoadSpec {
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     }
 }
 
@@ -6026,3 +6091,6 @@ fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell
         Ok(_) => panic!("a ModelOpt NVFP4 snapshot was re-quantized to Q8"),
     }
 }
+
+/// The block draft through the provider (SW-F360, SW-7197).
+mod block_draft;

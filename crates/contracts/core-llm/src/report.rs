@@ -112,6 +112,65 @@ pub struct CudaGraphsReport {
     pub fallback_reason: Option<String>,
 }
 
+/// The draft weights a decode ran its proposer on (SW-F360 E8).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecodeDraft {
+    /// The draft source the load named.
+    pub source: String,
+    /// The checkpoint format (`dspine`).
+    pub format: String,
+    /// The load precision (`q8`, `q4`).
+    pub precision: String,
+}
+
+/// What tree verification did in one generation (feature SW-F328, E8): carried on
+/// [`DecodeReport::tree_verify`] whenever the request's tree resolved to run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeVerifyReport {
+    /// The candidate-row bound the run verified under.
+    pub max_rows: u32,
+    /// Verify passes of the run (every pass, linear-routed chains and plain steps included).
+    pub passes: u64,
+    /// Passes that verified a branching tree in one tree forward.
+    pub tree_passes: u64,
+    /// Rows the verify passes fed the target, anchors included (every pass).
+    pub rows_verified: u64,
+    /// Rows the branching-tree passes alone fed the target, anchors included. Backends that run
+    /// tree verification (MLX and Candle) set this beside `tree_passes`.
+    pub tree_rows_verified: u64,
+    /// Candidates the branching-tree passes alone accepted.
+    pub tree_accepted_tokens: u64,
+    /// The most rows one pass fed.
+    pub max_rows_per_pass: u64,
+    /// Candidates accepted over the run's passes.
+    pub accepted_tokens: u64,
+    /// The largest transient tree workspace one pass held (the ancestor mask, and the hybrid
+    /// recurrent per-row states), in bytes.
+    pub peak_workspace_bytes: u64,
+}
+
+impl TreeVerifyReport {
+    /// Rows verified per pass, or `None` before any pass.
+    pub fn rows_per_pass(&self) -> Option<f64> {
+        (self.passes > 0).then(|| self.rows_verified as f64 / self.passes as f64)
+    }
+
+    /// Candidates accepted per authoritative (target) pass, or `None` before any pass.
+    pub fn accepted_per_pass(&self) -> Option<f64> {
+        (self.passes > 0).then(|| self.accepted_tokens as f64 / self.passes as f64)
+    }
+
+    /// Rows verified per branching-tree pass, or `None` before any tree pass.
+    pub fn rows_per_tree_pass(&self) -> Option<f64> {
+        (self.tree_passes > 0).then(|| self.tree_rows_verified as f64 / self.tree_passes as f64)
+    }
+
+    /// Candidates accepted per branching-tree pass, or `None` before any tree pass.
+    pub fn accepted_per_tree_pass(&self) -> Option<f64> {
+        (self.tree_passes > 0).then(|| self.tree_accepted_tokens as f64 / self.tree_passes as f64)
+    }
+}
+
 /// Which decode path served one generation, as the backend measured it (epic sc-24128 E2: the path
 /// that ran is visible and a fallback is named). Carried on
 /// [`TextLlmOutput::decode`](crate::TextLlmOutput::decode).
@@ -126,6 +185,10 @@ pub struct DecodeReport {
     pub proposer: ProposerKind,
     /// Draft tokens per verification pass (the depth) when a proposer ran.
     pub draft_tokens: Option<u32>,
+    /// The draft weights the proposer ran on (SW-F360 E8), when it ran on one the report can name
+    /// — the block draft's source, format and load precision. `None` for a proposer without its
+    /// own weights or a backend that does not report it.
+    pub draft: Option<DecodeDraft>,
     /// The sampler path: `device`, `host:<reason>` (for example `host:penalty`), or `none`.
     pub sampler: String,
     /// The KV cache implementation (`growing`, `static`).
@@ -212,6 +275,9 @@ pub struct DecodeReport {
     /// [`nvfp4_projections`](Self::nvfp4_projections) and
     /// [`fused_primitives`](Self::fused_primitives).
     pub fallbacks: Vec<String>,
+    /// Tree verification's part (feature SW-F328): `None` unless the request's tree resolved
+    /// to run.
+    pub tree_verify: Option<TreeVerifyReport>,
 }
 
 impl DecodeReport {
@@ -226,6 +292,18 @@ impl DecodeReport {
             .into_iter()
             .collect();
         self.prefix_cache.reason = Some(crate::CAPTIONER_NO_PREFIX_CACHE.to_string());
+        self
+    }
+
+    /// Name why a captioner or SVG decoder verifies a requested tree linearly (feature SW-F328,
+    /// E5): it advertises no tree verification and runs no proposer, so the shared
+    /// [`resolve_tree_verify_with`](crate::resolve_tree_verify_with) names the reason. A request
+    /// that did not ask for a tree adds nothing. Call after
+    /// [`with_captioner_reasons`](Self::with_captioner_reasons), which replaces `fallbacks`.
+    pub fn with_captioner_tree_reason(mut self, verify: crate::SpeculativeVerify) -> Self {
+        self.fallbacks.extend(
+            crate::resolve_tree_verify_with(verify, crate::SpeculativePlan::Off, None).fallback,
+        );
         self
     }
 
@@ -446,6 +524,20 @@ mod tests {
             graphs.starts_with("cuda_graphs: ") && graphs.contains("mlx"),
             "{graphs}"
         );
+    }
+
+    /// E5: a captioner's report names why a requested tree verified linearly, and adds nothing for
+    /// a linear request.
+    #[test]
+    fn a_captioner_report_names_the_tree_fallback_only_when_asked() {
+        let base = DecodeReport::default().with_captioner_reasons(crate::Speculative::Off);
+        let tree = base
+            .clone()
+            .with_captioner_tree_reason(crate::SpeculativeVerify::Tree { max_rows: 8 });
+        assert_eq!(tree.fallbacks.len(), 1, "{:?}", tree.fallbacks);
+        assert!(tree.fallbacks[0].contains("tree verification"));
+        let linear = base.with_captioner_tree_reason(crate::SpeculativeVerify::Linear);
+        assert!(linear.fallbacks.is_empty());
     }
 
     /// E2/E8: a captioner's report names its speculative fallback (none for `off`) and why its
