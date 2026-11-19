@@ -780,6 +780,15 @@ impl Pipeline {
         let total_steps = plan.denoise_sigmas().len().saturating_sub(1);
         let mut eval_idx = 0usize;
         let low_res_plan = plan.low_res_start().copied();
+        if let Some(low_res_report) = plan
+            .low_res_start_execution_report("bf16", 2, "base_dit")
+            .map_err(CandleError::from)?
+        {
+            candle_gen::execution::policy(
+                "flux.low_res_start",
+                serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+            );
+        }
         let low_tokens = plan.phase_packed_tokens(0);
         let mut phase1_context: Option<(Tensor, PreparedDit)> = None;
 
@@ -2022,6 +2031,20 @@ pub fn execute_candle_flux_denoise_trajectory(
     let output_index = seed.wrapping_sub(plan.base_seed()) as u32;
     let pass_index = plan.pass_index();
     let base_seed = plan.base_seed();
+    let (dtype_label, dtype_bytes) = match dtype {
+        DType::BF16 => ("bf16", 2),
+        DType::F16 => ("f16", 2),
+        _ => ("f32", 4),
+    };
+    if let Some(low_res_report) = plan
+        .low_res_start_execution_report(dtype_label, dtype_bytes, "base_dit")
+        .map_err(CandleError::from)?
+    {
+        candle_gen::execution::policy(
+            "flux.low_res_start",
+            serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+        );
+    }
 
     let mut transition_cb = |phase: usize,
                              boundary_step: usize,
@@ -2037,17 +2060,8 @@ pub fn execute_candle_flux_denoise_trajectory(
         }
         candle_gen::check_cancel(&req.cancel)?;
         let sigma_k = denoise_sigmas[boundary_step];
-        let boundary_state = match (
-            low_res_plan.estimate_source,
-            state.previous_denoised().cloned(),
-        ) {
-            (gen_core::EstimateSource::PreviousEvaluation, Some(prev_x0)) => {
-                gen_core::BoundaryState::CleanEstimate {
-                    latent: prev_x0,
-                    source: gen_core::EstimateSource::PreviousEvaluation,
-                }
-            }
-            _ => {
+        let boundary_state = match low_res_plan.estimate_source {
+            gen_core::EstimateSource::EndpointEvaluation => {
                 let x0_low = gen_core::sampling::denoise(ops, ms, x_sigma_k, sigma_k, |x_in, t| {
                     (velocity_cell.borrow_mut())(
                         x_in,
@@ -2063,6 +2077,15 @@ pub fn execute_candle_flux_denoise_trajectory(
                 gen_core::BoundaryState::CleanEstimate {
                     latent: x0_low,
                     source: gen_core::EstimateSource::EndpointEvaluation,
+                }
+            }
+            gen_core::EstimateSource::PreviousEvaluation => {
+                let captured = state
+                    .take_captured_primary_estimate(boundary_step - 1)
+                    .map_err(CandleError::from)?;
+                gen_core::BoundaryState::CleanEstimate {
+                    latent: captured.latent,
+                    source: gen_core::EstimateSource::PreviousEvaluation,
                 }
             }
         };

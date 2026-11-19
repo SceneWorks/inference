@@ -604,8 +604,15 @@ impl Generator for Flux1 {
             .capabilities
             .resolve_pag(self.descriptor.id, req)?
             .map(|p| p.execution_report(plan.denoise_sigmas().len().saturating_sub(1) as u32));
+        let slot_config = if self.loaded_spec.adapters.is_empty() {
+            "base_dit".to_owned()
+        } else {
+            format!("base_dit+adapters:{}", self.loaded_spec.adapters.len())
+        };
+        let low_res_report = plan.low_res_start_execution_report("f32", 4, &slot_config)?;
         let mut report = gen_core::GenerationReport::from_output(output);
         report.pag = pag_report;
+        report.low_res_start = low_res_report;
         Ok(report)
     }
 
@@ -1451,6 +1458,12 @@ pub fn execute_flux_denoise_trajectory(
     let output_index = seed.wrapping_sub(plan.base_seed()) as u32;
     let pass_index = plan.pass_index();
     let base_seed = plan.base_seed();
+    if let Some(low_res_report) = plan.low_res_start_execution_report("f32", 4, "base_dit")? {
+        mlx_gen::image_execution::policy(
+            "flux.low_res_start",
+            serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+        );
+    }
 
     let mut transition_cb =
         |phase: usize,
@@ -1467,17 +1480,8 @@ pub fn execute_flux_denoise_trajectory(
                 return Err(Error::Canceled);
             }
             let sigma_k = denoise_sigmas[boundary_step];
-            let boundary_state = match (
-                low_res_plan.estimate_source,
-                state.previous_denoised().cloned(),
-            ) {
-                (gen_core::EstimateSource::PreviousEvaluation, Some(prev_x0)) => {
-                    gen_core::BoundaryState::CleanEstimate {
-                        latent: prev_x0,
-                        source: gen_core::EstimateSource::PreviousEvaluation,
-                    }
-                }
-                _ => {
+            let boundary_state = match low_res_plan.estimate_source {
+                gen_core::EstimateSource::EndpointEvaluation => {
                     let x0_low =
                         gen_core::sampling::denoise(ops, ms, x_sigma_k, sigma_k, |x_in, t| {
                             (velocity_cell.borrow_mut())(
@@ -1493,6 +1497,13 @@ pub fn execute_flux_denoise_trajectory(
                     gen_core::BoundaryState::CleanEstimate {
                         latent: x0_low,
                         source: gen_core::EstimateSource::EndpointEvaluation,
+                    }
+                }
+                gen_core::EstimateSource::PreviousEvaluation => {
+                    let captured = state.take_captured_primary_estimate(boundary_step - 1)?;
+                    gen_core::BoundaryState::CleanEstimate {
+                        latent: captured.latent,
+                        source: gen_core::EstimateSource::PreviousEvaluation,
                     }
                 }
             };
@@ -3286,5 +3297,150 @@ mod tests {
             (0, 1, 512, 512)
         );
         let _ = EstimateSource::EndpointEvaluation;
+    }
+
+    #[test]
+    fn sw6940_mlx_flux_endpoint_and_previous_evaluation_end_to_end_and_provenance_report() {
+        use gen_core::{EstimateSource, EvaluationKind, LowResStartSpec};
+        use std::cell::RefCell;
+
+        for (sampler_name, expected_p0_evals, expected_p1_evals) in [
+            ("euler", 2usize, 2usize),
+            ("dpmpp_2m", 2usize, 2usize),
+            ("heun", 4usize, 3usize),
+            ("dpmpp_sde", 4usize, 3usize),
+        ] {
+            let make_req = |source: EstimateSource| GenerationRequest {
+                prompt: "a lighthouse in a storm".into(),
+                width: 512,
+                height: 512,
+                count: 1,
+                steps: Some(4),
+                seed: Some(42),
+                sampler: Some(sampler_name.into()),
+                low_res_start: Some(
+                    LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
+                ),
+                ..Default::default()
+            };
+
+            let req_endpoint = make_req(EstimateSource::EndpointEvaluation);
+            let req_previous = make_req(EstimateSource::PreviousEvaluation);
+            let plan_endpoint = compile_trajectory(FluxVariant::Dev, &req_endpoint).unwrap();
+            let plan_previous = compile_trajectory(FluxVariant::Dev, &req_previous).unwrap();
+
+            let report_endpoint = plan_endpoint
+                .low_res_start_execution_report("f32", 4, "base_dit")
+                .unwrap()
+                .unwrap();
+            let report_previous = plan_previous
+                .low_res_start_execution_report("f32", 4, "base_dit")
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(report_endpoint.estimator, "endpoint_evaluation_v1");
+            assert_eq!(
+                report_endpoint.estimate_provenance.evaluation_kind,
+                EvaluationKind::BoundaryEstimate
+            );
+            assert_eq!(report_endpoint.estimate_provenance.step_index, 2);
+            assert_eq!(
+                report_endpoint.estimate_provenance.sigma.to_bits(),
+                plan_endpoint.denoise_sigmas()[2].to_bits()
+            );
+            assert_eq!(report_endpoint.boundary_evaluations, 1);
+            assert_eq!(
+                report_endpoint.phase0_step_evaluations,
+                expected_p0_evals as u32
+            );
+            assert_eq!(
+                report_endpoint.phase1_step_evaluations,
+                expected_p1_evals as u32
+            );
+            assert_eq!(
+                report_endpoint.total_model_evaluations,
+                (expected_p0_evals + 1 + expected_p1_evals) as u32
+            );
+
+            assert_eq!(report_previous.estimator, "previous_evaluation_v1");
+            assert_eq!(
+                report_previous.estimate_provenance.evaluation_kind,
+                EvaluationKind::GuidedPrimaryX0
+            );
+            assert_eq!(report_previous.estimate_provenance.step_index, 1);
+            assert_eq!(
+                report_previous.estimate_provenance.sigma.to_bits(),
+                plan_previous.denoise_sigmas()[1].to_bits()
+            );
+            assert_eq!(report_previous.boundary_evaluations, 0);
+            assert_eq!(
+                report_previous.total_model_evaluations,
+                (expected_p0_evals + expected_p1_evals) as u32
+            );
+            assert_eq!(
+                report_previous
+                    .estimate_provenance
+                    .retained_primary_estimate_bytes,
+                256 * 64 * 4
+            );
+
+            let run_policy = |req: &GenerationRequest, plan: &gen_core::RenderPlan| {
+                let trace = RefCell::new(Vec::<(usize, u32, u32, usize, u32)>::new());
+                let mut progress = Vec::new();
+                let init_low = create_noise(42, 256, 256).unwrap();
+                let run = gen_core::RenderRun::new(plan, &req.cancel, None);
+                run.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+                let out = run
+                    .images_with_denoise_phases(
+                        &mut |p| progress.push(p),
+                        |_| Ok::<_, Error>(init_low.clone()),
+                        |seed, lat, prog| {
+                            execute_flux_denoise_trajectory(
+                                &run,
+                                req,
+                                seed,
+                                lat,
+                                prog,
+                                |x_in, step_idx, timestep, _guidance, pw, ph| {
+                                    trace.borrow_mut().push((
+                                        step_idx,
+                                        pw,
+                                        ph,
+                                        x_in.shape()[1] as usize,
+                                        timestep.to_bits(),
+                                    ));
+                                    Ok(multiply(x_in, scalar(0.15))?)
+                                },
+                            )
+                        },
+                        |_, lat, _| Ok(lat),
+                    )
+                    .unwrap()
+                    .remove(0);
+                mlx_rs::transforms::eval([&out]).unwrap();
+                (out.as_slice::<f32>().to_vec(), trace.into_inner(), progress)
+            };
+
+            let (out_ep, trace_ep, prog_ep) = run_policy(&req_endpoint, &plan_endpoint);
+            let (out_pr, trace_pr, prog_pr) = run_policy(&req_previous, &plan_previous);
+
+            assert_eq!(out_ep.len(), 1024 * 64);
+            assert_eq!(out_pr.len(), 1024 * 64);
+            assert!(out_ep.iter().all(|v| v.is_finite()));
+            assert!(out_pr.iter().all(|v| v.is_finite()));
+            assert_ne!(
+                out_ep, out_pr,
+                "{sampler_name}: EndpointEvaluation (sigma_K) and PreviousEvaluation (sigma_{{K-1}}) must produce distinct trajectories"
+            );
+            // Identical outer progress and identical Phase-0 evaluation trace before boundary K.
+            assert_eq!(prog_ep, prog_pr);
+            assert_eq!(
+                &trace_ep[..expected_p0_evals],
+                &trace_pr[..expected_p0_evals],
+                "{sampler_name}: Phase-0 evaluations must be bit-identical between EndpointEvaluation and PreviousEvaluation"
+            );
+            assert_eq!(trace_ep.len(), expected_p0_evals + 1 + expected_p1_evals);
+            assert_eq!(trace_pr.len(), expected_p0_evals + expected_p1_evals);
+        }
     }
 }

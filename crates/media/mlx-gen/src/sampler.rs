@@ -646,6 +646,13 @@ pub fn run_curated_sampler_with_phase_transition_spans(
     let solver = canonical_solver(sampler_name, Solver::Euler);
     let sampler: Box<dyn Sampler<MlxLatentOps>> = solver.boxed();
     let mut state = SolverRunState::new(solver, sigmas);
+    if let Some(run) = phase_scope {
+        if let Some(low_res_plan) = run.plan().low_res_start() {
+            state
+                .configure_low_res_start(low_res_plan)
+                .map_err(crate::Error::from)?;
+        }
+    }
     let mut step_observer = CuratedStepObserver::new(solver);
     let mut evaluations = 0u64;
 

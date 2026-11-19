@@ -1173,6 +1173,7 @@ mod tests {
                     warnings: vec![],
                     prefix_kv_cache: None,
                     pag: Some(pag_report.clone()),
+                    low_res_start: None,
                 })
             });
         assert!(matches!(

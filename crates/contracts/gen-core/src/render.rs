@@ -629,6 +629,47 @@ impl RenderPlan {
         self.pass.low_res_start.as_ref()
     }
 
+    /// Build the persisted [`crate::LowResStartExecutionReport`] receipt when `low_res_start` is active
+    /// on this pass (`SW-6940`: `FEAT-1`, `PIPE-3`, `PIPE-4`, `PERF-3`, `E3`).
+    pub fn low_res_start_execution_report(
+        &self,
+        dtype: &str,
+        dtype_bytes: u64,
+        slot_configuration: &str,
+    ) -> Result<Option<crate::LowResStartExecutionReport>> {
+        let Some(low_res) = &self.pass.low_res_start else {
+            return Ok(None);
+        };
+        let solver = low_res.estimate_source.validate_sampler_name(
+            &self.provider,
+            Some(self.sampler()),
+            self.inputs.guidance_method.as_deref(),
+        )?;
+        let guidance_mode = if let Some(method) = &self.inputs.guidance_method {
+            method.as_str()
+        } else if self.inputs.true_cfg_bits.is_some() {
+            "true_cfg"
+        } else if self.guidance() > 0.0 {
+            "embedded_guidance"
+        } else {
+            "distilled_unconditional"
+        };
+        let report = low_res.execution_report(
+            self.pass_index,
+            self.denoise_sigmas(),
+            solver,
+            guidance_mode,
+            self.guidance(),
+            slot_configuration,
+            dtype,
+            dtype_bytes,
+            1,
+            self.pixel_stride(),
+            self.token_width(),
+        )?;
+        Ok(Some(report))
+    }
+
     /// Spatial `(width, height)` for denoise `phase` (`0..denoise_spans().len()`).
     pub fn phase_output_size(&self, phase: usize) -> (u32, u32) {
         if let Some(low_res) = &self.pass.low_res_start {
