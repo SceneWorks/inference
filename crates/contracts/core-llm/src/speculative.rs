@@ -237,11 +237,14 @@ pub struct AutoBlockDraftDecision {
     pub reason: &'static str,
 }
 
-/// Every recorded [`AutoBlockDraftDecision`], from the SW-7200 speculative-paths campaign on a
-/// Qwen3.8-27B target (256-token cold context, each path at its recommended depth, linear check,
-/// decode speed as a multiple of plain decoding). No recorded pair beats MTP, so none is preferred
-/// and `auto` still resolves as [`resolve_speculative`] always has; a pair with no entry is
-/// unmeasured and keeps that order too.
+/// Every recorded [`AutoBlockDraftDecision`], from the SW-7200 speculative-paths campaigns on a
+/// Qwen3.8-27B target (report: `docs/migration/evidence/sw-7200/speculative-paths.md`, data
+/// beside it). The rule: a pair is preferred where its block draft — at its recommended depth,
+/// linear check — beats MTP at its recommended depth on mean decode speed **and** matches or beats
+/// it on mean full-request time, in **both** cold (256-token) and reused (64-token) context. A
+/// preferred draft still runs under `auto`'s acceptance monitor, which demotes it to plain decoding
+/// on a request where it is measurably slower. A pair with no entry is unmeasured and keeps
+/// `auto`'s MTP-then-prompt-lookup order. Ratios below are decode / request against MTP.
 pub const AUTO_BLOCK_DRAFT_DECISIONS: &[AutoBlockDraftDecision] = &[
     // Candle/CUDA — campaign run 44516873473.
     AutoBlockDraftDecision {
@@ -272,8 +275,37 @@ pub const AUTO_BLOCK_DRAFT_DECISIONS: &[AutoBlockDraftDecision] = &[
         prefer: false,
         reason: "run 44516873473: DSpine 1.92x plain vs MTP 2.04x — loses",
     },
-    // MLX — PENDING: the MLX speculative-paths rerun has not finished. Add its measured entries
-    // here; do not record values that run did not measure.
+    // MLX (M5 Max 128 GB) — campaign runs 44587316639 (every row but q4 cold) and 44605799110
+    // (the q4 cold rows).
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q4",
+        prefer: true,
+        reason: "runs 44605799110/44587316639: DFlash2 vs MTP cold 1.33/1.29, reused 1.84/1.81 \
+                 — beats it on every prompt",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q8",
+        prefer: true,
+        reason: "run 44587316639: DFlash2 vs MTP cold 1.16/1.03, reused 1.20/1.19",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q4",
+        prefer: true,
+        reason: "runs 44605799110/44587316639: DSpine vs MTP cold 1.29/1.25, reused 1.07/1.00",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q8",
+        prefer: true,
+        reason: "run 44587316639: DSpine vs MTP cold 1.13/1.10, reused 1.07/1.06",
+    },
 ];
 
 /// The recorded decision for `backend`, `format` and `tier`, or `None` (not measured — `auto` keeps

@@ -1511,7 +1511,7 @@ fn greedy_is_the_point_mass_special_case() {
 
 /// SW-7200: `auto` keeps its MTP-then-prompt-lookup order unless the caller passes a recorded
 /// block-draft preference; with it, an advertised block draft runs first at its recommended depth,
-/// and a model without one still falls through to MTP. No recorded decision prefers a draft yet.
+/// and a model without one still falls through to MTP.
 #[test]
 fn auto_prefers_a_block_draft_only_when_asked() {
     use crate::{
@@ -1572,14 +1572,69 @@ fn auto_prefers_a_block_draft_only_when_asked() {
         resolve_speculative_with(Speculative::Auto, &lookup_only, true).plan,
         run(SpeculativeProposer::PromptLookup, 2)
     );
-    // No recorded decision prefers a block draft yet, so the providers' preference is `false`
-    // for every backend, format and tier and `auto` keeps MTP.
+    // Only MLX's quantized tiers prefer a block draft; every other backend and tier keeps MTP.
     for backend in DecodeBackend::ALL {
         for format in BlockDraftFormat::ALL {
             for tier in ["q4", "q8", "bf16"] {
-                assert!(auto_block_draft_decision(backend, format, tier).is_none_or(|d| !d.prefer));
+                let prefer =
+                    auto_block_draft_decision(backend, format, tier).is_some_and(|d| d.prefer);
+                assert_eq!(
+                    prefer,
+                    backend == DecodeBackend::Mlx && tier != "bf16",
+                    "{backend:?} {format:?} {tier}"
+                );
             }
         }
+    }
+}
+
+#[test]
+fn auto_block_draft_decisions_record_the_mlx_campaign() {
+    use crate::{BlockDraftFormat, DecodeBackend};
+    for (format, tier, runs, numbers) in [
+        (
+            BlockDraftFormat::DFlash2,
+            "q4",
+            "44605799110",
+            "cold 1.33/1.29, reused 1.84/1.81",
+        ),
+        (
+            BlockDraftFormat::DFlash2,
+            "q8",
+            "44587316639",
+            "cold 1.16/1.03, reused 1.20/1.19",
+        ),
+        (
+            BlockDraftFormat::DSpine,
+            "q4",
+            "44605799110",
+            "cold 1.29/1.25, reused 1.07/1.00",
+        ),
+        (
+            BlockDraftFormat::DSpine,
+            "q8",
+            "44587316639",
+            "cold 1.13/1.10, reused 1.07/1.06",
+        ),
+    ] {
+        let d = auto_block_draft_decision(DecodeBackend::Mlx, format, tier)
+            .unwrap_or_else(|| panic!("MLX {format:?} {tier} is recorded"));
+        assert!(d.prefer, "MLX {format:?} {tier} beat MTP");
+        assert!(d.reason.contains(runs), "{}", d.reason);
+        assert!(d.reason.contains("44587316639"), "{}", d.reason);
+        assert!(d.reason.contains(numbers), "{}", d.reason);
+    }
+    // No bf16 target was measured on MLX.
+    for format in BlockDraftFormat::ALL {
+        assert_eq!(
+            auto_block_draft_decision(DecodeBackend::Mlx, format, "bf16"),
+            None
+        );
+    }
+    // Exactly the four CUDA and four MLX entries; the CUDA ones never prefer.
+    assert_eq!(AUTO_BLOCK_DRAFT_DECISIONS.len(), 8);
+    for d in AUTO_BLOCK_DRAFT_DECISIONS {
+        assert_eq!(d.prefer, d.backend == DecodeBackend::Mlx, "{d:?}");
     }
 }
 
@@ -1650,6 +1705,29 @@ fn auto_prefers_block_draft_only_for_a_preferring_record() {
             ));
         }
     }
+    // MLX prefers a resident draft beside a Q4/Q8 target — never without a draft, beside a bf16
+    // target (unmeasured) or beside one whose tier is unknown.
+    for format in BlockDraftFormat::ALL {
+        for bits in [4, 8] {
+            assert!(auto_prefers_block_draft(
+                DecodeBackend::Mlx,
+                Some(format),
+                R::Bits(bits)
+            ));
+        }
+        for resident in [R::Dense, R::Unknown, R::Bits(6)] {
+            assert!(!auto_prefers_block_draft(
+                DecodeBackend::Mlx,
+                Some(format),
+                resident
+            ));
+        }
+    }
+    assert!(!auto_prefers_block_draft(
+        DecodeBackend::Mlx,
+        None,
+        R::Bits(4)
+    ));
     // The preference follows every recorded entry's own `prefer`, reached from the resident fact.
     for d in AUTO_BLOCK_DRAFT_DECISIONS {
         let resident = match d.tier {
