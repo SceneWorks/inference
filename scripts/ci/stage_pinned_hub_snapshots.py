@@ -10,7 +10,10 @@ pin this setup:
 2. stats each file at `<hub>/models--org--name/snapshots/<revision>/<file>` — it never lists a
    directory (a Hub listing blocked forever on nax-macos-2) — and fetches only the absent ones,
    after refusing when their bytes plus a reserve exceed the free space; an existing file is
-   never replaced;
+   never replaced. Several runner listeners share one host's hub, so each absent file is fetched
+   under a host-wide per-file lock (`<hub>/.locks/<repo>/model-proof-staging/...`, released by
+   the OS when a job dies) and re-checked once the lock is held: a job that waited finds the
+   file the other job staged instead of downloading it again;
 3. authenticates every file of the subfolder against the Hub's LFS SHA-256 / Git blob digests
    (scripts/ci/pinned_hub_source.py), whether staged now or already present;
 4. appends `NAME=<snapshot>/<subfolder>` for each slot and the receipt path to `GITHUB_ENV`.
@@ -21,12 +24,15 @@ loaded; the one manual proof invocation that follows re-checks the receipt again
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import sys
+import time
 import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,10 +43,66 @@ GIB = 1024**3
 # Free space a staging run must leave on the model root's volume.
 DISK_RESERVE_BYTES = 20 * GIB
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{name}"
+LOCK_POLL_SECONDS = 5
+# A holder may be downloading tens of GiB; say so periodically rather than going silent.
+LOCK_LOG_SECONDS = 180
+# Only these mean "another holder has it"; any other lock error (ENOLCK/ENOTSUP on a network
+# hub, EBADF, EINVAL) is raised instead of spinning forever.
+POSIX_LOCK_BUSY = frozenset((errno.EWOULDBLOCK, errno.EAGAIN))
+MSVCRT_LOCK_BUSY = frozenset((errno.EACCES, errno.EDEADLK))
 
 
 def snapshot_dir(hub: Path, repository: str, revision: str) -> Path:
     return hub / ("models--" + repository.replace("/", "--")) / "snapshots" / revision
+
+
+def _try_lock(handle) -> bool:
+    windows = os.name == "nt"
+    try:
+        if windows:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as error:
+        if error.errno in (MSVCRT_LOCK_BUSY if windows else POSIX_LOCK_BUSY):
+            return False
+        raise
+
+
+@contextmanager
+def staging_lock(hub: Path, repository: str, revision: str, file: str):
+    """Hold the host-wide lock for one pinned file. The lock file is never deleted, because a
+    waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
+    path = (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
+            / revision / (file + ".lock"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as handle:
+        if handle.seek(0, 2) == 0:
+            handle.write(b"0")
+            handle.flush()
+        if not _try_lock(handle):
+            started = logged = time.monotonic()
+            print(f"waiting for another job staging {repository}@{revision}/{file}", flush=True)
+            while not _try_lock(handle):
+                time.sleep(LOCK_POLL_SECONDS)
+                if time.monotonic() - logged >= LOCK_LOG_SECONDS:
+                    logged = time.monotonic()
+                    print(f"still waiting ({logged - started:.0f} s) for another job staging "
+                          f"{repository}@{revision}/{file}", flush=True)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def pinned_files(inventory: dict[str, dict], subfolder: str) -> dict[str, int]:
@@ -86,18 +148,21 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
                          f"but {hub} has {free / GIB:.1f} GiB free")
     receipt: dict[str, dict] = {}
     for name, pin, base, files, absent in plans:
-        fetched = []
+        fetched, placed_by_another_job = [], []
         for file in sorted(absent):
-            if (base / file).exists():  # Staged for an earlier slot of the same revision.
-                continue
-            url = HF_RESOLVE.format(repo=pin["repository"], revision=pin["revision"], name=urllib.parse.quote(file))
-            print(f"staging {pin['repository']}@{pin['revision']}/{file} ({absent[file] / GIB:.2f} GiB)", flush=True)
-            fetch(url, base / file)
-            fetched.append(file)
+            with staging_lock(hub, pin["repository"], pin["revision"], file):
+                # Staged for an earlier slot of the same revision, or by another job on this host.
+                if (base / file).exists():
+                    continue
+                url = HF_RESOLVE.format(repo=pin["repository"], revision=pin["revision"], name=urllib.parse.quote(file))
+                print(f"staging {pin['repository']}@{pin['revision']}/{file} ({absent[file] / GIB:.2f} GiB)", flush=True)
+                _, _, _, placed = fetch(url, base / file)
+                (placed_by_another_job if placed else fetched).append(file)
         verified = verify(pin["repository"], pin["revision"], base, tuple(sorted(files)))
         path = base / pin["subfolder"] if pin["subfolder"] else base
         receipt[name] = {**pin, "path": str(path), "status": verified["status"], "fetched": fetched,
                          "kept_existing": sorted(set(files) - set(fetched)),
+                         "placed_by_another_job": placed_by_another_job,
                          "manifest_sha256": verified["manifest_sha256"], "files": verified["files"]}
     return receipt
 
