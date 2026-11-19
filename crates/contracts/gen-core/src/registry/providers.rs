@@ -6,6 +6,7 @@ use super::*;
 pub struct ProviderRegistry {
     pub(super) generators: Box<[ModelRegistration]>,
     pub(super) render_plans: Box<[crate::RenderPlanRegistration]>,
+    pub(super) feature_routes: Box<[FeatureRouteRegistration]>,
     pub(super) checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
     pub(super) checkpoint_codecs: CheckpointCodecRegistry,
     pub(super) imported_models: Box<[ImportedModelRegistration]>,
@@ -57,6 +58,110 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Look up the pre-load [`crate::RenderPlanRegistration`] for `id`, when registered.
+    pub fn render_plan_registration(&self, id: &str) -> Option<&crate::RenderPlanRegistration> {
+        self.render_plans.iter().find(|entry| entry.provider_id == id)
+    }
+
+    /// Every registered conditioned or platform-composed feature route in this catalog.
+    pub fn feature_route_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &FeatureRouteRegistration> {
+        self.feature_routes.iter()
+    }
+
+    /// Compute structural Feature applicability for `descriptor` in this registry, including any
+    /// conditioned sub-routes bound to `descriptor.id`.
+    pub fn generator_feature_applicability(
+        &self,
+        descriptor: &ModelDescriptor,
+    ) -> std::collections::BTreeMap<String, crate::FeatureApplicability> {
+        let registry = crate::FeatureRegistry::standard();
+        let route = crate::FeatureRouteStructure::from_descriptor_and_plan(
+            descriptor,
+            self.render_plan_registration(descriptor.id),
+        );
+        let mut features = registry.evaluate_route(&route);
+
+        for child in self
+            .feature_routes
+            .iter()
+            .filter(|r| r.parent_provider_id == Some(descriptor.id))
+        {
+            let mut child_desc = (child.descriptor)();
+            child_desc.id = child.route_id;
+            let child_route = crate::FeatureRouteStructure::from_descriptor_and_plan(
+                &child_desc,
+                child.render_plan.as_ref(),
+            );
+            let child_features = registry.evaluate_route(&child_route);
+            for (feature_id, child_app) in child_features {
+                if let Some(parent_app) = features.get_mut(&feature_id) {
+                    parent_app
+                        .conditioned_routes
+                        .insert(child.route_id.to_string(), child_app);
+                }
+            }
+        }
+        features
+    }
+
+    /// Compute structural Feature applicability for every registered generator and conditioned
+    /// feature route in this catalog, keyed by `route_id -> feature_id -> FeatureApplicability`.
+    pub fn all_route_feature_applicability(
+        &self,
+    ) -> std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::FeatureApplicability>,
+    > {
+        let registry = crate::FeatureRegistry::standard();
+        let mut all = std::collections::BTreeMap::new();
+        for generator in &self.generators {
+            let descriptor = (generator.descriptor)();
+            all.insert(
+                descriptor.id.to_string(),
+                self.generator_feature_applicability(&descriptor),
+            );
+        }
+        for feature_route in &self.feature_routes {
+            let mut descriptor = (feature_route.descriptor)();
+            descriptor.id = feature_route.route_id;
+            let route = crate::FeatureRouteStructure::from_descriptor_and_plan(
+                &descriptor,
+                feature_route.render_plan.as_ref(),
+            );
+            all.entry(feature_route.route_id.to_string())
+                .or_insert_with(|| registry.evaluate_route(&route));
+        }
+        all
+    }
+
+    /// Compute structural Feature applicability for a specific `route_id` (ordinary generator or
+    /// registered conditioned feature route).
+    pub fn route_feature_applicability(
+        &self,
+        route_id: &str,
+    ) -> Option<std::collections::BTreeMap<String, crate::FeatureApplicability>> {
+        if let Some(generator) = self
+            .generators
+            .iter()
+            .find(|g| (g.descriptor)().id == route_id)
+        {
+            return Some(self.generator_feature_applicability(&(generator.descriptor)()));
+        }
+        let feature_route = self
+            .feature_routes
+            .iter()
+            .find(|r| r.route_id == route_id)?;
+        let mut descriptor = (feature_route.descriptor)();
+        descriptor.id = feature_route.route_id;
+        let route = crate::FeatureRouteStructure::from_descriptor_and_plan(
+            &descriptor,
+            feature_route.render_plan.as_ref(),
+        );
+        Some(crate::FeatureRegistry::standard().evaluate_route(&route))
+    }
+
     /// Compile before calling the provider factory. Unmigrated routes have no plan.
     pub fn compile_render_plan(
         &self,

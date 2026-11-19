@@ -54,6 +54,19 @@ pub mod env_flag;
 pub mod error;
 pub mod execution_domains;
 pub mod face;
+pub mod feature;
+pub use feature::{
+    dump_hook_map_json, hook_map, hook_map_for_registry, hook_point_metadata,
+    validate_low_res_start_request, ComposedDenoisePhase, ComposedPassPlan,
+    ComposedPhaseTransition, ComposedRenderPlan, FeatureApplicability, FeatureClass,
+    FeatureHookBinding, FeatureInapplicabilityCode, FeatureInapplicabilityReason,
+    FeatureInvocation, FeatureMemoryEffect, FeatureParameterDomain, FeatureParameterSchema,
+    FeatureParameterSpec, FeatureParameters, FeatureRegistry, FeatureRelations,
+    FeatureRouteStructure, FeatureSpec, HiresFixFeature, HookPoint, HookPointMetadata,
+    HookTiming, InertPhaseSplitFeature, KreaMultiphaseFeature, LowResStartFeature, PagFeature,
+    Pass0ConditioningRequirement, PhaseTransitionAction, TrajectoryObserverFeature,
+    TransitionResidency, WanExpertSwitchFeature,
+};
 pub mod flux3;
 pub mod generator;
 pub mod guidance;
@@ -81,7 +94,7 @@ pub mod registry;
 pub mod render;
 pub use render::{
     MultiPassRenderPlan, PlannedPassRequest, ProducedReference, RenderLoadBinding, RenderPlan,
-    RenderPlanRegistration, RenderRun,
+    RenderPlanRegistration, RenderRun, RenderStage,
 };
 pub mod residency;
 pub mod runtime;
@@ -258,7 +271,7 @@ pub use registry::{
     CheckpointBaseCompatibilityRegistration, CheckpointCanonicalMappingRegistration,
     CheckpointComponentRegistration, CheckpointConfigRecoveryRegistration,
     CheckpointDialectRegistration, CheckpointSignatureRegistration,
-    EncoderContractRouteRegistration, ImageEmbedderRegistration,
+    EncoderContractRouteRegistration, FeatureRouteRegistration, ImageEmbedderRegistration,
     ImportedModelCompatibilityProjectionRegistration, ImportedModelOperation,
     ImportedModelRegistration, ImportedModelSource, MemoryBehaviorBeginRequest,
     MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,

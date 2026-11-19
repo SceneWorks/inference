@@ -530,6 +530,9 @@ pub fn compile_conditioned_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<RenderPlan> {
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
     let sigmas = pipeline::base_schedule(variant, req)?;
     let executed_steps = sigmas.len().saturating_sub(1);
     let guidance = if variant.supports_guidance() {
@@ -775,6 +778,33 @@ candle_gen::register_generators! {
     pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev
 }
 
+fn pulid_feature_descriptor() -> ModelDescriptor {
+    let mut descriptor = ip_provider::ip_descriptor(Variant::Dev);
+    descriptor.id = "flux1_dev_pulid";
+    descriptor.family = "pulid";
+    descriptor
+}
+
+fn compile_pulid_feature_route(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<RenderPlan>> {
+    let descriptor = pulid_feature_descriptor();
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if !matches!(
+        req.conditioning.as_slice(),
+        [gen_core::Conditioning::Reference { .. }]
+    ) || spec.identity.is_none()
+    {
+        return Err(gen_core::Error::Unsupported(
+            "flux1_dev_pulid requires a Reference face image and identity weights".into(),
+        ));
+    }
+    compile_conditioned_plan(Variant::Dev, &descriptor, spec, req).map(Some)
+}
+
 /// Add all Candle FLUX.1 providers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
@@ -783,7 +813,45 @@ pub fn register_providers(
         .register_generator(SCHNELL_REGISTRATION)
         .register_generator(DEV_REGISTRATION)
         .register_render_plan(SCHNELL_RENDER_PLAN)
-        .register_render_plan(DEV_RENDER_PLAN);
+        .register_render_plan(DEV_RENDER_PLAN)
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: "flux1_dev_control",
+            parent_provider_id: Some(FLUX1_DEV_ID),
+            descriptor: control_provider::control_descriptor,
+            render_plan: Some(RenderPlanRegistration {
+                provider_id: "flux1_dev_control",
+                compile: control_provider::compile_control_feature_route,
+            }),
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: "flux1_dev_ip_adapter",
+            parent_provider_id: Some(FLUX1_DEV_ID),
+            descriptor: || ip_provider::ip_descriptor(Variant::Dev),
+            render_plan: Some(RenderPlanRegistration {
+                provider_id: "flux1_dev_ip_adapter",
+                compile: |spec, req| ip_provider::compile_ip_feature_route(Variant::Dev, spec, req),
+            }),
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: "flux1_schnell_ip_adapter",
+            parent_provider_id: Some(FLUX1_SCHNELL_ID),
+            descriptor: || ip_provider::ip_descriptor(Variant::Schnell),
+            render_plan: Some(RenderPlanRegistration {
+                provider_id: "flux1_schnell_ip_adapter",
+                compile: |spec, req| {
+                    ip_provider::compile_ip_feature_route(Variant::Schnell, spec, req)
+                },
+            }),
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: "flux1_dev_pulid",
+            parent_provider_id: Some(FLUX1_DEV_ID),
+            descriptor: pulid_feature_descriptor,
+            render_plan: Some(RenderPlanRegistration {
+                provider_id: "flux1_dev_pulid",
+                compile: compile_pulid_feature_route,
+            }),
+        });
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
@@ -885,6 +953,96 @@ mod tests {
     fn base_flux_plan_is_tensor_free_and_variant_exact() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let registry = provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        for (route_id, expected_steps, expected_max_k) in
+            [("flux1_schnell", 4u32, 3u64), ("flux1_dev", 25u32, 24u64)]
+        {
+            let app = &all_features[route_id]["low_res_start"];
+            assert!(app.applicable, "candle {route_id} must support low_res_start");
+            let json = app.to_json();
+            assert_eq!(json["class"], "recipe");
+            assert_eq!(json["version"], 1);
+            assert_eq!(
+                json["parameter_schema"]["k"]["default_executed_steps"],
+                expected_steps
+            );
+            assert_eq!(json["parameter_schema"]["k"]["max"], expected_max_k);
+        }
+        assert!(!all_features["flux1_dev_control"]["low_res_start"].applicable);
+        assert!(all_features["flux1_dev_control"]["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code
+                == gen_core::FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
+        for ref_route in [
+            "flux1_dev_ip_adapter",
+            "flux1_schnell_ip_adapter",
+            "flux1_dev_pulid",
+        ] {
+            let app = &all_features[ref_route]["low_res_start"];
+            assert!(!app.applicable, "candle {ref_route} must refuse low_res_start");
+            assert!(app
+                .reasons
+                .iter()
+                .any(|r| r.code
+                    == gen_core::FeatureInapplicabilityCode::ConflictsWithPass0ReferenceConditioning));
+        }
+
+        // Unsupported `phases` on every migrated Candle FLUX.1 route returns a typed Error::Unsupported.
+        let phased_req = GenerationRequest {
+            prompt: "a blue lamp".into(),
+            width: 512,
+            height: 512,
+            phases: Some(vec![gen_core::GenerationPhase {
+                steps: 4,
+                guidance: Some(3.5),
+                adapters: vec![],
+            }]),
+            ..Default::default()
+        };
+        for id in [FLUX1_SCHNELL_ID, FLUX1_DEV_ID] {
+            assert!(matches!(
+                registry.compile_render_plan(id, &spec, &phased_req),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+        }
+        assert!(matches!(
+            compile_conditioned_plan(
+                Variant::Dev,
+                &control_provider::control_descriptor(),
+                &spec,
+                &phased_req
+            ),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            compile_conditioned_plan(
+                Variant::Dev,
+                &ip_provider::ip_descriptor(Variant::Dev),
+                &spec,
+                &phased_req
+            ),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            compile_conditioned_plan(
+                Variant::Schnell,
+                &ip_provider::ip_descriptor(Variant::Schnell),
+                &spec,
+                &phased_req
+            ),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            compile_conditioned_plan(
+                Variant::Dev,
+                &pulid_feature_descriptor(),
+                &spec,
+                &phased_req
+            ),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
         for (variant, expected_steps, expected_guidance) in
             [(Variant::Schnell, 4, 0.0), (Variant::Dev, 25, 3.5)]
         {

@@ -9,11 +9,12 @@ use crate::{
     default_seed, CancelFlag, Conditioning, ControlKind, Error, GenerationRequest, Image, LoadSpec,
     MemoryPhase, MemoryRequestScope, ModelDescriptor, Progress, Result,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
+#[derive(Clone, Copy)]
 pub struct RenderPlanRegistration {
     pub provider_id: &'static str,
     pub compile: fn(&LoadSpec, &GenerationRequest) -> Result<Option<RenderPlan>>,
@@ -21,8 +22,8 @@ pub struct RenderPlanRegistration {
 
 /// A serialized plan exposes the actual execution order, including once-per-request encoding
 /// and the subset repeated for each sequential image. This noise-start pass has no reference stage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-enum Stage {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RenderStage {
     PromptPrep,
     Encode,
     Schedule,
@@ -34,6 +35,8 @@ enum Stage {
     Decode,
     Output,
 }
+
+type Stage = RenderStage;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct PackedImageStream {
@@ -131,6 +134,11 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
     type Error = Error;
 
     fn try_from(req: &GenerationRequest) -> Result<Self> {
+        if req.phases.is_some() {
+            return Err(Error::Unsupported(
+                "packed image plan does not support multi-phase denoise (phases)".into(),
+            ));
+        }
         let conditioning = match req.conditioning.as_slice() {
             [] => PackedImageConditioning::None,
             [Conditioning::Reference { image, strength }] => PackedImageConditioning::Reference {
@@ -303,6 +311,12 @@ impl RenderPlan {
         req: &GenerationRequest,
         pass: PackedImagePass<'_>,
     ) -> Result<Self> {
+        if req.phases.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{}: multi-phase denoise (phases) is not supported on this route",
+                descriptor.id
+            )));
+        }
         let PackedImagePass {
             pixel_stride,
             token_width,
@@ -465,6 +479,26 @@ impl RenderPlan {
     /// The (width, height) of this pass's output image.
     pub fn output_size(&self) -> (u32, u32) {
         (self.pass.phase.stream.width, self.pass.phase.stream.height)
+    }
+
+    /// Packed image spatial pixel stride (e.g., 16 for 2x2-packed /8 VAE latents).
+    pub fn pixel_stride(&self) -> u32 {
+        self.pass.phase.stream.patch_stride
+    }
+
+    /// Packed token channel width (e.g., 64 for FLUX.1).
+    pub fn token_width(&self) -> u32 {
+        self.pass.phase.stream.token_width
+    }
+
+    /// Declared stage execution order for this pass.
+    pub fn stages(&self) -> &[RenderStage; 10] {
+        &self.pass.stages
+    }
+
+    /// Whether this pass carries reference or control conditioning.
+    pub fn has_conditioning(&self) -> bool {
+        !matches!(self.inputs.conditioning, PackedImageConditioning::None)
     }
 
     /// Replace a compiled single-reference input with a declaration that pass `from_pass`

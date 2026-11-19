@@ -1404,6 +1404,32 @@ pub fn compile_trajectory_for(
     )?)
 }
 
+pub(crate) fn descriptor_schnell_ip_adapter() -> ModelDescriptor {
+    let mut descriptor = descriptor_schnell();
+    descriptor.id = "flux1_schnell_ip_adapter";
+    descriptor
+}
+
+pub(crate) fn descriptor_dev_ip_adapter() -> ModelDescriptor {
+    let mut descriptor = descriptor_dev();
+    descriptor.id = "flux1_dev_ip_adapter";
+    descriptor
+}
+
+pub(crate) fn compile_ip_adapter(
+    variant: FluxVariant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if single_reference(req)?.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}_ip_adapter: a reference image (Conditioning::Reference) is required",
+            variant.id()
+        )));
+    }
+    compile_base(variant, spec, req)
+}
+
 pub(crate) fn compile_base(
     variant: FluxVariant,
     spec: &LoadSpec,
@@ -1520,6 +1546,12 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     if req.steps == Some(0) {
         return Err(Error::Msg(format!(
             "{}: steps must be >= 1 (an explicit 0 renders undenoised noise)",
+            desc.id
+        )));
+    }
+    if req.phases.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{}: multi-phase denoise (phases) is not supported",
             desc.id
         )));
     }

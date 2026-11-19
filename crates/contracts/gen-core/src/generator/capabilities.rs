@@ -449,6 +449,11 @@ pub struct Capabilities {
     /// means this model/backend does not support PAG, and the shared request floor rejects any
     /// `Some` [`GenerationRequest::pag`] as [`Error::Unsupported`].
     pub pag: Option<crate::PagCapability>,
+    /// Whether this model route honours [`GenerationRequest::phases`] multi-phase denoise
+    /// (SW-6938). `Default` is `false`, and the shared floor refuses any `Some` `phases` on a
+    /// non-supporting route with [`Error::Unsupported`] rather than letting a provider silently
+    /// ignore it and render a single-phase trajectory.
+    pub supports_phases: bool,
 }
 
 /// The one typed refusal for an **adapter-bearing** request against a descriptor whose advertised
@@ -750,6 +755,25 @@ impl Capabilities {
             return Err(Error::Unsupported(format!(
                 "{id}: Perturbed-Attention Guidance (PAG) is not supported by this model"
             )));
+        }
+        if let Some(phases) = &req.phases {
+            if !self.supports_phases && id != "krea_2_raw" {
+                return Err(Error::Unsupported(format!(
+                    "{id}: multi-phase denoise (phases) is not supported by this model (supported on krea_2_raw only)"
+                )));
+            }
+            if phases.is_empty() {
+                return Err(Error::Msg(format!(
+                    "{id}: phases must contain at least one phase"
+                )));
+            }
+            for (i, phase) in phases.iter().enumerate() {
+                if phase.steps == 0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: phase {i} must run at least one step"
+                    )));
+                }
+            }
         }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
         // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
