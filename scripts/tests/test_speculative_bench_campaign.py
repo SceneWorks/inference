@@ -253,11 +253,24 @@ class PlanTests(unittest.TestCase):
         self.assertIn(f'option_env!("{campaign.BUILD_SHA_ENV}")', source)
         self.assertIn(f'pub const BENCH_SCHEMA: &str = "{campaign.SCHEMA}";', source)
 
+    def test_the_optional_matrix_runner_is_accepted_for_both_macs_and_not_planned(self) -> None:
+        good = {"id": "r", "snapshot": "qwen38"}
+        base = campaign.plan_matrix(json.dumps({"rows": [good]}), SNAPSHOTS)
+        for runner in ("rw-starvector", "rw-llm"):
+            with self.subTest(runner):
+                plan = campaign.plan_matrix(json.dumps({"rows": [good], "runner": runner}), SNAPSHOTS)
+                self.assertEqual(plan, base)
+        with self.assertRaisesRegex(campaign.MatrixError, "rw-starvector.*rw-llm"):
+            campaign.plan_matrix(json.dumps({"rows": [good], "runner": "rw-mage"}), SNAPSHOTS)
+
     def test_every_malformed_matrix_is_refused_before_anything_runs(self) -> None:
         good = {"id": "r", "snapshot": "qwen38"}
         cases = {
             "not json": "{",
             "extra top key": {"rows": [good], "more": 1},
+            "unknown runner": {"rows": [good], "runner": "rw-mage"},
+            "non-string runner": {"rows": [good], "runner": None},
+            "runner without rows": {"runner": "rw-llm"},
             "no rows": {"rows": []},
             "rows not a list": {"rows": good},
             "too many rows": {"rows": [{**good, "id": f"r{i}"} for i in range(65)]},

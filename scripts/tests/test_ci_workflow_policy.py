@@ -5630,7 +5630,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ):
             errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
         # The loaned primary Mac, by its unique label.
-        if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "rw-starvector"]:
+        if job["runs-on"] != [
+            "self-hosted", "macOS", "ARM64",
+            "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner || 'rw-starvector' }}",
+        ]:
             errors.append(f"wrong runner: {job['runs-on']!r}")
         shell = job.get("defaults", {}).get("run", {}).get("shell", "")
         if "scripts/ci/inference_metal_launcher.py" not in shell:
@@ -5673,8 +5676,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for name in ("CARGO_PROFILE_RELEASE_STRIP", "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP"):
             if f"export {name}=none" not in run.split("speculative_bench_campaign.py run ")[0]:
                 errors.append(f"the build does not export {name}=none before it runs")
-        if not str(env.get("DECODE_BENCH_TARGET_DIR", "")).startswith("/Volumes/Models/"):
-            errors.append("the build target is not job-owned on /Volumes/Models")
+        target = str(env.get("DECODE_BENCH_TARGET_DIR", ""))
+        if "'/Volumes/Models/sceneworks-ci/decode-speedups-bench/cargo-target'" not in target:
+            errors.append("the rw-starvector build target is not job-owned on /Volumes/Models")
+        if "runner == 'rw-llm'" not in target or "format('{0}/../decode-speedups-bench-target', github.workspace)" not in target:
+            errors.append("the rw-llm build target is not the workspace-sibling directory")
+        if target.count("/Volumes") != 1:
+            errors.append("the rw-llm build target must not be under /Volumes")
         upload = next((s for s in steps if s.get("name") == "Keep the decode-speedups benchmark documents"), {})
         if upload.get("if") != "always()" or upload.get("with", {}).get("if-no-files-found") != "error":
             errors.append("the documents upload must survive a failed row, a cancel and a timeout")

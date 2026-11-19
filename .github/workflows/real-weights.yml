@@ -5567,7 +5567,10 @@ jobs:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 900 -- /bin/bash -e {0}
     name: Decode-speedups benchmark campaign (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench-mlx'
-    runs-on: [self-hosted, macOS, ARM64, rw-starvector]
+    # The matrix's optional top-level `runner` ("rw-starvector" default, or "rw-llm") picks the host.
+    # nax-macos-2 (rw-llm) is the default home for MLX real-weight work; its hub cache starts
+    # empty, and the `hub:` pins are fetched by the existing staging step.
+    runs-on: [self-hosted, macOS, ARM64, "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner || 'rw-starvector' }}"]
     timeout-minutes: 180
     env:
       DECODE_BENCH_MATRIX: ${{ inputs.decode_bench_matrix }}
@@ -5575,7 +5578,7 @@ jobs:
       DECODE_BENCH_SNAPSHOT_BONSAI_MLX: ${{ vars.BONSAI_MLX_SNAPSHOT }}
       MODEL_PROOF_HUB_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
       DECODE_BENCH_BUDGET_MINUTES: "100"
-      DECODE_BENCH_TARGET_DIR: /Volumes/Models/sceneworks-ci/decode-speedups-bench/cargo-target
+      DECODE_BENCH_TARGET_DIR: ${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' && format('{0}/../decode-speedups-bench-target', github.workspace) || '/Volumes/Models/sceneworks-ci/decode-speedups-bench/cargo-target' }}
     steps:
       - shell: bash
         name: Prepare the persistent build target

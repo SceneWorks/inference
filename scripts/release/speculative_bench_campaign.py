@@ -62,6 +62,9 @@ Subcommands:
            one listed as superseded
 
 The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
+(the one optional top-level key besides ``rows`` is ``"runner"``, ``"rw-starvector"`` (default, the
+owner's Mac) or ``"rw-llm"`` (nax-macos-2); it only selects the MLX job's runner in the workflow
+and is not part of the plan)
 
   id                  ``[a-z0-9][a-z0-9._-]{0,63}``, unique; the row's output directory
   snapshot            ``qwen38`` / ``bonsai-mlx`` (the repository-variable snapshots the
@@ -263,6 +266,10 @@ LANES = {
         mlx=True,
     ),
 }
+
+
+# The MLX job's runner labels a matrix may select (`runs-on` reads the same key in the workflow).
+MATRIX_RUNNERS = ("rw-starvector", "rw-llm")
 
 
 class MatrixError(ValueError):
@@ -520,8 +527,10 @@ def plan_matrix(text: str, environ: dict[str, str], lane: str = "cuda") -> dict[
         matrix = json.loads(text)
     except json.JSONDecodeError as error:
         raise MatrixError(f"the matrix is not JSON: {error}") from error
-    if not isinstance(matrix, dict) or set(matrix) != {"rows"}:
-        raise MatrixError('the matrix must be an object with exactly the key "rows"')
+    if not isinstance(matrix, dict) or not {"rows"} <= set(matrix) <= {"rows", "runner"}:
+        raise MatrixError('the matrix must be an object with the key "rows" and optionally "runner"')
+    if "runner" in matrix and matrix["runner"] not in MATRIX_RUNNERS:
+        raise MatrixError(f"runner must be one of {list(MATRIX_RUNNERS)}, got {matrix['runner']!r}")
     rows = matrix["rows"]
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ROWS:
         raise MatrixError(f"rows must be a list of 1..{MAX_ROWS} rows")
