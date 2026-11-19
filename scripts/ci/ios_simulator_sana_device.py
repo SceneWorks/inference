@@ -112,7 +112,7 @@ def main() -> int:
     args = parser.parse_args()
     runner = os.environ.get("RUNNER_NAME", "")
     if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
-            or runner not in ("nax-macos", "nax-macos-2")
+            or not runner
             or not args.run_id.isdecimal() or not args.attempt.isdecimal()):
         raise ValueError("simulator ownership is restricted to manual Mac dispatches")
     if args.phase == "select":

@@ -42,7 +42,7 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     if "github.event_name == 'workflow_dispatch'" not in mlx or "inputs.profile == 'starvector-terminal'" not in mlx:
         errors.append("MLX terminal lane is not dispatch-only")
     if "runs-on: [self-hosted, macOS, ARM64, rw-llm]" not in mlx:
-        errors.append("MLX terminal lane does not target nax-macos-2 (rw-llm)")
+        errors.append("MLX terminal lane does not select the rw-llm label")
     for snapshot in (
         "${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-1b-im2svg/snapshots/380ab95d25a8e9ab1dc825debe238b4953ae13b9",
         "${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-8b-im2svg/snapshots/518beea8dcb5f7a37c5911e92d1d62a76beee7f9",

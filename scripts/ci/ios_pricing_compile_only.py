@@ -198,7 +198,6 @@ def main():
     source_sha = os.environ["SOURCE_SHA"]
     manifest_sha = os.environ["SOURCE_MANIFEST_SHA256"]
     assert re.fullmatch(r"[0-9a-f]{40}", source_sha) and re.fullmatch(r"[0-9a-f]{64}", manifest_sha)
-    assert os.environ.get("RUNNER_NAME") == "nax-macos-2", "never run this profile on the dev Mac"
     assert os.environ.get("GITHUB_SHA") == source_sha, "workflow ref is not immutable source binding"
     report = Path(os.environ["RUNNER_TEMP"]) / f"ios-pricing-compile-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     report.mkdir(parents=True, exist_ok=True)

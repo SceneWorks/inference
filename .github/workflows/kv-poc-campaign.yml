@@ -1,9 +1,8 @@
 name: KV PoC campaigns (epic 20669, W1 + W2)
 
-# Runs epic 20669's GPU windows on a selected Mac (`rw-krea` = nax-macos-2, the second Mac; `nax` =
-# the dev Mac nax-macos). The runner label names a HOST: config.sh maps it to a label set only that
-# Mac carries and every job asserts its runner name, because each job reuses the previous job's
-# $HOME/kv-poc state and the raw `nax` label is registered on both Macs. Measurement, not a gate:
+# Runs epic 20669's GPU windows on the Mac a route label selects (`rw-krea` or `nax`; config.sh maps
+# each to a label set). Each job reuses the previous job's $HOME/kv-poc state, so every job after
+# the probe must land on the runner the probe landed on; no job names a machine. Measurement, not a gate:
 # no pull_request / schedule trigger, and nothing here can become a required check.
 #   W1 (mode=w1), the LLM KV campaign, with the exact commands of the dev-Mac prep's W1-COMMANDS.sh:
 #     A1 dense sc20671 -> A3 packed sc20676 -> A2 compressed sc20671 -> B sc20677 capture + compare.
@@ -112,7 +111,7 @@ on:
         type: string
         default: 278f4b3af4d252aa58ac5905e08a3ddebaf7568f
       runner_label:
-        description: "rw-krea = nax-macos-2 (the second Mac); nax = Michael's dev Mac"
+        description: "Route label: rw-krea or nax (nax adds rw-starvector)"
         type: choice
         options: [rw-krea, nax]
         default: rw-krea
@@ -177,7 +176,6 @@ jobs:
       nf_only_coordinate: ${{ steps.resolve.outputs.nf_only_coordinate }}
       hf_hub_override: ${{ steps.resolve.outputs.hf_hub_override }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
-      runner_name: ${{ steps.resolve.outputs.runner_name }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -208,11 +206,15 @@ jobs:
     timeout-minutes: 15
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_MODE: ${{ needs.config.outputs.mode }}
+    outputs:
+      runner_name: ${{ steps.host.outputs.runner_name }}
     steps:
+      - name: Record the runner every later job must reuse
+        id: host
+        run: printf 'runner_name=%s\n' "$RUNNER_NAME" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           sparse-checkout: |
@@ -232,7 +234,7 @@ jobs:
     timeout-minutes: 180
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
@@ -253,7 +255,7 @@ jobs:
 
   a1:
     name: "A1 dense baseline (sc20671)"
-    needs: [config, build]
+    needs: [config, probe, build]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a1,')
       && needs.build.result == 'success' }}
@@ -264,7 +266,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "660"
@@ -294,7 +296,7 @@ jobs:
 
   a3:
     name: "A3 packed arms, kv-bits ${{ needs.config.outputs.a3_bits }} (sc20676)"
-    needs: [config, build, a1]
+    needs: [config, probe, build, a1]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a3,')
       && needs.build.result == 'success'
@@ -306,7 +308,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       BASELINE_EVIDENCE_SHA: ${{ needs.config.outputs.baseline_evidence_sha }}
@@ -338,7 +340,7 @@ jobs:
 
   a2:
     name: "A2 compressed ${{ needs.config.outputs.a2_methods }} (sc20671)"
-    needs: [config, build, a1, a3]
+    needs: [config, probe, build, a1, a3]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a2,')
       && needs.build.result == 'success'
@@ -351,7 +353,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_A2_METHODS: ${{ needs.config.outputs.a2_methods }}
@@ -383,7 +385,7 @@ jobs:
 
   b:
     name: "B KV capture + compare (sc20677)"
-    needs: [config, build, a1, a3, a2]
+    needs: [config, probe, build, a1, a3, a2]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',b,')
       && needs.build.result == 'success'
@@ -396,7 +398,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "60"
@@ -426,7 +428,7 @@ jobs:
 
   nf:
     name: "NF dense noise floor (sc20671 noise-floor-parent)"
-    needs: [config, build, a1, a3, a2, b]
+    needs: [config, probe, build, a1, a3, a2, b]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',nf,')
       && needs.build.result == 'success'
@@ -442,7 +444,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_NF_ONLY_COORDINATE: ${{ needs.config.outputs.nf_only_coordinate }}
@@ -480,7 +482,7 @@ jobs:
     timeout-minutes: 360
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
@@ -502,13 +504,13 @@ jobs:
 
   w2-build:
     name: Build and seal the frozen W2 campaign binaries
-    needs: [config, w2-assets]
+    needs: [config, probe, w2-assets]
     if: ${{ needs.config.outputs.mode == 'w2' && needs.w2-assets.result == 'success' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
     timeout-minutes: 180
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
@@ -522,7 +524,7 @@ jobs:
 
   c:
     name: "C Krea Realtime six-cell (sc20684)"
-    needs: [config, w2-build]
+    needs: [config, probe, w2-build]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',c,')
       && needs.w2-build.result == 'success' }}
@@ -532,7 +534,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "240"
@@ -562,7 +564,7 @@ jobs:
 
   d:
     name: "D SC-20686 Metal matrix (sc20686)"
-    needs: [config, w2-build, c]
+    needs: [config, probe, w2-build, c]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d,')
       && needs.w2-build.result == 'success'
@@ -573,7 +575,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "360"
@@ -603,7 +605,7 @@ jobs:
 
   d-control:
     name: "D-control SC-20686 schedule-control arm"
-    needs: [config, w2-build, c, d]
+    needs: [config, probe, w2-build, c, d]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d-control,')
       && needs.w2-build.result == 'success'
@@ -615,7 +617,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "240"
@@ -650,7 +652,7 @@ jobs:
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
     timeout-minutes: 30
     env:
-      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      KV_EXPECTED_RUNNER: ${{ needs.probe.outputs.runner_name }}
       KV_HF_HUB_OVERRIDE: ${{ needs.config.outputs.hf_hub_override }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -660,6 +662,10 @@ jobs:
           persist-credentials: false
       - name: Delete the validated override directory (never /Volumes/Models)
         run: |
+          if [ -z "$KV_EXPECTED_RUNNER" ]; then
+            echo "the probe never started, so no job created the override; nothing to delete"
+            exit 0
+          fi
           if [ "${RUNNER_NAME:-}" != "$KV_EXPECTED_RUNNER" ]; then
             echo "::error title=wrong runner::cleanup landed on '${RUNNER_NAME:-?}', the override lives on '$KV_EXPECTED_RUNNER'"
             exit 1

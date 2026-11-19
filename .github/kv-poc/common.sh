@@ -26,10 +26,11 @@
 
 # Host affinity. Each job reuses what the previous one left in THIS host's $KV_ROOT, so a run whose
 # jobs split across the two Macs fails later with a missing tree or frozen dir on the other box
-# (run 36816509385). config.sh resolves the one runner the run must stay on; refuse anything else
+# (run 36816509385). KV_EXPECTED_RUNNER is whichever runner this run's probe job landed on -- never
+# a fixed machine name -- so every later job must land on that same runner; refuse anything else
 # before touching state. Unset outside the workflow (local tests source this file).
 if [ -n "${KV_EXPECTED_RUNNER:-}" ] && [ "${RUNNER_NAME:-}" != "$KV_EXPECTED_RUNNER" ]; then
-  echo "::error title=wrong runner::this job landed on '${RUNNER_NAME:-?}' ($(hostname)), but the campaign's state lives on '$KV_EXPECTED_RUNNER'; its runs-on labels no longer select that runner alone (check the org runner labels, kv-poc/config.sh)"
+  echo "::error title=wrong runner::this job landed on '${RUNNER_NAME:-?}' ($(hostname)), but this run's probe and state are on '$KV_EXPECTED_RUNNER'; its runs-on labels select more than one Mac (check the org runner labels, kv-poc/config.sh)"
   exit 1
 fi
 

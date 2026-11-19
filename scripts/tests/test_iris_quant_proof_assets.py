@@ -9,7 +9,7 @@ from scripts.ci import prepare_iris_quant_proof_assets as assets
 
 
 class IrisQuantProofAssets(unittest.TestCase):
-    def test_secondary_mac_uses_its_own_pinned_cache_and_rejects_other_runners(self):
+    def test_any_mac_uses_its_own_pinned_cache_and_non_macs_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             stale = home / "sceneworks-rw-weights" / "hub"
@@ -23,8 +23,10 @@ class IrisQuantProofAssets(unittest.TestCase):
                 # hub still holds an old copy.
                 self.assertEqual(paths[0][2], home / "runner-hub" / iris)
                 self.assertEqual(paths[1][2], home / "runner-hub" / qwen)
-                with self.assertRaisesRegex(ValueError, "secondary Mac"):
-                    assets.snapshot_paths("mlx", {**env, "RUNNER_NAME": "nax-macos"})
+                # Either interchangeable Mac binds the same pins; only the OS is checked.
+                self.assertEqual(assets.snapshot_paths("mlx", {**env, "RUNNER_NAME": "nax-macos"}), paths)
+                with self.assertRaisesRegex(ValueError, "macOS runner"):
+                    assets.snapshot_paths("mlx", {**env, "RUNNER_OS": "Linux"})
 
     def test_a_missing_snapshot_is_downloaded_into_the_runner_hub_cache(self):
         with tempfile.TemporaryDirectory() as temporary:

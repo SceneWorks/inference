@@ -5729,7 +5729,7 @@ class WindowsBashSelectionTests(unittest.TestCase):
             "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"
         ):
             errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
-        # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
+        # The Qwen-Image weight-set label, never the privileged `real-weights` one.
         runner = inputs.get("qwen_image_2_1_lora_runner", {})
         if runner.get("type") != "choice" or runner.get("default") != "rw-mage" or runner.get("options") != ["rw-mage", "rw-starvector"]:
             errors.append("MLX LoRA runner must be bounded to rw-mage/rw-starvector, default rw-mage")
