@@ -262,6 +262,12 @@ impl TextLlm for LlamaProvider {
             .into_iter()
             .chain(route_fallback)
             .collect();
+        // A block draft reads the target's tapped text rows; an image or video prompt decodes
+        // without it on Candle, by name (SW-F360).
+        if route.proposer() == ProposerKind::BlockDraft && (multimodal || gemma4_mm_request) {
+            route = self.decode_route(SpeculativePlan::Off).0;
+            fallbacks.push(super::BLOCK_DRAFT_MULTIMODAL.into());
+        }
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
         // will actually run (a proposer on the engine), at the advertised row bound — else
         // linear, by name. The multimodal paths prefill spliced embeddings and verify linearly
@@ -496,6 +502,8 @@ impl TextLlm for LlamaProvider {
         let tokenizer = &self.tokenizer;
         let mut mtp_stats = None;
         let mut engine_record: Option<DecodeRecord> = None;
+        // The block draft a `block_draft` run proposed with (SW-F360 E8), named in the report.
+        let mut decode_draft: Option<core_llm::DecodeDraft> = None;
         let phase_prefill;
         let phase_decode_started;
         let out = {
@@ -615,19 +623,37 @@ impl TextLlm for LlamaProvider {
                     )?),
                     _ => None,
                 };
+                // The resident block draft (SW-F360) over the target tapped at its layers: the
+                // engine's steps, prefill and rollback are the tapped target's.
+                let block = match route_proposer {
+                    ProposerKind::BlockDraft => {
+                        Some(self.block_draft.as_ref().ok_or_else(|| {
+                            CoreError::Load(
+                                "`block_draft` was routed without a resident draft".into(),
+                            )
+                        })?)
+                    }
+                    _ => None,
+                };
+                let tapped = block.map(|b| TappedQwen35::for_draft(target, &b.model));
+                let mut block_proposer = block.map(|b| BlockDraftProposer::new(&b.model, target));
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
                 // The CUDA-graph runner (sc-24134) wraps the target when the switch is on: it
                 // replays captured decode / verify steps where it can and falls back eager with
                 // a named reason otherwise (`decode_record.cuda_graphs`); the engine is the
-                // same either way.
+                // same either way. A block draft's verify steps are ordinary linear verify steps
+                // of the tapped target, captured and replayed alike.
                 let graphs = GraphRunner::new(target);
-                let stepper: &dyn StepModel<Cache = Qwen35Cache> = if cuda_graphs_enabled() {
-                    &graphs
-                } else {
-                    target
-                };
+                let tapped_graphs = tapped.as_ref().map(GraphRunner::new);
+                let stepper: &dyn StepModel<Cache = Qwen35Cache> =
+                    match (&tapped, &tapped_graphs, cuda_graphs_enabled()) {
+                        (Some(_), Some(runner), true) => runner,
+                        (Some(tapped), _, false) => tapped,
+                        (_, _, true) => &graphs,
+                        _ => target,
+                    };
                 let run = match &mm {
                     Some(m) => {
                         // Multimodal: the fused-embedding / M-RoPE prefill is the caller's, into
@@ -664,15 +690,19 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let proposer: &mut dyn Proposer =
-                            match (mtp_proposer.as_mut(), draft_proposer.as_deref_mut()) {
-                                (Some(mtp), _) => mtp,
-                                (None, Some(draft)) => draft,
-                                (None, None) if route_proposer == ProposerKind::PromptLookup => {
-                                    &mut ngram_proposer
-                                }
-                                (None, None) => &mut no_proposer,
-                            };
+                        let proposer: &mut dyn Proposer = match (
+                            mtp_proposer.as_mut(),
+                            draft_proposer.as_deref_mut(),
+                            block_proposer.as_mut(),
+                        ) {
+                            (Some(mtp), _, _) => mtp,
+                            (None, Some(draft), _) => draft,
+                            (None, None, Some(block)) => block,
+                            (None, None, None) if route_proposer == ProposerKind::PromptLookup => {
+                                &mut ngram_proposer
+                            }
+                            (None, None, None) => &mut no_proposer,
+                        };
                         let run = generate_speculative_monitored(
                             stepper,
                             proposer,
@@ -732,7 +762,7 @@ impl TextLlm for LlamaProvider {
                             restored,
                             &prompt_ids,
                             prefix_boundary,
-                            speculative,
+                            speculative || block.is_some(),
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
@@ -756,15 +786,19 @@ impl TextLlm for LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let proposer: &mut dyn Proposer =
-                            match (mtp_proposer.as_mut(), draft_proposer.as_deref_mut()) {
-                                (Some(mtp), _) => mtp,
-                                (None, Some(draft)) => draft,
-                                (None, None) if route_proposer == ProposerKind::PromptLookup => {
-                                    &mut ngram_proposer
-                                }
-                                (None, None) => &mut no_proposer,
-                            };
+                        let proposer: &mut dyn Proposer = match (
+                            mtp_proposer.as_mut(),
+                            draft_proposer.as_deref_mut(),
+                            block_proposer.as_mut(),
+                        ) {
+                            (Some(mtp), _, _) => mtp,
+                            (None, Some(draft), _) => draft,
+                            (None, None, Some(block)) => block,
+                            (None, None, None) if route_proposer == ProposerKind::PromptLookup => {
+                                &mut ngram_proposer
+                            }
+                            (None, None, None) => &mut no_proposer,
+                        };
                         let run = generate_speculative_monitored(
                             stepper,
                             proposer,
@@ -804,6 +838,9 @@ impl TextLlm for LlamaProvider {
                         run
                     }
                 };
+                if run.record.proposer == ProposerKind::BlockDraft {
+                    decode_draft = block.map(|b| b.report.clone());
+                }
                 if speculative {
                     mtp_stats = Some(MtpStats {
                         proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
@@ -1383,7 +1420,10 @@ impl TextLlm for LlamaProvider {
             tool_calls,
             usage,
             mtp: mtp_stats,
-            decode: Some(request_report(&decode_record, cuda_graphs_on, fallbacks)),
+            decode: Some(core_llm::DecodeReport {
+                draft: decode_draft,
+                ..request_report(&decode_record, cuda_graphs_on, fallbacks)
+            }),
             finish_reason: Some(finish),
             kv_cache: Some(kv_cache),
         })
