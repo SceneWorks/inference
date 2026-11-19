@@ -21,6 +21,13 @@ CUDA_METADATA_ABI_CHECKSUM = '1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8
 STRICT_CUDA_ACTIVITY = 'strict-zero-utilization'
 IRIS_CUDA_CORRECTNESS_ACTIVITY = 'non-isolated-correctness-low-activity'
 SHARED_CUDA_HEADROOM_ACTIVITY = 'non-isolated-correctness-headroom'
+# Post-run release sampling gets its own fixed per-query budget. It never inherits the admission
+# claim deadline or the guard's five-second admission window (run 44431476698: a passing proof
+# was rejected when one nvidia-smi query on a busy shared host got 2.7 s).
+RELEASE_QUERY_SECONDS = 30
+RELEASE_QUERY_ATTEMPTS = 3
+RELEASE_SAMPLING_SECONDS = 5 * (RELEASE_QUERY_SECONDS * RELEASE_QUERY_ATTEMPTS + 1)
+RELEASE_WINDOW_OVERRUN = 'physical GPU identity or sampling deadline changed during model-proof-release'
 
 
 class CudaClaimRejected(ValueError):
@@ -276,6 +283,31 @@ def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy
                 {**card, 'uuid': uuid} if sample['predicates']['unique_uuid'] else card,
                 uuid, physical_index, baseline.get('admitted_total_mib'))
     return facts
+
+
+def release_inventory_reader(guard, uuid: str):
+    """Selected-card release reads with a fixed budget per nvidia-smi query and a bounded retry."""
+    def read(out, label, _window_deadline=None):
+        for attempt in range(RELEASE_QUERY_ATTEMPTS):
+            try:
+                return guard.inventory(out, label, time.monotonic() + RELEASE_QUERY_SECONDS, selected_uuid=uuid)
+            except (subprocess.TimeoutExpired, TimeoutError):
+                if attempt == RELEASE_QUERY_ATTEMPTS - 1:
+                    raise
+    return read
+
+
+def release_check_inconclusive(error: Exception, diagnostic: dict) -> bool:
+    """A query timeout or sampling-time overrun is not evidence against the release.
+
+    Only a retained sample whose exact selected-card metadata is invalid is. The owned-Job
+    completion check (`shared_owned_completion`) stays the proof that this proof's process exited.
+    """
+    timing = (isinstance(error, (subprocess.TimeoutExpired, TimeoutError))
+              or (type(error) is RuntimeError and str(error) in (
+                  RELEASE_WINDOW_OVERRUN, 'CUDA settle deadline expired during model-proof-release')))
+    return timing and all(sample.get('post_owned_exit_primary_metadata_valid') is True
+                          for sample in diagnostic.get('samples', []))
 
 
 def accepted_utilization_samples(output: Path, phase: str, uuid: str, physical_index: int,
@@ -729,16 +761,26 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                     lambda: veda_cuda_guard.verify_idle(
                         selected, output, 'model-proof-release', baseline, idle_check=release_check,
                         identity_key=identity_key, permit_bounded_growth=True,
-                        require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader),
+                        require_stable_contexts=not shared_headroom,
+                        inventory_reader=(release_inventory_reader(veda_cuda_guard, uuid)
+                                          if shared_headroom else inventory_reader)),
                     output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline,
-                    min(claim_deadline, time.monotonic() + 30),
+                    (time.monotonic() + RELEASE_SAMPLING_SECONDS if shared_headroom
+                     else min(claim_deadline, time.monotonic() + 30)),
                     activity_profile=activity_profile)
+                release_inconclusive = None
             except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-                raise CudaReleaseRejected('CUDA post-idle verification failed: ' + str(error),
-                                          cuda_settle_refusal(
-                                              error, cuda_release_diagnostic(output, uuid, matched[0]['index'], policy,
-                                                                             baseline, activity_profile=activity_profile))) from error
-            if activity_profile in (IRIS_CUDA_CORRECTNESS_ACTIVITY, SHARED_CUDA_HEADROOM_ACTIVITY):
+                diagnostic = cuda_settle_refusal(
+                    error, cuda_release_diagnostic(output, uuid, matched[0]['index'], policy,
+                                                   baseline, activity_profile=activity_profile))
+                if not (shared_headroom and release_check_inconclusive(error, diagnostic)):
+                    raise CudaReleaseRejected('CUDA post-idle verification failed: ' + str(error), diagnostic) from error
+                # Owned-Job exit was verified above; a slow driver query on a shared card is a diagnostic.
+                release_inconclusive = {'status': 'inconclusive-driver-query-timing', 'error': str(error),
+                                        'diagnostic': diagnostic}
+            if shared_headroom:
+                record['release_metadata_verification'] = release_inconclusive or {'status': 'verified'}
+            if activity_profile in (IRIS_CUDA_CORRECTNESS_ACTIVITY, SHARED_CUDA_HEADROOM_ACTIVITY) and not release_inconclusive:
                 record['release_utilization_percent'] = accepted_utilization_samples(
                     output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline, activity_profile)
             if shared_headroom:

@@ -326,6 +326,76 @@ class ChildCudaVisibility(unittest.TestCase):
             self.assertFalse(diagnostic['samples'][0]['post_owned_exit_primary_metadata_valid'])
             self.assertNotIn('private-process-name', json.dumps(diagnostic))
 
+    def _release_with(self, release_inventory):
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        calls = []
+        def inventory(out, label, deadline=None, *, selected_uuid=None):
+            if not label.startswith('model-proof-release'):
+                return [card], []
+            calls.append(deadline - guard.time.monotonic() if deadline is not None else None)
+            return release_inventory(card, len(calls))
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = Path(temporary.name)
+        os_patch, lock_patch = self._fake_windows()
+        with os_patch, lock_patch, patch.object(guard, 'inventory', side_effect=inventory), \
+                patch.object(guard.time, 'sleep'):
+            with resources.execution_claim('candle-cuda', GPU_POLICY, output, {'PUBLIC': str(output)},
+                                           constraints={'required_cuda_physical_index': 1}) as claim:
+                pass
+        return claim, calls
+
+    def test_release_query_timeout_is_a_diagnostic_and_the_passing_proof_is_kept(self):
+        # CI_IMPACT: mocked nvidia-smi timeouts only (run 44431476698); no driver, GPU or model.
+        def timeout(_card, _call):
+            raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
+        claim, calls = self._release_with(timeout)
+        self.assertTrue(claim['post_execution_verified'])
+        self.assertTrue(claim['lease_released'])
+        verification = claim['release_metadata_verification']
+        self.assertEqual(verification['status'], 'inconclusive-driver-query-timing')
+        self.assertIn('timed out', verification['error'])
+        self.assertNotIn('release_utilization_percent', claim)
+        # Bounded retry, and each query had the fixed budget, not a leftover admission window.
+        self.assertEqual(len(calls), resources.RELEASE_QUERY_ATTEMPTS)
+        self.assertTrue(all(resources.RELEASE_QUERY_SECONDS - 1 < budget <= resources.RELEASE_QUERY_SECONDS
+                            for budget in calls))
+
+    def test_only_timing_failures_with_valid_retained_metadata_are_inconclusive(self):
+        valid = {'samples': [{'post_owned_exit_primary_metadata_valid': True}]}
+        invalid = {'samples': [{'post_owned_exit_primary_metadata_valid': False}]}
+        overrun = RuntimeError(resources.RELEASE_WINDOW_OVERRUN)
+        self.assertTrue(resources.release_check_inconclusive(overrun, valid))
+        self.assertTrue(resources.release_check_inconclusive(TimeoutError('slow'), {'status': 'missing-or-malformed'}))
+        self.assertFalse(resources.release_check_inconclusive(overrun, invalid))
+        for error in (RuntimeError('supervisor-owned Windows Job completion is unverified; no release seal'),
+                      RuntimeError('selected physical GPU UUID absent or ambiguous; no device fallback'),
+                      OSError('driver failed')):
+            with self.subTest(error=error):
+                self.assertFalse(resources.release_check_inconclusive(error, valid))
+
+    def test_release_query_retry_recovers_and_metadata_is_verified(self):
+        # CI_IMPACT: mocked nvidia-smi only; one slow query, then five valid release samples.
+        def flaky(card, call):
+            if call == 1:
+                raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
+            return [card], []
+        claim, calls = self._release_with(flaky)
+        self.assertTrue(claim['post_execution_verified'])
+        self.assertEqual(claim['release_metadata_verification'], {'status': 'verified'})
+        self.assertEqual(claim['release_utilization_percent'], [0] * 5)
+        self.assertEqual(len(calls), 6)
+
+    def test_release_timeout_after_invalid_metadata_still_rejects(self):
+        # CI_IMPACT: mocked nvidia-smi only; a card whose total changed is evidence, not a timeout.
+        def swapped_then_timeout(card, call):
+            if call == 1:
+                return [dict(card, total_mib=48000, free_mib=46116)], []
+            raise subprocess.TimeoutExpired(['nvidia-smi'], resources.RELEASE_QUERY_SECONDS)
+        with self.assertRaises(resources.CudaReleaseRejected):
+            self._release_with(swapped_then_timeout)
+
     def test_unquiet_window_restarts_sampling_after_releasing_the_lock(self):
         # CI_IMPACT: mocked SMI snapshots; another tenant's burst refuses, then a quiet window admits.
         card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,

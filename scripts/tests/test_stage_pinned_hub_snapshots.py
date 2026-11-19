@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -171,6 +172,67 @@ class Staging(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "content mismatch"):
                 self.stage(hub, [])
             self.assertEqual((base / "q8/model.safetensors").read_bytes(), b"WEIGHTS")
+
+    def test_two_stagers_of_the_same_file_download_it_once(self):
+        # Two runner listeners on one host stage the same snapshot; the second waits on the lock.
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary)
+            base = staging.snapshot_dir(hub, self.PIN["repository"], REV)
+            (base / "q8").mkdir(parents=True)
+            (base / "q8/config.json").write_bytes(b"{}")
+            calls, results, errors = [], {}, []
+            first_fetching, second_waiting = threading.Event(), threading.Event()
+            fetch = self.fetcher(calls)
+
+            def slow_fetch(url, destination):
+                first_fetching.set()
+                self.assertTrue(second_waiting.wait(10), "the second stager never waited on the lock")
+                fetch(url, destination)
+
+            real_try_lock = staging._try_lock
+
+            def try_lock(handle):
+                locked = real_try_lock(handle)
+                if not locked:
+                    second_waiting.set()
+                return locked
+
+            def run(name, fetcher):
+                try:
+                    results[name] = staging.stage({"PLAIN": self.PIN}, hub, manifest=self.manifest, fetch=fetcher,
+                                                  verify=self.verify, free_bytes=lambda path: 10**15)["PLAIN"]
+                except Exception as error:  # surfaced below
+                    errors.append(error)
+
+            with patch.object(staging, "_try_lock", side_effect=try_lock), \
+                    patch.object(staging, "LOCK_POLL_SECONDS", 0.01), patch("builtins.print"):
+                first = threading.Thread(target=run, args=("first", slow_fetch))
+                first.start()
+                self.assertTrue(first_fetching.wait(10))
+                second = threading.Thread(target=run, args=("second", fetch))
+                second.start()
+                first.join(20)
+                second.join(20)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(results["first"]["fetched"], ["q8/model.safetensors"])
+            self.assertEqual(results["second"]["fetched"], [])
+            self.assertIn("q8/model.safetensors", results["second"]["kept_existing"])
+            for receipt in results.values():
+                self.assertEqual(receipt["status"], "hub_content_verified")
+            self.assertEqual([p.name for p in (base / "q8").iterdir() if p.name.endswith(".partial")], [])
+
+    def test_staging_lock_lives_outside_the_snapshot_and_is_released_after_use(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = Path(temporary)
+            with staging.staging_lock(hub, self.PIN["repository"], REV, "q8/model.safetensors"):
+                pass
+            with staging.staging_lock(hub, self.PIN["repository"], REV, "q8/model.safetensors"):
+                pass
+            lock = (hub / ".locks/models--SceneWorks--qwen3.8-27b-abliterated-mlx/model-proof-staging"
+                    / REV / "q8/model.safetensors.lock")
+            self.assertTrue(lock.is_file())
+            self.assertFalse(staging.snapshot_dir(hub, self.PIN["repository"], REV).exists())
 
     def test_disk_shortfall_is_refused_before_any_fetch(self):
         with tempfile.TemporaryDirectory() as temporary:
