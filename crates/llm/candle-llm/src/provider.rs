@@ -1316,7 +1316,7 @@ pub struct LoadRecord {
     /// load.
     pub prefix_cache_bytes: Option<u64>,
     /// What the **target** decoder's own projections hold (SW-7200), taken from its census before
-    /// a predictor's joins it ([`record_predictor`](Self::record_predictor)): the tier `auto`'s
+    /// a predictor's joins it (`record_predictor`): the tier `auto`'s
     /// block-draft decision is keyed by. A companion MTP head stored MLX-affine Q4 is re-packed to
     /// Q8_0 and would otherwise make a Q4_K target mixed. `None` without a census.
     pub target_quantization: Option<core_llm::ResidentQuantization>,

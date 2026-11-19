@@ -262,7 +262,7 @@ pub struct Qwen35Config {
     pub mtp_use_dedicated_embeddings: bool,
     /// Stored GGML block tensors whose format differs from the tier's own (a mixed tier, SW-7201:
     /// a Q4_K body with a Q8_0 `lm_head` / `embed_tokens`), keyed by checkpoint tensor stem
-    /// ([`crate::prepare::persisted_ggml_overrides`]).
+    /// (`crate::prepare::persisted_ggml_overrides`).
     pub stored_overrides: std::collections::BTreeMap<String, QuantSpec>,
 }
 

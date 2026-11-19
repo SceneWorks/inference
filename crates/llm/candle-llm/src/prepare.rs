@@ -54,7 +54,7 @@
 //! A **fully quantized** qwen3_5 tier ([`prepare_fully_quantized`], SW-7201) also stores the LM
 //! head, the embedding and every Gated DeltaNet `in_proj_a` / `in_proj_b` as Q8_0 blocks, at both
 //! body widths; where that differs from the body's `bits`, the `quantization` block names each such
-//! tensor stem with its own `{"bits": 8}` ([`persisted_ggml_overrides`]), which the loader and load
+//! tensor stem with its own `{"bits": 8}` (`persisted_ggml_overrides`), which the loader and load
 //! admission read per tensor.
 //!
 //! Q4 is Q4_K (256-weight blocks), falling back to Q4_0 (32-weight blocks, the same 4.5
@@ -119,11 +119,11 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
 
 /// [`prepare`] for a **fully quantized** qwen3_5 tier (SW-7201) from an HF-safetensors source:
 /// the `spec.quantize` body (Q4 or Q8) plus `lm_head`, the decoder `embed_tokens` and every Gated
-/// DeltaNet `in_proj_a` / `in_proj_b` ([`is_remaining_matrix`]) stored as Q8_0 GGML blocks
+/// DeltaNet `in_proj_a` / `in_proj_b` (`is_remaining_matrix`) stored as Q8_0 GGML blocks
 /// ([`REMAINING_MATRIX_SPEC`]). Q8 is the int8 tier (every language-model matrix Q8_0); Q4 is the
 /// 4-bit tier (Q4_K body, Q8_0 head, embedding and decay / delta-strength inputs). Where a
 /// tensor's format differs from the body's, `config.json`'s `quantization` block names it with
-/// its own `bits` ([`persisted_ggml_overrides`]). The vision tower stays dense and the MTP head is
+/// its own `bits` (`persisted_ggml_overrides`). The vision tower stays dense and the MTP head is
 /// stored exactly as in the plain tier. Any other architecture, a GGUF source or a dense request
 /// is refused.
 pub fn prepare_fully_quantized(spec: &PrepareSpec) -> CoreResult<PrepareReport> {

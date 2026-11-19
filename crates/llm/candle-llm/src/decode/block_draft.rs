@@ -28,7 +28,7 @@
 //!
 //! ## Tree verification (SW-7198)
 //! Under a tree request the proposer hands the verifier the candidate **tree** of the same draft
-//! forward ([`Proposer::propose_tree`], built by [`tree::build_tree`]), and the target verifies it
+//! forward ([`Proposer::propose_tree`], built by `tree::build_tree`), and the target verifies it
 //! in one eager tree forward (the [`TappedQwen35`] tree forward returns the tapped rows of every
 //! tree row). The engine keeps the accepted branch only, so a commit appends the accepted
 //! branch's taps — the context a draft that only ever saw the accepted path holds — and an aborted
@@ -313,7 +313,7 @@ impl Proposer for BlockDraftProposer<'_> {
         })
     }
 
-    /// The candidate tree of one draft forward (SW-7198): see [`tree::build_tree`].
+    /// The candidate tree of one draft forward (SW-7198): see `tree::build_tree`.
     fn propose_tree(
         &mut self,
         ctx: &ProposeContext<'_>,
