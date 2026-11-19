@@ -3335,3 +3335,26 @@ fn stored_quantized_scales_keep_activations_and_kv_in_compute_dtype() {
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::stored_quantized_scales_keep_activations_and_kv_in_compute_dtype");
 }
+
+#[test]
+fn sensenova_refuses_foreign_cache_with_same_virtual_depth() {
+    let cfg = Qwen35Config::from_json(
+        &serde_json::from_str(include_str!(
+            "../../../../../contracts/core-llm/src/sensenova_loop.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let layers = (0..cfg.visit_count())
+        .map(|_| Qwen35LayerCache::Delta(DeltaNetCache::new()))
+        .collect();
+    let foreign = Qwen35Cache {
+        layers,
+        loop_plan: None,
+    };
+    assert!(foreign
+        .check_plan(&cfg)
+        .unwrap_err()
+        .to_string()
+        .contains("cache execution plan"));
+}

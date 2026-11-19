@@ -83,6 +83,7 @@ pub mod request;
 pub mod resource;
 pub mod rope_config;
 pub mod schedule;
+pub mod sensenova_loop;
 pub mod speculative;
 pub mod starvector;
 pub mod stop;

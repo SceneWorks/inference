@@ -493,21 +493,41 @@ impl Decoder {
                 }
                 Decoder::Qwen35(m) => {
                     let c = m.config();
+                    let (attention, recurrent) = if let Some(plan) = c.sensenova_loop {
+                        let full = plan.visits().filter(|&i| !c.is_linear(i)).count();
+                        let recurrent_state = u64::from(c.linear_num_value_heads as u32)
+                            * c.linear_value_head_dim as u64
+                            * c.linear_key_head_dim as u64
+                            * 4;
+                        let conv_width = 2 * c.linear_num_key_heads * c.linear_key_head_dim
+                            + c.linear_num_value_heads * c.linear_value_head_dim;
+                        let conv_tail =
+                            (c.linear_conv_kernel_dim - 1) as u64 * conv_width as u64 * 2;
+                        (
+                            full,
+                            (c.visit_count() - full) as u64 * (conv_tail + recurrent_state),
+                        )
+                    } else {
+                        (
+                            c.num_layers,
+                            (c.num_layers as u64)
+                                .saturating_mul(c.linear_num_value_heads as u64)
+                                .saturating_mul(c.linear_value_head_dim as u64)
+                                .saturating_mul(
+                                    (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
+                                )
+                                .saturating_mul(4),
+                        )
+                    };
                     (
                         c.num_heads,
                         c.num_kv_heads,
                         c.head_dim,
-                        c.num_layers,
+                        attention,
                         c.hidden_size,
                         c.intermediate_size,
                         c.vocab_size,
-                        (c.num_layers as u64)
-                            .saturating_mul(c.linear_num_value_heads as u64)
-                            .saturating_mul(c.linear_value_head_dim as u64)
-                            .saturating_mul(
-                                (c.linear_key_head_dim + c.linear_conv_kernel_dim) as u64,
-                            )
-                            .saturating_mul(4),
+                        recurrent,
                     )
                 }
             };
@@ -1330,7 +1350,11 @@ impl LlamaProvider {
                     config.num_heads,
                     config.num_kv_heads,
                     config.head_dim,
-                    config.num_layers,
+                    if let Some(plan) = config.sensenova_loop {
+                        plan.visits().filter(|&i| !config.is_linear(i)).count()
+                    } else {
+                        config.num_layers
+                    },
                 )
             }
         };
@@ -1873,7 +1897,13 @@ impl LlamaProvider {
         let source = spec.source.clone();
         let target_logits = self.model.memory_geometry().vocab_size as usize;
         // The tokenizer is checked before any draft weight is touched when the draft ships one.
-        let early = core_llm::draft_tokenizer_refusal(&self.tokenizer, Path::new(&source));
+        let early = if self.descriptor.family == "sensenova_loop" {
+            Some(core_llm::draft_refusal(
+                "SenseNova Loop has no qualified draft route",
+            ))
+        } else {
+            core_llm::draft_tokenizer_refusal(&self.tokenizer, Path::new(&source))
+        };
         let outcome = match early {
             Some(why) => Err(why),
             None => match spec.quantize.map(quant_spec).transpose() {
@@ -1939,7 +1969,7 @@ impl LlamaProvider {
         let campaign_family =
             core_llm::kv_model_family(arch.family(), &architecture_name, &model_type)
                 .map(crate::kv_policy::campaign_family);
-        let mut weights = Weights::from_dir(dir).map_err(to_core)?;
+        let mut weights = Weights::from_configured_dir(dir, &cfg_value).map_err(to_core)?;
         let is_prism =
             cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
         if is_prism && quant.is_some() {
@@ -2018,6 +2048,8 @@ impl LlamaProvider {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
             let tower = if is_prism {
                 Qwen35VisionModel::from_mlx_weights(&weights, prefix, vcfg.clone())
+            } else if descriptor.family == "sensenova_loop" {
+                Qwen35VisionModel::from_sensenova_weights(&weights, prefix, vcfg.clone())
             } else {
                 Qwen35VisionModel::from_weights(&weights, prefix, vcfg.clone())
             }
@@ -3169,6 +3201,10 @@ impl TextLlm for LlamaProvider {
     }
 
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
+        if self.descriptor.family == "sensenova_loop" {
+            core_llm::sensenova_loop::validate_messages(&req.messages)
+                .map_err(CoreError::InvalidRequest)?;
+        }
         self.descriptor
             .capabilities
             .validate_request(&self.descriptor.id, req)
@@ -5281,10 +5317,19 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
 /// [`Qwen35Config`], which `ModelConfig` does not represent).
 fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
-    d.family = Architecture::Qwen35.family().to_string();
+    d.family = if cfg.sensenova_loop.is_some() {
+        "sensenova_loop"
+    } else {
+        Architecture::Qwen35.family()
+    }
+    .to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
     // Both proposers at the full-attention layers' backend-true depth (sc-24438); a configured
     // head — dense or sparse-MoE predictor layer — on both the legacy and the per-proposer field.
+    if cfg.sensenova_loop.is_some() {
+        d.capabilities.speculative.clear();
+        return d;
+    }
     let max_depth = speculative_max_depth([qwen35_attention_geometry(cfg)]);
     d.capabilities.speculative = vec![prompt_lookup_capabilities(max_depth)];
     if cfg.mtp_num_hidden_layers > 0 {
@@ -5605,7 +5650,15 @@ fn estimate_qwen35_workspace_extra_bytes(
     let recurrent_state_buffers =
         checked_product([value_width, key_head_dim, 4, recurrence_state_arrays])?;
 
+    // The routed block holds two BF16 streams and their FP32 normalization
+    // plus BF16 merge outputs. Each physical block evaluates before the next.
+    let routing = if config.sensenova_loop.is_some() {
+        checked_product([prompt, hidden, 2, 4 + 4 + 2 + 2 + 2])?
+    } else {
+        0
+    };
     checked_sum([
+        routing,
         prompt_workspace,
         attention_window,
         row_padding,
@@ -6039,7 +6092,7 @@ fn can_load_value(v: &serde_json::Value) -> bool {
     if v.get("vision_config").is_some() && crate::joycaption::can_load_value(v) {
         return false;
     }
-    Architecture::from_config(v).is_ok()
+    Architecture::from_config(v).is_ok() && crate::sensenova_snapshot::tier(v).is_ok()
 }
 
 /// **Weightless** per-snapshot vision probe (sc-8077): does `mlx-llama` serve the snapshot at

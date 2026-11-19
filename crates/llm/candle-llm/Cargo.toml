@@ -34,6 +34,8 @@ candle-quant-kernels = { workspace = true }
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
 serde_json = { workspace = true }
+# Authenticate the prepared SenseNova shard index and weight proof inputs.
+sha2 = { workspace = true }
 # One-time warning when the CUDA device sampler kernel fails to compile/load (sc-24133).
 tracing = "0.1"
 # bf16 / f16 element types for the fused Prism rotation's CUDA buffers (sc-24440); the CUDA
@@ -45,8 +47,6 @@ half = "2"
 core-llm-testkit = { workspace = true }
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
-# Slice identity for the NVFP4 real-weight evidence run (sc-24135); already in the graph.
-sha2 = { workspace = true }
 # This crate's own integration tests arm the compressed-KV test seam (`test-kv-arm`); a dev
 # dependency's features reach only this package's test targets (resolver 2).
 candle-llm = { path = ".", features = ["test-kv-arm"] }

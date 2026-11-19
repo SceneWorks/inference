@@ -41,6 +41,7 @@ pub struct Rope {
     /// interleaved each frequency twice — as a device-resident f32 `[dim]` row, built once. Every
     /// table is `positions ⊗ freq_row`.
     freq_row: Array,
+    attention_factor: f32,
     /// The number of (last-axis) dimensions RoPE rotates — `head_dim` for full rotary, less for a
     /// partial schedule (GLM-4, DeepSeek MLA). Equals `inv_freq.len() * 2`.
     dim: i32,
@@ -85,9 +86,30 @@ impl Rope {
         Self {
             inv_freq,
             freq_row,
+            attention_factor: 1.,
             dim,
             interleaved,
         }
+    }
+
+    pub(crate) fn scaled_neox(frequencies: Vec<f32>, attention_factor: f32) -> Self {
+        let dim = frequencies.len() as i32 * 2;
+        Self {
+            attention_factor,
+            ..Self::new(frequencies, dim, false)
+        }
+    }
+
+    fn angle_tables(&self, emb: &Array, dtype: Dtype) -> Result<(Array, Array)> {
+        let narrow = |value: Array| -> Result<Array> {
+            let value = if self.attention_factor == 1. {
+                value
+            } else {
+                multiply(value, Array::from_f32(self.attention_factor))?
+            };
+            Ok(value.as_dtype(dtype)?)
+        };
+        Ok((narrow(cos(emb)?)?, narrow(sin(emb)?)?))
     }
 
     /// Standard RoPE: `inv_freq[i] = theta^(-2i / head_dim)`.
@@ -279,9 +301,7 @@ impl Rope {
         let n = positions.shape()[0];
         let pos = positions.as_dtype(Dtype::Float32)?.reshape(&[1, n, 1])?;
         let emb = multiply(&pos, &self.freq_row.reshape(&[1, 1, self.dim])?)?;
-        let cos_t = cos(&emb)?.as_dtype(dtype)?;
-        let sin_t = sin(&emb)?.as_dtype(dtype)?;
-        Ok((cos_t, sin_t))
+        self.angle_tables(&emb, dtype)
     }
 
     /// Build the 3-axis multimodal-RoPE `(cos, sin)` tables — Qwen2-VL / Qwen2.5-VL **M-RoPE**.
@@ -425,9 +445,7 @@ impl Rope {
         let inv = self.freq_row.index(..half as i32);
         let freqs = multiply(&pos, &inv)?;
         let emb = concatenate_axis(&[&freqs, &freqs], 1)?.reshape(&[1, l, self.dim])?;
-        let cos_t = cos(&emb)?.as_dtype(dtype)?;
-        let sin_t = sin(&emb)?.as_dtype(dtype)?;
-        Ok((cos_t, sin_t))
+        self.angle_tables(&emb, dtype)
     }
 }
 

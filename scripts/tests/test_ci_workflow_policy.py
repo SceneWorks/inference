@@ -68,6 +68,14 @@ YUE_WORKFLOW = WORKFLOW.with_name("real-weights-yue.yml")
 WINDOWS_YUE_LOCK = (
     ".github/requirements/real-weights-yue-reference-windows-x64-py312.txt"
 )
+WINDOWS_SENSENOVA_LOCK = (
+    ".github/requirements/real-weights-sensenova-loop-reference-windows-x64-py312.txt"
+)
+WINDOWS_SENSENOVA_UV_INSTALL = (
+    "uv pip install --no-config --index https://download.pytorch.org/whl/cu130 "
+    "--index-strategy unsafe-first-match --only-binary=:all: --require-hashes "
+    f'--python "%SENSENOVA_REFERENCE_PYTHON%" -r {WINDOWS_SENSENOVA_LOCK} || exit /b 1'
+)
 MACOS_INTERPRETER = "python3.12"
 WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
 WINDOWS_UV_VERSION = 'version: "0.12.3"'
@@ -97,6 +105,7 @@ APPROVED_REAL_WEIGHT_LOCKS = {
     WINDOWS_HUB_LOCK,
     WINDOWS_SCAIL_HUB_LOCK,
     WINDOWS_MAGE_LOCK,
+    WINDOWS_SENSENOVA_LOCK,
     MACOS_MAGE_LOCK,
 }
 HUB_LOCK_PACKAGES = {
@@ -827,6 +836,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         if lock not in APPROVED_REAL_WEIGHT_LOCKS:
             errors.append(f"{prefix}: unapproved requirement lock {lock}")
 
+        if lock == WINDOWS_SENSENOVA_LOCK:
+            if job != "sensenova-loop-reference" or command != WINDOWS_SENSENOVA_UV_INSTALL:
+                errors.append(f"{prefix}: invalid reviewed SenseNova CUDA wheel install")
+            continue
+
         expected_lock = None
         if "mage-reference/bin/python" in command:
             expected_lock = MACOS_MAGE_LOCK
@@ -892,7 +906,8 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 48 since SW-7098 added the dispatch-only `mlx-minimax-h3-image-train-load` job;
         # 49 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-publish` job;
         # 50 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-pe-render` job.
-        MACOS_HUB_LOCK: 50,
+        # SW-7186 adds SenseNova provisioning on the secondary MLX runner.
+        MACOS_HUB_LOCK: 51,
         # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
         # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
@@ -911,10 +926,12 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # in its snapshot materialization;
         # 27 since SW-7104 added the dispatch-only `candle-minimax-h3-image-pe-render` job;
         # 28 since SW-7104's acceptance step installs it for the `minimax-h3-image-acceptance` profile.
-        WINDOWS_HUB_LOCK: 28,
+        # SW-7186 adds separate Hub provisioning in the reference and native CUDA jobs.
+        WINDOWS_HUB_LOCK: 30,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
+        WINDOWS_SENSENOVA_LOCK: 1,
         # 2 since SW-7089's MiniMax-H3-Image diffusers reference (now the cached
         # `minimax-h3-image-reference` job) is produced in the same reviewed Mage reference environment.
         MACOS_MAGE_LOCK: 2,
@@ -1640,10 +1657,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # publish and again in the PE lane's own materialization script); 50 / 27 after SW-7104
         # added the PE-expansion render pair; 50 / 28 after the Candle acceptance step installs it
         # for the acceptance-only profile.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 50)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 28)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 51)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 30)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
+        self.assertEqual(workflow.count(WINDOWS_SENSENOVA_LOCK), 1)
+        wrong_cuda_index = workflow.replace(WINDOWS_SENSENOVA_UV_INSTALL, WINDOWS_SENSENOVA_UV_INSTALL.replace("cu130", "cu129"))
+        self.assertTrue(any("invalid reviewed SenseNova CUDA wheel install" in error
+                            for error in real_weight_pip_policy_errors(wrong_cuda_index)))
         self.assertNotRegex(
             workflow,
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",

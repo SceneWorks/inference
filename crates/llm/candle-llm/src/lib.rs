@@ -57,6 +57,7 @@ mod prism_checkpoint;
 mod prism_gguf;
 mod prism_vision_gguf;
 pub mod provider;
+mod sensenova_loop;
 pub mod starvector;
 pub mod starvector_8b;
 mod starvector_common;

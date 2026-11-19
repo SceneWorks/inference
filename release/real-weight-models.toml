@@ -3569,3 +3569,60 @@ expected_files = [
   "prompt/t2i/request_params.json",
   "prompt/edit/task_prompt.txt",
 ]
+
+[[models]]
+key = "sensenova-loop-9b"
+repository = "sensenova/SenseNova-Loop-9B"
+revision = "3e1ba6e8ac98090f9f7c03a55f26269eb3850fb6"
+requires_auth = true
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["model-inference-proofs"]
+environment = ["SENSENOVA_LOOP_BF16_SNAPSHOT"]
+expected_files = [
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "model-00001.safetensors",
+    "model-00002.safetensors",
+    "model-00003.safetensors",
+    "model-00004.safetensors",
+    "model-00005.safetensors",
+    "model-00006.safetensors",
+    "model-00007.safetensors",
+    "model-00008.safetensors",
+    "model-00009.safetensors",
+    "model-00010.safetensors",
+    "model-00011.safetensors",
+    "model.safetensors.index.json",
+    "modeling_sensenova_loop.py",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "video_preprocessor_config.json",
+]
+# Exclude the standalone MTP draft, cards and images. The proof covers the base release.
+download_files = [
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "model-00001.safetensors",
+    "model-00002.safetensors",
+    "model-00003.safetensors",
+    "model-00004.safetensors",
+    "model-00005.safetensors",
+    "model-00006.safetensors",
+    "model-00007.safetensors",
+    "model-00008.safetensors",
+    "model-00009.safetensors",
+    "model-00010.safetensors",
+    "model-00011.safetensors",
+    "model.safetensors.index.json",
+    "modeling_sensenova_loop.py",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "video_preprocessor_config.json",
+]

@@ -283,6 +283,7 @@ impl DevicePositions {
 /// built from [`DevicePositions::rope_positions`] without a host upload (see the module docs).
 #[derive(Clone, Debug)]
 pub struct DeviceRope {
+    attention_scale: f32,
     /// `[1, rotary_dim / 2]` f32.
     inv_freq: Tensor,
     interleaved: bool,
@@ -295,6 +296,7 @@ impl DeviceRope {
         Ok(Self {
             inv_freq: Tensor::from_slice(rope.inv_freq(), (1, half), device)?,
             interleaved: rope.interleaved(),
+            attention_scale: rope.attention_scale(),
         })
     }
 
@@ -314,7 +316,7 @@ impl DeviceRope {
             Tensor::cat(&[&freqs, &freqs], 1)?
         };
         let emb = emb.reshape((1, n, 2 * half))?;
-        Ok((emb.cos()?.to_dtype(dtype)?, emb.sin()?.to_dtype(dtype)?))
+        super::rope::trig_tables(&emb, self.attention_scale, dtype)
     }
 }
 

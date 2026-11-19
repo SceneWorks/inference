@@ -17,6 +17,9 @@
 //! cache (full-attn layers) and the recurrent [`DeltaNetCache`] (linear layers) live side by side in
 //! a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next `(1 + weight)` convention.
 
+mod sensenova;
+use core_llm::sensenova_loop::SenseNovaLoop;
+use sensenova::RoutedBlock;
 use std::cell::Cell;
 
 use mlx_rs::ops::{
@@ -59,11 +62,12 @@ enum PrecisionProfile {
     #[default]
     Native,
     MossFrozenHf,
+    SenseNovaFrozenHf,
 }
 
 impl PrecisionProfile {
     fn norm_weight(self, weight: Array, prism: bool) -> Result<Array> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             debug_assert!(!prism);
             Ok(add(
                 &weight.as_dtype(Dtype::Float32)?,
@@ -75,7 +79,7 @@ impl PrecisionProfile {
     }
 
     fn norm(self, x: &Array, weight: &Array, eps: f32) -> Result<Array> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             // Both fused-kernel inputs are F32, so normalization AND multiplication precede
             // the single output narrowing, without relying on mixed-input promotion.
             Ok(rms_norm(&x.as_dtype(Dtype::Float32)?, weight, eps)?.as_dtype(x.dtype())?)
@@ -85,7 +89,7 @@ impl PrecisionProfile {
     }
 
     fn scaled_query(self, normalized: &Array, inverse_head_dim: f32) -> Result<Array> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             scale(&normalized.as_dtype(Dtype::Float32)?, inverse_head_dim)
         } else {
             scale(normalized, inverse_head_dim)
@@ -93,7 +97,7 @@ impl PrecisionProfile {
     }
 
     fn gated_norm(self, x: &Array, weight: &Array, gate: &Array, eps: f32) -> Result<Array> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             // Frozen Qwen3_5RMSNormGated differs from its zero-centered RMSNorm:
             // narrow the normalized values BEFORE the direct weight multiplication,
             // then apply the F32 SiLU gate before the final narrowing.
@@ -113,7 +117,7 @@ impl PrecisionProfile {
     }
 
     fn convolve(self, x: &Array, weight: &Array, state: &Array) -> Result<(Array, ConvTrace)> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             causal_depthwise_conv_traced_f32_accum(x, weight, state)
         } else {
             causal_depthwise_conv_traced(x, weight, state)
@@ -121,7 +125,7 @@ impl PrecisionProfile {
     }
 
     fn silu(self, x: &Array) -> Result<Array> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             Ok(silu(&x.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?)
         } else {
             silu(x)
@@ -129,7 +133,7 @@ impl PrecisionProfile {
     }
 
     fn decay(self, a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
-        if self == Self::MossFrozenHf {
+        if self != Self::Native {
             compute_g(&a.as_dtype(Dtype::Float32)?, a_log, dt_bias)
         } else {
             compute_g(a, a_log, dt_bias)
@@ -192,6 +196,7 @@ pub struct MoeParams {
 /// `text_config` of the VLM wrapper (or the top-level config if not wrapped).
 #[derive(Clone, Debug)]
 pub struct Qwen35Config {
+    pub sensenova_loop: Option<SenseNovaLoop>,
     pub hidden_size: i32,
     pub num_layers: usize,
     pub intermediate_size: i32,
@@ -231,6 +236,7 @@ pub struct Qwen35Config {
 impl Qwen35Config {
     /// Parse from a `config.json` value, descending into `text_config` for the VLM wrapper.
     pub fn from_json(v: &serde_json::Value) -> Result<Self> {
+        let sensenova_loop = SenseNovaLoop::from_config(v).map_err(Error::Config)?;
         let c = v.get("text_config").unwrap_or(v);
         let int = |k: &str| -> Option<i32> { c.get(k).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let req = |k: &str| -> Result<i32> {
@@ -270,6 +276,7 @@ impl Qwen35Config {
         }
         let quantization = nested_quant.or(top_quant);
         Ok(Self {
+            sensenova_loop,
             hidden_size,
             num_layers: req("num_hidden_layers")? as usize,
             intermediate_size,
@@ -341,8 +348,10 @@ impl Qwen35Config {
     pub fn prefix_snapshot_bytes(&self, positions: usize, mtp: bool) -> Option<u64> {
         let block = crate::primitives::kv_cache::KV_BLOCK_TOKENS as u64;
         let positions = (positions as u64).div_ceil(block).checked_mul(block)?;
-        let linear = (0..self.num_layers).filter(|&i| self.is_linear(i)).count() as u64;
-        let attention = self.num_layers as u64 - linear;
+        let linear = (0..self.visit_count())
+            .filter(|&i| self.is_linear(self.physical(i)))
+            .count() as u64;
+        let attention = self.visit_count() as u64 - linear;
         let kv_position = (self.num_kv_heads as u64)
             .checked_mul(self.head_dim as u64)?
             .checked_mul(2 * 4)?;
@@ -374,6 +383,19 @@ impl Qwen35Config {
             .checked_mul(positions)?
             .checked_add(linear.checked_mul(recurrent)?)?
             .checked_add(head)
+    }
+
+    pub(crate) fn visit_count(&self) -> usize {
+        if self.sensenova_loop.is_some() {
+            SenseNovaLoop::VISITS
+        } else {
+            self.num_layers
+        }
+    }
+
+    fn physical(&self, visit: usize) -> usize {
+        self.sensenova_loop
+            .map_or(visit, |plan| plan.visits().nth(visit).expect("valid visit"))
     }
 
     /// Whether layer `i` (0-indexed) is a linear (Gated DeltaNet) layer; otherwise full attention.
@@ -527,6 +549,12 @@ impl GatedDeltaNet {
 
         // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim — `use_qk_l2norm_in_kernel`.
         let inv = (self.head_k_dim as f32).powf(-0.5);
+        let (qc, kc) = if self.precision == PrecisionProfile::SenseNovaFrozenHf {
+            // Transformers 5.18 casts BOTH inputs before the sum of squares.
+            (qc.as_dtype(Dtype::Float32)?, kc.as_dtype(Dtype::Float32)?)
+        } else {
+            (qc, kc)
+        };
         let qn = self.precision.scaled_query(&l2norm(&qc, 1e-6)?, inv)?;
         let kn = l2norm(&kc, 1e-6)?;
 
@@ -676,6 +704,7 @@ enum Mixer {
 
 #[derive(Debug)]
 struct DecoderLayer {
+    routed: Option<RoutedBlock>,
     precision: PrecisionProfile,
     input_ln: Array,
     post_ln: Array,
@@ -693,6 +722,9 @@ impl DecoderLayer {
             Mixer::Attn(a) => a.push_arrays(&mut out),
         }
         self.ffn.push_arrays(&mut out);
+        if let Some(block) = &self.routed {
+            block.arrays(&mut out);
+        }
         out
     }
 
@@ -703,18 +735,25 @@ impl DecoderLayer {
         sin: &Array,
         cache: &mut Qwen35LayerCache,
     ) -> Result<Array> {
-        let normed = self.precision.norm(x, &self.input_ln, self.eps)?;
-        let r = match (&self.mixer, cache) {
-            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
-            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c)?,
-            _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
+        let attention = |x: &Array| {
+            let normed = self.precision.norm(x, &self.input_ln, self.eps)?;
+            match (&self.mixer, cache) {
+                (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c),
+                (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c),
+                _ => Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
+            }
         };
-        let h = add(x, &r)?;
-        let m = self.ffn.forward(
-            &self.precision.norm(&h, &self.post_ln, self.eps)?,
-            self.precision,
-        )?;
-        Ok(add(&h, &m)?)
+        let ffn = |x: &Array| {
+            self.ffn.forward(
+                &self.precision.norm(x, &self.post_ln, self.eps)?,
+                self.precision,
+            )
+        };
+        if let Some(block) = &self.routed {
+            return block.forward(x, attention, ffn);
+        }
+        let h = add(x, attention(x)?)?;
+        Ok(add(&h, ffn(&h)?)?)
     }
 }
 
@@ -801,6 +840,7 @@ pub enum Qwen35LayerCache {
 /// copy its block); the engine never takes one.
 #[derive(Debug)]
 pub struct Qwen35Cache {
+    loop_plan: Option<SenseNovaLoop>,
     layers: Vec<Qwen35LayerCache>,
 }
 
@@ -809,6 +849,7 @@ impl Clone for Qwen35Cache {
         #[cfg(test)]
         CACHE_CLONES.with(|c| c.set(c.get() + 1));
         Self {
+            loop_plan: self.loop_plan,
             layers: self.layers.clone(),
         }
     }
@@ -829,6 +870,15 @@ pub(crate) fn counting_cache_clones<R>(f: impl FnOnce() -> R) -> (R, usize) {
 }
 
 impl Qwen35Cache {
+    fn check_plan(&self, cfg: &Qwen35Config) -> Result<()> {
+        if self.loop_plan != cfg.sensenova_loop || self.layers.len() != cfg.visit_count() {
+            return Err(Error::Config(
+                "incompatible Qwen3.5/SenseNova Loop cache execution plan".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Positions already cached — the RoPE offset for the next step (read from the first full-attn
     /// layer; all layers advance in lockstep).
     pub fn offset(&self) -> i32 {
@@ -994,7 +1044,10 @@ impl Qwen35Cache {
             Qwen35LayerCache::Delta(c) => c.live_state().map(|(conv, _)| conv),
             Qwen35LayerCache::Attn(_) => None,
         }))?;
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            loop_plan: self.loop_plan,
+        })
     }
 
     /// Every attention layer's live `(keys, values)` on the host, in layer order.
@@ -1284,7 +1337,9 @@ impl Qwen35Model {
     pub fn checkpoint_ring_bytes(&self, width: usize) -> Option<u64> {
         let c = &self.cfg;
         let n = |v: i32| u64::try_from(v).ok();
-        let linear = (0..c.num_layers).filter(|&i| c.is_linear(i)).count() as u64;
+        let linear = (0..c.visit_count())
+            .filter(|&i| c.is_linear(c.physical(i)))
+            .count() as u64;
         let state = n(c.linear_num_value_heads)?
             .checked_mul(n(c.linear_value_head_dim)?)?
             .checked_mul(n(c.linear_key_head_dim)?)?;
@@ -1302,16 +1357,19 @@ impl Qwen35Model {
 
     /// A fresh per-layer cache (linear vs full-attn slot per the schedule).
     pub fn new_cache(&self) -> Qwen35Cache {
-        let layers = (0..self.cfg.num_layers)
+        let layers = (0..self.cfg.visit_count())
             .map(|i| {
-                if self.cfg.is_linear(i) {
+                if self.cfg.is_linear(self.cfg.physical(i)) {
                     Qwen35LayerCache::Delta(DeltaNetCache::new())
                 } else {
                     Qwen35LayerCache::Attn(AttnKv::default())
                 }
             })
             .collect();
-        Qwen35Cache { layers }
+        Qwen35Cache {
+            layers,
+            loop_plan: self.cfg.sensenova_loop,
+        }
     }
 
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
@@ -1346,16 +1404,19 @@ impl Qwen35Model {
         offset: i32,
         hook: &mut dyn FnMut(usize, &Array) -> Result<()>,
     ) -> Result<Array> {
+        cache.check_plan(&self.cfg)?;
         let h = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
         let (cos, sin) = self.rope.cos_sin(h.shape()[1], offset, compute())?;
         let h = walk_hidden_blocks(
             h,
-            self.layers.iter().zip(cache.layers.iter_mut()),
+            (0..self.cfg.visit_count())
+                .map(|i| &self.layers[self.cfg.physical(i)])
+                .zip(cache.layers.iter_mut()),
             |h, (layer, slot)| layer.forward(&h, &cos, &sin, slot),
             &mut *hook,
         )?;
         let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
-        hook(self.layers.len() + 1, &normalized)?;
+        hook(self.cfg.visit_count() + 1, &normalized)?;
         Ok(normalized)
     }
 
@@ -1413,6 +1474,7 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Array],
     ) -> Result<(Array, Array)> {
+        cache.check_plan(&self.cfg)?;
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -1425,8 +1487,8 @@ impl Qwen35Model {
             &h0,
             visual_pos_mask,
             deepstack,
-            layers.len(),
-            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+            self.cfg.visit_count(),
+            |i, h| layers[self.cfg.physical(i)].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
         let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let logits = self.language_head()?.forward(&normalized)?;
@@ -1442,6 +1504,7 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Array],
     ) -> Result<(Array, Array)> {
+        cache.check_plan(&self.cfg)?;
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -1454,8 +1517,8 @@ impl Qwen35Model {
             &h0,
             visual_pos_mask,
             deepstack,
-            layers.len(),
-            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+            self.cfg.visit_count(),
+            |i, h| layers[self.cfg.physical(i)].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
         let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
@@ -1578,8 +1641,12 @@ impl Qwen35Model {
         sin: &Array,
         cache: &mut Qwen35Cache,
     ) -> Result<Array> {
+        cache.check_plan(&self.cfg)?;
         let mut h = embeds.clone();
-        for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
+        for (layer, slot) in (0..self.cfg.visit_count())
+            .map(|i| &self.layers[self.cfg.physical(i)])
+            .zip(cache.layers.iter_mut())
+        {
             h = layer.forward(&h, cos, sin, slot)?;
         }
         Ok(h)
@@ -1765,6 +1832,7 @@ impl Qwen35Model {
         visual_pos_mask: &[bool],
         deepstack: &[Array],
     ) -> Result<Array> {
+        cache.check_plan(&self.cfg)?;
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -1777,8 +1845,8 @@ impl Qwen35Model {
             &h0,
             visual_pos_mask,
             deepstack,
-            layers.len(),
-            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+            self.cfg.visit_count(),
+            |i, h| layers[self.cfg.physical(i)].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
         self.project_last(&h)
     }
@@ -1908,6 +1976,17 @@ impl Qwen35Model {
                     .into(),
             ));
         }
+        let precision = if cfg.sensenova_loop.is_some() {
+            PrecisionProfile::SenseNovaFrozenHf
+        } else {
+            precision
+        };
+        if cfg.sensenova_loop.is_some() && quant.is_some() {
+            return Err(Error::Config(
+                "SenseNova-Loop-9B requires a stored native MLX Q4/Q8 tier for quantized execution"
+                    .into(),
+            ));
+        }
         let eps = cfg.rms_norm_eps;
         let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute())?) };
         // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
@@ -1994,6 +2073,8 @@ impl Qwen35Model {
                     in_proj_a: proj_dense(lp("linear_attn.in_proj_a.weight"))?,
                     in_proj_b: proj_dense(lp("linear_attn.in_proj_b.weight"))?,
                     conv_weight,
+                    // HF's BF16 loader narrows these source FP32 tensors to their
+                    // initialized module dtype. compute_g widens them for the decay.
                     a_log: req(lp("linear_attn.A_log"))?,
                     dt_bias: req(lp("linear_attn.dt_bias"))?,
                     norm_weight: req(lp("linear_attn.norm.weight"))?,
@@ -2026,6 +2107,11 @@ impl Qwen35Model {
             };
             let ffn = build_ffn(w, &dp(&format!("layers.{i}.")), &cfg, quant, &proj_q)?;
             layers.push(DecoderLayer {
+                routed: cfg
+                    .sensenova_loop
+                    .filter(|plan| plan.mhc(i))
+                    .map(|_| RoutedBlock::load(w, &dp(&format!("layers.{i}")), i, cfg.hidden_size))
+                    .transpose()?,
                 precision,
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
@@ -2042,7 +2128,7 @@ impl Qwen35Model {
         // fails the load in `build_mtp_predictor` (a missing tensor is integrity, not absence).
         let mut cfg = cfg;
         let mut mtp_fallback = None;
-        let mtp = if !with_lm_head {
+        let mtp = if !with_lm_head || cfg.sensenova_loop.is_some() {
             cfg.mtp_num_hidden_layers = 0;
             None
         } else {
@@ -2072,7 +2158,12 @@ impl Qwen35Model {
             }
         };
 
-        let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
+        let rope = if let Some(plan) = cfg.sensenova_loop {
+            let (frequencies, factor) = plan.yarn_frequencies();
+            Rope::scaled_neox(frequencies, factor)
+        } else {
+            Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false)
+        };
         let model = Self {
             precision,
             embed_tokens,
@@ -2287,6 +2378,7 @@ fn build_mtp_predictor(
     let eps = cfg.rms_norm_eps;
     let lp = |s: &str| format!("{prefix}layers.0.{s}");
     let layer = DecoderLayer {
+        routed: None,
         precision: PrecisionProfile::Native,
         input_ln: norm(lp("input_layernorm.weight"))?,
         post_ln: norm(lp("post_attention_layernorm.weight"))?,
@@ -2380,6 +2472,11 @@ impl Qwen35Model {
         }
         let value =
             core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
+        if self.cfg.sensenova_loop.is_some() {
+            return Err(Error::Unsupported(
+                "SenseNova Loop release does not support a companion MTP head".into(),
+            ));
+        }
         let head_cfg = Qwen35Config::from_json(&value)?;
         let head_geometry = head_cfg.companion_mtp_geometry();
         head_geometry

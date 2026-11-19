@@ -462,6 +462,12 @@ impl Architecture {
     /// `text_config`; dispatch reads that nested decoder's `architectures` / `model_type` when it
     /// names either, else the top level (sc-27255: the MLX rule, shared by both backends).
     pub fn from_config(v: &Value) -> Result<Self, ModelConfigError> {
+        if crate::sensenova_loop::SenseNovaLoop::from_config(v)
+            .map_err(ModelConfigError::Unsupported)?
+            .is_some()
+        {
+            return Ok(Architecture::Qwen35);
+        }
         let names_decoder =
             |cfg: &Value| cfg.get("architectures").is_some() || cfg.get("model_type").is_some();
         let cfg = v

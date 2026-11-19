@@ -126,6 +126,7 @@ impl PatchEmbed {
 
 /// One pre-norm transformer block: `h += attn(norm1(h)); h += mlp(norm2(h))`.
 struct VisionBlock {
+    frozen_hf_bf16: bool,
     n1_w: Array,
     n1_b: Array,
     n2_w: Array,
@@ -187,6 +188,12 @@ impl VisionBlock {
             sin,
             false,
         )?;
+        // HF rotates in FP32, then narrows the result back to the projection dtype.
+        let (q, k) = if self.frozen_hf_bf16 {
+            (q.as_dtype(qkv.dtype())?, k.as_dtype(qkv.dtype())?)
+        } else {
+            (q, k)
+        };
         let v = parts[2].reshape(&[1, n, num_heads, head_dim])?;
         // → [1, heads, n, head_dim] for SDPA.
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
@@ -245,6 +252,7 @@ pub type Qwen3VLVisionModel = Qwen35VisionModel;
 
 /// A loaded Qwen3.6 vision tower.
 pub struct Qwen35VisionModel {
+    frozen_hf_bf16: bool,
     patch_embed: PatchEmbed,
     pos_embed: Array,
     blocks: Vec<VisionBlock>,
@@ -257,14 +265,24 @@ impl Qwen35VisionModel {
     /// Load from a checkpoint. `prefix` points at the visual tower module — `model.visual` for the
     /// `qwen3_5` checkpoint.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, false)
+        Self::from_weights_layout(w, prefix, cfg, false, false)
     }
 
     /// Load the frozen Bonsai MLX vision tower. Its Conv3d kernel is stored as
     /// `[out, temporal, height, width, channels]`, while preprocessed patches are flattened in
     /// `[channels, temporal, height, width]` order.
     pub fn from_mlx_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, true)
+        Self::from_weights_layout(w, prefix, cfg, true, false)
+    }
+
+    /// Load the original SenseNova BF16 vision tower with the pinned Transformers
+    /// activation casts. Stored MLX language tiers keep the same vision tensors.
+    pub fn from_sensenova_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35VisionConfig,
+    ) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, false, true)
     }
 
     fn from_weights_layout(
@@ -272,6 +290,7 @@ impl Qwen35VisionModel {
         prefix: &str,
         cfg: Qwen35VisionConfig,
         mlx_channels_last: bool,
+        frozen_hf_bf16: bool,
     ) -> Result<Self> {
         let p = |leaf: &str| join(prefix, leaf);
         let req = |k: String| -> Result<Array> { w.require(&k).cloned() };
@@ -294,6 +313,7 @@ impl Qwen35VisionModel {
             .map(|i| {
                 let b = |leaf: &str| p(&format!("blocks.{i}.{leaf}"));
                 Ok(VisionBlock {
+                    frozen_hf_bf16,
                     n1_w: req(b("norm1.weight"))?,
                     n1_b: req(b("norm1.bias"))?,
                     n2_w: req(b("norm2.weight"))?,
@@ -336,6 +356,7 @@ impl Qwen35VisionModel {
             blocks,
             merger,
             deepstack_mergers,
+            frozen_hf_bf16,
             cfg,
         };
         w.verify_accessed_gpu_view()?;
@@ -370,7 +391,12 @@ impl Qwen35VisionModel {
         let head_dim = cfg.head_dim();
         let n = pixel_values.shape()[0];
 
-        let mut hs = self.patch_embed.forward(pixel_values)?;
+        let mut hs = if self.frozen_hf_bf16 {
+            self.patch_embed
+                .forward(&pixel_values.as_dtype(self.patch_embed.weight.dtype())?)?
+        } else {
+            self.patch_embed.forward(pixel_values)?
+        };
         let pos = self.position_embeds(grid_thw, n)?;
         hs = add(&hs, &pos)?;
 
@@ -381,6 +407,11 @@ impl Qwen35VisionModel {
         let mut deepstack_features = Vec::with_capacity(self.deepstack_mergers.len());
         for (layer_num, blk) in self.blocks.iter().enumerate() {
             hs = blk.forward(&hs, &cos, &sin, cfg.num_heads, head_dim, &cu)?;
+            if self.frozen_hf_bf16 {
+                // Release each block's attention and FFN scratch before the
+                // next block on full-resolution product images.
+                hs.eval()?;
+            }
             if let Some(tap) = cfg
                 .deepstack_visual_indexes
                 .iter()
@@ -410,8 +441,15 @@ impl Qwen35VisionModel {
             self.pos_embed
                 .take_axis(&idx_arr, 0)?
                 .reshape(&[4, n, self.cfg.hidden_size])?;
-        let w_arr = Array::from_slice(&wts, &[4, n, 1]).as_dtype(gathered.dtype())?;
-        Ok(sum_axis(&multiply(&gathered, &w_arr)?, 0, false)?)
+        let w_arr = Array::from_slice(&wts, &[4, n, 1]);
+        if self.frozen_hf_bf16 {
+            return Ok(sum_axis(multiply(&gathered, w_arr)?, 0, false)?.as_dtype(gathered.dtype())?);
+        }
+        Ok(sum_axis(
+            &multiply(&gathered, w_arr.as_dtype(gathered.dtype())?)?,
+            0,
+            false,
+        )?)
     }
 }
 

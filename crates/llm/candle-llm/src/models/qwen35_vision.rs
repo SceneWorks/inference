@@ -188,8 +188,10 @@ impl VisionBlock {
                 .reshape((1, n, num_heads, head_dim))?)
         };
         // RoPE expects [batch, seq, heads, head_dim]; cos/sin [1, n, head_dim] broadcast over heads.
-        let q = apply_rope(&pick(0)?, cos, sin, false)?;
-        let k = apply_rope(&pick(1)?, cos, sin, false)?;
+        let q =
+            apply_rope(&pick(0)?.to_dtype(DType::F32)?, cos, sin, false)?.to_dtype(x.dtype())?;
+        let k =
+            apply_rope(&pick(1)?.to_dtype(DType::F32)?, cos, sin, false)?.to_dtype(x.dtype())?;
         let v = pick(2)?;
         // → [1, heads, n, head_dim] for SDPA (MHA, no GQA expand needed).
         let q = q.transpose(1, 2)?.contiguous()?;
@@ -262,7 +264,23 @@ impl Qwen35VisionModel {
     /// Load from a checkpoint. `prefix` points at the visual tower module — `model.visual` for the
     /// `qwen3_5` checkpoint. Weights are promoted to f32 (the SigLIP vision path).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, PatchWeightLayout::ChannelsFirst, None)
+        Self::from_weights_dtype(w, prefix, cfg, DType::F32)
+    }
+
+    pub(crate) fn from_weights_dtype(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35VisionConfig,
+        dtype: DType,
+    ) -> Result<Self> {
+        Self::from_weights_layout(
+            w,
+            prefix,
+            cfg,
+            PatchWeightLayout::ChannelsFirst,
+            None,
+            dtype,
+        )
     }
 
     /// Load the dense Bonsai MLX vision tower. MLX stores its Conv3d kernel channels-last as
@@ -270,7 +288,14 @@ impl Qwen35VisionModel {
     /// PyTorch `[channels, temporal, height, width]` order, so the one layout conversion happens at
     /// load time before the kernel is reshaped into a matrix.
     pub fn from_mlx_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, PatchWeightLayout::MlxChannelsLast, None)
+        Self::from_weights_layout(
+            w,
+            prefix,
+            cfg,
+            PatchWeightLayout::MlxChannelsLast,
+            None,
+            DType::F32,
+        )
     }
 
     /// Construct from a strict GGUF projector mapping. Block-quantized matrices are removed from
@@ -289,6 +314,7 @@ impl Qwen35VisionModel {
             cfg,
             PatchWeightLayout::ChannelsFirst,
             Some(packed),
+            DType::F32,
         )?;
         if let Some(name) = packed.keys().next() {
             return Err(Error::Config(format!(
@@ -304,12 +330,13 @@ impl Qwen35VisionModel {
         cfg: Qwen35VisionConfig,
         patch_layout: PatchWeightLayout,
         mut packed: Option<&mut HashMap<String, QTensor>>,
+        dtype: DType,
     ) -> Result<Self> {
         let p = |leaf: &str| join(prefix, leaf);
-        let req = |k: String| -> Result<Tensor> { Ok(w.require(&k)?.to_dtype(DType::F32)?) };
+        let req = |k: String| -> Result<Tensor> { Ok(w.require(&k)?.to_dtype(dtype)?) };
         let opt = |k: String| -> Result<Option<Tensor>> {
             match w.get(&k) {
-                Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+                Some(t) => Ok(Some(t.to_dtype(dtype)?)),
                 None => Ok(None),
             }
         };
@@ -427,15 +454,17 @@ impl Qwen35VisionModel {
         // Patch embed + bilinearly-resampled learned position embedding.
         let mut hs = self
             .patch_embed
-            .forward(&pixel_values.to_dtype(DType::F32)?)?;
-        let pos = self.position_embeds(grid_thw, n)?;
+            .forward(&pixel_values.to_dtype(self.patch_embed.weight.dtype())?)?;
+        let pos = self.position_embeds(grid_thw, n)?.to_dtype(hs.dtype())?;
         hs = hs.broadcast_add(&pos)?;
 
         // 2-D rotary tables and the per-frame block-diagonal attention mask.
         let pos_ids = vision_position_ids(grid_thw, merge);
         let (cos, sin) = vision_rotary(&pos_ids, cfg.head_dim(), ROPE_THETA, device)?;
         let cu = vision_cu_seqlens(grid_thw);
-        let mask_arr = block_diag_mask(&cu, n, device)?;
+        let mask_arr = block_diag_mask(&cu, n, device)?
+            .map(|mask| mask.to_dtype(hs.dtype()))
+            .transpose()?;
         let mask = match &mask_arr {
             Some(a) => AttnMask::Additive(a),
             None => AttnMask::None,
@@ -477,7 +506,7 @@ impl Qwen35VisionModel {
             .index_select(&idx_arr, 0)?
             .reshape((4, n as usize, hidden))?;
         let w_arr = Tensor::from_vec(wts, (4, n as usize, 1), device)?;
-        Ok(__model_proof_output!(gathered.broadcast_mul(&w_arr))?.sum(0)?)
+        Ok(__model_proof_output!(gathered.to_dtype(DType::F32)?.broadcast_mul(&w_arr))?.sum(0)?)
     }
 }
 
