@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.ci.proof_asset_snapshots import Input, manifest_keys, materialize  # noqa: E402
+from scripts.ci.proof_asset_snapshots import Input, manifest_bindings, manifest_keys, materialize  # noqa: E402
 
 # `asset_setup` (scripts/ci/model_inference_proofs.py) -> {environment variable: pinned input}.
 KREA_PROOFS = {
@@ -26,6 +26,7 @@ KREA_PROOFS = {
     },
     "krea-training": {"KREA_RAW_DIR": Input("krea-2-raw-train-proof")},
 }
+MANIFEST_BINDINGS = manifest_bindings(KREA_PROOFS)
 MANIFEST_KEYS = manifest_keys(KREA_PROOFS)
 
 

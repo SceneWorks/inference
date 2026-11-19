@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.ci.proof_asset_snapshots import Input, manifest_keys, materialize  # noqa: E402
+from scripts.ci.proof_asset_snapshots import Input, manifest_bindings, manifest_keys, materialize  # noqa: E402
 
 ANIMA = Input("anima-base-train-proof", "split_files")
 MAGE = Input("mage-flow-base-bf16-train-proof", "bf16")
@@ -42,6 +42,7 @@ BESPOKE_TRAINING_PROOFS = {
         "IRIS_CRITIC_TRUNK_DIR": Input("openclip-convnext-xxlarge-cuda")},
     "candle-gen-krea/integration/trainer_e2e::krea_control_bounded_acceleration_acceptance": {"KREA_CONTROL_BASE_DIR": KREA},
 }
+MANIFEST_BINDINGS = manifest_bindings(BESPOKE_TRAINING_PROOFS)
 MANIFEST_KEYS = manifest_keys(BESPOKE_TRAINING_PROOFS)
 
 REQUIRED_FILES = {

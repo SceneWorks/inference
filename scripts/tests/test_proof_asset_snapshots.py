@@ -90,6 +90,18 @@ class MaterializeTests(unittest.TestCase):
 
         self.assertEqual(self.materialize(refuse), {"FIXTURE_DIR": self.snapshot / "bf16"})
 
+    def test_zero_byte_pinned_file_is_refused(self):
+        # A hand-copied cache can hold an empty shard that existence checks accept.
+        (self.snapshot / "bf16").mkdir(parents=True)
+        (self.snapshot / "bf16/config.json").write_text("{}", encoding="utf-8")
+        (self.snapshot / "bf16/model.safetensors").write_bytes(b"")
+
+        def refuse(**_):
+            raise AssertionError("a present file must not be downloaded")
+
+        with self.assertRaisesRegex(ValueError, "zero-byte pinned file.*bf16/model.safetensors"):
+            self.materialize(refuse)
+
     def test_download_short_of_the_expected_files_fails(self):
         with self.assertRaisesRegex(RuntimeError, "bf16/model.safetensors"):
             self.materialize(FakeHub(files=("bf16/config.json",)))

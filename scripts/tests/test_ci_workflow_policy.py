@@ -1124,11 +1124,20 @@ def models_bound_by_proof_asset_setups(workflows: str) -> set[str]:
     themselves, the same channel as `export_model_snapshot_paths.py`: the variable name lives in the
     script, not the workflow. Only a setup the workflow code actually invokes counts.
     """
-    keys: set[str] = set()
+    return set(proof_asset_setup_bindings(workflows))
+
+
+def proof_asset_setup_bindings(workflows: str) -> dict[str, set[str]]:
+    """`{model key: environment variables it is bound to}` across the setups a workflow runs."""
+    bindings: dict[str, set[str]] = {}
     pattern = r"scripts[\\/]ci[\\/](prepare_[a-z0-9_]+_proof_assets)\.py"
     for name in sorted(set(re.findall(pattern, workflow_code(workflows)))):
-        keys.update(getattr(importlib.import_module(f"scripts.ci.{name}"), "MANIFEST_KEYS", ()))
-    return keys
+        module = importlib.import_module(f"scripts.ci.{name}")
+        for variable, key in getattr(module, "MANIFEST_BINDINGS", ()):
+            bindings.setdefault(key, set()).add(variable)
+        for key in getattr(module, "MANIFEST_KEYS", ()):
+            bindings.setdefault(key, set())
+    return bindings
 
 
 def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> list[str]:
@@ -1141,7 +1150,8 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
     referenced means the exemption outlived its justification, which is how the record of a
     deliberate non-goal (Mochi-1's freeze) decays into something indistinguishable from an oversight.
     """
-    exported_by_key = models_exported_by_key(workflows) | models_bound_by_proof_asset_setups(workflows)
+    setup_bindings = proof_asset_setup_bindings(workflows)
+    exported_by_key = models_exported_by_key(workflows) | set(setup_bindings)
     errors: list[str] = []
     for model in models:
         key = model.get("key", "<unkeyed>")
@@ -1150,6 +1160,14 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
         if not variables:
             errors.append(f"{key}: declares no environment variable")
             continue
+        # A proof setup writes the variable itself, so the row must name what the setup binds.
+        bound = setup_bindings.get(key)
+        if bound:
+            for name in variables:
+                if name not in bound:
+                    errors.append(
+                        f"{key}: declares {name}, but its proof setup binds it as {sorted(bound)}"
+                    )
         if reason is not None and (
             not isinstance(reason, str) or len(reason.strip()) < MINIMUM_UNWIRED_REASON
         ):
@@ -3265,6 +3283,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         setup = '        run: \'"%REVIEWED_PYTHON%" -I scripts\\ci\\prepare_cohort_training_proof_assets.py\'\n'
         self.assertEqual(manifest_environment_wiring_errors([lens], setup), [])
         self.assertIn("lens-base-train-proof", models_bound_by_proof_asset_setups(setup))
+        # The row must name the variable its setup binds it to: a stale or borrowed name is caught.
+        renamed = {"key": "lens-base-train-proof", "environment": ["LENS_SNAPSHOT_RENAMED"]}
+        self.assertIn(
+            "declares LENS_SNAPSHOT_RENAMED, but its proof setup binds it as ['LENS_BASE_SNAPSHOT']",
+            "\n".join(manifest_environment_wiring_errors([renamed], setup)),
+        )
         for unrun in ("", "      # scripts/ci/prepare_cohort_training_proof_assets.py binds it\n"):
             with self.subTest(unrun=unrun.strip()):
                 self.assertIn(

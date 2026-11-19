@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.ci.proof_asset_snapshots import Input, manifest_keys, materialize  # noqa: E402
+from scripts.ci.proof_asset_snapshots import Input, manifest_bindings, manifest_keys, materialize  # noqa: E402
 
 BINDINGS = {
     "candle-gen-lens/trainer_e2e::lens_bounded_acceleration_acceptance": {
@@ -44,6 +44,7 @@ BINDINGS = {
 # snapshot without it gets the pinned derived file the worker overlays at install time.
 OVERLAYS = {"KOLORS_TRAIN_SNAPSHOT": (Input("kolors-chatglm3-tokenizer-proof", "tokenizer.json"),
                                       "tokenizer/tokenizer.json")}
+MANIFEST_BINDINGS = manifest_bindings(BINDINGS, {name: {name: source} for name, (source, _) in OVERLAYS.items()})
 MANIFEST_KEYS = manifest_keys(BINDINGS, {name: {name: source} for name, (source, _) in OVERLAYS.items()})
 
 

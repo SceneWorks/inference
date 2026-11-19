@@ -4309,7 +4309,7 @@ download_files = ["diffusion_pytorch_model.safetensors"]
 expected_files = ["diffusion_pytorch_model.safetensors"]
 
 [[models]]
-# the fp16 encoder, U-Net and VAE (candle-gen-kolors/src/trainer.rs:552-605,
+# the fp16 encoder, U-Net and VAE (candle-gen-kolors/src/training.rs:552-605,
 # src/memory_strategy.rs:1075,1135); upstream has no tokenizer.json, so the setup overlays the
 # derived one from the row below
 key = "kolors-diffusers-fp16-train-proof"

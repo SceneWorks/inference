@@ -36,9 +36,15 @@ class Input:
     path: str = ""
 
 
+def manifest_bindings(*tables: dict[str, dict[str, Input]]) -> frozenset[tuple[str, str]]:
+    """Every `(environment variable, manifest row)` pair the given `{case: {variable: Input}}` tables bind."""
+    return frozenset((name, item.model) for table in tables for case in table.values()
+                     for name, item in case.items())
+
+
 def manifest_keys(*tables: dict[str, dict[str, Input]]) -> frozenset[str]:
     """Every manifest row the given `{case: {variable: Input}}` tables bind."""
-    return frozenset(item.model for table in tables for case in table.values() for item in case.values())
+    return frozenset(model for _, model in manifest_bindings(*tables))
 
 
 def materialize(bindings: dict[str, Input], *, environ: dict | None = None, download=download_snapshot,
@@ -58,6 +64,11 @@ def materialize(bindings: dict[str, Input], *, environ: dict | None = None, down
         model = load_model(manifest, item.model)
         snapshot = runner_cache_snapshot(model, cache)
         fetched = ensure_snapshot(model, snapshot, download, download_root=download_root)
+        # A hand-copied cache can hold a zero-byte file that existence checks accept; refuse it here,
+        # before a proof spends a build on it.
+        empty = [name for name in model["expected_files"] if (snapshot / name).stat().st_size == 0]
+        if empty:
+            raise ValueError(f"{item.model}: zero-byte pinned file(s) in {snapshot}: {', '.join(empty)}")
         print(f"{item.model}: {'downloaded' if fetched else 'complete, no transfer'} "
               f"({model['repository']}@{model['revision']} in {snapshot})", flush=True)
         snapshots[item.model] = snapshot
