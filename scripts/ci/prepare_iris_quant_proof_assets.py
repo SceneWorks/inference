@@ -72,11 +72,7 @@ def snapshot_paths(backend: str, env: dict[str, str]) -> tuple[tuple[str, str, P
     if backend == "mlx":
         if env.get("RUNNER_OS") != "macOS" or env.get("RUNNER_NAME") != "nax-macos-2":
             raise ValueError("Iris MLX quant proofs require the provisioned secondary Mac")
-        # The existing Iris curricula/memory lanes use this runner-local internal hub; a snapshot it
-        # does not hold is taken from (and, when missing, downloaded into) the runner's hub cache.
-        internal = Path.home() / "sceneworks-rw-weights" / "hub"
-        if internal.parent.is_symlink():
-            raise ValueError(f"secondary Mac task-owned weights root must not be a symlink: {internal.parent}")
+        # The runner's own hub cache, where the other Iris MLX lanes now read and download too.
         cache = runner_hub_cache(env)
         models = (("IRIS_WEIGHTS_DIR", "iris-3b-generation-mlx", "speridlabs--iris-3b", IRIS_REVISION),
                   ("IRIS_TEXT_ENCODER_DIR", "qwen3-vl-4b-instruct-mlx", "Qwen--Qwen3-VL-4B-Instruct", QWEN_REVISION))
@@ -86,7 +82,7 @@ def snapshot_paths(backend: str, env: dict[str, str]) -> tuple[tuple[str, str, P
         value = env.get("CANDLE_GEN_MODELS_ROOT", "")
         if not value or not Path(value).is_absolute():
             raise ValueError("CANDLE_GEN_MODELS_ROOT must be an absolute, operator-provided Windows cache path")
-        internal = cache = Path(value)
+        cache = Path(value)
         models = (("IRIS_WEIGHTS_DIR", "iris-3b-cuda", "speridlabs--iris-3b", IRIS_REVISION),
                   ("IRIS_TEXT_ENCODER_DIR", "qwen3-vl-4b-instruct-cuda", "Qwen--Qwen3-VL-4B-Instruct", QWEN_REVISION))
     else:
@@ -94,7 +90,7 @@ def snapshot_paths(backend: str, env: dict[str, str]) -> tuple[tuple[str, str, P
     paths = []
     for name, model, repository, revision in models:
         relative = Path(f"models--{repository}") / "snapshots" / revision
-        paths.append((name, model, internal / relative if (internal / relative).is_dir() else cache / relative))
+        paths.append((name, model, cache / relative))
     return tuple(paths)
 
 

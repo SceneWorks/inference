@@ -12,16 +12,16 @@ class IrisQuantProofAssets(unittest.TestCase):
     def test_secondary_mac_uses_its_own_pinned_cache_and_rejects_other_runners(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            hub = home / "sceneworks-rw-weights" / "hub"
+            stale = home / "sceneworks-rw-weights" / "hub"
             iris = Path("models--speridlabs--iris-3b") / "snapshots" / assets.IRIS_REVISION
             qwen = Path("models--Qwen--Qwen3-VL-4B-Instruct") / "snapshots" / assets.QWEN_REVISION
-            (hub / iris).mkdir(parents=True)
+            (stale / iris).mkdir(parents=True)
             env = {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2", "HF_HUB_CACHE": str(home / "runner-hub")}
             with patch.object(Path, "home", return_value=home):
                 paths = assets.snapshot_paths("mlx", env)
-                # A snapshot the internal hub holds is bound there; one it lacks comes from (and is
-                # downloaded into) the runner's hub cache.
-                self.assertEqual(paths[0][2], hub / iris)
+                # Both snapshots bind in the runner's hub cache, even where the retired task-owned
+                # hub still holds an old copy.
+                self.assertEqual(paths[0][2], home / "runner-hub" / iris)
                 self.assertEqual(paths[1][2], home / "runner-hub" / qwen)
                 with self.assertRaisesRegex(ValueError, "secondary Mac"):
                     assets.snapshot_paths("mlx", {**env, "RUNNER_NAME": "nax-macos"})

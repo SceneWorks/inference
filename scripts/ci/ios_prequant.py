@@ -80,23 +80,28 @@ def download_patterns(name):
         return [f"{suffix}/{path}" for path in ("diffusion_models/anima-turbo-v1.0.safetensors",
                                                  "text_encoders/qwen_3_06b_base.safetensors",
                                                  "vae/qwen_image_vae.safetensors")]
+    if name == "iris-generation":
+        # The repository root holds the generation model; `depth/` and `upscaler/` (~24 GB more)
+        # belong to other routes.
+        return ["config.yaml", "model.safetensors"]
     return [f"{suffix}/*"] if suffix else None
 
 
 def materialize_source(name, cache, download=None):
-    """Fetch a route's missing pinned source through the runner's hub cache (`cache_dir`)."""
+    """Fetch a route's pinned source through the runner's hub cache and prove the slice complete.
+
+    Runs on every dispatch: a complete cached slice costs only Hub metadata calls, and a slice an
+    interrupted earlier run left partial is repaired instead of being converted as found.
+    """
     owner, repo, revision, _ = PINS[name]
     if download is None:
         hub_path = os.environ.get("IOS_PREQUANT_HF_HUB_PATH", "")
         if hub_path:
             sys.path.insert(0, hub_path)
-        from scripts.release.ensure_model_snapshot import download_snapshot as download
-    kwargs = {"repo_id": f"{owner}/{repo}", "revision": revision, "cache_dir": str(cache), "token": False}
-    patterns = download_patterns(name)
-    if patterns is not None:
-        kwargs["allow_patterns"] = patterns
-    print(f"downloading {owner}/{repo}@{revision} into the runner's hub cache {cache}", flush=True)
-    download(**kwargs)
+        from scripts.release.ensure_model_snapshot import download_to_runner_cache as download
+    print(f"materializing {owner}/{repo}@{revision} through the runner's hub cache {cache}", flush=True)
+    return download(repo_id=f"{owner}/{repo}", revision=revision,
+                    allow_patterns=download_patterns(name), token=False, cache=cache)
 
 
 def header_rows(path):
@@ -371,9 +376,7 @@ def main():
         # The runner's own hub cache: HF_HUB_CACHE, else $HF_HOME/hub, else the fleet root.
         cache = runner_hub_cache()
         name, source_revision, source = source_for(binding["route"], cache)
-        # A route's inputs, not its directory, decide: Iris routes share one snapshot root.
-        if not all(path.exists() for path in input_paths(name, source)):
-            materialize_source(name, cache)
+        materialize_source(name, cache)
         if not source.is_dir():
             raise ValueError(f"pinned source missing after download: {source}")
         receipt.update(source_revision=source_revision, source=str(source),
