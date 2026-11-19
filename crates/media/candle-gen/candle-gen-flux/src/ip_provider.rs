@@ -275,8 +275,10 @@ pub(crate) fn compile_ip_feature_route(
     descriptor
         .capabilities
         .validate_request(descriptor.id, req)?;
-    if !matches!(req.conditioning.as_slice(), [Conditioning::Reference { .. }])
-        || spec.ip_adapter.is_none()
+    if !matches!(
+        req.conditioning.as_slice(),
+        [Conditioning::Reference { .. }]
+    ) || spec.ip_adapter.is_none()
     {
         return Err(candle_gen::gen_core::Error::Unsupported(
             "FLUX.1 IP-Adapter requires a Reference conditioning input and ip_adapter weights"

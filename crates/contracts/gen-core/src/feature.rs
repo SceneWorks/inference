@@ -8,13 +8,814 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
+use crate::sampling::ModelSampling;
 use crate::{
     Conditioning, ConditioningKind, ControlKind, Error, GenerationPhase, GenerationRequest,
     IdentityWeights, Image, LatentPatchLayout, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
     PhaseAdapter, ProducedReference, RenderPlan, RenderPlanRegistration, RenderStage, Result,
     WeightsSource,
 };
+
+// -------------------------------------------------------------------------------------------------
+// SW-6939 (FEAT-1, PIPE-2, PIPE-3, PIPE-4, PIPE-5, HOOK-5, E2):
+// Request & Plan Contract, Typed Boundary State, and Fp32 Transition Arithmetic
+// -------------------------------------------------------------------------------------------------
+
+/// Domain separation label for the low-res-start phase-transition noise draw (`PIPE-4`, `§6.1`).
+pub const LOW_RES_START_TRANSITION_DOMAIN: &str = "low_res_start_transition_v1";
+
+/// Clean-estimate evaluation provenance at the phase-0 -> phase-1 transition boundary (`PIPE-4`, `FEAT-1`, `§6.1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateSource {
+    /// Default read-only endpoint evaluation at boundary `sigma_K`.
+    #[default]
+    EndpointEvaluation,
+    /// Reuse the previous solver step's clean estimate when qualified (`SW-6940`).
+    PreviousEvaluation,
+}
+
+/// Request-level specification for the two-phase low-resolution start recipe (`FEAT-1`, `PIPE-2`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct LowResStartSpec {
+    /// Contract version (`1`). Any version other than `1` is refused with a typed [`Error::Unsupported`].
+    pub version: u32,
+    /// Boundary step index `K` (`1 <= K < M`, resolved after img2img strength truncation).
+    pub k: usize,
+    /// Spatial reduction scale (`0.25..=0.9`), defaulting to `0.5` when `None`.
+    pub scale: Option<f32>,
+    /// Clean-estimate evaluation provenance at boundary `K`.
+    pub estimate_source: EstimateSource,
+}
+
+impl LowResStartSpec {
+    pub const VERSION: u32 = 1;
+    pub const SCALE_MIN: f32 = 0.25;
+    pub const SCALE_MAX: f32 = 0.9;
+    pub const SCALE_DEFAULT: f32 = 0.5;
+
+    /// Construct a version-1 [`LowResStartSpec`] with default [`EstimateSource::EndpointEvaluation`].
+    pub const fn new(k: usize, scale: Option<f32>) -> Self {
+        Self {
+            version: Self::VERSION,
+            k,
+            scale,
+            estimate_source: EstimateSource::EndpointEvaluation,
+        }
+    }
+
+    /// Override the contract version (for negative conformance tests).
+    pub const fn with_version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Select the clean-estimate source at boundary `K`.
+    pub const fn with_estimate_source(mut self, estimate_source: EstimateSource) -> Self {
+        self.estimate_source = estimate_source;
+        self
+    }
+
+    /// Validate `version == 1` and `scale in 0.25..=0.9` without clamping.
+    pub fn validate_parameters(&self, route_id: &str) -> Result<f32> {
+        if self.version != Self::VERSION {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: low_res_start version {} is unsupported (expected {})",
+                self.version,
+                Self::VERSION
+            )));
+        }
+        let scale = self.scale.unwrap_or(Self::SCALE_DEFAULT);
+        if !scale.is_finite() || !(Self::SCALE_MIN..=Self::SCALE_MAX).contains(&scale) {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: low_res_start scale {scale} must lie in {}..={}",
+                Self::SCALE_MIN,
+                Self::SCALE_MAX
+            )));
+        }
+        Ok(scale)
+    }
+
+    /// Resolve the two-phase low-res geometry and step boundary against `executed_steps` (`M`)
+    /// after any img2img strength truncation (`§6.1`, `FEAT-1`, `PIPE-2`).
+    ///
+    /// Never clamps invalid parameters or non-reducing dimensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_geometry(
+        &self,
+        route_id: &str,
+        full_width: u32,
+        full_height: u32,
+        executed_steps: usize,
+        vae_spatial_scale: u32,
+        patch_size: u32,
+        requires_dimensions_multiple_of: u32,
+        min_dim: u32,
+    ) -> Result<ResolvedLowResStartPlan> {
+        let scale = self.validate_parameters(route_id)?;
+        if executed_steps < 2 {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: low_res_start requires executed_steps >= 2 after strength truncation, got {executed_steps}"
+            )));
+        }
+        if self.k == 0 || self.k >= executed_steps {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: low_res_start step k={} must satisfy 1 <= k < executed_steps ({executed_steps})",
+                self.k
+            )));
+        }
+        let legal_quantum = low_res_start_legal_quantum(
+            vae_spatial_scale,
+            patch_size,
+            requires_dimensions_multiple_of,
+        )?;
+        if full_width == 0
+            || full_height == 0
+            || !full_width.is_multiple_of(legal_quantum)
+            || !full_height.is_multiple_of(legal_quantum)
+        {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: target geometry {full_width}x{full_height} is not a positive multiple of legal_quantum={legal_quantum}"
+            )));
+        }
+        let low_width = (((full_width as f32 * scale) / (legal_quantum as f32)).floor() as u32)
+            .checked_mul(legal_quantum)
+            .ok_or_else(|| Error::Unsupported("low_res_start width overflow".into()))?;
+        let low_height = (((full_height as f32 * scale) / (legal_quantum as f32)).floor() as u32)
+            .checked_mul(legal_quantum)
+            .ok_or_else(|| Error::Unsupported("low_res_start height overflow".into()))?;
+        let effective_min_dim = min_dim.max(legal_quantum);
+        if low_width < effective_min_dim
+            || low_height < effective_min_dim
+            || low_width >= full_width
+            || low_height >= full_height
+        {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: low_res_start scale {scale} on {full_width}x{full_height} produces {low_width}x{low_height} outside legal bounds (min_dim={effective_min_dim}, legal_quantum={legal_quantum})"
+            )));
+        }
+        Ok(ResolvedLowResStartPlan {
+            version: self.version,
+            k: self.k,
+            executed_steps,
+            scale,
+            legal_quantum,
+            min_dim: effective_min_dim,
+            low_width,
+            low_height,
+            full_width,
+            full_height,
+            estimate_source: self.estimate_source,
+        })
+    }
+
+    /// Resolve [`LowResStartSpec`] against a [`ModelDescriptor`], [`GenerationRequest`], and the
+    /// pass's truncated `executed_steps` (`M`).
+    pub fn resolve_for_descriptor(
+        &self,
+        descriptor: &ModelDescriptor,
+        req: &GenerationRequest,
+        executed_steps: usize,
+        pixel_stride: u32,
+    ) -> Result<ResolvedLowResStartPlan> {
+        if req.phases.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{}: low_res_start conflicts with multi-phase denoise (phases)",
+                descriptor.id
+            )));
+        }
+        if !req.conditioning.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{}: low_res_start conflicts with pass-0 edit/reference/control conditioning",
+                descriptor.id
+            )));
+        }
+        if classify_descriptor_pass0_conditioning(descriptor)
+            != Pass0ConditioningRequirement::NoiseStartSupported
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: route requires pass-0 conditioning and does not support low_res_start",
+                descriptor.id
+            )));
+        }
+        let space = descriptor.denoiser_output_latent_space.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}: route does not declare a packed spatial latent space for low_res_start",
+                descriptor.id
+            ))
+        })?;
+        if !space.is_well_formed()
+            || space.spatial_compression.width != space.spatial_compression.height
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: route latent space does not have isotropic 2D spatial compression for low_res_start",
+                descriptor.id
+            )));
+        }
+        let vae_spatial_scale = u32::from(space.spatial_compression.width);
+        let patch_size = match space.patch_layout {
+            LatentPatchLayout::Packed {
+                patch_height,
+                patch_width,
+            } if patch_height == patch_width && patch_width > 0 => u32::from(patch_width),
+            LatentPatchLayout::Unpacked
+                if pixel_stride > 0 && pixel_stride.is_multiple_of(vae_spatial_scale) =>
+            {
+                (pixel_stride / vae_spatial_scale).max(1)
+            }
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "{}: route latent space does not declare a 2x2-packed spatial layout",
+                    descriptor.id
+                )))
+            }
+        };
+        let requires_multiple = descriptor
+            .capabilities
+            .size_floor
+            .explicit_size_multiple()
+            .unwrap_or(pixel_stride)
+            .max(pixel_stride);
+        let min_dim = descriptor.capabilities.min_size.max(requires_multiple);
+        self.resolve_geometry(
+            descriptor.id,
+            req.width,
+            req.height,
+            executed_steps,
+            vae_spatial_scale,
+            patch_size,
+            requires_multiple,
+            min_dim,
+        )
+    }
+}
+
+/// Resolved, validated two-phase low-resolution execution plan for pass 0 (`FEAT-1`, `PIPE-2`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ResolvedLowResStartPlan {
+    pub version: u32,
+    pub k: usize,
+    pub executed_steps: usize,
+    pub scale: f32,
+    pub legal_quantum: u32,
+    pub min_dim: u32,
+    pub low_width: u32,
+    pub low_height: u32,
+    pub full_width: u32,
+    pub full_height: u32,
+    pub estimate_source: EstimateSource,
+}
+
+impl ResolvedLowResStartPlan {
+    /// Phase-0 step range `0..K` at `(low_width, low_height)`.
+    pub const fn phase0_span(&self) -> std::ops::Range<usize> {
+        0..self.k
+    }
+
+    /// Phase-1 step range `K..M` at `(full_width, full_height)`.
+    pub const fn phase1_span(&self) -> std::ops::Range<usize> {
+        self.k..self.executed_steps
+    }
+
+    /// Spatial `(width, height)` for denoise `phase` (`0` -> low-res, `>= 1` -> full-res).
+    pub const fn phase_dimensions(&self, phase: usize) -> (u32, u32) {
+        if phase == 0 {
+            (self.low_width, self.low_height)
+        } else {
+            (self.full_width, self.full_height)
+        }
+    }
+}
+
+/// Greatest common divisor of two positive `u32` values.
+pub const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// Least common multiple of two positive `u32` values, refusing zero or overflow.
+pub fn lcm_u32(a: u32, b: u32) -> Result<u32> {
+    if a == 0 || b == 0 {
+        return Err(Error::Unsupported(
+            "low_res_start spatial quantum parameters must be non-zero".into(),
+        ));
+    }
+    let g = gcd_u32(a, b);
+    (a / g)
+        .checked_mul(b)
+        .ok_or_else(|| Error::Unsupported("low_res_start spatial quantum lcm overflow".into()))
+}
+
+/// Compute `legal_quantum = lcm(vae_spatial_scale * patch_size, requires_dimensions_multiple_of)` (`§6.1`).
+pub fn low_res_start_legal_quantum(
+    vae_spatial_scale: u32,
+    patch_size: u32,
+    requires_dimensions_multiple_of: u32,
+) -> Result<u32> {
+    let token_stride = vae_spatial_scale
+        .checked_mul(patch_size)
+        .ok_or_else(|| Error::Unsupported("low_res_start token stride overflow".into()))?;
+    lcm_u32(token_stride, requires_dimensions_multiple_of)
+}
+
+/// Resolve the img2img start step (`init_time_step`) and validate `strength` in `[0.0, 1.0]` without clamping
+/// out-of-range values when validating `low_res_start` + img2img (`§6.13`, `FEAT-1`).
+pub fn resolve_img2img_init_time_step(num_steps: usize, strength: Option<f32>) -> Result<usize> {
+    if num_steps == 0 {
+        return Err(Error::Unsupported(
+            "img2img schedule requires num_steps >= 1".into(),
+        ));
+    }
+    let s = strength.unwrap_or(0.5);
+    if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+        return Err(Error::Unsupported(format!(
+            "img2img strength {s} must be finite and lie in 0.0..=1.0"
+        )));
+    }
+    if s > 0.0 {
+        Ok(((num_steps as f32 * s) as usize).max(1))
+    } else {
+        Ok(0)
+    }
+}
+
+/// Truncate a full-pass sigma schedule `full_sigmas[0..=num_steps]` (computed once at full target
+/// geometry and full step count) by ordinary img2img `strength`, returning `(start_step, truncated_sigmas)`.
+///
+/// The truncated schedule has `M = truncated_sigmas.len() - 1` executed steps, and `K` is resolved
+/// **after** this truncation (`1 <= K < M`, `M >= 2`).
+pub fn resolve_img2img_truncated_schedule(
+    full_sigmas: &[f32],
+    strength: Option<f32>,
+) -> Result<(usize, Vec<f32>)> {
+    if full_sigmas.len() < 2 {
+        return Err(Error::Unsupported(
+            "full sigma schedule must have at least 2 nodes".into(),
+        ));
+    }
+    let num_steps = full_sigmas.len() - 1;
+    let start_step = resolve_img2img_init_time_step(num_steps, strength)?;
+    if start_step >= num_steps {
+        return Err(Error::Unsupported(format!(
+            "img2img strength {:?} on {num_steps} steps leaves {} executed steps (low_res_start requires M >= 2)",
+            strength,
+            num_steps.saturating_sub(start_step)
+        )));
+    }
+    Ok((start_step, full_sigmas[start_step..].to_vec()))
+}
+
+/// Typed state at a phase boundary (`PIPE-4`, `FEAT-1`, `§6.1`).
+///
+/// Re-noising from a clean estimate only accepts [`BoundaryState::CleanEstimate`]; passing
+/// [`BoundaryState::XSigma`] or [`BoundaryState::RouteSpecific`] refuses with a typed
+/// [`Error::Unsupported`], preventing double-noising of an already-noisy latent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundaryState<T> {
+    /// Noisy trajectory state $x(\sigma_K)$ at boundary $\sigma_K$.
+    XSigma(T),
+    /// Clean $\hat{x}_0$ estimate at boundary $\sigma_K$ with its evaluation provenance.
+    CleanEstimate { latent: T, source: EstimateSource },
+    /// Route-specific boundary carrier that cannot be re-noised as a clean estimate.
+    RouteSpecific { label: &'static str, state: T },
+}
+
+impl<T> BoundaryState<T> {
+    /// Extract the clean estimate and its provenance, refusing noisy (`XSigma`) or
+    /// route-specific boundary states with a typed [`Error::Unsupported`].
+    pub fn into_clean_estimate(self) -> Result<(T, EstimateSource)> {
+        match self {
+            Self::CleanEstimate { latent, source } => Ok((latent, source)),
+            Self::XSigma(_) => Err(Error::Unsupported(
+                "low_res_start boundary re-noise requires BoundaryState::CleanEstimate; refused noisy BoundaryState::XSigma to prevent double-noising".into(),
+            )),
+            Self::RouteSpecific { label, .. } => Err(Error::Unsupported(format!(
+                "low_res_start boundary re-noise requires BoundaryState::CleanEstimate; refused route-specific boundary state '{label}'"
+            ))),
+        }
+    }
+
+    /// Borrow the inner latent reference wrapped in a borrowed [`BoundaryState`].
+    pub fn as_ref(&self) -> BoundaryState<&T> {
+        match self {
+            Self::XSigma(x) => BoundaryState::XSigma(x),
+            Self::CleanEstimate { latent, source } => BoundaryState::CleanEstimate {
+                latent,
+                source: *source,
+            },
+            Self::RouteSpecific { label, state } => BoundaryState::RouteSpecific { label, state },
+        }
+    }
+}
+
+/// Derive a deterministic domain-separated 64-bit seed from
+/// `(request_seed, output_index, pass_index, phase_index, "low_res_start_transition_v1")` (`PIPE-4`, `§6.1`).
+///
+/// Uses SHA-256 over the domain label and tuple coordinates so it never collides with initial
+/// noise (`request_seed + output_index`) or per-step stochastic solver draws (`StepRng`).
+pub fn low_res_start_transition_seed(
+    request_seed: u64,
+    output_index: u32,
+    pass_index: usize,
+    phase_index: usize,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(LOW_RES_START_TRANSITION_DOMAIN.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(request_seed.to_le_bytes());
+    hasher.update(output_index.to_le_bytes());
+    hasher.update((pass_index as u64).to_le_bytes());
+    hasher.update((phase_index as u64).to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Draw `len` independent unit Gaussian $\mathcal{N}(0, 1)$ samples in fp32 using the
+/// deterministic domain-separated transition seed.
+pub fn low_res_start_transition_noise_f32(
+    request_seed: u64,
+    output_index: u32,
+    pass_index: usize,
+    phase_index: usize,
+    len: usize,
+) -> Vec<f32> {
+    let mut state =
+        low_res_start_transition_seed(request_seed, output_index, pass_index, phase_index);
+    let mut next_u64 = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let unit = |u: u64| (u >> 11) as f64 / (1u64 << 53) as f64;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let u1 = unit(next_u64()).max(1e-12);
+        let u2 = unit(next_u64());
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        out.push((r * theta.cos()) as f32);
+        if out.len() < len {
+            out.push((r * theta.sin()) as f32);
+        }
+    }
+    out
+}
+
+/// Unpack a token-packed latent `[B, (H_lat/p)*(W_lat/p), C*p*p]` to physical spatial axes
+/// `[B, C, H_lat, W_lat]` in fp32 (`PIPE-4`, `§6.1`).
+///
+/// Matches the 2x2 patch packing of FLUX.1 (`[B, h*w, C*p*p]` -> `[B, h, w, C, p, p]` ->
+/// transpose `[0, 3, 1, 4, 2, 5]` -> `[B, C, h*p, w*p]`).
+pub fn unpack_packed_latents_f32(
+    packed: &[f32],
+    batch: usize,
+    channels: usize,
+    latent_height: usize,
+    latent_width: usize,
+    patch_size: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0
+        || channels == 0
+        || latent_height == 0
+        || latent_width == 0
+        || patch_size == 0
+        || !latent_height.is_multiple_of(patch_size)
+        || !latent_width.is_multiple_of(patch_size)
+    {
+        return Err(Error::Unsupported(format!(
+            "unpack_packed_latents_f32: invalid dimensions B={batch}, C={channels}, H={latent_height}, W={latent_width}, p={patch_size}"
+        )));
+    }
+    let expected = batch
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(latent_height))
+        .and_then(|v| v.checked_mul(latent_width))
+        .ok_or_else(|| {
+            Error::Unsupported("unpack_packed_latents_f32: element count overflow".into())
+        })?;
+    if packed.len() != expected {
+        return Err(Error::Unsupported(format!(
+            "unpack_packed_latents_f32: buffer len {} != expected {expected}",
+            packed.len()
+        )));
+    }
+    let grid_h = latent_height / patch_size;
+    let grid_w = latent_width / patch_size;
+    let token_width = channels * patch_size * patch_size;
+    let tokens_per_batch = grid_h * grid_w;
+    let mut unpacked = vec![0.0_f32; expected];
+
+    for b in 0..batch {
+        for gh in 0..grid_h {
+            for gw in 0..grid_w {
+                let tok_idx = (b * tokens_per_batch + (gh * grid_w + gw)) * token_width;
+                for c in 0..channels {
+                    for py in 0..patch_size {
+                        for px in 0..patch_size {
+                            let patch_offset = (c * patch_size + py) * patch_size + px;
+                            let y = gh * patch_size + py;
+                            let x = gw * patch_size + px;
+                            let dst_idx =
+                                ((b * channels + c) * latent_height + y) * latent_width + x;
+                            unpacked[dst_idx] = packed[tok_idx + patch_offset];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(unpacked)
+}
+
+/// Repack physical spatial axes `[B, C, H_lat, W_lat]` back to token-packed layout
+/// `[B, (H_lat/p)*(W_lat/p), C*p*p]` in fp32 (`PIPE-4`, `§6.1`).
+pub fn repack_unpacked_latents_f32(
+    unpacked: &[f32],
+    batch: usize,
+    channels: usize,
+    latent_height: usize,
+    latent_width: usize,
+    patch_size: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0
+        || channels == 0
+        || latent_height == 0
+        || latent_width == 0
+        || patch_size == 0
+        || !latent_height.is_multiple_of(patch_size)
+        || !latent_width.is_multiple_of(patch_size)
+    {
+        return Err(Error::Unsupported(format!(
+            "repack_unpacked_latents_f32: invalid dimensions B={batch}, C={channels}, H={latent_height}, W={latent_width}, p={patch_size}"
+        )));
+    }
+    let expected = batch
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(latent_height))
+        .and_then(|v| v.checked_mul(latent_width))
+        .ok_or_else(|| {
+            Error::Unsupported("repack_unpacked_latents_f32: element count overflow".into())
+        })?;
+    if unpacked.len() != expected {
+        return Err(Error::Unsupported(format!(
+            "repack_unpacked_latents_f32: buffer len {} != expected {expected}",
+            unpacked.len()
+        )));
+    }
+    let grid_h = latent_height / patch_size;
+    let grid_w = latent_width / patch_size;
+    let token_width = channels * patch_size * patch_size;
+    let tokens_per_batch = grid_h * grid_w;
+    let mut packed = vec![0.0_f32; expected];
+
+    for b in 0..batch {
+        for gh in 0..grid_h {
+            for gw in 0..grid_w {
+                let tok_idx = (b * tokens_per_batch + (gh * grid_w + gw)) * token_width;
+                for c in 0..channels {
+                    for py in 0..patch_size {
+                        for px in 0..patch_size {
+                            let patch_offset = (c * patch_size + py) * patch_size + px;
+                            let y = gh * patch_size + py;
+                            let x = gw * patch_size + px;
+                            let src_idx =
+                                ((b * channels + c) * latent_height + y) * latent_width + x;
+                            packed[tok_idx + patch_offset] = unpacked[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(packed)
+}
+
+/// 1D half-pixel (`align_corners = false`) coordinate mapping with `clamp-to-edge` border handling (`§6.1`):
+/// `coord_src = (coord_dst + 0.5) * (src_len as f32 / dst_len as f32) - 0.5`, clamped to `[0.0, (src_len - 1) as f32]`.
+#[inline]
+pub fn bilinear_half_pixel_clamp_coord(
+    coord_dst: usize,
+    src_len: usize,
+    dst_len: usize,
+) -> (usize, usize, f32) {
+    let scale = (src_len as f32) / (dst_len as f32);
+    let max_src = (src_len.saturating_sub(1)) as f32;
+    let coord_src = ((coord_dst as f32 + 0.5) * scale - 0.5).clamp(0.0, max_src);
+    let i0 = coord_src.floor() as usize;
+    let i1 = (i0 + 1).min(src_len.saturating_sub(1));
+    let weight = coord_src - (i0 as f32);
+    (i0, i1, weight)
+}
+
+/// Resize physical spatial axes `[B, C, H_low, W_low] -> [B, C, H_full, W_full]` in fp32 using
+/// bilinear interpolation with half-pixel centers (`align_corners = false`) and border clamping (`clamp-to-edge`) (`PIPE-4`, `§6.1`).
+pub fn resize_bilinear_half_pixel_clamp_f32(
+    src: &[f32],
+    batch: usize,
+    channels: usize,
+    src_h: usize,
+    src_w: usize,
+    dst_h: usize,
+    dst_w: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || channels == 0 || src_h == 0 || src_w == 0 || dst_h == 0 || dst_w == 0 {
+        return Err(Error::Unsupported(
+            "resize_bilinear_half_pixel_clamp_f32: dimensions must be non-zero".into(),
+        ));
+    }
+    let expected_src = batch
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(src_h))
+        .and_then(|v| v.checked_mul(src_w))
+        .ok_or_else(|| {
+            Error::Unsupported("resize_bilinear_half_pixel_clamp_f32: src size overflow".into())
+        })?;
+    if src.len() != expected_src {
+        return Err(Error::Unsupported(format!(
+            "resize_bilinear_half_pixel_clamp_f32: src len {} != expected {expected_src}",
+            src.len()
+        )));
+    }
+    let dst_len = batch
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(dst_h))
+        .and_then(|v| v.checked_mul(dst_w))
+        .ok_or_else(|| {
+            Error::Unsupported("resize_bilinear_half_pixel_clamp_f32: dst size overflow".into())
+        })?;
+
+    let y_coords: Vec<(usize, usize, f32)> = (0..dst_h)
+        .map(|dy| bilinear_half_pixel_clamp_coord(dy, src_h, dst_h))
+        .collect();
+    let x_coords: Vec<(usize, usize, f32)> = (0..dst_w)
+        .map(|dx| bilinear_half_pixel_clamp_coord(dx, src_w, dst_w))
+        .collect();
+
+    let mut dst = vec![0.0_f32; dst_len];
+    let planes = batch * channels;
+    let src_plane_len = src_h * src_w;
+    let dst_plane_len = dst_h * dst_w;
+
+    for p in 0..planes {
+        let src_plane = &src[p * src_plane_len..(p + 1) * src_plane_len];
+        let dst_plane = &mut dst[p * dst_plane_len..(p + 1) * dst_plane_len];
+        for (dy, &(y0, y1, wy)) in y_coords.iter().enumerate() {
+            let row0 = &src_plane[y0 * src_w..(y0 + 1) * src_w];
+            let row1 = &src_plane[y1 * src_w..(y1 + 1) * src_w];
+            let dst_row = &mut dst_plane[dy * dst_w..(dy + 1) * dst_w];
+            let wy0 = 1.0 - wy;
+            for (dx, &(x0, x1, wx)) in x_coords.iter().enumerate() {
+                let wx0 = 1.0 - wx;
+                let top = row0[x0] * wx0 + row0[x1] * wx;
+                let bot = row1[x0] * wx0 + row1[x1] * wx;
+                dst_row[dx] = top * wy0 + bot * wy;
+            }
+        }
+    }
+    Ok(dst)
+}
+
+/// Apply the destination sampling convention's noise law (`ModelSampling::noise_scaling_coeffs(sigma_k)`)
+/// in fp32 (`PIPE-4`, `§6.1`):
+/// - Flow (`FlowModelSampling`): `x_full(sigma_K) = (1 - sigma_K) * resize(x0_low) + sigma_K * eps_trans`
+/// - VE / EDM (`EdmModelSampling` / `DiscreteModelSampling`): `x_full(sigma_K) = resize(x0_low) + sigma_K * eps_trans`
+pub fn apply_destination_noise_law_f32(
+    resized_x0: &[f32],
+    eps_trans: &[f32],
+    sigma_k: f32,
+    model_sampling: &dyn ModelSampling,
+) -> Result<Vec<f32>> {
+    if resized_x0.len() != eps_trans.len() {
+        return Err(Error::Unsupported(format!(
+            "apply_destination_noise_law_f32: resized_x0 len {} != eps_trans len {}",
+            resized_x0.len(),
+            eps_trans.len()
+        )));
+    }
+    if !sigma_k.is_finite() || sigma_k < 0.0 {
+        return Err(Error::Unsupported(format!(
+            "apply_destination_noise_law_f32: invalid boundary sigma_K={sigma_k}"
+        )));
+    }
+    let (k_noise, k_x0) = model_sampling.noise_scaling_coeffs(sigma_k);
+    Ok(resized_x0
+        .iter()
+        .zip(eps_trans)
+        .map(|(&x0, &eps)| k_x0 * x0 + k_noise * eps)
+        .collect())
+}
+
+/// Execute the full typed boundary transition from a token-packed clean estimate at `sigma_K`
+/// using an explicit full-resolution `[B, C, H_full, W_full]` unit Gaussian noise buffer (`PIPE-4`, `§6.1`).
+///
+/// Refuses [`BoundaryState::XSigma`] and [`BoundaryState::RouteSpecific`] with a typed
+/// [`Error::Unsupported`] so a transition can never double-noise a noisy latent.
+#[allow(clippy::too_many_arguments)]
+pub fn transition_packed_clean_estimate_with_noise_f32(
+    boundary_state: BoundaryState<&[f32]>,
+    batch: usize,
+    channels: usize,
+    patch_size: u32,
+    vae_spatial_scale: u32,
+    plan: &ResolvedLowResStartPlan,
+    sigma_k: f32,
+    model_sampling: &dyn ModelSampling,
+    eps_trans_nchw: &[f32],
+) -> Result<Vec<f32>> {
+    let (packed_x0_low, _source) = boundary_state.into_clean_estimate()?;
+    if vae_spatial_scale == 0 || patch_size == 0 {
+        return Err(Error::Unsupported(
+            "transition_packed_clean_estimate_with_noise_f32: vae_spatial_scale and patch_size must be non-zero".into(),
+        ));
+    }
+    let h_low = (plan.low_height / vae_spatial_scale) as usize;
+    let w_low = (plan.low_width / vae_spatial_scale) as usize;
+    let h_full = (plan.full_height / vae_spatial_scale) as usize;
+    let w_full = (plan.full_width / vae_spatial_scale) as usize;
+    let p = patch_size as usize;
+
+    let unpacked_low = unpack_packed_latents_f32(packed_x0_low, batch, channels, h_low, w_low, p)?;
+    let resized_full = resize_bilinear_half_pixel_clamp_f32(
+        &unpacked_low,
+        batch,
+        channels,
+        h_low,
+        w_low,
+        h_full,
+        w_full,
+    )?;
+    let noised_full =
+        apply_destination_noise_law_f32(&resized_full, eps_trans_nchw, sigma_k, model_sampling)?;
+    repack_unpacked_latents_f32(&noised_full, batch, channels, h_full, w_full, p)
+}
+
+/// Execute the full typed boundary transition from a token-packed clean estimate at `sigma_K`,
+/// drawing $\epsilon_{\text{trans}} \sim \mathcal{N}(0, I)$ in `[B, C, H_full, W_full]` with the
+/// deterministic domain-separated seed derived from
+/// `(request_seed, output_index, pass_index, phase_index, "low_res_start_transition_v1")` (`PIPE-4`, `§6.1`).
+#[allow(clippy::too_many_arguments)]
+pub fn transition_packed_clean_estimate_f32(
+    boundary_state: BoundaryState<&[f32]>,
+    batch: usize,
+    channels: usize,
+    patch_size: u32,
+    vae_spatial_scale: u32,
+    plan: &ResolvedLowResStartPlan,
+    sigma_k: f32,
+    model_sampling: &dyn ModelSampling,
+    request_seed: u64,
+    output_index: u32,
+    pass_index: usize,
+    phase_index: usize,
+) -> Result<Vec<f32>> {
+    // Check clean-estimate typing before drawing transition noise so `XSigma` is refused immediately.
+    let (packed_x0_low, source) = boundary_state.into_clean_estimate()?;
+    if vae_spatial_scale == 0 {
+        return Err(Error::Unsupported(
+            "transition_packed_clean_estimate_f32: vae_spatial_scale must be non-zero".into(),
+        ));
+    }
+    let h_full = (plan.full_height / vae_spatial_scale) as usize;
+    let w_full = (plan.full_width / vae_spatial_scale) as usize;
+    let full_len = batch
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(h_full))
+        .and_then(|v| v.checked_mul(w_full))
+        .ok_or_else(|| {
+            Error::Unsupported("transition_packed_clean_estimate_f32: size overflow".into())
+        })?;
+    let eps_trans = low_res_start_transition_noise_f32(
+        request_seed,
+        output_index,
+        pass_index,
+        phase_index,
+        full_len,
+    );
+    transition_packed_clean_estimate_with_noise_f32(
+        BoundaryState::CleanEstimate {
+            latent: packed_x0_low,
+            source,
+        },
+        batch,
+        channels,
+        patch_size,
+        vae_spatial_scale,
+        plan,
+        sigma_k,
+        model_sampling,
+        &eps_trans,
+    )
+}
 
 // -------------------------------------------------------------------------------------------------
 // HOOK-1: Documented hook map
@@ -772,10 +1573,16 @@ impl FeatureApplicability {
         } else {
             serde_json::Value::Null
         };
-        let reason_codes: Vec<&'static str> =
-            self.reasons.iter().map(|reason| reason.code.as_str()).collect();
-        let hook_names: Vec<&'static str> =
-            self.hook_points.iter().map(|point| point.as_str()).collect();
+        let reason_codes: Vec<&'static str> = self
+            .reasons
+            .iter()
+            .map(|reason| reason.code.as_str())
+            .collect();
+        let hook_names: Vec<&'static str> = self
+            .hook_points
+            .iter()
+            .map(|point| point.as_str())
+            .collect();
         let mut obj = serde_json::json!({
             "id": self.feature_id,
             "version": self.version,
@@ -1469,42 +2276,29 @@ impl FeatureSpec for LowResStartFeature {
                 "low_res_start requires FeatureParameters::LowResStart".into(),
             ));
         };
-        let scale = scale.unwrap_or(Self::SCALE_DEFAULT);
-        if !scale.is_finite() || !(Self::SCALE_MIN..=Self::SCALE_MAX).contains(&scale) {
-            return Err(Error::Unsupported(format!(
-                "{}: low_res_start scale {scale} must lie in {}..={}",
-                route.route_id,
-                Self::SCALE_MIN,
-                Self::SCALE_MAX
-            )));
-        }
         let pass0 = plan
             .passes
             .first_mut()
             .ok_or_else(|| Error::Unsupported("composed plan has no pass 0".into()))?;
-        if *k == 0 || *k >= pass0.executed_steps {
-            return Err(Error::Unsupported(format!(
-                "{}: low_res_start step k={k} must lie in 1..{}",
-                route.route_id, pass0.executed_steps
-            )));
-        }
         let stride = pass0.pixel_stride.max(1);
-        let low_w = (((pass0.target_width as f32 * scale).round() as u32) / stride) * stride;
-        let low_h = (((pass0.target_height as f32 * scale).round() as u32) / stride) * stride;
-        if low_w == 0 || low_h == 0 || low_w >= pass0.target_width || low_h >= pass0.target_height {
-            return Err(Error::Unsupported(format!(
-                "{}: low_res_start scale {scale} on {}x{} produces invalid aligned low-res geometry {low_w}x{low_h}",
-                route.route_id, pass0.target_width, pass0.target_height
-            )));
-        }
+        let resolved = LowResStartSpec::new(*k, *scale).resolve_geometry(
+            &route.route_id,
+            pass0.target_width,
+            pass0.target_height,
+            pass0.executed_steps,
+            stride,
+            1,
+            stride,
+            stride,
+        )?;
         pass0.insert_boundary_action(
-            *k,
+            resolved.k,
             PhaseTransitionAction::CleanEstimateSpatialResizeRenoise {
-                scale_bits: scale.to_bits(),
-                from_width: low_w,
-                from_height: low_h,
-                to_width: pass0.target_width,
-                to_height: pass0.target_height,
+                scale_bits: resolved.scale.to_bits(),
+                from_width: resolved.low_width,
+                from_height: resolved.low_height,
+                to_width: resolved.full_width,
+                to_height: resolved.full_height,
             },
         )
     }
@@ -1824,8 +2618,8 @@ impl FeatureSpec for KreaMultiphaseFeature {
         }
         let mut cursor = 0usize;
         let mut composed_phases = Vec::with_capacity(phases.len());
-        let packed_tokens = (pass0.target_width / pass0.pixel_stride)
-            * (pass0.target_height / pass0.pixel_stride);
+        let packed_tokens =
+            (pass0.target_width / pass0.pixel_stride) * (pass0.target_height / pass0.pixel_stride);
         for (idx, phase) in phases.iter().enumerate() {
             if phase.steps == 0 {
                 return Err(Error::Unsupported(format!(
@@ -1915,7 +2709,8 @@ impl FeatureSpec for WanExpertSwitchFeature {
                     max_inclusive_for_default_steps: max_inc,
                     default_executed_steps: default_steps,
                 },
-                description: "Step index in 1..executed_steps at which the active MoE expert switches",
+                description:
+                    "Step index in 1..executed_steps at which the active MoE expert switches",
             }],
         }
     }
@@ -2652,6 +3447,17 @@ pub fn validate_low_res_start_request(
     }
     let route = FeatureRouteStructure::from_descriptor_and_plan(descriptor, render_plan);
     let stride = route.pixel_stride.unwrap_or(16);
+    if route.pass0_conditioning == Pass0ConditioningRequirement::NoiseStartSupported
+        && descriptor.denoiser_output_latent_space.is_some()
+        && render_plan.is_some()
+    {
+        LowResStartSpec::new(k, scale).resolve_for_descriptor(
+            descriptor,
+            req,
+            executed_steps,
+            stride,
+        )?;
+    }
     let token_width = route.token_width.unwrap_or(64);
     let sigmas: Vec<f32> = (0..=executed_steps)
         .map(|i| 1.0 - (i as f32 / executed_steps.max(1) as f32))
@@ -2715,7 +3521,9 @@ mod tests {
     }
 
     fn synthetic_base_plan(route: &FeatureRouteStructure, steps: usize) -> ComposedRenderPlan {
-        let sigmas: Vec<f32> = (0..=steps).map(|i| 1.0 - (i as f32 / steps as f32)).collect();
+        let sigmas: Vec<f32> = (0..=steps)
+            .map(|i| 1.0 - (i as f32 / steps as f32))
+            .collect();
         let pass0 = ComposedPassPlan::single_phase(
             0,
             1024,
@@ -2891,11 +3699,8 @@ mod tests {
                     synthetic_base_plan(&route, 20),
                     &[inv_a.clone(), inv_b.clone()],
                 );
-                let res_ba = registry.compose(
-                    &route,
-                    synthetic_base_plan(&route, 20),
-                    &[inv_b, inv_a],
-                );
+                let res_ba =
+                    registry.compose(&route, synthetic_base_plan(&route, 20), &[inv_b, inv_a]);
 
                 let spec_a = registry.get(id_a).unwrap();
                 let spec_b = registry.get(id_b).unwrap();
@@ -3361,10 +4166,8 @@ mod tests {
             provider_id: "structural_probe_route",
             compile: compile_control_only,
         };
-        let control_route = FeatureRouteStructure::from_descriptor_and_plan(
-            &control_desc,
-            Some(&control_planner),
-        );
+        let control_route =
+            FeatureRouteStructure::from_descriptor_and_plan(&control_desc, Some(&control_planner));
         let control_app = LowResStartFeature.applicability(&control_route);
         assert!(!control_app.applicable);
         assert!(control_app
@@ -3427,15 +4230,10 @@ mod tests {
             height: 1024,
             ..Default::default()
         };
-        assert!(validate_low_res_start_request(
-            &desc,
-            Some(&planner),
-            &clean_req,
-            4,
-            2,
-            Some(0.5)
-        )
-        .is_ok());
+        assert!(
+            validate_low_res_start_request(&desc, Some(&planner), &clean_req, 4, 2, Some(0.5))
+                .is_ok()
+        );
 
         let phased_req = GenerationRequest {
             phases: Some(vec![GenerationPhase {
@@ -3465,5 +4263,608 @@ mod tests {
             validate_low_res_start_request(&desc, Some(&planner), &ref_req, 4, 2, Some(0.5)),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    /// SW-6939 (FEAT-1, PIPE-2): Parameter boundaries (`version == 1`, `scale in 0.25..=0.9`,
+    /// `M >= 2`, `1 <= K < M` resolved after img2img strength truncation), floor quantization
+    /// to `legal_quantum = lcm(vae_spatial_scale * patch_size, requires_dimensions_multiple_of)`,
+    /// spatial-only scaling (frames, count, audio unchanged), and Hires.fix composition applying
+    /// `low_res_start` once to pass 0 only.
+    #[test]
+    fn sw6939_parameter_boundaries_strength_truncation_legal_grid_and_hires_composition() {
+        use crate::{MultiPassRenderPlan, PlannedPassRequest};
+
+        fn flux_desc() -> ModelDescriptor {
+            ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: Some(&FLUX1_LATENT_SPACE),
+                control_kinds: None,
+                required_components: &[],
+                id: "flux1_dev",
+                family: "flux",
+                backend: "mlx",
+                modality: Modality::Image,
+                capabilities: Capabilities {
+                    min_size: 256,
+                    max_size: 2048,
+                    max_count: 4,
+                    conditioning: vec![ConditioningKind::Reference],
+                    ..Default::default()
+                },
+            }
+        }
+
+        // 1. Version != 1 is refused without clamping.
+        let bad_version = LowResStartSpec::new(2, Some(0.5)).with_version(2);
+        assert!(matches!(
+            bad_version.resolve_geometry("flux1_dev", 1024, 1024, 10, 8, 2, 16, 256),
+            Err(Error::Unsupported(_))
+        ));
+        let zero_version = LowResStartSpec::new(2, Some(0.5)).with_version(0);
+        assert!(matches!(
+            zero_version.resolve_geometry("flux1_dev", 1024, 1024, 10, 8, 2, 16, 256),
+            Err(Error::Unsupported(_))
+        ));
+
+        // 2. Scale outside [0.25, 0.9] or non-finite is refused without clamping.
+        for bad_scale in [0.0_f32, 0.2499, 0.9001, 1.0, -0.5, f32::NAN, f32::INFINITY] {
+            let spec = LowResStartSpec::new(2, Some(bad_scale));
+            assert!(
+                matches!(
+                    spec.resolve_geometry("flux1_dev", 1024, 1024, 10, 8, 2, 16, 256),
+                    Err(Error::Unsupported(_))
+                ),
+                "bad scale {bad_scale} must be refused"
+            );
+        }
+
+        // 3. M < 2, K == 0, and K >= M are refused without clamping.
+        let spec_k1 = LowResStartSpec::new(1, Some(0.5));
+        assert!(matches!(
+            spec_k1.resolve_geometry("flux1_dev", 1024, 1024, 1, 8, 2, 16, 256),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            LowResStartSpec::new(0, Some(0.5)).resolve_geometry(
+                "flux1_dev",
+                1024,
+                1024,
+                10,
+                8,
+                2,
+                16,
+                256
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            LowResStartSpec::new(10, Some(0.5)).resolve_geometry(
+                "flux1_dev",
+                1024,
+                1024,
+                10,
+                8,
+                2,
+                16,
+                256
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        // 4. Img2img strength truncation resolves M = executed_steps BEFORE validating K.
+        // Full schedule has 10 steps (11 sigma nodes). With strength = 0.7, init_time_step = 7,
+        // so truncated schedule has M = 10 - 7 = 3 executed steps (4 nodes).
+        let full_sigmas: Vec<f32> = (0..=10).map(|i| 1.0 - (i as f32 / 10.0)).collect();
+        let (start_step, truncated) =
+            resolve_img2img_truncated_schedule(&full_sigmas, Some(0.7)).unwrap();
+        assert_eq!(start_step, 7);
+        let m = truncated.len() - 1;
+        assert_eq!(m, 3);
+        // K = 2 < M = 3 succeeds; K = 3 >= M = 3 is refused even though K < full_steps (10)!
+        assert!(LowResStartSpec::new(2, Some(0.5))
+            .resolve_geometry("flux1_dev", 1024, 1024, m, 8, 2, 16, 256)
+            .is_ok());
+        assert!(matches!(
+            LowResStartSpec::new(3, Some(0.5)).resolve_geometry(
+                "flux1_dev",
+                1024,
+                1024,
+                m,
+                8,
+                2,
+                16,
+                256
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        // If strength leaves M = 1 (e.g. strength = 0.9 on 10 steps -> start_step = 9, M = 1), refused!
+        let (_, truncated_m1) =
+            resolve_img2img_truncated_schedule(&full_sigmas, Some(0.9)).unwrap();
+        assert_eq!(truncated_m1.len() - 1, 1);
+        assert!(matches!(
+            LowResStartSpec::new(1, Some(0.5)).resolve_geometry(
+                "flux1_dev",
+                1024,
+                1024,
+                truncated_m1.len() - 1,
+                8,
+                2,
+                16,
+                256
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        // 5. Floor quantization to legal_quantum = lcm(vae_spatial_scale * patch_size, requires_dimensions_multiple_of).
+        // For FLUX.1: lcm(8 * 2, 16) = 16.
+        // At 1024x768 with scale = 0.51:
+        // floor((1024 * 0.51) / 16) * 16 = floor(522.24 / 16) * 16 = 32 * 16 = 512 (NOT round = 528!).
+        // floor((768 * 0.51) / 16) * 16 = floor(391.68 / 16) * 16 = 24 * 16 = 384.
+        let resolved_floor = LowResStartSpec::new(2, Some(0.51))
+            .resolve_geometry("flux1_dev", 1024, 768, 8, 8, 2, 16, 256)
+            .unwrap();
+        assert_eq!(resolved_floor.legal_quantum, 16);
+        assert_eq!(resolved_floor.low_width, 512);
+        assert_eq!(resolved_floor.low_height, 384);
+
+        // Non-trivial LCM: vae_spatial_scale * patch_size = 16, requires_dimensions_multiple_of = 24 -> legal_quantum = 48.
+        let resolved_lcm = LowResStartSpec::new(2, Some(0.5))
+            .resolve_geometry("av_route", 960, 576, 8, 8, 2, 24, 240)
+            .unwrap();
+        assert_eq!(resolved_lcm.legal_quantum, 48);
+        assert_eq!(resolved_lcm.low_width, 480);
+        assert_eq!(resolved_lcm.low_height, 288);
+
+        // Below min_dim (e.g. 384 * 0.5 = 192 < min_dim 256) is refused without clamping.
+        assert!(matches!(
+            LowResStartSpec::new(2, Some(0.5)).resolve_geometry(
+                "flux1_dev",
+                384,
+                1024,
+                8,
+                8,
+                2,
+                16,
+                256
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Non-reducing scale on small target (e.g. 256 * 0.9 = 230.4 -> floor 224 < 256, or if full == low) is refused.
+        assert!(matches!(
+            LowResStartSpec::new(2, Some(0.9))
+                .resolve_geometry("flux1_dev", 256, 256, 8, 8, 2, 16, 224),
+            Ok(plan) if plan.low_width == 224 && plan.low_height == 224
+        ));
+
+        // 6. Spatial-only scaling: frames and count in RenderPlan / RenderRun stay unchanged across phases.
+        let desc = flux_desc();
+        let req = GenerationRequest {
+            prompt: "cinematic lighthouse".into(),
+            width: 1024,
+            height: 768,
+            count: 2,
+            frames: Some(25),
+            seed: Some(42),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = RenderPlan::base_image(
+            &desc,
+            &req,
+            crate::render::PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 3.5,
+                sigmas: vec![1.0, 0.75, 0.5, 0.25, 0.0],
+                executed_steps: 4,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(plan.phase_output_size(0), (512, 384));
+        assert_eq!(plan.phase_output_size(1), (1024, 768));
+        assert_eq!(plan.image_count(), 2);
+
+        // 7. Composition with Hires.fix (`MultiPassRenderPlan`): `low_res_start` applies once, to base pass 0 only.
+        let pass0_req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(7),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let pass1_req = GenerationRequest {
+            width: 1536,
+            height: 1536,
+            ..pass0_req.clone()
+        };
+        let multipass = MultiPassRenderPlan::compile(
+            &[
+                PlannedPassRequest {
+                    request: &pass0_req,
+                    produced_reference: None,
+                },
+                PlannedPassRequest {
+                    request: &pass1_req,
+                    produced_reference: Some(ProducedReference {
+                        from_pass: 0,
+                        width: 1536,
+                        height: 1536,
+                        strength: Some(0.35),
+                    }),
+                },
+            ],
+            |r| {
+                RenderPlan::packed_image_trajectory(
+                    &desc,
+                    r,
+                    crate::render::PackedImagePass {
+                        pixel_stride: 16,
+                        token_width: 64,
+                        sampler: "euler",
+                        guidance: 3.5,
+                        sigmas: vec![1.0, 0.75, 0.5, 0.25, 0.0],
+                        executed_steps: 4,
+                        capture_sigma: 0.0,
+                    },
+                )
+                .map(Some)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(multipass.passes().len(), 2);
+        // Pass 0 has low_res_start active (2 phases: 0..2 at 512x512, 2..4 at 1024x1024).
+        assert!(multipass.passes()[0].low_res_start().is_some());
+        assert_eq!(multipass.passes()[0].denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(multipass.passes()[0].phase_output_size(0), (512, 512));
+        assert_eq!(multipass.passes()[0].phase_output_size(1), (1024, 1024));
+        // Pass 1 (Hires.fix) has low_res_start inactive (1 phase: 0..4 at 1536x1536).
+        assert!(multipass.passes()[1].low_res_start().is_none());
+        assert_eq!(multipass.passes()[1].denoise_spans(), vec![0..4]);
+        assert_eq!(multipass.passes()[1].phase_output_size(0), (1536, 1536));
+    }
+
+    /// SW-6939 (PIPE-4, FEAT-1, §6.1): Typed `BoundaryState` refuses `XSigma` and `RouteSpecific`
+    /// so a transition cannot double-noise; fp32 unpack -> bilinear half-pixel (`align_corners = false`,
+    /// clamp-to-edge) resize -> deterministic domain-separated noise draw -> Flow vs VE/EDM noise laws -> repack.
+    #[test]
+    fn sw6939_typed_boundary_state_and_exact_fp32_transition_arithmetic() {
+        use crate::sampling::{
+            AlphaSchedule, CpuLatentOps, DiscreteModelSampling, EdmModelSampling,
+            FlowModelSampling, LatentOps, PredictionType, TimestepConvention,
+        };
+
+        let plan = LowResStartSpec::new(2, Some(0.5))
+            .resolve_geometry("flux1_dev", 512, 512, 4, 8, 2, 16, 256)
+            .unwrap();
+        assert_eq!((plan.low_width, plan.low_height), (256, 256));
+        assert_eq!((plan.full_width, plan.full_height), (512, 512));
+
+        let flow_ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let edm_ms = EdmModelSampling::new(PredictionType::Eps, 0.002, 80.0, 1.0);
+        let discrete_ms =
+            DiscreteModelSampling::sdxl(&AlphaSchedule::scaled_linear(1000, 0.00085, 0.012));
+
+        // 1. BoundaryState::XSigma and RouteSpecific are refused with a typed Error::Unsupported.
+        let dummy_low = vec![1.0_f32; 16 * 32 * 32];
+        let noisy_state = BoundaryState::XSigma(dummy_low.as_slice());
+        assert!(matches!(
+            transition_packed_clean_estimate_f32(
+                noisy_state,
+                1,
+                16,
+                2,
+                8,
+                &plan,
+                0.5,
+                &flow_ms,
+                42,
+                0,
+                0,
+                0,
+            ),
+            Err(Error::Unsupported(msg)) if msg.contains("BoundaryState::XSigma")
+        ));
+        let route_state = BoundaryState::RouteSpecific {
+            label: "custom_carrier",
+            state: dummy_low.as_slice(),
+        };
+        assert!(matches!(
+            transition_packed_clean_estimate_f32(
+                route_state,
+                1,
+                16,
+                2,
+                8,
+                &plan,
+                0.5,
+                &flow_ms,
+                42,
+                0,
+                0,
+                0,
+            ),
+            Err(Error::Unsupported(msg)) if msg.contains("custom_carrier")
+        ));
+
+        // 2. Unpack <-> Repack round-trip identity and exact 2x2 patch mapping.
+        let (b, c, h_low, w_low, p) = (1usize, 16usize, 32usize, 32usize, 2usize);
+        let unpacked_orig: Vec<f32> = (0..(b * c * h_low * w_low))
+            .map(|i| (i as f32) * 0.01 - 5.0)
+            .collect();
+        let packed = repack_unpacked_latents_f32(&unpacked_orig, b, c, h_low, w_low, p).unwrap();
+        let unpacked_rt = unpack_packed_latents_f32(&packed, b, c, h_low, w_low, p).unwrap();
+        assert_eq!(unpacked_orig, unpacked_rt);
+
+        // 3. Exact bilinear half-pixel (`align_corners = false`, clamp-to-edge) coordinates & interpolation.
+        // Upsampling 2x2 -> 4x4:
+        // dst=0 -> coord_src = (0.5 * 0.5) - 0.5 = -0.25 -> clamped to 0.0 -> (0, 1, 0.0)
+        // dst=1 -> coord_src = (1.5 * 0.5) - 0.5 = 0.25 -> (0, 1, 0.25)
+        // dst=2 -> coord_src = (2.5 * 0.5) - 0.5 = 0.75 -> (0, 1, 0.75)
+        // dst=3 -> coord_src = (3.5 * 0.5) - 0.5 = 1.25 -> clamped to 1.0 -> (1, 1, 0.0)
+        assert_eq!(bilinear_half_pixel_clamp_coord(0, 2, 4), (0, 1, 0.0));
+        assert_eq!(bilinear_half_pixel_clamp_coord(1, 2, 4), (0, 1, 0.25));
+        assert_eq!(bilinear_half_pixel_clamp_coord(2, 2, 4), (0, 1, 0.75));
+        assert_eq!(bilinear_half_pixel_clamp_coord(3, 2, 4), (1, 1, 0.0));
+
+        let src_2x2 = vec![10.0_f32, 20.0, 30.0, 40.0];
+        let resized_4x4 = resize_bilinear_half_pixel_clamp_f32(&src_2x2, 1, 1, 2, 2, 4, 4).unwrap();
+        // Corner (0,0) clamps to src(0,0) = 10.0; corner (3,3) clamps to src(1,1) = 40.0.
+        assert!((resized_4x4[0] - 10.0).abs() < 1e-6);
+        assert!((resized_4x4[15] - 40.0).abs() < 1e-6);
+        // Inner (1,1): wx=0.25, wy=0.25 -> top = 12.5, bot = 32.5 -> 12.5*0.75 + 32.5*0.25 = 17.5.
+        assert!((resized_4x4[5] - 17.5).abs() < 1e-6);
+
+        // 4. Deterministic domain-separated transition seed never collides with initial noise or StepRng draws.
+        let s_trans = low_res_start_transition_seed(12345, 0, 0, 0);
+        assert_ne!(s_trans, 12345);
+        assert_ne!(s_trans, low_res_start_transition_seed(12345, 1, 0, 0));
+        assert_ne!(s_trans, low_res_start_transition_seed(12345, 0, 1, 0));
+        assert_ne!(s_trans, low_res_start_transition_seed(12345, 0, 0, 1));
+        let trans_noise = low_res_start_transition_noise_f32(12345, 0, 0, 0, 64);
+        let step_noise = CpuLatentOps
+            .randn_like(&vec![0.0_f32; 64], 12345, 0)
+            .unwrap();
+        assert_ne!(trans_noise, step_noise);
+
+        // 5. Flow vs VE/EDM noise laws at sigma_K = 0.6:
+        // Flow: (1 - sigma_K) * resize(x0_low) + sigma_K * eps_trans
+        // VE/EDM: resize(x0_low) + sigma_K * eps_trans
+        let sigma_k = 0.6_f32;
+        let constant_x0 = vec![2.0_f32; 16 * 32 * 32];
+        let constant_eps = vec![0.5_f32; 16 * 64 * 64];
+        let flow_out = transition_packed_clean_estimate_with_noise_f32(
+            BoundaryState::CleanEstimate {
+                latent: &constant_x0,
+                source: EstimateSource::EndpointEvaluation,
+            },
+            1,
+            16,
+            2,
+            8,
+            &plan,
+            sigma_k,
+            &flow_ms,
+            &constant_eps,
+        )
+        .unwrap();
+        let expected_flow = (1.0 - sigma_k) * 2.0 + sigma_k * 0.5;
+        assert!(flow_out.iter().all(|&v| (v - expected_flow).abs() < 1e-6));
+
+        for ve_ms in [&edm_ms as &dyn ModelSampling, &discrete_ms] {
+            let ve_out = transition_packed_clean_estimate_with_noise_f32(
+                BoundaryState::CleanEstimate {
+                    latent: &constant_x0,
+                    source: EstimateSource::EndpointEvaluation,
+                },
+                1,
+                16,
+                2,
+                8,
+                &plan,
+                sigma_k,
+                ve_ms,
+                &constant_eps,
+            )
+            .unwrap();
+            let expected_ve = 2.0 + sigma_k * 0.5;
+            assert!(ve_out.iter().all(|&v| (v - expected_ve).abs() < 1e-6));
+        }
+    }
+
+    /// SW-6939 (PIPE-3, PIPE-5): `SolverRunState` history reset across geometry change / re-noise
+    /// while preserving `next_step = K` and RNG draw coordinates `K..M`; incompatible `Carry`
+    /// across geometry change or re-noise refuses with a typed error; read-only boundary evaluation
+    /// leaves APG `MomentumBuffer`, solver history, and RNG unchanged.
+    #[test]
+    fn sw6939_solver_history_reset_carry_refusal_and_readonly_apg_evaluation() {
+        use crate::guidance::{normalized_guidance, normalized_guidance_readonly, MomentumBuffer};
+        use crate::sampling::{
+            CpuLatentOps, Dpmpp2m, EulerAncestral, FlowModelSampling, PhaseBoundary, Sampler,
+            Solver, SolverRunState, TimestepConvention,
+        };
+
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let sigmas = vec![1.0_f32, 0.75, 0.5, 0.25, 0.0];
+
+        // 1. Multistep solver (Dpmpp2m) accumulates history in Phase 0 (0..2 at len 4).
+        let mut state = SolverRunState::new(Solver::Dpmpp2m, &sigmas);
+        let mut denoise_low = |x: &Vec<f32>, s: f32| -> Result<Vec<f32>> {
+            Ok(x.iter().map(|&v| v * (1.0 - 0.1 * s)).collect())
+        };
+        let out_p0 = Dpmpp2m
+            .sample_span(
+                &ops,
+                &ms,
+                &mut denoise_low,
+                vec![1.0_f32; 4],
+                &sigmas,
+                99,
+                0..2,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(out_p0.len(), 4);
+        assert_eq!(state.next_step(), 2);
+        assert!(
+            state.has_history(),
+            "multistep solver must hold history at step K=2"
+        );
+
+        // 2. Marking a geometry change or re-noise and attempting Carry refuses with a typed Error::Unsupported!
+        state.note_geometry_change((256, 256), (512, 512));
+        state.note_renoise_transition();
+        assert!(matches!(
+            state.apply_phase_boundary(PhaseBoundary::Carry, true),
+            Err(Error::Unsupported(_))
+        ));
+        let mut denoise_full = |x: &Vec<f32>, s: f32| -> Result<Vec<f32>> {
+            Ok(x.iter().map(|&v| v * (1.0 - 0.1 * s)).collect())
+        };
+        assert!(
+            matches!(
+                Dpmpp2m.sample_span(
+                    &ops,
+                    &ms,
+                    &mut denoise_full,
+                    vec![1.0_f32; 16],
+                    &sigmas,
+                    99,
+                    2..4,
+                    &mut state,
+                ),
+                Err(Error::Unsupported(_))
+            ),
+            "sample_span must refuse Carry across unreset geometry/renoise boundary"
+        );
+
+        // 3. Resetting history clears old-shape history while preserving next_step = K = 2,
+        // allowing Phase 1 (2..4 at len 16) to integrate cleanly without shape mismatch!
+        state
+            .apply_phase_boundary(PhaseBoundary::Reset, true)
+            .unwrap();
+        assert!(!state.has_history());
+        assert_eq!(state.next_step(), 2);
+        let out_p1 = Dpmpp2m
+            .sample_span(
+                &ops,
+                &ms,
+                &mut denoise_full,
+                vec![1.0_f32; 16],
+                &sigmas,
+                99,
+                2..4,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(out_p1.len(), 16);
+        assert_eq!(state.next_step(), 4);
+
+        // 4. Stochastic solver (EulerAncestral) preserves absolute RNG draw coordinates K..M after reset_history().
+        let mut stoch_state = SolverRunState::new(Solver::EulerAncestral, &sigmas);
+        let _ = EulerAncestral::default()
+            .sample_span(
+                &ops,
+                &ms,
+                &mut |x, _| Ok(x.clone()),
+                vec![0.5_f32; 4],
+                &sigmas,
+                777,
+                0..2,
+                &mut stoch_state,
+            )
+            .unwrap();
+        stoch_state.note_geometry_change((256, 256), (512, 512));
+        stoch_state
+            .apply_phase_boundary(PhaseBoundary::Reset, true)
+            .unwrap();
+        assert_eq!(stoch_state.next_step(), 2);
+        let p1_after_reset = EulerAncestral::default()
+            .sample_span(
+                &ops,
+                &ms,
+                &mut |x, _| Ok(x.clone()),
+                vec![0.25_f32; 8],
+                &sigmas,
+                777,
+                2..4,
+                &mut stoch_state,
+            )
+            .unwrap();
+
+        // Compare with a direct span 2..4 starting from the same state at step 2 with seed 777:
+        // because stochastic draws use absolute step indices 2..4, the outputs are bit-identical!
+        let mut ref_state = SolverRunState::new(Solver::EulerAncestral, &sigmas);
+        let _ = EulerAncestral::default()
+            .sample_span(
+                &ops,
+                &ms,
+                &mut |x, _| Ok(x.clone()),
+                vec![0.5_f32; 8],
+                &sigmas,
+                777,
+                0..2,
+                &mut ref_state,
+            )
+            .unwrap();
+        let p1_direct = EulerAncestral::default()
+            .sample_span(
+                &ops,
+                &ms,
+                &mut |x, _| Ok(x.clone()),
+                vec![0.25_f32; 8],
+                &sigmas,
+                777,
+                2..4,
+                &mut ref_state,
+            )
+            .unwrap();
+        assert_eq!(
+            p1_after_reset, p1_direct,
+            "reset_history() must preserve exact stochastic RNG draw coordinates K..M"
+        );
+
+        // 5. Read-only boundary evaluation does not mutate APG MomentumBuffer, and MomentumBuffer::reset()
+        // invalidates old-shape phase-0 state before phase 1.
+        let mut apg_buf = MomentumBuffer::new(-0.5);
+        let cond_low = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let uncond_low = vec![0.5_f32, 1.0, 1.5, 2.0];
+        let _ = normalized_guidance(
+            &ops,
+            &cond_low,
+            &uncond_low,
+            4.0,
+            Some(&mut apg_buf),
+            0.0,
+            2.5,
+            &[1, 4],
+            &[-1],
+        )
+        .unwrap();
+        let saved_running = apg_buf.running().unwrap().clone();
+        // Read-only boundary evaluation at sigma_K leaves `apg_buf` completely unchanged.
+        let _readonly_out = normalized_guidance_readonly(
+            &ops,
+            &vec![2.0_f32, 1.0, 0.5, 3.0],
+            &uncond_low,
+            4.0,
+            Some(&apg_buf),
+            0.0,
+            2.5,
+            &[1, 4],
+            &[-1],
+        )
+        .unwrap();
+        assert_eq!(apg_buf.running(), Some(&saved_running));
+        // Phase-boundary reset clears old-shape `(low_w, low_h)` buffer so Phase 1 starts fresh at `(full_w, full_h)`.
+        apg_buf.reset();
+        assert!(apg_buf.is_empty());
     }
 }

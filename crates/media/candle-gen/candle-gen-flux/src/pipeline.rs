@@ -153,13 +153,18 @@ pub(crate) fn base_schedule(variant: Variant, req: &GenerationRequest) -> Result
         get_schedule(steps, None)
     };
     let native: Vec<f32> = native.into_iter().map(|sigma| sigma as f32).collect();
-    Ok(candle_gen::resolve_flow_schedule_with_shift(
+    let mut sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
         req.scheduler_shift,
         flow_mu(variant, seq_len),
         steps,
         &native,
-    )?)
+    )?;
+    if req.source_image.is_some() {
+        let (_, truncated) = gen_core::resolve_img2img_truncated_schedule(&sigmas, req.strength)?;
+        sigmas = truncated;
+    }
+    Ok(sigmas)
 }
 
 /// A FLUX pipeline handle: the snapshot `root`, the variant, and the compute device/dtype (bf16).
@@ -774,10 +779,259 @@ impl Pipeline {
             candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(plan.sampler()));
         let total_steps = plan.denoise_sigmas().len().saturating_sub(1);
         let mut eval_idx = 0usize;
-        candle_gen::run_flow_sampler_spans(
+
+        let Some(low_res_plan) = plan.low_res_start().copied() else {
+            return candle_gen::run_flow_sampler_with_phase_transition_spans(
+                Some(plan.sampler()),
+                TimestepConvention::Sigma,
+                plan.denoise_sigmas(),
+                &plan.denoise_spans(),
+                Some(run),
+                true,
+                state.img.clone(),
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(preview),
+                |img, t| -> Result<Tensor> {
+                    let current_eval = eval_idx;
+                    eval_idx += 1;
+                    let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                        canonical_solver,
+                        current_eval,
+                        total_steps,
+                    );
+                    let t_vec = Tensor::full(t, b_sz, dev)?;
+                    let attention_plan = request_attention_plan(req);
+                    let transformer_window = req
+                        .memory
+                        .and_then(|memory| memory.transformer_window_size)
+                        .map(|value| value as usize)
+                        .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+                    candle_gen::execution::policy(
+                        "flux/pipeline/transformer_window",
+                        format!("{transformer_window:?}").into(),
+                    );
+                    let forward_one = |pag_layers: Option<&[u32]>| -> Result<Tensor> {
+                        match (dit, &prepared) {
+                            (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => {
+                                transformer.forward_prepared_with_memory_pag(
+                                    img,
+                                    &state.img_ids,
+                                    &state.txt,
+                                    &state.txt_ids,
+                                    &t_vec,
+                                    &state.vec,
+                                    Some(&guidance_t),
+                                    None,
+                                    None,
+                                    None,
+                                    prepared,
+                                    attention_plan,
+                                    transformer_window,
+                                    &req.cancel,
+                                    pag_layers,
+                                )
+                            }
+                            (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => {
+                                transformer.forward_prepared_with_memory_pag(
+                                    img,
+                                    &state.img_ids,
+                                    &state.txt,
+                                    &state.txt_ids,
+                                    &t_vec,
+                                    &state.vec,
+                                    packed_guidance,
+                                    None,
+                                    None,
+                                    None,
+                                    prepared,
+                                    attention_plan,
+                                    transformer_window,
+                                    &req.cancel,
+                                    pag_layers,
+                                )
+                            }
+                            _ => Err(CandleError::Msg(
+                                "flux: prepared conditioning belongs to another DiT variant".into(),
+                            )),
+                        }
+                    };
+                    let out = forward_one(None)?;
+                    let step_pag = pag
+                        .as_ref()
+                        .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                    if step_pag > 0.0 {
+                        let layers = pag
+                            .as_ref()
+                            .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                        let pert = forward_one(Some(layers))?;
+                        crate::apply_pag_blend(&out, &pert, step_pag)
+                    } else {
+                        Ok(out)
+                    }
+                },
+                None,
+            );
+        };
+
+        use std::cell::RefCell;
+        let phase_context = RefCell::new((state.img_ids.clone(), prepared));
+        let forward_step = |img: &Tensor, step_idx: usize, t: f32| -> Result<Tensor> {
+            let t_vec = Tensor::full(t, b_sz, dev)?;
+            let attention_plan = request_attention_plan(req);
+            let transformer_window = req
+                .memory
+                .and_then(|memory| memory.transformer_window_size)
+                .map(|value| value as usize)
+                .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+            candle_gen::execution::policy(
+                "flux/pipeline/transformer_window",
+                format!("{transformer_window:?}").into(),
+            );
+            let ctx = phase_context.borrow();
+            let (ref active_img_ids, ref active_prepared) = *ctx;
+            let forward_one = |pag_layers: Option<&[u32]>| -> Result<Tensor> {
+                match (dit, active_prepared) {
+                    (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
+                        .forward_prepared_with_memory_pag(
+                            img,
+                            active_img_ids,
+                            &state.txt,
+                            &state.txt_ids,
+                            &t_vec,
+                            &state.vec,
+                            Some(&guidance_t),
+                            None,
+                            None,
+                            None,
+                            prepared,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                            pag_layers,
+                        ),
+                    (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
+                        .forward_prepared_with_memory_pag(
+                            img,
+                            active_img_ids,
+                            &state.txt,
+                            &state.txt_ids,
+                            &t_vec,
+                            &state.vec,
+                            packed_guidance,
+                            None,
+                            None,
+                            None,
+                            prepared,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                            pag_layers,
+                        ),
+                    _ => Err(CandleError::Msg(
+                        "flux: prepared conditioning belongs to another DiT variant".into(),
+                    )),
+                }
+            };
+            let out = forward_one(None)?;
+            let step_pag = pag
+                .as_ref()
+                .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+            if step_pag > 0.0 {
+                let layers = pag
+                    .as_ref()
+                    .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                let pert = forward_one(Some(layers))?;
+                crate::apply_pag_blend(&out, &pert, step_pag)
+            } else {
+                Ok(out)
+            }
+        };
+
+        let output_index = seed.wrapping_sub(plan.base_seed()) as u32;
+        let pass_index = plan.pass_index();
+        let base_seed = plan.base_seed();
+        let denoise_sigmas = plan.denoise_sigmas();
+
+        let mut transition_cb = |phase: usize,
+                                 boundary_step: usize,
+                                 ops: &candle_gen::CandleLatentOps,
+                                 ms: &dyn gen_core::sampling::ModelSampling,
+                                 x_sigma_k: &Tensor,
+                                 solver_state: &mut gen_core::sampling::SolverRunState<
+            candle_gen::CandleLatentOps,
+        >|
+         -> Result<Tensor> {
+            if boundary_step != low_res_plan.k {
+                return Ok(x_sigma_k.clone());
+            }
+            candle_gen::check_cancel(&req.cancel)?;
+            let sigma_k = denoise_sigmas[boundary_step];
+            let boundary_state = match (
+                low_res_plan.estimate_source,
+                solver_state.previous_denoised().cloned(),
+            ) {
+                (gen_core::EstimateSource::PreviousEvaluation, Some(prev_x0)) => {
+                    gen_core::BoundaryState::CleanEstimate {
+                        latent: prev_x0,
+                        source: gen_core::EstimateSource::PreviousEvaluation,
+                    }
+                }
+                _ => {
+                    let x0_low =
+                        gen_core::sampling::denoise(ops, ms, x_sigma_k, sigma_k, |x_in, t| {
+                            forward_step(x_in, boundary_step, t).map_err(gen_core::Error::from)
+                        })
+                        .map_err(CandleError::from)?;
+                    gen_core::BoundaryState::CleanEstimate {
+                        latent: x0_low,
+                        source: gen_core::EstimateSource::EndpointEvaluation,
+                    }
+                }
+            };
+            let transitioned = transition_candle_flux_boundary_state(
+                boundary_state,
+                &low_res_plan,
+                sigma_k,
+                ms,
+                base_seed,
+                output_index,
+                pass_index,
+                phase,
+                dev,
+                self.dtype,
+            )?;
+            solver_state.note_geometry_change(
+                (low_res_plan.low_width, low_res_plan.low_height),
+                (low_res_plan.full_width, low_res_plan.full_height),
+            );
+            solver_state.note_renoise_transition();
+            solver_state.apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)?;
+
+            // Re-derive Phase-1 position IDs (`img_ids`) and RoPE conditioning (`PreparedDit`) for `(full_w, full_h)`.
+            let full_lat_h = (low_res_plan.full_height as usize).div_ceil(16) * 2;
+            let full_lat_w = (low_res_plan.full_width as usize).div_ceil(16) * 2;
+            let dummy_full = Tensor::zeros(
+                (b_sz, LATENT_CHANNELS, full_lat_h, full_lat_w),
+                self.dtype,
+                dev,
+            )?;
+            let full_state = State::new(&state.txt, &state.vec, &dummy_full)?;
+            let full_prepared = dit.prepare_conditioning(
+                &transitioned,
+                &full_state.img_ids,
+                &state.txt,
+                &state.txt_ids,
+            )?;
+            *phase_context.borrow_mut() = (full_state.img_ids, full_prepared);
+            Ok(transitioned)
+        };
+
+        candle_gen::run_flow_sampler_with_phase_transition_spans(
             Some(plan.sampler()),
             TimestepConvention::Sigma,
-            plan.denoise_sigmas(),
+            denoise_sigmas,
             &plan.denoise_spans(),
             Some(run),
             true,
@@ -785,7 +1039,7 @@ impl Pipeline {
             seed,
             &req.cancel,
             on_progress,
-            Some(preview),
+            None,
             |img, t| -> Result<Tensor> {
                 let current_eval = eval_idx;
                 eval_idx += 1;
@@ -794,78 +1048,9 @@ impl Pipeline {
                     current_eval,
                     total_steps,
                 );
-                // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
-                // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
-                let t_vec = Tensor::full(t, b_sz, dev)?;
-                let attention_plan = request_attention_plan(req);
-                let transformer_window = req
-                    .memory
-                    .and_then(|memory| memory.transformer_window_size)
-                    .map(|value| value as usize)
-                    .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-                candle_gen::execution::policy(
-                    "flux/pipeline/transformer_window",
-                    format!("{transformer_window:?}").into(),
-                );
-                let forward_one = |pag_layers: Option<&[u32]>| -> Result<Tensor> {
-                    match (dit, &prepared) {
-                        // `IpFlux::forward` with `ip = None` is byte-identical to the stock
-                        // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
-                        (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                            .forward_prepared_with_memory_pag(
-                                img,
-                                &state.img_ids,
-                                &state.txt,
-                                &state.txt_ids,
-                                &t_vec,
-                                &state.vec,
-                                Some(&guidance_t),
-                                None,
-                                None,
-                                None,
-                                prepared,
-                                attention_plan,
-                                transformer_window,
-                                &req.cancel,
-                                pag_layers,
-                            ),
-                        (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                            .forward_prepared_with_memory_pag(
-                                img,
-                                &state.img_ids,
-                                &state.txt,
-                                &state.txt_ids,
-                                &t_vec,
-                                &state.vec,
-                                packed_guidance,
-                                None,
-                                None,
-                                None,
-                                prepared,
-                                attention_plan,
-                                transformer_window,
-                                &req.cancel,
-                                pag_layers,
-                            ),
-                        _ => Err(CandleError::Msg(
-                            "flux: prepared conditioning belongs to another DiT variant".into(),
-                        )),
-                    }
-                };
-                let out = forward_one(None)?;
-                let step_pag = pag
-                    .as_ref()
-                    .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
-                if step_pag > 0.0 {
-                    let layers = pag
-                        .as_ref()
-                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
-                    let pert = forward_one(Some(layers))?;
-                    crate::apply_pag_blend(&out, &pert, step_pag)
-                } else {
-                    Ok(out)
-                }
+                forward_step(img, step_idx, t)
             },
+            Some(&mut transition_cb),
         )
     }
 
@@ -1476,8 +1661,9 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         self.variant.resolved_guidance(req.guidance);
-        let lat_h = (req.height as usize).div_ceil(16) * 2;
-        let lat_w = (req.width as usize).div_ceil(16) * 2;
+        let (init_w, init_h) = plan.phase_output_size(0);
+        let lat_h = (init_h as usize).div_ceil(16) * 2;
+        let lat_w = (init_w as usize).div_ceil(16) * 2;
 
         let (t5_emb, clip_emb) = encoded;
         // Resolve the decode seam once for the whole batch. Minting a PiD decoder runs its Gemma
@@ -1494,25 +1680,44 @@ impl Pipeline {
             run.end_conditioning()?;
         }
 
+        let clean_init = match &req.source_image {
+            Some(source_image) => {
+                let nchw = crate::control_provider::preprocess_control(
+                    source_image,
+                    init_w,
+                    init_h,
+                    &self.device,
+                    self.dtype,
+                )?;
+                Some(self.encode_control_ref_residency(heavy, &nchw, &req.cancel)?)
+            }
+            None => None,
+        };
+        let sigma_0 = plan.denoise_sigmas()[0] as f64;
+
         // Per-image denoise + decode.
         run.images_with_denoise_phases(
             on_progress,
             |seed| {
-                crate::flux1_load::seeded_noise(
+                let noise = crate::flux1_load::seeded_noise(
                     seed,
                     LATENT_CHANNELS,
                     lat_h,
                     lat_w,
                     &self.device,
                     self.dtype,
-                )
+                )?;
+                match &clean_init {
+                    Some(clean) => Ok(((clean * (1.0 - sigma_0))? + (&noise * sigma_0)?)?),
+                    None => Ok(noise),
+                }
             },
             |seed, noise, on_progress| {
                 // State packing allocates device tensors inside the first denoise phase.
                 // The sampler closes this phase after its first span.
                 run.begin_denoise_phase(0)?;
                 let state = State::new(&t5_emb, &clip_emb, &noise)?;
-                let planned_tokens = plan.packed_tokens();
+                let planned_tokens = plan.phase_packed_tokens(0);
                 if state.img.dim(1)? != planned_tokens {
                     return Err(CandleError::Msg(format!(
                         "FLUX.1 packed image geometry changed after plan compilation: expected {planned_tokens} tokens"
@@ -1522,7 +1727,7 @@ impl Pipeline {
                 // `(width, height)` the decode below is given — one source for the hook's geometry and the
                 // render's. Per image, not per batch: each seed is its own driver call and therefore its own
                 // trajectory, numbered from frame 1.
-                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                let preview = crate::preview::hook(&req.preview, init_w, init_h);
                 self.denoise(
                     run,
                     heavy.dit.as_ref(),
@@ -1835,6 +2040,206 @@ pub fn ae_config(variant: Variant) -> AeConfig {
     } else {
         AeConfig::schnell()
     }
+}
+
+/// Execute the typed fp32 boundary transition for Candle FLUX.1 at `sigma_k` (`SW-6939`: `PIPE-4`, `FEAT-1`, `§6.1`).
+///
+/// Refuses [`gen_core::BoundaryState::XSigma`] with a typed [`CandleError`] so a transition
+/// can never double-noise a noisy latent.
+#[allow(clippy::too_many_arguments)]
+pub fn transition_candle_flux_boundary_state(
+    boundary_state: gen_core::BoundaryState<Tensor>,
+    low_res_plan: &gen_core::ResolvedLowResStartPlan,
+    sigma_k: f32,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    request_seed: u64,
+    output_index: u32,
+    pass_index: usize,
+    phase_index: usize,
+    device: &Device,
+    target_dtype: DType,
+) -> Result<Tensor> {
+    let (x0_low, source) = boundary_state
+        .into_clean_estimate()
+        .map_err(CandleError::from)?;
+    let b_sz = x0_low.dim(0)?;
+    let packed_f32: Vec<f32> = x0_low.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let repacked = gen_core::transition_packed_clean_estimate_f32(
+        gen_core::BoundaryState::CleanEstimate {
+            latent: &packed_f32,
+            source,
+        },
+        b_sz,
+        LATENT_CHANNELS,
+        2,
+        8,
+        low_res_plan,
+        sigma_k,
+        ms,
+        request_seed,
+        output_index,
+        pass_index,
+        phase_index,
+    )
+    .map_err(CandleError::from)?;
+    let full_tokens = ((low_res_plan.full_height / 16) * (low_res_plan.full_width / 16)) as usize;
+    let out = Tensor::from_vec(repacked, (b_sz, full_tokens, 64), device)?;
+    if target_dtype == DType::F32 {
+        Ok(out)
+    } else {
+        Ok(out.to_dtype(target_dtype)?)
+    }
+}
+
+/// Unified Candle FLUX.1 denoise trajectory runner supporting both single-phase (`low_res_start: None`)
+/// and two-phase (`low_res_start: Some(..)`) execution over the same sampler implementation (`SW-6939`: `HOOK-5`, `E2`).
+pub fn execute_candle_flux_denoise_trajectory(
+    run: &RenderRun<'_, '_>,
+    req: &GenerationRequest,
+    seed: u64,
+    latents: Tensor,
+    on_progress: &mut dyn FnMut(Progress),
+    mut velocity_fn: impl FnMut(&Tensor, usize, f32, f32, u32, u32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    use std::cell::{Cell, RefCell};
+
+    let plan = run.plan();
+    let sampler_name = plan.sampler();
+    let guidance = plan.guidance();
+    let denoise_sigmas = plan.denoise_sigmas();
+    let denoise_spans = plan.denoise_spans();
+    let canonical_solver =
+        candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(sampler_name));
+    let total_steps = denoise_sigmas.len().saturating_sub(1);
+    let mut eval_idx = 0usize;
+    let device = latents.device().clone();
+    let dtype = latents.dtype();
+
+    let Some(low_res_plan) = plan.low_res_start().copied() else {
+        return candle_gen::run_flow_sampler_with_phase_transition_spans(
+            Some(sampler_name),
+            TimestepConvention::Sigma,
+            denoise_sigmas,
+            &denoise_spans,
+            Some(run),
+            false,
+            latents,
+            seed,
+            &req.cancel,
+            on_progress,
+            None,
+            |x_in, timestep| {
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                velocity_fn(x_in, step_idx, timestep, guidance, req.width, req.height)
+            },
+            None,
+        );
+    };
+
+    let current_dims = Cell::new((low_res_plan.low_width, low_res_plan.low_height));
+    let velocity_cell = RefCell::new(&mut velocity_fn);
+    let output_index = seed.wrapping_sub(plan.base_seed()) as u32;
+    let pass_index = plan.pass_index();
+    let base_seed = plan.base_seed();
+
+    let mut transition_cb = |phase: usize,
+                             boundary_step: usize,
+                             ops: &candle_gen::CandleLatentOps,
+                             ms: &dyn gen_core::sampling::ModelSampling,
+                             x_sigma_k: &Tensor,
+                             state: &mut gen_core::sampling::SolverRunState<
+        candle_gen::CandleLatentOps,
+    >|
+     -> Result<Tensor> {
+        if boundary_step != low_res_plan.k {
+            return Ok(x_sigma_k.clone());
+        }
+        candle_gen::check_cancel(&req.cancel)?;
+        let sigma_k = denoise_sigmas[boundary_step];
+        let boundary_state = match (
+            low_res_plan.estimate_source,
+            state.previous_denoised().cloned(),
+        ) {
+            (gen_core::EstimateSource::PreviousEvaluation, Some(prev_x0)) => {
+                gen_core::BoundaryState::CleanEstimate {
+                    latent: prev_x0,
+                    source: gen_core::EstimateSource::PreviousEvaluation,
+                }
+            }
+            _ => {
+                let x0_low = gen_core::sampling::denoise(ops, ms, x_sigma_k, sigma_k, |x_in, t| {
+                    (velocity_cell.borrow_mut())(
+                        x_in,
+                        boundary_step,
+                        t,
+                        guidance,
+                        low_res_plan.low_width,
+                        low_res_plan.low_height,
+                    )
+                    .map_err(gen_core::Error::from)
+                })
+                .map_err(CandleError::from)?;
+                gen_core::BoundaryState::CleanEstimate {
+                    latent: x0_low,
+                    source: gen_core::EstimateSource::EndpointEvaluation,
+                }
+            }
+        };
+        let transitioned = transition_candle_flux_boundary_state(
+            boundary_state,
+            &low_res_plan,
+            sigma_k,
+            ms,
+            base_seed,
+            output_index,
+            pass_index,
+            phase,
+            &device,
+            dtype,
+        )?;
+        state.note_geometry_change(
+            (low_res_plan.low_width, low_res_plan.low_height),
+            (low_res_plan.full_width, low_res_plan.full_height),
+        );
+        state.note_renoise_transition();
+        state
+            .apply_phase_boundary(gen_core::sampling::PhaseBoundary::Reset, true)
+            .map_err(CandleError::from)?;
+        current_dims.set((low_res_plan.full_width, low_res_plan.full_height));
+        Ok(transitioned)
+    };
+
+    candle_gen::run_flow_sampler_with_phase_transition_spans(
+        Some(sampler_name),
+        TimestepConvention::Sigma,
+        denoise_sigmas,
+        &denoise_spans,
+        Some(run),
+        false,
+        latents,
+        seed,
+        &req.cancel,
+        on_progress,
+        None,
+        |x_in, timestep| {
+            let current_eval = eval_idx;
+            eval_idx += 1;
+            let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                canonical_solver,
+                current_eval,
+                total_steps,
+            );
+            let (pw, ph) = current_dims.get();
+            (velocity_cell.borrow_mut())(x_in, step_idx, timestep, guidance, pw, ph)
+        },
+        Some(&mut transition_cb),
+    )
 }
 
 #[cfg(test)]

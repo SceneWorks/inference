@@ -388,6 +388,14 @@ pub struct GenerationRequest {
     /// Qwen-Image 2.1 transparency is prompt-driven (upstream ships no flag); this field only
     /// decides whether the decoder's alpha reaches the caller or is composited over white first.
     pub output_channels: OutputChannels,
+
+    // --- Two-phase low-resolution start recipe (SW-6939: FEAT-1, PIPE-2) ---
+    /// Optional pass-0 two-phase low-resolution start specification (`low_res_start`).
+    /// `None` leaves the inactive hook completely absent and byte-identical.
+    pub low_res_start: Option<crate::LowResStartSpec>,
+    /// Optional ordinary single-source img2img input image (`§6.13`, `FEAT-1`), distinct from
+    /// pass-0 edit, reference/identity, and control conditioning.
+    pub source_image: Option<Image>,
 }
 
 impl Default for GenerationRequest {
@@ -459,6 +467,8 @@ impl Default for GenerationRequest {
             // RGB. Like `hdr`, a default that must never drift: an unasked-for alpha channel
             // reaching a consumer that indexes RGB triples is a corrupted image, not a bonus.
             output_channels: OutputChannels::Rgb,
+            low_res_start: None,
+            source_image: None,
         }
     }
 }
@@ -627,6 +637,10 @@ impl GenerationRequest {
             hdr: _,
             // An enum with two unit variants — no float to check (sc-24111).
             output_channels: _,
+            // Two-phase low-resolution start recipe: `scale` is checked below (SW-6939).
+            low_res_start,
+            // Ordinary single-source img2img pixel buffer: integer dims + u8 pixels, no floats.
+            source_image: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -659,6 +673,17 @@ impl GenerationRequest {
         }
         if let Some(nonfinite) = pag.as_ref().and_then(|v| v.first_nonfinite_float()) {
             return Some(nonfinite);
+        }
+        if let Some(crate::LowResStartSpec {
+            version: _,
+            k: _,
+            scale: Some(scale),
+            estimate_source: _,
+        }) = low_res_start
+        {
+            if !scale.is_finite() {
+                return Some(("low_res_start.scale", *scale));
+            }
         }
         let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),

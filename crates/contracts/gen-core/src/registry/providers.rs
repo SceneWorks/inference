@@ -60,7 +60,9 @@ macro_rules! explicit_registry_kind {
 impl ProviderRegistry {
     /// Look up the pre-load [`crate::RenderPlanRegistration`] for `id`, when registered.
     pub fn render_plan_registration(&self, id: &str) -> Option<&crate::RenderPlanRegistration> {
-        self.render_plans.iter().find(|entry| entry.provider_id == id)
+        self.render_plans
+            .iter()
+            .find(|entry| entry.provider_id == id)
     }
 
     /// Every registered conditioned or platform-composed feature route in this catalog.

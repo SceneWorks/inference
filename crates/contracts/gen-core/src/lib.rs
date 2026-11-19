@@ -56,16 +56,22 @@ pub mod execution_domains;
 pub mod face;
 pub mod feature;
 pub use feature::{
-    dump_hook_map_json, hook_map, hook_map_for_registry, hook_point_metadata,
-    validate_low_res_start_request, ComposedDenoisePhase, ComposedPassPlan,
-    ComposedPhaseTransition, ComposedRenderPlan, FeatureApplicability, FeatureClass,
-    FeatureHookBinding, FeatureInapplicabilityCode, FeatureInapplicabilityReason,
+    apply_destination_noise_law_f32, bilinear_half_pixel_clamp_coord, dump_hook_map_json, gcd_u32,
+    hook_map, hook_map_for_registry, hook_point_metadata, lcm_u32, low_res_start_legal_quantum,
+    low_res_start_transition_noise_f32, low_res_start_transition_seed, repack_unpacked_latents_f32,
+    resize_bilinear_half_pixel_clamp_f32, resolve_img2img_init_time_step,
+    resolve_img2img_truncated_schedule, transition_packed_clean_estimate_f32,
+    transition_packed_clean_estimate_with_noise_f32, unpack_packed_latents_f32,
+    validate_low_res_start_request, BoundaryState, ComposedDenoisePhase, ComposedPassPlan,
+    ComposedPhaseTransition, ComposedRenderPlan, EstimateSource, FeatureApplicability,
+    FeatureClass, FeatureHookBinding, FeatureInapplicabilityCode, FeatureInapplicabilityReason,
     FeatureInvocation, FeatureMemoryEffect, FeatureParameterDomain, FeatureParameterSchema,
     FeatureParameterSpec, FeatureParameters, FeatureRegistry, FeatureRelations,
-    FeatureRouteStructure, FeatureSpec, HiresFixFeature, HookPoint, HookPointMetadata,
-    HookTiming, InertPhaseSplitFeature, KreaMultiphaseFeature, LowResStartFeature, PagFeature,
-    Pass0ConditioningRequirement, PhaseTransitionAction, TrajectoryObserverFeature,
-    TransitionResidency, WanExpertSwitchFeature,
+    FeatureRouteStructure, FeatureSpec, HiresFixFeature, HookPoint, HookPointMetadata, HookTiming,
+    InertPhaseSplitFeature, KreaMultiphaseFeature, LowResStartFeature, LowResStartSpec, PagFeature,
+    Pass0ConditioningRequirement, PhaseTransitionAction, ResolvedLowResStartPlan,
+    TrajectoryObserverFeature, TransitionResidency, WanExpertSwitchFeature,
+    LOW_RES_START_TRANSITION_DOMAIN,
 };
 pub mod flux3;
 pub mod generator;

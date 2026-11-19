@@ -35,8 +35,9 @@ pub use loader::{
     load_t5_tokenizer, load_transformer, load_vae, load_vae_from_weights,
 };
 pub use model::{
-    descriptor_dev, descriptor_for, descriptor_schnell, load_dev, load_schnell, Flux1,
-    SIZE_MULTIPLE,
+    compile_trajectory_for, descriptor_dev, descriptor_for, descriptor_schnell,
+    execute_flux_denoise_trajectory, load_dev, load_schnell, transition_mlx_flux_boundary_state,
+    Flux1, SIZE_MULTIPLE,
 };
 pub use model_control::{descriptor_dev_control, load_dev_control, Flux1DevControl};
 pub use pipeline::{
@@ -217,8 +218,7 @@ mod explicit_registry_tests {
         assert!(control_app
             .reasons
             .iter()
-            .any(|r| r.code
-                == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
 
         for ip_route in ["flux1_dev_ip_adapter", "flux1_schnell_ip_adapter"] {
             let ip_app = &all[ip_route]["low_res_start"];
@@ -271,8 +271,9 @@ mod explicit_registry_tests {
                 Err(Error::Unsupported(_))
             ));
         }
-        let control_spec = base_spec
-            .with_control(WeightsSource::File("/nonexistent/control.safetensors".into()));
+        let control_spec = base_spec.with_control(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ));
         let control_phased = GenerationRequest {
             conditioning: vec![Conditioning::Control {
                 image: img,

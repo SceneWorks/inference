@@ -1516,6 +1516,42 @@ impl Capabilities {
                 }
             }
         }
+        if let Some(spec) = &req.low_res_start {
+            spec.validate_parameters(id)?;
+            if req.phases.is_some() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: low_res_start conflicts with multi-phase denoise (phases)"
+                )));
+            }
+            if !req.conditioning.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: low_res_start conflicts with pass-0 edit/reference/control conditioning"
+                )));
+            }
+        }
+        if let Some(source) = &req.source_image {
+            let expected = u64::from(source.width)
+                .checked_mul(u64::from(source.height))
+                .and_then(|p| p.checked_mul(3))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!("{id}: source_image geometry overflows"))
+                })?;
+            if source.width == 0 || source.height == 0 || source.pixels.len() as u64 != expected {
+                return Err(Error::Unsupported(format!(
+                    "{id}: source_image buffer len {} does not match {}x{}x3",
+                    source.pixels.len(),
+                    source.width,
+                    source.height
+                )));
+            }
+            if let Some(s) = req.strength {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: img2img strength {s} must lie in 0.0..=1.0"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }

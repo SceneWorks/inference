@@ -54,7 +54,16 @@ impl MultiPassRenderPlan {
         let mut compiled = Vec::with_capacity(passes.len());
         for (index, pass) in passes.iter().enumerate() {
             let plan = match pass.produced_reference {
-                None => compile(pass.request)?,
+                None => {
+                    if index > 0 && pass.request.low_res_start.is_some() {
+                        let mut stripped = pass.request.clone();
+                        stripped.low_res_start = None;
+                        stripped.source_image = None;
+                        compile(&stripped)?
+                    } else {
+                        compile(pass.request)?
+                    }
+                }
                 Some(produced) => {
                     if produced.from_pass >= index {
                         return Err(Error::Unsupported(format!(
@@ -147,6 +156,9 @@ fn with_placeholder_reference(
         )));
     }
     let mut request = request.clone();
+    // Target pass for low_res_start is the first denoising pass (pass 0) only (FEAT-1, PIPE-2).
+    request.low_res_start = None;
+    request.source_image = None;
     request.conditioning = vec![Conditioning::Reference {
         image: Image {
             width: produced.width,

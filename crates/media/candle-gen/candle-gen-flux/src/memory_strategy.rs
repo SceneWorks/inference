@@ -727,6 +727,31 @@ impl FluxMemoryScope {
             )))
         }
     }
+
+    fn validate_render_phase_geometry(
+        &self,
+        phase: MemoryPhase,
+        geometry: MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        if phase == MemoryPhase::Denoise {
+            if geometry.width > 0
+                && geometry.width <= self.geometry.width
+                && geometry.height > 0
+                && geometry.height <= self.geometry.height
+                && geometry.frames == self.geometry.frames
+                && geometry.reference_count == self.geometry.reference_count
+                && geometry.batch > 0
+                && geometry.batch <= self.geometry.batch
+            {
+                return Ok(());
+            }
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: denoise phase geometry does not fit admitted request geometry",
+                self.provider_id
+            )));
+        }
+        self.validate_geometry(geometry)
+    }
 }
 
 impl MemoryRequestScope for FluxMemoryScope {
@@ -756,7 +781,7 @@ impl MemoryRequestScope for FluxMemoryScope {
         phase: MemoryPhase,
         identity: &gen_core::render::RenderPhaseIdentity,
     ) -> gen_core::Result<()> {
-        self.validate_geometry(identity.geometry)?;
+        self.validate_render_phase_geometry(phase, identity.geometry)?;
         self.enter_phase(phase)
     }
 

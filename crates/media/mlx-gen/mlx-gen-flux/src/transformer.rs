@@ -1447,8 +1447,8 @@ pub(crate) struct FluxRope {
 }
 
 pub(crate) struct RopeTable {
-    cos: Array,
-    sin: Array,
+    pub(crate) cos: Array,
+    pub(crate) sin: Array,
 }
 
 impl FluxRope {

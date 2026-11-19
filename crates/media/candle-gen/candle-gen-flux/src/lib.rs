@@ -106,7 +106,8 @@ pub use ip_dit::{Config as FluxConfig, DitImageInjector, IpFlux};
 // tokenization / VAE decode / config (the candle twin of `mlx-gen-flux`'s shared `Flux1` surface). The
 // IP-Adapter provider reaches these as `pub(crate)`; PuLID is a separate crate, hence `pub`.
 pub use pipeline::{
-    ae_config, clip_config, decode_latents, encode_text, flux_config, FluxTokenizers,
+    ae_config, clip_config, decode_latents, encode_text, execute_candle_flux_denoise_trajectory,
+    flux_config, transition_candle_flux_boundary_state, FluxTokenizers,
 };
 
 /// Combine unperturbed (`out`) and attention-perturbed (`pert`) FLUX velocity predictions in f32:
@@ -478,6 +479,18 @@ fn validate_base_request(variant: Variant, req: &GenerationRequest) -> gen_core:
             "{}: optimized native-VAE memory strategies do not support PiD decode",
             variant.model_id()
         )));
+    }
+    if req.low_res_start.is_some() || req.source_image.is_some() {
+        let sigmas = pipeline::base_schedule(variant, req)?;
+        let executed_steps = sigmas.len().saturating_sub(1);
+        if let Some(spec) = &req.low_res_start {
+            spec.resolve_for_descriptor(
+                &descriptor_for(variant),
+                req,
+                executed_steps,
+                SIZE_MULTIPLE,
+            )?;
+        }
     }
     Ok(())
 }
@@ -958,7 +971,10 @@ mod tests {
             [("flux1_schnell", 4u32, 3u64), ("flux1_dev", 25u32, 24u64)]
         {
             let app = &all_features[route_id]["low_res_start"];
-            assert!(app.applicable, "candle {route_id} must support low_res_start");
+            assert!(
+                app.applicable,
+                "candle {route_id} must support low_res_start"
+            );
             let json = app.to_json();
             assert_eq!(json["class"], "recipe");
             assert_eq!(json["version"], 1);
@@ -980,12 +996,12 @@ mod tests {
             "flux1_dev_pulid",
         ] {
             let app = &all_features[ref_route]["low_res_start"];
-            assert!(!app.applicable, "candle {ref_route} must refuse low_res_start");
-            assert!(app
-                .reasons
-                .iter()
-                .any(|r| r.code
-                    == gen_core::FeatureInapplicabilityCode::ConflictsWithPass0ReferenceConditioning));
+            assert!(
+                !app.applicable,
+                "candle {ref_route} must refuse low_res_start"
+            );
+            assert!(app.reasons.iter().any(|r| r.code
+                == gen_core::FeatureInapplicabilityCode::ConflictsWithPass0ReferenceConditioning));
         }
 
         // Unsupported `phases` on every migrated Candle FLUX.1 route returns a typed Error::Unsupported.
@@ -1615,5 +1631,362 @@ mod execution_policy_tests {
             descriptor_for(Variant::Dev).id
         );
         assert_ne!(report(Variant::Dev, None), report(Variant::Schnell, None));
+    }
+
+    #[test]
+    fn sw6939_candle_flux_inactive_hook_is_byte_identical_and_two_phase_low_res_executes_conformance(
+    ) {
+        use candle_core::{DType, Device, Tensor};
+        use candle_transformers::models::flux::sampling::State;
+        use gen_core::render::RenderPhaseIdentity;
+        use gen_core::sampling::{FlowModelSampling, TimestepConvention};
+        use gen_core::{
+            BoundaryState, Image, LowResStartSpec, MemoryGeometry, MemoryPhase, MemoryRequestScope,
+            MemoryRunOutcome, RenderRun,
+        };
+        use std::cell::RefCell;
+
+        let dev = Device::Cpu;
+        let base_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 512,
+            height: 512,
+            count: 1,
+            steps: Some(4),
+            seed: Some(42),
+            sampler: Some("dpmpp_2m".into()),
+            ..Default::default()
+        };
+        let active_req = GenerationRequest {
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..base_req.clone()
+        };
+
+        // 1. Schedule & flow_mu invariance across both Variant::Dev and Variant::Schnell.
+        for variant in [Variant::Dev, Variant::Schnell] {
+            let plan_off = compile_base_plan(variant, &base_req).unwrap();
+            let plan_on = compile_base_plan(variant, &active_req).unwrap();
+            assert_eq!(
+                plan_off.denoise_sigmas(),
+                plan_on.denoise_sigmas(),
+                "{variant:?}: full-pass sigma schedule and mu must stay invariant under low_res_start"
+            );
+            assert_eq!(plan_off.denoise_spans(), vec![0..4]);
+            assert_eq!(plan_on.denoise_spans(), vec![0..2, 2..4]);
+            assert_eq!(plan_on.phase_output_size(0), (256, 256));
+            assert_eq!(plan_on.phase_output_size(1), (512, 512));
+        }
+
+        // 2. Ordinary single-source img2img strength truncation resolves M = executed_steps before checking K.
+        let src_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        let img2img_ok = GenerationRequest {
+            steps: Some(10),
+            strength: Some(0.6),
+            source_image: Some(src_img),
+            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            ..base_req.clone()
+        };
+        let img2img_plan = compile_base_plan(Variant::Dev, &img2img_ok).unwrap();
+        assert_eq!(img2img_plan.executed_steps(), 4);
+        assert_eq!(img2img_plan.denoise_spans(), vec![0..3, 3..4]);
+
+        let img2img_bad_k = GenerationRequest {
+            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            ..img2img_ok
+        };
+        assert!(validate_base_request(Variant::Dev, &img2img_bad_k).is_err());
+
+        // 3. BoundaryState::XSigma is refused by transition_candle_flux_boundary_state (cannot double-noise).
+        let plan_on = compile_base_plan(Variant::Dev, &active_req).unwrap();
+        let low_res_plan = *plan_on.low_res_start().unwrap();
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let dummy_low = Tensor::zeros((1, 256, 64), DType::F32, &dev).unwrap();
+        assert!(transition_candle_flux_boundary_state(
+            BoundaryState::XSigma(dummy_low),
+            &low_res_plan,
+            plan_on.denoise_sigmas()[2],
+            &ms,
+            42,
+            0,
+            0,
+            0,
+            &dev,
+            DType::F32,
+        )
+        .is_err());
+
+        // 4. Inactive hook byte-identity: execute_candle_flux_denoise_trajectory with low_res_start: None
+        // produces byte-identical latents, evaluation trace, and progress to run_flow_sampler_spans.
+        let plan_off = compile_base_plan(Variant::Dev, &base_req).unwrap();
+        let noise_full = flux1_load::seeded_noise(42, 16, 64, 64, &dev, DType::F32).unwrap();
+        let t5_dummy = Tensor::zeros((1, 16, 4096), DType::F32, &dev).unwrap();
+        let clip_dummy = Tensor::zeros((1, 768), DType::F32, &dev).unwrap();
+        let state_full = State::new(&t5_dummy, &clip_dummy, &noise_full).unwrap();
+
+        let trace_off = RefCell::new(Vec::<(usize, u32, u32, usize, u32)>::new());
+        let mut progress_off = Vec::new();
+        let run_off = RenderRun::new(&plan_off, &base_req.cancel, None);
+        run_off.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+        let out_off = run_off
+            .images_with_denoise_phases(
+                &mut |p| progress_off.push(p),
+                |_| Ok::<_, candle_gen::CandleError>(state_full.img.clone()),
+                |seed, lat, prog| {
+                    execute_candle_flux_denoise_trajectory(
+                        &run_off,
+                        &base_req,
+                        seed,
+                        lat,
+                        prog,
+                        |x_in, step_idx, timestep, _guidance, pw, ph| {
+                            trace_off.borrow_mut().push((
+                                step_idx,
+                                pw,
+                                ph,
+                                x_in.dim(1)?,
+                                timestep.to_bits(),
+                            ));
+                            Ok((x_in * 0.15)?)
+                        },
+                    )
+                },
+                |_, lat, _| Ok(lat),
+            )
+            .unwrap()
+            .remove(0);
+
+        let trace_ref = RefCell::new(Vec::<(usize, u32, u32, usize, u32)>::new());
+        let mut progress_ref = Vec::new();
+        let run_ref = RenderRun::new(&plan_off, &base_req.cancel, None);
+        run_ref.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+        let out_ref = run_ref
+            .images_with_denoise_phases(
+                &mut |p| progress_ref.push(p),
+                |_| Ok::<_, candle_gen::CandleError>(state_full.img.clone()),
+                |seed, lat, prog| {
+                    let mut eval_idx = 0usize;
+                    candle_gen::run_flow_sampler_spans(
+                        Some(plan_off.sampler()),
+                        TimestepConvention::Sigma,
+                        plan_off.denoise_sigmas(),
+                        &plan_off.denoise_spans(),
+                        Some(&run_ref),
+                        false,
+                        lat,
+                        seed,
+                        &base_req.cancel,
+                        prog,
+                        None,
+                        |x_in, timestep| {
+                            let step_idx = eval_idx;
+                            eval_idx += 1;
+                            trace_ref.borrow_mut().push((
+                                step_idx,
+                                512,
+                                512,
+                                x_in.dim(1)?,
+                                timestep.to_bits(),
+                            ));
+                            Ok((x_in * 0.15)?)
+                        },
+                    )
+                },
+                |_, lat, _| Ok(lat),
+            )
+            .unwrap()
+            .remove(0);
+
+        let vec_off: Vec<f32> = out_off.flatten_all().unwrap().to_vec1().unwrap();
+        let vec_ref: Vec<f32> = out_ref.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(vec_off, vec_ref);
+        assert_eq!(*trace_off.borrow(), *trace_ref.borrow());
+        assert_eq!(progress_off, progress_ref);
+
+        // 5. Active two-phase execution with FluxMemoryScope:
+        // Phase 0 (steps 0..2) runs at 256x256 (256 tokens), boundary K=2 performs read-only endpoint
+        // evaluation at 256x256, transitions in fp32 to 512x512 (1024 tokens), resets Dpmpp2m history,
+        // and Phase 1 (steps 2..4) runs at 512x512 (1024 tokens).
+        struct RecordingFluxScope {
+            inner: memory_strategy::FluxMemoryScope,
+            phase_identities: Vec<(MemoryPhase, RenderPhaseIdentity)>,
+        }
+        impl MemoryRequestScope for RecordingFluxScope {
+            fn configure_request(&mut self, req: &mut GenerationRequest) -> gen_core::Result<()> {
+                self.inner.configure_request(req)
+            }
+            fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.inner.enter_phase(phase)
+            }
+            fn enter_render_phase(
+                &mut self,
+                phase: MemoryPhase,
+                identity: &RenderPhaseIdentity,
+            ) -> gen_core::Result<()> {
+                self.inner.enter_render_phase(phase, identity)?;
+                self.phase_identities.push((phase, *identity));
+                Ok(())
+            }
+            fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.inner.leave_phase(phase)
+            }
+            fn configure_decode(
+                &mut self,
+                tile_edge: u32,
+                overlap: u32,
+                geometry: MemoryGeometry,
+            ) -> gen_core::Result<()> {
+                self.inner.configure_decode(tile_edge, overlap, geometry)
+            }
+            fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+                self.inner.configure_attention(chunk_size)
+            }
+            fn materialize_transformer_window(
+                &mut self,
+                first_block: u32,
+                block_count: u32,
+            ) -> gen_core::Result<()> {
+                self.inner
+                    .materialize_transformer_window(first_block, block_count)
+            }
+            fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
+                self.inner.finish(outcome)
+            }
+        }
+
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ))
+        .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        let contract = memory_strategy::provider_contract(FLUX1_DEV_ID, &spec).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::Resident,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        context.geometry.width = 512;
+        context.geometry.height = 512;
+        let mut scope = RecordingFluxScope {
+            inner: memory_strategy::FluxMemoryScope::new(
+                FLUX1_DEV_ID,
+                dev.clone(),
+                &contract,
+                &context,
+            ),
+            phase_identities: Vec::new(),
+        };
+
+        let noise_low = flux1_load::seeded_noise(42, 16, 32, 32, &dev, DType::F32).unwrap();
+        let state_low = State::new(&t5_dummy, &clip_dummy, &noise_low).unwrap();
+        assert_eq!(state_low.img.dims(), &[1, 256, 64]);
+        assert_eq!(state_low.img_ids.dims(), &[1, 256, 3]);
+        assert_eq!(state_full.img_ids.dims(), &[1, 1024, 3]);
+
+        let trace_on = RefCell::new(Vec::<(usize, u32, u32, usize)>::new());
+        let mut progress_on = Vec::new();
+        let run_on = RenderRun::new(&plan_on, &active_req.cancel, Some(&mut scope));
+        run_on.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+        let out_on = run_on
+            .images_with_denoise_phases(
+                &mut |p| progress_on.push(p),
+                |_| Ok::<_, candle_gen::CandleError>(state_low.img.clone()),
+                |seed, lat, prog| {
+                    execute_candle_flux_denoise_trajectory(
+                        &run_on,
+                        &active_req,
+                        seed,
+                        lat,
+                        prog,
+                        |x_in, step_idx, _timestep, _guidance, pw, ph| {
+                            // Verify per-phase State/img_ids derivation matches the phase geometry and token count.
+                            let lat_h = (ph as usize).div_ceil(16) * 2;
+                            let lat_w = (pw as usize).div_ceil(16) * 2;
+                            let dummy = Tensor::zeros((1, 16, lat_h, lat_w), DType::F32, &dev)?;
+                            let phase_state = State::new(&t5_dummy, &clip_dummy, &dummy)?;
+                            let expected_tokens = ((ph / 16) * (pw / 16)) as usize;
+                            assert_eq!(x_in.dim(1)?, expected_tokens);
+                            assert_eq!(phase_state.img_ids.dims(), &[1, expected_tokens, 3]);
+                            trace_on.borrow_mut().push((step_idx, pw, ph, x_in.dim(1)?));
+                            Ok((x_in * 0.15)?)
+                        },
+                    )
+                },
+                |_, lat, _| Ok(lat),
+            )
+            .unwrap()
+            .remove(0);
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+
+        assert_eq!(out_on.dims(), &[1, 1024, 64]);
+        assert_eq!(
+            progress_on,
+            vec![
+                Progress::Step {
+                    current: 1,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 2,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 3,
+                    total: 4
+                },
+                Progress::Step {
+                    current: 4,
+                    total: 4
+                },
+            ]
+        );
+        assert_eq!(
+            *trace_on.borrow(),
+            vec![
+                (0, 256, 256, 256),
+                (1, 256, 256, 256),
+                (2, 256, 256, 256),
+                (2, 512, 512, 1024),
+                (3, 512, 512, 1024),
+            ]
+        );
+        let denoise_identities: Vec<RenderPhaseIdentity> = scope
+            .phase_identities
+            .iter()
+            .filter_map(|(phase, id)| (*phase == MemoryPhase::Denoise).then_some(*id))
+            .collect();
+        assert_eq!(denoise_identities.len(), 2);
+        assert_eq!(
+            (
+                denoise_identities[0].pass,
+                denoise_identities[0].phase,
+                denoise_identities[0].geometry.width,
+                denoise_identities[0].geometry.height
+            ),
+            (0, 0, 256, 256)
+        );
+        assert_eq!(
+            (
+                denoise_identities[1].pass,
+                denoise_identities[1].phase,
+                denoise_identities[1].geometry.width,
+                denoise_identities[1].geometry.height
+            ),
+            (0, 1, 512, 512)
+        );
     }
 }

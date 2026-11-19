@@ -20,6 +20,16 @@ use std::ops::Range;
 pub type DenoiseFn<'a, L> =
     dyn FnMut(&<L as LatentOps>::Latent, f32) -> Result<<L as LatentOps>::Latent> + 'a;
 
+/// How a phase transition handles multistep solver history (`PIPE-3`, `PIPE-5`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseBoundary {
+    /// Continue the same trajectory in the same geometry without re-noising.
+    Carry,
+    /// Clear solver history after a geometry change or re-noise while preserving absolute
+    /// schedule and stochastic draw coordinates.
+    Reset,
+}
+
 /// Numerical history for one request trajectory. The full pass schedule and the next absolute
 /// step are retained across inert phase boundaries; resetting history leaves the step position
 /// (and therefore stochastic draw addresses) unchanged.
@@ -36,6 +46,7 @@ pub struct SolverRunState<L: LatentOps> {
     seed: Option<u64>,
     sampling: Option<SamplingIdentity>,
     variant: Option<[u32; 3]>,
+    pending_reset_reason: Option<&'static str>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -83,6 +94,7 @@ impl<L: LatentOps> SolverRunState<L> {
             seed: None,
             sampling: None,
             variant: None,
+            pending_reset_reason: None,
         }
     }
 
@@ -96,6 +108,60 @@ impl<L: LatentOps> SolverRunState<L> {
         self.next_step
     }
 
+    /// Whether any multistep solver history is currently retained.
+    pub fn has_history(&self) -> bool {
+        self.previous_denoised.is_some()
+            || self.previous_derivative.is_some()
+            || self.previous_sample.is_some()
+            || self.previous_interval.is_some()
+            || self.history_steps > 0
+    }
+
+    /// Borrow the previous step's denoised (`x0`) estimate when retained by a multistep solver.
+    pub fn previous_denoised(&self) -> Option<&L::Latent> {
+        self.previous_denoised.as_ref()
+    }
+
+    /// Record that a phase boundary changed the latent spatial geometry (`(from_w, from_h) -> (to_w, to_h)`).
+    /// Continuing with `Carry` without calling [`Self::reset_history`] will refuse with a typed error.
+    pub fn note_geometry_change(&mut self, from: (u32, u32), to: (u32, u32)) {
+        if from != to {
+            self.pending_reset_reason = Some("geometry change");
+        }
+    }
+
+    /// Record that a phase boundary re-noised the latent at the transition node.
+    /// Continuing with `Carry` without calling [`Self::reset_history`] will refuse with a typed error.
+    pub fn note_renoise_transition(&mut self) {
+        self.pending_reset_reason = Some("re-noise transition");
+    }
+
+    /// Apply a [`PhaseBoundary`] policy across a phase transition, refusing `PhaseBoundary::Carry`
+    /// when a geometry change or re-noise occurred (`PIPE-3`, `PIPE-5`).
+    pub fn apply_phase_boundary(
+        &mut self,
+        boundary: PhaseBoundary,
+        geometry_changed_or_renoised: bool,
+    ) -> Result<()> {
+        if geometry_changed_or_renoised && self.pending_reset_reason.is_none() {
+            self.pending_reset_reason = Some("geometry change or re-noise");
+        }
+        match boundary {
+            PhaseBoundary::Carry => {
+                if let Some(reason) = self.pending_reset_reason {
+                    return Err(Error::Unsupported(format!(
+                        "solver Carry across a {reason} boundary is incompatible; must reset solver history"
+                    )));
+                }
+                Ok(())
+            }
+            PhaseBoundary::Reset => {
+                self.reset_history();
+                Ok(())
+            }
+        }
+    }
+
     /// A geometry change, re-noise or explicit Reset clears solver history without rewinding the
     /// pass's RNG coordinates. The caller owns separate guidance and driver-cache invalidation.
     pub fn reset_history(&mut self) {
@@ -104,6 +170,7 @@ impl<L: LatentOps> SolverRunState<L> {
         self.previous_sample = None;
         self.previous_interval = None;
         self.history_steps = 0;
+        self.pending_reset_reason = None;
     }
 
     /// Select a different solver only at an explicit Reset boundary. The pass step and bound seed
@@ -135,6 +202,11 @@ impl<L: LatentOps> SolverRunState<L> {
         variant: [u32; 3],
         span: &Range<usize>,
     ) -> Result<()> {
+        if let Some(reason) = self.pending_reset_reason {
+            return Err(Error::Unsupported(format!(
+                "solver Carry across a {reason} boundary is incompatible; call reset_history() before the next span"
+            )));
+        }
         if self.cfg_pp
             || self.solver != solver
             || self.sigmas != sigmas
@@ -170,6 +242,11 @@ impl<L: LatentOps> SolverRunState<L> {
         sigmas: &[f32],
         span: &Range<usize>,
     ) -> Result<()> {
+        if let Some(reason) = self.pending_reset_reason {
+            return Err(Error::Unsupported(format!(
+                "CFG++ Carry across a {reason} boundary is incompatible; call reset_history() before the next span"
+            )));
+        }
         if !self.cfg_pp
             || (self.solver != solver
                 && !(solver == super::Solver::Euler && self.solver == super::Solver::Ddim))

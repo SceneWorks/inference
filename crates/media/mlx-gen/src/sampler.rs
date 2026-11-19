@@ -579,6 +579,18 @@ pub fn run_curated_sampler_with_latent_hook(
     )
 }
 
+/// Phase-transition callback invoked between consecutive denoise spans (`phase` -> `phase + 1`)
+/// at boundary step `boundary_step = span.end` (`SW-6939`: `PIPE-3`, `PIPE-4`, `PIPE-5`, `HOOK-5`).
+pub type MlxPhaseTransitionFn<'a> = dyn FnMut(
+        usize,
+        usize,
+        &MlxLatentOps,
+        &dyn gen_core::sampling::ModelSampling,
+        &Array,
+        &mut gen_core::sampling::SolverRunState<MlxLatentOps>,
+    ) -> Result<Array>
+    + 'a;
+
 /// One request trajectory over precompiled inert phase spans. All spans use the same callback,
 /// progress/preview observers and request-owned solver state.
 pub fn run_curated_sampler_with_latent_hook_spans(
@@ -587,8 +599,36 @@ pub fn run_curated_sampler_with_latent_hook_spans(
     latents: Array,
     spans: &[std::ops::Range<usize>],
     phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    on_latent: impl FnMut(&Array, f32),
+    predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    run_curated_sampler_with_phase_transition_spans(
+        run,
+        ms,
+        latents,
+        spans,
+        phase_scope,
+        on_latent,
+        predict,
+        None,
+    )
+}
+
+/// Unified multi-phase curated sampler driver with an optional phase-transition callback (`SW-6939`).
+///
+/// Both inactive (`on_phase_boundary = None`, single span `0..M`) and active (`on_phase_boundary = Some(..)`,
+/// two spans `0..K` and `K..M`) execute this exact implementation so inactive hooks are byte-identical
+/// with zero per-step overhead (`HOOK-5`, `E2`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_curated_sampler_with_phase_transition_spans(
+    run: SamplerRun<'_>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    latents: Array,
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
     mut on_latent: impl FnMut(&Array, f32),
     mut predict: impl FnMut(&Array, f32) -> Result<Array>,
+    mut on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>>,
 ) -> Result<Array> {
     use gen_core::sampling::{denoise as gc_denoise, Sampler, Solver, SolverRunState};
 
@@ -678,6 +718,11 @@ pub fn run_curated_sampler_with_latent_hook_spans(
             .map_err(crate::Error::from)?;
         if let Some(run) = phase_scope {
             evaluate_and_end_denoise_phase(run, phase, &out, |out| step_eval(&[out]))?;
+        }
+        if phase + 1 < spans.len() {
+            if let Some(transition) = on_phase_boundary.as_deref_mut() {
+                out = transition(phase, span.end, &ops, ms, &out, &mut state)?;
+            }
         }
     }
     if state.next_step() != sigmas.len().saturating_sub(1) {
@@ -878,9 +923,32 @@ pub fn run_flow_sampler_with_latent_hook_spans(
     on_latent: impl FnMut(&Array, f32),
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
+    run_flow_sampler_with_phase_transition_spans(
+        run,
+        conv,
+        latents,
+        spans,
+        phase_scope,
+        on_latent,
+        predict,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler_with_phase_transition_spans(
+    run: SamplerRun<'_>,
+    conv: TimestepConvention,
+    latents: Array,
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    on_latent: impl FnMut(&Array, f32),
+    predict: impl FnMut(&Array, f32) -> Result<Array>,
+    on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>>,
+) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
     let (sampler, sigmas, seed, dtype) = (run.sampler_name, run.sigmas, run.seed, latents.dtype());
-    let output = run_curated_sampler_with_latent_hook_spans(
+    let output = run_curated_sampler_with_phase_transition_spans(
         run,
         &ms,
         latents,
@@ -888,6 +956,7 @@ pub fn run_flow_sampler_with_latent_hook_spans(
         phase_scope,
         on_latent,
         predict,
+        on_phase_boundary,
     )?;
     // The same successful-sampling observation as the unscoped wrapper: a planned render that
     // skipped it would report its device, solver, schedule and seed as unobserved.

@@ -342,6 +342,41 @@ impl MlxRequestScopeCore {
             self.config.geometry.reference_count
         )))
     }
+
+    fn validate_render_phase_geometry(
+        &self,
+        phase: MemoryPhase,
+        geometry: MemoryGeometry,
+    ) -> Result<()> {
+        if phase == MemoryPhase::Denoise {
+            if geometry.width > 0
+                && geometry.width <= self.config.geometry.width
+                && geometry.height > 0
+                && geometry.height <= self.config.geometry.height
+                && geometry.frames == self.config.geometry.frames
+                && geometry.reference_count == self.config.geometry.reference_count
+                && geometry.batch > 0
+                && geometry.batch <= self.config.geometry.batch
+            {
+                return Ok(());
+            }
+            return Err(Error::Unsupported(format!(
+                "{}: denoise phase geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
+                self.config.provider_id,
+                geometry.width,
+                geometry.height,
+                geometry.batch,
+                geometry.frames,
+                geometry.reference_count,
+                self.config.geometry.width,
+                self.config.geometry.height,
+                self.config.geometry.batch,
+                self.config.geometry.frames,
+                self.config.geometry.reference_count
+            )));
+        }
+        self.validate_geometry(geometry)
+    }
 }
 
 impl MlxRequestScopeCore {
@@ -444,7 +479,7 @@ impl MemoryRequestScope for MlxRequestScopeCore {
         phase: MemoryPhase,
         identity: &gen_core::render::RenderPhaseIdentity,
     ) -> Result<()> {
-        self.validate_geometry(identity.geometry)?;
+        self.validate_render_phase_geometry(phase, identity.geometry)?;
         self.enter_phase(phase)
     }
 

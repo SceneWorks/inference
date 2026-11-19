@@ -231,7 +231,7 @@ fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<Var
 /// Resize `image` to `width`×`height` and convert to an NCHW `[1, 3, H, W]` tensor in `[-1, 1]` at
 /// `dtype` on `device` — the VAE-encode input for the control image (the same normalization the noise
 /// path uses for decode).
-fn preprocess_control(
+pub(crate) fn preprocess_control(
     image: &Image,
     width: u32,
     height: u32,
