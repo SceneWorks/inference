@@ -1,16 +1,21 @@
 python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-python3.12 - <<'PY'
+# Through the runner's Hugging Face hub cache (`cache_dir`, never a per-run directory), so a
+# complete snapshot transfers nothing on a rerun. The snapshot path comes back on stdout.
+CHROMA_SNAPSHOT="$(python3.12 - <<'PY'
 import os
-from huggingface_hub import snapshot_download
+import sys
+sys.path.insert(0, "scripts/release")
+from ensure_model_snapshot import download_to_runner_cache
 
-snapshot_download(
+print(download_to_runner_cache(
     repo_id=os.environ["CHROMA_REPOSITORY"],
     revision=os.environ["CHROMA_SOURCE_REVISION"],
     allow_patterns=["bf16/**", "q4/**", "q8/**"],
-    local_dir=os.environ["CHROMA_SNAPSHOT"],
     token=False,
-)
+))
 PY
+)"
+export CHROMA_SNAPSHOT
 mkdir -p "$CHROMA_PACKED"
 for bits in 4 8; do
   # `repack_auxiliaries` copies transformer/tokenizer/scheduler/top-level bytes verbatim and

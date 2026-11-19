@@ -40,13 +40,14 @@ done
 # SW-7093 -- MiniMax-H3-Image q8 / q4 DiT tiers on MLX: convert from the dense snapshot, audit the
 # artifact, and render 2048x2048 through the registered generator at each tier.
 #
-# Runs after the DiT parity and the bf16 render above, so the task-owned hub, the pinned
+# Runs after the DiT parity and the bf16 render above, so the image snapshot path, the pinned
 # huggingface-hub install, the image snapshot, the run-scoped CARGO_TARGET_DIR and the prebuilt libmlx
 # are all in place. The converted tiers go to the runner's own weights root (never to Hugging Face:
 # publication is a separate step) and are removed after each tier's render to bound the disk footprint.
 # The text encoder at each tier is MiniMax-H3's existing `SceneWorks/minimax-h3-mlx` artifact.
 lane_root="$HOME/sceneworks-rw-weights"
-export MINIMAX_H3_TIER_SNAPSHOT="$lane_root/hub/models--SceneWorks--minimax-h3-mlx/snapshots/137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+hub="$(python3.12 scripts/release/runner_hub_cache.py)"
+export MINIMAX_H3_TIER_SNAPSHOT="$hub/models--SceneWorks--minimax-h3-mlx/snapshots/137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
 export MINIMAX_H3_IMAGE_TIERS_ROOT="$lane_root/minimax-h3-image-tiers"
 for tier in q8 q4; do
   for attempt in 1 2 3; do
