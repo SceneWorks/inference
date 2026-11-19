@@ -332,9 +332,12 @@ pub fn estimate_training(
         };
         let live_blocks = if run.checkpointed { 1 } else { geometry.layers };
         // A packed projection's dequantized dense weight is an operand of its matmul, which
-        // autograd retains for the input gradient: one block's (streamed) or every block's.
+        // autograd retains for the input gradient: one block's (streamed) or every block's — plus
+        // every trained refiner block's, whose forward is retained whole all step (the packed
+        // tiers pack the refiner's attention and feed-forward too; its blocks have the DiT
+        // blocks' widths).
         let dequantized = if run.packed_base {
-            live_blocks * dense_block_elements(&geometry) * run.width
+            (live_blocks + run.refiner_layers) * dense_block_elements(&geometry) * run.width
         } else {
             0
         };
@@ -634,6 +637,19 @@ mod tests {
                 b.train.device - a.train.device,
                 shared + 2 * F32_ATTENTION_OPERANDS * rows * g.heads * g.head_dim * 4,
                 "checkpointed: {checkpointed}"
+            );
+            // On a packed tier the retained refiner forward also holds each trained refiner
+            // block's dequantized dense weights. Mutation: price only the DiT blocks' ⇒ red.
+            let packed = |r: &TrainingRunShape| TrainingRunShape {
+                packed_base: true,
+                ..r.clone()
+            };
+            let pa = estimate_training(&c, &f, t, &packed(&frozen)).unwrap();
+            let pb = estimate_training(&c, &f, t, &packed(&trained)).unwrap();
+            assert_eq!(
+                (pb.train.device - pa.train.device) - (b.train.device - a.train.device),
+                2 * dense_block_elements(&g) * frozen.width,
+                "packed, checkpointed: {checkpointed}"
             );
         }
     }
