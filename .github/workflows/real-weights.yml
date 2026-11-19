@@ -5554,12 +5554,14 @@ jobs:
 
   # SW-7200 (feature SW-F360 terminal campaign): the same campaign runner on MLX, epic rows only,
   # for the paired speculative-paths comparison. Dispatch-only on its own profile, on the primary
-  # Mac (`rw-starvector`, a loaned host): the runner starts no benchmark process once
+  # Mac (`rw-starvector` = nax-macos, the owner's dev Mac, used only on a loan) by default; the
+  # matrix may select nax-macos-2 instead (see `runs-on`). The runner starts no benchmark process once
   # DECODE_BENCH_BUDGET_MINUTES have passed since the build and never interrupts the running one
   # (signalling an MLX process mid-command-buffer can hang the GPU); `timeout-minutes` is only a
   # runaway guard. Every process runs under scripts/ci/mlx_tree_guard.py at its row's
   # `memory_cap_gib` (SIGTERM only). The build target is job-owned and persistent on
-  # /Volumes/Models, off the internal disk.
+  # /Volumes/Models on nax-macos (off the internal disk), or beside the
+  # workspace on nax-macos-2.
   mlx-decode-speedups-bench:
     needs: validate-selection
     defaults:
@@ -5567,10 +5569,11 @@ jobs:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 900 -- /bin/bash -e {0}
     name: Decode-speedups benchmark campaign (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench-mlx'
-    # The matrix's optional top-level `runner` ("rw-starvector" default, or "rw-llm") picks the host.
-    # nax-macos-2 (rw-llm) is the default home for MLX real-weight work; its hub cache starts
-    # empty, and the `hub:` pins are fetched by the existing staging step.
-    runs-on: [self-hosted, macOS, ARM64, "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner || 'rw-starvector' }}"]
+    # The default runner is rw-starvector (nax-macos, the owner's dev Mac, used only on a loan).
+    # Set "runner":"rw-llm" in the matrix for nax-macos-2, whose hub cache starts empty: only
+    # `hub:` pins are fetched there, so its rows must use `hub:` pins. Any other value runs on
+    # rw-starvector and the matrix validator refuses it once the job starts.
+    runs-on: [self-hosted, macOS, ARM64, "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' && 'rw-llm' || 'rw-starvector' }}"]
     timeout-minutes: 180
     env:
       DECODE_BENCH_MATRIX: ${{ inputs.decode_bench_matrix }}

@@ -263,6 +263,46 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(campaign.MatrixError, "rw-starvector.*rw-llm"):
             campaign.plan_matrix(json.dumps({"rows": [good], "runner": "rw-mage"}), SNAPSHOTS)
 
+    def test_the_plan_command_refuses_missing_runner_local_paths_but_not_hub_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "snap").mkdir()
+            (root / "head.safetensors").write_text("x", encoding="utf-8")
+            snap, head = str(root / "snap"), str(root / "head.safetensors")
+            missing = str(root / "absent")
+
+            def check(row, environ=None):
+                return campaign.plan_matrix(
+                    json.dumps({"rows": [{"id": "r", **row}]}),
+                    {**SNAPSHOTS, "DECODE_BENCH_SNAPSHOT_QWEN38": missing, **(environ or {})},
+                    "mlx",
+                    require_local=True,
+                )
+
+            check({"snapshot": snap, "runs": ["epic"], "draft": snap, "mtp_head": head})
+            for row, field in (
+                ({"snapshot": missing}, "snapshot"),
+                ({"snapshot": snap, "runs": ["epic"], "draft": missing}, "draft"),
+                ({"snapshot": snap, "runs": ["epic"], "mtp_head": missing}, "mtp_head"),
+                ({"snapshot": snap, "runs": ["epic"], "draft": head}, "draft"),
+                ({"snapshot": "qwen38"}, "snapshot"),  # the alias resolves to the absent $QWEN path
+            ):
+                with self.subTest(field=field, row=row):
+                    with self.assertRaisesRegex(campaign.MatrixError, rf"row r: {field} .*not an existing"):
+                        check(row)
+            hub = {"snapshot": "hub:org/name@" + "a" * 40}
+            planned = check(hub, {"MODEL_PROOF_HUB_ROOT": str(root / "hub")})
+            self.assertEqual(len(planned["hub_snapshots"]), 1)
+            # Without the check (the other tests, `local`) a missing path still plans.
+            plan({"rows": [{"id": "r", "snapshot": missing}]})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "plan.json"
+            matrix = '{"rows": [{"id": "r", "snapshot": "qwen38"}]}'
+            environ = {**SNAPSHOTS, "DECODE_BENCH_MATRIX": matrix}
+            with mock.patch.dict(os.environ, environ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(campaign.main(["plan", "--output", str(output)]), 1)
+            self.assertFalse(output.exists())
+
     def test_every_malformed_matrix_is_refused_before_anything_runs(self) -> None:
         good = {"id": "r", "snapshot": "qwen38"}
         cases = {
@@ -322,6 +362,7 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(campaign.main(["plan", "--output", str(output)]), 1)
             self.assertFalse(output.exists())
             environ["DECODE_BENCH_MATRIX"] = '{"rows": [{"id": "r", "snapshot": "qwen38"}]}'
+            environ["DECODE_BENCH_SNAPSHOT_QWEN38"] = directory
             with mock.patch.dict(os.environ, environ), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     campaign.main(["plan", "--lane", "cuda", "--output", str(output)]), 0

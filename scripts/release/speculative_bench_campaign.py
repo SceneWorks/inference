@@ -365,9 +365,21 @@ def _option(option: Any, what: str) -> None:
     bound(tree["max_rows"], "max_rows")
 
 
-def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
+def _require_local(path: str, tag: str, field: str, *, file_ok: bool = False) -> None:
+    """Refuse a runner-local path that does not exist here: ``run`` would otherwise fail after the
+    cold release build (``snapshot_identity``: "is not a directory")."""
+    if not (Path(path).is_dir() or (file_ok and Path(path).is_file())):
+        kind = "file or directory" if file_ok else "directory"
+        raise MatrixError(f"{tag}: {field} {path!r} is not an existing {kind} on this runner")
+
+
+def plan_row(
+    row: Any, environ: dict[str, str], lane: Lane, require_local: bool = False
+) -> dict[str, Any]:
     """One validated row: its id, runs, process repeats, switches, and the environment each
-    process gets."""
+    process gets. ``require_local`` (the ``plan`` command, which runs on the runner before the
+    build) also refuses a non-``hub:`` snapshot, draft or MTP head path that does not exist;
+    ``hub:`` pins are staged after the plan, so they are not checked."""
     if not isinstance(row, dict):
         raise MatrixError(f"a row must be an object, got {row!r}")
     unknown = set(row) - ROW_KEYS
@@ -384,6 +396,7 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
     if pinned:
         snapshot = pinned[0]
         pins.append(pinned[1])
+    check_snapshot = require_local and not pinned
     if snapshot in SNAPSHOT_ALIASES:
         variable = SNAPSHOT_ALIASES[snapshot]
         resolved = environ.get(variable, "").strip()
@@ -392,6 +405,8 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
         snapshot = resolved
     if not _absolute(snapshot):
         raise MatrixError(f"{tag}: snapshot must be an alias or an absolute path, got {snapshot!r}")
+    if check_snapshot:
+        _require_local(snapshot, tag, "snapshot")
     prepare = None
     without_mtp = row.get("without_mtp", False)
     if not isinstance(without_mtp, bool):
@@ -476,6 +491,8 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
                 pins.append(pinned[1])
             if not _absolute(path):
                 raise MatrixError(f"{tag}: {key} must be an absolute path, got {path!r}")
+            if require_local and not pinned:
+                _require_local(path, tag, key, file_ok=key == "mtp_head")
             knobs[variable] = path
             epic_only.append(key)
     if "prefix_cache_bytes" in row:
@@ -519,8 +536,11 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
     return planned
 
 
-def plan_matrix(text: str, environ: dict[str, str], lane: str = "cuda") -> dict[str, Any]:
-    """The validated plan of a matrix document for ``lane``."""
+def plan_matrix(
+    text: str, environ: dict[str, str], lane: str = "cuda", require_local: bool = False
+) -> dict[str, Any]:
+    """The validated plan of a matrix document for ``lane``; ``require_local`` is
+    :func:`plan_row`'s."""
     if lane not in LANES:
         raise MatrixError(f"lane must be one of {sorted(LANES)}, got {lane!r}")
     try:
@@ -534,7 +554,7 @@ def plan_matrix(text: str, environ: dict[str, str], lane: str = "cuda") -> dict[
     rows = matrix["rows"]
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ROWS:
         raise MatrixError(f"rows must be a list of 1..{MAX_ROWS} rows")
-    planned = [plan_row(row, environ, LANES[lane]) for row in rows]
+    planned = [plan_row(row, environ, LANES[lane], require_local) for row in rows]
     ids = [row["id"] for row in planned]
     duplicates = sorted({row_id for row_id in ids if ids.count(row_id) > 1})
     if duplicates:
@@ -1265,7 +1285,7 @@ def guard_prefix(text: str | None) -> list[str]:
 def command_plan(args: argparse.Namespace) -> int:
     text = os.environ.get(MATRIX_ENV, "")
     try:
-        plan = plan_matrix(text, dict(os.environ), args.lane)
+        plan = plan_matrix(text, dict(os.environ), args.lane, require_local=True)
     except MatrixError as error:
         print(f"::error::{MATRIX_ENV}: {error}", file=sys.stderr)
         return 1

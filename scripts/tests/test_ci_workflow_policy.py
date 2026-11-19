@@ -5632,7 +5632,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # The loaned primary Mac, by its unique label.
         if job["runs-on"] != [
             "self-hosted", "macOS", "ARM64",
-            "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner || 'rw-starvector' }}",
+            "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' && 'rw-llm' || 'rw-starvector' }}",
         ]:
             errors.append(f"wrong runner: {job['runs-on']!r}")
         shell = job.get("defaults", {}).get("run", {}).get("shell", "")
