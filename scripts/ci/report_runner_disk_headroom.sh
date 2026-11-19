@@ -53,6 +53,7 @@ echo "runner: ${RUNNER_NAME:-<unset>}  home: ${HOME:-<unset>}"
 # existing ancestor because an empty drive may not hold the directory yet.
 hub_cache="${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-${HF_HOME:+$HF_HOME/hub}}}"
 hub_cache="${hub_cache:-/Volumes/Models/huggingface/hub}"
+hub_cache="${hub_cache/#\~/${HOME:-}}"
 while [[ ! -e "$hub_cache" && "$hub_cache" != / ]]; do hub_cache="$(dirname "$hub_cache")"; done
 echo "hub cache volume: $hub_cache"
 df -h "${HOME:-/}" "${RUNNER_TEMP:-${HOME:-/}}" "$hub_cache" 2>/dev/null | awk 'NR == 1 || !seen[$0]++'
