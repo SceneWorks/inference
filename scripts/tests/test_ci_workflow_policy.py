@@ -5669,6 +5669,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 errors.append(f"the run step lacks {fragment!r}")
         if "--pre-epic-root" in run:
             errors.append("the MLX lane measures epic rows only")
+        # rust-lang/rust#157750: a stripped release build failed `castaway` with E0463.
+        for name in ("CARGO_PROFILE_RELEASE_STRIP", "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP"):
+            if f"export {name}=none" not in run.split("speculative_bench_campaign.py run ")[0]:
+                errors.append(f"the build does not export {name}=none before it runs")
         if not str(env.get("DECODE_BENCH_TARGET_DIR", "")).startswith("/Volumes/Models/"):
             errors.append("the build target is not job-owned on /Volumes/Models")
         upload = next((s for s in steps if s.get("name") == "Keep the decode-speedups benchmark documents"), {})
@@ -5708,6 +5712,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             lambda job: job["steps"][-1].pop("if"),
             lambda job: job["defaults"]["run"].update({"shell": "bash"}),
             lambda job: job["env"].update({"DECODE_BENCH_TARGET_DIR": "target"}),
+            lambda job: [
+                step.update({"run": step["run"].replace("export CARGO_PROFILE_RELEASE_STRIP=none", "")})
+                for step in job["steps"]
+                if step.get("name") == "Build and run every matrix row"
+            ],
             lambda job: job["steps"][2].update({"run": job["steps"][2]["run"] + ' && echo "${{ inputs.decode_bench_matrix }}"'}),
         ):
             mutated = copy.deepcopy(workflow)

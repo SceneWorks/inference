@@ -1,3 +1,8 @@
+# The release profile unstripped (rust-lang/rust#157750): Rust 1.96/LLVM 22 mis-strips macOS
+# proc-macro dylibs, and `castaway` then failed with E0463 on `rustversion`. The profile change
+# also rebuilds the stripped artifacts the persistent target already holds.
+export CARGO_PROFILE_RELEASE_STRIP=none
+export CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none
 # Report-only: the host the loan ran on and its memory before the first build.
 { sysctl -n machdep.cpu.brand_string; sysctl -n hw.memsize; sw_vers -productVersion; } > "$DECODE_BENCH_OUT/host.txt" || true
 # Every benchmark process runs under the external phys_footprint guard at its row's
