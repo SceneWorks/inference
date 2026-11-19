@@ -262,12 +262,6 @@ impl TextLlm for LlamaProvider {
             .into_iter()
             .chain(route_fallback)
             .collect();
-        // A block draft reads the target's tapped text rows; an image or video prompt decodes
-        // without it on Candle, by name (SW-F360).
-        if route.proposer() == ProposerKind::BlockDraft && (multimodal || gemma4_mm_request) {
-            route = self.decode_route(SpeculativePlan::Off).0;
-            fallbacks.push(super::BLOCK_DRAFT_MULTIMODAL.into());
-        }
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
         // will actually run (a proposer on the engine), at the advertised row bound — else
         // linear, by name. The multimodal paths prefill spliced embeddings and verify linearly
@@ -301,6 +295,7 @@ impl TextLlm for LlamaProvider {
                     tree_rows,
                     admitted_prompt,
                     req.max_new_tokens,
+                    self.tree_tap_width(route.proposer()),
                 )?)
             })
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
@@ -637,6 +632,8 @@ impl TextLlm for LlamaProvider {
                 };
                 let tapped = block.map(|b| TappedQwen35::for_draft(target, &b.model));
                 let mut block_proposer = block.map(|b| BlockDraftProposer::new(&b.model, target));
+                // A block draft over an image or video prompt (SW-7198) reads the target's own
+                // tapped rows at the visual positions, prefilled below.
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
@@ -669,16 +666,32 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
                         let positions = [t.as_slice(), h.as_slice(), w.as_slice()];
-                        let (logits, hidden) = target
-                            .prefill_from_embeds_deepstack_with_hidden(
+                        let (logits, hidden) = match &tapped {
+                            // The block draft's context reads the tapped rows of the fused
+                            // prompt, under the MTP prefill's M-RoPE positions and DeepStack
+                            // fusion; its own positions count the sequence (`rope_delta`).
+                            Some(tapped) => target.prefill_tapped_from_embeds_deepstack(
                                 &m.embeds,
                                 positions,
                                 &mut cache,
                                 &m.visual_pos_mask,
                                 &m.deepstack,
-                            )
-                            .map_err(to_core)?;
+                                &tapped.layers,
+                                tapped.keep,
+                            ),
+                            None => target.prefill_from_embeds_deepstack_with_hidden(
+                                &m.embeds,
+                                positions,
+                                &mut cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            ),
+                        }
+                        .map_err(to_core)?;
                         cache.set_rope_delta(*delta);
+                        if let Some(proposer) = block_proposer.as_mut() {
+                            proposer.set_rope_delta(*delta);
+                        }
                         if let Some(proposer) = mtp_proposer.as_mut() {
                             proposer
                                 .warm_multimodal(&m.embeds, &hidden, positions)
@@ -709,11 +722,12 @@ impl TextLlm for LlamaProvider {
                             SpeculativePrompt::Prefilled {
                                 cache: &mut cache,
                                 logits,
-                                hidden: speculative.then_some(hidden),
+                                hidden: (speculative || block.is_some()).then_some(hidden),
                                 history: &m.expanded_ids,
                                 position_delta: *delta,
                                 // The MTP head was warmed from the fused rows above; any other
-                                // proposer (a draft model) warms over the expanded prompt ids.
+                                // proposer warms here — a draft model over the expanded prompt
+                                // ids, a block draft from the tapped rows.
                                 warm_proposer: !speculative,
                             },
                             &config,

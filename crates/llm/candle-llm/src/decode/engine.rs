@@ -226,14 +226,53 @@ impl DraftSampler<'_, '_> {
                     });
             return Ok(best.map(|(t, _)| (t, None)));
         }
-        let mut row = vec![f32::NEG_INFINITY; width];
-        for (&t, &s) in candidates.iter().zip(scores) {
-            if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
-                *slot = s;
+        let logits = dense_row(candidates, scores, width)?;
+        self.sample_draft(&logits, draft_history).map(Some)
+    }
+
+    /// The stochastic proposal distribution `q` over a block draft's row — exactly the one
+    /// [`sample_among`](Self::sample_among) draws a stochastic draft from — without drawing, or
+    /// `None` when the constraint allows no candidate. A tree proposal (SW-7198) reads it to rank
+    /// a node's deterministic siblings and draws the node's sampled child from it with
+    /// [`draw`](Self::draw).
+    pub fn among_distribution(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        draft_history: &[i32],
+    ) -> Result<Option<Vec<(i32, f32)>>> {
+        if self.allowed_among(candidates).is_empty() {
+            return Ok(None);
+        }
+        let logits = dense_row(candidates, scores, width)?;
+        let mask = self.constraint.as_mut().map(|c| c.allowed());
+        shaped_candidates(&logits, draft_history, &self.config.sampling, mask).map(Some)
+    }
+
+    /// One draw from `dist` with the run's seeded stream (an inverse-CDF walk over a fresh
+    /// uniform), so the draft is distributed exactly as `dist`. The constraint is not advanced.
+    pub fn draw(&mut self, dist: &[(i32, f32)]) -> i32 {
+        let fallback = dist.first().map_or(0, |&(t, _)| t);
+        core_llm::speculative::sample_weighted(dist, self.rng.next_f32(), fallback)
+    }
+
+    /// The constraint's checkpoint at the proposal's start (`None` without a constraint).
+    pub fn constraint_checkpoint(&self) -> Option<usize> {
+        self.constraint.as_ref().map(|c| c.checkpoint())
+    }
+
+    /// Put the constraint in its state at a tree node (SW-7198): rewound to `checkpoint` (the
+    /// proposal's start), then advanced by the node's `path` from the anchor, stop tokens
+    /// excepted. The engine rewinds the constraint after the proposal as for any draft.
+    pub fn enter_branch(&mut self, checkpoint: Option<usize>, path: &[i32]) {
+        let stops = &self.config.stop_tokens;
+        if let (Some(c), Some(checkpoint)) = (self.constraint.as_mut(), checkpoint) {
+            c.rewind(checkpoint);
+            for &token in path.iter().filter(|t| !stops.contains(t)) {
+                c.accept(token);
             }
         }
-        let logits = Tensor::from_vec(row, (1, width), &candle_core::Device::Cpu)?;
-        self.sample_draft(&logits, draft_history).map(Some)
     }
 
     /// The `candidates` the constraint (if any) allows in its current state, in order.
@@ -252,6 +291,40 @@ impl DraftSampler<'_, '_> {
             None => candidates.to_vec(),
         }
     }
+}
+
+#[cfg(test)]
+impl<'a, 'c> DraftSampler<'a, 'c> {
+    /// A sampler over `config`, `rng` and `constraint` with host-sampled drafts — for unit tests
+    /// of a proposal builder that run no model.
+    pub(crate) fn for_tests(
+        config: &'a GenerationConfig,
+        rng: &'a mut SplitMix64,
+        constraint: Option<&'a mut (dyn RewindableConstraintMask + 'c)>,
+    ) -> Self {
+        Self {
+            config,
+            rng,
+            constraint,
+            device_greedy: false,
+        }
+    }
+}
+
+/// A block draft's scored row as dense host `[1, width]` logits: `scores` at `candidates`, `-inf`
+/// elsewhere.
+fn dense_row(candidates: &[i32], scores: &[f32], width: usize) -> Result<Tensor> {
+    let mut row = vec![f32::NEG_INFINITY; width];
+    for (&t, &s) in candidates.iter().zip(scores) {
+        if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
+            *slot = s;
+        }
+    }
+    Ok(Tensor::from_vec(
+        row,
+        (1, width),
+        &candle_core::Device::Cpu,
+    )?)
 }
 
 /// A proposal source for the engine. Implementations: [`MtpProposer`](super::proposers::MtpProposer),

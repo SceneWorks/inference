@@ -44,27 +44,36 @@ fn a_loaded_decoder_advertises_tree_verification_and_a_tree_is_priced() {
         })
     );
     let lookup = ProposerKind::PromptLookup;
-    let tree = super::tree_request_bytes(&provider.model, lookup, 4, 16, 100, 50).unwrap();
+    let tree = super::tree_request_bytes(&provider.model, lookup, 4, 16, 100, 50, 0).unwrap();
     assert!(tree > 0);
-    assert!(super::tree_request_bytes(&provider.model, lookup, 4, 32, 100, 50).unwrap() == tree);
+    assert!(super::tree_request_bytes(&provider.model, lookup, 4, 32, 100, 50, 0).unwrap() == tree);
     assert_eq!(
-        super::tree_request_bytes(&provider.model, lookup, 4, 0, 100, 50),
+        super::tree_request_bytes(&provider.model, lookup, 4, 0, 100, 50, 0),
         Some(0)
     );
     assert_eq!(
-        super::tree_request_bytes(&provider.model, lookup, 0, 16, 100, 50),
+        super::tree_request_bytes(&provider.model, lookup, 0, 16, 100, 50, 0),
         Some(0)
     );
     // A one-branch proposer (a draft model, the MTP head) verifies at most `drafts` candidates on
     // the linear path its route already prices: a tree request adds no tree workspace (E6).
     for one_branch in [ProposerKind::DraftModel, ProposerKind::Mtp] {
         assert_eq!(
-            super::tree_request_bytes(&provider.model, one_branch, 4, 16, 100, 50),
+            super::tree_request_bytes(&provider.model, one_branch, 4, 16, 100, 50, 0),
             Some(0),
             "{}",
             one_branch.label()
         );
     }
+    // A block draft builds branching trees (SW-7198): its tree is priced, and its eager tree
+    // forward also holds every tree row's tapped layer outputs.
+    let block = ProposerKind::BlockDraft;
+    let plain = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 0).unwrap();
+    let tapped = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 256).unwrap();
+    let element = provider.model.step_memory_geometry(4).element_bytes;
+    assert_eq!(plain, tree);
+    // Every tree row's taps — the anchor and 16 candidates — and the accepted branch's copy.
+    assert_eq!(tapped - plain, 17 * 256 * element * 2);
     // The request resolves against the advertisement: a tree needs a running proposer.
     let verify = core_llm::SpeculativeVerify::Tree { max_rows: 40 };
     let run = core_llm::resolve_tree_verify(
