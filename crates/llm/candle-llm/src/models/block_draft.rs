@@ -22,10 +22,11 @@
 //! the compute dtype — and their sources released before the next group reads its own, so the
 //! device never holds the BF16 payload beside the converted draft.
 //!
-//! **Scores** are f32. Where MLX gathers the LM head's dense rows for DSpine's refinement, Candle
-//! runs the target's head itself over the refined rows (its head may be GGML-packed, without dense
-//! rows) and gathers the candidates' logits: the verifier commits only the target's tokens, so the
-//! draft's rounding moves acceptance, never the output.
+//! **Scores** are f32. DSpine's refinement scores each refined row against its row's `K`
+//! candidates only, as MLX gathers the LM head's `K` rows: the target's head reads just those rows
+//! ([`TargetHead::scores`] — gathered dense rows, gathered GGML blocks, or the CUDA indexed GEMV
+//! over the packed head in place; see [`crate::primitives::head_rows`]). The verifier commits only
+//! the target's tokens, so the draft's rounding moves acceptance, never the output.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -493,6 +494,28 @@ fn senders(anchor: i32, cand: &Tensor) -> Result<Tensor> {
 /// A proposal's per-row candidates (ascending) and its `[rows, K, K]` row-major score table.
 pub type BlockProposal = (Vec<Vec<i32>>, Vec<f32>);
 
+/// The target's LM head as a block draft reads it.
+pub trait TargetHead {
+    /// The whole vocabulary's logits of normalized rows `[n, hidden]` → `[n, vocab]`.
+    fn logits(&self, rows: &Tensor) -> Result<Tensor>;
+
+    /// The logits of only `ids` `[groups, K]` (`U32`) for normalized rows
+    /// `[groups, senders, hidden]` → `[groups, senders, K]` f32: the [`Self::logits`] columns of
+    /// those ids, read without the rest of the vocabulary where the head allows (DSpine's
+    /// refinement rescores each row's candidates only).
+    fn scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor>;
+}
+
+impl TargetHead for crate::models::qwen35::Qwen35Model {
+    fn logits(&self, rows: &Tensor) -> Result<Tensor> {
+        self.lm_head(rows)
+    }
+
+    fn scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        self.lm_head_scores(rows, ids)
+    }
+}
+
 /// The code bridge's tensors (never quantized: the refinement depends on their rounding), plus
 /// the f32 copies the refinement computes with.
 struct Bridge {
@@ -752,11 +775,11 @@ impl DSpineDraft {
         &self,
         block: &DSpineBlock,
         anchor: i32,
-        head: &dyn Fn(&Tensor) -> Result<Tensor>,
+        head: &dyn TargetHead,
     ) -> Result<BlockProposal> {
         let (b, body) = (&self.bridge, &self.body);
         let n = block.rows.dim(0)?;
-        let logits = f32(&head(&block.rows)?)?;
+        let logits = f32(&head.logits(&block.rows)?)?;
         let (candidates, cand) = top_k_ascending(&logits, body.cfg.head_topk)?;
         let k = cand.dim(1)?;
         let sqrt_c = (self.code_size as f64).sqrt();
@@ -775,16 +798,10 @@ impl DSpineDraft {
         let normalized = refined
             .broadcast_div(&norm)?
             .broadcast_mul(&f32(&body.norm)?)?
-            .to_dtype(body.dtype)?
-            .reshape((n * k, ()))?;
-        let refined_logits = f32(&head(&normalized)?)?;
-        let index = cand
-            .unsqueeze(1)?
-            .broadcast_as((n, k, k))?
-            .reshape((n * k, k))?
-            .contiguous()?;
-        let table = refined_logits
-            .gather(&index, 1)?
+            .to_dtype(body.dtype)?;
+        // Row `i`'s `K` refined rows read only its `K` candidates' head rows: `[n, K, K]`.
+        let table = head
+            .scores(&normalized, &cand)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         Ok((candidates, table))
@@ -977,14 +994,9 @@ impl DFlash2Draft {
     }
 
     /// The candidate-path selector's table for the draft `rows` `[n, hidden]`.
-    fn table(
-        &self,
-        rows: &Tensor,
-        anchor: i32,
-        head: &dyn Fn(&Tensor) -> Result<Tensor>,
-    ) -> Result<BlockProposal> {
+    fn table(&self, rows: &Tensor, anchor: i32, head: &dyn TargetHead) -> Result<BlockProposal> {
         let n = rows.dim(0)?;
-        let mut logits = f32(&head(rows)?)?;
+        let mut logits = f32(&head.logits(rows)?)?;
         if self.output_multiplier != 1.0 {
             logits = (logits * f64::from(self.output_multiplier))?;
         }
@@ -1108,14 +1120,14 @@ impl BlockDraft {
     /// `[anchor, mask × (T - 1)]`), scoring its first `n` draft rows (`1 <= n <= T - 1`; the rest
     /// only condition a non-causal block, and a causal DSpine block scores all `T - 1`): each
     /// scored row's candidates (ascending) and the `[n, K, K]` table. `head` is the target's LM
-    /// head over normalized rows.
+    /// head ([`TargetHead`]).
     pub fn propose(
         &self,
         ctx: &BlockDraftContext,
         embeds: &Tensor,
         n: usize,
         anchor: i32,
-        head: &dyn Fn(&Tensor) -> Result<Tensor>,
+        head: &dyn TargetHead,
     ) -> Result<BlockProposal> {
         let t = embeds.dim(1)?;
         if n == 0 || n >= t {

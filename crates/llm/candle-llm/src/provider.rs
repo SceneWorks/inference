@@ -28,11 +28,12 @@ use serde_json::Value;
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_monitored,
-    graph_demoted_step_admission_bytes, graph_workspace_admission_bytes, prefill_restored,
-    tree_extra_positions, BlockDraftProposer, Boundary, ConstraintMask, CountingDecode, Decode,
-    DecodePath, DecodeRecord, DraftModelProposer, FinishReason, GenerationConfig, GraphRunner,
-    GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixStats, Proposer,
-    RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent, TappedQwen35,
+    graph_demoted_step_admission_bytes, graph_workspace_admission_bytes_with_hidden_row,
+    prefill_restored, tree_extra_positions, BlockDraftProposer, Boundary, ConstraintMask,
+    CountingDecode, Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason,
+    GenerationConfig, GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache,
+    PrefixStats, Proposer, RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel,
+    StreamEvent, TappedQwen35,
 };
 use crate::device::select_device;
 use crate::error::to_core;
@@ -188,6 +189,27 @@ impl DecodeRoute {
     }
 }
 
+/// The pricing tests' untapped form of [`priced_request_bytes_tapped`].
+#[cfg(test)]
+fn priced_request_bytes(
+    model: &Decoder,
+    route: DecodeRoute,
+    admitted_prompt: usize,
+    max_new_tokens: u32,
+    vision_workspace: u64,
+    cuda_graphs: bool,
+) -> Option<u64> {
+    priced_request_bytes_tapped(
+        model,
+        route,
+        admitted_prompt,
+        max_new_tokens,
+        vision_workspace,
+        cuda_graphs,
+        None,
+    )
+}
+
 /// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens (the
 /// engine's device-positions step buffers included, [`Decoder::device_step_bytes`]): on
 /// the reference geometry for the reference loop, and on the step seam's geometry whenever the
@@ -203,15 +225,20 @@ impl DecodeRoute {
 ///
 /// Whenever the engine runs through the CUDA-graph runner (`cuda_graphs`, sc-24134) — with a
 /// proposer or without one — the graphs it may capture are priced too
-/// ([`graph_workspace_admission_bytes`] over the `1 ..= K + 1` step token counts), so a request
-/// that could not hold them fails closed at admission instead of at instantiation (sc-24140).
-fn priced_request_bytes(
+/// ([`engine_graph_workspace`] over the `1 ..= K + 1` step token counts), so a request that could
+/// not hold them fails closed at admission instead of at instantiation (sc-24140).
+///
+/// A `block_draft` route's verify steps stage the tapped layers' outputs, `tap_width`
+/// (`layers × hidden`) elements per row, not one hidden row (SW-7197); `None` prices them at
+/// `hidden_size`.
+fn priced_request_bytes_tapped(
     model: &Decoder,
     route: DecodeRoute,
     admitted_prompt: usize,
     max_new_tokens: u32,
     vision_workspace: u64,
     cuda_graphs: bool,
+    tap_width: Option<u64>,
 ) -> Option<u64> {
     let geometry = match route {
         DecodeRoute::Engine { drafts, .. } => model.step_memory_geometry(drafts as usize),
@@ -223,9 +250,14 @@ fn priced_request_bytes(
                 .ok()?
                 .checked_add(u64::from(max_new_tokens))?;
             // An MTP head's and a block draft's steps ask for hidden rows (a block draft's: its
-            // tapped rows), a captured shape of their own.
-            let hidden_steps = matches!(proposer, ProposerKind::Mtp | ProposerKind::BlockDraft);
-            engine_graph_workspace(model, drafts, positions, cuda_graphs, hidden_steps)?
+            // tapped rows, `tap_width` wide), a captured shape of their own.
+            let hidden = model.step_memory_geometry(drafts as usize).hidden_size;
+            let hidden_row = match proposer {
+                ProposerKind::Mtp => Some(hidden),
+                ProposerKind::BlockDraft => Some(tap_width.unwrap_or(hidden)),
+                _ => None,
+            };
+            engine_graph_workspace(model, drafts, positions, cuda_graphs, hidden_row)?
                 .checked_add(model.device_step_bytes(drafts, positions)?)?
         }
         DecodeRoute::Reference => 0,
@@ -302,30 +334,38 @@ fn tree_request_bytes(
 
 /// The CUDA-graph workspace admission charges a request on the engine with `drafts` drafts per
 /// verify step whose prompt and budget reach `positions` positions: every graph the runner may
-/// capture ([`graph_workspace_admission_bytes`] over the step geometry, the reach plus the verify
-/// overshoot, and the `1 ..= K + 1` step token counts — `1` with no proposer), or `0` when the
-/// runner is off (`cuda_graphs`). A route whose steps ask for hidden rows (`hidden_steps`: MTP)
-/// also prices the plain step it takes once `auto` demotes it (sc-24446,
-/// [`graph_demoted_step_admission_bytes`]) — whether a request is demoted is decided mid-request,
-/// so every MTP route carries it. `None` on overflow (the caller fails closed).
+/// capture ([`crate::decode::graph_workspace_admission_bytes`] over the step geometry, the reach
+/// plus the verify overshoot, and the `1 ..= K + 1` step token counts — `1` with no proposer), or
+/// `0` when the runner is off (`cuda_graphs`). A route whose steps ask for hidden rows
+/// (`hidden_row`: the staged row's width — `hidden_size` for MTP, the tapped layers'
+/// `layers × hidden` for a block draft, SW-7197) stages that row per token, and also prices the
+/// plain step it takes once `auto` demotes it (sc-24446, [`graph_demoted_step_admission_bytes`])
+/// — whether a request is demoted is decided mid-request, so every such route carries it. `None`
+/// on overflow (the caller fails closed).
 fn engine_graph_workspace(
     model: &Decoder,
     drafts: u32,
     positions: u64,
     cuda_graphs: bool,
-    hidden_steps: bool,
+    hidden_row: Option<u64>,
 ) -> Option<u64> {
     if !cuda_graphs {
         return Some(0);
     }
     let geometry = model.step_memory_geometry(drafts as usize);
     let reach = positions.checked_add(u64::from(drafts))?;
-    let demoted = if hidden_steps {
+    let demoted = if hidden_row.is_some() {
         graph_demoted_step_admission_bytes(&geometry, reach)?
     } else {
         0
     };
-    graph_workspace_admission_bytes(&geometry, reach, drafts.checked_add(1)?)?.checked_add(demoted)
+    graph_workspace_admission_bytes_with_hidden_row(
+        &geometry,
+        reach,
+        drafts.checked_add(1)?,
+        hidden_row.unwrap_or(geometry.hidden_size),
+    )?
+    .checked_add(demoted)
 }
 
 /// What the Gemma 4 soft-token splice re-admits once the expanded prompt (`capacity` = expanded
@@ -341,7 +381,7 @@ fn spliced_prompt_bytes(
 ) -> Option<u64> {
     let positions = u64::try_from(capacity).ok()?;
     // The Gemma 4 splice runs prompt lookup or no proposer: no hidden-row steps.
-    let graphs = engine_graph_workspace(model, drafts, positions, cuda_graphs, false)?;
+    let graphs = engine_graph_workspace(model, drafts, positions, cuda_graphs, None)?;
     let preallocated = capacity.checked_add(usize::try_from(drafts).ok()?)?;
     u64::try_from(model.static_kv_bytes(preallocated))
         .ok()?
@@ -1115,6 +1155,14 @@ fn block_draft_load_estimate(
             .map(|g| g.window)
             .max()
             .unwrap_or(0);
+        // DSpine's refinement reads the target head's candidate rows in place through one 8-byte
+        // address per vocabulary row (`HeadRows::Indexed`, SW-7197), uploaded beside the draft.
+        let device = match cfg.format {
+            core_llm::BlockDraftFormat::DSpine => {
+                device.saturating_add((cfg.vocab_size as u64).saturating_mul(8))
+            }
+            core_llm::BlockDraftFormat::DFlash2 => device,
+        };
         // A host load holds the draft itself on the host too.
         let host = window.saturating_mul(3) + if cuda { 0 } else { device };
         let payload = core_llm::checkpoint_payload_bytes(dir)?;
@@ -1181,23 +1229,34 @@ fn draft_request_bytes(
 
 /// What a request's `block_draft` proposer holds beside the target (SW-F360 E8): the shared
 /// pricing ([`core_llm::BlockDraftConfig::request_bytes`] — the tapped rows it reads, its
-/// window-bounded context and a step's transients) plus what Candle's scoring adds: DSpine runs
-/// the target's LM head over every refined `(row, sender)` pair, `drafts × K` rows of f32 logits.
-/// `None` on overflow.
+/// window-bounded context and a step's transients) plus what Candle's scoring adds: DSpine scores
+/// every refined `(row, sender)` pair against the row's `K` candidates through the target head's
+/// row access `head` ([`HeadRows::workspace_bytes`](crate::primitives::head_rows::HeadRows::workspace_bytes)
+/// — the gathered rows or the indexed GEMV's activation copy, and the `drafts × K × K` scores;
+/// the whole head's logits only where the head has no row access). `act` is the target's
+/// activation width in bytes. `None` on overflow.
 fn block_draft_request_bytes(
     draft: &crate::models::BlockDraft,
+    head: Option<&crate::primitives::head_rows::HeadRows>,
+    act: u64,
     prompt: usize,
     max_new_tokens: u32,
     drafts: u32,
 ) -> Option<u64> {
     let cfg = draft.config();
     let width = usize::try_from(drafts).ok()?;
-    let refined = match cfg.format {
-        core_llm::BlockDraftFormat::DSpine => (width as u64)
-            .checked_mul(cfg.head_topk as u64)?
-            .checked_mul(cfg.vocab_size as u64)?
-            .checked_mul(4 + 2)?,
-        core_llm::BlockDraftFormat::DFlash2 => 0,
+    let refined = match (cfg.format, head) {
+        (core_llm::BlockDraftFormat::DSpine, Some(head)) => head.workspace_bytes(
+            width as u64,
+            cfg.head_topk as u64,
+            cfg.head_topk as u64,
+            cfg.vocab_size as u64,
+            cfg.hidden_size as u64,
+            act,
+        )?,
+        // A DSpine draft is attached only with its head access built.
+        (core_llm::BlockDraftFormat::DSpine, None) => return None,
+        (core_llm::BlockDraftFormat::DFlash2, _) => 0,
     };
     cfg.request_bytes(prompt, max_new_tokens, width)?
         .checked_add(refined)
@@ -1918,9 +1977,10 @@ impl LlamaProvider {
                 )
                 .to_string());
             };
-            // The MLX rule, kept so both backends accept the same drafts: DSpine's refinement
-            // scores candidates against the LM head's dense rows, which a Prism head lacks.
-            if target.has_prism_head() && format == core_llm::BlockDraftFormat::DSpine {
+            // The MLX rule (`is_prism`), kept so both backends accept the same drafts: DSpine's
+            // refinement scores candidates against the LM head's dense rows, and MLX refuses any
+            // Prism load — a Prism snapshot with a dense or tied head included.
+            if target.is_prism() && format == core_llm::BlockDraftFormat::DSpine {
                 return Err(core_llm::BlockDraftRefusal::TargetFamily(
                     "a Prism target's packed LM head has no dense rows for the refinement".into(),
                 )
@@ -1940,6 +2000,16 @@ impl LlamaProvider {
                 return Err(core_llm::block_draft_refusal_reason(&mismatches));
             }
             let label = cfg.format.label();
+            if format == core_llm::BlockDraftFormat::DSpine {
+                // The refinement's row access to the target's head (its CUDA address table), built
+                // now so a request never builds it; priced with the draft's load.
+                target.head_rows().map_err(|e| {
+                    core_llm::BlockDraftRefusal::TargetFamily(format!(
+                        "the target's LM head rows cannot be addressed: {e}"
+                    ))
+                    .to_string()
+                })?;
+            }
             let model = crate::models::BlockDraft::load(
                 Path::new(&source),
                 cfg,
@@ -2048,13 +2118,16 @@ impl LlamaProvider {
         max_new_tokens: u32,
         vision_workspace: u64,
     ) -> Option<u64> {
-        priced_request_bytes(
+        priced_request_bytes_tapped(
             &self.model,
             route,
             prompt,
             max_new_tokens,
             vision_workspace,
             cuda_graphs_enabled(),
+            self.block_draft
+                .as_ref()
+                .map(|d| d.model.config().tap_width() as u64),
         )?
         .checked_add(self.draft_bytes(route, prompt, max_new_tokens)?)
     }
@@ -2095,12 +2168,24 @@ impl LlamaProvider {
                     drafts,
                 },
                 _,
-            ) => block_draft_request_bytes(
-                &self.block_draft.as_ref()?.model,
-                prompt,
-                max_new_tokens,
-                drafts,
-            ),
+            ) => {
+                let Decoder::Qwen35(target) = &self.model else {
+                    return None;
+                };
+                let draft = &self.block_draft.as_ref()?.model;
+                // Built at the DSpine attach; a DFlash2 draft never reads it.
+                let head = (draft.config().format == core_llm::BlockDraftFormat::DSpine)
+                    .then(|| target.head_rows().ok())
+                    .flatten();
+                block_draft_request_bytes(
+                    draft,
+                    head,
+                    target.compute_dtype().size_in_bytes() as u64,
+                    prompt,
+                    max_new_tokens,
+                    drafts,
+                )
+            }
             _ => Some(0),
         }
     }

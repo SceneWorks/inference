@@ -1366,10 +1366,15 @@ mod cuda {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+
+    /// A one-row Prism weight `name` (no transform): what a registry needs to call a load Prism.
+    pub(crate) fn one_row_weight(name: &str) -> PrismPackedWeight {
+        mlx_weight(name, &[1; 128], PrismTransformRole::None)
+    }
 
     fn metadata(name: &str, role: PrismTransformRole, signs: Vec<i8>) -> PrismHadamardMetadata {
         let mut signs_by_width = BTreeMap::new();

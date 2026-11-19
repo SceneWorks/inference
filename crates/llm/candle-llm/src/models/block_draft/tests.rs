@@ -65,6 +65,21 @@ pub(crate) fn tiny_target_on(device: &Device, random: bool) -> Qwen35Model {
     Qwen35Model::from_weights(&w, "model.language_model", cfg).unwrap()
 }
 
+/// The tiny target loaded as a Prism snapshot whose LM head (and every other matrix) stayed
+/// dense: its registry packs one tensor no projection reads, so only the load is Prism.
+pub(crate) fn tiny_prism_target() -> Qwen35Model {
+    let cfg = tiny_target_config();
+    let w = Weights::from_map(synthetic_weights(&cfg).into_map(), Device::Cpu);
+    let name = "model.visual.unused.weight";
+    let registry = crate::primitives::PrismRegistry::new(HashMap::from([(
+        name.to_string(),
+        std::sync::Arc::new(crate::primitives::prism::tests::one_row_weight(name)),
+    )]))
+    .unwrap();
+    let dtype = crate::device::compute_dtype(&Device::Cpu);
+    Qwen35Model::from_prism_weights(&w, "model.language_model", cfg, &registry, dtype).unwrap()
+}
+
 /// A DSpine config shaped like `Qwen3.8-27B-DSpine-b16` at toy size over [`tiny_target`]: two
 /// layers reading target layers 0 and 2, block 6, top-4 refinement and an 8-row sliding window,
 /// so a 12-token prompt already exercises the window (E5). The MLX fixture's config.
@@ -352,6 +367,23 @@ fn the_block_mask_is_causal_or_not_over_the_block_and_windowed_over_the_context(
     }
 }
 
+/// A bare `[vocab, hidden]` matrix as the target head (its logits are `x · Wᵀ`).
+struct MatrixHead<'a>(&'a Tensor);
+
+impl TargetHead for MatrixHead<'_> {
+    fn logits(&self, rows: &Tensor) -> Result<Tensor> {
+        mm(rows, self.0)
+    }
+
+    fn scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        crate::primitives::head_rows::HeadRows::Dense(self.0.clone()).scores(
+            &Projection::Dense(candle_nn::Linear::new(self.0.clone(), None)),
+            rows,
+            ids,
+        )
+    }
+}
+
 /// The selector's table against a host recomputation of the reference's edge formula: row `i`'s
 /// candidates are the top-`K` of the row's logits, and `table[i, s, j] = logit_i(c_j) +
 /// Σ_r pred[sender_s]_r · h_i,r · succ[c_j]_r` with row 0's senders the anchor.
@@ -379,7 +411,7 @@ fn the_selector_table_is_the_reference_edge_score() {
     );
     let head = |x: &Tensor| -> Result<Tensor> { mm(x, &head_w) };
     let anchor = 7;
-    let (cand, table) = draft.table(&rows, anchor, &head).unwrap();
+    let (cand, table) = draft.table(&rows, anchor, &MatrixHead(&head_w)).unwrap();
     let k = 4usize;
     assert!(cand.len() == n && cand.iter().all(|c| c.len() == k));
     assert_eq!(table.len(), n * k * k);

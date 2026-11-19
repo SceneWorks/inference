@@ -202,9 +202,7 @@ impl<'d> BlockDraftProposer<'d> {
                 ctx.position
             )));
         }
-        let (candidates, table) = draft.propose(context, &embeds, depth, ctx.cur, &|rows| {
-            target.lm_head(rows)
-        })?;
+        let (candidates, table) = draft.propose(context, &embeds, depth, ctx.cur, target)?;
         self.draft_forwards += 1;
         self.candidates = candidates;
         self.table = table;

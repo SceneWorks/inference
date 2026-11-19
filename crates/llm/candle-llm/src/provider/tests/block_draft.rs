@@ -6,9 +6,10 @@
 use super::super::*;
 use super::{synthetic_tokenizer_json, tiny_causal_from, tiny_llama_parts};
 use crate::models::block_draft::tests::{
-    dflash2_config_json, dspine_config_json, proof_device, tiny_target, tiny_target_on,
-    tiny_tensors,
+    dflash2_config_json, dspine_config_json, proof_device, tiny_prism_target, tiny_target,
+    tiny_target_on, tiny_tensors,
 };
+use crate::primitives::head_rows::HeadRows;
 use core_llm::{BlockDraftFormat, Speculative};
 
 fn hybrid_provider(model: Qwen35Model) -> LlamaProvider {
@@ -132,6 +133,72 @@ fn block_drafts_are_accepted_and_refused_by_the_shared_typed_rule() {
     }
 }
 
+/// AC2: a Prism target is refused for DSpine by the MLX rule — any Prism load, whatever its LM
+/// head — even when the snapshot kept its head dense; DFlash2, whose selector reads only the
+/// head's logits, is accepted over the same target, as MLX accepts it.
+#[test]
+fn a_prism_load_with_a_dense_head_refuses_dspine_and_accepts_dflash2() {
+    let target = tiny_prism_target();
+    assert!(target.is_prism());
+    assert_eq!(
+        target.head_rows().unwrap().label(),
+        "dense",
+        "the head stayed dense"
+    );
+    assert!(!tiny_target().is_prism());
+
+    let dir = draft_dir(&dspine_config_json(), true);
+    let mut dspine = hybrid_provider(tiny_prism_target());
+    dspine.attach_draft(&spec(&dir, None), &Device::Cpu, None);
+    let why = dspine.draft_report.unwrap().refusal.unwrap();
+    assert!(why.starts_with("block draft: target_family:"), "{why}");
+    assert!(why.contains("Prism"), "{why}");
+    assert!(dspine.block_draft.is_none());
+    assert!(dspine.load_record.fallbacks.contains(&why));
+
+    let dir = draft_dir(&dflash2_config_json(), true);
+    let mut dflash2 = hybrid_provider(tiny_prism_target());
+    dflash2.attach_draft(&spec(&dir, None), &Device::Cpu, None);
+    let report = dflash2.draft_report.unwrap();
+    assert!(report.is_resident(), "{:?}", report.refusal);
+    assert_eq!(
+        dflash2.block_draft.unwrap().report.format,
+        BlockDraftFormat::DFlash2.label()
+    );
+}
+
+/// A block-draft route's captured verify steps stage the tapped layers' outputs (`layers ×
+/// hidden` per row), so the graph workspace prices that width, not one hidden row; with the graph
+/// runner off nothing changes.
+#[test]
+fn a_block_draft_route_prices_its_tapped_rows_in_the_graph_workspace() {
+    let decoder = Decoder::Qwen35(tiny_target());
+    let route = DecodeRoute::Engine {
+        proposer: ProposerKind::BlockDraft,
+        drafts: 3,
+    };
+    let priced = |graphs, taps| {
+        priced_request_bytes_tapped(&decoder, route, 12, 16, 0, graphs, taps).unwrap()
+    };
+    let geometry = decoder.step_memory_geometry(3);
+    let (hidden, tap) = (geometry.hidden_size, 3 * geometry.hidden_size);
+    // Σ_{M=1}^{K+1} M token-rows in two scopes, each staging `tap - hidden` more elements.
+    let rows = 4 * 5 / 2 * 2;
+    assert_eq!(
+        priced(true, Some(tap)) - priced(true, Some(hidden)),
+        rows * (tap - hidden) * geometry.element_bytes
+    );
+    assert_eq!(priced(true, None), priced(true, Some(hidden)));
+    assert_eq!(priced(false, Some(tap)), priced(false, None));
+    let reach = 12 + 16 + 3;
+    assert_eq!(
+        crate::decode::graph_workspace_admission_bytes_with_hidden_row(&geometry, reach, 4, tap)
+            .unwrap()
+            - crate::decode::graph_workspace_admission_bytes(&geometry, reach, 4).unwrap(),
+        rows * (tap - hidden) * geometry.element_bytes
+    );
+}
+
 /// AC3: a block draft's load is priced by the shared rule at its requested precision — its
 /// resident arrays and twice its largest group's window, plus each GGML projection's CUDA row
 /// padding — and a request on its route adds the shared request pricing.
@@ -148,8 +215,14 @@ fn a_block_draft_is_priced_at_its_precision() {
                 .unwrap()
         };
         let (q8, q4) = (device(None), device(Some(Quantize::Q4)));
-        let padded =
-            |p, bytes: u64| cfg.load_bytes(p) + bytes * cfg.quantized_matrices().len() as u64;
+        // DSpine adds the head-row address table: one 8-byte entry per vocabulary row.
+        let table = match cfg.format {
+            BlockDraftFormat::DSpine => 50 * 8,
+            BlockDraftFormat::DFlash2 => 0,
+        };
+        let padded = |p, bytes: u64| {
+            cfg.load_bytes(p) + bytes * cfg.quantized_matrices().len() as u64 + table
+        };
         assert_eq!(q8, padded(core_llm::BlockDraftPrecision::Q8, 544));
         assert_eq!(q4, padded(core_llm::BlockDraftPrecision::Q4, 288));
         assert!(q4 < q8);
@@ -160,9 +233,20 @@ fn a_block_draft_is_priced_at_its_precision() {
         );
         let draft = crate::models::block_draft::tests::tiny_draft(format_of(&config), None);
         let shared = cfg.request_bytes(12, 16, 3).unwrap();
-        let priced = block_draft_request_bytes(&draft, 12, 16, 3).unwrap();
+        let target = tiny_target();
+        let head = target.head_rows().unwrap();
+        assert_eq!(head.label(), "dense");
+        let priced = block_draft_request_bytes(&draft, Some(head), 2, 12, 16, 3).unwrap();
         match cfg.format {
-            BlockDraftFormat::DSpine => assert_eq!(priced, shared + 3 * 4 * 50 * 6),
+            // The refinement reads each draft row's 4 candidate rows of the 64-wide head and
+            // writes 3 × 4 × 4 scores — never the 3 × 4 × 50 whole-head logits.
+            BlockDraftFormat::DSpine => {
+                assert_eq!(priced, shared + 3 * 4 * 64 * 4 + 3 * 4 * 4 * 6);
+                let whole = HeadRows::Full("test");
+                let fallback = block_draft_request_bytes(&draft, Some(&whole), 2, 12, 16, 3);
+                assert_eq!(fallback, Some(shared + 3 * 4 * 50 * 6 + 3 * 4 * 4 * 6));
+                assert_eq!(block_draft_request_bytes(&draft, None, 2, 12, 16, 3), None);
+            }
             BlockDraftFormat::DFlash2 => assert_eq!(priced, shared),
         }
     }

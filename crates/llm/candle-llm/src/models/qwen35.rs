@@ -1835,6 +1835,13 @@ pub struct Qwen35Model {
     /// ([`device_positions_default`](crate::primitives::device_positions_default)) — on CUDA, off
     /// on the CPU.
     device_positions: bool,
+    /// Whether this model was built from a Prism checkpoint (any projection, embedding or head
+    /// read from a Prism registry) — MLX's `is_prism`, which a DSpine draft refuses whatever the
+    /// head ended up as (SW-7197).
+    prism: bool,
+    /// The LM head's row access for a block draft's candidate scoring (SW-7197), built on first
+    /// use ([`Qwen35Model::head_rows`]).
+    head_rows: std::sync::OnceLock<crate::primitives::head_rows::HeadRows>,
 }
 
 /// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
@@ -3192,30 +3199,46 @@ impl Qwen35Model {
         keep: Option<usize>,
         scope: LogitsScope,
     ) -> Result<(Tensor, Tensor)> {
-        let mut taps: Vec<Option<Tensor>> = vec![None; layers.len()];
+        // Each tapped layer's kept rows are copied straight into their column band of one
+        // `[B, n, layers × hidden]` buffer: the taps are held once (as the request pricing counts
+        // them), never as per-layer copies plus their concatenation. The buffer is allocated
+        // once per forward and filled by device copies, so a captured verify step stages its taps
+        // in its own fixed buffer.
+        let mut taps: Option<Tensor> = None;
+        let mut filled = vec![false; layers.len()];
         let h = self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()), &mut |i, h| {
-            for (slot, _) in taps.iter_mut().zip(layers).filter(|(_, &l)| l == i) {
-                let s = h.dim(1)?;
-                let n = keep.map_or(s, |k| k.min(s));
-                // A kept window of a longer prefill is copied out, so the full output is freed.
-                *slot = Some(if n < s {
-                    h.narrow(1, s - n, n)?.copy()?
-                } else {
-                    h.clone()
-                });
+            let (b, s, hidden) = h.dims3()?;
+            let n = keep.map_or(s, |k| k.min(s));
+            for (j, _) in layers.iter().enumerate().filter(|(_, &l)| l == i) {
+                let buffer = match &taps {
+                    Some(buffer) => buffer,
+                    // SAFETY: every column band is written below before the buffer is read (a
+                    // band left unwritten is refused after the forward).
+                    None => taps.insert(unsafe {
+                        Tensor::empty((b, n, layers.len() * hidden), h.dtype(), h.device())?
+                    }),
+                };
+                // `[B, n, hidden]` into columns `j·hidden..` of `[B, n, layers·hidden]`: one
+                // strided device copy per layer (the reshapes are views of the same storage).
+                let rows = h.narrow(1, s - n, n)?.contiguous()?;
+                buffer.reshape((b * n, layers.len() * hidden))?.slice_set(
+                    &rows.reshape((b * n, hidden))?,
+                    1,
+                    j * hidden,
+                )?;
+                filled[j] = true;
             }
             Ok(())
         })?;
-        let taps = taps
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                Error::Config(format!(
+        let taps = match taps {
+            Some(taps) if filled.iter().all(|&f| f) => taps,
+            _ => {
+                return Err(Error::Config(format!(
                     "tapped layers {layers:?} outside this {}-layer target",
                     self.layers.len()
-                ))
-            })?;
-        let taps = Tensor::cat(&taps, 2)?;
+                )))
+            }
+        };
         let logits = match scope {
             LogitsScope::Last => self.project_last(&h)?,
             LogitsScope::All => self.project(&h)?,
@@ -3228,15 +3251,44 @@ impl Qwen35Model {
         self.layers.len()
     }
 
-    /// Whether the LM head is a Prism-packed weight (no dense rows).
-    pub fn has_prism_head(&self) -> bool {
-        matches!(self.lm_head.as_deref(), Some(Projection::Prism(_)))
+    /// Whether this model was loaded from a Prism checkpoint — whatever its LM head is (a Prism
+    /// snapshot may keep a dense or tied head). MLX's `is_prism`.
+    pub fn is_prism(&self) -> bool {
+        self.prism
     }
 
     /// The LM head over already-normalized rows `[.., hidden]` → `[.., vocab]` (a block draft
     /// scores its rows with the target's head).
     pub fn lm_head(&self, normalized: &Tensor) -> Result<Tensor> {
         self.project_normalized(normalized)
+    }
+
+    /// The LM head's row access (SW-7197): how [`Self::lm_head_scores`] reads only the rows it is
+    /// asked for — built once, on first use (a CUDA head uploads its row-address table then).
+    pub fn head_rows(&self) -> Result<&crate::primitives::head_rows::HeadRows> {
+        if let Some(rows) = self.head_rows.get() {
+            return Ok(rows);
+        }
+        let head = self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })?;
+        let built = crate::primitives::head_rows::HeadRows::new(head)?;
+        Ok(self.head_rows.get_or_init(|| built))
+    }
+
+    /// The LM head's logits of only `ids` `[groups, k]` (`U32`) for normalized `rows`
+    /// `[groups, senders, hidden]`: `[groups, senders, k]` f32 — the head's columns of those ids,
+    /// read without the rest of the vocabulary where the head's format allows
+    /// ([`Self::head_rows`]).
+    pub fn lm_head_scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let head = self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })?;
+        self.head_rows()?.scores(head, rows, ids)
     }
 
     /// [`StepModel::forward_step`] whose hidden rows, when asked for, are the outputs of `taps`'
@@ -3788,6 +3840,8 @@ impl Qwen35Model {
             quantized: format.is_some() || prism.is_some(),
             step_kv_cache: KvCacheKind::Static,
             attn_formulation: AttnFormulation::Gqa,
+            prism: prism.is_some(),
+            head_rows: std::sync::OnceLock::new(),
         })
     }
 }

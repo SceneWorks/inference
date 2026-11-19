@@ -320,9 +320,7 @@ fn a_non_causal_draft_scores_its_rows_over_the_whole_block() {
                 .append_context(&mut context, &taps(&model, draft, &PROMPT))
                 .unwrap();
             let (cand, table) = draft
-                .propose(&context, &embed(len), n, anchor, &|rows| {
-                    model.lm_head(rows)
-                })
+                .propose(&context, &embed(len), n, anchor, &model)
                 .unwrap();
             (cand.concat(), table)
         };

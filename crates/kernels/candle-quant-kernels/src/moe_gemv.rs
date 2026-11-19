@@ -390,6 +390,52 @@ impl IndexedExperts {
         }
     }
 
+    /// The rows of one GGML block-quantized `[rows, k]` matrix as a bank of one-row experts
+    /// (SW-7197): expert `r` is row `r` (`n = 1`), addressed in place at the matrix's base plus `r`
+    /// whole rows of blocks — the offset candle's own mat-vec reads row `r` at — so a forward
+    /// scores each task's activation row against only the rows its ids name (a block draft's
+    /// candidate rows of a packed LM head) without reading the rest. `dequant` as for
+    /// [`Self::ggml`].
+    pub fn ggml_rows(
+        matrix: &std::sync::Arc<QTensor>,
+        dequant: bool,
+    ) -> Result<Self, MoeGemvError> {
+        let dtype = matrix.dtype();
+        let format = if dequant {
+            if dtype != GgmlDType::Q8_0 {
+                return Err(MoeGemvRefusal::Format(format!("dequantized {dtype:?} rows")).into());
+            }
+            IndexedFormat::Q8Dequant
+        } else {
+            if ggml_kernel(dtype).is_none() {
+                return Err(MoeGemvRefusal::Format(format!("{dtype:?} rows")).into());
+            }
+            IndexedFormat::Ggml(dtype)
+        };
+        let (rows, k) = matrix.shape().dims2()?;
+        if rows == 0 {
+            return Err(MoeGemvRefusal::Empty.into());
+        }
+        if !k.is_multiple_of(dtype.block_size()) {
+            return Err(MoeGemvRefusal::Format(format!("{dtype:?} rows of {k} columns")).into());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            Ok(Self {
+                format,
+                experts: rows,
+                n: 1,
+                k,
+                tables: cuda_impl::Tables::ggml_rows(matrix, rows, k)?,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (format, k);
+            Err(MoeGemvRefusal::NotCuda.into())
+        }
+    }
+
     /// A bank of NVFP4 experts (one shape, one CUDA device, no bias).
     pub fn nvfp4(experts: &[std::sync::Arc<Nvfp4Weight>]) -> Result<Self, MoeGemvError> {
         if experts.is_empty() {
@@ -653,6 +699,30 @@ mod cuda_impl {
                 vec: false,
                 functions: OnceLock::new(),
                 _owners: Owners::Ggml(experts.to_vec()),
+            })
+        }
+
+        /// One table entry per row of `matrix` (`[rows, k]` GGML blocks): row `r` starts `r`
+        /// whole rows of blocks past the base.
+        pub(crate) fn ggml_rows(
+            matrix: &Arc<QTensor>,
+            rows: usize,
+            k: usize,
+        ) -> Result<Self, MoeGemvError> {
+            let dev = cuda_dev(&matrix.device())?;
+            let dtype = matrix.dtype();
+            let row_bytes = (k / dtype.block_size() * dtype.type_size()) as u64;
+            let base = matrix.device_ptr()? as u64;
+            let addresses = (0..rows as u64)
+                .map(|r| base + r * row_bytes)
+                .collect::<Vec<_>>();
+            Ok(Self {
+                weights: upload_addresses(addresses, &dev)?,
+                dev,
+                nvfp4: None,
+                vec: false,
+                functions: OnceLock::new(),
+                _owners: Owners::Ggml(vec![matrix.clone()]),
             })
         }
 
