@@ -293,11 +293,8 @@ fn image_request(speculative: Speculative, sampling: Sampling) -> TextLlmRequest
 }
 
 /// Why a `block_draft` run's report shows it did not run as asked — another proposer, an unnamed
-/// draft, or a `block_draft` fallback (the depth clamp among them) — or committed more tokens
-/// than its target passes verified: each pass commits the target's own token plus the drafts it
-/// accepted, so `tokens <= passes + accepted` (the first token is the prefill's; a stop token
-/// is committed but not emitted). `None`: it ran as asked.
-fn ran_as_asked(what: &str, tokens: usize, out: &TextLlmOutput) -> Option<String> {
+/// draft, or a `block_draft` fallback (the depth clamp among them). `None`: it ran as asked.
+fn ran_as_asked(what: &str, out: &TextLlmOutput) -> Option<String> {
     let decode = out.decode.as_ref()?;
     if decode.proposer != ProposerKind::BlockDraft || decode.draft.is_none() {
         return Some(format!(
@@ -305,20 +302,48 @@ fn ran_as_asked(what: &str, tokens: usize, out: &TextLlmOutput) -> Option<String
             decode.proposer
         ));
     }
-    if let Some(f) = decode.fallbacks.iter().find(|f| f.contains("block_draft")) {
-        return Some(format!("{what}: fell back: {f}"));
-    }
-    let verified = 1 + decode.verify_steps + decode.accepted_tokens;
-    (tokens as u64 > verified).then(|| {
-        format!("{what}: {tokens} tokens committed, only {verified} verified by the target")
+    decode
+        .fallbacks
+        .iter()
+        .find(|f| f.contains("block_draft"))
+        .map(|f| format!("{what}: fell back: {f}"))
+}
+
+/// The greedy tokens a `block_draft` stream must share with the same provider's speculation-off
+/// stream before they may part. Greedy speculative decoding commits exactly the target's own
+/// greedy tokens, so the two streams agree until a multi-token verify rounds a few BF16 ULPs
+/// differently from the single-token step on a near-tie (the drift the module docs describe;
+/// exact agreement is proven on the tiny fixtures, through the provider too). A commit of a draft
+/// the target did not verify parts them at the first wrong draft — with a quarter or more of the
+/// drafts accepted, within the first few passes — so an early split fails. 16 tokens is a judgment,
+/// not a measurement: a near-tie flip inside it would fail a correct run, so a failure here
+/// prints both streams for that call.
+const MIN_GREEDY_AGREEMENT: usize = 16;
+
+/// Why a greedy `block_draft` stream `ids` parts from the speculation-off stream `off` too early
+/// ([`MIN_GREEDY_AGREEMENT`]), after printing where they first differ. `None`: they agree that far.
+fn agrees_with_off(what: &str, ids: &[u32], off: &[u32]) -> Option<String> {
+    let first = ids.iter().zip(off).position(|(a, b)| a != b);
+    let shorter = ids.len().min(off.len());
+    println!(
+        "{what}: first difference from off at {first:?} ({} against {} tokens)",
+        ids.len(),
+        off.len()
+    );
+    let agreed = first.unwrap_or(shorter);
+    (agreed < MIN_GREEDY_AGREEMENT.min(shorter)).then(|| {
+        format!(
+            "{what}: parts from off at token {agreed}, inside the first {MIN_GREEDY_AGREEMENT}: \
+             {ids:?} against {off:?}"
+        )
     })
 }
 
 /// Load the 27B with the `format` draft and run an image + text request with it (SW-7198 AC1):
 /// greedy and seeded sampled (which must reproduce), each with no `block_draft` fallback, the
-/// draft named, every committed token verified by the target, and the acceptance floors held;
-/// it reports where the greedy stream first differs from the same provider with speculation off.
-/// Every arm runs and prints before any check fails.
+/// draft named, and the acceptance floors held; the greedy stream agrees with the same provider's
+/// speculation-off stream for at least [`MIN_GREEDY_AGREEMENT`] tokens (the target's own greedy
+/// tokens) and reports where it first differs. Every arm runs and prints before any check fails.
 fn image_request_runs_the_block_draft(format: BlockDraftFormat, source_var: &str) {
     let name = format.label();
     let (provider, depth, label) = load(source_var, None);
@@ -338,15 +363,16 @@ fn image_request_runs_the_block_draft(format: BlockDraftFormat, source_var: &str
         &provider,
         &image_request(Speculative::Off, Sampling::greedy()),
     );
-    let first = ids.iter().zip(&off).position(|(a, b)| a != b);
     println!(
-        "BLOCK_DRAFT_IMAGE {name} ({label}) depth {depth}: first difference from off at {first:?} \
-         ({} against {} tokens), fallbacks {:?}, text {:?}",
-        ids.len(),
-        off.len(),
+        "BLOCK_DRAFT_IMAGE {name} ({label}) depth {depth}: fallbacks {:?}, text {:?}",
         out.decode.as_ref().map(|d| &d.fallbacks),
         out.text,
     );
+    failures.extend(agrees_with_off(
+        &format!("BLOCK_DRAFT_IMAGE {name} greedy"),
+        &ids,
+        &off,
+    ));
     let named = out.decode.as_ref().and_then(|d| d.draft.clone());
     if named
         .as_ref()
@@ -355,19 +381,11 @@ fn image_request_runs_the_block_draft(format: BlockDraftFormat, source_var: &str
     {
         failures.push(format!("{name} image: the draft is named {named:?}"));
     }
-    failures.extend(ran_as_asked(
-        &format!("{name} image greedy"),
-        ids.len(),
-        &out,
-    ));
+    failures.extend(ran_as_asked(&format!("{name} image greedy"), &out));
     failures.extend(check(&format!("{name} image greedy"), ids.len(), out));
     let (a, out) = generate(&provider, &image_request(block, sampled));
     let (b, _) = generate(&provider, &image_request(block, sampled));
-    failures.extend(ran_as_asked(
-        &format!("{name} image sampled"),
-        a.len(),
-        &out,
-    ));
+    failures.extend(ran_as_asked(&format!("{name} image sampled"), &out));
     failures.extend(check(&format!("{name} image sampled"), a.len(), out));
     if a != b {
         failures.push(format!(
@@ -440,8 +458,9 @@ fn tree_ran_as_asked(
             tree.max_rows, tree.tree_passes
         ));
     }
-    // The accepted branch only: every pass and every accepted candidate counted once, each tree
-    // pass feeding its anchor and at least one candidate, accepted at most down one branch.
+    // The report's own consistency (bookkeeping, not proof of the committed tokens — the greedy
+    // agreement with `off` is that): every pass and every accepted candidate counted once, each
+    // tree pass feeding its anchor and at least one candidate.
     if tree.passes != decode.verify_steps
         || tree.accepted_tokens != decode.accepted_tokens
         || tree.tree_rows_verified <= tree.tree_passes
@@ -466,12 +485,14 @@ fn tree_ran_as_asked(
 
 /// Load the 27B with the `format` draft and run the same text request under a 16-row tree and
 /// then linearly, greedy and seeded sampled (SW-7198 AC2): each tree run verifies branching trees
-/// with no tree or `block_draft` fallback, commits only verified tokens down the accepted branch
-/// (its pass figures agree with the run's), runs each tree pass eager through the graph runner and
-/// holds [`MIN_TOKENS_PER_PASS`]; the linear runs after it hold both floors and replay their
-/// captured graphs again; a seeded sampled tree run reproduces. Prints both runs' tokens per pass,
-/// the tree's rows checked and tokens accepted per pass, and where the greedy tree stream first
-/// differs from the linear one. Every arm runs and prints before any check fails.
+/// with no tree or `block_draft` fallback, its tree report consistent with the run's counts,
+/// runs each tree pass eager through the graph runner and holds [`MIN_TOKENS_PER_PASS`]; the
+/// greedy tree stream agrees with speculation off for at least [`MIN_GREEDY_AGREEMENT`] tokens
+/// (the target's own greedy tokens: the accepted branch only); the linear runs after it hold
+/// both floors and replay their captured graphs again; a seeded sampled tree run reproduces.
+/// Prints both runs' tokens per pass, the tree's rows checked and tokens accepted per pass, and
+/// where the greedy tree stream first differs from off and from the linear one. Every arm runs
+/// and prints before any check fails.
 fn tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_var: &str) {
     let name = format.label();
     let (provider, depth, _) = load(source_var, None);
@@ -487,10 +508,14 @@ fn tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_var: &s
         ..request(block, sampling)
     };
     let mut failures = Vec::new();
+    let (off, _) = generate(&provider, &request(Speculative::Off, Sampling::greedy()));
     for (mode, sampling) in [("greedy", Sampling::greedy()), ("sampled", sampled)] {
         let (tree_ids, out) = generate(&provider, &verified(sampling, tree));
         let what = format!("{name} {mode} tree depth {depth}");
-        failures.extend(ran_as_asked(&what, tree_ids.len(), &out));
+        failures.extend(ran_as_asked(&what, &out));
+        if mode == "greedy" {
+            failures.extend(agrees_with_off(&what, &tree_ids, &off));
+        }
         failures.extend(tree_ran_as_asked(&what, tree_ids.len(), &out, 16));
         if mode == "sampled" {
             let (again, _) = generate(&provider, &verified(sampling, tree));
@@ -503,7 +528,7 @@ fn tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_var: &s
         let (linear_ids, out) = generate(&provider, &verified(sampling, SpeculativeVerify::Linear));
         let what = format!("{name} {mode} linear depth {depth}");
         let replayed = out.decode.as_ref().map_or(0, |d| d.cuda_graphs.replayed);
-        failures.extend(ran_as_asked(&what, linear_ids.len(), &out));
+        failures.extend(ran_as_asked(&what, &out));
         failures.extend(check(&what, linear_ids.len(), out));
         if replayed == 0 {
             failures.push(format!(

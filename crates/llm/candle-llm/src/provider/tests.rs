@@ -65,14 +65,15 @@ fn a_loaded_decoder_advertises_tree_verification_and_a_tree_is_priced() {
             one_branch.label()
         );
     }
-    // A block draft builds branching trees (SW-7198): its tree is priced, and every extra row
-    // also carries its tapped layer outputs.
+    // A block draft builds branching trees (SW-7198): its tree is priced, and its eager tree
+    // forward also holds every tree row's tapped layer outputs.
     let block = ProposerKind::BlockDraft;
     let plain = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 0).unwrap();
     let tapped = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 256).unwrap();
-    let extra = super::tree_extra_positions(4, 16) as u64;
+    let element = provider.model.step_memory_geometry(4).element_bytes;
     assert_eq!(plain, tree);
-    assert_eq!(tapped - plain, extra * 256 * 4);
+    // Every tree row's taps — the anchor and 16 candidates — and the accepted branch's copy.
+    assert_eq!(tapped - plain, 17 * 256 * element * 2);
     // The request resolves against the advertisement: a tree needs a running proposer.
     let verify = core_llm::SpeculativeVerify::Tree { max_rows: 40 };
     let run = core_llm::resolve_tree_verify(

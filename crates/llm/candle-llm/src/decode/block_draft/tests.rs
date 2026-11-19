@@ -1502,14 +1502,23 @@ fn block_draft_tree_context_is_the_accepted_path() {
 /// first three tokens over seeded runs (the second and third from one tree pass of depth 2)
 /// matches the target's chain rule by a chi-square test, plain, under the constraint mask, and
 /// with repetition and presence penalties (each branch row scored against its own ancestor path).
+/// The target and the drafts lean on the same few ids ([`tiny_target_biased_on`],
+/// [`tiny_draft_damped_on`]), so most committed tokens are accepted drafts and the test is
+/// sensitive to the `q` each was drawn from; the constrained arm forbids two of the leaned-on ids.
+///
+/// [`tiny_target_biased_on`]: crate::models::block_draft::tests::tiny_target_biased_on
+/// [`tiny_draft_damped_on`]: crate::models::block_draft::tests::tiny_draft_damped_on
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn sampled_block_draft_tree_keeps_the_target_distribution() {
     let (_guard, device) = proof_device();
-    let model = tiny_target_on(&device, true);
+    // A target whose draft agrees with it often (both put most mass on the same few ids), so most
+    // committed tokens are accepted drafts — whose law depends on the `q` each was drawn from —
+    // rather than residual draws.
+    let model = crate::models::block_draft::tests::tiny_target_biased_on(&device);
     let plain_params = SamplingParams {
         temperature: 1.0,
-        top_k: 4,
+        top_k: 6,
         top_p: 1.0,
         ..SamplingParams::default()
     };
@@ -1522,7 +1531,11 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
     for format in BlockDraftFormat::ALL {
         let mut cfg = tiny_config(format);
         cfg.head_topk = 32;
-        let draft = tiny_draft_on(cfg, Some(BlockDraftPrecision::Q8), &device);
+        let draft = crate::models::block_draft::tests::tiny_draft_damped_on(
+            cfg,
+            Some(BlockDraftPrecision::Q8),
+            &device,
+        );
         let target = TappedQwen35::for_draft(&model, &draft);
         let prompt = &PROMPT[..6];
         for (forbidden, params) in [
@@ -1530,6 +1543,16 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
             (&[1usize, 9][..], plain_params),
             (&[][..], penalized_params),
         ] {
+            // The constraint matters: without it the target puts real mass on the forbidden ids.
+            let unmasked: f64 = target_dist(&model, prompt, &params, None)
+                .iter()
+                .filter(|&&(t, _)| forbidden.contains(&(t as usize)))
+                .map(|&(_, p)| p)
+                .sum();
+            assert!(
+                forbidden.is_empty() || unmasked > 0.1,
+                "{format:?}: the forbidden ids carry {unmasked:.3} of the unmasked mass"
+            );
             let mask = Forbid::new(forbidden).allow;
             let masked = (!forbidden.is_empty()).then_some(mask.as_slice());
             let mut expected: HashMap<[i32; 3], f64> = HashMap::new();
@@ -1545,6 +1568,7 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
             let n = 2000u64;
             let mut counts: HashMap<[i32; 3], u64> = HashMap::new();
             let (mut tree_passes, mut proposed, mut accepted) = (0u64, 0u64, 0u64);
+            let mut tree_accepted = 0u64;
             for seed in 0..n {
                 let mut cfg = config(4, seed);
                 cfg.sampling = params;
@@ -1563,11 +1587,21 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
                 let t = &run.output.tokens;
                 assert!(t.iter().all(|&x| !forbidden.contains(&(x as usize))));
                 *counts.entry([t[0], t[1], t[2]]).or_default() += 1;
-                tree_passes += tree_report(&run, format.label()).tree_passes;
+                let report = tree_report(&run, format.label());
+                tree_passes += report.tree_passes;
+                tree_accepted += report.tree_accepted_tokens;
                 proposed += run.record.proposed_tokens;
                 accepted += run.record.accepted_tokens;
             }
             assert!(tree_passes > 0, "{format:?}: branching trees verified");
+            // Most committed tokens are accepted drafts (measured 1.57–1.81 of the 2 a depth-2 pass
+            // can accept), so a stored `q` other than the one a draft was drawn from moves the
+            // law (a square-rooted `q` measured chi-square 670 against a critical 87).
+            let accepted_per_tree_pass = tree_accepted as f64 / tree_passes as f64;
+            assert!(
+                accepted_per_tree_pass >= 1.0,
+                "{format:?} forbidden {forbidden:?}: {accepted_per_tree_pass:.2} accepted per tree pass"
+            );
             assert!(
                 accepted > 0 && proposed > accepted,
                 "{format:?}: {proposed} proposed, {accepted} accepted"
@@ -1601,7 +1635,8 @@ fn sampled_block_draft_tree_keeps_the_target_distribution() {
             println!(
                 "BLOCK_DRAFT_TREE_SAMPLED {format:?} forbidden {forbidden:?} penalties {}: \
                  chi-square {chi2:.1} over {cells} cells (critical {critical:.1}); {tree_passes} \
-                 tree passes, {accepted}/{proposed} accepted",
+                 tree passes, {accepted_per_tree_pass:.2} accepted per tree pass, \
+                 {accepted}/{proposed} accepted",
                 params.repetition_penalty != 1.0
             );
             assert!(

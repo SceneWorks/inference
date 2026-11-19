@@ -87,6 +87,52 @@ pub(crate) fn tiny_target_quantized_on(
     Qwen35Model::from_weights_with(&w, "model.language_model", cfg, quant).unwrap()
 }
 
+/// The ids [`tiny_target_biased_on`] boosts, most first.
+pub(crate) const BIASED_IDS: [usize; 6] = [1, 9, 3, 14, 22, 30];
+
+/// [`tiny_target_on`] (random embedding and head) with every embedding row carrying one shared
+/// direction and the head rows of [`BIASED_IDS`] aligned with it, by decreasing strength (SW-7198).
+/// The direction rides the residual stream of the target and of a block draft (which embeds its
+/// block with the target's embedding and scores its rows with the target's head) alike, so both
+/// put most of their mass on those ids whatever the context: a draft that agrees with the target
+/// often, as a trained one does — what a sampled acceptance proof needs to be sensitive to the
+/// proposal distribution it divides by.
+pub(crate) fn tiny_target_biased_on(device: &Device) -> Qwen35Model {
+    let cfg = tiny_target_config();
+    let hidden = 64usize;
+    let mut tensors = synthetic_weights(&cfg).into_map();
+    let mut rng = SplitMix64::new(0x7198_B1A5);
+    let direction = |i: usize| if i.is_multiple_of(2) { 0.25f32 } else { -0.25 };
+    let embed: Vec<f32> = (0..TINY_VOCAB * hidden)
+        .map(|i| (rng.next_f32() - 0.5) * 0.8 + 6.0 * direction(i % hidden))
+        .collect();
+    let head: Vec<f32> = (0..TINY_VOCAB * hidden)
+        .map(|i| {
+            let (row, col) = (i / hidden, i % hidden);
+            let boost = BIASED_IDS
+                .iter()
+                .position(|&id| id == row)
+                .map_or(0.0, |rank| 0.3 - 0.04 * rank as f32);
+            (rng.next_f32() - 0.5) * 0.8 + boost * direction(col)
+        })
+        .collect();
+    for (name, data) in [
+        ("model.language_model.embed_tokens.weight", embed),
+        ("lm_head.weight", head),
+    ] {
+        tensors.insert(
+            name.into(),
+            Tensor::from_vec(data, (TINY_VOCAB, hidden), &Device::Cpu).unwrap(),
+        );
+    }
+    let tensors = tensors
+        .into_iter()
+        .map(|(k, t)| (k, t.to_device(device).unwrap()))
+        .collect();
+    let w = Weights::from_map(tensors, device.clone());
+    Qwen35Model::from_weights_with(&w, "model.language_model", cfg, None).unwrap()
+}
+
 /// The tiny target loaded as a Prism snapshot whose LM head (and every other matrix) stayed
 /// dense: its registry packs one tensor no projection reads, so only the load is Prism.
 pub(crate) fn tiny_prism_target() -> Qwen35Model {
@@ -724,4 +770,30 @@ fn the_dynamic_convolution_is_the_reference_grouped_causal_sum() {
             }
         }
     }
+}
+
+/// [`tiny_draft_on`] with every matrix but the norms scaled by a tenth, so the draft's layers
+/// barely move its residual stream — the target's embedding of its block, which over
+/// [`tiny_target_biased_on`] carries the boosted direction — and its rows score like the target's
+/// (SW-7198: most of a sampled tree's drafts are accepted).
+pub(crate) fn tiny_draft_damped_on(
+    cfg: BlockDraftConfig,
+    precision: Option<BlockDraftPrecision>,
+    device: &Device,
+) -> BlockDraft {
+    let tensors = tiny_tensors(&cfg)
+        .into_iter()
+        .map(|(k, t)| {
+            let scaled = t.dtype() == DType::F32 && t.rank() == 2 && !k.contains("norm");
+            (k, if scaled { (t * 0.1).unwrap() } else { t })
+        })
+        .collect();
+    BlockDraft::from_source(
+        &DraftSource::Map(tensors),
+        cfg,
+        precision,
+        device,
+        crate::device::compute_dtype(device),
+    )
+    .unwrap()
 }

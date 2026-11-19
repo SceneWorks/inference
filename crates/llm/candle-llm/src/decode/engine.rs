@@ -293,6 +293,24 @@ impl DraftSampler<'_, '_> {
     }
 }
 
+#[cfg(test)]
+impl<'a, 'c> DraftSampler<'a, 'c> {
+    /// A sampler over `config`, `rng` and `constraint` with host-sampled drafts — for unit tests
+    /// of a proposal builder that run no model.
+    pub(crate) fn for_tests(
+        config: &'a GenerationConfig,
+        rng: &'a mut SplitMix64,
+        constraint: Option<&'a mut (dyn RewindableConstraintMask + 'c)>,
+    ) -> Self {
+        Self {
+            config,
+            rng,
+            constraint,
+            device_greedy: false,
+        }
+    }
+}
+
 /// A block draft's scored row as dense host `[1, width]` logits: `scores` at `candidates`, `-inf`
 /// elsewhere.
 fn dense_row(candidates: &[i32], scores: &[f32], width: usize) -> Result<Tensor> {

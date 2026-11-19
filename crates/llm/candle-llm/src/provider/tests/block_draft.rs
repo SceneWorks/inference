@@ -339,3 +339,142 @@ fn a_resident_block_draft_runs_block_draft_and_is_named() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::block_draft::a_resident_block_draft_runs_block_draft_and_is_named");
 }
+
+/// With the graph runner off, a `block_draft` route's eager verify steps still stage their tapped
+/// rows, and they are priced (SW-7198 review): the request beside the target
+/// ([`block_draft_request_bytes`] over [`core_llm::BlockDraftConfig::request_bytes`]) holds the
+/// prompt's tapped rows (capped at the window) and a verify step's `K + 1`, `tap_width` wide, on
+/// top of the target's own price.
+#[test]
+fn an_eager_block_draft_route_prices_its_tapped_rows() {
+    let dir = draft_dir(&dspine_config_json(), true);
+    let mut provider = hybrid_provider(tiny_target());
+    provider.attach_draft(&spec(&dir, None), &Device::Cpu, None);
+    let block = provider.block_draft.as_ref().unwrap();
+    let tap = block.model.config().tap_width() as u64;
+    let window = block.model.config().context_rows().unwrap() as u64;
+    let route = DecodeRoute::Engine {
+        proposer: ProposerKind::BlockDraft,
+        drafts: 3,
+    };
+    let beside = provider.draft_bytes(route, 12, 16).unwrap();
+    assert!(beside >= (12u64.min(window) + 4) * tap * 2, "{beside}");
+    let target =
+        priced_request_bytes_tapped(&provider.model, route, 12, 16, 0, false, Some(tap)).unwrap();
+    let _graphs = crate::decode::cuda_graphs_scope(Some(false));
+    assert_eq!(
+        provider.request_bytes(route, 12, 16, 0),
+        Some(target + beside)
+    );
+}
+
+/// The tiny target ([`tiny_target_on`]'s random-head hybrid, 64 wide over 50 ids) with a
+/// [`synthetic_vision_tower`](super::synthetic_vision_tower) written as a Qwen3.5 VLM snapshot
+/// (keep the directory alive): the image fixture the tiny drafts fit.
+fn tiny_vl_target_snapshot() -> tempfile::TempDir {
+    use crate::primitives::sampler::{SplitMix64, TokenRng};
+    let mut json = crate::models::qwen35::tests::cfg_json();
+    json["text_config"]["hidden_size"] = 64.into();
+    json["text_config"]["intermediate_size"] = 128.into();
+    json["text_config"]["mtp_num_hidden_layers"] = 0.into();
+    // Room for the 64 image tokens beside the prompt and the continuation.
+    json["text_config"]["max_position_embeddings"] = 512.into();
+    let cfg = crate::models::Qwen35Config::from_json(&json).unwrap();
+    let vocab = cfg.vocab_size as usize;
+    let mut tensors = crate::models::qwen35::tests::synthetic_weights(&cfg).into_map();
+    let mut rng = SplitMix64::new(0x7193_7A26);
+    for name in ["lm_head.weight", "model.language_model.embed_tokens.weight"] {
+        let data: Vec<f32> = (0..vocab * 64)
+            .map(|_| (rng.next_f32() - 0.5) * 0.8)
+            .collect();
+        tensors.insert(
+            name.into(),
+            Tensor::from_vec(data, (vocab, 64), &Device::Cpu).unwrap(),
+        );
+    }
+    let (vision_config, vision) = super::synthetic_vision_tower(64);
+    tensors.extend(vision);
+    let config = serde_json::json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "image_token_id": super::vl_special_ids(vocab).1,
+        "text_config": json["text_config"],
+        "vision_config": vision_config,
+    });
+    super::write_vl_snapshot(&config, &tensors, vocab)
+}
+
+/// SW-7198 AC1 through the provider: a Qwen3.5 VLM with a resident draft of either format runs a
+/// greedy image + text `block_draft` request — the image at the head of the prompt and mid-prompt
+/// — that decodes exactly `off`'s stream: the provider prefills the fused prompt tapped at the
+/// draft's layers, warms the draft from those rows and shifts its positions by the prompt's
+/// M-RoPE delta, and the report names the draft with no `block_draft` fallback. The same request
+/// under a tree bound verifies linearly, by name (the multimodal rule), and is still `off`'s.
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn a_block_draft_decodes_an_image_request_as_off_does() {
+    use core_llm::SpeculativeVerify;
+    let (_guard, _device) = proof_device();
+    let target = tiny_vl_target_snapshot();
+    for config in [dspine_config_json(), dflash2_config_json()] {
+        let format = format_of(&config);
+        let draft = draft_dir(&config, true);
+        let spec = LoadSpec::dense(target.path().to_string_lossy())
+            .with_draft(draft.path().to_string_lossy());
+        let provider = LlamaProvider::load(&spec).unwrap();
+        assert!(provider.descriptor.capabilities.supports_vision);
+        assert!(
+            provider.block_draft.is_some(),
+            "{:?}",
+            provider.draft_report
+        );
+        let block = Speculative::proposer(SpeculativeProposer::BlockDraft, 3);
+        let (mut proposed, mut accepted) = (0, 0);
+        for prompt in super::image_fixture_prompts() {
+            let label = format!("{format:?} {}", prompt.id);
+            let req = |speculative| {
+                core_llm_testkit::bench_request(&prompt, speculative, &Sampling::greedy(), 24)
+            };
+            let (on, out) = super::token_events(&provider, &req(block));
+            let (off, _) = super::token_events(&provider, &req(Speculative::Off));
+            assert_eq!(on, off, "{label}: the off stream");
+            assert!(
+                out.usage.prompt_tokens > 64,
+                "{label}: the image tokens are in the prompt"
+            );
+            let report = out.decode.unwrap();
+            assert_eq!(report.proposer, ProposerKind::BlockDraft, "{label}");
+            assert_eq!(report.draft.unwrap().format, format.label(), "{label}");
+            assert!(
+                report.fallbacks.iter().all(|f| !f.contains("block_draft")),
+                "{label}: {:?}",
+                report.fallbacks
+            );
+            assert!(report.verify_steps > 0, "{label}");
+            proposed += report.proposed_tokens;
+            accepted += report.accepted_tokens;
+
+            let tree = TextLlmRequest {
+                speculative_verify: SpeculativeVerify::Tree { max_rows: 16 },
+                ..req(block)
+            };
+            let (treed, out) = super::token_events(&provider, &tree);
+            assert_eq!(treed, off, "{label}: under a tree bound");
+            let report = out.decode.unwrap();
+            assert_eq!(report.proposer, ProposerKind::BlockDraft, "{label}");
+            assert!(
+                report
+                    .fallbacks
+                    .iter()
+                    .any(|f| f == super::super::TREE_MULTIMODAL_LINEAR),
+                "{label}: {:?}",
+                report.fallbacks
+            );
+        }
+        assert!(proposed > 0, "{format:?}: the draft proposed");
+        println!("{format:?}: {accepted} of {proposed} drafts accepted on the image prompts");
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does");
+}

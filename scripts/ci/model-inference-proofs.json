@@ -117900,7 +117900,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_is_the_plain_loop@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -117957,7 +117957,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_greedy_block_draft_drafts_the_same_with_cuda_graphs_on_and_off@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118027,7 +118027,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_non_causal_draft_scores_its_rows_over_the_whole_block@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118097,7 +118097,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::the_rolled_back_state_is_the_committed_sequence@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118167,7 +118167,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::a_cold_prompt_context_is_the_context_verify_steps_build@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118237,7 +118237,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_keeps_the_target_distribution@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118307,7 +118307,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_is_the_plain_loop@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_image_block_draft_is_the_plain_loop@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118377,7 +118377,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_draft_context_follows_the_target_positions@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::image_draft_context_follows_the_target_positions@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118447,7 +118447,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::greedy_block_draft_tree_is_the_plain_loop@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118517,7 +118517,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::block_draft_tree_context_is_the_accepted_path@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118544,7 +118544,7 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution; source setup helpers=proof_device,tiny_target_on,tiny_config,tiny_draft_on,run_block_tree,tree_report,target_dist,Forbid,config; source-bound asset/control facts below",
+    "fixture_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution; source setup helpers=proof_device,tiny_target_biased_on,tiny_config,tiny_draft_damped_on,run_block_tree,tree_report,target_dist,Forbid,config; source-bound asset/control facts below",
     "configuration_source": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
@@ -118587,7 +118587,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::sampled_block_draft_tree_keeps_the_target_distribution@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118657,7 +118657,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@eefc855fc028391318aced5c7247c723abc0d320a9b135d22efc1090de87bc77",
+      "source_identity": "crates/llm/candle-llm/src/decode/block_draft/tests.rs::decode::block_draft::tests::an_aborted_or_cancelled_block_draft_tree_leaves_both_caches_clean@780fa0ee0a73d37fa39962f1d3b90dfa99369758a09e93917705ada4beb98886",
       "requirements": []
     }
   },
@@ -118727,7 +118727,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@05f29e32c3589951411e8535daf2ac4ffc82bc451d1eb6d31fc946b77375b059",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_selector_table_is_the_reference_edge_score@7a109586afaf4ee9fb9f08cc0e556e0593366f572fd399dde3496fc465ecc7a9",
       "requirements": []
     }
   },
@@ -118797,7 +118797,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@05f29e32c3589951411e8535daf2ac4ffc82bc451d1eb6d31fc946b77375b059",
+      "source_identity": "crates/llm/candle-llm/src/models/block_draft/tests.rs::models::block_draft::tests::the_dspine_table_is_the_reference_refinement_under_every_head_access@7a109586afaf4ee9fb9f08cc0e556e0593366f572fd399dde3496fc465ecc7a9",
       "requirements": []
     }
   },
@@ -118867,7 +118867,77 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_resident_block_draft_runs_block_draft_and_is_named@ce2e1269a26cfe869cbdce7ed3ab16e30a20240cd898b43eebf48a34cd481599",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_resident_block_draft_runs_block_draft_and_is_named@3872078373fa399c2aad081feac523941d676f647459e21e2a11963f0e60a7e7",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "fqn": "provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does",
+    "source": "crates/llm/candle-llm/src/provider/tests/block_draft.rs",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does; source setup helpers=proof_device,tiny_vl_target_snapshot,synthetic_vision_tower,write_vl_snapshot,draft_dir,tiny_tensors,image_fixture_prompts,token_events; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "source-fixed-candle-cpu",
+    "configurations": {
+      "source-fixed-candle-cpu": {
+        "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does/source-fixed-candle-cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      },
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does/source-fixed-candle-cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests/block_draft.rs::provider::tests::block_draft::a_block_draft_decodes_an_image_request_as_off_does@3872078373fa399c2aad081feac523941d676f647459e21e2a11963f0e60a7e7",
       "requirements": []
     }
   },
@@ -119000,7 +119070,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@c1a2be16c5a71647643620778f4d43d7b7b6c9ab27a4a78ddfce59c57197b8bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@075f45c5b1e377658d0afb515a429d451d82936e38bb9c5604eb320205a39993",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119118,7 +119188,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@c1a2be16c5a71647643620778f4d43d7b7b6c9ab27a4a78ddfce59c57197b8bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@075f45c5b1e377658d0afb515a429d451d82936e38bb9c5604eb320205a39993",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119236,7 +119306,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_runs_on_an_image_request@c1a2be16c5a71647643620778f4d43d7b7b6c9ab27a4a78ddfce59c57197b8bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_runs_on_an_image_request@075f45c5b1e377658d0afb515a429d451d82936e38bb9c5604eb320205a39993",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119354,7 +119424,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_tree_verifies_its_candidates@c1a2be16c5a71647643620778f4d43d7b7b6c9ab27a4a78ddfce59c57197b8bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_tree_verifies_its_candidates@075f45c5b1e377658d0afb515a429d451d82936e38bb9c5604eb320205a39993",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119472,7 +119542,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_runs_on_an_image_request@c1a2be16c5a71647643620778f4d43d7b7b6c9ab27a4a78ddfce59c57197b8bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_runs_on_an_image_request@075f45c5b1e377658d0afb515a429d451d82936e38bb9c5604eb320205a39993",
       "requirements": [
         {
           "slot": "target-weights",
@@ -119590,7 +119660,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_tree_verifies_its_candidates@c1a2be16c5a71647643620778f4d43d7b7b6c9ab27a4a78ddfce59c57197b8bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_tree_verifies_its_candidates@075f45c5b1e377658d0afb515a429d451d82936e38bb9c5604eb320205a39993",
       "requirements": [
         {
           "slot": "target-weights",

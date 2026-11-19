@@ -291,9 +291,11 @@ const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not avai
 /// recurrent state (one full state per linear layer per row, held until the branch is kept).
 /// Only a `proposer` that builds branching trees carries that workspace
 /// ([`core_llm::tree_workspace_rows`]); any other's one branch is capped at `drafts` candidates
-/// and verified on the linear path the linear route already prices. A block draft's tree forward
-/// also returns every extra row's tapped layer outputs, `tap_width` elements each (SW-7198; `0`
-/// for any other proposer). `0` without a tree; `None` on overflow.
+/// and verified on the linear path the linear route already prices. A block draft's eager tree
+/// forward also holds the tapped layer outputs of every tree row — the anchor and up to
+/// [`core_llm::MAX_TREE_ROWS`] candidates, `tap_width` elements each at the compute dtype — and
+/// the engine's gather of the accepted branch copies at most as many again (SW-7198; `tap_width`
+/// is `0` for any other proposer). `0` without a tree; `None` on overflow.
 #[allow(clippy::too_many_arguments)]
 fn tree_request_bytes(
     model: &Decoder,
@@ -317,11 +319,12 @@ fn tree_request_bytes(
         .checked_mul(g.head_dim)?
         .checked_mul(g.element_bytes)?
         .checked_mul(2)?;
-    let row = g
-        .hidden_size
-        .checked_add(g.vocab_size)?
-        .checked_add(tap_width)?
-        .checked_mul(4)?;
+    let row = g.hidden_size.checked_add(g.vocab_size)?.checked_mul(4)?;
+    // The tree rows' tap buffer and the accepted branch's gathered copy.
+    let taps = rows
+        .checked_mul(tap_width)?
+        .checked_mul(g.element_bytes)?
+        .checked_mul(2)?;
     let context = u64::try_from(prompt)
         .ok()?
         .checked_add(u64::from(max_new_tokens))?
@@ -336,7 +339,8 @@ fn tree_request_bytes(
     extra
         .checked_mul(kv_position.checked_add(row)?)?
         .checked_add(mask)?
-        .checked_add(states)
+        .checked_add(states)?
+        .checked_add(taps)
 }
 
 /// The CUDA-graph workspace admission charges a request on the engine with `drafts` drafts per
