@@ -79,9 +79,13 @@ The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
                       prepared-Q4 snapshot keeps its own format (see below)
   options             speculative options, the harness's wire form (default ``["off", "auto"]``):
                       ``"off"``, ``"auto"``, ``{"proposer", "depth": N}``, or a path
-                      ``{"proposer", "depth": N | "max", "verify": "linear" |
+                      ``{"proposer", "depth": N | "max" | "recommended", "verify": "linear" |
                       {"tree": {"max_rows": N | "max"}}}`` whose ``"max"`` is the loaded model's
-                      advertised bound (SW-7200, ``core_llm_testkit::BenchOption``)
+                      advertised bound and ``"recommended"`` the depth ``auto`` runs (SW-7200,
+                      ``core_llm_testkit::BenchOption``)
+  memory_cap_gib      positive number (SW-7200): the row's external memory cap, substituted for
+                      ``{cap_gib}`` in ``--guard`` (a guard naming ``{cap_gib}`` refuses a row
+                      without one)
   sampling            ``"greedy"`` (default) or a sampling object
   thinking            ``default`` / ``off`` / ``on`` / ``xhigh`` / ``medium`` / ``low``
   new_tokens, repeats non-negative integers: tokens per request, in-process repeats (default:
@@ -185,6 +189,7 @@ ROW_KEYS = {
     "model",
     "switches",
     "without_mtp",
+    "memory_cap_gib",
 }
 ROW_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 MAX_ROWS = 64
@@ -321,8 +326,11 @@ def _option(option: Any, what: str) -> None:
     mode, a request-wire object, or a path object with a ``"max"``-able depth and a verify layout."""
 
     def bound(value: Any, key: str) -> None:
-        if value != "max" and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-            raise MatrixError(f"{what}: `{key}` must be a positive integer or \"max\", got {value!r}")
+        named = ("max", "recommended") if key == "depth" else ("max",)
+        if value not in named and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise MatrixError(f"{what}: `{key}` must be a positive integer or one of {named}, got {value!r}")
 
     if isinstance(option, str):
         if option not in ("off", "auto"):
@@ -492,6 +500,11 @@ def plan_row(row: Any, environ: dict[str, str], lane: Lane) -> dict[str, Any]:
         "switches": dict(switches),
         "env": knobs,
     }
+    if "memory_cap_gib" in row:
+        cap = row["memory_cap_gib"]
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not 0 < cap <= 1024:
+            raise MatrixError(f"{tag}: memory_cap_gib must be a positive number of GiB, got {cap!r}")
+        planned["memory_cap_gib"] = cap
     if prepare:
         planned["prepare"] = prepare
     if pins:
@@ -1001,11 +1014,17 @@ def run_process(
     directory: Path,
     guard: list[str],
     sha_override: bool,
+    cap_gib: float | None = None,
 ) -> None:
-    """One benchmark process (under ``guard``); raises with the reason it does not count."""
+    """One benchmark process (under ``guard``, its ``{cap_gib}`` the row's cap); raises with the
+    reason it does not count."""
     output = directory / f"{name}.json"
     log = directory / f"{name}.log"
     process_env = {**environ, **knobs, "SPECULATIVE_BENCH_OUTPUT": str(output)}
+    if any("{cap_gib}" in part for part in guard):
+        if cap_gib is None:
+            raise CampaignError("the guard names {cap_gib} and the row sets no memory_cap_gib")
+        guard = [part.replace("{cap_gib}", f"{cap_gib:g}") for part in guard]
     with log.open("wb") as sink:
         result = subprocess.run(
             [*guard, cargo, *cargo_args(lane, run)],
@@ -1029,6 +1048,26 @@ def run_process(
         backend=lane.backend,
         sha_override=sha_override,
     )
+
+
+GUARD_SUMMARY = re.compile(r"^GUARD_SUMMARY (.*)$", re.MULTILINE)
+
+
+def guard_summary(log: Path) -> dict[str, Any] | None:
+    """The external memory guard's closing ``GUARD_SUMMARY key=value …`` line in a process log
+    (``scripts/ci/mlx_tree_guard.py``) as a dict — integers as integers — or ``None``."""
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = GUARD_SUMMARY.findall(text)
+    if not lines:
+        return None
+    out: dict[str, Any] = {}
+    for key, value in re.findall(r'(\w+)=("[^"]*"|\S+)', lines[-1]):
+        value = value.strip('"')
+        out[key] = int(value) if re.fullmatch(r"-?\d+", value) else value
+    return out
 
 
 def write_summary(output: Path, summary: dict[str, Any]) -> None:
@@ -1058,12 +1097,11 @@ def run_plan(
     """Check both checkouts, build them stamped, run every row (processes alternating between the
     runs), and write ``summary.json``. Returns the exit code.
 
-    ``stop_starting_after`` (seconds from the call, builds included) bounds a loaned host
+    ``stop_starting_after`` (seconds from the end of the builds) bounds a loaned host
     (SW-7200): once it has passed, no further benchmark process starts — the one running is
     never interrupted, since signalling a GPU process mid-command-buffer can hang the device —
     the row it stopped in stays ``complete: false`` and the summary records why."""
     clock = clock or __import__("time").monotonic
-    started = clock()
     if plan.get("schema") != CAMPAIGN_SCHEMA or plan.get("document_schema") != SCHEMA:
         print(f"::error::the plan is not a {CAMPAIGN_SCHEMA} plan over {SCHEMA}", file=sys.stderr)
         return 1
@@ -1118,6 +1156,8 @@ def run_plan(
             write_summary(output, summary)
             return 1
 
+    # The budget counts benchmark processes only: it starts once both builds are done.
+    started = clock()
     failed = []
     for row in plan["rows"]:
         directory = output / row["id"]
@@ -1177,6 +1217,7 @@ def run_plan(
                         directory=directory,
                         guard=guard,
                         sha_override=sha_override,
+                        cap_gib=row.get("memory_cap_gib"),
                     )
                     if snapshot_identity(snapshot)["sha256"] != identity:
                         raise CampaignError("the snapshot's content changed during the process")
@@ -1195,6 +1236,7 @@ def run_plan(
                         "error": error,
                         "snapshot_identity": identity,
                         "switches": row["switches"],
+                        "guard": guard_summary(directory / f"{name}.log"),
                     }
                 )
                 write_summary(output, summary)
@@ -2351,17 +2393,19 @@ def path_label(row: dict[str, Any]) -> str:
     """The path a document row measured, from what it asked for: ``off``, ``auto``, the proposer
     (``mtp``, ``prompt_lookup``, ``draft_model``), and for a block draft its format (from the
     report's ``draft``) and verify layout — ``block_draft:dspine:tree``. A path that asked for a
-    tree says so whatever the proposer."""
+    tree says so whatever the proposer; one asked at the recommended depth (the depth ``auto``
+    runs) ends ``@recommended``."""
     requested = row.get("requested")
     if isinstance(requested, str):
         return requested
     proposer = (requested or {}).get("proposer") or (requested or {}).get("mode") or "?"
     verify = row.get("verify") or (requested or {}).get("verify") or "linear"
     tree = isinstance(verify, dict) and "tree" in verify
+    suffix = "@recommended" if (requested or {}).get("depth") == "recommended" else ""
     if proposer == "block_draft":
         fmt = (row.get("draft") or {}).get("format") or "unloaded"
-        return f"block_draft:{fmt}:{'tree' if tree else 'linear'}"
-    return f"{proposer}:tree" if tree else str(proposer)
+        return f"block_draft:{fmt}:{'tree' if tree else 'linear'}{suffix}"
+    return f"{proposer}:tree{suffix}" if tree else f"{proposer}{suffix}"
 
 
 def row_tier(process: Process) -> str:
@@ -2600,11 +2644,16 @@ def summarize_paths(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+AUTO_MTP_PATH = "mtp@recommended"
+
+
 def auto_inputs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per (backend, tier, context, block-draft path): the decode-rate and full-request ratios to
-    ``off`` (geometric means over prompts) and to MTP of the same group (each path's ratio over its
-    own process's ``off``, prompt by prompt), and whether it beat MTP on every prompt — the
-    measured inputs for ``core_llm::AUTO_BLOCK_DRAFT_DECISIONS``. A decision is the reader's, not
+    """Per (backend, tier, context, block draft at its recommended depth, linear — what ``auto``
+    would run): the decode-rate and full-request ratios to ``off`` (geometric means over prompts)
+    and to MTP at its recommended depth in the same group (:data:`AUTO_MTP_PATH`; each path's ratio
+    over its own process's ``off``, prompt by prompt), and whether it beat MTP on every prompt —
+    the measured inputs for ``core_llm::AUTO_BLOCK_DRAFT_DECISIONS``. The ``"max"`` rows answer
+    another question (the most a path can do) and are left out. A decision is the reader's, not
     this report's."""
     by_group: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
     meta: dict[str, dict[str, Any]] = {}
@@ -2618,9 +2667,11 @@ def auto_inputs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             bucket[metric].append(ratio)
     out = []
     for key, paths in sorted(by_group.items()):
-        mtp = paths.get("mtp", {})
+        # What `auto` would choose between: MTP and each block draft at their recommended
+        # depths, linear (auto never turns a tree on).
+        mtp = paths.get(AUTO_MTP_PATH, {})
         for path, prompts in sorted(paths.items()):
-            if not path.startswith("block_draft:"):
+            if not (path.startswith("block_draft:") and path.endswith(":linear@recommended")):
                 continue
             item: dict[str, Any] = {**meta[key], "path": path}
             for metric in ("decode_tok_s", "wall_ms"):
@@ -2645,7 +2696,18 @@ def auto_inputs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def paths_markdown(report: dict[str, Any]) -> str:
     """The report's summary as one table per (backend, tier, context)."""
     gib = 1024**3
-    lines = ["# Speculative paths (SW-7200)", ""]
+    lines = [
+        "# Speculative paths (SW-7200)",
+        "",
+        "Every ratio is against the `off` row of the same process. `draft ms/pass` is the "
+        "proposer's host wall time per call: where the proposal comes back on the host it waited "
+        "for the draft's device work and anything still queued ahead of it (the previous verify), "
+        "so it is an upper bound on the draft's own cost; rows marked `enqueue-only` left their "
+        "drafts on the device (Candle greedy MTP / draft model), so it is a lower bound. Peak "
+        "GiB is the backend's reading (MLX allocator high-water; CUDA device-used at tokens, a "
+        "lower bound) and `+request` what the request added over its start.",
+        "",
+    ]
     for item in report["refusals"]:
         lines.append(f"- refused: {item}")
     for item in report["incomplete"]:
@@ -2696,6 +2758,9 @@ def paths_markdown(report: dict[str, Any]) -> str:
         lines += [
             "",
             "## Block-draft inputs for `auto`",
+            "",
+            f"Each block draft at its recommended depth, linear, against `{AUTO_MTP_PATH}` of "
+            "the same backend, tier and context.",
             "",
             "| backend | tier | context | path | decode ×off | decode ×MTP (min) | request ×MTP | "
             "beats MTP on every prompt (decode / request) |",
@@ -2785,8 +2850,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--stop-starting-after-minutes",
         type=float,
-        help="start no benchmark process once this many minutes (builds included) have passed; "
-        "the running one finishes (a loaned host's budget)",
+        help="start no benchmark process once this many minutes have passed since the builds "
+        "finished; the running one finishes (a loaned host's budget)",
     )
     run_options(run)
 

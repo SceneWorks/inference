@@ -5478,6 +5478,8 @@ jobs:
       DECODE_BENCH_PRE_EPIC_TARGET: ${{ github.workspace }}/../cargo-target-pre-epic
       # SW-7200: where a matrix's `hub:` pins are bound and staged.
       MODEL_PROOF_HUB_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      # SW-7200: the card the campaign is measured on (visible index 1, PCI bus order).
+      DECODE_BENCH_CUDA_UUID: GPU-e4b79931-7be6-f216-460a-f5405cfafffe
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_VISIBLE_DEVICES: "1"
       # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
@@ -5533,6 +5535,9 @@ jobs:
         continue-on-error: true
         shell: cmd
         run: call scripts\ci\real-weights\candle-decode-speedups-bench\record-the-cuda-device-inventory.cmd
+      - name: Require the campaign card at index 1
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\require-the-campaign-card-at-index-1.cmd
       # The runner builds both checkouts first (stamped: `SPECULATIVE_BENCH_BUILD_GIT_SHA`), then
       # alternates the epic and baseline processes per row.
       - name: Build both checkouts and run every matrix row (epic and baseline alternating)
@@ -5553,8 +5558,11 @@ jobs:
   # SW-7200 (feature SW-F360 terminal campaign): the same campaign runner on MLX, epic rows only,
   # for the paired speculative-paths comparison. Dispatch-only on its own profile, on the primary
   # Mac (`rw-starvector`, a loaned host): the runner starts no benchmark process once
-  # DECODE_BENCH_BUDGET_MINUTES have passed and never interrupts the running one (signalling an
-  # MLX process mid-command-buffer can hang the GPU); `timeout-minutes` is only a runaway guard.
+  # DECODE_BENCH_BUDGET_MINUTES have passed since the build and never interrupts the running one
+  # (signalling an MLX process mid-command-buffer can hang the GPU); `timeout-minutes` is only a
+  # runaway guard. Every process runs under scripts/ci/mlx_tree_guard.py at its row's
+  # `memory_cap_gib` (SIGTERM only). The build target is job-owned and persistent on
+  # /Volumes/Models, off the internal disk.
   mlx-decode-speedups-bench:
     needs: validate-selection
     defaults:
@@ -5570,7 +5578,13 @@ jobs:
       DECODE_BENCH_SNAPSHOT_BONSAI_MLX: ${{ vars.BONSAI_MLX_SNAPSHOT }}
       MODEL_PROOF_HUB_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
       DECODE_BENCH_BUDGET_MINUTES: "100"
+      DECODE_BENCH_TARGET_DIR: /Volumes/Models/sceneworks-ci/decode-speedups-bench/cargo-target
     steps:
+      - shell: bash
+        name: Prepare the persistent build target
+        # A pending macOS volume permission must not consume the loan.
+        timeout-minutes: 2
+        run: mkdir -p "$DECODE_BENCH_TARGET_DIR"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Resolve runner-local snapshot paths
         run: >-

@@ -840,20 +840,24 @@ pub const BENCH_DEFAULT_REPEATS: u32 = 3;
 /// request itself — the closest warm-up, and nothing for it to leak.
 pub const BENCH_WARMUP_PROMPT: &str = "Count from one to ten in words, one number per line.";
 
-/// A [`BenchOption`]'s value that may name the loaded model's advertised bound: a number, or
-/// `"max"` — the proposer's `max_depth` / the tree's `max_rows` (SW-7200).
+/// A [`BenchOption`]'s value that may name what the loaded model advertises: a number, `"max"` —
+/// the proposer's `max_depth` / the tree's `max_rows` — or, for a depth, `"recommended"` — the
+/// proposer's `recommended_depth`, the depth `auto` runs it at (SW-7200).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchBound {
     /// Exactly this value.
     Fixed(u32),
     /// The loaded model's advertised maximum.
     Max,
+    /// The loaded model's advertised recommended depth (a depth only).
+    Recommended,
 }
 
 impl BenchBound {
     fn from_wire(value: &Value, key: &str) -> Result<Self, String> {
         match value {
             Value::String(s) if s == "max" => Ok(Self::Max),
+            Value::String(s) if s == "recommended" && key == "depth" => Ok(Self::Recommended),
             v => v
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
@@ -867,15 +871,18 @@ impl BenchBound {
         match self {
             Self::Fixed(n) => json!(n),
             Self::Max => json!("max"),
+            Self::Recommended => json!("recommended"),
         }
     }
 
-    /// The value, with `Max` read as `advertised` (`fallback` when nothing is advertised — the
-    /// request then falls back with the reason named, never a failure).
-    fn resolve(self, advertised: Option<u32>, fallback: u32) -> u32 {
+    /// The value, with `Max` / `Recommended` read as the advertised `(max, recommended)`
+    /// (`fallback` when nothing is advertised — the request then falls back with the reason
+    /// named, never a failure).
+    fn resolve(self, advertised: Option<(u32, u32)>, fallback: u32) -> u32 {
         match self {
             Self::Fixed(n) => n,
-            Self::Max => advertised.unwrap_or(fallback).max(1),
+            Self::Max => advertised.map_or(fallback, |(max, _)| max).max(1),
+            Self::Recommended => advertised.map_or(fallback, |(_, rec)| rec).max(1),
         }
     }
 }
@@ -883,9 +890,10 @@ impl BenchBound {
 /// One option a benchmark runs every prompt under (`SPECULATIVE_BENCH_OPTIONS`): either a
 /// speculative option exactly as the request wire spells it (`"off"`, `"auto"`,
 /// `{"proposer", "depth": N}`), verified linearly — every pre-SW-7200 option — or a **path**
-/// (SW-7200) `{"proposer", "depth": N | "max", "verify": "linear" | {"tree": {"max_rows": N |
-/// "max"}}}` whose `"max"` reads the loaded model's advertised bound, so a campaign row asks for
-/// the advertised depth (the verify bound) on each backend without naming it.
+/// (SW-7200) `{"proposer", "depth": N | "max" | "recommended", "verify": "linear" | {"tree":
+/// {"max_rows": N | "max"}}}` whose `"max"` reads the loaded model's advertised bound and
+/// `"recommended"` its recommended depth, so a campaign row asks for the verify bound — or the
+/// depth `auto` runs — on each backend without naming it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchOption {
     /// A request-wire speculative option, verified linearly.
@@ -990,11 +998,14 @@ impl BenchOption {
                 depth,
                 tree_rows,
             } => {
-                let depth = depth.resolve(caps.proposer(proposer).map(|c| c.max_depth), 1);
+                let advertised = caps
+                    .proposer(proposer)
+                    .map(|c| (c.max_depth, c.recommended_depth));
+                let depth = depth.resolve(advertised, 1);
                 let verify =
                     tree_rows.map_or(SpeculativeVerify::Linear, |rows| SpeculativeVerify::Tree {
                         max_rows: rows.resolve(
-                            caps.tree_verify.map(|t| t.max_rows),
+                            caps.tree_verify.map(|t| (t.max_rows, t.max_rows)),
                             core_llm::MAX_TREE_ROWS,
                         ),
                     });
@@ -2716,8 +2727,17 @@ mod tests {
             }
         );
         let linear = parse(r#"{"proposer": "mtp", "depth": 3, "verify": "linear"}"#).unwrap();
+        let recommended =
+            parse(r#"{"proposer": "block_draft", "depth": "recommended", "verify": "linear"}"#)
+                .unwrap();
         // The wire form round-trips; a plain option is written as the request writes it.
-        for option in [tree, linear, lookup.into(), Speculative::Auto.into()] {
+        for option in [
+            tree,
+            linear,
+            recommended,
+            lookup.into(),
+            Speculative::Auto.into(),
+        ] {
             assert_eq!(BenchOption::from_wire(&option.to_wire()), Ok(option));
         }
         assert_eq!(BenchOption::from(lookup).to_wire(), json!(lookup));
@@ -2726,6 +2746,7 @@ mod tests {
             r#"{"proposer": "block_draft", "depth": 0, "verify": "linear"}"#,
             r#"{"proposer": "block_draft", "depth": 4, "verify": "tree"}"#,
             r#"{"proposer": "block_draft", "depth": 4, "verify": {"tree": {}}}"#,
+            r#"{"proposer": "block_draft", "depth": 4, "verify": {"tree": {"max_rows": "recommended"}}}"#,
             r#"{"proposer": "sometimes", "depth": "max"}"#,
             r#"{"proposer": "mtp", "depth": "max", "format": "dspine"}"#,
             r#""sometimes""#,
@@ -2737,11 +2758,18 @@ mod tests {
             speculative: vec![ProposerCapabilities {
                 proposer: SpeculativeProposer::BlockDraft,
                 max_depth: 4,
-                recommended_depth: 4,
+                recommended_depth: 3,
             }],
             tree_verify: Some(core_llm::TreeVerifyCapabilities { max_rows: 12 }),
             ..Default::default()
         };
+        assert_eq!(
+            recommended.request(&caps),
+            (
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 3),
+                SpeculativeVerify::Linear
+            )
+        );
         assert_eq!(
             tree.request(&caps),
             (

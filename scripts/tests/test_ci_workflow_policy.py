@@ -5654,11 +5654,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "speculative_bench_campaign.py run ",
             '--epic-sha "$GITHUB_SHA"',
             '--stop-starting-after-minutes "$DECODE_BENCH_BUDGET_MINUTES"',
+            '--epic-target-dir "$DECODE_BENCH_TARGET_DIR"',
+            '--guard "python3.12 -I scripts/ci/mlx_tree_guard.py {cap_gib} ',
         ):
             if fragment not in run:
                 errors.append(f"the run step lacks {fragment!r}")
         if "--pre-epic-root" in run:
             errors.append("the MLX lane measures epic rows only")
+        if not str(env.get("DECODE_BENCH_TARGET_DIR", "")).startswith("/Volumes/Models/"):
+            errors.append("the build target is not job-owned on /Volumes/Models")
         upload = next((s for s in steps if s.get("name") == "Keep the decode-speedups benchmark documents"), {})
         if upload.get("if") != "always()" or upload.get("with", {}).get("if-no-files-found") != "error":
             errors.append("the documents upload must survive a failed row, a cancel and a timeout")
@@ -5675,6 +5679,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "Build both checkouts and run every matrix row (epic and baseline alternating)"
         ):
             errors.append("the CUDA lane does not stage the Hub pins before it runs")
+        card = "Require the campaign card at index 1"
+        if cuda.get("env", {}).get("DECODE_BENCH_CUDA_UUID") != "GPU-e4b79931-7be6-f216-460a-f5405cfafffe" or (
+            card not in names
+            or names.index(card)
+            > names.index("Build both checkouts and run every matrix row (epic and baseline alternating)")
+            or cuda["steps"][names.index(card)].get("continue-on-error")
+        ):
+            errors.append("the CUDA lane does not refuse a card other than the campaign's")
         return errors
 
     def test_mlx_decode_speedups_bench_is_dispatch_only_on_the_loaned_mac_and_bounded(self) -> None:
@@ -5690,6 +5702,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             lambda job: job.update({"timeout-minutes": 110}),
             lambda job: job["steps"][-1].pop("if"),
             lambda job: job["defaults"]["run"].update({"shell": "bash"}),
+            lambda job: job["env"].update({"DECODE_BENCH_TARGET_DIR": "target"}),
             lambda job: job["steps"][2].update({"run": job["steps"][2]["run"] + ' && echo "${{ inputs.decode_bench_matrix }}"'}),
         ):
             mutated = copy.deepcopy(workflow)

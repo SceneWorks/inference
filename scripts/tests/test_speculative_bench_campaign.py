@@ -1892,6 +1892,8 @@ TARGET_PIN = f"hub:SceneWorks/qwen3.8-27b-abliterated-mlx@{'7' * 40}/q4"
 DSPINE_PIN = f"hub:SceneWorks/qwen3.8-27b-dspine-b16@{REV}"
 TREE = {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": "max"}}}
 LINEAR = {"proposer": "block_draft", "depth": "max", "verify": "linear"}
+REC_MTP = {"proposer": "mtp", "depth": "recommended", "verify": "linear"}
+REC_BLOCK = {"proposer": "block_draft", "depth": "recommended", "verify": "linear"}
 
 
 class HubPinPlanTests(unittest.TestCase):
@@ -1971,6 +1973,7 @@ class HubPinPlanTests(unittest.TestCase):
         good = [
             "off", "auto", {"proposer": "mtp", "depth": 3}, {"mode": "auto"}, LINEAR, TREE,
             {"proposer": "prompt_lookup", "depth": 4, "verify": {"tree": {"max_rows": 8}}},
+            REC_MTP, REC_BLOCK,
         ]
         self.plan([{"id": "r", "snapshot": TARGET_PIN, "runs": ["epic"], "options": good}])
         for bad in (
@@ -1984,6 +1987,8 @@ class HubPinPlanTests(unittest.TestCase):
             {"proposer": "block_draft", "depth": "max", "verify": "tree"},
             {"proposer": "block_draft", "depth": "max", "verify": {"tree": {}}},
             {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 0}}},
+            {"proposer": "block_draft", "depth": "max",
+             "verify": {"tree": {"max_rows": "recommended"}}},
             {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 4}, "x": 1}},
         ):
             with self.subTest(option=bad), self.assertRaises(campaign.MatrixError):
@@ -2077,10 +2082,15 @@ class PathsReportTests(unittest.TestCase):
                 for prompt, cls, fast in (("code_edit", "predictable", 3.0), ("chat", "open_ended", 1.5))
                 for row in (
                     path_row(prompt, cls, "off", tok_s=10.0, wall=26000.0),
-                    path_row(prompt, cls, {"proposer": "mtp", "depth": "max", "verify": "linear"},
+                    path_row(prompt, cls, REC_MTP,
                              tok_s=15.0, wall=18000.0, proposer="mtp", accepted=1.0, draft_ms=500.0,
                              sync=False),
+                    # The max-depth MTP row is reported, never used for `auto`'s inputs.
+                    path_row(prompt, cls, {"proposer": "mtp", "depth": "max", "verify": "linear"},
+                             tok_s=40.0, wall=7000.0, proposer="mtp", accepted=2.0),
                     path_row(prompt, cls, LINEAR, tok_s=10.0 * fast, wall=26000.0 / fast,
+                             proposer="block_draft", draft=dspine, accepted=fast - 1, draft_ms=900.0),
+                    path_row(prompt, cls, REC_BLOCK, tok_s=10.0 * fast, wall=26000.0 / fast,
                              proposer="block_draft", draft=dspine, accepted=fast - 1, draft_ms=900.0),
                     path_row(prompt, cls, TREE, tok_s=10.0 * fast * 1.1, wall=26000.0 / fast / 1.1,
                              proposer="block_draft", draft=dspine, verify={"tree": {"max_rows": 16}},
@@ -2096,6 +2106,8 @@ class PathsReportTests(unittest.TestCase):
                 for row in (
                     path_row(prompt, cls, "off", tok_s=8.0, wall=32000.0),
                     path_row(prompt, cls, LINEAR, tok_s=8.0 * 1.2, wall=32000.0 / 1.2,
+                             proposer="block_draft", draft=dflash, accepted=0.4, draft_ms=600.0),
+                    path_row(prompt, cls, REC_BLOCK, tok_s=8.0 * 1.2, wall=32000.0 / 1.2,
                              proposer="block_draft", draft=dflash, accepted=0.4, draft_ms=600.0),
                 )
             ], draft_source="/hub/dflash2")
@@ -2154,7 +2166,8 @@ class PathsReportTests(unittest.TestCase):
         dflash = self.summary(report, "block_draft:dflash2:linear")
         self.assertAlmostEqual(dflash["speedup_vs_off"]["decode_tok_s"]["all"], 1.2)
         # The MTP draft time was enqueue-only (drafts left on the device).
-        self.assertFalse(self.summary(report, "mtp")["draft_time_host_synchronized"])
+        self.assertFalse(self.summary(report, "mtp@recommended")["draft_time_host_synchronized"])
+        self.assertAlmostEqual(self.summary(report, "mtp")["speedup_vs_off"]["decode_tok_s"]["all"], 4.0)
         # The draft-model path ran nothing, and says why.
         probe = self.summary(report, "draft_model")
         self.assertEqual(probe["ran"], ["none"])
@@ -2167,15 +2180,20 @@ class PathsReportTests(unittest.TestCase):
     def test_auto_inputs_compare_each_block_draft_with_mtp_through_off(self) -> None:
         report = campaign.paths_report([self.campaign()])
         inputs = {(i["path"], i["context"]): i for i in report["auto_inputs"]}
-        dspine = inputs[("block_draft:dspine:linear", "cold")]["decode_tok_s"]
-        # MTP is 1.5x off in process A; DSpine 3.0x / 1.5x: 2.0x / 1.0x over MTP.
+        # Only what `auto` would run: each block draft at its recommended depth, linear.
+        self.assertEqual(
+            sorted(inputs),
+            [("block_draft:dflash2:linear@recommended", "cold"),
+             ("block_draft:dspine:linear@recommended", "cold")],
+        )
+        dspine = inputs[("block_draft:dspine:linear@recommended", "cold")]["decode_tok_s"]
+        # MTP at its recommended depth is 1.5x off in process A (the 4x max-depth row is not the
+        # comparison); DSpine 3.0x / 1.5x: 2.0x / 1.0x over it.
         self.assertAlmostEqual(dspine["vs_mtp"], math_sqrt(2.0))
         self.assertAlmostEqual(dspine["vs_mtp_min"], 1.0)
         self.assertFalse(dspine["beats_mtp_on_every_prompt"])
-        tree = inputs[("block_draft:dspine:tree", "cold")]["decode_tok_s"]
-        self.assertTrue(tree["beats_mtp_on_every_prompt"])
         # DFlash2's process has no MTP row; its ratio meets MTP's through each process's `off`.
-        dflash = inputs[("block_draft:dflash2:linear", "cold")]["decode_tok_s"]
+        dflash = inputs[("block_draft:dflash2:linear@recommended", "cold")]["decode_tok_s"]
         self.assertAlmostEqual(dflash["vs_mtp"], 0.8)
         self.assertFalse(dflash["beats_mtp_on_every_prompt"])
 
@@ -2238,3 +2256,89 @@ class TimeBudgetTests(unittest.TestCase):
         self.assertEqual(second["processes"], [])
         runs = [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(sum(not r["build"] for r in runs), 2)
+
+
+class GuardTests(unittest.TestCase):
+    """SW-7200: every benchmark process runs under the external memory guard at its row's cap,
+    and the guard's closing summary is kept beside the process."""
+
+    setUp = RunTests.setUp
+
+    def test_the_rows_cap_reaches_the_guard_and_its_summary_is_recorded(self) -> None:
+        guard = self.directory / "summary_guard.py"
+        guard.write_text(textwrap.dedent("""
+            import subprocess, sys
+            cap = sys.argv[1]
+            code = subprocess.call(sys.argv[4:])
+            print(f"GUARD_SUMMARY exit={code} root_lifetime_max_bytes=123"
+                  f" max_process_lifetime_max_bytes=456 cap_gib={cap}", flush=True)
+            sys.exit(code)
+        """), encoding="utf-8")
+        output = self.directory / "out"
+        output.mkdir()
+        rows = [{"id": "q4", "snapshot": "qwen38", "runs": ["epic"], "process_repeats": 1,
+                 "memory_cap_gib": 40}]
+        planned = plan({"rows": rows}, {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})
+        self.assertEqual(planned["rows"][0]["memory_cap_gib"], 40)
+        with mock.patch.dict(os.environ, {"FAKE_RECORD": str(self.record)}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.run_plan(
+                planned, roots={"epic": self.directory / "epic"}, target_dirs={},
+                epic_sha=EPIC_SHA, output=output, cargo=sys.executable,
+                guard=[sys.executable, str(guard), "{cap_gib}", "60", "--"], sha_override=False,
+            )
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(
+            summary["rows"][0]["processes"][0]["guard"],
+            {"exit": 0, "root_lifetime_max_bytes": 123, "max_process_lifetime_max_bytes": 456,
+             "cap_gib": 40},
+        )
+        # A guard that names a cap refuses a row without one.
+        del planned["rows"][0]["memory_cap_gib"]
+        out2 = self.directory / "out2"
+        out2.mkdir()
+        with mock.patch.dict(os.environ, {"FAKE_RECORD": str(self.record)}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.run_plan(
+                planned, roots={"epic": self.directory / "epic"}, target_dirs={},
+                epic_sha=EPIC_SHA, output=out2, cargo=sys.executable,
+                guard=[sys.executable, str(guard), "{cap_gib}", "60", "--"], sha_override=False,
+            )
+        self.assertEqual(code, 1)
+        process = json.loads((out2 / "summary.json").read_text(encoding="utf-8"))["rows"][0]["processes"][0]
+        self.assertIn("memory_cap_gib", process["error"])
+        for bad in (0, -1, True, "40", 2048):
+            with self.subTest(cap=bad), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [{**rows[0], "memory_cap_gib": bad}]},
+                     {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the guard reads macOS process ledgers")
+class MlxTreeGuardTests(unittest.TestCase):
+    """SW-7200: the MLX campaign's external guard refuses without headroom and otherwise runs the
+    command, passing its output through and closing with a parseable summary."""
+
+    GUARD = REPOSITORY / "scripts" / "ci" / "mlx_tree_guard.py"
+
+    def run_guard(self, *args):
+        return subprocess.run([sys.executable, str(self.GUARD), *args], capture_output=True,
+                              text=True, check=False)
+
+    def test_no_headroom_refuses_before_starting(self) -> None:
+        result = self.run_guard("100000", "60", "--", sys.executable, "-c", "print('ran')")
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("ran", result.stdout)
+        self.assertIn("not started", result.stdout)
+
+    def test_a_command_runs_and_the_summary_parses(self) -> None:
+        result = self.run_guard("1", "60", "--", sys.executable, "-c", "print('ran')")
+        if result.returncode == 3:
+            self.skipTest("this host has under 11 GiB free")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ran", result.stdout)
+        log = Path(self.enterContext(tempfile.TemporaryDirectory())) / "p.log"
+        log.write_text(result.stdout, encoding="utf-8")
+        summary = campaign.guard_summary(log)
+        self.assertEqual((summary["exit"], summary["cap_gib"]), (0, 1))
+        self.assertGreater(summary["max_process_lifetime_max_bytes"], 0)
