@@ -315,6 +315,12 @@ pub struct ProjectionCensus {
     /// dequantizes the weight and multiplies the activation densely, never quantizing it
     /// ([`QuantSpec::with_dequantized_forward`]). The rest of `ggml` runs through `QMatMul`.
     pub ggml_weight_only: u64,
+    /// How many of the `ggml` projections hold 4-bit blocks (`Q4_0`, `Q4_1`, `Q4_K`) and 8-bit
+    /// blocks (`Q8_0`, `Q8_1`, `Q8_K`) — the resident bit width, whether quantized at load or
+    /// stored in a prepared snapshot (SW-7200). The rest of `ggml` holds another block type.
+    pub ggml_4bit: u64,
+    /// See [`ggml_4bit`](Self::ggml_4bit).
+    pub ggml_8bit: u64,
 }
 
 impl ProjectionCensus {
@@ -328,6 +334,11 @@ impl ProjectionCensus {
         };
         if let Projection::Quantized(q) = p {
             self.ggml_weight_only += u64::from(q.dequantizes_forward());
+            match q.ggml_dtype().and_then(ggml_bits) {
+                Some(4) => self.ggml_4bit += 1,
+                Some(8) => self.ggml_8bit += 1,
+                _ => {}
+            }
         }
         tally.count += 1;
         tally.params += p.params();
@@ -363,6 +374,35 @@ impl ProjectionCensus {
         self.prism.add(&other.prism);
         self.nvfp4.add(&other.nvfp4);
         self.ggml_weight_only += other.ggml_weight_only;
+        self.ggml_4bit += other.ggml_4bit;
+        self.ggml_8bit += other.ggml_8bit;
+    }
+
+    /// What the quantized projections hold (SW-7200): dense when there are none, the GGML bit
+    /// width when every one is a 4-bit or every one an 8-bit block, NVFP4 when every one is
+    /// NVFP4; unknown for mixed widths or kinds, another block type, or Prism. Dense projections
+    /// beside quantized ones (an LM head) do not make it mixed. A llama.cpp mixed-precision GGUF
+    /// (`Q4_K_M`: `Q4_K` beside `Q6_K`) is deliberately unknown, not `q4`: every recorded
+    /// decision was measured on a uniform-width prepared snapshot, so none applies to it.
+    pub fn resident_quantization(&self) -> core_llm::ResidentQuantization {
+        use core_llm::ResidentQuantization as R;
+        let (ggml, nvfp4, prism) = (self.ggml.count, self.nvfp4.count, self.prism.count);
+        match (ggml, nvfp4, prism) {
+            (0, 0, 0) => R::Dense,
+            (0, _, 0) => R::Nvfp4,
+            (n, 0, 0) if self.ggml_4bit == n => R::Bits(4),
+            (n, 0, 0) if self.ggml_8bit == n => R::Bits(8),
+            _ => R::Unknown,
+        }
+    }
+}
+
+/// The bit width of a 4- or 8-bit GGML block type; `None` for any other.
+fn ggml_bits(dtype: GgmlDType) -> Option<u32> {
+    match dtype {
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q4K => Some(4),
+        GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Q8K => Some(8),
+        _ => None,
     }
 }
 
@@ -817,6 +857,67 @@ mod tests {
         assert_eq!(census.ggml.bits_per_param(), Some(8.5));
         assert_eq!(census.nvfp4, ProjectionTally::default());
         assert_eq!(census.total().count, 2);
+    }
+
+    /// SW-7200: the census reads the resident tier from the GGML block width of every quantized
+    /// projection; a dense LM head beside them does not make it mixed, two widths do.
+    #[test]
+    fn census_resident_quantization_follows_the_block_width() {
+        use core_llm::ResidentQuantization as R;
+        let dev = Device::Cpu;
+        let dense = || Projection::load(ramp(64, 32, 1, &dev), None).unwrap();
+        let q4 = || Projection::load(ramp(64, 256, 2, &dev), Some(QuantSpec::q4())).unwrap();
+        let q4_0 = || Projection::load(ramp(64, 64, 3, &dev), Some(QuantSpec::q4())).unwrap();
+        let q8 = || Projection::load(ramp(64, 64, 4, &dev), Some(QuantSpec::q8())).unwrap();
+        let census = |ps: Vec<Projection>| {
+            let mut c = ProjectionCensus::default();
+            ps.iter().for_each(|p| c.record(p));
+            c
+        };
+        assert_eq!(
+            ProjectionCensus::default().resident_quantization(),
+            R::Dense
+        );
+        assert_eq!(
+            census(vec![dense(), dense()]).resident_quantization(),
+            R::Dense
+        );
+        assert_eq!(
+            census(vec![q4(), q4_0(), dense()]).resident_quantization(),
+            R::Bits(4)
+        );
+        assert_eq!(
+            census(vec![q8(), q8(), dense()]).resident_quantization(),
+            R::Bits(8)
+        );
+        assert_eq!(census(vec![q4(), q8()]).resident_quantization(), R::Unknown);
+        // Merging (a predictor's census) keeps the widths.
+        let mut merged = census(vec![q8()]);
+        merged.merge(&census(vec![q8(), dense()]));
+        assert_eq!(merged.resident_quantization(), R::Bits(8));
+        merged.merge(&census(vec![q4()]));
+        assert_eq!(merged.resident_quantization(), R::Unknown);
+        // NVFP4 alone, and Prism (no tier), from the tallies.
+        let nvfp4 = ProjectionCensus {
+            nvfp4: ProjectionTally {
+                count: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(nvfp4.resident_quantization(), R::Nvfp4);
+        let prism = ProjectionCensus {
+            prism: ProjectionTally {
+                count: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(prism.resident_quantization(), R::Unknown);
+        // A GGML block type that is neither 4- nor 8-bit has no tier.
+        assert_eq!(ggml_bits(GgmlDType::Q6K), None);
+        assert_eq!(ggml_bits(GgmlDType::Q4K), Some(4));
+        assert_eq!(ggml_bits(GgmlDType::Q8_0), Some(8));
     }
 
     /// sc-24140: outside NVFP4, `load_eligible` is exactly `load_as` — whatever the shape.

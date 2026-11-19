@@ -587,6 +587,7 @@ fn only_auto_is_monitored() {
                 (ProposerKind::None, 0),
                 (ProposerKind::DraftModel, 4),
                 (ProposerKind::Mtp, 0),
+                (ProposerKind::BlockDraft, 0),
             ] {
                 assert_eq!(
                     monitor(Speculative::Auto, kind, depth, plain, timed),
@@ -596,6 +597,81 @@ fn only_auto_is_monitored() {
             }
         }
     }
+}
+
+/// SW-7200: `auto`'s block draft keeps auto's guarantee — never measurably slower than plain —
+/// the way MTP and prompt lookup do: with no static threshold measured for it, a timed engine's
+/// monitor probes and judges it on the request's own costs; an untimed engine cannot, so it runs
+/// unmonitored, and an explicit `block_draft` request runs as asked (only `auto` is monitored).
+#[test]
+fn auto_block_draft_is_monitored_on_its_measured_costs() {
+    use crate::{Speculative, SpeculativeProposer};
+    use PlainDecode::{Candle, MlxPipelined, MlxUnpipelined};
+    for plain in [MlxPipelined, MlxUnpipelined, Candle] {
+        assert_eq!(demotion_threshold(ProposerKind::BlockDraft, 4, plain), None);
+        let monitor = AcceptanceMonitor::for_request(
+            Speculative::Auto,
+            ProposerKind::BlockDraft,
+            4,
+            plain,
+            true,
+        )
+        .expect("auto's block draft is monitored on a timed engine");
+        assert_eq!(monitor.threshold(), None);
+        assert!(monitor.probing(), "a timed monitor probes plain first");
+        assert_eq!(
+            AcceptanceMonitor::for_request(
+                Speculative::Auto,
+                ProposerKind::BlockDraft,
+                4,
+                plain,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            AcceptanceMonitor::for_request(
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+                ProposerKind::BlockDraft,
+                4,
+                plain,
+                true
+            ),
+            None,
+            "explicit block_draft runs as asked"
+        );
+    }
+}
+
+/// SW-7200: only `auto`'s block draft refused for the request's memory is withdrawn; an explicit
+/// `block_draft`, another route or another refusal keeps the error.
+#[test]
+fn only_auto_block_draft_memory_refusals_are_withdrawn() {
+    use crate::{Error, Speculative, SpeculativeProposer};
+    let exhausted = crate::admit_request_memory_with_geometry(8, 8, 4096, u64::MAX, 1)
+        .expect_err("a request larger than available memory is refused");
+    assert!(matches!(exhausted, Error::RequestResourceExhausted(_)));
+    assert!(withdraws_auto_block_draft(
+        Speculative::Auto,
+        ProposerKind::BlockDraft,
+        &exhausted
+    ));
+    assert!(!withdraws_auto_block_draft(
+        Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+        ProposerKind::BlockDraft,
+        &exhausted
+    ));
+    assert!(!withdraws_auto_block_draft(
+        Speculative::Auto,
+        ProposerKind::Mtp,
+        &exhausted
+    ));
+    assert!(!withdraws_auto_block_draft(
+        Speculative::Auto,
+        ProposerKind::BlockDraft,
+        &Error::InvalidRequest("context".into())
+    ));
+    assert!(AUTO_BLOCK_DRAFT_NOT_ADMITTED.starts_with("speculative: auto's block draft"));
 }
 
 // --- the cost-aware (timed) monitor (sc-24446) ---
@@ -1431,4 +1507,239 @@ fn greedy_is_the_point_mass_special_case() {
         accept_token(&p2, &q2, 1, 0.999, 0.5),
         Acceptance::Rejected(3)
     );
+}
+
+/// SW-7200: `auto` keeps its MTP-then-prompt-lookup order unless the caller passes a recorded
+/// block-draft preference; with it, an advertised block draft runs first at its recommended depth,
+/// and a model without one still falls through to MTP.
+#[test]
+fn auto_prefers_a_block_draft_only_when_asked() {
+    use crate::{
+        BlockDraftFormat, DecodeBackend, MtpCapabilities, ProposerCapabilities, Speculative,
+        SpeculativeProposer, TextLlmCapabilities,
+    };
+    let block = ProposerCapabilities {
+        proposer: SpeculativeProposer::BlockDraft,
+        max_depth: 4,
+        recommended_depth: 4,
+    };
+    let mtp = Some(MtpCapabilities {
+        max_draft_tokens: 5,
+        recommended_draft_tokens: 3,
+    });
+    let with_draft = TextLlmCapabilities {
+        mtp,
+        speculative: vec![block],
+        ..Default::default()
+    };
+    let without_draft = TextLlmCapabilities {
+        mtp,
+        ..Default::default()
+    };
+    let run = |proposer, depth| SpeculativePlan::Run { proposer, depth };
+
+    assert_eq!(
+        resolve_speculative(Speculative::Auto, &with_draft).plan,
+        run(SpeculativeProposer::Mtp, 3)
+    );
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &with_draft, false),
+        resolve_speculative(Speculative::Auto, &with_draft)
+    );
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &with_draft, true).plan,
+        run(SpeculativeProposer::BlockDraft, 4)
+    );
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &without_draft, true).plan,
+        run(SpeculativeProposer::Mtp, 3)
+    );
+    // The preference never changes an explicit option.
+    assert_eq!(
+        resolve_speculative_with(Speculative::Off, &with_draft, true),
+        SpeculativeResolution::default()
+    );
+    // Advertised MTP is not required for the fallthrough: prompt lookup follows when MTP is absent.
+    let lookup_only = TextLlmCapabilities {
+        speculative: vec![ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 6,
+            recommended_depth: 2,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &lookup_only, true).plan,
+        run(SpeculativeProposer::PromptLookup, 2)
+    );
+    // Only MLX's quantized tiers prefer a block draft; every other backend and tier keeps MTP.
+    for backend in DecodeBackend::ALL {
+        for format in BlockDraftFormat::ALL {
+            for tier in ["q4", "q8", "bf16"] {
+                let prefer =
+                    auto_block_draft_decision(backend, format, tier).is_some_and(|d| d.prefer);
+                assert_eq!(
+                    prefer,
+                    backend == DecodeBackend::Mlx && tier != "bf16",
+                    "{backend:?} {format:?} {tier}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn auto_block_draft_decisions_record_the_mlx_campaign() {
+    use crate::{BlockDraftFormat, DecodeBackend};
+    for (format, tier, runs, numbers) in [
+        (
+            BlockDraftFormat::DFlash2,
+            "q4",
+            "44605799110",
+            "cold 1.33/1.29, reused 1.84/1.81",
+        ),
+        (
+            BlockDraftFormat::DFlash2,
+            "q8",
+            "44587316639",
+            "cold 1.16/1.03, reused 1.20/1.19",
+        ),
+        (
+            BlockDraftFormat::DSpine,
+            "q4",
+            "44605799110",
+            "cold 1.29/1.25, reused 1.07/1.00",
+        ),
+        (
+            BlockDraftFormat::DSpine,
+            "q8",
+            "44587316639",
+            "cold 1.13/1.10, reused 1.07/1.06",
+        ),
+    ] {
+        let d = auto_block_draft_decision(DecodeBackend::Mlx, format, tier)
+            .unwrap_or_else(|| panic!("MLX {format:?} {tier} is recorded"));
+        assert!(d.prefer, "MLX {format:?} {tier} beat MTP");
+        assert!(d.reason.contains(runs), "{}", d.reason);
+        assert!(d.reason.contains("44587316639"), "{}", d.reason);
+        assert!(d.reason.contains(numbers), "{}", d.reason);
+    }
+    // No bf16 target was measured on MLX.
+    for format in BlockDraftFormat::ALL {
+        assert_eq!(
+            auto_block_draft_decision(DecodeBackend::Mlx, format, "bf16"),
+            None
+        );
+    }
+    // Exactly the four CUDA and four MLX entries; the CUDA ones never prefer.
+    assert_eq!(AUTO_BLOCK_DRAFT_DECISIONS.len(), 8);
+    for d in AUTO_BLOCK_DRAFT_DECISIONS {
+        assert_eq!(d.prefer, d.backend == DecodeBackend::Mlx, "{d:?}");
+    }
+}
+
+#[test]
+fn auto_block_draft_decisions_record_the_cuda_campaign() {
+    use crate::{BlockDraftFormat, DecodeBackend};
+    for (format, tier, numbers) in [
+        (BlockDraftFormat::DFlash2, "q4", "1.49x plain vs MTP 1.70x"),
+        (BlockDraftFormat::DSpine, "q4", "1.48x plain vs MTP 1.70x"),
+        (BlockDraftFormat::DFlash2, "q8", "2.00x plain vs MTP 2.04x"),
+        (BlockDraftFormat::DSpine, "q8", "1.92x plain vs MTP 2.04x"),
+    ] {
+        let d = auto_block_draft_decision(DecodeBackend::CandleCuda, format, tier)
+            .unwrap_or_else(|| panic!("CUDA {format:?} {tier} is recorded"));
+        assert!(!d.prefer, "CUDA {format:?} {tier} loses to MTP");
+        assert!(d.reason.contains("44516873473"), "{}", d.reason);
+        assert!(d.reason.contains(numbers), "{}", d.reason);
+    }
+    // Unmeasured pairs have no entry: CUDA bf16, the other Candle devices.
+    assert_eq!(
+        auto_block_draft_decision(DecodeBackend::CandleCuda, BlockDraftFormat::DFlash2, "bf16"),
+        None
+    );
+    assert_eq!(
+        auto_block_draft_decision(DecodeBackend::CandleMetal, BlockDraftFormat::DFlash2, "q4"),
+        None
+    );
+    // One entry per (backend, format, tier).
+    for (i, a) in AUTO_BLOCK_DRAFT_DECISIONS.iter().enumerate() {
+        assert!(AUTO_BLOCK_DRAFT_DECISIONS[i + 1..]
+            .iter()
+            .all(|b| (a.backend, a.format, a.tier) != (b.backend, b.format, b.tier)));
+    }
+}
+
+#[test]
+fn auto_block_draft_tier_follows_the_resident_quantization() {
+    use crate::ResidentQuantization as R;
+    assert_eq!(auto_block_draft_tier(R::Bits(4)), Some("q4"));
+    assert_eq!(auto_block_draft_tier(R::Bits(8)), Some("q8"));
+    assert_eq!(auto_block_draft_tier(R::Dense), Some("bf16"));
+    assert_eq!(auto_block_draft_tier(R::Nvfp4), Some("nvfp4"));
+    // Another width, mixed or unknown projections match no decision.
+    assert_eq!(auto_block_draft_tier(R::Bits(6)), None);
+    assert_eq!(auto_block_draft_tier(R::Unknown), None);
+}
+
+#[test]
+fn auto_prefers_block_draft_only_for_a_preferring_record() {
+    use crate::{BlockDraftFormat, DecodeBackend, ResidentQuantization as R};
+    // No resident draft, an unknown tier, or a recorded `prefer: false` all leave `auto` on MTP.
+    assert!(!auto_prefers_block_draft(
+        DecodeBackend::CandleCuda,
+        None,
+        R::Bits(8)
+    ));
+    assert!(!auto_prefers_block_draft(
+        DecodeBackend::CandleCuda,
+        Some(BlockDraftFormat::DFlash2),
+        R::Unknown
+    ));
+    for format in BlockDraftFormat::ALL {
+        for bits in [4, 8] {
+            assert!(!auto_prefers_block_draft(
+                DecodeBackend::CandleCuda,
+                Some(format),
+                R::Bits(bits)
+            ));
+        }
+    }
+    // MLX prefers a resident draft beside a Q4/Q8 target — never without a draft, beside a bf16
+    // target (unmeasured) or beside one whose tier is unknown.
+    for format in BlockDraftFormat::ALL {
+        for bits in [4, 8] {
+            assert!(auto_prefers_block_draft(
+                DecodeBackend::Mlx,
+                Some(format),
+                R::Bits(bits)
+            ));
+        }
+        for resident in [R::Dense, R::Unknown, R::Bits(6)] {
+            assert!(!auto_prefers_block_draft(
+                DecodeBackend::Mlx,
+                Some(format),
+                resident
+            ));
+        }
+    }
+    assert!(!auto_prefers_block_draft(
+        DecodeBackend::Mlx,
+        None,
+        R::Bits(4)
+    ));
+    // The preference follows every recorded entry's own `prefer`, reached from the resident fact.
+    for d in AUTO_BLOCK_DRAFT_DECISIONS {
+        let resident = match d.tier {
+            "q4" => R::Bits(4),
+            "q8" => R::Bits(8),
+            "nvfp4" => R::Nvfp4,
+            "bf16" => R::Dense,
+            other => panic!("unrecorded tier {other}"),
+        };
+        assert_eq!(
+            auto_prefers_block_draft(d.backend, Some(d.format), resident),
+            d.prefer
+        );
+    }
 }

@@ -42,8 +42,19 @@ fn switches() -> Vec<(&'static str, serde_json::Value)> {
 #[test]
 #[ignore = "needs a snapshot via SPECULATIVE_BENCH_SNAPSHOT and an output path via SPECULATIVE_BENCH_OUTPUT"]
 fn speculative_bench_writes_the_baseline_document() {
-    let (output, doc) = core_llm_testkit::run_speculative_bench_from_env("mlx", &load, &switches)
-        .unwrap_or_else(|e| panic!("{e}"));
+    // SW-7200: the MLX allocator's bytes in use and its own high-water mark, reset before each
+    // measured repeat.
+    let used = || Some(mlx_rs::memory::get_active_memory() as u64);
+    let reset = || mlx_rs::memory::reset_peak_memory();
+    let peak = || Some(mlx_rs::memory::get_peak_memory() as u64);
+    let memory = core_llm_testkit::BenchMemory {
+        source: "mlx_allocator",
+        used: &used,
+        peak: Some((&reset, &peak)),
+    };
+    let (output, doc) =
+        core_llm_testkit::run_speculative_bench_from_env("mlx", &load, &switches, Some(&memory))
+            .unwrap_or_else(|e| panic!("{e}"));
     println!("wrote {} ({} rows)", output.display(), doc.rows.len());
 }
 

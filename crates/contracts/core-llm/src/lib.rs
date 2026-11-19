@@ -166,7 +166,7 @@ pub use registry::{
 };
 pub use report::{
     prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeDraft, DecodeReport,
-    DraftReport, FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
+    DraftReport, DraftTime, FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
     TreeVerifyReport,
 };
 pub use request::{
@@ -188,13 +188,16 @@ pub use speculative::tree::{
     DraftTree, TreeResolution, TreeWalk, MAX_TREE_ROWS,
 };
 pub use speculative::{
-    accept_greedy_run, accept_token, decode_clock, demotion_threshold, draft_compatibility,
+    accept_greedy_run, accept_token, auto_block_draft_decision, auto_block_draft_tier,
+    auto_prefers_block_draft, decode_clock, demotion_threshold, draft_compatibility,
     draft_load_refusal, draft_model_capabilities, draft_refusal, draft_tokenizer_refusal,
     draft_unpriced_refusal, fit_draft_context, greedy_commit, ngram_propose, no_proposer_fallback,
-    prompt_lookup_capabilities, resolve_speculative, settle_draft, verify_depth_bound,
-    with_decode_clock, Acceptance, AcceptanceMonitor, DecodeClock, DemotionBasis, MonitorDecision,
-    PlainDecode, ProposerKind, SpeculativePlan, SpeculativeResolution, StepObservation, WallClock,
-    ACCEPTANCE_PROBE_VERIFIES, CANDLE_MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
+    prompt_lookup_capabilities, resolve_speculative, resolve_speculative_with, settle_draft,
+    verify_depth_bound, with_decode_clock, withdraws_auto_block_draft, Acceptance,
+    AcceptanceMonitor, AutoBlockDraftDecision, DecodeClock, DemotionBasis, MonitorDecision,
+    PlainDecode, ProposerKind, ResidentQuantization, SpeculativePlan, SpeculativeResolution,
+    StepObservation, WallClock, ACCEPTANCE_PROBE_VERIFIES, AUTO_BLOCK_DRAFT_DECISIONS,
+    AUTO_BLOCK_DRAFT_NOT_ADMITTED, CANDLE_MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
     CANDLE_PROMPT_LOOKUP_DEMOTE_BELOW_AT_ONE_DRAFT,
     CANDLE_PROMPT_LOOKUP_DEMOTE_BELOW_PER_EXTRA_DRAFT, CAPTIONER_NO_PREFIX_CACHE,
     CAPTIONER_NO_PROPOSER, CLEAR_LOSS_CONFIDENCE_Z, CLEAR_LOSS_GAIN, CLEAR_LOSS_MIN_TIMED_STEPS,

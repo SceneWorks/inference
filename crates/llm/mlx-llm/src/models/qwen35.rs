@@ -1365,6 +1365,9 @@ pub struct Qwen35Model {
     cfg: Qwen35Config,
     eps: f32,
     quantized: bool,
+    /// The affine spec the quantized projections hold: the snapshot's stored spec when its
+    /// quantized triples were loaded, else the load-time spec; `None` for dense or Prism.
+    resident_quant: Option<QuantSpec>,
     prism: bool,
 }
 
@@ -1479,6 +1482,12 @@ impl Qwen35Model {
     /// Whether the large projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
+    }
+
+    /// The affine spec the quantized projections hold (stored in the snapshot or applied at
+    /// load), or `None` for dense or Prism projections.
+    pub fn resident_quant(&self) -> Option<QuantSpec> {
+        self.resident_quant
     }
 
     /// The decoder's compute dtype (bf16): its activations, logits, and full-attention K/V. The
@@ -2529,6 +2538,11 @@ impl Qwen35Model {
             eps,
             cfg,
             quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
+            resident_quant: match prism {
+                Some(_) => None,
+                None if saw_stored.get() => stored_quant,
+                None => quant,
+            },
             prism: prism.is_some(),
         };
         Ok(model)

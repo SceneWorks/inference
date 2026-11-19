@@ -67,4 +67,6 @@ pub struct SpeculativeStats {
     /// Why a tree request on this run verified linearly — the model or its cache cannot keep a
     /// tree branch (feature SW-F328, E5); `None` otherwise.
     pub tree_fallback: Option<&'static str>,
+    /// The proposer's wall time (SW-7200); `None` when no proposer call ran.
+    pub draft_time: Option<core_llm::DraftTime>,
 }

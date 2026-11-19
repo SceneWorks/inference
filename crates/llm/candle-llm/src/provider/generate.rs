@@ -114,6 +114,64 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        self.generate_resolving(req, on_event, false)
+    }
+}
+
+/// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
+/// switch, carrying the speculative resolution's and the route's fallback reasons verbatim (epic
+/// sc-24432 E2), then the engine's own (a tree request it verified linearly, SW-F328).
+pub(super) fn request_report(
+    record: &DecodeRecord,
+    cuda_graphs_on: bool,
+    mut fallbacks: Vec<String>,
+) -> core_llm::DecodeReport {
+    let mut report = record.report(cuda_graphs_on);
+    // The engine's own (a tree its model or cache could not run, SW-F328) follow the request's.
+    fallbacks.append(&mut report.fallbacks);
+    core_llm::DecodeReport {
+        fallbacks,
+        ..report
+    }
+}
+
+pub(super) fn validate_context_window(
+    cap: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> CoreResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let total = prompt_tokens
+        .checked_add(max_new_tokens as usize)
+        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
+    if total > cap {
+        return Err(CoreError::InvalidRequest(format!(
+            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn map_finish(f: FinishReason) -> CoreFinish {
+    match f {
+        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
+        FinishReason::MaxTokens => CoreFinish::Length,
+        FinishReason::Cancelled => CoreFinish::Cancelled,
+    }
+}
+
+impl LlamaProvider {
+    /// [`TextLlm::generate`]; `block_draft_withheld` resolves `auto` without its block-draft
+    /// preference (a request whose memory refused the preferred draft, SW-7200) and names
+    /// [`core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED`].
+    fn generate_resolving(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        block_draft_withheld: bool,
+    ) -> CoreResult<TextLlmOutput> {
         let _progress = req.install_progress();
         // Request start: a request that fails or is cancelled (anywhere below, before the record
         // is written on success) must not leave the previous request's record readable.
@@ -247,8 +305,16 @@ impl TextLlm for LlamaProvider {
         // an explicit `{proposer, depth}` runs as asked. (Named apart from the MTP branch's
         // `speculative` flag, which shadows `speculative` below.)
         let requested_speculative = speculative;
+        // Under `auto`, a resident block draft runs ahead of MTP only where the SW-7200 paths
+        // campaign recorded it faster for this device's backend, draft format and target tier —
+        // and not on a request whose memory refused it once already (resolved again without it,
+        // by name).
         let resolution = core_llm::fit_draft_context(
-            core_llm::resolve_speculative(speculative, &self.descriptor.capabilities),
+            core_llm::resolve_speculative_with(
+                speculative,
+                &self.descriptor.capabilities,
+                !block_draft_withheld && self.auto_prefers_block_draft(),
+            ),
             &self.descriptor.capabilities,
             self.draft_context(),
             admitted_prompt,
@@ -257,9 +323,10 @@ impl TextLlm for LlamaProvider {
         // Which loop decodes this request (sc-24140): decided once, so admission prices the
         // cache and graphs that loop will actually hold.
         let (mut route, route_fallback) = self.decode_route(resolution.plan);
-        let mut fallbacks: Vec<String> = resolution
-            .fallback
+        let mut fallbacks: Vec<String> = block_draft_withheld
+            .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
             .into_iter()
+            .chain(resolution.fallback)
             .chain(route_fallback)
             .collect();
         // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
@@ -351,7 +418,7 @@ impl TextLlm for LlamaProvider {
         if prefix_on && prefix_route && !keep_prefix {
             prefix_reason = Some(PREFIX_NOT_ADMITTED);
         }
-        core_llm::admit_request_memory_with_geometry(
+        if let Err(error) = core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
@@ -361,7 +428,18 @@ impl TextLlm for LlamaProvider {
                 required
             },
             prefix_admission.available,
-        )?;
+        ) {
+            // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
+            // prompt lookup or plain — what `auto` admitted before the preference), by name.
+            // Nothing has run: no K/V, no prefill, no preprocessing.
+            if core_llm::withdraws_auto_block_draft(requested_speculative, route.proposer(), &error)
+            {
+                drop(_cuda_graphs_scope);
+                drop(_progress);
+                return self.generate_resolving(req, on_event, true);
+            }
+            return Err(error);
+        }
         let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         let mut prefix_hit = 0usize;
 
@@ -1443,46 +1521,32 @@ impl TextLlm for LlamaProvider {
     }
 }
 
-/// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
-/// switch, carrying the speculative resolution's and the route's fallback reasons verbatim (epic
-/// sc-24432 E2), then the engine's own (a tree request it verified linearly, SW-F328).
-pub(super) fn request_report(
-    record: &DecodeRecord,
-    cuda_graphs_on: bool,
-    mut fallbacks: Vec<String>,
-) -> core_llm::DecodeReport {
-    let mut report = record.report(cuda_graphs_on);
-    // The engine's own (a tree its model or cache could not run, SW-F328) follow the request's.
-    fallbacks.append(&mut report.fallbacks);
-    core_llm::DecodeReport {
-        fallbacks,
-        ..report
+impl LlamaProvider {
+    /// Whether `auto` runs this provider's resident block draft ahead of MTP (SW-7200): the
+    /// decision recorded for this device's backend, the draft's format and the target's resident
+    /// tier.
+    pub(crate) fn auto_prefers_block_draft(&self) -> bool {
+        self.auto_block_draft_key()
+            .is_some_and(|(backend, format, resident)| {
+                core_llm::auto_prefers_block_draft(backend, Some(format), resident)
+            })
     }
-}
 
-pub(super) fn validate_context_window(
-    cap: usize,
-    prompt_tokens: usize,
-    max_new_tokens: u32,
-) -> CoreResult<()> {
-    if cap == 0 {
-        return Ok(());
-    }
-    let total = prompt_tokens
-        .checked_add(max_new_tokens as usize)
-        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
-    if total > cap {
-        return Err(CoreError::InvalidRequest(format!(
-            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn map_finish(f: FinishReason) -> CoreFinish {
-    match f {
-        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
-        FinishReason::MaxTokens => CoreFinish::Length,
-        FinishReason::Cancelled => CoreFinish::Cancelled,
+    /// What `auto`'s block-draft decision is looked up by: this device's backend, the resident
+    /// draft's format and the target decoder's own resident quantization; `None` with no block
+    /// draft.
+    pub(crate) fn auto_block_draft_key(
+        &self,
+    ) -> Option<(
+        core_llm::DecodeBackend,
+        core_llm::BlockDraftFormat,
+        core_llm::ResidentQuantization,
+    )> {
+        let draft = self.block_draft.as_ref()?;
+        Some((
+            crate::device::decode_backend(self.model.device()),
+            draft.model.config().format,
+            self.load_record.target_quantization(),
+        ))
     }
 }
