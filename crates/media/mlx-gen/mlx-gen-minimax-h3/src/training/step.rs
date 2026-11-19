@@ -22,6 +22,14 @@
 //! The whole DiT is resident and one `keyed_value_and_grad` traces the full forward, retaining
 //! every block's activations — the configuration the memory estimate refuses unless the device
 //! holds all of it.
+//!
+//! # A trained token refiner (SW-F369)
+//!
+//! When a refiner leaf is a target ([`LossSpec::refiner`]), the caption's frozen
+//! `context_embedder` rows are refined under the trace. Resident, the traced `loss_fn` refines them
+//! itself. Streamed, the forward runs with the concrete refiner factors installed on the trunk;
+//! after the block walk hands back `dL/dh_0`, one `vjp` of `[refine(embedded) | proj_in(packed)]`
+//! against it yields the refiner factors' gradients.
 
 use std::rc::Rc;
 
@@ -66,6 +74,9 @@ pub(crate) struct LossSpec<'a> {
     pub(crate) frozen: &'a FrozenResiduals,
     /// Per block (the streamed path installs one block's at a time).
     pub(crate) blocks: &'a [BlockTrainables],
+    /// The token-refiner targets' trainables, installed on the trunk (`adapter: None` when no
+    /// refiner leaf is a target and the caption rows are a constant of the step).
+    pub(crate) refiner: &'a BlockTrainables,
     pub(crate) alpha: f32,
     pub(crate) rank: f32,
     pub(crate) mae: bool,
@@ -143,13 +154,78 @@ pub(crate) fn stack_input(
     parts: &DenoiserParts,
     packed: &Array,
 ) -> Result<Array> {
-    let stream = parts.text_rows.dtype();
+    stack_input_from(dit, &parts.text_rows, packed)
+}
+
+/// [`stack_input`] over explicit refined text rows (the traced refiner's, SW-F369).
+fn stack_input_from(dit: &MiniMaxH3ImageDit, text_rows: &Array, packed: &Array) -> Result<Array> {
+    let stream = text_rows.dtype();
     let image = dit
         .projections()
         .proj_in
         .forward(packed)?
         .as_dtype(stream)?;
-    Ok(concatenate_axis(&[parts.text_rows.clone(), image], 1)?)
+    Ok(concatenate_axis(&[text_rows.clone(), image], 1)?)
+}
+
+/// The refiner trainables' factors from `params` (concrete or traced), installed on the trunk's
+/// refiner leaves, the frozen training-adapter residuals appended back. A no-op without refiner
+/// targets.
+fn install_refiner<H: AdaptableHost>(
+    host: &mut H,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+) -> MlxResult<()> {
+    if let Some(adapter) = &spec.refiner.adapter {
+        adapter.install_as(
+            &mut *host,
+            params,
+            spec.alpha,
+            spec.rank,
+            spec.lora_dtype,
+            LOKR_DTYPE,
+        )?;
+        spec.frozen.reattach_refiner(host)?;
+    }
+    Ok(())
+}
+
+/// The refiner factors' gradients against `cotangent = dL/dh_0`: one `vjp` of
+/// `[refine(embedded) | proj_in(packed)]` with the refiner's factors traced. The concrete factors
+/// are re-installed afterwards, so no traced array stays on the trunk.
+fn refiner_vjp(
+    dit: &mut MiniMaxH3ImageDit,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    embedded: &Array,
+    packed: &Array,
+    cotangent: &Array,
+) -> Result<FactorGrads> {
+    let keys = &spec.refiner.keys;
+    let primals = keys
+        .iter()
+        .map(|key| {
+            params
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Error::Msg(format!("LoRA param missing: {key}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (_, grads) = fallible_vjp(
+        |xs: &[Array]| -> MlxResult<Vec<Array>> {
+            let traced: LoraParams = keys.iter().cloned().zip(xs.iter().cloned()).collect();
+            install_refiner(&mut *dit, &traced, spec)?;
+            let dit: &MiniMaxH3ImageDit = dit;
+            let text = dit.refine_text(embedded).map_err(mlx_err)?;
+            Ok(vec![stack_input_from(dit, &text, packed).map_err(mlx_err)?])
+        },
+        &primals,
+        std::slice::from_ref(cotangent),
+    )?;
+    install_refiner(dit, params, spec)?;
+    let grads: FactorGrads = keys.iter().cloned().zip(grads).collect();
+    eval(grads.iter().map(|(_, g)| g))?;
+    Ok(grads)
 }
 
 /// The attention plan every training block runs under: [`AttentionChunkAxis::HeadsRecomputed`] at
@@ -225,27 +301,61 @@ pub(crate) fn loss_and_grads(
 ) -> Result<(f32, LoraParams)> {
     // One SwiGLU implementation for the untraced forward and every traced graph.
     let _eager = crate::dit::layers::EagerSwigluScope::enter();
+    let refine = spec.refiner.adapter.is_some();
+    // The forward's refined caption rows run with this step's concrete refiner factors.
+    install_refiner(&mut *dit, params, spec)?;
     let parts = parts(dit, inputs)?;
+    // The frozen `context_embedder` rows the traced refiner starts from.
+    let embedded = refine
+        .then(|| dit.embed_context_rows(inputs.context))
+        .transpose()?;
     // Every array the step's graph shares across blocks is forced before the graph is built, so
     // no block re-derives a lazy shared input inside it.
-    eval([
-        &parts.text_rows,
-        &parts.tables.cos,
-        &parts.tables.sin,
-        &parts.adaln_indices[inputs.step.index],
-        &parts.timestep_indices[inputs.step.index],
-    ])?;
+    eval(
+        [
+            &parts.text_rows,
+            &parts.tables.cos,
+            &parts.tables.sin,
+            &parts.adaln_indices[inputs.step.index],
+            &parts.timestep_indices[inputs.step.index],
+        ]
+        .into_iter()
+        .chain(embedded.as_ref()),
+    )?;
     if spec.streamed {
-        streamed_loss_and_grads(dit, modulation, &parts, params, spec, inputs, None)
+        let (loss, mut grads, cotangent) =
+            streamed_backward(dit, modulation, &parts, params, spec, inputs, None)?;
+        if let Some(embedded) = &embedded {
+            grads.extend(refiner_vjp(
+                dit,
+                params,
+                spec,
+                embedded,
+                inputs.packed,
+                &cotangent,
+            )?);
+        }
+        Ok((loss, grads))
     } else {
-        resident_loss_and_grads(dit, modulation, &parts, params, spec, inputs)
+        resident_loss_and_grads(
+            dit,
+            modulation,
+            &parts,
+            embedded.as_ref(),
+            params,
+            spec,
+            inputs,
+        )
     }
 }
 
+/// The resident backward. `embedded` (a trained refiner) makes the traced `loss_fn` refine the
+/// caption itself, so the refiner factors installed by `spec.adapter` are differentiated too.
 fn resident_loss_and_grads(
     dit: &mut MiniMaxH3ImageDit,
     modulation: &Modulation,
     parts: &DenoiserParts,
+    embedded: Option<&Array>,
     params: &LoraParams,
     spec: &LossSpec<'_>,
     inputs: &StepInputs<'_>,
@@ -267,7 +377,14 @@ fn resident_loss_and_grads(
         )?;
         spec.frozen.reattach(&mut *dit, None)?;
         let dit: &MiniMaxH3ImageDit = dit;
-        let mut x = stack_input(dit, parts, inputs.packed).map_err(mlx_err)?;
+        let mut x = match embedded {
+            Some(embedded) => {
+                let text = dit.refine_text(embedded).map_err(mlx_err)?;
+                stack_input_from(dit, &text, inputs.packed)
+            }
+            None => stack_input(dit, parts, inputs.packed),
+        }
+        .map_err(mlx_err)?;
         for (layer, block) in dit.blocks().iter().enumerate() {
             x = run_block(
                 dit,
@@ -378,6 +495,7 @@ pub(crate) fn streamed_loss(
     inputs: &StepInputs<'_>,
 ) -> Result<f32> {
     let _eager = crate::dit::layers::EagerSwigluScope::enter();
+    install_refiner(&mut *dit, params, spec)?;
     let parts = parts(dit, inputs)?;
     let dit: &MiniMaxH3ImageDit = dit;
     let bounded = attention(spec, inputs.layout.seq_len() as u64);
@@ -555,9 +673,11 @@ pub(crate) fn streamed_jvp(
     Ok(loss_tangent.item::<f32>())
 }
 
-/// The streamed backward. `trace`, when given, receives the cotangent of every block's output
-/// `(l + 1, dL/dh_{l+1})` from the stack output down, then block 0's input `(0, dL/dh_0)` — the
-/// gradient gate's per-boundary diagnostic.
+/// The streamed backward over the DiT blocks. `trace`, when given, receives the cotangent of every
+/// block's output `(l + 1, dL/dh_{l+1})` from the stack output down, then block 0's input
+/// `(0, dL/dh_0)` — the gradient gate's per-boundary diagnostic. The trainer itself calls
+/// `streamed_backward` (through [`loss_and_grads`]), which also returns `dL/dh_0`.
+#[cfg(test)]
 pub(crate) fn streamed_loss_and_grads(
     dit: &mut MiniMaxH3ImageDit,
     modulation: &Modulation,
@@ -565,8 +685,23 @@ pub(crate) fn streamed_loss_and_grads(
     params: &LoraParams,
     spec: &LossSpec<'_>,
     inputs: &StepInputs<'_>,
-    mut trace: Option<&mut Vec<(usize, Array)>>,
+    trace: Option<&mut Vec<(usize, Array)>>,
 ) -> Result<(f32, LoraParams)> {
+    let (loss, grads, _) = streamed_backward(dit, modulation, parts, params, spec, inputs, trace)?;
+    Ok((loss, grads))
+}
+
+/// The streamed backward over the DiT blocks, returning the loss, the block factors' gradients and
+/// `dL/dh_0` — the stack input's cotangent a trained refiner's `vjp` continues from.
+fn streamed_backward(
+    dit: &mut MiniMaxH3ImageDit,
+    modulation: &Modulation,
+    parts: &DenoiserParts,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    inputs: &StepInputs<'_>,
+    mut trace: Option<&mut Vec<(usize, Array)>>,
+) -> Result<(f32, LoraParams, Array)> {
     let dit: &MiniMaxH3ImageDit = dit;
     let layers = dit.num_layers();
     if spec.blocks.len() != layers {
@@ -624,5 +759,5 @@ pub(crate) fn streamed_loss_and_grads(
             trace.push((layer, cotangent.clone()));
         }
     }
-    Ok((loss, out))
+    Ok((loss, out, cotangent))
 }

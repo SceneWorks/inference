@@ -81,6 +81,13 @@ pub struct TrainingRunShape {
     /// all blocks' (resident). Candle never forms a dense `[out, in]` delta.
     pub lokr_rows_block_max: u64,
     pub lokr_rows_total: u64,
+    /// Token-refiner blocks the run trains (SW-F369): their forward over the caption rows is
+    /// retained whole every step, whatever the block residency. `0` when no refiner leaf is a
+    /// target.
+    pub refiner_layers: u64,
+    /// LoKr vec-trick intermediate elements per **caption** row over the trained refiner leaves,
+    /// retained with that forward (included in [`Self::lokr_rows_total`] too).
+    pub lokr_rows_refiner: u64,
     /// The DiT tier is packed (q4 / q8): every projection dequantizes per forward, and autograd
     /// retains each dense copy until its backward.
     pub packed_base: bool,
@@ -311,6 +318,7 @@ pub fn estimate_training(
             } else {
                 geometry.heads
             },
+            refiner_layers: run.refiner_layers,
         };
         let bytes = train_step_bytes(&geometry, &weights, &s);
         let seq = s.sequence();
@@ -324,9 +332,12 @@ pub fn estimate_training(
         };
         let live_blocks = if run.checkpointed { 1 } else { geometry.layers };
         // A packed projection's dequantized dense weight is an operand of its matmul, which
-        // autograd retains for the input gradient: one block's (streamed) or every block's.
+        // autograd retains for the input gradient: one block's (streamed) or every block's — plus
+        // every trained refiner block's, whose forward is retained whole all step (the packed
+        // tiers pack the refiner's attention and feed-forward too; its blocks have the DiT
+        // blocks' widths).
         let dequantized = if run.packed_base {
-            live_blocks * dense_block_elements(&geometry) * run.width
+            (live_blocks + run.refiner_layers) * dense_block_elements(&geometry) * run.width
         } else {
             0
         };
@@ -339,11 +350,27 @@ pub fn estimate_training(
         // The frozen training adapter's residual intermediates and outputs, retained for the
         // backward: one live block's (checkpointed) or every block's.
         let training_adapter_rows = run.training_adapter.rows(run.checkpointed) * seq;
+        // A trained refiner's forward is retained whole (never checkpointed): each refiner block's
+        // float32 attention operands over the caption rows, and its LoKr intermediates. The
+        // shared envelope already counts its activation-width saved tensors.
+        let refiner_attention = if run.chunked_attention {
+            F32_ATTENTION_OPERANDS * text_rows * geometry.heads * geometry.head_dim * 4
+        } else {
+            geometry.heads * text_rows * text_rows * 4 * F32_SCORE_BUFFERS
+        };
+        let refiner = run.refiner_layers * refiner_attention
+            + if run.checkpointed {
+                run.lokr_rows_refiner * text_rows * run.width
+            } else {
+                // Resident: `lokr_rows_total` already prices them at every row.
+                0
+            };
         let total = bytes.total()
             + live_blocks * f32_attention
             + dequantized
             + lokr_rows * seq * run.width
             + training_adapter_rows
+            + refiner
             + ALLOCATOR_SLACK_BYTES;
         if total > train.device {
             train.device = total;
@@ -575,12 +602,55 @@ mod tests {
             optimizer_state_per_element: 2,
             lokr_rows_block_max: 0,
             lokr_rows_total: 0,
+            refiner_layers: 0,
+            lokr_rows_refiner: 0,
             packed_base: false,
             training_adapter: TrainingAdapterBytes::default(),
             checkpointed,
             resident_blocks: false,
             chunked_attention: true,
             preview: None,
+        }
+    }
+
+    /// A trained refiner (SW-F369) adds the shared envelope's retained refiner forward plus
+    /// candle's float32 attention operands over the caption rows — in both residencies — and
+    /// nothing else. Mutation: price the operands over the whole sequence ⇒ the delta assert fails.
+    #[test]
+    fn a_trained_refiner_adds_its_retained_caption_forward() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        let g = DitGeometry::SHIPPED;
+        for checkpointed in [true, false] {
+            let frozen = run(checkpointed);
+            let trained = TrainingRunShape {
+                refiner_layers: 2,
+                ..frozen.clone()
+            };
+            let a = estimate_training(&c, &f, t, &frozen).unwrap();
+            let b = estimate_training(&c, &f, t, &trained).unwrap();
+            let rows = u64::from(frozen.items[0].caption_tokens);
+            let shared = b.step.retained - a.step.retained;
+            assert!(shared > 0);
+            assert_eq!(
+                b.train.device - a.train.device,
+                shared + 2 * F32_ATTENTION_OPERANDS * rows * g.heads * g.head_dim * 4,
+                "checkpointed: {checkpointed}"
+            );
+            // On a packed tier the retained refiner forward also holds each trained refiner
+            // block's dequantized dense weights. Mutation: price only the DiT blocks' ⇒ red.
+            let packed = |r: &TrainingRunShape| TrainingRunShape {
+                packed_base: true,
+                ..r.clone()
+            };
+            let pa = estimate_training(&c, &f, t, &packed(&frozen)).unwrap();
+            let pb = estimate_training(&c, &f, t, &packed(&trained)).unwrap();
+            assert_eq!(
+                (pb.train.device - pa.train.device) - (b.train.device - a.train.device),
+                2 * dense_block_elements(&g) * frozen.width,
+                "packed, checkpointed: {checkpointed}"
+            );
         }
     }
 

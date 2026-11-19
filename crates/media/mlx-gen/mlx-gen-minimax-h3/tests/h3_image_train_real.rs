@@ -157,7 +157,8 @@ fn train(spec: &LoadSpec, req: &TrainingRequest) -> (PathBuf, f32, Vec<(u32, Ima
 }
 
 /// The saved file is the PEFT layout the H3-Image install reads: a down/up pair and an alpha for
-/// every block leaf, the reload stamps, and at least one trained (non-zero) up factor.
+/// every DiT-block and token-refiner-block leaf (SW-F369, ai-toolkit's surface), the reload stamps,
+/// and a trained (non-zero) up factor in a DiT block and in the refiner.
 fn check_layout(path: &Path, edit: bool) -> usize {
     let w = Weights::from_file(path).unwrap();
     let downs: Vec<String> = w
@@ -165,25 +166,41 @@ fn check_layout(path: &Path, edit: bool) -> usize {
         .filter(|k| k.ends_with(".lora_A.weight"))
         .map(String::from)
         .collect();
-    assert_eq!(downs.len(), 50 * 6, "every block leaf");
+    assert_eq!(
+        downs.len(),
+        (50 + 2) * 6,
+        "every DiT and refiner block leaf"
+    );
     for down in &downs {
         let stem = down.trim_end_matches(".lora_A.weight");
-        assert!(stem.starts_with("transformer_blocks."), "{stem}");
+        assert!(
+            stem.starts_with("transformer_blocks.")
+                || stem.starts_with("token_refiner.refiner_blocks."),
+            "{stem}"
+        );
         assert!(w.get(&format!("{stem}.lora_B.weight")).is_some(), "{stem}");
         assert!(w.get(&format!("{stem}.alpha")).is_some(), "{stem}");
     }
     assert_eq!(w.metadata("networkType"), Some("lora"));
     assert_eq!(w.metadata("baseModel"), Some("minimax_h3_image"));
     assert_eq!(w.metadata("trainingMode"), edit.then_some("edit"));
-    let up = w
-        .get("transformer_blocks.0.attn.to_q.lora_B.weight")
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item::<f32>();
-    assert!(up > 0.0, "the up factor never moved off its zero init");
+    for key in [
+        "transformer_blocks.0.attn.to_q.lora_B.weight",
+        "token_refiner.refiner_blocks.0.attn.to_q.lora_B.weight",
+    ] {
+        let up = w
+            .get(key)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            up > 0.0,
+            "{key}: the up factor never moved off its zero init"
+        );
+    }
     downs.len()
 }
 

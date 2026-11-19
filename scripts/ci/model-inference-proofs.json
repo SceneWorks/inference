@@ -314450,6 +314450,39 @@
     "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/real_tests.rs"
   },
   {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "training::real_tests::refiner_gradients_match_resident_and_finite_differences_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 transformer_diffusers/ converted to the q4 tier; seeded synthetic context and latents",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident",
+      "env_gates": [],
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/training/real_tests.rs"
+  },
+  {
     "package": "candle-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
