@@ -252,8 +252,11 @@ impl TextLlm for LlamaProvider {
         let auto_prefers_block_draft = core_llm::auto_prefers_block_draft(
             crate::device::decode_backend(self.model.device()),
             self.block_draft.as_ref().map(|d| d.model.config().format),
-            self.load_record.requested,
-            self.model.is_quantized(),
+            self.load_record
+                .census
+                .map_or(core_llm::ResidentQuantization::Unknown, |c| {
+                    c.projections.resident_quantization()
+                }),
         );
         let resolution = core_llm::fit_draft_context(
             core_llm::resolve_speculative_with(

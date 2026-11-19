@@ -288,35 +288,47 @@ pub fn auto_block_draft_decision(
         .find(|d| d.backend == backend && d.format == format && d.tier == tier)
 }
 
-/// The target tier an [`AutoBlockDraftDecision`] is keyed by, from what the load knows: the
-/// load-time format it requested (`q4`, `q8`, `nvfp4`), else `bf16` when the resident projections
-/// are dense. `None` for a snapshot loaded quantized as stored — the load does not know its bit
-/// width, so no recorded decision applies.
-pub fn auto_block_draft_tier(
-    requested: Option<crate::Quantize>,
-    resident_quantized: bool,
-) -> Option<&'static str> {
-    match requested {
-        Some(crate::Quantize::Q4) => Some("q4"),
-        Some(crate::Quantize::Q8) => Some("q8"),
-        Some(crate::Quantize::Nvfp4) => Some("nvfp4"),
-        None => (!resident_quantized).then_some("bf16"),
+/// What a loaded target's projections actually hold — the resident fact the tier an
+/// [`AutoBlockDraftDecision`] is keyed by comes from, whether the weights were quantized at load
+/// or stored quantized in a prepared snapshot. Projections a quantized load keeps dense (an LM
+/// head, a predictor) do not make it mixed; quantized projections of more than one width or
+/// representation do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentQuantization {
+    /// Every projection dense.
+    Dense,
+    /// Every quantized projection is an integer block/group code of this bit width.
+    Bits(u32),
+    /// Every quantized projection is NVFP4.
+    Nvfp4,
+    /// Mixed widths or representations, a representation with no tier (Prism), or not known.
+    Unknown,
+}
+
+/// The target tier an [`AutoBlockDraftDecision`] is keyed by, from the resident projections:
+/// 4 bits → `q4`, 8 bits → `q8`, dense → `bf16`, NVFP4 → `nvfp4`; anything else (mixed,
+/// another width, unknown) → `None`, which no decision matches.
+pub fn auto_block_draft_tier(resident: ResidentQuantization) -> Option<&'static str> {
+    match resident {
+        ResidentQuantization::Dense => Some("bf16"),
+        ResidentQuantization::Bits(4) => Some("q4"),
+        ResidentQuantization::Bits(8) => Some("q8"),
+        ResidentQuantization::Nvfp4 => Some("nvfp4"),
+        ResidentQuantization::Bits(_) | ResidentQuantization::Unknown => None,
     }
 }
 
 /// The `auto_prefers_block_draft` argument of [`resolve_speculative_with`] for a provider on
 /// `backend` holding `resident_draft` (its format, `None` with no block draft resident) beside a
-/// target loaded with `requested` whose projections are `resident_quantized`: the recorded
-/// decision's `prefer`, `false` when no draft is resident, the tier is unknown or nothing is
-/// recorded.
+/// target whose projections hold `resident`: the recorded decision's `prefer`, `false` when no
+/// draft is resident, the tier is unknown or nothing is recorded.
 pub fn auto_prefers_block_draft(
     backend: crate::DecodeBackend,
     resident_draft: Option<crate::BlockDraftFormat>,
-    requested: Option<crate::Quantize>,
-    resident_quantized: bool,
+    resident: ResidentQuantization,
 ) -> bool {
     resident_draft
-        .zip(auto_block_draft_tier(requested, resident_quantized))
+        .zip(auto_block_draft_tier(resident))
         .and_then(|(format, tier)| auto_block_draft_decision(backend, format, tier))
         .is_some_and(|d| d.prefer)
 }

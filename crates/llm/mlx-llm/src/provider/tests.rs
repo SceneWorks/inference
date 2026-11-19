@@ -7196,3 +7196,21 @@ fn a_resident_block_draft_runs_block_draft_and_is_named() {
         "MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_resident_block_draft_runs_block_draft_and_is_named"
     );
 }
+
+/// SW-7200: `auto`'s block-draft tier reads the resident projections — a prepared Q4/Q8 snapshot
+/// loaded as stored reports its stored bit width exactly as a load-time quantization does.
+#[test]
+fn resident_quantization_follows_the_affine_bit_width() {
+    use core_llm::ResidentQuantization as R;
+    assert_eq!(resident_quantization(false, None), R::Dense);
+    // A config spec whose weights loaded dense is dense.
+    assert_eq!(resident_quantization(false, Some(4)), R::Dense);
+    assert_eq!(resident_quantization(true, Some(4)), R::Bits(4));
+    assert_eq!(resident_quantization(true, Some(8)), R::Bits(8));
+    // Quantized with no affine spec (Prism) has no tier.
+    assert_eq!(resident_quantization(true, None), R::Unknown);
+    assert_eq!(
+        core_llm::auto_block_draft_tier(resident_quantization(true, Some(4))),
+        Some("q4")
+    );
+}

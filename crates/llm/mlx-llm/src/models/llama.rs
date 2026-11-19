@@ -641,6 +641,12 @@ impl CausalLm {
         self.quantized
     }
 
+    /// The affine spec the quantized projections hold — the load-time spec, else the snapshot's
+    /// stored one — or `None` for dense projections.
+    pub fn resident_quant(&self) -> Option<QuantSpec> {
+        self.load_quant.or(self.cfg.quantization)
+    }
+
     /// A fresh contiguous KV cache sized for this model.
     pub fn new_cache(&self) -> ContiguousKvCache {
         ContiguousKvCache::new(self.cfg.num_layers)

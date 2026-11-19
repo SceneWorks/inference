@@ -1540,55 +1540,51 @@ fn auto_block_draft_decisions_record_the_cuda_campaign() {
 }
 
 #[test]
-fn auto_block_draft_tier_follows_what_the_load_knows() {
-    use crate::Quantize;
-    assert_eq!(auto_block_draft_tier(Some(Quantize::Q4), true), Some("q4"));
-    assert_eq!(auto_block_draft_tier(Some(Quantize::Q8), true), Some("q8"));
-    assert_eq!(
-        auto_block_draft_tier(Some(Quantize::Nvfp4), true),
-        Some("nvfp4")
-    );
-    assert_eq!(auto_block_draft_tier(None, false), Some("bf16"));
-    // A snapshot quantized as stored: its bit width is not known from the load.
-    assert_eq!(auto_block_draft_tier(None, true), None);
+fn auto_block_draft_tier_follows_the_resident_quantization() {
+    use crate::ResidentQuantization as R;
+    assert_eq!(auto_block_draft_tier(R::Bits(4)), Some("q4"));
+    assert_eq!(auto_block_draft_tier(R::Bits(8)), Some("q8"));
+    assert_eq!(auto_block_draft_tier(R::Dense), Some("bf16"));
+    assert_eq!(auto_block_draft_tier(R::Nvfp4), Some("nvfp4"));
+    // Another width, mixed or unknown projections match no decision.
+    assert_eq!(auto_block_draft_tier(R::Bits(6)), None);
+    assert_eq!(auto_block_draft_tier(R::Unknown), None);
 }
 
 #[test]
 fn auto_prefers_block_draft_only_for_a_preferring_record() {
-    use crate::{BlockDraftFormat, DecodeBackend, Quantize};
+    use crate::{BlockDraftFormat, DecodeBackend, ResidentQuantization as R};
     // No resident draft, an unknown tier, or a recorded `prefer: false` all leave `auto` on MTP.
     assert!(!auto_prefers_block_draft(
         DecodeBackend::CandleCuda,
         None,
-        Some(Quantize::Q8),
-        true
+        R::Bits(8)
     ));
     assert!(!auto_prefers_block_draft(
         DecodeBackend::CandleCuda,
         Some(BlockDraftFormat::DFlash2),
-        None,
-        true
+        R::Unknown
     ));
     for format in BlockDraftFormat::ALL {
-        for tier in [Quantize::Q4, Quantize::Q8] {
+        for bits in [4, 8] {
             assert!(!auto_prefers_block_draft(
                 DecodeBackend::CandleCuda,
                 Some(format),
-                Some(tier),
-                true
+                R::Bits(bits)
             ));
         }
     }
-    // The preference follows every recorded entry's own `prefer`.
+    // The preference follows every recorded entry's own `prefer`, reached from the resident fact.
     for d in AUTO_BLOCK_DRAFT_DECISIONS {
-        let requested = match d.tier {
-            "q4" => Some(Quantize::Q4),
-            "q8" => Some(Quantize::Q8),
-            "nvfp4" => Some(Quantize::Nvfp4),
-            _ => None,
+        let resident = match d.tier {
+            "q4" => R::Bits(4),
+            "q8" => R::Bits(8),
+            "nvfp4" => R::Nvfp4,
+            "bf16" => R::Dense,
+            other => panic!("unrecorded tier {other}"),
         };
         assert_eq!(
-            auto_prefers_block_draft(d.backend, Some(d.format), requested, requested.is_some()),
+            auto_prefers_block_draft(d.backend, Some(d.format), resident),
             d.prefer
         );
     }

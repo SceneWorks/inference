@@ -571,6 +571,17 @@ impl Decoder {
         }
     }
 
+    /// What the resident projections hold (SW-7200): the affine spec's bit width when they are
+    /// quantized, dense when they are not, unknown for a quantized decoder with no affine spec
+    /// (Prism).
+    fn resident_quantization(&self) -> core_llm::ResidentQuantization {
+        let spec = match self {
+            Decoder::Causal(m) => m.resident_quant(),
+            Decoder::Qwen35(m) => m.resident_quant(),
+        };
+        resident_quantization(self.is_quantized(), spec.map(|q| q.bits))
+    }
+
     /// The decoder as the backend-neutral multimodal seam. Both backbones implement [`VlmDecode`]
     /// (the Qwen3.6 hybrid and the generic Qwen3-VL causal decoder), so the provider drives the
     /// image/video prefill + decode through this one trait object rather than forking on the concrete
@@ -4094,8 +4105,7 @@ impl LlamaProvider {
         let auto_prefers_block_draft = core_llm::auto_prefers_block_draft(
             core_llm::DecodeBackend::Mlx,
             self.block_draft.as_ref().map(|d| d.model.config().format),
-            self.load_report.requested,
-            self.is_quantized(),
+            self.model.resident_quantization(),
         );
         let resolution = core_llm::resolve_speculative_with(
             speculative_mode,
@@ -5687,6 +5697,16 @@ impl LlamaProvider {
         )?;
         run.report.draft = Some(block.report.clone());
         Ok(run)
+    }
+}
+
+/// The resident quantization of a decoder whose projections are `quantized` with affine bit
+/// width `bits` (`None` when no affine spec describes them).
+fn resident_quantization(quantized: bool, bits: Option<i32>) -> core_llm::ResidentQuantization {
+    match (quantized, bits.and_then(|b| u32::try_from(b).ok())) {
+        (false, _) => core_llm::ResidentQuantization::Dense,
+        (true, Some(bits)) => core_llm::ResidentQuantization::Bits(bits),
+        (true, None) => core_llm::ResidentQuantization::Unknown,
     }
 }
 
