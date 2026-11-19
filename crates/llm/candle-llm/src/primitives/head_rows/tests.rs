@@ -116,7 +116,10 @@ fn gathered_head_rows_score_as_the_whole_head() {
                 .forward(&rows.reshape((groups * senders, HIDDEN)).unwrap())
                 .unwrap(),
         );
-        let bit_exact = device.is_cpu() && label == "host";
+        // The gathered rows and the whole head multiply different shapes, so the gemm blocking and
+        // summation order differ by platform (x86 differs from arm by 1-2 ULP): the host gather is
+        // held to a tight relative bound, not to bit equality.
+        let host_gather = device.is_cpu() && label == "host";
         let mut worst = 0f32;
         for g in 0..groups {
             for s in 0..senders {
@@ -124,10 +127,14 @@ fn gathered_head_rows_score_as_the_whole_head() {
                     let id = ids_host[g * k + j] as usize;
                     let want = full[(g * senders + s) * VOCAB + id];
                     let have = got[(g * senders + s) * k + j];
-                    if bit_exact {
-                        assert_eq!(have, want, "{name}: ({g}, {s}, {j})");
+                    let rel = (have - want).abs() / want.abs().max(1.0);
+                    if host_gather {
+                        assert!(
+                            rel <= 1e-5,
+                            "{name}: ({g}, {s}, {j}): {have} vs {want}, relative difference {rel}"
+                        );
                     }
-                    worst = worst.max((have - want).abs() / want.abs().max(1.0));
+                    worst = worst.max(rel);
                 }
             }
         }

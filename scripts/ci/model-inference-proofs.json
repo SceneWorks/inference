@@ -118269,7 +118269,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/primitives/head_rows/tests.rs::primitives::head_rows::tests::gathered_head_rows_score_as_the_whole_head@5a91cb58580d1952226c759b460099fade7d98d45f63decdf5129e07bfa8e32b",
+      "source_identity": "crates/llm/candle-llm/src/primitives/head_rows/tests.rs::primitives::head_rows::tests::gathered_head_rows_score_as_the_whole_head@56aa63581c9b53038ec978b20971784914b1b8ae6d5e04049a3939de763129f7",
       "requirements": []
     }
   },
