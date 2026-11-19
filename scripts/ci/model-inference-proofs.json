@@ -114156,7 +114156,8 @@
         "environment": {},
         "cargo_features": [
           "cuda",
-          "model-inference-proof"
+          "model-inference-proof",
+          "testkit"
         ],
         "backend": "candle-cuda",
         "expected_devices": [
