@@ -5333,11 +5333,18 @@ fn an_unset_speculative_option_runs_the_providers_default() {
     core_llm_testkit::check_speculative_default(
         &provider,
         crate::device::decode_defaults(provider.model.device()).speculative,
+        provider.auto_prefers_block_draft(),
         prompt,
         8,
     );
     provider.set_speculative_default(core_llm::Speculative::Auto);
-    core_llm_testkit::check_speculative_default(&provider, core_llm::Speculative::Auto, prompt, 8);
+    core_llm_testkit::check_speculative_default(
+        &provider,
+        core_llm::Speculative::Auto,
+        provider.auto_prefers_block_draft(),
+        prompt,
+        8,
+    );
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");

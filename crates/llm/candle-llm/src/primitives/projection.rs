@@ -381,7 +381,9 @@ impl ProjectionCensus {
     /// What the quantized projections hold (SW-7200): dense when there are none, the GGML bit
     /// width when every one is a 4-bit or every one an 8-bit block, NVFP4 when every one is
     /// NVFP4; unknown for mixed widths or kinds, another block type, or Prism. Dense projections
-    /// beside quantized ones (an LM head) do not make it mixed.
+    /// beside quantized ones (an LM head) do not make it mixed. A llama.cpp mixed-precision GGUF
+    /// (`Q4_K_M`: `Q4_K` beside `Q6_K`) is deliberately unknown, not `q4`: every recorded
+    /// decision was measured on a uniform-width prepared snapshot, so none applies to it.
     pub fn resident_quantization(&self) -> core_llm::ResidentQuantization {
         use core_llm::ResidentQuantization as R;
         let (ggml, nvfp4, prism) = (self.ggml.count, self.nvfp4.count, self.prism.count);

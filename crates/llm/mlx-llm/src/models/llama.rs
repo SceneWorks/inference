@@ -641,10 +641,10 @@ impl CausalLm {
         self.quantized
     }
 
-    /// The affine spec the quantized projections hold — the load-time spec, else the snapshot's
-    /// stored one — or `None` for dense projections.
+    /// The affine spec the quantized projections hold — the snapshot's stored one, which its
+    /// projections load as stored, else the load-time spec — or `None` for dense projections.
     pub fn resident_quant(&self) -> Option<QuantSpec> {
-        self.load_quant.or(self.cfg.quantization)
+        self.cfg.quantization.or(self.load_quant)
     }
 
     /// A fresh contiguous KV cache sized for this model.

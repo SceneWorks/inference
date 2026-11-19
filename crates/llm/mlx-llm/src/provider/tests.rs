@@ -5824,11 +5824,18 @@ fn an_unset_speculative_option_runs_the_providers_default() {
     core_llm_testkit::check_speculative_default(
         &provider,
         core_llm::defaults::MLX.speculative,
+        provider.auto_prefers_block_draft(),
         prompt,
         8,
     );
     provider.set_speculative_default(core_llm::Speculative::Auto);
-    core_llm_testkit::check_speculative_default(&provider, core_llm::Speculative::Auto, prompt, 8);
+    core_llm_testkit::check_speculative_default(
+        &provider,
+        core_llm::Speculative::Auto,
+        provider.auto_prefers_block_draft(),
+        prompt,
+        8,
+    );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");
 }
@@ -7213,4 +7220,26 @@ fn resident_quantization_follows_the_affine_bit_width() {
         core_llm::auto_block_draft_tier(resident_quantization(true, Some(4))),
         Some("q4")
     );
+}
+
+/// SW-7200: the provider looks `auto`'s block-draft decision up by the resident draft's own format
+/// and the target's resident quantization, and passes the result to the resolver — no block
+/// draft, no preference.
+#[test]
+fn auto_block_draft_decision_is_keyed_on_the_resident_draft_and_target() {
+    use core_llm::ResidentQuantization as R;
+    for format in core_llm::BlockDraftFormat::ALL {
+        let provider = qwen35_provider_with_block_draft(format);
+        assert!(!provider.model.is_quantized(), "the tiny target is dense");
+        assert_eq!(provider.auto_block_draft_key(), Some((format, R::Dense)));
+        let recorded =
+            core_llm::auto_block_draft_decision(core_llm::DecodeBackend::Mlx, format, "bf16");
+        assert_eq!(
+            provider.auto_prefers_block_draft(),
+            recorded.is_some_and(|d| d.prefer)
+        );
+    }
+    let without = qwen35_mtp_provider();
+    assert_eq!(without.auto_block_draft_key(), None);
+    assert!(!without.auto_prefers_block_draft());
 }

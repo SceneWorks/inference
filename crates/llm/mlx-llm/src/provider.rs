@@ -3999,6 +3999,46 @@ impl LlamaProvider {
         packed: Option<&crate::decode::observe::CompressedKvArm>,
         prefix_cache: Option<&mut crate::decode::PrefixCache>,
     ) -> CoreResult<TextLlmOutput> {
+        self.generate_resolving(req, on_event, observer, packed, prefix_cache, false)
+    }
+
+    /// Whether `auto` runs this provider's resident block draft ahead of MTP (SW-7200): the
+    /// decision recorded for MLX, the draft's format and the target's resident tier.
+    pub(crate) fn auto_prefers_block_draft(&self) -> bool {
+        self.auto_block_draft_key()
+            .is_some_and(|(format, resident)| {
+                core_llm::auto_prefers_block_draft(
+                    core_llm::DecodeBackend::Mlx,
+                    Some(format),
+                    resident,
+                )
+            })
+    }
+
+    /// What `auto`'s block-draft decision is looked up by beside the backend: the resident
+    /// draft's format and the target's resident quantization; `None` with no block draft.
+    fn auto_block_draft_key(
+        &self,
+    ) -> Option<(core_llm::BlockDraftFormat, core_llm::ResidentQuantization)> {
+        let draft = self.block_draft.as_ref()?;
+        Some((
+            draft.model.config().format,
+            self.model.resident_quantization(),
+        ))
+    }
+
+    /// [`generate_inner`](Self::generate_inner); `block_draft_withheld` resolves `auto` without
+    /// its block-draft preference (a request whose memory refused the preferred draft) and names
+    /// [`core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED`].
+    fn generate_resolving(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: Option<&mut dyn crate::decode::observe::Observer>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
+        prefix_cache: Option<&mut crate::decode::PrefixCache>,
+        block_draft_withheld: bool,
+    ) -> CoreResult<TextLlmOutput> {
         let _progress = req.install_progress();
         self.validate(req)?;
         if req.cancel.is_cancelled() {
@@ -4100,20 +4140,20 @@ impl LlamaProvider {
         // against the plain loop it would fall back to, and demotes one measurably slower than
         // plain decoding (sc-24446, E5); an explicit `{proposer, depth}` runs as asked.
         // Under `auto`, a resident block draft runs ahead of MTP only where the SW-7200 paths
-        // campaign recorded it faster for this backend, draft format and target tier.
+        // campaign recorded it faster for this backend, draft format and target tier — and not
+        // on a request whose memory refused it once already (resolved again without it, by name).
         let speculative_mode = req.speculative_or(self.speculative_default);
-        let auto_prefers_block_draft = core_llm::auto_prefers_block_draft(
-            core_llm::DecodeBackend::Mlx,
-            self.block_draft.as_ref().map(|d| d.model.config().format),
-            self.model.resident_quantization(),
-        );
         let resolution = core_llm::resolve_speculative_with(
             speculative_mode,
             &self.descriptor.capabilities,
-            auto_prefers_block_draft,
+            !block_draft_withheld && self.auto_prefers_block_draft(),
         );
         let plan = resolution.plan;
-        let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
+        let mut fallbacks: Vec<String> = block_draft_withheld
+            .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
+            .into_iter()
+            .chain(resolution.fallback)
+            .collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
         // instead, by name (sc-24436, E2).
@@ -4282,7 +4322,7 @@ impl LlamaProvider {
         if prefix_route && compressed_format.is_some() {
             prefix_reason = Some(core_llm::PREFIX_COMPRESSED_NOT_STORED);
         }
-        core_llm::admit_request_memory_with_geometry(
+        if let Err(error) = core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
@@ -4292,7 +4332,25 @@ impl LlamaProvider {
                 required
             },
             prefix_admission.available,
-        )?;
+        ) {
+            // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
+            // prompt lookup or plain — what `auto` admitted before the preference), by name.
+            // Nothing has run: no K/V, no prefill, no preprocessing.
+            if core_llm::withdraws_auto_block_draft(speculative_mode, route.proposer_kind(), &error)
+            {
+                drop(compressed_prefix);
+                drop(_progress);
+                return self.generate_resolving(
+                    req,
+                    on_event,
+                    observer,
+                    packed,
+                    prefix_cache,
+                    true,
+                );
+            }
+            return Err(error);
+        }
         let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         // A compressed selection the model refuses runs dense from the start: the request was
         // admitted at the compressed price, so it is admitted again at the dense price before any

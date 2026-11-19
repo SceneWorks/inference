@@ -587,6 +587,7 @@ fn only_auto_is_monitored() {
                 (ProposerKind::None, 0),
                 (ProposerKind::DraftModel, 4),
                 (ProposerKind::Mtp, 0),
+                (ProposerKind::BlockDraft, 0),
             ] {
                 assert_eq!(
                     monitor(Speculative::Auto, kind, depth, plain, timed),
@@ -596,6 +597,81 @@ fn only_auto_is_monitored() {
             }
         }
     }
+}
+
+/// SW-7200: `auto`'s block draft keeps auto's guarantee — never measurably slower than plain —
+/// the way MTP and prompt lookup do: with no static threshold measured for it, a timed engine's
+/// monitor probes and judges it on the request's own costs; an untimed engine cannot, so it runs
+/// unmonitored, and an explicit `block_draft` request runs as asked (only `auto` is monitored).
+#[test]
+fn auto_block_draft_is_monitored_on_its_measured_costs() {
+    use crate::{Speculative, SpeculativeProposer};
+    use PlainDecode::{Candle, MlxPipelined, MlxUnpipelined};
+    for plain in [MlxPipelined, MlxUnpipelined, Candle] {
+        assert_eq!(demotion_threshold(ProposerKind::BlockDraft, 4, plain), None);
+        let monitor = AcceptanceMonitor::for_request(
+            Speculative::Auto,
+            ProposerKind::BlockDraft,
+            4,
+            plain,
+            true,
+        )
+        .expect("auto's block draft is monitored on a timed engine");
+        assert_eq!(monitor.threshold(), None);
+        assert!(monitor.probing(), "a timed monitor probes plain first");
+        assert_eq!(
+            AcceptanceMonitor::for_request(
+                Speculative::Auto,
+                ProposerKind::BlockDraft,
+                4,
+                plain,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            AcceptanceMonitor::for_request(
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+                ProposerKind::BlockDraft,
+                4,
+                plain,
+                true
+            ),
+            None,
+            "explicit block_draft runs as asked"
+        );
+    }
+}
+
+/// SW-7200: only `auto`'s block draft refused for the request's memory is withdrawn; an explicit
+/// `block_draft`, another route or another refusal keeps the error.
+#[test]
+fn only_auto_block_draft_memory_refusals_are_withdrawn() {
+    use crate::{Error, Speculative, SpeculativeProposer};
+    let exhausted = crate::admit_request_memory_with_geometry(8, 8, 4096, u64::MAX, 1)
+        .expect_err("a request larger than available memory is refused");
+    assert!(matches!(exhausted, Error::RequestResourceExhausted(_)));
+    assert!(withdraws_auto_block_draft(
+        Speculative::Auto,
+        ProposerKind::BlockDraft,
+        &exhausted
+    ));
+    assert!(!withdraws_auto_block_draft(
+        Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+        ProposerKind::BlockDraft,
+        &exhausted
+    ));
+    assert!(!withdraws_auto_block_draft(
+        Speculative::Auto,
+        ProposerKind::Mtp,
+        &exhausted
+    ));
+    assert!(!withdraws_auto_block_draft(
+        Speculative::Auto,
+        ProposerKind::BlockDraft,
+        &Error::InvalidRequest("context".into())
+    ));
+    assert!(AUTO_BLOCK_DRAFT_NOT_ADMITTED.starts_with("speculative: auto's block draft"));
 }
 
 // --- the cost-aware (timed) monitor (sc-24446) ---

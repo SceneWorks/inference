@@ -333,6 +333,27 @@ pub fn auto_prefers_block_draft(
         .is_some_and(|d| d.prefer)
 }
 
+/// The fallback a request names when `auto`'s preferred block draft did not fit the request's
+/// memory and `auto` resolved again without it (SW-7200): a request `auto` admitted before a block
+/// draft was preferred is never refused for the preference.
+pub const AUTO_BLOCK_DRAFT_NOT_ADMITTED: &str = "speculative: auto's block draft did not fit this \
+     request's memory; resolved without it";
+
+/// Whether a request's memory refusal `error` withdraws `auto`'s block draft (SW-7200): the request
+/// asked for `auto` (`mode`), the route it priced runs a block draft (`route`), and the refusal is
+/// the request's memory ([`Error::RequestResourceExhausted`](crate::Error::RequestResourceExhausted)).
+/// The provider then resolves again without the preference and names
+/// [`AUTO_BLOCK_DRAFT_NOT_ADMITTED`]; an explicit `block_draft` request keeps its refusal.
+pub fn withdraws_auto_block_draft(
+    mode: crate::Speculative,
+    route: ProposerKind,
+    error: &crate::Error,
+) -> bool {
+    mode == crate::Speculative::Auto
+        && route == ProposerKind::BlockDraft
+        && matches!(error, crate::Error::RequestResourceExhausted(_))
+}
+
 /// How an `auto` fallback with no runnable proposer begins; the reason follows in parentheses.
 const AUTO_FOUND_NO_PROPOSER: &str = "speculative: auto found no proposer this model can run";
 
@@ -697,9 +718,10 @@ pub enum PlainDecode {
 /// The mean accepted length per verify below which `proposer` at `depth` loses to `plain`
 /// decoding at the cheapest measured verify cost (see the constants above), or `None` when no
 /// demotion applies: no proposer, a zero depth, prompt lookup falling back to MLX's unpipelined
-/// loop (no measured regression there), or `draft_model` / `block_draft` — which
-/// [`Speculative::Auto`] never resolves to ([`resolve_speculative`] picks MTP, else prompt lookup) and whose cost the campaign
-/// did not measure.
+/// loop (no measured regression there), or `draft_model` / `block_draft`, whose verify cost no
+/// campaign measured. [`Speculative::Auto`] never resolves to `draft_model`; it resolves to
+/// `block_draft` only where a recorded decision prefers it ([`resolve_speculative_with`]), and
+/// there the timed [`AcceptanceMonitor`] judges it on its own measured costs.
 ///
 /// [`Speculative::Auto`]: crate::Speculative::Auto
 pub fn demotion_threshold(proposer: ProposerKind, depth: u32, plain: PlainDecode) -> Option<f64> {
@@ -1075,8 +1097,9 @@ impl AcceptanceMonitor {
     /// [`Speculative::Auto`](crate::Speculative::Auto) and it resolved to a proposer (`proposer` /
     /// `depth` are what the engine will actually run, after any route fallback) the monitor can
     /// judge against the `plain` loop a demotion would fall back to — one with a static
-    /// [`demotion_threshold`] there, or, when the engine times its steps (`timed`), MTP or prompt
-    /// lookup at a non-zero depth (its own measured costs decide).
+    /// [`demotion_threshold`] there, or, when the engine times its steps (`timed`), MTP, prompt
+    /// lookup or a block draft (SW-7200: `auto` runs one where a recorded decision prefers it) at
+    /// a non-zero depth (its own measured costs decide).
     pub fn for_request(
         mode: crate::Speculative,
         proposer: ProposerKind,
@@ -1090,7 +1113,10 @@ impl AcceptanceMonitor {
         let threshold = demotion_threshold(proposer, depth, plain);
         let measurable = timed
             && depth > 0
-            && matches!(proposer, ProposerKind::Mtp | ProposerKind::PromptLookup);
+            && matches!(
+                proposer,
+                ProposerKind::Mtp | ProposerKind::PromptLookup | ProposerKind::BlockDraft
+            );
         if threshold.is_none() && !measurable {
             return None;
         }
