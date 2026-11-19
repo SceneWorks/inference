@@ -54,16 +54,20 @@ FLEET_HUB_CACHE = {"nt": r"E:\HuggingFace\hub", "posix": "/Volumes/Models/huggin
 def runner_hub_cache(environ: dict | None = None, os_name: str | None = None) -> Path:
     """Return the runner's Hugging Face hub cache, the one place real-weight downloads land.
 
-    Resolved the way `huggingface_hub` resolves it -- `HF_HUB_CACHE`, else `$HF_HOME/hub` -- and,
-    when the runner environment sets neither, the fleet's fixed root for this OS rather than the
-    library's `~/.cache/huggingface` default, which is not where any runner keeps its weights.
+    Follows `huggingface_hub`'s order -- `HF_HUB_CACHE`, then the legacy `HUGGINGFACE_HUB_CACHE`,
+    then `$HF_HOME/hub` -- treating an empty value as unset. When the runner environment sets none
+    of them it uses the fleet's fixed root for this OS, not the library's `~/.cache/huggingface`
+    default, which is not where any runner keeps its weights. The result is absolute, because
+    later steps read the exported path from other working directories (`cargo test` runs test
+    binaries from the crate directory).
     """
     environ = os.environ if environ is None else environ
     os_name = os.name if os_name is None else os_name
-    if environ.get("HF_HUB_CACHE"):
-        return Path(environ["HF_HUB_CACHE"]).expanduser()
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if environ.get(name):
+            return Path(os.path.abspath(Path(environ[name]).expanduser()))
     if environ.get("HF_HOME"):
-        return Path(environ["HF_HOME"]).expanduser() / "hub"
+        return Path(os.path.abspath(Path(environ["HF_HOME"]).expanduser())) / "hub"
     return Path(FLEET_HUB_CACHE["nt" if os_name == "nt" else "posix"])
 
 

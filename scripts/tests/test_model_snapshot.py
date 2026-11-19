@@ -741,6 +741,17 @@ class RunnerHubCacheTests(unittest.TestCase):
     def test_hf_home_names_its_hub_directory(self) -> None:
         self.assertEqual(runner_hub_cache({"HF_HOME": "/y/home"}, "posix"), Path("/y/home/hub"))
 
+    def test_legacy_hub_cache_variable_is_honored_after_hf_hub_cache(self) -> None:
+        environ = {"HUGGINGFACE_HUB_CACHE": "/legacy/hub", "HF_HOME": "/y/home"}
+        self.assertEqual(runner_hub_cache(environ, "posix"), Path("/legacy/hub"))
+        environ["HF_HUB_CACHE"] = "/x/hub-cache"
+        self.assertEqual(runner_hub_cache(environ, "posix"), Path("/x/hub-cache"))
+
+    def test_relative_cache_variable_resolves_to_an_absolute_path(self) -> None:
+        resolved = runner_hub_cache({"HF_HOME": "relative-home"}, "posix")
+        self.assertTrue(resolved.is_absolute())
+        self.assertEqual(resolved, Path.cwd() / "relative-home" / "hub")
+
     def test_unset_environment_falls_back_to_the_fleet_root_per_os(self) -> None:
         self.assertEqual(
             runner_hub_cache({}, "posix"), Path("/Volumes/Models/huggingface/hub")
