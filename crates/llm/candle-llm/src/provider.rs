@@ -291,8 +291,10 @@ const TREE_MULTIMODAL_LINEAR: &str = "speculative: tree verification is not avai
 /// recurrent state (one full state per linear layer per row, held until the branch is kept).
 /// Only a `proposer` that builds branching trees carries that workspace
 /// ([`core_llm::tree_workspace_rows`]); any other's one branch is capped at `drafts` candidates
-/// and verified on the linear path the linear route already prices. `0` without a tree; `None`
-/// on overflow.
+/// and verified on the linear path the linear route already prices. A block draft's tree forward
+/// also returns every extra row's tapped layer outputs, `tap_width` elements each (SW-7198; `0`
+/// for any other proposer). `0` without a tree; `None` on overflow.
+#[allow(clippy::too_many_arguments)]
 fn tree_request_bytes(
     model: &Decoder,
     proposer: ProposerKind,
@@ -300,6 +302,7 @@ fn tree_request_bytes(
     tree_rows: usize,
     prompt: usize,
     max_new_tokens: u32,
+    tap_width: u64,
 ) -> Option<u64> {
     let tree_rows = core_llm::tree_workspace_rows(proposer, tree_rows);
     if drafts == 0 || tree_rows == 0 {
@@ -314,7 +317,11 @@ fn tree_request_bytes(
         .checked_mul(g.head_dim)?
         .checked_mul(g.element_bytes)?
         .checked_mul(2)?;
-    let row = g.hidden_size.checked_add(g.vocab_size)?.checked_mul(4)?;
+    let row = g
+        .hidden_size
+        .checked_add(g.vocab_size)?
+        .checked_add(tap_width)?
+        .checked_mul(4)?;
     let context = u64::try_from(prompt)
         .ok()?
         .checked_add(u64::from(max_new_tokens))?
@@ -1117,10 +1124,6 @@ struct ResidentBlockDraft {
 /// The fallback a `block_draft` plan names on a provider with no resident block draft.
 const BLOCK_DRAFT_NOT_LOADED: &str = "speculative: `block_draft` has no block draft loaded \
      beside this target; decoded without a proposer";
-
-/// The fallback a `block_draft` route names for an image or video prompt on Candle.
-pub(crate) const BLOCK_DRAFT_MULTIMODAL: &str = "speculative: `block_draft` runs on text prompts \
-     on Candle; this image/video prompt decoded without a proposer";
 
 /// The load estimate of a named block draft (SW-F360 E8), from the shared pricing at its
 /// requested precision: on the device its resident arrays plus twice its largest load group's
@@ -2106,6 +2109,15 @@ impl LlamaProvider {
         );
         self.draft = draft;
         self.draft_report = Some(report);
+    }
+
+    /// The tapped row width a `proposer`'s tree rows carry past the logit and hidden rows
+    /// ([`tree_request_bytes`]): a resident block draft's `layers × hidden` (SW-7198), else `0`.
+    fn tree_tap_width(&self, proposer: ProposerKind) -> u64 {
+        match (proposer, self.block_draft.as_ref()) {
+            (ProposerKind::BlockDraft, Some(d)) => d.model.config().tap_width() as u64,
+            _ => 0,
+        }
     }
 
     /// What a request on `route` is admitted against before any preprocessing: the target's

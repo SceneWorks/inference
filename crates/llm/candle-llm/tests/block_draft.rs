@@ -1,6 +1,8 @@
-//! Real-weight block-draft smokes on Candle (epic SW-F360, story SW-7197), `#[ignore]`d: the
-//! Qwen3.8-27B Candle describer tier with the DSpine or the DFlash2 draft resident beside it,
-//! through the provider on the CUDA device, greedy and sampled.
+//! Real-weight block-draft smokes on Candle (epic SW-F360, stories SW-7197 and SW-7198),
+//! `#[ignore]`d: the Qwen3.8-27B Candle describer tier with the DSpine or the DFlash2 draft
+//! resident beside it, through the provider on the CUDA device, greedy and sampled — on a text
+//! request, on an image + text request (the image generated in the test), and with tree
+//! verification against the linear verifier on the same request.
 //!
 //! The model-proof workflow stages the pinned snapshots and binds their paths:
 //!
@@ -42,8 +44,9 @@ const _: fn() = || {
 
 use candle_llm::LlamaProvider;
 use core_llm::{
-    BlockDraftFormat, LoadSpec, Message, ProposerKind, Quantize, Sampling, Speculative,
-    SpeculativeProposer, StreamEvent, TextLlm, TextLlmOutput, TextLlmRequest, ThinkingMode,
+    BlockDraftFormat, Content, ImageRef, LoadSpec, Message, ProposerKind, Quantize, Role, Sampling,
+    Speculative, SpeculativeProposer, SpeculativeVerify, StreamEvent, TextLlm, TextLlmOutput,
+    TextLlmRequest, ThinkingMode,
 };
 
 const TARGET: &str = "CANDLE_LLM_BLOCK_DRAFT_TARGET";
@@ -250,4 +253,285 @@ fn qwen38_27b_dflash2_accepts_more_than_one_token_per_pass() {
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dflash2_accepts_more_than_one_token_per_pass"
     );
+}
+
+/// The image request (SW-7198, E7; MLX's SW-7195 request): a 448 × 448 picture generated here —
+/// the left half orange, the right half deep blue — and a describe instruction, thinking off, as
+/// the describer asks.
+fn image_request(speculative: Speculative, sampling: Sampling) -> TextLlmRequest {
+    let (w, h) = (448u32, 448u32);
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            pixels.extend_from_slice(if x < w / 2 {
+                &[240, 140, 30]
+            } else {
+                &[20, 40, 140]
+            });
+        }
+    }
+    TextLlmRequest {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::Image(ImageRef::new(w, h, pixels).unwrap()),
+                Content::text(
+                    "Describe this image in two short paragraphs: its colours, how the picture \
+                     is divided, and what it might be used for.",
+                ),
+            ],
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+        sampling,
+        max_new_tokens: 160,
+        seed: Some(0),
+        thinking: ThinkingMode::Disabled,
+        speculative: Some(speculative),
+        ..Default::default()
+    }
+}
+
+/// Why a `block_draft` run's report shows it did not run as asked — another proposer, an unnamed
+/// draft, or a `block_draft` fallback (the depth clamp among them) — or committed more tokens
+/// than its target passes verified: each pass commits the target's own token plus the drafts it
+/// accepted, so `tokens <= passes + accepted` (the first token is the prefill's; a stop token
+/// is committed but not emitted). `None`: it ran as asked.
+fn ran_as_asked(what: &str, tokens: usize, out: &TextLlmOutput) -> Option<String> {
+    let decode = out.decode.as_ref()?;
+    if decode.proposer != ProposerKind::BlockDraft || decode.draft.is_none() {
+        return Some(format!(
+            "{what}: ran {:?} without the named draft",
+            decode.proposer
+        ));
+    }
+    if let Some(f) = decode.fallbacks.iter().find(|f| f.contains("block_draft")) {
+        return Some(format!("{what}: fell back: {f}"));
+    }
+    let verified = 1 + decode.verify_steps + decode.accepted_tokens;
+    (tokens as u64 > verified).then(|| {
+        format!("{what}: {tokens} tokens committed, only {verified} verified by the target")
+    })
+}
+
+/// Load the 27B with the `format` draft and run an image + text request with it (SW-7198 AC1):
+/// greedy and seeded sampled (which must reproduce), each with no `block_draft` fallback, the
+/// draft named, every committed token verified by the target, and the acceptance floors held;
+/// it reports where the greedy stream first differs from the same provider with speculation off.
+/// Every arm runs and prints before any check fails.
+fn image_request_runs_the_block_draft(format: BlockDraftFormat, source_var: &str) {
+    let name = format.label();
+    let (provider, depth, label) = load(source_var, None);
+    assert!(
+        provider.descriptor().capabilities.supports_vision,
+        "the describer tier loads its vision tower"
+    );
+    let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+    let sampled = Sampling {
+        temperature: 0.7,
+        top_p: 0.95,
+        ..Sampling::greedy()
+    };
+    let mut failures = Vec::new();
+    let (ids, out) = generate(&provider, &image_request(block, Sampling::greedy()));
+    let (off, _) = generate(
+        &provider,
+        &image_request(Speculative::Off, Sampling::greedy()),
+    );
+    let first = ids.iter().zip(&off).position(|(a, b)| a != b);
+    println!(
+        "BLOCK_DRAFT_IMAGE {name} ({label}) depth {depth}: first difference from off at {first:?} \
+         ({} against {} tokens), fallbacks {:?}, text {:?}",
+        ids.len(),
+        off.len(),
+        out.decode.as_ref().map(|d| &d.fallbacks),
+        out.text,
+    );
+    let named = out.decode.as_ref().and_then(|d| d.draft.clone());
+    if named
+        .as_ref()
+        .map(|d| (d.format.as_str(), d.precision.as_str()))
+        != Some((name, label))
+    {
+        failures.push(format!("{name} image: the draft is named {named:?}"));
+    }
+    failures.extend(ran_as_asked(
+        &format!("{name} image greedy"),
+        ids.len(),
+        &out,
+    ));
+    failures.extend(check(&format!("{name} image greedy"), ids.len(), out));
+    let (a, out) = generate(&provider, &image_request(block, sampled));
+    let (b, _) = generate(&provider, &image_request(block, sampled));
+    failures.extend(ran_as_asked(
+        &format!("{name} image sampled"),
+        a.len(),
+        &out,
+    ));
+    failures.extend(check(&format!("{name} image sampled"), a.len(), out));
+    if a != b {
+        failures.push(format!(
+            "{name} image sampled: a seeded sampled run does not reproduce"
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The 27B with the DSpine draft on an image + text request on CUDA (SW-7198 AC1).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen38_27b_dspine_runs_on_an_image_request() {
+    image_request_runs_the_block_draft(BlockDraftFormat::DSpine, "CANDLE_LLM_DSPINE_SOURCE");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dspine_runs_on_an_image_request");
+}
+
+/// The 27B with the DFlash2 draft on an image + text request on CUDA (SW-7198 AC1).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen38_27b_dflash2_runs_on_an_image_request() {
+    image_request_runs_the_block_draft(BlockDraftFormat::DFlash2, "CANDLE_LLM_DFLASH2_SOURCE");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dflash2_runs_on_an_image_request");
+}
+
+/// Why a tree run's report shows it did not verify the block draft's candidate trees as asked:
+/// a tree or `block_draft` fallback, no branching pass, a bound other than `max_rows`, pass
+/// figures that disagree with the run's, or fewer committed tokens per target pass than
+/// [`MIN_TOKENS_PER_PASS`]. Prints the run's rows checked and tokens accepted per pass and per
+/// tree pass first. `None`: it verified as asked.
+fn tree_ran_as_asked(
+    what: &str,
+    tokens: usize,
+    out: &TextLlmOutput,
+    max_rows: u32,
+) -> Option<String> {
+    let Some(decode) = out.decode.as_ref() else {
+        return Some(format!("{what}: no decode report"));
+    };
+    let Some(tree) = decode.tree_verify else {
+        return Some(format!("{what}: the tree request ran no tree"));
+    };
+    let per_pass = tokens as f64 / decode.verify_steps.max(1) as f64;
+    println!(
+        "BLOCK_DRAFT_TREE {what}: {tokens} tokens, {} target passes, {per_pass:.2} tokens per \
+         pass, tree_passes={} rows_verified_per_pass={:.2} accepted_per_pass={:.2} \
+         rows_per_tree_pass={:.2} accepted_per_tree_pass={:.2} max_rows_per_pass={} \
+         peak_workspace_bytes={} graphs {:?} fallbacks {:?}",
+        decode.verify_steps,
+        tree.tree_passes,
+        tree.rows_per_pass().unwrap_or(0.0),
+        tree.accepted_per_pass().unwrap_or(0.0),
+        tree.rows_per_tree_pass().unwrap_or(0.0),
+        tree.accepted_per_tree_pass().unwrap_or(0.0),
+        tree.max_rows_per_pass,
+        tree.peak_workspace_bytes,
+        decode.cuda_graphs,
+        decode.fallbacks,
+    );
+    if let Some(f) = decode.fallbacks.iter().find(|f| f.contains("tree")) {
+        return Some(format!("{what}: verified linearly: {f}"));
+    }
+    if tree.max_rows != max_rows || tree.tree_passes == 0 {
+        return Some(format!(
+            "{what}: bound {} and {} branching passes",
+            tree.max_rows, tree.tree_passes
+        ));
+    }
+    // The accepted branch only: every pass and every accepted candidate counted once, each tree
+    // pass feeding its anchor and at least one candidate, accepted at most down one branch.
+    if tree.passes != decode.verify_steps
+        || tree.accepted_tokens != decode.accepted_tokens
+        || tree.tree_rows_verified <= tree.tree_passes
+        || tree.tree_accepted_tokens > tree.accepted_tokens
+        || tree.max_rows_per_pass > 1 + u64::from(max_rows)
+    {
+        return Some(format!(
+            "{what}: the tree report disagrees with the run: {tree:?}"
+        ));
+    }
+    // Each tree pass ran eager through the CUDA-graph runner.
+    if decode.cuda_graphs.eager < tree.tree_passes {
+        return Some(format!(
+            "{what}: {} eager steps for {} tree passes",
+            decode.cuda_graphs.eager, tree.tree_passes
+        ));
+    }
+    (per_pass < MIN_TOKENS_PER_PASS).then(|| {
+        format!("{what}: {per_pass:.2} tokens per target pass, below {MIN_TOKENS_PER_PASS}")
+    })
+}
+
+/// Load the 27B with the `format` draft and run the same text request under a 16-row tree and
+/// then linearly, greedy and seeded sampled (SW-7198 AC2): each tree run verifies branching trees
+/// with no tree or `block_draft` fallback, commits only verified tokens down the accepted branch
+/// (its pass figures agree with the run's), runs each tree pass eager through the graph runner and
+/// holds [`MIN_TOKENS_PER_PASS`]; the linear runs after it hold both floors and replay their
+/// captured graphs again; a seeded sampled tree run reproduces. Prints both runs' tokens per pass,
+/// the tree's rows checked and tokens accepted per pass, and where the greedy tree stream first
+/// differs from the linear one. Every arm runs and prints before any check fails.
+fn tree_verifies_block_draft_candidates(format: BlockDraftFormat, source_var: &str) {
+    let name = format.label();
+    let (provider, depth, _) = load(source_var, None);
+    let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+    let tree = SpeculativeVerify::Tree { max_rows: 16 };
+    let sampled = Sampling {
+        temperature: 0.7,
+        top_p: 0.95,
+        ..Sampling::greedy()
+    };
+    let verified = |sampling: Sampling, verify: SpeculativeVerify| TextLlmRequest {
+        speculative_verify: verify,
+        ..request(block, sampling)
+    };
+    let mut failures = Vec::new();
+    for (mode, sampling) in [("greedy", Sampling::greedy()), ("sampled", sampled)] {
+        let (tree_ids, out) = generate(&provider, &verified(sampling, tree));
+        let what = format!("{name} {mode} tree depth {depth}");
+        failures.extend(ran_as_asked(&what, tree_ids.len(), &out));
+        failures.extend(tree_ran_as_asked(&what, tree_ids.len(), &out, 16));
+        if mode == "sampled" {
+            let (again, _) = generate(&provider, &verified(sampling, tree));
+            if again != tree_ids {
+                failures.push(format!(
+                    "{what}: a seeded sampled tree run does not reproduce"
+                ));
+            }
+        }
+        let (linear_ids, out) = generate(&provider, &verified(sampling, SpeculativeVerify::Linear));
+        let what = format!("{name} {mode} linear depth {depth}");
+        let replayed = out.decode.as_ref().map_or(0, |d| d.cuda_graphs.replayed);
+        failures.extend(ran_as_asked(&what, linear_ids.len(), &out));
+        failures.extend(check(&what, linear_ids.len(), out));
+        if replayed == 0 {
+            failures.push(format!(
+                "{what}: no graph replay on the linear steps after the tree run"
+            ));
+        }
+        let first = tree_ids.iter().zip(&linear_ids).position(|(a, b)| a != b);
+        println!("{name} {mode}: the tree stream first differs from the linear one at {first:?}");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The 27B with the DSpine draft under tree verification on CUDA (SW-7198 AC2).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen38_27b_dspine_tree_verifies_its_candidates() {
+    tree_verifies_block_draft_candidates(BlockDraftFormat::DSpine, "CANDLE_LLM_DSPINE_SOURCE");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dspine_tree_verifies_its_candidates");
+}
+
+/// The 27B with the DFlash2 draft under tree verification on CUDA (SW-7198 AC2).
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen38_27b_dflash2_tree_verifies_its_candidates() {
+    tree_verifies_block_draft_candidates(BlockDraftFormat::DFlash2, "CANDLE_LLM_DFLASH2_SOURCE");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_dflash2_tree_verifies_its_candidates");
 }

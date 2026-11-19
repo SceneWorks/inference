@@ -17,20 +17,34 @@
 //! sender column — row `i`'s candidates scored for each candidate of row `i - 1` — so the proposer
 //! keeps every scored row's candidates and the whole table ([`BlockDraftProposer::candidates`]),
 //! the lattice a tree proposal branches over.
+//!
+//! ## Image prompts (SW-7198)
+//! On an image or video prompt the caller prefills the fused embeddings through the tapped target
+//! ([`Qwen35Model::prefill_tapped_from_embeds_deepstack`]: the M-RoPE positions and DeepStack
+//! fusion of the MTP multimodal prefill), so the context reads the target's own rows at the visual
+//! positions. The context is indexed by sequence position (the references' draft cache offset);
+//! the engine's positions are the target's RoPE positions, which an M-RoPE prompt shifts by its
+//! `mrope_delta` ([`BlockDraftProposer::set_rope_delta`]).
+//!
+//! ## Tree verification (SW-7198)
+//! Under a tree request the proposer hands the verifier the candidate **tree** of the same draft
+//! forward ([`Proposer::propose_tree`], built by [`tree::build_tree`]), and the target verifies it
+//! in one eager tree forward ([`TappedQwen35`]'s returns the tapped rows of every tree row). The
+//! engine keeps the accepted branch only, so a commit appends the accepted branch's taps — the
+//! context a draft that only ever saw the accepted path holds — and an aborted tree step never
+//! reaches the proposer.
 
 use candle_core::Tensor;
-use core_llm::ProposerKind;
+use core_llm::{DraftTree, ProposerKind};
 
 use crate::decode::engine::{DraftSampler, Drafts, Proposal, ProposeContext, Proposer};
-use crate::decode::step::{StepModel, StepOutput, StepRequest};
+use crate::decode::step::{StepModel, StepOutput, StepRequest, TreeOutput, TreeVerify};
 use crate::error::{Error, Result};
 use crate::models::{BlockDraft, BlockDraftContext, Qwen35Cache, Qwen35Model};
 use crate::primitives::attention::AttnFormulation;
 use crate::primitives::input_ids;
 
-/// Why a tree request with a block draft verifies linearly on Candle (feature SW-F328): the
-/// block-draft proposer here hands the verifier its linear chain.
-pub const BLOCK_DRAFT_TREE_UNSUPPORTED: &str = "the Candle block-draft proposer proposes linearly";
+mod tree;
 
 /// The Qwen3.5/3.8 hybrid as a block draft's target: its hidden rows are the outputs of `layers`
 /// (0-based), concatenated, and a step returns at most the last `keep` of them (the draft's
@@ -91,8 +105,18 @@ impl StepModel for TappedQwen35<'_> {
             .forward_step_tapped(cache, request, Some((&self.layers, self.keep)))
     }
 
-    fn tree_unsupported(&self, _: &Qwen35Cache) -> Option<&'static str> {
-        Some(BLOCK_DRAFT_TREE_UNSUPPORTED)
+    fn tree_unsupported(&self, cache: &Qwen35Cache) -> Option<&'static str> {
+        StepModel::tree_unsupported(self.model, cache)
+    }
+
+    /// The hybrid's tree forward; with hidden rows asked for, they are every tree row's taps (the
+    /// window cap does not apply: a tree carries at most the anchor and sixteen rows).
+    fn forward_tree(&self, cache: &mut Qwen35Cache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
+        if tree.want_hidden {
+            self.model.forward_tree_tapped(cache, tree, &self.layers)
+        } else {
+            StepModel::forward_tree(self.model, cache, tree)
+        }
     }
 }
 
@@ -113,6 +137,9 @@ pub struct BlockDraftProposer<'d> {
     /// The last proposal's `[rows, K, K]` score table, row-major: row `i`'s candidates scored for
     /// each candidate sender of row `i - 1`.
     table: Vec<f32>,
+    /// RoPE position minus sequence position for the continuation: an M-RoPE prompt's
+    /// `mrope_delta`, `0` for text ([`Self::set_rope_delta`]).
+    rope_delta: i32,
     /// Draft block forwards issued.
     pub draft_forwards: u64,
 }
@@ -126,8 +153,16 @@ impl<'d> BlockDraftProposer<'d> {
             context: None,
             candidates: Vec::new(),
             table: Vec::new(),
+            rope_delta: 0,
             draft_forwards: 0,
         }
+    }
+
+    /// The prompt's RoPE shift (an M-RoPE image or video prompt's `mrope_delta`, the cache's
+    /// [`Qwen35Cache::set_rope_delta`]): the engine hands the proposer RoPE positions, the context
+    /// counts sequence positions, as both references' draft caches do (SW-7198).
+    pub fn set_rope_delta(&mut self, delta: i32) {
+        self.rope_delta = delta;
     }
 
     /// The last proposal's candidates per scored draft row.
@@ -152,10 +187,11 @@ impl<'d> BlockDraftProposer<'d> {
             .ok_or_else(|| Error::Msg("BlockDraftProposer: used before warm".into()))
     }
 
-    /// Append the target rows `rows` `[1, n, tap_width]` for positions `first..`, skipping any the
-    /// context already holds.
+    /// Append the target rows `rows` `[1, n, tap_width]` for RoPE positions `first..`, skipping
+    /// any the context already holds.
     fn append_from(&mut self, rows: &Tensor, first: i32) -> Result<()> {
         let draft = self.draft;
+        let first = first - self.rope_delta;
         let context = self.context_mut()?;
         let skip = context.next_position() - first;
         let n = rows.dim(1)? as i32;
@@ -172,12 +208,14 @@ impl<'d> BlockDraftProposer<'d> {
     /// One draft block forward for the step `ctx`: stores each scored row's candidates and the
     /// score table, and returns the vocabulary width the rows are drawn over.
     fn run_draft(&mut self, ctx: &ProposeContext<'_>) -> Result<usize> {
+        // The anchor's sequence position.
+        let position = ctx.position - self.rope_delta;
         // After steps the target ran without a proposal (`auto`'s probe), the row before `cur`
         // arrives as the step's previous hidden row.
         let behind = self
             .context
             .as_ref()
-            .is_some_and(|c| c.next_position() < ctx.position);
+            .is_some_and(|c| c.next_position() < position);
         if behind {
             let row = ctx.previous_hidden.ok_or_else(|| {
                 Error::Msg("BlockDraftProposer: no target row before the anchor".into())
@@ -195,11 +233,10 @@ impl<'d> BlockDraftProposer<'d> {
             .context
             .as_ref()
             .ok_or_else(|| Error::Msg("BlockDraftProposer: propose before warm".into()))?;
-        if context.next_position() != ctx.position {
+        if context.next_position() != position {
             return Err(Error::Msg(format!(
-                "BlockDraftProposer: the context ends at {}, the anchor sits at {}",
+                "BlockDraftProposer: the context ends at {}, the anchor sits at {position}",
                 context.next_position(),
-                ctx.position
             )));
         }
         let (candidates, table) = draft.propose(context, &embeds, depth, ctx.cur, target)?;
@@ -276,6 +313,21 @@ impl Proposer for BlockDraftProposer<'_> {
         })
     }
 
+    /// The candidate tree of one draft forward (SW-7198): see [`tree::build_tree`].
+    fn propose_tree(
+        &mut self,
+        ctx: &ProposeContext<'_>,
+        sampler: &mut DraftSampler<'_, '_>,
+    ) -> Result<Option<DraftTree>> {
+        let width = self.run_draft(ctx)?;
+        let lattice = tree::Lattice {
+            candidates: &self.candidates,
+            table: &self.table,
+            width,
+        };
+        tree::build_tree(&lattice, ctx, sampler).map(Some)
+    }
+
     fn commit(
         &mut self,
         _: i32,
@@ -286,7 +338,8 @@ impl Proposer for BlockDraftProposer<'_> {
         let rows = kept_hidden.ok_or_else(|| {
             Error::Msg("BlockDraftProposer: no target rows for the committed tokens".into())
         })?;
-        // `position` is `accepted[0]`'s; the rows start at `cur`'s.
+        // `position` is `accepted[0]`'s; the rows start at `cur`'s (on a tree step, the accepted
+        // branch's rows only).
         self.append_from(rows, position - 1)
     }
 

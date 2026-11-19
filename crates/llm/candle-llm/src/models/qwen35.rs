@@ -3199,51 +3199,109 @@ impl Qwen35Model {
         keep: Option<usize>,
         scope: LogitsScope,
     ) -> Result<(Tensor, Tensor)> {
-        // Each tapped layer's kept rows are copied straight into their column band of one
-        // `[B, n, layers × hidden]` buffer: the taps are held once (as the request pricing counts
-        // them), never as per-layer copies plus their concatenation. The buffer is allocated
-        // once per forward and filled by device copies, so a captured verify step stages its taps
-        // in its own fixed buffer.
-        let mut taps: Option<Tensor> = None;
-        let mut filled = vec![false; layers.len()];
+        let mut taps = Taps::new(layers, keep);
         let h = self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()), &mut |i, h| {
-            let (b, s, hidden) = h.dims3()?;
-            let n = keep.map_or(s, |k| k.min(s));
-            for (j, _) in layers.iter().enumerate().filter(|(_, &l)| l == i) {
-                let buffer = match &taps {
-                    Some(buffer) => buffer,
-                    // SAFETY: every column band is written below before the buffer is read (a
-                    // band left unwritten is refused after the forward).
-                    None => taps.insert(unsafe {
-                        Tensor::empty((b, n, layers.len() * hidden), h.dtype(), h.device())?
-                    }),
-                };
-                // `[B, n, hidden]` into columns `j·hidden..` of `[B, n, layers·hidden]`: one
-                // strided device copy per layer (the reshapes are views of the same storage).
-                let rows = h.narrow(1, s - n, n)?.contiguous()?;
-                buffer.reshape((b * n, layers.len() * hidden))?.slice_set(
-                    &rows.reshape((b * n, hidden))?,
-                    1,
-                    j * hidden,
-                )?;
-                filled[j] = true;
-            }
-            Ok(())
+            taps.take(i, h)
         })?;
-        let taps = match taps {
-            Some(taps) if filled.iter().all(|&f| f) => taps,
-            _ => {
-                return Err(Error::Config(format!(
-                    "tapped layers {layers:?} outside this {}-layer target",
-                    self.layers.len()
-                )))
-            }
-        };
+        let taps = taps.finish(self.layers.len())?;
         let logits = match scope {
             LogitsScope::Last => self.project_last(&h)?,
             LogitsScope::All => self.project(&h)?,
         };
         Ok((logits, taps))
+    }
+
+    /// The tapped decoder over a fused multimodal prompt (SW-7198, E7): the prompt's decoder input
+    /// `embeds` `[1, S, hidden]` — the vision encoder's rows already spliced in — run under their
+    /// explicit three-axis M-RoPE `positions` with the DeepStack features added after the first
+    /// layers, exactly as [`Self::prefill_from_embeds_deepstack_with_hidden`] (the MTP multimodal
+    /// prefill) runs them. Returns the last position's logits `[1, vocab]` and the tapped rows of
+    /// [`Self::forward_tapped`] — image positions included, the last `keep` of them. A layer's tap
+    /// is the residual stream the next layer reads, so a DeepStack layer's tap carries its fused
+    /// features (MLX's `prefill_tapped_from_embeds_with_deepstack`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tapped_from_embeds_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+        layers: &[usize],
+        keep: Option<usize>,
+    ) -> Result<(Tensor, Tensor)> {
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            self.dtype,
+            &self.device,
+        )?;
+        let mut h = embeds.to_dtype(self.dtype)?;
+        cache.begin_forward(h.dim(1)?)?;
+        let mut taps = Taps::new(layers, keep);
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = layer.forward(&h, &cos, &sin, slot, self.attn_formulation)?;
+            if let Some(feature) = deepstack.get(i) {
+                h = deepstack::add_visual_features(&h, visual_pos_mask, feature)?;
+            }
+            taps.take(i, &h)?;
+        }
+        Ok((self.project_last(&h)?, taps.finish(self.layers.len())?))
+    }
+
+    /// [`StepModel::forward_tree`] with **hidden-state taps** (SW-7198): every row's logits and
+    /// the outputs of decoder `layers` for every tree row, concatenated `[1, rows, layers ×
+    /// hidden]` as [`Self::forward_tapped`] returns them. Row `r`'s taps see only the cached
+    /// prefix and `r`'s ancestors, so the accepted branch's rows are the taps a linear forward of
+    /// that branch returns — the rows a block draft's context reads.
+    pub fn forward_tree_tapped(
+        &self,
+        cache: &mut Qwen35Cache,
+        tree: &TreeVerify<'_>,
+        layers: &[usize],
+    ) -> Result<TreeOutput> {
+        self.tree_forward(cache, tree, Some(layers))
+    }
+
+    /// The tree forward ([`StepModel::forward_tree`]); with `layers`, the hidden rows are those
+    /// layers' taps for every row, else (when asked) the final-normalized rows.
+    fn tree_forward(
+        &self,
+        cache: &mut Qwen35Cache,
+        tree: &TreeVerify<'_>,
+        layers: Option<&[usize]>,
+    ) -> Result<TreeOutput> {
+        let base = cache.offset();
+        let rows = tree.tree.rows();
+        cache.begin_forward(rows)?;
+        let plan = TreePlan::new(tree.tree);
+        let mask = tree.mask(base as usize, self.dtype, &self.device)?;
+        let mask_bytes = tensor_bytes(&mask);
+        let positions = tree.positions(base + cache.rope_delta());
+        let (cos, sin) = self.rope.cos_sin_at(&positions, self.dtype, &self.device)?;
+        let mut h = self
+            .embed_tokens
+            .forward(&tree.ids(&self.device)?)?
+            .to_dtype(self.dtype)?;
+        let mut taps = layers.map(|layers| Taps::new(layers, None));
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = layer.forward_tree(&h, &cos, &sin, slot, &plan, &mask)?;
+            if let Some(taps) = taps.as_mut() {
+                taps.take(i, &h)?;
+            }
+        }
+        let normalized = self.normalize(&h)?;
+        let logits = self.project_normalized(&normalized)?;
+        let hidden = match taps {
+            Some(taps) => Some(taps.finish(self.layers.len())?),
+            None => tree.want_hidden.then_some(normalized),
+        };
+        Ok(TreeOutput {
+            step: StepOutput { logits, hidden },
+            mask_bytes,
+        })
     }
 
     /// The decoder layer count.
@@ -3993,30 +4051,69 @@ impl StepModel for Qwen35Model {
     /// mask. The attention KV holds every row afterwards and the DeltaNet layers the per-row
     /// states, until the cache commits a branch or aborts.
     fn forward_tree(&self, cache: &mut Qwen35Cache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
-        let base = cache.offset();
-        let rows = tree.tree.rows();
-        cache.begin_forward(rows)?;
-        let plan = TreePlan::new(tree.tree);
-        let mask = tree.mask(base as usize, self.dtype, &self.device)?;
-        let mask_bytes = tensor_bytes(&mask);
-        let positions = tree.positions(base + cache.rope_delta());
-        let (cos, sin) = self.rope.cos_sin_at(&positions, self.dtype, &self.device)?;
-        let mut h = self
-            .embed_tokens
-            .forward(&tree.ids(&self.device)?)?
-            .to_dtype(self.dtype)?;
-        for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            h = layer.forward_tree(&h, &cos, &sin, slot, &plan, &mask)?;
+        self.tree_forward(cache, tree, None)
+    }
+}
+
+/// A block draft's target taps over one forward (SW-F360): each tapped layer's last `keep` rows
+/// copied straight into their column band of one `[B, n, layers × hidden]` buffer, so the taps are
+/// held once (as the request pricing counts them), never as per-layer copies plus their
+/// concatenation. The buffer is allocated once per forward and filled by device copies, so a
+/// captured verify step stages its taps in its own fixed buffer.
+struct Taps<'a> {
+    layers: &'a [usize],
+    keep: Option<usize>,
+    buffer: Option<Tensor>,
+    filled: Vec<bool>,
+}
+
+impl<'a> Taps<'a> {
+    fn new(layers: &'a [usize], keep: Option<usize>) -> Self {
+        Self {
+            layers,
+            keep,
+            buffer: None,
+            filled: vec![false; layers.len()],
         }
-        let normalized = self.normalize(&h)?;
-        let logits = self.project_normalized(&normalized)?;
-        Ok(TreeOutput {
-            step: StepOutput {
-                logits,
-                hidden: tree.want_hidden.then_some(normalized),
-            },
-            mask_bytes,
-        })
+    }
+
+    /// Take decoder layer `i`'s output `h` `[B, S, hidden]` if `i` is tapped.
+    fn take(&mut self, i: usize, h: &Tensor) -> Result<()> {
+        let (b, s, hidden) = h.dims3()?;
+        let n = self.keep.map_or(s, |k| k.min(s));
+        let width = self.layers.len() * hidden;
+        for (j, _) in self.layers.iter().enumerate().filter(|(_, &l)| l == i) {
+            let buffer = match &self.buffer {
+                Some(buffer) => buffer,
+                // SAFETY: every column band is written before the buffer is read (a band left
+                // unwritten is refused by `finish`).
+                None => self
+                    .buffer
+                    .insert(unsafe { Tensor::empty((b, n, width), h.dtype(), h.device())? }),
+            };
+            // `[B, n, hidden]` into columns `j·hidden..` of `[B, n, layers·hidden]`: one strided
+            // device copy per layer (the reshapes are views of the same storage).
+            let rows = h.narrow(1, s - n, n)?.contiguous()?;
+            buffer.reshape((b * n, width))?.slice_set(
+                &rows.reshape((b * n, hidden))?,
+                1,
+                j * hidden,
+            )?;
+            self.filled[j] = true;
+        }
+        Ok(())
+    }
+
+    /// The filled buffer, or a refusal naming a tapped layer outside this `num_layers`-layer
+    /// target.
+    fn finish(self, num_layers: usize) -> Result<Tensor> {
+        match self.buffer {
+            Some(taps) if self.filled.iter().all(|&f| f) => Ok(taps),
+            _ => Err(Error::Config(format!(
+                "tapped layers {:?} outside this {num_layers}-layer target",
+                self.layers
+            ))),
+        }
     }
 }
 

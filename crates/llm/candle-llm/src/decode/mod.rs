@@ -30,7 +30,7 @@ pub mod step;
 pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
-pub use block_draft::{BlockDraftProposer, TappedQwen35, BLOCK_DRAFT_TREE_UNSUPPORTED};
+pub use block_draft::{BlockDraftProposer, TappedQwen35};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
