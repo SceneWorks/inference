@@ -1435,7 +1435,7 @@ fn greedy_is_the_point_mass_special_case() {
 
 /// SW-7200: `auto` keeps its MTP-then-prompt-lookup order unless the caller passes a recorded
 /// block-draft preference; with it, an advertised block draft runs first at its recommended depth,
-/// and a model without one still falls through to MTP. No decision is recorded yet.
+/// and a model without one still falls through to MTP. No recorded decision prefers a draft yet.
 #[test]
 fn auto_prefers_a_block_draft_only_when_asked() {
     use crate::{
@@ -1483,11 +1483,113 @@ fn auto_prefers_a_block_draft_only_when_asked() {
         resolve_speculative_with(Speculative::Off, &with_draft, true),
         SpeculativeResolution::default()
     );
+    // Advertised MTP is not required for the fallthrough: prompt lookup follows when MTP is absent.
+    let lookup_only = TextLlmCapabilities {
+        speculative: vec![ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 6,
+            recommended_depth: 2,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve_speculative_with(Speculative::Auto, &lookup_only, true).plan,
+        run(SpeculativeProposer::PromptLookup, 2)
+    );
+    // No recorded decision prefers a block draft yet, so the providers' preference is `false`
+    // for every backend, format and tier and `auto` keeps MTP.
     for backend in DecodeBackend::ALL {
         for format in BlockDraftFormat::ALL {
             for tier in ["q4", "q8", "bf16"] {
-                assert_eq!(auto_block_draft_decision(backend, format, tier), None);
+                assert!(auto_block_draft_decision(backend, format, tier).is_none_or(|d| !d.prefer));
             }
         }
+    }
+}
+
+#[test]
+fn auto_block_draft_decisions_record_the_cuda_campaign() {
+    use crate::{BlockDraftFormat, DecodeBackend};
+    for (format, tier, numbers) in [
+        (BlockDraftFormat::DFlash2, "q4", "1.49x plain vs MTP 1.70x"),
+        (BlockDraftFormat::DSpine, "q4", "1.48x plain vs MTP 1.70x"),
+        (BlockDraftFormat::DFlash2, "q8", "2.00x plain vs MTP 2.04x"),
+        (BlockDraftFormat::DSpine, "q8", "1.92x plain vs MTP 2.04x"),
+    ] {
+        let d = auto_block_draft_decision(DecodeBackend::CandleCuda, format, tier)
+            .unwrap_or_else(|| panic!("CUDA {format:?} {tier} is recorded"));
+        assert!(!d.prefer, "CUDA {format:?} {tier} loses to MTP");
+        assert!(d.reason.contains("44516873473"), "{}", d.reason);
+        assert!(d.reason.contains(numbers), "{}", d.reason);
+    }
+    // Unmeasured pairs have no entry: CUDA bf16, the other Candle devices.
+    assert_eq!(
+        auto_block_draft_decision(DecodeBackend::CandleCuda, BlockDraftFormat::DFlash2, "bf16"),
+        None
+    );
+    assert_eq!(
+        auto_block_draft_decision(DecodeBackend::CandleMetal, BlockDraftFormat::DFlash2, "q4"),
+        None
+    );
+    // One entry per (backend, format, tier).
+    for (i, a) in AUTO_BLOCK_DRAFT_DECISIONS.iter().enumerate() {
+        assert!(AUTO_BLOCK_DRAFT_DECISIONS[i + 1..]
+            .iter()
+            .all(|b| (a.backend, a.format, a.tier) != (b.backend, b.format, b.tier)));
+    }
+}
+
+#[test]
+fn auto_block_draft_tier_follows_what_the_load_knows() {
+    use crate::Quantize;
+    assert_eq!(auto_block_draft_tier(Some(Quantize::Q4), true), Some("q4"));
+    assert_eq!(auto_block_draft_tier(Some(Quantize::Q8), true), Some("q8"));
+    assert_eq!(
+        auto_block_draft_tier(Some(Quantize::Nvfp4), true),
+        Some("nvfp4")
+    );
+    assert_eq!(auto_block_draft_tier(None, false), Some("bf16"));
+    // A snapshot quantized as stored: its bit width is not known from the load.
+    assert_eq!(auto_block_draft_tier(None, true), None);
+}
+
+#[test]
+fn auto_prefers_block_draft_only_for_a_preferring_record() {
+    use crate::{BlockDraftFormat, DecodeBackend, Quantize};
+    // No resident draft, an unknown tier, or a recorded `prefer: false` all leave `auto` on MTP.
+    assert!(!auto_prefers_block_draft(
+        DecodeBackend::CandleCuda,
+        None,
+        Some(Quantize::Q8),
+        true
+    ));
+    assert!(!auto_prefers_block_draft(
+        DecodeBackend::CandleCuda,
+        Some(BlockDraftFormat::DFlash2),
+        None,
+        true
+    ));
+    for format in BlockDraftFormat::ALL {
+        for tier in [Quantize::Q4, Quantize::Q8] {
+            assert!(!auto_prefers_block_draft(
+                DecodeBackend::CandleCuda,
+                Some(format),
+                Some(tier),
+                true
+            ));
+        }
+    }
+    // The preference follows every recorded entry's own `prefer`.
+    for d in AUTO_BLOCK_DRAFT_DECISIONS {
+        let requested = match d.tier {
+            "q4" => Some(Quantize::Q4),
+            "q8" => Some(Quantize::Q8),
+            "nvfp4" => Some(Quantize::Nvfp4),
+            _ => None,
+        };
+        assert_eq!(
+            auto_prefers_block_draft(d.backend, Some(d.format), requested, requested.is_some()),
+            d.prefer
+        );
     }
 }

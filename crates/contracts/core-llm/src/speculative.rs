@@ -161,8 +161,9 @@ pub fn resolve_speculative(
 /// [`resolve_speculative`] with `auto`'s block-draft preference (SW-7200): when
 /// `auto_prefers_block_draft`, `auto` runs an advertised `block_draft` at its recommended depth
 /// before MTP and prompt lookup; otherwise it is exactly [`resolve_speculative`]. A provider
-/// passes the preference [`auto_block_draft_decision`] records for its backend, resident draft
-/// format and target tier — `false` wherever no decision is recorded, which today is everywhere.
+/// passes [`auto_prefers_block_draft`] for its backend, resident draft format and target tier —
+/// `false` with no resident draft, and wherever no decision is recorded or the recorded one does
+/// not prefer the draft.
 pub fn resolve_speculative_with(
     mode: crate::Speculative,
     capabilities: &crate::TextLlmCapabilities,
@@ -236,9 +237,44 @@ pub struct AutoBlockDraftDecision {
     pub reason: &'static str,
 }
 
-/// Every recorded [`AutoBlockDraftDecision`]. Empty until the SW-7200 campaign's numbers exist: no
-/// pair is preferred, so `auto` resolves as [`resolve_speculative`] always has.
-pub const AUTO_BLOCK_DRAFT_DECISIONS: &[AutoBlockDraftDecision] = &[];
+/// Every recorded [`AutoBlockDraftDecision`], from the SW-7200 speculative-paths campaign on a
+/// Qwen3.8-27B target (256-token cold context, each path at its recommended depth, linear check,
+/// decode speed as a multiple of plain decoding). No recorded pair beats MTP, so none is preferred
+/// and `auto` still resolves as [`resolve_speculative`] always has; a pair with no entry is
+/// unmeasured and keeps that order too.
+pub const AUTO_BLOCK_DRAFT_DECISIONS: &[AutoBlockDraftDecision] = &[
+    // Candle/CUDA — campaign run 44516873473.
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q4",
+        prefer: false,
+        reason: "run 44516873473: DFlash2 1.49x plain vs MTP 1.70x — loses",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q4",
+        prefer: false,
+        reason: "run 44516873473: DSpine 1.48x plain vs MTP 1.70x — loses",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q8",
+        prefer: false,
+        reason: "run 44516873473: DFlash2 2.00x plain vs MTP 2.04x — loses on every prompt",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q8",
+        prefer: false,
+        reason: "run 44516873473: DSpine 1.92x plain vs MTP 2.04x — loses",
+    },
+    // MLX — PENDING: the MLX speculative-paths rerun has not finished. Add its measured entries
+    // here; do not record values that run did not measure.
+];
 
 /// The recorded decision for `backend`, `format` and `tier`, or `None` (not measured — `auto` keeps
 /// its MTP-then-prompt-lookup order).
@@ -250,6 +286,39 @@ pub fn auto_block_draft_decision(
     AUTO_BLOCK_DRAFT_DECISIONS
         .iter()
         .find(|d| d.backend == backend && d.format == format && d.tier == tier)
+}
+
+/// The target tier an [`AutoBlockDraftDecision`] is keyed by, from what the load knows: the
+/// load-time format it requested (`q4`, `q8`, `nvfp4`), else `bf16` when the resident projections
+/// are dense. `None` for a snapshot loaded quantized as stored — the load does not know its bit
+/// width, so no recorded decision applies.
+pub fn auto_block_draft_tier(
+    requested: Option<crate::Quantize>,
+    resident_quantized: bool,
+) -> Option<&'static str> {
+    match requested {
+        Some(crate::Quantize::Q4) => Some("q4"),
+        Some(crate::Quantize::Q8) => Some("q8"),
+        Some(crate::Quantize::Nvfp4) => Some("nvfp4"),
+        None => (!resident_quantized).then_some("bf16"),
+    }
+}
+
+/// The `auto_prefers_block_draft` argument of [`resolve_speculative_with`] for a provider on
+/// `backend` holding `resident_draft` (its format, `None` with no block draft resident) beside a
+/// target loaded with `requested` whose projections are `resident_quantized`: the recorded
+/// decision's `prefer`, `false` when no draft is resident, the tier is unknown or nothing is
+/// recorded.
+pub fn auto_prefers_block_draft(
+    backend: crate::DecodeBackend,
+    resident_draft: Option<crate::BlockDraftFormat>,
+    requested: Option<crate::Quantize>,
+    resident_quantized: bool,
+) -> bool {
+    resident_draft
+        .zip(auto_block_draft_tier(requested, resident_quantized))
+        .and_then(|(format, tier)| auto_block_draft_decision(backend, format, tier))
+        .is_some_and(|d| d.prefer)
 }
 
 /// How an `auto` fallback with no runnable proposer begins; the reason follows in parentheses.

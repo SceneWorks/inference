@@ -4088,9 +4088,20 @@ impl LlamaProvider {
         // The engine also gets the option itself: under `auto` it monitors the proposer it runs
         // against the plain loop it would fall back to, and demotes one measurably slower than
         // plain decoding (sc-24446, E5); an explicit `{proposer, depth}` runs as asked.
+        // Under `auto`, a resident block draft runs ahead of MTP only where the SW-7200 paths
+        // campaign recorded it faster for this backend, draft format and target tier.
         let speculative_mode = req.speculative_or(self.speculative_default);
-        let resolution =
-            core_llm::resolve_speculative(speculative_mode, &self.descriptor.capabilities);
+        let auto_prefers_block_draft = core_llm::auto_prefers_block_draft(
+            core_llm::DecodeBackend::Mlx,
+            self.block_draft.as_ref().map(|d| d.model.config().format),
+            self.load_report.requested,
+            self.is_quantized(),
+        );
+        let resolution = core_llm::resolve_speculative_with(
+            speculative_mode,
+            &self.descriptor.capabilities,
+            auto_prefers_block_draft,
+        );
         let plan = resolution.plan;
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);

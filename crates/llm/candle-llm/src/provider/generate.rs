@@ -247,8 +247,20 @@ impl TextLlm for LlamaProvider {
         // an explicit `{proposer, depth}` runs as asked. (Named apart from the MTP branch's
         // `speculative` flag, which shadows `speculative` below.)
         let requested_speculative = speculative;
+        // Under `auto`, a resident block draft runs ahead of MTP only where the SW-7200 paths
+        // campaign recorded it faster for this device's backend, draft format and target tier.
+        let auto_prefers_block_draft = core_llm::auto_prefers_block_draft(
+            crate::device::decode_backend(self.model.device()),
+            self.block_draft.as_ref().map(|d| d.model.config().format),
+            self.load_record.requested,
+            self.model.is_quantized(),
+        );
         let resolution = core_llm::fit_draft_context(
-            core_llm::resolve_speculative(speculative, &self.descriptor.capabilities),
+            core_llm::resolve_speculative_with(
+                speculative,
+                &self.descriptor.capabilities,
+                auto_prefers_block_draft,
+            ),
             &self.descriptor.capabilities,
             self.draft_context(),
             admitted_prompt,
