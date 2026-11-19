@@ -18,14 +18,15 @@
 //!   cargo test -p candle-llm --features cuda --test block_draft -- --ignored --nocapture
 //! ```
 //!
-//! `CANDLE_LLM_BLOCK_DRAFT_PRECISION=q4` loads the draft at 4-bit (default 8-bit). Each run
-//! asserts the draft is resident, advertised and named at its precision; that a greedy
-//! `block_draft` request on a cold prompt, the same request again (its prompt prefix restored
-//! from the cross-turn cache) and a seeded sampled request each reach the acceptance floors
-//! ([`MIN_TOKENS_PER_PASS`], [`MIN_ACCEPTED_FRACTION`], set from the healthy MLX and Candle
-//! measurements); and that the sampled request reproduces. It prints each run's acceptance and
-//! reports the first position where the greedy stream differs from the same provider with
-//! speculation off (a
+//! `CANDLE_LLM_BLOCK_DRAFT_PRECISION=q4` loads the draft at 4-bit (default 8-bit). Each test
+//! asserts the draft is resident, advertised and named at its precision, and holds four arms to
+//! the acceptance floors ([`MIN_TOKENS_PER_PASS`], [`MIN_ACCEPTED_FRACTION`], set from the healthy
+//! MLX and Candle measurements): a greedy request on a cold prompt, the same request again (its
+//! prompt prefix restored from the cross-turn cache), a seeded sampled request (which must
+//! reproduce), and the cold greedy request on a second load with the CUDA-graph runner off. Every
+//! arm runs and prints its acceptance, prefix-cache path and CUDA-graph report before any floor
+//! fails. It also reports the first position where the greedy stream differs from the same
+//! provider with speculation off (a
 //! multi-token verify rounds a few BF16 ULP differently from the single-token step, so real
 //! weights track rather than bit-match where a near-tie flips — exact agreement is proven on the
 //! tiny fixtures).
@@ -81,16 +82,17 @@ fn path(var: &str) -> String {
         .unwrap_or_else(|| panic!("set {var}"))
 }
 
-/// Load the target with the `format` draft in `source_var` and run the greedy and sampled
-/// `block_draft` requests.
-fn block_draft_on_the_27b(format: BlockDraftFormat, source_var: &str) {
-    let draft = path(source_var);
+/// The 27B with the `format` draft in `source_var`, its load's CUDA-graph policy `cuda_graphs`
+/// (`None`: the device default, on for CUDA), the depth it advertises and the draft's precision
+/// label.
+fn load(source_var: &str, cuda_graphs: Option<bool>) -> (LlamaProvider, u32, &'static str) {
     let precision = match std::env::var("CANDLE_LLM_BLOCK_DRAFT_PRECISION").as_deref() {
         Ok("q4") => Some(Quantize::Q4),
         _ => None,
     };
-    let mut spec = LoadSpec::dense(path(TARGET)).with_draft(draft.clone());
+    let mut spec = LoadSpec::dense(path(TARGET)).with_draft(path(source_var));
     spec.draft_quantize = precision;
+    spec.cuda_graphs = cuda_graphs;
     let provider = LlamaProvider::load(&spec).unwrap();
     let report = provider.load_report().unwrap().draft.unwrap();
     assert!(report.is_resident(), "{:?}", report.refusal);
@@ -105,52 +107,75 @@ fn block_draft_on_the_27b(format: BlockDraftFormat, source_var: &str) {
     } else {
         "q8"
     };
+    (provider, depth, label)
+}
 
-    let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
-    // The first request prefills the prompt cold, so the draft's context starts with the prompt's
-    // tapped rows. The repeat restores the prompt's prefix from the cross-turn cache (when the
-    // load kept one) and the draft reads only the rows past it. Both are held to the floor: a
-    // context built from a cold prompt prefill must draft as well as one built from commits.
-    let (ids, out) = generate(&provider, &request(block, Sampling::greedy()));
-    let decode = out.decode.unwrap();
-    assert_eq!(decode.proposer, ProposerKind::BlockDraft);
-    assert_eq!(decode.draft_tokens, Some(depth));
-    let named = decode.draft.clone().expect("the draft is named");
-    assert_eq!(
-        (named.format.as_str(), named.precision.as_str()),
-        (format.label(), label)
-    );
-    println!(
-        "{} {label} depth {depth}, graphs {:?}",
-        format.label(),
-        decode.cuda_graphs
-    );
-    assert_accepts(&format!("{} greedy", format.label()), ids.len(), &decode);
-
-    let (off, _) = generate(&provider, &request(Speculative::Off, Sampling::greedy()));
-    let first = ids.iter().zip(&off).position(|(a, b)| a != b);
-    println!("{}: first difference from off at {first:?}", format.label());
-
-    let (again, out) = generate(&provider, &request(block, Sampling::greedy()));
-    let decode = out.decode.unwrap();
-    assert_accepts(
-        &format!("{} greedy repeat", format.label()),
-        again.len(),
-        &decode,
-    );
-
+/// Run the `format` draft's arms and hold each to the acceptance floors — every arm runs and
+/// prints before any floor fails, so one run tells the hypotheses apart (SW-7197):
+///
+/// * **cold greedy**: a fresh load's first request, its draft context starting with the prompt's
+///   prefill rows; CUDA graphs on (the default); the draft named at its precision;
+/// * **warm greedy**: the same request again, its prompt prefix restored from the cross-turn
+///   cache, the draft reading only the rows past it;
+/// * **sampled**: seeded, run twice (it must reproduce);
+/// * **graphs-off cold greedy**: a second load of the same weights with the CUDA-graph runner off
+///   (`LoadSpec::cuda_graphs = Some(false)`), the cold request again — every verify step eager.
+///
+/// Each arm prints its acceptance, its prefix-cache path and its CUDA-graph report.
+fn block_draft_on_the_27b(format: BlockDraftFormat, source_var: &str) {
+    let name = format.label();
     let sampled = Sampling {
         temperature: 0.7,
         top_p: 0.95,
         ..Sampling::greedy()
     };
-    let (a, out) = generate(&provider, &request(block, sampled));
-    let (b, _) = generate(&provider, &request(block, sampled));
-    assert_eq!(a, b, "a seeded sampled run reproduces");
-    let decode = out.decode.unwrap();
-    assert_eq!(decode.proposer, ProposerKind::BlockDraft);
-    assert!(decode.draft.is_some());
-    assert_accepts(&format!("{} sampled", format.label()), a.len(), &decode);
+    let mut failures = Vec::new();
+    {
+        let (provider, depth, label) = load(source_var, None);
+        let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+        let (ids, out) = generate(&provider, &request(block, Sampling::greedy()));
+        let decode = out.decode.as_ref().expect("a decode report");
+        assert_eq!(decode.draft_tokens, Some(depth));
+        let named = decode.draft.clone().expect("the draft is named");
+        assert_eq!(
+            (named.format.as_str(), named.precision.as_str()),
+            (format.label(), label)
+        );
+        failures.extend(check(&format!("{name} cold greedy"), ids.len(), out));
+
+        let (off, _) = generate(&provider, &request(Speculative::Off, Sampling::greedy()));
+        let first = ids.iter().zip(&off).position(|(a, b)| a != b);
+        println!("{name}: first difference from off at {first:?}");
+
+        let (again, out) = generate(&provider, &request(block, Sampling::greedy()));
+        failures.extend(check(&format!("{name} warm greedy"), again.len(), out));
+
+        let (a, out) = generate(&provider, &request(block, sampled));
+        let (b, _) = generate(&provider, &request(block, sampled));
+        failures.extend(check(&format!("{name} sampled"), a.len(), out));
+        if a != b {
+            failures.push(format!(
+                "{name} sampled: a seeded sampled run does not reproduce"
+            ));
+        }
+    }
+    {
+        let (provider, depth, _) = load(source_var, Some(false));
+        let block = Speculative::proposer(SpeculativeProposer::BlockDraft, depth);
+        let (ids, out) = generate(&provider, &request(block, Sampling::greedy()));
+        let graphs = out.decode.as_ref().map(|d| d.cuda_graphs.replayed);
+        failures.extend(check(
+            &format!("{name} graphs-off cold greedy"),
+            ids.len(),
+            out,
+        ));
+        if graphs != Some(0) {
+            failures.push(format!(
+                "{name} graphs-off cold greedy: {graphs:?} graph replays with the runner off"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The least tokens a greedy or sampled `block_draft` pass commits on this prompt at depth 4,
@@ -166,31 +191,41 @@ const MIN_TOKENS_PER_PASS: f64 = 1.6;
 /// run's 27% (MLX DSpine), the same headroom as [`MIN_TOKENS_PER_PASS`].
 const MIN_ACCEPTED_FRACTION: f64 = 0.15;
 
-/// Print and check one run's acceptance against the floors.
-fn assert_accepts(what: &str, tokens: usize, decode: &core_llm::DecodeReport) {
+/// Print one arm's acceptance, prefix-cache path and CUDA-graph report, and return why it falls
+/// below the floors (`None`: it clears them).
+fn check(what: &str, tokens: usize, out: TextLlmOutput) -> Option<String> {
+    let Some(decode) = out.decode else {
+        return Some(format!("{what}: no decode report"));
+    };
     let per_pass =
         (decode.accepted_tokens + decode.verify_steps) as f64 / decode.verify_steps.max(1) as f64;
     let fraction = decode.accepted_tokens as f64 / decode.proposed_tokens.max(1) as f64;
     println!(
         "{what}: {tokens} tokens, {} target passes, {per_pass:.2} tokens per target pass, {} \
-         accepted of {} proposed ({:.1}%), prefix {} ({} restored tokens)",
+         accepted of {} proposed ({:.1}%), prefix {} ({} restored tokens), graphs {:?}",
         decode.verify_steps,
         decode.accepted_tokens,
         decode.proposed_tokens,
         fraction * 100.0,
         decode.prefix_cache.path,
         decode.prefix_hit_tokens,
+        decode.cuda_graphs,
     );
-    assert!(
-        per_pass >= MIN_TOKENS_PER_PASS,
-        "{what}: {per_pass:.2} tokens per target pass, below {MIN_TOKENS_PER_PASS}"
-    );
-    assert!(
-        fraction >= MIN_ACCEPTED_FRACTION,
-        "{what}: {:.1}% of drafts accepted, below {:.0}%",
-        fraction * 100.0,
-        MIN_ACCEPTED_FRACTION * 100.0
-    );
+    if decode.proposer != ProposerKind::BlockDraft || decode.draft.is_none() {
+        return Some(format!(
+            "{what}: ran {:?} without the named draft",
+            decode.proposer
+        ));
+    }
+    if per_pass < MIN_TOKENS_PER_PASS || fraction < MIN_ACCEPTED_FRACTION {
+        return Some(format!(
+            "{what}: {per_pass:.2} tokens per target pass and {:.1}% of drafts accepted, below \
+             {MIN_TOKENS_PER_PASS} and {:.0}%",
+            fraction * 100.0,
+            MIN_ACCEPTED_FRACTION * 100.0
+        ));
+    }
+    None
 }
 
 /// The 27B with the DSpine draft on CUDA (AC1, AC3).

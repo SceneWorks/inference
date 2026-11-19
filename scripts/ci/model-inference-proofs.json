@@ -118472,7 +118472,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@8beeb207f185842336125ab2774cf49fd9220939e6cd3b26b1e8d287bd3689bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dspine_accepts_more_than_one_token_per_pass@efea23821f83c2c088b7dc7d5bec5338f6ca6f2fa8ce56f4237d302888b4703b",
       "requirements": [
         {
           "slot": "target-weights",
@@ -118590,7 +118590,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@8beeb207f185842336125ab2774cf49fd9220939e6cd3b26b1e8d287bd3689bd",
+      "source_identity": "crates/llm/candle-llm/tests/block_draft.rs::qwen38_27b_dflash2_accepts_more_than_one_token_per_pass@efea23821f83c2c088b7dc7d5bec5338f6ca6f2fa8ce56f4237d302888b4703b",
       "requirements": [
         {
           "slot": "target-weights",
