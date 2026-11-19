@@ -30,6 +30,17 @@ pub enum PhaseBoundary {
     Reset,
 }
 
+/// Captured primary guided clean estimate (`x0`) from outer step `K - 1` at `sigma_{K-1}`
+/// under [`crate::EstimateSource::PreviousEvaluation`] (`SW-6940`: `FEAT-1`, `PIPE-4`, `E3`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapturedPrimaryEstimate<T> {
+    pub step: usize,
+    pub sigma: f32,
+    pub evaluation_kind: crate::EvaluationKind,
+    pub solver: super::Solver,
+    pub latent: T,
+}
+
 /// Numerical history for one request trajectory. The full pass schedule and the next absolute
 /// step are retained across inert phase boundaries; resetting history leaves the step position
 /// (and therefore stochastic draw addresses) unchanged.
@@ -43,6 +54,8 @@ pub struct SolverRunState<L: LatentOps> {
     pub(crate) previous_sample: Option<L::Latent>,
     pub(crate) previous_interval: Option<f64>,
     pub(crate) history_steps: usize,
+    pub(crate) capture_primary_at_step: Option<usize>,
+    pub(crate) captured_primary_estimate: Option<CapturedPrimaryEstimate<L::Latent>>,
     seed: Option<u64>,
     sampling: Option<SamplingIdentity>,
     variant: Option<[u32; 3]>,
@@ -91,6 +104,8 @@ impl<L: LatentOps> SolverRunState<L> {
             previous_sample: None,
             previous_interval: None,
             history_steps: 0,
+            capture_primary_at_step: None,
+            captured_primary_estimate: None,
             seed: None,
             sampling: None,
             variant: None,
@@ -120,6 +135,108 @@ impl<L: LatentOps> SolverRunState<L> {
     /// Borrow the previous step's denoised (`x0`) estimate when retained by a multistep solver.
     pub fn previous_denoised(&self) -> Option<&L::Latent> {
         self.previous_denoised.as_ref()
+    }
+
+    /// Opt-in capture of the primary guided clean estimate (`GuidedPrimaryX0`) at outer step
+    /// `target_step = K - 1` for [`crate::EstimateSource::PreviousEvaluation`] (`SW-6940`).
+    ///
+    /// Refuses CFG++ solver state because CFG++ carries dual `(guided, uncond)` re-noising
+    /// rather than a single-`x0` callback trajectory.
+    pub fn enable_primary_estimate_capture(&mut self, target_step: usize) -> Result<()> {
+        if self.cfg_pp {
+            return Err(Error::Unsupported(
+                "low_res_start estimate_source=previous_evaluation is unsupported on CFG++ solver state".into(),
+            ));
+        }
+        if target_step >= self.sigmas.len().saturating_sub(1) {
+            return Err(Error::Unsupported(format!(
+                "low_res_start primary estimate capture step {target_step} is out of range for schedule of {} steps",
+                self.sigmas.len().saturating_sub(1)
+            )));
+        }
+        self.capture_primary_at_step = Some(target_step);
+        self.captured_primary_estimate = None;
+        Ok(())
+    }
+
+    /// Configure [`SolverRunState`] for a [`crate::ResolvedLowResStartPlan`], enabling
+    /// primary clean-estimate capture at step `K - 1` when [`crate::EstimateSource::PreviousEvaluation`]
+    /// is selected and leaving [`crate::EstimateSource::EndpointEvaluation`] with zero extra
+    /// retained buffers (`SW-6940`).
+    pub fn configure_low_res_start(&mut self, plan: &crate::ResolvedLowResStartPlan) -> Result<()> {
+        plan.estimate_source
+            .validate_solver("low_res_start", self.solver, self.cfg_pp)?;
+        match plan.estimate_source {
+            crate::EstimateSource::EndpointEvaluation => {
+                self.capture_primary_at_step = None;
+                self.captured_primary_estimate = None;
+                Ok(())
+            }
+            crate::EstimateSource::PreviousEvaluation => {
+                let target_step = plan.k.checked_sub(1).ok_or_else(|| {
+                    Error::Unsupported("low_res_start boundary k must be >= 1".into())
+                })?;
+                self.enable_primary_estimate_capture(target_step)
+            }
+        }
+    }
+
+    /// Target step index configured for primary clean-estimate capture (`Some(K - 1)` when
+    /// [`crate::EstimateSource::PreviousEvaluation`] is active, `None` otherwise).
+    pub fn capture_primary_at_step(&self) -> Option<usize> {
+        self.capture_primary_at_step
+    }
+
+    /// Borrow the captured primary clean estimate from step `K - 1`, if currently retained.
+    pub fn captured_primary_estimate(&self) -> Option<&CapturedPrimaryEstimate<L::Latent>> {
+        self.captured_primary_estimate.as_ref()
+    }
+
+    /// Record the primary guided clean estimate `x0` at outer step `step` when opt-in capture
+    /// targets this step (`SW-6940`). Secondary solver sub-evaluations (Heun corrector, DPM++ SDE
+    /// midpoint) never call this method, so the primary `x0` at `sigma_{K-1}` is preserved while
+    /// all sub-evaluations complete normally.
+    #[inline]
+    pub(crate) fn record_primary_estimate_if_targeted(
+        &mut self,
+        step: usize,
+        sigma: f32,
+        guided_x0: &L::Latent,
+    ) {
+        if self.capture_primary_at_step == Some(step) {
+            self.captured_primary_estimate = Some(CapturedPrimaryEstimate {
+                step,
+                sigma,
+                evaluation_kind: crate::EvaluationKind::GuidedPrimaryX0,
+                solver: self.solver,
+                latent: guided_x0.clone(),
+            });
+        }
+    }
+
+    /// Consume the captured primary guided clean estimate from outer step `expected_step = K - 1`
+    /// at the phase boundary, refusing with a typed [`Error::Unsupported`] if capture was not
+    /// enabled or if the solver/driver did not produce `GuidedPrimaryX0` at `expected_step` (`SW-6940`).
+    pub fn take_captured_primary_estimate(
+        &mut self,
+        expected_step: usize,
+    ) -> Result<CapturedPrimaryEstimate<L::Latent>> {
+        self.capture_primary_at_step = None;
+        let captured = self.captured_primary_estimate.take().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "low_res_start estimate_source=previous_evaluation requires a captured GuidedPrimaryX0 at step {expected_step}, but none was recorded by solver '{}'",
+                self.solver.name()
+            ))
+        })?;
+        if captured.step != expected_step
+            || captured.evaluation_kind != crate::EvaluationKind::GuidedPrimaryX0
+        {
+            return Err(Error::Unsupported(format!(
+                "low_res_start captured primary estimate provenance mismatch: expected (step={expected_step}, GuidedPrimaryX0), got (step={}, {:?})",
+                captured.step, captured.evaluation_kind
+            )));
+        }
+        Ok(captured)
     }
 
     /// Record that a phase boundary changed the latent spatial geometry (`(from_w, from_h) -> (to_w, to_h)`).
@@ -170,6 +287,8 @@ impl<L: LatentOps> SolverRunState<L> {
         self.previous_sample = None;
         self.previous_interval = None;
         self.history_steps = 0;
+        self.capture_primary_at_step = None;
+        self.captured_primary_estimate = None;
         self.pending_reset_reason = None;
     }
 
@@ -378,6 +497,7 @@ impl<L: LatentOps> Sampler<L> for Euler {
                 &x,
             ));
             let x0 = denoise(&x, sigma)?;
+            state.record_primary_estimate_if_targeted(i, sigma, &x0);
             if is_terminal(sigma) {
                 // Degenerate leading 0 (no real schedule starts here): land on x0, no division.
                 x = x0;

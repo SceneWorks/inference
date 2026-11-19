@@ -7,10 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::sampling::ModelSampling;
+use crate::sampling::{ModelSampling, Solver};
 use crate::{
     Conditioning, ConditioningKind, ControlKind, Error, GenerationPhase, GenerationRequest,
     IdentityWeights, Image, LatentPatchLayout, LoadSpec, Modality, ModelDescriptor, OffloadPolicy,
@@ -19,26 +19,173 @@ use crate::{
 };
 
 // -------------------------------------------------------------------------------------------------
-// SW-6939 (FEAT-1, PIPE-2, PIPE-3, PIPE-4, PIPE-5, HOOK-5, E2):
-// Request & Plan Contract, Typed Boundary State, and Fp32 Transition Arithmetic
+// SW-6939 & SW-6940 (FEAT-1, PIPE-2, PIPE-3, PIPE-4, PIPE-5, PERF-3, HOOK-5, E2, E3):
+// Request & Plan Contract, Typed Boundary State, Fp32 Transition Arithmetic, Estimator Provenance,
+// Execution Receipt Report, and Bounded Quality/Time/Memory Qualification
 // -------------------------------------------------------------------------------------------------
+
+/// Canonical recipe identifier for the two-phase low-resolution start recipe (`FEAT-1`, `E3`).
+pub const LOW_RES_START_RECIPE_ID: &str = "low_res_start";
+
+/// Versioned fp32 boundary transition arithmetic identifier (`PIPE-4`, `E3`).
+pub const LOW_RES_START_TRANSITION_ARITHMETIC_ID: &str =
+    "unpack_f32_bilinear_half_pixel_clamp_renoise_repack_v1";
+
+/// Versioned default endpoint clean-estimate policy identifier (`FEAT-1`, `E3`).
+pub const LOW_RES_START_ENDPOINT_ESTIMATOR_ID: &str = "endpoint_evaluation_v1";
+
+/// Versioned candidate previous-step primary clean-estimate policy identifier (`FEAT-1`, `DEC-10`, `E3`).
+pub const LOW_RES_START_PREVIOUS_ESTIMATOR_ID: &str = "previous_evaluation_v1";
 
 /// Domain separation label for the low-res-start phase-transition noise draw (`PIPE-4`, `§6.1`).
 pub const LOW_RES_START_TRANSITION_DOMAIN: &str = "low_res_start_transition_v1";
 
+/// Kind of clean-estimate evaluation used at the phase-0 -> phase-1 transition boundary (`PIPE-3`, `PIPE-4`, `FEAT-1`, `E3`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationKind {
+    /// Read-only boundary model evaluation at `(x_low(sigma_K), sigma_K)` after step `K - 1` completes.
+    /// Does not advance outer progress (`on_progress`), emit a duplicate preview frame, or mutate solver
+    /// history, RNG state, or stateful guidance accumulators.
+    BoundaryEstimate,
+    /// Primary guided clean estimate (`x0`) captured from outer solver step `K - 1` at `sigma_{K-1}`
+    /// while completing all `K` low-res outer steps (`0..K`) and their full solver sub-evaluations normally.
+    GuidedPrimaryX0,
+}
+
+impl EvaluationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BoundaryEstimate => "boundary_estimate",
+            Self::GuidedPrimaryX0 => "guided_primary_x0",
+        }
+    }
+
+    pub const fn is_read_only_boundary(self) -> bool {
+        matches!(self, Self::BoundaryEstimate)
+    }
+}
+
 /// Clean-estimate evaluation provenance at the phase-0 -> phase-1 transition boundary (`PIPE-4`, `FEAT-1`, `§6.1`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EstimateSource {
     /// Default read-only endpoint evaluation at boundary `sigma_K`.
     #[default]
     EndpointEvaluation,
-    /// Reuse the previous solver step's clean estimate when qualified (`SW-6940`).
+    /// Reuse the previous solver step's primary clean estimate (`GuidedPrimaryX0` from outer step `K - 1` at `sigma_{K-1}`) (`SW-6940`).
     PreviousEvaluation,
 }
 
+impl EstimateSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EndpointEvaluation => "endpoint_evaluation",
+            Self::PreviousEvaluation => "previous_evaluation",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "endpoint_evaluation" | LOW_RES_START_ENDPOINT_ESTIMATOR_ID => {
+                Some(Self::EndpointEvaluation)
+            }
+            "previous_evaluation" | LOW_RES_START_PREVIOUS_ESTIMATOR_ID => {
+                Some(Self::PreviousEvaluation)
+            }
+            _ => None,
+        }
+    }
+
+    /// Versioned estimator identity recorded in execution receipts (`E3`).
+    pub const fn estimator_id(self) -> &'static str {
+        match self {
+            Self::EndpointEvaluation => LOW_RES_START_ENDPOINT_ESTIMATOR_ID,
+            Self::PreviousEvaluation => LOW_RES_START_PREVIOUS_ESTIMATOR_ID,
+        }
+    }
+
+    /// [`EvaluationKind`] corresponding to this clean-estimate policy.
+    pub const fn evaluation_kind(self) -> EvaluationKind {
+        match self {
+            Self::EndpointEvaluation => EvaluationKind::BoundaryEstimate,
+            Self::PreviousEvaluation => EvaluationKind::GuidedPrimaryX0,
+        }
+    }
+
+    /// Number of dedicated read-only boundary model evaluations performed at `sigma_K` (`1` vs `0`).
+    pub const fn boundary_evaluations(self) -> u32 {
+        match self {
+            Self::EndpointEvaluation => 1,
+            Self::PreviousEvaluation => 0,
+        }
+    }
+
+    /// Whether this policy is the default admission/replay recipe policy (`EndpointEvaluation`).
+    pub const fn is_default_policy(self) -> bool {
+        matches!(self, Self::EndpointEvaluation)
+    }
+
+    /// Schedule index where the boundary clean estimate is evaluated (`K` for `EndpointEvaluation`,
+    /// `K - 1` for `PreviousEvaluation`).
+    pub fn source_step_index(self, k: usize) -> Result<usize> {
+        if k == 0 {
+            return Err(Error::Unsupported(
+                "low_res_start boundary step k must be >= 1".into(),
+            ));
+        }
+        Ok(match self {
+            Self::EndpointEvaluation => k,
+            Self::PreviousEvaluation => k - 1,
+        })
+    }
+
+    /// Validate that `solver` and `cfg_pp` can supply a well-defined boundary clean estimate under `self`.
+    pub fn validate_solver(self, route_id: &str, _solver: Solver, cfg_pp: bool) -> Result<()> {
+        if self == Self::PreviousEvaluation && cfg_pp {
+            return Err(Error::Unsupported(format!(
+                "{route_id}: low_res_start estimate_source=previous_evaluation is unsupported with cfg_pp guidance (CFG++ re-noises from unconditional x0 and cannot supply a standard single-callback GuidedPrimaryX0)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a request's `sampler` and `guidance_method` against `self`, returning the canonical
+    /// [`Solver`]. Refuses unsupported estimator/solver combinations for `PreviousEvaluation`
+    /// (such as legacy coefficient-only policies `"lightning"`, `"tcd"`, `"scm"`, or `"cfg_pp"`)
+    /// with a typed [`Error::Unsupported`] without removing `EndpointEvaluation`'s supported routes or solvers.
+    pub fn validate_sampler_name(
+        self,
+        route_id: &str,
+        sampler_name: Option<&str>,
+        guidance_method: Option<&str>,
+    ) -> Result<Solver> {
+        let cfg_pp = guidance_method == Some("cfg_pp");
+        let solver = match sampler_name {
+            None
+            | Some("flow_match")
+            | Some("flow_match_euler")
+            | Some("hyper")
+            | Some("native") => Solver::Euler,
+            Some(name) => match Solver::from_name(name) {
+                Some(solver) => solver,
+                None => {
+                    if self == Self::PreviousEvaluation {
+                        return Err(Error::Unsupported(format!(
+                            "{route_id}: low_res_start estimate_source=previous_evaluation is unsupported for solver/sampler {name:?} (cannot supply a well-defined GuidedPrimaryX0 at step K - 1)"
+                        )));
+                    }
+                    Solver::Euler
+                }
+            },
+        };
+        self.validate_solver(route_id, solver, cfg_pp)?;
+        Ok(solver)
+    }
+}
+
 /// Request-level specification for the two-phase low-resolution start recipe (`FEAT-1`, `PIPE-2`).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LowResStartSpec {
     /// Contract version (`1`). Any version other than `1` is refused with a typed [`Error::Unsupported`].
     pub version: u32,
@@ -200,6 +347,11 @@ impl LowResStartSpec {
                 descriptor.id
             )));
         }
+        self.estimate_source.validate_sampler_name(
+            descriptor.id,
+            req.sampler.as_deref(),
+            req.guidance_method.as_deref(),
+        )?;
         let space = descriptor.denoiser_output_latent_space.ok_or_else(|| {
             Error::Unsupported(format!(
                 "{}: route does not declare a packed spatial latent space for low_res_start",
@@ -253,7 +405,7 @@ impl LowResStartSpec {
 }
 
 /// Resolved, validated two-phase low-resolution execution plan for pass 0 (`FEAT-1`, `PIPE-2`).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedLowResStartPlan {
     pub version: u32,
     pub k: usize,
@@ -287,6 +439,337 @@ impl ResolvedLowResStartPlan {
             (self.full_width, self.full_height)
         }
     }
+
+    /// Packed spatial token count for `phase` (`0` -> low-res, `>= 1` -> full-res) at `pixel_stride`.
+    pub const fn phase_packed_tokens(&self, phase: usize, pixel_stride: u32) -> usize {
+        let stride = if pixel_stride == 0 { 16 } else { pixel_stride };
+        let (w, h) = self.phase_dimensions(phase);
+        ((w / stride) * (h / stride)) as usize
+    }
+
+    /// Compute the evaluation/time/work profile for this low-res start plan over `sigmas` and `solver` (`PERF-3`, `E3`).
+    pub fn work_profile(
+        &self,
+        solver: Solver,
+        sigmas: &[f32],
+        pixel_stride: u32,
+    ) -> Result<LowResStartWorkProfile> {
+        if sigmas.len() != self.executed_steps + 1 {
+            return Err(Error::Unsupported(format!(
+                "low_res_start work_profile requires sigmas.len() ({}) == executed_steps ({}) + 1",
+                sigmas.len(),
+                self.executed_steps
+            )));
+        }
+        let epochs = solver.logical_epochs(sigmas)?;
+        let phase0_step_evaluations = epochs.iter().filter(|e| e.step < self.k).count() as u32;
+        let phase1_step_evaluations = epochs.iter().filter(|e| e.step >= self.k).count() as u32;
+        let boundary_evaluations = self.estimate_source.boundary_evaluations();
+        let total_model_evaluations =
+            phase0_step_evaluations + boundary_evaluations + phase1_step_evaluations;
+        let full_res_baseline_evaluations = epochs.len() as u32;
+        let stages_per_step = solver.stages_per_step();
+        let full_res_nominal_stage_evaluations = stages_per_step * (self.executed_steps as u32);
+        let nominal_stage_evaluations = full_res_nominal_stage_evaluations + boundary_evaluations;
+        let low_tokens = self.phase_packed_tokens(0, pixel_stride);
+        let full_tokens = self.phase_packed_tokens(1, pixel_stride).max(1);
+        let token_ratio = (low_tokens as f32) / (full_tokens as f32);
+        let low_evals_nominal = stages_per_step * (self.k as u32) + boundary_evaluations;
+        let full_evals_nominal = stages_per_step * ((self.executed_steps - self.k) as u32);
+        let token_weighted_work_ratio = ((low_evals_nominal as f32) * token_ratio
+            + (full_evals_nominal as f32))
+            / (full_res_nominal_stage_evaluations.max(1) as f32);
+        let theoretical_speedup = 1.0 / token_weighted_work_ratio.max(1e-6);
+
+        Ok(LowResStartWorkProfile {
+            estimate_source: self.estimate_source,
+            estimator: self.estimate_source.estimator_id().to_string(),
+            solver: solver.name().to_string(),
+            stages_per_step,
+            k: self.k,
+            executed_steps: self.executed_steps,
+            low_tokens,
+            full_tokens,
+            phase0_step_evaluations,
+            boundary_evaluations,
+            phase1_step_evaluations,
+            total_model_evaluations,
+            nominal_stage_evaluations,
+            full_res_baseline_evaluations,
+            full_res_nominal_stage_evaluations,
+            token_weighted_work_ratio,
+            theoretical_speedup,
+        })
+    }
+
+    /// Compute the memory & retained-buffer coexistence profile for this low-res start plan (`PIPE-3`, `PIPE-4`, `E3`).
+    pub fn memory_profile(
+        &self,
+        batch: usize,
+        pixel_stride: u32,
+        token_width: u32,
+        dtype_bytes: u64,
+    ) -> LowResStartMemoryProfile {
+        let batch_u64 = (batch.max(1)) as u64;
+        let token_width_u64 = u64::from(token_width.max(1));
+        let dtype_u64 = dtype_bytes.max(1);
+        let low_tokens = self.phase_packed_tokens(0, pixel_stride) as u64;
+        let full_tokens = self.phase_packed_tokens(1, pixel_stride) as u64;
+        let low_packed_latent_bytes = batch_u64 * low_tokens * token_width_u64 * dtype_u64;
+        let full_packed_latent_bytes = batch_u64 * full_tokens * token_width_u64 * dtype_u64;
+        let low_f32_bytes = batch_u64 * low_tokens * token_width_u64 * 4;
+        let full_f32_bytes = batch_u64 * full_tokens * token_width_u64 * 4;
+        // fp32 unpack (`low_f32`) + bilinear resize (`full_f32`) + transition noise (`full_f32`) + repack (`full_f32`)
+        let transition_f32_workspace_bytes = low_f32_bytes + 3 * full_f32_bytes;
+        let (retained_primary_estimate_bytes, boundary_eval_workspace_bytes) =
+            match self.estimate_source {
+                EstimateSource::EndpointEvaluation => (0, low_packed_latent_bytes),
+                EstimateSource::PreviousEvaluation => (low_packed_latent_bytes, 0),
+            };
+        // During step K - 1's advancement: running low-res latent x + solver derivative/update working tensor + any retained primary estimate x0.
+        let phase0_step_k_minus_1_coexisting_buffer_bytes =
+            2 * low_packed_latent_bytes + retained_primary_estimate_bytes;
+
+        LowResStartMemoryProfile {
+            estimate_source: self.estimate_source,
+            estimator: self.estimate_source.estimator_id().to_string(),
+            low_packed_latent_bytes,
+            full_packed_latent_bytes,
+            retained_primary_estimate_bytes,
+            boundary_eval_workspace_bytes,
+            transition_f32_workspace_bytes,
+            phase0_step_k_minus_1_coexisting_buffer_bytes,
+        }
+    }
+
+    /// Build the persisted [`LowResStartExecutionReport`] receipt for this resolved plan (`SW-6940`: `FEAT-1`, `E3`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn execution_report(
+        &self,
+        pass_index: usize,
+        sigmas: &[f32],
+        solver: Solver,
+        guidance_mode: &str,
+        guidance_scale: f32,
+        slot_configuration: &str,
+        dtype: &str,
+        dtype_bytes: u64,
+        batch: usize,
+        pixel_stride: u32,
+        token_width: u32,
+    ) -> Result<LowResStartExecutionReport> {
+        let source_step = self.estimate_source.source_step_index(self.k)?;
+        let sigma = *sigmas.get(source_step).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "low_res_start provenance step_index {source_step} out of bounds for sigmas len {}",
+                sigmas.len()
+            ))
+        })?;
+        let work = self.work_profile(solver, sigmas, pixel_stride)?;
+        let memory = self.memory_profile(batch, pixel_stride, token_width, dtype_bytes);
+        let provenance = EstimateProvenance {
+            pass_index,
+            phase_index: 0,
+            evaluation_kind: self.estimate_source.evaluation_kind(),
+            step_index: source_step,
+            sigma,
+            solver: solver.name().to_string(),
+            guidance_mode: guidance_mode.to_string(),
+            guidance_scale,
+            slot_configuration: slot_configuration.to_string(),
+            dtype: dtype.to_string(),
+            read_only_boundary: true,
+            boundary_evaluations: work.boundary_evaluations,
+            retained_primary_estimate_bytes: memory.retained_primary_estimate_bytes,
+        };
+        Ok(LowResStartExecutionReport {
+            recipe_id: LOW_RES_START_RECIPE_ID.to_string(),
+            version: self.version,
+            k: self.k,
+            executed_steps: self.executed_steps,
+            scale: self.scale,
+            low_width: self.low_width,
+            low_height: self.low_height,
+            full_width: self.full_width,
+            full_height: self.full_height,
+            estimate_source: self.estimate_source,
+            estimator: self.estimate_source.estimator_id().to_string(),
+            estimate_provenance: provenance,
+            transition_arithmetic_id: LOW_RES_START_TRANSITION_ARITHMETIC_ID.to_string(),
+            transition_seed_derivation_id: LOW_RES_START_TRANSITION_DOMAIN.to_string(),
+            phase0_step_evaluations: work.phase0_step_evaluations,
+            boundary_evaluations: work.boundary_evaluations,
+            phase1_step_evaluations: work.phase1_step_evaluations,
+            total_model_evaluations: work.total_model_evaluations,
+        })
+    }
+}
+
+/// Full evaluation provenance of the clean estimate $\hat{x}_0^{\text{low}}$ used at the
+/// phase-0 -> phase-1 transition boundary (`SW-6940`: `FEAT-1`, `PIPE-3`, `PIPE-4`, `E3`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EstimateProvenance {
+    /// Pass index (`0` for base pass 0).
+    pub pass_index: usize,
+    /// Departing denoise phase index (`0` for low-res phase 0).
+    pub phase_index: usize,
+    /// Evaluation kind (`BoundaryEstimate` for `EndpointEvaluation`, `GuidedPrimaryX0` for `PreviousEvaluation`).
+    pub evaluation_kind: EvaluationKind,
+    /// Schedule step index where the clean estimate was evaluated (`K` for `EndpointEvaluation`, `K - 1` for `PreviousEvaluation`).
+    pub step_index: usize,
+    /// Schedule sigma at which the clean estimate was evaluated ($\sigma_K$ for `EndpointEvaluation`, $\sigma_{K-1}$ for `PreviousEvaluation`).
+    pub sigma: f32,
+    /// Canonical solver name (`"euler"`, `"heun"`, `"dpmpp_2m"`, `"dpmpp_sde"`, etc.).
+    pub solver: String,
+    /// Active guidance mode during the clean-estimate evaluation (`"embedded_guidance"`, `"distilled_unconditional"`, `"true_cfg"`, `"apg"`, etc.).
+    pub guidance_mode: String,
+    /// Effective guidance scale during the clean-estimate evaluation.
+    pub guidance_scale: f32,
+    /// Departing phase's model/adapter slot configuration (e.g. `"base_dit"` or `"base_dit+adapters:1"`).
+    pub slot_configuration: String,
+    /// Latent/compute dtype string (e.g. `"f32"`, `"bf16"`).
+    pub dtype: String,
+    /// Whether the boundary transition evaluation is strictly read-only (does not advance outer progress,
+    /// emit a duplicate preview frame, or mutate solver history, RNG state, or stateful guidance accumulators).
+    pub read_only_boundary: bool,
+    /// Number of dedicated read-only boundary model evaluations (`1` for `EndpointEvaluation`, `0` for `PreviousEvaluation`).
+    pub boundary_evaluations: u32,
+    /// Bytes of the primary clean estimate buffer `x0` retained concurrently across step `K - 1`'s solver update
+    /// (`0` for `EndpointEvaluation`, `B * low_tokens * token_width * dtype_bytes` for `PreviousEvaluation`).
+    pub retained_primary_estimate_bytes: u64,
+}
+
+/// Persisted execution receipt for the two-phase low-resolution start recipe (`SW-6940`: `FEAT-1`, `PIPE-3`, `PIPE-4`, `PERF-3`, `E3`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LowResStartExecutionReport {
+    /// Canonical recipe identifier (`"low_res_start"`).
+    pub recipe_id: String,
+    /// Recipe contract version (`1`).
+    pub version: u32,
+    /// Boundary step index `K` (`1 <= K < executed_steps`).
+    pub k: usize,
+    /// Executed pass-0 denoise steps `M` (`executed_steps`, after any img2img strength truncation).
+    pub executed_steps: usize,
+    /// Resolved spatial reduction scale in `0.25..=0.9`.
+    pub scale: f32,
+    /// Phase-0 low-resolution width in pixels.
+    pub low_width: u32,
+    /// Phase-0 low-resolution height in pixels.
+    pub low_height: u32,
+    /// Phase-1 full target width in pixels.
+    pub full_width: u32,
+    /// Phase-1 full target height in pixels.
+    pub full_height: u32,
+    /// Selected clean-estimate policy (`EndpointEvaluation` default vs `PreviousEvaluation` candidate).
+    pub estimate_source: EstimateSource,
+    /// Versioned estimator identifier (`"endpoint_evaluation_v1"` vs `"previous_evaluation_v1"`).
+    pub estimator: String,
+    /// Complete provenance of the boundary clean estimate.
+    pub estimate_provenance: EstimateProvenance,
+    /// Versioned fp32 boundary transition arithmetic identifier (`"unpack_f32_bilinear_half_pixel_clamp_renoise_repack_v1"`).
+    pub transition_arithmetic_id: String,
+    /// Versioned deterministic transition noise seed derivation domain (`"low_res_start_transition_v1"`).
+    pub transition_seed_derivation_id: String,
+    /// Model evaluations executed in Phase 0 (`0..K`).
+    pub phase0_step_evaluations: u32,
+    /// Read-only boundary model evaluations at step `K` (`1` for `EndpointEvaluation`, `0` for `PreviousEvaluation`).
+    pub boundary_evaluations: u32,
+    /// Model evaluations executed in Phase 1 (`K..M`).
+    pub phase1_step_evaluations: u32,
+    /// Total model evaluations across the pass (`phase0_step_evaluations + boundary_evaluations + phase1_step_evaluations`).
+    pub total_model_evaluations: u32,
+}
+
+/// Evaluation and token-weighted work comparison profile for one estimator policy (`PERF-3`, `E3`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LowResStartWorkProfile {
+    pub estimate_source: EstimateSource,
+    pub estimator: String,
+    pub solver: String,
+    pub stages_per_step: u32,
+    pub k: usize,
+    pub executed_steps: usize,
+    pub low_tokens: usize,
+    pub full_tokens: usize,
+    pub phase0_step_evaluations: u32,
+    pub boundary_evaluations: u32,
+    pub phase1_step_evaluations: u32,
+    pub total_model_evaluations: u32,
+    /// Nominal stage evaluation count (`stages_per_step * M + boundary_evaluations`: `M + 1` vs `M`
+    /// for 1-stage solvers, `2M + 1` vs `2M` for 2-stage solvers).
+    pub nominal_stage_evaluations: u32,
+    pub full_res_baseline_evaluations: u32,
+    pub full_res_nominal_stage_evaluations: u32,
+    pub token_weighted_work_ratio: f32,
+    pub theoretical_speedup: f32,
+}
+
+/// Memory and retained-buffer coexistence profile for one estimator policy (`PIPE-3`, `PIPE-4`, `E3`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LowResStartMemoryProfile {
+    pub estimate_source: EstimateSource,
+    pub estimator: String,
+    pub low_packed_latent_bytes: u64,
+    pub full_packed_latent_bytes: u64,
+    pub retained_primary_estimate_bytes: u64,
+    pub boundary_eval_workspace_bytes: u64,
+    pub transition_f32_workspace_bytes: u64,
+    pub phase0_step_k_minus_1_coexisting_buffer_bytes: u64,
+}
+
+/// Recorded execution trace for one estimator policy during qualification (`E3`, `FEAT-1`, `PIPE-3`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LowResStartTraceSummary {
+    pub completed_low_res_steps: usize,
+    pub phase0_sub_evaluations: Vec<(usize, String, u32)>,
+    pub phase0_rng_draw_coordinates: Vec<(u64, usize)>,
+    pub phase0_progress_events: Vec<(u32, u32)>,
+    pub phase0_preview_frames: Vec<(u32, u32, u32, u32)>,
+    pub boundary_evaluations: u32,
+    pub boundary_advanced_progress: bool,
+    pub boundary_emitted_preview: bool,
+    pub boundary_mutated_solver_history: bool,
+    pub boundary_mutated_rng: bool,
+    pub boundary_mutated_guidance_accumulator: bool,
+    pub phase1_sub_evaluations: Vec<(usize, String, u32)>,
+    pub phase1_rng_draw_coordinates: Vec<(u64, usize)>,
+    pub total_progress_events: Vec<(u32, u32)>,
+}
+
+/// Bounded quality and spatial-seam comparison metrics against the full-resolution reference trajectory (`E3`, `FEAT-1`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LowResStartQualityMetrics {
+    pub all_finite: bool,
+    pub cosine_similarity_vs_full_res: f32,
+    pub rms_diff_vs_full_res: f32,
+    pub max_seam_gradient_ratio: f32,
+}
+
+/// Complete structured qualification report comparing `EstimateSource::EndpointEvaluation` (default)
+/// vs `EstimateSource::PreviousEvaluation` (candidate under DEC-10) vs full-resolution baseline (`SW-6940`: `E3`, `FEAT-1`, `PERF-3`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LowResStartQualificationReport {
+    pub default_policy: EstimateSource,
+    pub candidate_policy: EstimateSource,
+    pub plan_endpoint: ResolvedLowResStartPlan,
+    pub plan_previous: ResolvedLowResStartPlan,
+    pub endpoint_report: LowResStartExecutionReport,
+    pub previous_report: LowResStartExecutionReport,
+    pub endpoint_work: LowResStartWorkProfile,
+    pub previous_work: LowResStartWorkProfile,
+    pub endpoint_memory: LowResStartMemoryProfile,
+    pub previous_memory: LowResStartMemoryProfile,
+    pub endpoint_trace: LowResStartTraceSummary,
+    pub previous_trace: LowResStartTraceSummary,
+    pub phase0_traces_identical: bool,
+    pub phase1_rng_coordinates_identical: bool,
+    pub outer_progress_identical: bool,
+    pub preview_sequences_identical: bool,
+    pub endpoint_quality: LowResStartQualityMetrics,
+    pub previous_quality: LowResStartQualityMetrics,
+    pub endpoint_vs_previous_cosine_similarity: f32,
+    pub endpoint_vs_previous_rms_diff: f32,
+    pub default_selection_unchanged: bool,
 }
 
 /// Greatest common divisor of two positive `u32` values.
@@ -815,6 +1298,665 @@ pub fn transition_packed_clean_estimate_f32(
         model_sampling,
         &eps_trans,
     )
+}
+
+#[derive(Default)]
+struct QualificationTracingOps {
+    inner: crate::sampling::CpuLatentOps,
+    sub_evaluations: std::cell::RefCell<Vec<(usize, String, u32)>>,
+    rng_draws: std::cell::RefCell<Vec<(u64, usize)>>,
+}
+
+impl crate::sampling::LatentOps for QualificationTracingOps {
+    type Latent = Vec<f32>;
+
+    fn scale(&self, x: &Vec<f32>, s: f32) -> Result<Vec<f32>> {
+        self.inner.scale(x, s)
+    }
+
+    fn add(&self, a: &Vec<f32>, b: &Vec<f32>) -> Result<Vec<f32>> {
+        self.inner.add(a, b)
+    }
+
+    fn sub(&self, a: &Vec<f32>, b: &Vec<f32>) -> Result<Vec<f32>> {
+        self.inner.sub(a, b)
+    }
+
+    fn axpy(&self, a: f32, x: &Vec<f32>, b: f32, y: &Vec<f32>) -> Result<Vec<f32>> {
+        self.inner.axpy(a, x, b, y)
+    }
+
+    fn randn_like(&self, x: &Vec<f32>, seed: u64, step: usize) -> Result<Vec<f32>> {
+        self.rng_draws.borrow_mut().push((seed, step));
+        self.inner.randn_like(x, seed, step)
+    }
+
+    fn observe_solver(&self, event: crate::sampling::solvers::SolverObservation<'_, Vec<f32>>) {
+        if let crate::sampling::solvers::SolverObservationKind::Callback(eval) = event.kind {
+            let label = match eval {
+                crate::sampling::solvers::SolverEvaluation::Primary => "primary",
+                crate::sampling::solvers::SolverEvaluation::HeunCorrector => "heun_corrector",
+                crate::sampling::solvers::SolverEvaluation::SdeMidpoint => "sde_midpoint",
+            };
+            self.sub_evaluations.borrow_mut().push((
+                event.step,
+                label.to_string(),
+                event.sigma.to_bits(),
+            ));
+        }
+    }
+}
+
+impl crate::guidance::GuidanceOps for QualificationTracingOps {
+    fn mul(&self, a: &Vec<f32>, b: &Vec<f32>) -> Result<Vec<f32>> {
+        self.inner.mul(a, b)
+    }
+
+    fn div(&self, a: &Vec<f32>, b: &Vec<f32>) -> Result<Vec<f32>> {
+        self.inner.div(a, b)
+    }
+
+    fn clamp_min(&self, x: &Vec<f32>, s: f32) -> Result<Vec<f32>> {
+        self.inner.clamp_min(x, s)
+    }
+
+    fn clamp_max(&self, x: &Vec<f32>, s: f32) -> Result<Vec<f32>> {
+        self.inner.clamp_max(x, s)
+    }
+
+    fn select_positive(&self, sel: &Vec<f32>, a: &Vec<f32>, b: &Vec<f32>) -> Result<Vec<f32>> {
+        self.inner.select_positive(sel, a, b)
+    }
+
+    fn norm_over(&self, x: &Vec<f32>, shape: &[usize], axes: &[i32]) -> Result<Vec<f32>> {
+        self.inner.norm_over(x, shape, axes)
+    }
+
+    fn dot_over(
+        &self,
+        a: &Vec<f32>,
+        b: &Vec<f32>,
+        shape: &[usize],
+        axes: &[i32],
+    ) -> Result<Vec<f32>> {
+        self.inner.dot_over(a, b, shape, axes)
+    }
+}
+
+fn synthetic_target_nchw(
+    batch: usize,
+    channels: usize,
+    lat_h: usize,
+    lat_w: usize,
+    seed: u64,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; batch * channels * lat_h * lat_w];
+    let phase_shift = ((seed & 0xFFFF) as f32) * 0.001;
+    for b in 0..batch {
+        for c in 0..channels {
+            let c_freq = 1.0 + (c as f32) * 0.15;
+            for y in 0..lat_h {
+                let ny = (y as f32 + 0.5) / (lat_h.max(1) as f32);
+                for x in 0..lat_w {
+                    let nx = (x as f32 + 0.5) / (lat_w.max(1) as f32);
+                    let val = 0.65 * (std::f32::consts::TAU * nx * c_freq + phase_shift).cos()
+                        + 0.45 * (std::f32::consts::TAU * ny * (1.0 + 0.1 * (c as f32))).sin()
+                        + 0.25 * (nx - 0.5) * (ny - 0.5);
+                    let idx = ((b * channels + c) * lat_h + y) * lat_w + x;
+                    out[idx] = val;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn compute_quality_metrics(
+    candidate_packed: &[f32],
+    reference_packed: &[f32],
+    batch: usize,
+    channels: usize,
+    lat_h: usize,
+    lat_w: usize,
+    patch_size: usize,
+) -> Result<LowResStartQualityMetrics> {
+    if candidate_packed.len() != reference_packed.len() || candidate_packed.is_empty() {
+        return Err(Error::Unsupported(
+            "compute_quality_metrics: candidate and reference lengths must match and be non-empty"
+                .into(),
+        ));
+    }
+    let all_finite = candidate_packed.iter().all(|v| v.is_finite());
+    let mut dot = 0.0_f64;
+    let mut norm_a = 0.0_f64;
+    let mut norm_b = 0.0_f64;
+    let mut sq_diff = 0.0_f64;
+    for (&a, &b) in candidate_packed.iter().zip(reference_packed) {
+        let af = f64::from(a);
+        let bf = f64::from(b);
+        dot += af * bf;
+        norm_a += af * af;
+        norm_b += bf * bf;
+        let d = af - bf;
+        sq_diff += d * d;
+    }
+    let denom = (norm_a.sqrt() * norm_b.sqrt()).max(1e-12);
+    let cosine_similarity_vs_full_res = (dot / denom) as f32;
+    let rms_diff_vs_full_res = (sq_diff / (candidate_packed.len() as f64)).sqrt() as f32;
+
+    // Unpack to [B, C, H_lat, W_lat] and compare patch-boundary adjacent gradients against interior gradients
+    // to verify absence of 2x2 patch or upsampling seam artifacts.
+    let unpacked =
+        unpack_packed_latents_f32(candidate_packed, batch, channels, lat_h, lat_w, patch_size)?;
+    let mut seam_grad_sum = 0.0_f64;
+    let mut seam_count = 0usize;
+    let mut interior_grad_sum = 0.0_f64;
+    let mut interior_count = 0usize;
+    for b in 0..batch {
+        for c in 0..channels {
+            let plane = &unpacked
+                [(b * channels + c) * lat_h * lat_w..(b * channels + c + 1) * lat_h * lat_w];
+            for y in 0..lat_h {
+                for x in 0..lat_w.saturating_sub(1) {
+                    let g = f64::from((plane[y * lat_w + x + 1] - plane[y * lat_w + x]).abs());
+                    if (x + 1).is_multiple_of(patch_size) {
+                        seam_grad_sum += g;
+                        seam_count += 1;
+                    } else {
+                        interior_grad_sum += g;
+                        interior_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mean_seam = if seam_count > 0 {
+        seam_grad_sum / (seam_count as f64)
+    } else {
+        0.0
+    };
+    let mean_interior = if interior_count > 0 {
+        (interior_grad_sum / (interior_count as f64)).max(1e-6)
+    } else {
+        1.0
+    };
+    let max_seam_gradient_ratio = (mean_seam / mean_interior) as f32;
+
+    Ok(LowResStartQualityMetrics {
+        all_finite,
+        cosine_similarity_vs_full_res,
+        rms_diff_vs_full_res,
+        max_seam_gradient_ratio,
+    })
+}
+
+/// Execute the bounded quality, time (evaluation count / token-weighted work), and memory
+/// (retained buffer coexistence) qualification comparing [`EstimateSource::EndpointEvaluation`] (default)
+/// vs [`EstimateSource::PreviousEvaluation`] (candidate under DEC-10) vs a full-resolution baseline
+/// over `solver` and `sigmas` (`SW-6940`: `E3`, `FEAT-1`, `PIPE-3`, `PIPE-4`, `PERF-3`).
+#[allow(clippy::too_many_arguments)]
+pub fn qualify_low_res_start_estimators(
+    solver: Solver,
+    sigmas: &[f32],
+    k: usize,
+    scale: f32,
+    full_width: u32,
+    full_height: u32,
+    seed: u64,
+    dtype_bytes: u64,
+) -> Result<LowResStartQualificationReport> {
+    use crate::guidance::{normalized_guidance, normalized_guidance_readonly, MomentumBuffer};
+    use crate::sampling::{
+        denoise, FlowModelSampling, PhaseBoundary, SolverRunState, TimestepConvention,
+    };
+
+    if sigmas.len() < 3 {
+        return Err(Error::Unsupported(
+            "qualify_low_res_start_estimators requires at least 2 executed steps (sigmas.len() >= 3)".into(),
+        ));
+    }
+    let executed_steps = sigmas.len() - 1;
+    let vae_spatial_scale = 8u32;
+    let patch_size = 2u32;
+    let pixel_stride = 16u32;
+    let min_dim = 128u32;
+    let batch = 1usize;
+    let channels = 16usize;
+    let token_width = 64u32;
+
+    // 1. Construct default (EndpointEvaluation) and candidate (PreviousEvaluation) specs and verify default immutability.
+    let spec_endpoint = LowResStartSpec::new(k, Some(scale));
+    let spec_previous = LowResStartSpec::new(k, Some(scale))
+        .with_estimate_source(EstimateSource::PreviousEvaluation);
+    let plan_endpoint = spec_endpoint.resolve_geometry(
+        "flux1_dev",
+        full_width,
+        full_height,
+        executed_steps,
+        vae_spatial_scale,
+        patch_size,
+        pixel_stride,
+        min_dim,
+    )?;
+    let plan_previous = spec_previous.resolve_geometry(
+        "flux1_dev",
+        full_width,
+        full_height,
+        executed_steps,
+        vae_spatial_scale,
+        patch_size,
+        pixel_stride,
+        min_dim,
+    )?;
+
+    let flow_sampling = FlowModelSampling::new(TimestepConvention::Sigma);
+    let h_low = (plan_endpoint.low_height / vae_spatial_scale) as usize;
+    let w_low = (plan_endpoint.low_width / vae_spatial_scale) as usize;
+    let h_full = (plan_endpoint.full_height / vae_spatial_scale) as usize;
+    let w_full = (plan_endpoint.full_width / vae_spatial_scale) as usize;
+    let p = patch_size as usize;
+
+    let target_full_nchw = synthetic_target_nchw(batch, channels, h_full, w_full, seed);
+    let target_low_nchw = resize_bilinear_half_pixel_clamp_f32(
+        &target_full_nchw,
+        batch,
+        channels,
+        h_full,
+        w_full,
+        h_low,
+        w_low,
+    )?;
+    let target_full_packed =
+        repack_unpacked_latents_f32(&target_full_nchw, batch, channels, h_full, w_full, p)?;
+    let target_low_packed =
+        repack_unpacked_latents_f32(&target_low_nchw, batch, channels, h_low, w_low, p)?;
+
+    let init_noise_full_nchw = low_res_start_transition_noise_f32(
+        seed ^ 0x517C_C1B7_2722_0A95,
+        0,
+        0,
+        99,
+        target_full_nchw.len(),
+    );
+    let init_noise_low_nchw = resize_bilinear_half_pixel_clamp_f32(
+        &init_noise_full_nchw,
+        batch,
+        channels,
+        h_full,
+        w_full,
+        h_low,
+        w_low,
+    )?;
+    let init_full_packed =
+        repack_unpacked_latents_f32(&init_noise_full_nchw, batch, channels, h_full, w_full, p)?;
+    let init_low_packed =
+        repack_unpacked_latents_f32(&init_noise_low_nchw, batch, channels, h_low, w_low, p)?;
+
+    // Flow velocity model: v(x, sigma) = (x - x0_target) / max(sigma, 1e-4), guided via APG to test stateful guidance accumulator safety.
+    let predict_guided = |ops: &QualificationTracingOps,
+                          x_in: &Vec<f32>,
+                          sigma: f32,
+                          target_packed: &[f32],
+                          apg_buf: Option<&mut MomentumBuffer<Vec<f32>>>|
+     -> Result<Vec<f32>> {
+        let s = sigma.max(1e-4);
+        let cond: Vec<f32> = x_in
+            .iter()
+            .zip(target_packed)
+            .map(|(&xi, &ti)| (xi - ti) / s)
+            .collect();
+        let uncond: Vec<f32> = x_in
+            .iter()
+            .zip(target_packed)
+            .map(|(&xi, &ti)| (xi - 0.85 * ti) / s)
+            .collect();
+        let len = cond.len();
+        normalized_guidance(
+            ops,
+            &cond,
+            &uncond,
+            3.5,
+            apg_buf,
+            0.0,
+            2.5,
+            &[1, len],
+            &[-1],
+        )
+    };
+
+    let predict_guided_readonly = |ops: &QualificationTracingOps,
+                                   x_in: &Vec<f32>,
+                                   sigma: f32,
+                                   target_packed: &[f32],
+                                   apg_buf: Option<&MomentumBuffer<Vec<f32>>>|
+     -> Result<Vec<f32>> {
+        let s = sigma.max(1e-4);
+        let cond: Vec<f32> = x_in
+            .iter()
+            .zip(target_packed)
+            .map(|(&xi, &ti)| (xi - ti) / s)
+            .collect();
+        let uncond: Vec<f32> = x_in
+            .iter()
+            .zip(target_packed)
+            .map(|(&xi, &ti)| (xi - 0.85 * ti) / s)
+            .collect();
+        let len = cond.len();
+        normalized_guidance_readonly(
+            ops,
+            &cond,
+            &uncond,
+            3.5,
+            apg_buf,
+            0.0,
+            2.5,
+            &[1, len],
+            &[-1],
+        )
+    };
+
+    // 2. Run full-resolution single-phase baseline (0..M).
+    let full_ops = QualificationTracingOps::default();
+    let mut full_apg = MomentumBuffer::new(-0.5);
+    let mut full_state = SolverRunState::new(solver, sigmas);
+    let sampler = solver.boxed::<QualificationTracingOps>();
+    let full_res_final = {
+        let mut dn = |x: &Vec<f32>, sigma: f32| -> Result<Vec<f32>> {
+            denoise(&full_ops, &flow_sampling, x, sigma, |xin, t| {
+                predict_guided(&full_ops, xin, t, &target_full_packed, Some(&mut full_apg))
+            })
+        };
+        sampler.sample_span(
+            &full_ops,
+            &flow_sampling,
+            &mut dn,
+            init_full_packed,
+            sigmas,
+            seed,
+            0..executed_steps,
+            &mut full_state,
+        )?
+    };
+
+    // 3. Helper to run a two-phase trajectory for either EstimateSource::EndpointEvaluation or EstimateSource::PreviousEvaluation.
+    let total_u32 = executed_steps as u32;
+    let run_two_phase =
+        |plan: &ResolvedLowResStartPlan| -> Result<(Vec<f32>, LowResStartTraceSummary)> {
+            let ops = QualificationTracingOps::default();
+            let mut apg_buf = MomentumBuffer::new(-0.5);
+            let mut state = SolverRunState::new(solver, sigmas);
+            state.configure_low_res_start(plan)?;
+
+            let mut phase0_progress = Vec::new();
+            let mut total_progress = Vec::new();
+            let mut phase0_previews = Vec::new();
+            let mut emitted_preview_steps = BTreeSet::new();
+
+            // Phase 0: 0..K at (low_width, low_height)
+            let x_low_sigma_k = {
+                let mut dn0 = |x: &Vec<f32>, sigma: f32| -> Result<Vec<f32>> {
+                    let current =
+                        (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total_u32);
+                    phase0_progress.push((current, total_u32));
+                    total_progress.push((current, total_u32));
+                    if emitted_preview_steps.insert(current) {
+                        phase0_previews.push((
+                            current,
+                            total_u32,
+                            plan.low_width / 8,
+                            plan.low_height / 8,
+                        ));
+                    }
+                    denoise(&ops, &flow_sampling, x, sigma, |xin, t| {
+                        predict_guided(&ops, xin, t, &target_low_packed, Some(&mut apg_buf))
+                    })
+                };
+                sampler.sample_span(
+                    &ops,
+                    &flow_sampling,
+                    &mut dn0,
+                    init_low_packed.clone(),
+                    sigmas,
+                    seed,
+                    plan.phase0_span(),
+                    &mut state,
+                )?
+            };
+            let completed_low_res_steps = state.next_step();
+            let phase0_sub_evaluations = ops.sub_evaluations.borrow().clone();
+            let phase0_rng_draw_coordinates = ops.rng_draws.borrow().clone();
+
+            // Snapshot state before boundary clean-estimate resolution.
+            let pre_boundary_progress_len = total_progress.len();
+            let pre_boundary_preview_len = phase0_previews.len();
+            let pre_boundary_rng_len = ops.rng_draws.borrow().len();
+            let pre_boundary_has_history = state.has_history();
+            let pre_boundary_apg = apg_buf.running().cloned();
+
+            let sigma_k = sigmas[plan.k];
+            let (boundary_state, boundary_evaluations) = match plan.estimate_source {
+                EstimateSource::EndpointEvaluation => {
+                    // 1 read-only boundary evaluation at (x_low(sigma_K), sigma_K):
+                    // does not advance progress, emit preview, or mutate solver/RNG/guidance state.
+                    let x0_low =
+                        denoise(&ops, &flow_sampling, &x_low_sigma_k, sigma_k, |xin, t| {
+                            predict_guided_readonly(
+                                &ops,
+                                xin,
+                                t,
+                                &target_low_packed,
+                                Some(&apg_buf),
+                            )
+                        })?;
+                    (
+                        BoundaryState::CleanEstimate {
+                            latent: x0_low,
+                            source: EstimateSource::EndpointEvaluation,
+                        },
+                        1u32,
+                    )
+                }
+                EstimateSource::PreviousEvaluation => {
+                    let captured = state.take_captured_primary_estimate(plan.k - 1)?;
+                    (
+                        BoundaryState::CleanEstimate {
+                            latent: captured.latent,
+                            source: EstimateSource::PreviousEvaluation,
+                        },
+                        0u32,
+                    )
+                }
+            };
+
+            let boundary_advanced_progress = total_progress.len() != pre_boundary_progress_len;
+            let boundary_emitted_preview = phase0_previews.len() != pre_boundary_preview_len;
+            let boundary_mutated_rng = ops.rng_draws.borrow().len() != pre_boundary_rng_len;
+            let boundary_mutated_solver_history = state.has_history() != pre_boundary_has_history;
+            let boundary_mutated_guidance_accumulator =
+                apg_buf.running() != pre_boundary_apg.as_ref();
+
+            let (x0_low_vec, source) = boundary_state.into_clean_estimate()?;
+            let x_full_sigma_k = transition_packed_clean_estimate_f32(
+                BoundaryState::CleanEstimate {
+                    latent: &x0_low_vec,
+                    source,
+                },
+                batch,
+                channels,
+                patch_size,
+                vae_spatial_scale,
+                plan,
+                sigma_k,
+                &flow_sampling,
+                seed,
+                0,
+                0,
+                0,
+            )?;
+
+            // Phase boundary reset of solver history and shape-bound APG accumulator before Phase 1.
+            state.note_geometry_change(
+                (plan.low_width, plan.low_height),
+                (plan.full_width, plan.full_height),
+            );
+            state.note_renoise_transition();
+            state.apply_phase_boundary(PhaseBoundary::Reset, true)?;
+            apg_buf.reset();
+
+            // Phase 1: K..M at (full_width, full_height)
+            let final_packed = {
+                let mut dn1 = |x: &Vec<f32>, sigma: f32| -> Result<Vec<f32>> {
+                    let current =
+                        (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total_u32);
+                    total_progress.push((current, total_u32));
+                    denoise(&ops, &flow_sampling, x, sigma, |xin, t| {
+                        predict_guided(&ops, xin, t, &target_full_packed, Some(&mut apg_buf))
+                    })
+                };
+                sampler.sample_span(
+                    &ops,
+                    &flow_sampling,
+                    &mut dn1,
+                    x_full_sigma_k,
+                    sigmas,
+                    seed,
+                    plan.phase1_span(),
+                    &mut state,
+                )?
+            };
+
+            let all_sub_evals = ops.sub_evaluations.borrow();
+            let phase1_sub_evaluations = all_sub_evals[phase0_sub_evaluations.len()..].to_vec();
+            let all_rng_draws = ops.rng_draws.borrow();
+            let phase1_rng_draw_coordinates =
+                all_rng_draws[phase0_rng_draw_coordinates.len()..].to_vec();
+
+            Ok((
+                final_packed,
+                LowResStartTraceSummary {
+                    completed_low_res_steps,
+                    phase0_sub_evaluations,
+                    phase0_rng_draw_coordinates,
+                    phase0_progress_events: phase0_progress,
+                    phase0_preview_frames: phase0_previews,
+                    boundary_evaluations,
+                    boundary_advanced_progress,
+                    boundary_emitted_preview,
+                    boundary_mutated_solver_history,
+                    boundary_mutated_rng,
+                    boundary_mutated_guidance_accumulator,
+                    phase1_sub_evaluations,
+                    phase1_rng_draw_coordinates,
+                    total_progress_events: total_progress,
+                },
+            ))
+        };
+
+    let (endpoint_final, endpoint_trace) = run_two_phase(&plan_endpoint)?;
+    let (previous_final, previous_trace) = run_two_phase(&plan_previous)?;
+
+    let endpoint_quality = compute_quality_metrics(
+        &endpoint_final,
+        &full_res_final,
+        batch,
+        channels,
+        h_full,
+        w_full,
+        p,
+    )?;
+    let previous_quality = compute_quality_metrics(
+        &previous_final,
+        &full_res_final,
+        batch,
+        channels,
+        h_full,
+        w_full,
+        p,
+    )?;
+    let endpoint_vs_previous = compute_quality_metrics(
+        &endpoint_final,
+        &previous_final,
+        batch,
+        channels,
+        h_full,
+        w_full,
+        p,
+    )?;
+
+    let dtype_label = if dtype_bytes == 2 { "bf16" } else { "f32" };
+    let endpoint_report = plan_endpoint.execution_report(
+        0,
+        sigmas,
+        solver,
+        "apg",
+        3.5,
+        "base_dit",
+        dtype_label,
+        dtype_bytes,
+        batch,
+        pixel_stride,
+        token_width,
+    )?;
+    let previous_report = plan_previous.execution_report(
+        0,
+        sigmas,
+        solver,
+        "apg",
+        3.5,
+        "base_dit",
+        dtype_label,
+        dtype_bytes,
+        batch,
+        pixel_stride,
+        token_width,
+    )?;
+    let endpoint_work = plan_endpoint.work_profile(solver, sigmas, pixel_stride)?;
+    let previous_work = plan_previous.work_profile(solver, sigmas, pixel_stride)?;
+    let endpoint_memory =
+        plan_endpoint.memory_profile(batch, pixel_stride, token_width, dtype_bytes);
+    let previous_memory =
+        plan_previous.memory_profile(batch, pixel_stride, token_width, dtype_bytes);
+
+    let phase0_traces_identical = endpoint_trace.completed_low_res_steps == k
+        && previous_trace.completed_low_res_steps == k
+        && endpoint_trace.phase0_sub_evaluations == previous_trace.phase0_sub_evaluations
+        && endpoint_trace.phase0_rng_draw_coordinates == previous_trace.phase0_rng_draw_coordinates
+        && endpoint_trace.phase0_progress_events == previous_trace.phase0_progress_events
+        && endpoint_trace.phase0_preview_frames == previous_trace.phase0_preview_frames;
+    let phase1_rng_coordinates_identical =
+        endpoint_trace.phase1_rng_draw_coordinates == previous_trace.phase1_rng_draw_coordinates;
+    let outer_progress_identical =
+        endpoint_trace.total_progress_events == previous_trace.total_progress_events;
+    let preview_sequences_identical =
+        endpoint_trace.phase0_preview_frames == previous_trace.phase0_preview_frames;
+    let default_selection_unchanged = EstimateSource::default()
+        == EstimateSource::EndpointEvaluation
+        && LowResStartSpec::new(k, Some(scale)).estimate_source
+            == EstimateSource::EndpointEvaluation;
+
+    Ok(LowResStartQualificationReport {
+        default_policy: EstimateSource::EndpointEvaluation,
+        candidate_policy: EstimateSource::PreviousEvaluation,
+        plan_endpoint,
+        plan_previous,
+        endpoint_report,
+        previous_report,
+        endpoint_work,
+        previous_work,
+        endpoint_memory,
+        previous_memory,
+        endpoint_trace,
+        previous_trace,
+        phase0_traces_identical,
+        phase1_rng_coordinates_identical,
+        outer_progress_identical,
+        preview_sequences_identical,
+        endpoint_quality,
+        previous_quality,
+        endpoint_vs_previous_cosine_similarity: endpoint_vs_previous.cosine_similarity_vs_full_res,
+        endpoint_vs_previous_rms_diff: endpoint_vs_previous.rms_diff_vs_full_res,
+        default_selection_unchanged,
+    })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -4866,5 +6008,339 @@ mod tests {
         // Phase-boundary reset clears old-shape `(low_w, low_h)` buffer so Phase 1 starts fresh at `(full_w, full_h)`.
         apg_buf.reset();
         assert!(apg_buf.is_empty());
+    }
+
+    /// SW-6940 (FEAT-1, PIPE-3, PIPE-4, PERF-3, E3):
+    /// Qualify `EstimateSource::EndpointEvaluation` (default) vs `EstimateSource::PreviousEvaluation`
+    /// (candidate under DEC-10) across 1-stage (`Euler`, `Dpmpp2m`, `UniPc`), 2-stage (`Heun`, `DpmppSde`),
+    /// and stochastic (`EulerAncestral`) solvers:
+    /// - Read-only `BoundaryEstimate` at `sigma_K` vs captured `GuidedPrimaryX0` from outer step `K - 1` at `sigma_{K-1}`.
+    /// - Identical `0..K` low-res solver steps, sub-evaluations, RNG draw coordinates, progress events, and preview sequence.
+    /// - Explicit solver/guidance support and typed `Error::Unsupported` refusal for unsupported combinations.
+    /// - Persisted `LowResStartExecutionReport` and `EstimateProvenance` on `GenerationReport`.
+    /// - Bounded quality, evaluation/time cost (`M + 1` vs `M`, `2M + 1` vs `2M`, ~1.5-1.7x token speedup), and retained-buffer memory comparison.
+    #[test]
+    fn sw6940_endpoint_vs_previous_evaluation_qualification_provenance_and_solver_refusal() {
+        use crate::sampling::{
+            build_flow_sigmas, compute_mu, image_seq_len, CpuLatentOps, Solver, SolverRunState,
+        };
+        use crate::{Capabilities, GenerationOutput, GenerationReport};
+
+        fn flux_desc() -> ModelDescriptor {
+            ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: Some(&FLUX1_LATENT_SPACE),
+                control_kinds: None,
+                required_components: &[],
+                id: "flux1_dev",
+                family: "flux",
+                backend: "mlx",
+                modality: Modality::Image,
+                capabilities: Capabilities {
+                    min_size: 256,
+                    max_size: 2048,
+                    max_count: 4,
+                    ..Default::default()
+                },
+            }
+        }
+
+        let m = 8usize;
+        let k = 4usize;
+        let mu = compute_mu(image_seq_len(512, 512), m);
+        let sigmas = build_flow_sigmas(m, mu);
+        assert_eq!(sigmas.len(), m + 1);
+
+        // 1. Default policy is always EndpointEvaluation unless explicitly overridden.
+        assert_eq!(
+            EstimateSource::default(),
+            EstimateSource::EndpointEvaluation
+        );
+        assert!(EstimateSource::EndpointEvaluation.is_default_policy());
+        assert!(!EstimateSource::PreviousEvaluation.is_default_policy());
+        assert_eq!(
+            LowResStartSpec::new(k, Some(0.5)).estimate_source,
+            EstimateSource::EndpointEvaluation
+        );
+        assert_eq!(
+            EstimateSource::from_name("endpoint_evaluation"),
+            Some(EstimateSource::EndpointEvaluation)
+        );
+        assert_eq!(
+            EstimateSource::from_name(LOW_RES_START_ENDPOINT_ESTIMATOR_ID),
+            Some(EstimateSource::EndpointEvaluation)
+        );
+        assert_eq!(
+            EstimateSource::from_name("previous_evaluation"),
+            Some(EstimateSource::PreviousEvaluation)
+        );
+        assert_eq!(
+            EstimateSource::from_name(LOW_RES_START_PREVIOUS_ESTIMATOR_ID),
+            Some(EstimateSource::PreviousEvaluation)
+        );
+        assert_eq!(EstimateSource::from_name("unknown"), None);
+
+        // 2. Explicit solver/guidance support and typed refusal for unsupported PreviousEvaluation combinations,
+        // without removing EndpointEvaluation's supported routes or solvers.
+        let desc = flux_desc();
+        for unsupported_sampler in ["lightning", "tcd", "scm", "trigflow", "unknown_policy"] {
+            let mut req_prev = GenerationRequest {
+                prompt: "a lighthouse".into(),
+                width: 512,
+                height: 512,
+                sampler: Some(unsupported_sampler.into()),
+                low_res_start: Some(
+                    LowResStartSpec::new(2, Some(0.5))
+                        .with_estimate_source(EstimateSource::PreviousEvaluation),
+                ),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    req_prev
+                        .low_res_start
+                        .unwrap()
+                        .resolve_for_descriptor(&desc, &req_prev, 4, 16),
+                    Err(Error::Unsupported(ref msg)) if msg.contains("previous_evaluation is unsupported")
+                ),
+                "PreviousEvaluation must refuse unsupported sampler {unsupported_sampler}"
+            );
+            // EndpointEvaluation continues to resolve without removing its supported routes or fallback behavior.
+            req_prev.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+            assert!(req_prev
+                .low_res_start
+                .unwrap()
+                .resolve_for_descriptor(&desc, &req_prev, 4, 16)
+                .is_ok());
+        }
+
+        // CFG++ guidance_method is refused for PreviousEvaluation (CFG++ renoises from uncond x0), while EndpointEvaluation remains allowed.
+        let req_cfgpp = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            sampler: Some("euler".into()),
+            guidance_method: Some("cfg_pp".into()),
+            low_res_start: Some(
+                LowResStartSpec::new(2, Some(0.5))
+                    .with_estimate_source(EstimateSource::PreviousEvaluation),
+            ),
+            ..Default::default()
+        };
+        assert!(matches!(
+            req_cfgpp
+                .low_res_start
+                .unwrap()
+                .resolve_for_descriptor(&desc, &req_cfgpp, 4, 16),
+            Err(Error::Unsupported(ref msg)) if msg.contains("cfg_pp")
+        ));
+        let mut cfgpp_state = SolverRunState::<CpuLatentOps>::new_cfg_pp(Solver::Euler, &sigmas);
+        assert!(matches!(
+            cfgpp_state.enable_primary_estimate_capture(k - 1),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Calling take_captured_primary_estimate when capture was not enabled or not populated refuses with Error::Unsupported (never falls back!).
+        let mut uncaptured_state = SolverRunState::<CpuLatentOps>::new(Solver::Euler, &sigmas);
+        assert!(matches!(
+            uncaptured_state.take_captured_primary_estimate(k - 1),
+            Err(Error::Unsupported(ref msg)) if msg.contains("GuidedPrimaryX0")
+        ));
+
+        // 3. Qualify EndpointEvaluation vs PreviousEvaluation across 1-stage, 2-stage, and stochastic solvers.
+        for solver in [
+            Solver::Euler,
+            Solver::Dpmpp2m,
+            Solver::UniPc,
+            Solver::EulerAncestral,
+            Solver::Heun,
+            Solver::DpmppSde,
+        ] {
+            let qual =
+                qualify_low_res_start_estimators(solver, &sigmas, k, 0.5, 512, 512, 42, 2).unwrap();
+
+            assert_eq!(qual.default_policy, EstimateSource::EndpointEvaluation);
+            assert_eq!(qual.candidate_policy, EstimateSource::PreviousEvaluation);
+            assert!(qual.default_selection_unchanged);
+            assert!(
+                qual.phase0_traces_identical,
+                "{solver:?}: Phase-0 (0..K) completed steps, sub-evaluations, RNG draws, progress, and previews must be identical"
+            );
+            assert!(
+                qual.phase1_rng_coordinates_identical,
+                "{solver:?}: Phase-1 (K..M) RNG draw coordinates must be identical"
+            );
+            assert!(
+                qual.outer_progress_identical,
+                "{solver:?}: Outer progress events must be identical"
+            );
+            assert!(
+                qual.preview_sequences_identical,
+                "{solver:?}: Preview sequence must be identical"
+            );
+
+            // Read-only boundary guarantee for EndpointEvaluation and zero-boundary-eval guarantee for PreviousEvaluation.
+            assert_eq!(qual.endpoint_trace.boundary_evaluations, 1);
+            assert_eq!(qual.previous_trace.boundary_evaluations, 0);
+            for trace in [&qual.endpoint_trace, &qual.previous_trace] {
+                assert_eq!(trace.completed_low_res_steps, k);
+                assert!(!trace.boundary_advanced_progress);
+                assert!(!trace.boundary_emitted_preview);
+                assert!(!trace.boundary_mutated_solver_history);
+                assert!(!trace.boundary_mutated_rng);
+                assert!(!trace.boundary_mutated_guidance_accumulator);
+                assert_eq!(
+                    trace.total_progress_events.len(),
+                    m * (solver.stages_per_step() as usize)
+                        - usize::from(solver.stages_per_step() == 2)
+                );
+            }
+
+            // Evaluation count & token-weighted work comparison (PERF-3, E3):
+            let stages = solver.stages_per_step();
+            assert_eq!(
+                qual.endpoint_work.nominal_stage_evaluations,
+                stages * (m as u32) + 1
+            );
+            assert_eq!(
+                qual.previous_work.nominal_stage_evaluations,
+                stages * (m as u32)
+            );
+            assert_eq!(
+                qual.endpoint_work.total_model_evaluations,
+                qual.previous_work.total_model_evaluations + 1
+            );
+            assert_eq!(qual.endpoint_work.low_tokens, 256);
+            assert_eq!(qual.endpoint_work.full_tokens, 1024);
+            // At K = M / 2 = 4, scale = 0.5 (token_ratio = 0.25):
+            // PreviousEvaluation speedup = 1 / (0.5 * 0.25 + 0.5 * 1.0) = 1.60x.
+            // EndpointEvaluation speedup = 1 / ((4*stages + 1)/(8*stages) * 0.25 + 0.5) in ~1.52..=1.58x.
+            assert!(
+                (1.50..=1.70).contains(&qual.endpoint_work.theoretical_speedup),
+                "{solver:?}: endpoint speedup {} outside 1.5..=1.7",
+                qual.endpoint_work.theoretical_speedup
+            );
+            assert!(
+                (qual.previous_work.theoretical_speedup - 1.60).abs() < 1e-5,
+                "{solver:?}: previous speedup {} != 1.60",
+                qual.previous_work.theoretical_speedup
+            );
+
+            // For 2-stage solvers (Heun, DpmppSde), verify that step K - 1 executed BOTH Primary and Corrector/Midpoint
+            // sub-evaluations in Phase 0, and that PreviousEvaluation still captured GuidedPrimaryX0 at step K - 1 (sigma_{K-1}).
+            if stages == 2 {
+                assert_eq!(qual.previous_trace.phase0_sub_evaluations.len(), 2 * k);
+                assert_eq!(
+                    qual.previous_trace.phase0_sub_evaluations[2 * (k - 1)],
+                    (k - 1, "primary".to_string(), sigmas[k - 1].to_bits())
+                );
+                let second_kind = &qual.previous_trace.phase0_sub_evaluations[2 * (k - 1) + 1].1;
+                assert!(
+                    second_kind == "heun_corrector" || second_kind == "sde_midpoint",
+                    "unexpected 2nd-stage evaluation kind: {second_kind}"
+                );
+            }
+
+            // Memory comparison:
+            // At 256x256 (256 tokens * 64 channels * 2 bytes bf16 = 32_768 bytes):
+            assert_eq!(qual.endpoint_memory.low_packed_latent_bytes, 32_768);
+            assert_eq!(qual.endpoint_memory.full_packed_latent_bytes, 131_072);
+            assert_eq!(qual.endpoint_memory.retained_primary_estimate_bytes, 0);
+            assert_eq!(qual.endpoint_memory.boundary_eval_workspace_bytes, 32_768);
+            assert_eq!(qual.previous_memory.retained_primary_estimate_bytes, 32_768);
+            assert_eq!(qual.previous_memory.boundary_eval_workspace_bytes, 0);
+            assert_eq!(
+                qual.previous_memory
+                    .phase0_step_k_minus_1_coexisting_buffer_bytes,
+                qual.endpoint_memory
+                    .phase0_step_k_minus_1_coexisting_buffer_bytes
+                    + 32_768
+            );
+
+            // Quality metrics: finite values, strong prompt/seed signal retention vs full-res, and no spatial seam spike.
+            assert!(qual.endpoint_quality.all_finite);
+            assert!(qual.previous_quality.all_finite);
+            assert!(
+                qual.endpoint_quality.cosine_similarity_vs_full_res > 0.85,
+                "{solver:?}: endpoint cosine similarity {} too low",
+                qual.endpoint_quality.cosine_similarity_vs_full_res
+            );
+            assert!(
+                qual.previous_quality.cosine_similarity_vs_full_res > 0.85,
+                "{solver:?}: previous cosine similarity {} too low",
+                qual.previous_quality.cosine_similarity_vs_full_res
+            );
+            assert!(
+                qual.endpoint_vs_previous_cosine_similarity > 0.90,
+                "{solver:?}: endpoint vs previous cosine similarity {} too low",
+                qual.endpoint_vs_previous_cosine_similarity
+            );
+            assert!(
+                qual.endpoint_quality.max_seam_gradient_ratio < 1.35,
+                "{solver:?}: endpoint seam gradient ratio {} indicates seam artifact",
+                qual.endpoint_quality.max_seam_gradient_ratio
+            );
+            assert!(
+                qual.previous_quality.max_seam_gradient_ratio < 1.35,
+                "{solver:?}: previous seam gradient ratio {} indicates seam artifact",
+                qual.previous_quality.max_seam_gradient_ratio
+            );
+
+            // Provenance & Receipt Report verification:
+            assert_eq!(qual.endpoint_report.recipe_id, "low_res_start");
+            assert_eq!(qual.endpoint_report.version, 1);
+            assert_eq!(qual.endpoint_report.estimator, "endpoint_evaluation_v1");
+            assert_eq!(
+                qual.endpoint_report.estimate_provenance.evaluation_kind,
+                EvaluationKind::BoundaryEstimate
+            );
+            assert_eq!(qual.endpoint_report.estimate_provenance.step_index, k);
+            assert_eq!(
+                qual.endpoint_report.estimate_provenance.sigma.to_bits(),
+                sigmas[k].to_bits()
+            );
+            assert_eq!(qual.endpoint_report.boundary_evaluations, 1);
+            assert_eq!(
+                qual.endpoint_report.transition_arithmetic_id,
+                LOW_RES_START_TRANSITION_ARITHMETIC_ID
+            );
+            assert_eq!(
+                qual.endpoint_report.transition_seed_derivation_id,
+                LOW_RES_START_TRANSITION_DOMAIN
+            );
+
+            assert_eq!(qual.previous_report.recipe_id, "low_res_start");
+            assert_eq!(qual.previous_report.version, 1);
+            assert_eq!(qual.previous_report.estimator, "previous_evaluation_v1");
+            assert_eq!(
+                qual.previous_report.estimate_provenance.evaluation_kind,
+                EvaluationKind::GuidedPrimaryX0
+            );
+            assert_eq!(qual.previous_report.estimate_provenance.step_index, k - 1);
+            assert_eq!(
+                qual.previous_report.estimate_provenance.sigma.to_bits(),
+                sigmas[k - 1].to_bits()
+            );
+            assert_eq!(qual.previous_report.boundary_evaluations, 0);
+            assert_eq!(
+                qual.previous_report
+                    .estimate_provenance
+                    .retained_primary_estimate_bytes,
+                32_768
+            );
+
+            // JSON round-trip and GenerationReport integration.
+            let encoded = serde_json::to_value(&qual).unwrap();
+            let decoded: LowResStartQualificationReport = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, qual);
+
+            let mut gen_report = GenerationReport::from_output(GenerationOutput::Images(vec![]));
+            assert!(gen_report.low_res_start.is_none());
+            gen_report.low_res_start = Some(qual.endpoint_report.clone());
+            assert_eq!(
+                gen_report.low_res_start.as_ref().unwrap().estimator,
+                "endpoint_evaluation_v1"
+            );
+        }
     }
 }

@@ -296,6 +296,11 @@ pub fn run_curated_sampler_with_phase_transition_spans(
     let sampler = solver.boxed::<CandleLatentOps>();
     let mut state = SolverRunState::new(sampler.solver(), sigmas);
     if let Some(run) = phase_scope {
+        if let Some(low_res_plan) = run.plan().low_res_start() {
+            state
+                .configure_low_res_start(low_res_plan)
+                .map_err(CandleError::from)?;
+        }
         // A planned render iterates its plan's seeds, not `for_each_image_seed`, so its
         // per-image initial-noise draw is recorded here, before this output's runtime and
         // schedule, as `for_each_image_seed` does: output index = seed - plan base seed.
@@ -360,17 +365,8 @@ pub fn run_curated_sampler_with_phase_transition_spans(
                             return Err(CandleError::Canceled);
                         }
                         let sigma_k = sigmas[span.end];
-                        let boundary_state = match (
-                            low_res_plan.estimate_source,
-                            state.previous_denoised().cloned(),
-                        ) {
-                            (gen_core::EstimateSource::PreviousEvaluation, Some(prev_x0)) => {
-                                gen_core::BoundaryState::CleanEstimate {
-                                    latent: prev_x0,
-                                    source: gen_core::EstimateSource::PreviousEvaluation,
-                                }
-                            }
-                            _ => {
+                        let boundary_state = match low_res_plan.estimate_source {
+                            gen_core::EstimateSource::EndpointEvaluation => {
                                 let x0_low = gc_denoise(&ops, ms, &out, sigma_k, |xin, t| {
                                     predict(xin, t).map_err(Into::into)
                                 })
@@ -378,6 +374,15 @@ pub fn run_curated_sampler_with_phase_transition_spans(
                                 gen_core::BoundaryState::CleanEstimate {
                                     latent: x0_low,
                                     source: gen_core::EstimateSource::EndpointEvaluation,
+                                }
+                            }
+                            gen_core::EstimateSource::PreviousEvaluation => {
+                                let captured = state
+                                    .take_captured_primary_estimate(span.end - 1)
+                                    .map_err(CandleError::from)?;
+                                gen_core::BoundaryState::CleanEstimate {
+                                    latent: captured.latent,
+                                    source: gen_core::EstimateSource::PreviousEvaluation,
                                 }
                             }
                         };

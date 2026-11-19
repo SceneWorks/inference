@@ -1975,9 +1975,14 @@ mod tests {
                 compile: compile_base_probe,
             })
             .build();
-        let catalog =
-            RuntimeCatalog::try_new("macos", "mlx", media_with_plan, empty_text(), mlx_preparers())
-                .unwrap();
+        let catalog = RuntimeCatalog::try_new(
+            "macos",
+            "mlx",
+            media_with_plan,
+            empty_text(),
+            mlx_preparers(),
+        )
+        .unwrap();
         let json = catalog.snapshot().to_json();
         let entry = &json["generator_capabilities"][0];
         let low_res = entry
@@ -2026,7 +2031,8 @@ mod tests {
         )
         .unwrap();
         let json_no_plan = catalog_no_plan.snapshot().to_json();
-        let low_res_no_plan = &json_no_plan["generator_capabilities"][0]["features"]["low_res_start"];
+        let low_res_no_plan =
+            &json_no_plan["generator_capabilities"][0]["features"]["low_res_start"];
         assert_eq!(low_res_no_plan["applicable"], false);
         assert!(low_res_no_plan["inapplicability_reasons"]
             .as_array()

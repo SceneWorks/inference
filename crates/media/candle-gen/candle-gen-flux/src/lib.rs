@@ -429,8 +429,10 @@ impl Generator for FluxGenerator {
             .capabilities
             .resolve_pag(self.variant.model_id(), req)?
             .map(|p| p.execution_report(plan.denoise_sigmas().len().saturating_sub(1) as u32));
+        let low_res_report = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
         let mut report = GenerationReport::from_output(GenerationOutput::Images(images));
         report.pag = pag_report;
+        report.low_res_start = low_res_report;
         Ok(report)
     }
 }
@@ -2014,5 +2016,148 @@ mod execution_policy_tests {
             ),
             (0, 1, 512, 512)
         );
+    }
+
+    #[test]
+    fn sw6940_candle_flux_endpoint_and_previous_evaluation_end_to_end_and_provenance_report() {
+        use candle_core::{DType, Device, Tensor};
+        use candle_transformers::models::flux::sampling::State;
+        use gen_core::{EstimateSource, EvaluationKind, LowResStartSpec, RenderRun};
+        use std::cell::RefCell;
+
+        let dev = Device::Cpu;
+        let t5_dummy = Tensor::zeros((1, 16, 4096), DType::F32, &dev).unwrap();
+        let clip_dummy = Tensor::zeros((1, 768), DType::F32, &dev).unwrap();
+        let noise_low = flux1_load::seeded_noise(42, 16, 32, 32, &dev, DType::F32).unwrap();
+        let state_low = State::new(&t5_dummy, &clip_dummy, &noise_low).unwrap();
+
+        for (sampler_name, expected_p0_evals, expected_p1_evals) in [
+            ("euler", 2usize, 2usize),
+            ("dpmpp_2m", 2usize, 2usize),
+            ("heun", 4usize, 3usize),
+            ("dpmpp_sde", 4usize, 3usize),
+        ] {
+            let make_req = |source: EstimateSource| GenerationRequest {
+                prompt: "a lighthouse in a storm".into(),
+                width: 512,
+                height: 512,
+                count: 1,
+                steps: Some(4),
+                seed: Some(42),
+                sampler: Some(sampler_name.into()),
+                low_res_start: Some(
+                    LowResStartSpec::new(2, Some(0.5)).with_estimate_source(source),
+                ),
+                ..Default::default()
+            };
+
+            let req_endpoint = make_req(EstimateSource::EndpointEvaluation);
+            let req_previous = make_req(EstimateSource::PreviousEvaluation);
+            let plan_endpoint = compile_base_plan(Variant::Dev, &req_endpoint).unwrap();
+            let plan_previous = compile_base_plan(Variant::Dev, &req_previous).unwrap();
+
+            let report_endpoint = plan_endpoint
+                .low_res_start_execution_report("bf16", 2, "base_dit")
+                .unwrap()
+                .unwrap();
+            let report_previous = plan_previous
+                .low_res_start_execution_report("bf16", 2, "base_dit")
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(report_endpoint.estimator, "endpoint_evaluation_v1");
+            assert_eq!(
+                report_endpoint.estimate_provenance.evaluation_kind,
+                EvaluationKind::BoundaryEstimate
+            );
+            assert_eq!(report_endpoint.estimate_provenance.step_index, 2);
+            assert_eq!(
+                report_endpoint.estimate_provenance.sigma.to_bits(),
+                plan_endpoint.denoise_sigmas()[2].to_bits()
+            );
+            assert_eq!(report_endpoint.boundary_evaluations, 1);
+            assert_eq!(
+                report_endpoint.total_model_evaluations,
+                (expected_p0_evals + 1 + expected_p1_evals) as u32
+            );
+
+            assert_eq!(report_previous.estimator, "previous_evaluation_v1");
+            assert_eq!(
+                report_previous.estimate_provenance.evaluation_kind,
+                EvaluationKind::GuidedPrimaryX0
+            );
+            assert_eq!(report_previous.estimate_provenance.step_index, 1);
+            assert_eq!(
+                report_previous.estimate_provenance.sigma.to_bits(),
+                plan_previous.denoise_sigmas()[1].to_bits()
+            );
+            assert_eq!(report_previous.boundary_evaluations, 0);
+            assert_eq!(
+                report_previous.total_model_evaluations,
+                (expected_p0_evals + expected_p1_evals) as u32
+            );
+            assert_eq!(
+                report_previous
+                    .estimate_provenance
+                    .retained_primary_estimate_bytes,
+                256 * 64 * 2
+            );
+
+            let run_policy = |req: &GenerationRequest, plan: &gen_core::RenderPlan| {
+                let trace = RefCell::new(Vec::<(usize, u32, u32, usize, u32)>::new());
+                let mut progress = Vec::new();
+                let run = RenderRun::new(plan, &req.cancel, None);
+                run.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+                let out = run
+                    .images_with_denoise_phases(
+                        &mut |p| progress.push(p),
+                        |_| Ok::<_, candle_gen::CandleError>(state_low.img.clone()),
+                        |seed, lat, prog| {
+                            execute_candle_flux_denoise_trajectory(
+                                &run,
+                                req,
+                                seed,
+                                lat,
+                                prog,
+                                |x_in, step_idx, timestep, _guidance, pw, ph| {
+                                    trace.borrow_mut().push((
+                                        step_idx,
+                                        pw,
+                                        ph,
+                                        x_in.dim(1)?,
+                                        timestep.to_bits(),
+                                    ));
+                                    Ok((x_in * 0.15)?)
+                                },
+                            )
+                        },
+                        |_, lat, _| Ok(lat),
+                    )
+                    .unwrap()
+                    .remove(0);
+                let vec_out: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+                (vec_out, trace.into_inner(), progress)
+            };
+
+            let (out_ep, trace_ep, prog_ep) = run_policy(&req_endpoint, &plan_endpoint);
+            let (out_pr, trace_pr, prog_pr) = run_policy(&req_previous, &plan_previous);
+
+            assert_eq!(out_ep.len(), 1024 * 64);
+            assert_eq!(out_pr.len(), 1024 * 64);
+            assert!(out_ep.iter().all(|v| v.is_finite()));
+            assert!(out_pr.iter().all(|v| v.is_finite()));
+            assert_ne!(
+                out_ep, out_pr,
+                "{sampler_name}: EndpointEvaluation and PreviousEvaluation must produce distinct trajectories"
+            );
+            assert_eq!(prog_ep, prog_pr);
+            assert_eq!(
+                &trace_ep[..expected_p0_evals],
+                &trace_pr[..expected_p0_evals],
+                "{sampler_name}: Phase-0 evaluations must be bit-identical between EndpointEvaluation and PreviousEvaluation"
+            );
+            assert_eq!(trace_ep.len(), expected_p0_evals + 1 + expected_p1_evals);
+            assert_eq!(trace_pr.len(), expected_p0_evals + expected_p1_evals);
+        }
     }
 }

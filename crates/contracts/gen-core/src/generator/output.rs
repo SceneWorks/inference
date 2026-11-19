@@ -144,6 +144,11 @@ pub struct GenerationReport {
     /// `total_steps`, `scale`, `adaptive_scale`, `start`, `stop`), when PAG ran or was reported
     /// (SW-7173). `None` for non-PAG renders and providers without PAG reporting.
     pub pag: Option<crate::PagExecutionReport>,
+    /// Persisted execution receipt for the two-phase low-resolution start recipe (`recipe_id`,
+    /// `version`, `k`, `executed_steps`, `scale`, `(low_w, low_h) -> (full_w, full_h)`,
+    /// `estimator`, `estimate_provenance`, `transition_arithmetic_id`, `transition_seed_derivation_id`,
+    /// and evaluation accounting) when active (`SW-6940`: `FEAT-1`, `PIPE-3`, `PIPE-4`, `PERF-3`, `E3`).
+    pub low_res_start: Option<crate::LowResStartExecutionReport>,
 }
 
 impl GenerationReport {
@@ -156,6 +161,7 @@ impl GenerationReport {
             warnings: Vec::new(),
             prefix_kv_cache: None,
             pag: None,
+            low_res_start: None,
         }
     }
 }
