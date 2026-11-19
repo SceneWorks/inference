@@ -592,9 +592,11 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
         canary = (
             CANDLE_GEN / CUDA_CANARY_CRATE / "tests" / f"{CUDA_CANARY_TARGET}.rs"
         ).read_text(encoding="utf-8")
+        # `testkit` too (SW-7197): the canary imports `candle_gen::testkit`, and the `windows-cuda`
+        # step builds `-p "candle-gen*"`, whose provider dev-dependencies unify `testkit` on.
         self.assertEqual(
             file_level_cfgs(canary),
-            ['feature = "cuda"'],
+            ['all(feature = "cuda", feature = "testkit")'],
             "the sc-7544 canary's header prose is being counted as extra file-level cfgs",
         )
 
