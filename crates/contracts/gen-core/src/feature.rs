@@ -6466,5 +6466,82 @@ mod tests {
                 layers: vec![14, 28],
             })
         );
+
+        // - Unmigrated route (supports_low_res_start == false) rejects source_image at Capabilities::validate_request.
+        let source_img_req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            source_image: Some(Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            unmigrated_desc
+                .capabilities
+                .validate_request(unmigrated_desc.id, &source_img_req),
+            Err(Error::Unsupported(ref msg)) if msg.contains("source_image is not supported")
+        ));
+
+        // - MultiPassRenderPlan preserves source_image on later passes that have no produced_reference.
+        let mut migrated_desc = flux_desc();
+        migrated_desc.capabilities.supports_low_res_start = true;
+        let pass0_plain = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            ..Default::default()
+        };
+        let pass1_img2img = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            source_image: Some(Image {
+                width: 16,
+                height: 16,
+                pixels: vec![7; 16 * 16 * 3],
+            }),
+            strength: Some(0.5),
+            ..Default::default()
+        };
+        let mp_img2img = crate::MultiPassRenderPlan::compile(
+            &[
+                crate::PlannedPassRequest {
+                    request: &pass0_plain,
+                    produced_reference: None,
+                },
+                crate::PlannedPassRequest {
+                    request: &pass1_img2img,
+                    produced_reference: None,
+                },
+            ],
+            |r| {
+                RenderPlan::base_image(
+                    &migrated_desc,
+                    r,
+                    crate::render::PackedImagePass {
+                        pixel_stride: 16,
+                        token_width: 64,
+                        sampler: "euler",
+                        guidance: 3.5,
+                        sigmas: vec![1.0, 0.75, 0.5, 0.25, 0.0],
+                        executed_steps: 4,
+                        capture_sigma: 0.0,
+                    },
+                )
+                .map(Some)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mp_img2img.passes()[1]
+            .check_request(&migrated_desc, &pass1_img2img)
+            .is_ok());
     }
 }

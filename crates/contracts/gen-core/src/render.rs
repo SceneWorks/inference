@@ -461,7 +461,6 @@ impl RenderPlan {
         let mut live = ImageInputs::try_from(req)?;
         if self.pass_index > 0 {
             live.low_res_start = None;
-            live.source_image = None;
         }
         if let PackedImageConditioning::ProducedReference {
             from_pass,
@@ -470,6 +469,7 @@ impl RenderPlan {
             strength_bits,
         } = &self.inputs.conditioning
         {
+            live.source_image = None;
             // The produced image is bound by shape and strength: its bytes come from the earlier
             // pass and cannot be digested before load.
             match &live.conditioning {

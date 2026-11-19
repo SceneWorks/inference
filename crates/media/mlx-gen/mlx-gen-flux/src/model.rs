@@ -1466,7 +1466,7 @@ pub fn execute_flux_denoise_trajectory(
     }
 
     let mut transition_cb =
-        |phase: usize,
+        |_phase: usize,
          boundary_step: usize,
          ops: &mlx_gen::MlxLatentOps,
          ms: &dyn gen_core::sampling::ModelSampling,
@@ -1515,7 +1515,7 @@ pub fn execute_flux_denoise_trajectory(
                 base_seed,
                 output_index,
                 pass_index,
-                phase,
+                0,
             )?;
             state.note_geometry_change(
                 (low_res_plan.low_width, low_res_plan.low_height),
@@ -1839,6 +1839,12 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     }
     caps.resolve_pag(desc.id, req)?;
     if let Some(source) = &req.source_image {
+        if !desc.capabilities.supports_low_res_start {
+            return Err(Error::Unsupported(format!(
+                "{}: source_image is not supported by this model route",
+                desc.id
+            )));
+        }
         if has_reference || !req.conditioning.is_empty() {
             return Err(Error::Unsupported(format!(
                 "{}: source_image cannot be combined with pass-0 reference/control conditioning",

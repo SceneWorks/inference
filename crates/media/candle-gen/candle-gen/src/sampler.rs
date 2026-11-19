@@ -415,7 +415,7 @@ pub fn run_curated_sampler_with_phase_transition_spans(
                             base_seed,
                             output_index,
                             pass_index,
-                            phase,
+                            0,
                         )
                         .map_err(CandleError::from)?;
                         let full_tokens = ((low_res_plan.full_height as usize)

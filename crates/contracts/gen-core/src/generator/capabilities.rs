@@ -1540,6 +1540,11 @@ impl Capabilities {
             }
         }
         if let Some(source) = &req.source_image {
+            if !self.supports_low_res_start {
+                return Err(Error::Unsupported(format!(
+                    "{id}: source_image is not supported by this model route"
+                )));
+            }
             let expected = u64::from(source.width)
                 .checked_mul(u64::from(source.height))
                 .and_then(|p| p.checked_mul(3))

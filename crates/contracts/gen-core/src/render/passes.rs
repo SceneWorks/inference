@@ -58,7 +58,6 @@ impl MultiPassRenderPlan {
                     if index > 0 && pass.request.low_res_start.is_some() {
                         let mut stripped = pass.request.clone();
                         stripped.low_res_start = None;
-                        stripped.source_image = None;
                         compile(&stripped)?
                     } else {
                         compile(pass.request)?
