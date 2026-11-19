@@ -32,20 +32,19 @@ readonly WAN_SNAPSHOT="$MLX_GEN_MODELS_ROOT/models--SceneWorks--krea-realtime-14
 readonly KREA_TIER="$KREA_SNAPSHOT/q4"
 readonly WAN_VAE="$WAN_SNAPSHOT/q8/vae.safetensors"
 
-if [[ "${KREA_TURBO_DIR:?workflow must export the q4 manifest projection}" != */model-snapshots/krea-2-turbo-mlx-q4/$KREA_REVISION ]]; then
+if [[ "${KREA_TURBO_DIR:?workflow must export the q4 manifest projection}" != */models--SceneWorks--krea-2-turbo-mlx/snapshots/$KREA_REVISION ]]; then
   echo "KREA_TURBO_DIR was not exported from the pinned q4 manifest row: $KREA_TURBO_DIR" >&2
   exit 1
 fi
 if [[ \
   "${KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT:?workflow must export the Wan donor manifest projection}" \
-  != */model-snapshots/krea-realtime-14b-mlx-wan-z16-vae-q8/$WAN_REVISION \
+  != */models--SceneWorks--krea-realtime-14b-mlx/snapshots/$WAN_REVISION \
 ]]; then
   echo "Wan donor path was not exported from its pinned manifest row: $KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT" >&2
   exit 1
 fi
 # The manifest exporter binds the selected key/revision to the workflow policy. This smoke consumes
-# the immutable copy already resident in the canonical HF cache rather than materializing a second
-# ~20 GiB q4 tier into RUNNER_TEMP.
+# the immutable copy already resident in the canonical HF cache `MLX_GEN_MODELS_ROOT` names.
 export KREA_TURBO_DIR="$KREA_TIER"
 
 # The manifest checks bind the complete q4 base and the workflow-provisioned standalone q8 donor to

@@ -1,5 +1,5 @@
 python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-# The lane binds a task-owned persistent cache before this step. Record the actual filesystem.
+# The snapshots live in the runner's persistent Hugging Face cache. Record the actual filesystem.
 hub_real="$(cd "$MLX_GEN_MODELS_ROOT" && pwd -P)"
 df -h "$hub_real"
 echo "persistent hub $MLX_GEN_MODELS_ROOT -> $hub_real" > "$QWEN_IMAGE_2_1_RENDER_OUT/snapshot-location.txt"
