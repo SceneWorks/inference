@@ -86,9 +86,8 @@ function Measure-CudaPeak([string[]]$Arguments, [string]$Stdout, [string]$Stderr
     }
     $peak[$index] = $mib
   }
-  if ($peak.Count -eq 0) {
-    throw "nvidia-smi sampler took no sample"
-  }
+  # No sample (cargo exited before the job's runspace started) leaves every GPU at its baseline,
+  # so the caller still prints cargo's logs and checks its exit code before judging the probe.
   $gpu = -1
   $delta = 0
   $per = @()
