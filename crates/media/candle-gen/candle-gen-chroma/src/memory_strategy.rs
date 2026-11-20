@@ -1787,6 +1787,7 @@ fn estimated_behavior_context(
 ) -> gen_core::Result<MemoryRunContext> {
     Ok(MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
         // sc-22731: the handshake half is the contract's OWN identity, whatever it is — the empty

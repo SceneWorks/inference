@@ -110,6 +110,7 @@ pub fn registered_fixture(
         }
         let context = MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             selection,
             optimization_authority: MemoryOptimizationAuthority::Estimated,
             calibration_abi: calibration.map_or(0, |c| c.abi),

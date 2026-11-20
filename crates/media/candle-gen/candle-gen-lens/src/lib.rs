@@ -4502,6 +4502,7 @@ mod integration_tests {
         };
         let mut context = gen_core::MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,

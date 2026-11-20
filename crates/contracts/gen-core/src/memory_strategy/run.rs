@@ -47,6 +47,10 @@ pub struct MemoryRunContext {
     pub cache_state: MemoryCacheState,
     /// Caller-facing identity of the exact evidence record selected for this request.
     pub evidence_revision: String,
+    /// Optional `low_res_start` transition pricing attachment (`SW-7216`). Stored in its own typed
+    /// `Copy` field so iOS admission (`ios_admission.rs`) can rewrite `evidence_revision` without
+    /// discarding the caller's transition posture or admitted low-res plan.
+    pub low_res_start: Option<MemoryLowResStartContext>,
 }
 
 impl MemoryRunContext {
@@ -107,71 +111,53 @@ impl MemoryRunContext {
 
     /// Set or clear the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
     pub fn set_low_res_start(&mut self, low_res: Option<MemoryLowResStartContext>) {
-        let base = self.base_evidence_revision().to_owned();
-        self.evidence_revision = match low_res {
-            Some(ctx) => {
-                let id = intern_low_res_start_context(ctx);
-                format!("{base}{LOW_RES_CONTEXT_MARKER}{id}")
-            }
-            None => base,
-        };
+        self.low_res_start = low_res;
     }
 
     /// Retrieve the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
     pub fn low_res_start(&self) -> Option<MemoryLowResStartContext> {
-        let (_, tail) = self.evidence_revision.rsplit_once(LOW_RES_CONTEXT_MARKER)?;
-        let id: usize = tail.parse().ok()?;
-        lookup_low_res_start_context(id)
+        self.low_res_start
     }
 
     /// Retrieve the resolved [`crate::ResolvedLowResStartPlan`] attached to this context, if any (`SW-7216`).
     pub fn low_res_start_plan(&self) -> Option<crate::ResolvedLowResStartPlan> {
-        self.low_res_start().and_then(|ctx| ctx.plan)
-    }
-
-    /// Return `evidence_revision` with any internal `low_res_start` context tag stripped.
-    pub fn base_evidence_revision(&self) -> &str {
-        match self.evidence_revision.rsplit_once(LOW_RES_CONTEXT_MARKER) {
-            Some((base, tail)) if tail.parse::<usize>().is_ok() => base,
-            _ => self.evidence_revision.as_str(),
-        }
+        self.low_res_start.and_then(|ctx| ctx.plan)
     }
 }
 
-const LOW_RES_CONTEXT_MARKER: &str = "#low_res_start=";
-
 /// Optional `low_res_start` transition pricing attachment for [`MemoryRunContext`] (`SW-7216`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct MemoryLowResStartContext {
     pub plan: Option<crate::ResolvedLowResStartPlan>,
     pub evidence_basis: EvidencePeakBasis,
     pub posture: LowResTransitionPricingPosture,
 }
 
-fn low_res_context_table() -> &'static std::sync::Mutex<Vec<MemoryLowResStartContext>> {
-    static TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<MemoryLowResStartContext>>> =
-        std::sync::OnceLock::new();
-    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-fn intern_low_res_start_context(ctx: MemoryLowResStartContext) -> usize {
-    let mut guard = low_res_context_table()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(pos) = guard.iter().position(|existing| existing == &ctx) {
-        return pos;
+impl PartialEq for MemoryLowResStartContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.evidence_basis == other.evidence_basis
+            && self.posture == other.posture
+            && match (&self.plan, &other.plan) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.version == b.version
+                        && a.k == b.k
+                        && a.executed_steps == b.executed_steps
+                        && a.scale.to_bits() == b.scale.to_bits()
+                        && a.legal_quantum == b.legal_quantum
+                        && a.min_dim == b.min_dim
+                        && a.low_width == b.low_width
+                        && a.low_height == b.low_height
+                        && a.full_width == b.full_width
+                        && a.full_height == b.full_height
+                        && a.estimate_source == b.estimate_source
+                }
+                _ => false,
+            }
     }
-    let id = guard.len();
-    guard.push(ctx);
-    id
 }
 
-fn lookup_low_res_start_context(id: usize) -> Option<MemoryLowResStartContext> {
-    let guard = low_res_context_table()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.get(id).cloned()
-}
+impl Eq for MemoryLowResStartContext {}
 
 /// Build a deterministic, finite, weights-free context from provider-owned route facts.
 pub struct MemoryBehaviorRoute {
@@ -223,6 +209,7 @@ pub fn standard_memory_behavior_context(
         predicted_peak_bytes: 1024 * 1024 * 1024,
         cache_state: MemoryCacheState::Cold,
         evidence_revision: "weights-free-provider-behavior".to_owned(),
+        low_res_start: None,
     })
 }
 

@@ -173,6 +173,7 @@ fn admit(
     let geometry = wan_i2v_memory::geometry_from_request(request);
     MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         selection,
         optimization_authority: if strategy.is_optimized() {
             MemoryOptimizationAuthority::Estimated

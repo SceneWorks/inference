@@ -623,17 +623,17 @@ fn native_route_gate(
         )));
     }
     if let Some(low_res_ctx) = context.low_res_start() {
-        let variant = crate::Variant::from_model_id(provider_id).ok_or_else(|| {
-            gen_core::Error::Unsupported(format!(
-                "{provider_id}: low_res_start is only supported on base FLUX.1 routes"
-            ))
-        })?;
-        if context.geometry.reference_count > 0 || context.overlay.is_some() {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: low_res_start cannot be combined with reference or control conditioning"
-            )));
-        }
         if let Some(plan) = &low_res_ctx.plan {
+            let variant = crate::Variant::from_model_id(provider_id).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{provider_id}: low_res_start is only supported on base FLUX.1 routes"
+                ))
+            })?;
+            if context.geometry.reference_count > 0 || context.overlay.is_some() {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{provider_id}: low_res_start cannot be combined with reference or control conditioning"
+                )));
+            }
             if plan.full_width != context.geometry.width
                 || plan.full_height != context.geometry.height
             {
@@ -645,17 +645,17 @@ fn native_route_gate(
                     context.geometry.height
                 )));
             }
+            evaluate_candle_flux1_low_res_admission(
+                variant,
+                context.predicted_peak_bytes,
+                low_res_ctx.evidence_basis,
+                context.budget,
+                Some(plan),
+                context.geometry.batch,
+                &low_res_ctx.posture,
+            )
+            .map_err(|refusal| gen_core::Error::Unsupported(refusal.to_string()))?;
         }
-        evaluate_candle_flux1_low_res_admission(
-            variant,
-            context.predicted_peak_bytes,
-            low_res_ctx.evidence_basis,
-            context.budget,
-            low_res_ctx.plan.as_ref(),
-            context.geometry.batch,
-            &low_res_ctx.posture,
-        )
-        .map_err(|refusal| gen_core::Error::Unsupported(refusal.to_string()))?;
     }
     Ok(())
 }
@@ -705,6 +705,7 @@ pub(crate) struct FluxMemoryScope {
     provider_id: &'static str,
     device: Device,
     geometry: MemoryGeometry,
+    has_overlay: bool,
     memory: Option<GenerationMemory>,
     transformer_window: Option<u32>,
     use_pid: bool,
@@ -726,6 +727,7 @@ impl FluxMemoryScope {
             provider_id,
             device,
             geometry: context.geometry,
+            has_overlay: context.overlay.is_some(),
             memory: contract.generation_memory(&context.selection),
             transformer_window: contract
                 .engages(
@@ -763,6 +765,12 @@ impl FluxMemoryScope {
                 self.provider_id
             ))
         })?;
+        if self.geometry.reference_count > 0 || self.has_overlay {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: low_res_start cannot be combined with reference or control conditioning",
+                self.provider_id
+            )));
+        }
         let sigmas = crate::pipeline::base_schedule(variant, request)?;
         let executed_steps = sigmas.len().saturating_sub(1);
         let resolved_plan = spec.resolve_for_descriptor(
@@ -780,7 +788,7 @@ impl FluxMemoryScope {
             }
         }
         let (evidence_basis, posture) = match &self.low_res_context {
-            Some(ctx) => (ctx.evidence_basis, ctx.posture.clone()),
+            Some(ctx) => (ctx.evidence_basis, ctx.posture),
             None => (
                 gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES,
                 gen_core::LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
@@ -2067,11 +2075,14 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // 3. UnqualifiedRealEvidence posture: ordinary T2I is admitted, low_res_start is refused fail-closed:
+        // 3. UnqualifiedRealEvidence posture: ordinary T2I is admitted, low_res_start is refused fail-closed,
+        // even after evidence_revision is overwritten:
         let mut unqualified_posture_ctx = fixture.context.clone().with_low_res_start_posture(
             basis,
             gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
         );
+        unqualified_posture_ctx.evidence_revision =
+            "ios-device-anchor:rewritten-revision".to_owned();
         unqualified_posture_ctx.budget = gen_core::MemoryBudget {
             total_bytes: 24 * 1024 * 1024 * 1024,
             committed_bytes: 0,
@@ -2104,5 +2115,82 @@ mod tests {
                 .contains("low_res_start refused fail-closed before load"),
             "unexpected error: {err}"
         );
+
+        // 4. Posture-only context (`plan: None`) on an ordinary control-conditioned route
+        // (`overlay: Some("control")`) is accepted by safety_check and configure_request when the
+        // request is ordinary, and refused only when a plan is attached or the request enables
+        // low_res_start:
+        let control_spec = spec
+            .clone()
+            .with_control(WeightsSource::File("/tmp/flux-control.safetensors".into()));
+        let control_contract = provider_contract(crate::FLUX1_DEV_ID, &control_spec).unwrap();
+        let mut control_fixture = registered_valid_fixture(
+            &control_spec,
+            &control_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .remove(0);
+        control_fixture.context.overlay = Some("control".to_owned());
+        control_fixture.context.has_reference = true;
+        control_fixture.context.geometry.reference_count = 1;
+        control_fixture.request.conditioning = vec![gen_core::Conditioning::Control {
+            image: gen_core::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            },
+            kind: gen_core::ControlKind::Pose,
+            scale: Some(1.0),
+        }];
+        control_fixture.context = control_fixture.context.with_low_res_start_posture(
+            basis,
+            gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        );
+        assert_eq!(
+            registered_safety_check(&control_spec, &control_contract, &control_fixture.context),
+            MemorySafetyDecision::Accept,
+            "ordinary control-conditioned context with posture-only attachment must pass safety_check"
+        );
+        let mut control_scope = registered_begin_request(
+            crate::FLUX1_DEV_ID,
+            &control_spec,
+            &control_contract,
+            &control_fixture.context,
+        )
+        .unwrap()
+        .unwrap();
+        let mut ordinary_control_req = control_fixture.request.clone();
+        control_scope
+            .configure_request(&mut ordinary_control_req)
+            .expect(
+                "ordinary control request with posture-only context must pass configure_request",
+            );
+        let mut low_res_control_req = control_fixture.request.clone();
+        low_res_control_req.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+        let control_err = control_scope
+            .configure_request(&mut low_res_control_req)
+            .expect_err(
+                "control request enabling low_res_start must be refused at configure_request",
+            );
+        assert!(
+            control_err.to_string().contains(
+                "low_res_start cannot be combined with reference or control conditioning"
+            ),
+            "unexpected error: {control_err}"
+        );
+        let plan_attached_control_ctx = control_fixture
+            .context
+            .clone()
+            .with_low_res_start_plan(low_res);
+        assert!(matches!(
+            registered_safety_check(
+                &control_spec,
+                &control_contract,
+                &plan_attached_control_ctx
+            ),
+            MemorySafetyDecision::Reject { ref reason }
+                if reason.contains("low_res_start cannot be combined with reference or control conditioning")
+        ));
     }
 }

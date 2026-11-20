@@ -385,6 +385,7 @@ mod cpu_tests {
                 reference_count: 1,
             },
             reference_resources: None,
+            low_res_start: None,
             overlay: None,
             budget: MemoryBudget {
                 total_bytes: 10_000_000_000,

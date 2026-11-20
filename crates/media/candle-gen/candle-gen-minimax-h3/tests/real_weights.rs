@@ -3189,6 +3189,7 @@ fn image_t2i_renders_16mp_streamed_on_cuda() {
         let calibration = contract.calibration.clone().expect("calibration identity");
         let context_for = |selection, predicted| MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             selection,
             optimization_authority: MemoryOptimizationAuthority::Estimated,
             calibration_abi: calibration.abi,

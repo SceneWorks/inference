@@ -877,7 +877,7 @@ impl LowResTransitionSixBufferCeiling {
 ///    evaluation at `sigma_K` (when `EstimateSource::EndpointEvaluation` is active) executes at
 ///    `(low_w, low_h)` before the 6-buffer fp32 resize/renoise allocations and is therefore bounded
 ///    within the ordinary full-grid forward peak.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LowResTransitionCoverageTrace {
     pub ordinary_t2i_peak_bytes: u64,
     pub evidence_basis: EvidencePeakBasis,
@@ -922,7 +922,7 @@ impl LowResTransitionCoverageTrace {
 }
 
 /// Posture for pricing a `low_res_start` request against an ordinary T2I evidence cell (`§6.12`, `E4`, `SW-6941`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LowResTransitionPricingPosture {
     /// Conditional / bounded-increment mode (`§6.12` exact-fit / one-byte-under witness):
     /// ordinary peak coverage, retained buffers, snapshot, and endpoint workspace are bounded within
