@@ -780,7 +780,7 @@ impl PddHeads {
         }
         let mut mixed: Option<Array> = None;
         for &(k, w) in mix {
-            let term = multiply(&self.select(k)?.forward(rows)?, &Array::from_f32(w))?;
+            let term = multiply(&self.select(k)?.forward(rows)?, Array::from_f32(w))?;
             mixed = Some(match mixed {
                 None => term,
                 Some(acc) => add(&acc, &term)?,
