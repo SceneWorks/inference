@@ -2128,6 +2128,7 @@ mod tests {
         let calibration = contract.calibration.clone().unwrap();
         MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             selection: gen_core::MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

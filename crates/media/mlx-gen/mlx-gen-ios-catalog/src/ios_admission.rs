@@ -1600,6 +1600,7 @@ fn source_context_clone(
         context.budget,
         context.predicted_peak_bytes,
         context.cache_state,
+        context.low_res_start,
     ));
     let MemoryRunContext {
         selection: _,
@@ -1618,6 +1619,7 @@ fn source_context_clone(
         predicted_peak_bytes: _,
         cache_state: _,
         evidence_revision,
+        low_res_start: _,
     } = context;
     let mode_bytes = match mode {
         MemoryMode::TextToImage | MemoryMode::ImageToImage | MemoryMode::Edit => 0,
@@ -3329,6 +3331,10 @@ mod guarded_clone_tests {
             conditioning_tokens: 4096,
             prepared_canvases: vec![(512, 512), (768, 512), (1024, 1024)],
         });
+        context = context.with_low_res_start_posture(
+            mlx_gen::gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES,
+            mlx_gen::gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        );
         let bill = Cell::new(0);
         let mut next = |bytes| {
             bill.set(bytes);

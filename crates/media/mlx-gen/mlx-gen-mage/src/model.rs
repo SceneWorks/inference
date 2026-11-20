@@ -2833,6 +2833,7 @@ mod tests {
             .round() as u64;
         let valid = MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
@@ -3038,6 +3039,7 @@ mod tests {
         let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         let context = MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection,
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,

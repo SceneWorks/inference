@@ -622,6 +622,41 @@ fn native_route_gate(
             "{provider_id}: PiD cannot consume the native FLUX VAE memory selection"
         )));
     }
+    if let Some(low_res_ctx) = context.low_res_start() {
+        if let Some(plan) = &low_res_ctx.plan {
+            let variant = crate::Variant::from_model_id(provider_id).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{provider_id}: low_res_start is only supported on base FLUX.1 routes"
+                ))
+            })?;
+            if context.geometry.reference_count > 0 || context.overlay.is_some() {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{provider_id}: low_res_start cannot be combined with reference or control conditioning"
+                )));
+            }
+            if plan.full_width != context.geometry.width
+                || plan.full_height != context.geometry.height
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{provider_id}: low_res_start plan full geometry {}x{} does not match admitted {}x{}",
+                    plan.full_width,
+                    plan.full_height,
+                    context.geometry.width,
+                    context.geometry.height
+                )));
+            }
+            evaluate_candle_flux1_low_res_admission(
+                variant,
+                context.predicted_peak_bytes,
+                low_res_ctx.evidence_basis,
+                context.budget,
+                Some(plan),
+                context.geometry.batch,
+                &low_res_ctx.posture,
+            )
+            .map_err(|refusal| gen_core::Error::Unsupported(refusal.to_string()))?;
+        }
+    }
     Ok(())
 }
 
@@ -670,9 +705,13 @@ pub(crate) struct FluxMemoryScope {
     provider_id: &'static str,
     device: Device,
     geometry: MemoryGeometry,
+    has_overlay: bool,
     memory: Option<GenerationMemory>,
     transformer_window: Option<u32>,
     use_pid: bool,
+    budget: gen_core::MemoryBudget,
+    predicted_peak_bytes: u64,
+    low_res_context: Option<gen_core::MemoryLowResStartContext>,
     finished: bool,
     recorded_render_phases: Vec<(MemoryPhase, gen_core::render::RenderPhaseIdentity)>,
 }
@@ -688,6 +727,7 @@ impl FluxMemoryScope {
             provider_id,
             device,
             geometry: context.geometry,
+            has_overlay: context.overlay.is_some(),
             memory: contract.generation_memory(&context.selection),
             transformer_window: contract
                 .engages(
@@ -697,9 +737,74 @@ impl FluxMemoryScope {
                 .then_some(context.selection.parameters.transformer_window_size)
                 .flatten(),
             use_pid: context.use_pid,
+            budget: context.budget,
+            predicted_peak_bytes: context.predicted_peak_bytes,
+            low_res_context: context.low_res_start(),
             finished: false,
             recorded_render_phases: Vec::new(),
         }
+    }
+
+    fn validate_request_low_res_start(&self, request: &GenerationRequest) -> gen_core::Result<()> {
+        let admitted_plan = self
+            .low_res_context
+            .as_ref()
+            .and_then(|ctx| ctx.plan.as_ref());
+        let Some(spec) = &request.low_res_start else {
+            if admitted_plan.is_some() {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: request low_res_start plan changed after memory admission",
+                    self.provider_id
+                )));
+            }
+            return Ok(());
+        };
+        let variant = crate::Variant::from_model_id(self.provider_id).ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{}: low_res_start is only supported on base FLUX.1 routes",
+                self.provider_id
+            ))
+        })?;
+        if self.geometry.reference_count > 0 || self.has_overlay {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: low_res_start cannot be combined with reference or control conditioning",
+                self.provider_id
+            )));
+        }
+        let sigmas = crate::pipeline::base_schedule(variant, request)?;
+        let executed_steps = sigmas.len().saturating_sub(1);
+        let resolved_plan = spec.resolve_for_descriptor(
+            &crate::descriptor_for(variant),
+            request,
+            executed_steps,
+            crate::SIZE_MULTIPLE,
+        )?;
+        if let Some(expected_plan) = admitted_plan {
+            if &resolved_plan != expected_plan {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: request low_res_start plan changed after memory admission",
+                    self.provider_id
+                )));
+            }
+        }
+        let (evidence_basis, posture) = match &self.low_res_context {
+            Some(ctx) => (ctx.evidence_basis, ctx.posture),
+            None => (
+                gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES,
+                gen_core::LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+            ),
+        };
+        evaluate_candle_flux1_low_res_admission(
+            variant,
+            self.predicted_peak_bytes,
+            evidence_basis,
+            self.budget,
+            Some(&resolved_plan),
+            self.geometry.batch,
+            &posture,
+        )
+        .map_err(|refusal| gen_core::Error::Unsupported(refusal.to_string()))?;
+        Ok(())
     }
 
     /// Recorded `(MemoryPhase, RenderPhaseIdentity)` entries observed by this scope (`MEM-5`).
@@ -778,6 +883,7 @@ impl MemoryRequestScope for FluxMemoryScope {
                 self.provider_id
             )));
         }
+        self.validate_request_low_res_start(request)?;
         request.memory = self.memory;
         Ok(())
     }
@@ -1883,5 +1989,208 @@ mod tests {
                 (MemoryPhase::Decode, 0, 0, 1024, 1024),
             ]
         );
+    }
+
+    #[test]
+    fn sw_7216_registered_safety_check_and_configure_request_enforce_low_res_transition_pricing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let contract = provider_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        let mut fixture = registered_valid_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        fixture.context.selection.parameters.transformer_window_size = Some(1);
+        fixture.context.predicted_peak_bytes =
+            gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES;
+        fixture.request.prompt = "sw-7216 admission pricing".into();
+        fixture.request.width = 1024;
+        fixture.request.height = 1024;
+        fixture.request.steps = Some(8);
+        fixture.request.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+
+        let plan = crate::compile_base_plan(crate::Variant::Dev, &fixture.request).unwrap();
+        let low_res = *plan.low_res_start().expect("low_res_start resolved");
+        let basis = gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES;
+
+        // 1. Exact fit at 17,655,793,562 B admits through both registered_safety_check and configure_request:
+        let mut exact_ctx = fixture.context.clone().with_low_res_start_plan(low_res);
+        exact_ctx.budget = gen_core::MemoryBudget {
+            total_bytes: gen_core::CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &exact_ctx),
+            MemorySafetyDecision::Accept
+        );
+        let mut exact_scope =
+            registered_begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &exact_ctx)
+                .unwrap()
+                .unwrap();
+        let mut exact_req = fixture.request.clone();
+        exact_scope.configure_request(&mut exact_req).unwrap();
+
+        // 2. One byte under (17,655,793,561 B): ordinary T2I (17,651,074,970 B) still admits,
+        // but low_res_start is refused by BOTH registered_safety_check (when bound on context)
+        // AND FluxMemoryScope::configure_request (even when context was admitted as ordinary T2I):
+        let mut one_under_t2i_ctx = fixture.context.clone();
+        one_under_t2i_ctx.budget = gen_core::MemoryBudget {
+            total_bytes: gen_core::CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES - 1,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &one_under_t2i_ctx),
+            MemorySafetyDecision::Accept,
+            "ordinary T2I at 17,651,074,970 B fits 17,655,793,561 B"
+        );
+        let one_under_low_res_ctx = one_under_t2i_ctx.clone().with_low_res_start_plan(low_res);
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &one_under_low_res_ctx),
+            MemorySafetyDecision::Reject { ref reason } if reason.contains("17655793562 B exceeds effective budget 17655793561 B by 1 B")
+        ));
+        let mut one_under_scope =
+            registered_begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &one_under_t2i_ctx)
+                .unwrap()
+                .unwrap();
+        let mut ordinary_req = fixture.request.clone();
+        ordinary_req.low_res_start = None;
+        one_under_scope
+            .configure_request(&mut ordinary_req)
+            .expect("ordinary T2I configure_request must succeed");
+        let mut low_res_req = fixture.request.clone();
+        let err = one_under_scope
+            .configure_request(&mut low_res_req)
+            .expect_err("configure_request must refuse 1-byte-under low_res_start transition");
+        assert!(
+            err.to_string()
+                .contains("17655793562 B exceeds effective budget 17655793561 B by 1 B"),
+            "unexpected error: {err}"
+        );
+
+        // 3. UnqualifiedRealEvidence posture: ordinary T2I is admitted, low_res_start is refused fail-closed,
+        // even after evidence_revision is overwritten:
+        let mut unqualified_posture_ctx = fixture.context.clone().with_low_res_start_posture(
+            basis,
+            gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        );
+        unqualified_posture_ctx.evidence_revision =
+            "ios-device-anchor:rewritten-revision".to_owned();
+        unqualified_posture_ctx.budget = gen_core::MemoryBudget {
+            total_bytes: 24 * 1024 * 1024 * 1024,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &unqualified_posture_ctx),
+            MemorySafetyDecision::Accept
+        );
+        let mut unqualified_scope = registered_begin_request(
+            crate::FLUX1_DEV_ID,
+            &spec,
+            &contract,
+            &unqualified_posture_ctx,
+        )
+        .unwrap()
+        .unwrap();
+        let mut ordinary_req = fixture.request.clone();
+        ordinary_req.low_res_start = None;
+        unqualified_scope
+            .configure_request(&mut ordinary_req)
+            .expect("ordinary T2I under UnqualifiedRealEvidence must succeed");
+        let mut low_res_req = fixture.request.clone();
+        let err = unqualified_scope
+            .configure_request(&mut low_res_req)
+            .expect_err("low_res_start under UnqualifiedRealEvidence must refuse fail-closed");
+        assert!(
+            err.to_string()
+                .contains("low_res_start refused fail-closed before load"),
+            "unexpected error: {err}"
+        );
+
+        // 4. Posture-only context (`plan: None`) on an ordinary control-conditioned route
+        // (`overlay: Some("control")`) is accepted by safety_check and configure_request when the
+        // request is ordinary, and refused only when a plan is attached or the request enables
+        // low_res_start:
+        let control_spec = spec
+            .clone()
+            .with_control(WeightsSource::File("/tmp/flux-control.safetensors".into()));
+        let control_contract = provider_contract(crate::FLUX1_DEV_ID, &control_spec).unwrap();
+        let mut control_fixture = registered_valid_fixture(
+            &control_spec,
+            &control_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .remove(0);
+        control_fixture.context.overlay = Some("control".to_owned());
+        control_fixture.context.has_reference = true;
+        control_fixture.context.geometry.reference_count = 1;
+        control_fixture.request.conditioning = vec![gen_core::Conditioning::Control {
+            image: gen_core::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            },
+            kind: gen_core::ControlKind::Pose,
+            scale: Some(1.0),
+        }];
+        control_fixture.context = control_fixture.context.with_low_res_start_posture(
+            basis,
+            gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        );
+        assert_eq!(
+            registered_safety_check(&control_spec, &control_contract, &control_fixture.context),
+            MemorySafetyDecision::Accept,
+            "ordinary control-conditioned context with posture-only attachment must pass safety_check"
+        );
+        let mut control_scope = registered_begin_request(
+            crate::FLUX1_DEV_ID,
+            &control_spec,
+            &control_contract,
+            &control_fixture.context,
+        )
+        .unwrap()
+        .unwrap();
+        let mut ordinary_control_req = control_fixture.request.clone();
+        control_scope
+            .configure_request(&mut ordinary_control_req)
+            .expect(
+                "ordinary control request with posture-only context must pass configure_request",
+            );
+        let mut low_res_control_req = control_fixture.request.clone();
+        low_res_control_req.low_res_start = Some(gen_core::LowResStartSpec::new(4, Some(0.5)));
+        let control_err = control_scope
+            .configure_request(&mut low_res_control_req)
+            .expect_err(
+                "control request enabling low_res_start must be refused at configure_request",
+            );
+        assert!(
+            control_err.to_string().contains(
+                "low_res_start cannot be combined with reference or control conditioning"
+            ),
+            "unexpected error: {control_err}"
+        );
+        let plan_attached_control_ctx = control_fixture
+            .context
+            .clone()
+            .with_low_res_start_plan(low_res);
+        assert!(matches!(
+            registered_safety_check(
+                &control_spec,
+                &control_contract,
+                &plan_attached_control_ctx
+            ),
+            MemorySafetyDecision::Reject { ref reason }
+                if reason.contains("low_res_start cannot be combined with reference or control conditioning")
+        ));
     }
 }

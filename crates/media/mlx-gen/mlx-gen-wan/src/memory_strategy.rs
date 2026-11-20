@@ -2076,6 +2076,7 @@ mod tests {
         assert!(matches!(
             loaded.memory_strategy_safety_check(&MemoryRunContext {
                 reference_resources: None,
+                low_res_start: None,
                 // This probe asserts the Sequential route declares no contract at all, so the
                 // authority value is inert here; Calibrated matches every other provider's
                 // weights-free safety-check context.

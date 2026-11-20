@@ -330,6 +330,7 @@ pub(super) fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunCo
     let calibration = contract.calibration.as_ref().expect("calibration");
     MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         selection: MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: MemoryStrategyParameters::default(),

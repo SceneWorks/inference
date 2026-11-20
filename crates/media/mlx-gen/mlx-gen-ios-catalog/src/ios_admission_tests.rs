@@ -1451,3 +1451,91 @@ fn actual_output_cardinality_is_checked_never_clamped_or_promoted_from_zero() {
     request.prompt_batch.clear();
     assert_eq!(generation_batch(&request).unwrap(), u32::MAX);
 }
+
+#[test]
+fn ios_admission_carries_explicit_low_res_posture_into_request_configuration() {
+    use mlx_gen::gen_core::MemoryRequestScope;
+
+    let registry = crate::provider_registry().unwrap();
+    let root = crate::sdxl::tests::fixture();
+    let mut candidate =
+        crate::sdxl::tests::candidate(&registry, root.path(), "sdxl", 512, None, "text_to_image");
+    let basis = mlx_gen::gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES;
+    candidate.context = candidate.context.with_low_res_start_posture(
+        basis,
+        mlx_gen::gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+    );
+    let rows = [row(&registry, &candidate, 1 << 20)];
+    let receipt = admit_with_rows(
+        &registry,
+        std::slice::from_ref(&candidate),
+        DEVICE,
+        budget(),
+        &rows,
+    )
+    .expect("iOS admission must succeed for ordinary candidate with posture attachment");
+    assert!(
+        receipt
+            .context
+            .evidence_revision
+            .starts_with("ios-device-anchor:"),
+        "iOS admission must overwrite evidence_revision: {}",
+        receipt.context.evidence_revision
+    );
+    assert_eq!(
+        receipt.context.low_res_start(),
+        Some(mlx_gen::gen_core::MemoryLowResStartContext {
+            plan: None,
+            evidence_basis: basis,
+            posture: mlx_gen::gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        }),
+        "iOS admission must preserve typed low_res_start posture across evidence_revision rewrite"
+    );
+
+    let admitted_context = receipt.context.clone();
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+        "sdxl",
+        receipt.context.geometry,
+        None,
+        false,
+        1,
+        |_, _, _| Ok(()),
+    )
+    .unwrap();
+    config.set_request_validator(move |req| {
+        if req.low_res_start.is_some() {
+            if let Some(low_res) = admitted_context.low_res_start() {
+                if low_res.posture
+                    == mlx_gen::gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence
+                {
+                    return Err(mlx_gen::gen_core::Error::Unsupported(
+                        "low_res_start refused under UnqualifiedRealEvidence posture carried through iOS admission"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    });
+    let mut scope = mlx_gen::request_scope::MlxRequestScopeCore::new(config);
+    let mut ordinary = GenerationRequest {
+        width: 512,
+        height: 512,
+        count: 1,
+        ..Default::default()
+    };
+    scope
+        .configure_request(&mut ordinary)
+        .expect("ordinary request without low_res_start remains admitted");
+    let mut low_res_req = GenerationRequest {
+        width: 512,
+        height: 512,
+        count: 1,
+        low_res_start: Some(mlx_gen::gen_core::LowResStartSpec::new(1, Some(0.5))),
+        ..Default::default()
+    };
+    let err = scope
+        .configure_request(&mut low_res_req)
+        .expect_err("configure_request must enforce UnqualifiedRealEvidence posture preserved across iOS admission");
+    assert!(err.to_string().contains("UnqualifiedRealEvidence"), "{err}");
+}

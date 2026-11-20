@@ -2579,6 +2579,7 @@ mod tests {
         let tier = model.memory_numeric_tier.expect("loaded numeric tier");
         MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
@@ -2950,6 +2951,7 @@ mod tests {
         let calibration = contract.calibration.as_ref().expect("Dev calibration");
         MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,

@@ -14,6 +14,7 @@ use crate::gen_core::{
 use std::cell::RefCell;
 
 type DecodeValidator = Box<dyn Fn(bool, u32, u32) -> Result<()> + 'static>;
+type RequestValidator = Box<dyn Fn(&GenerationRequest) -> Result<()> + 'static>;
 type CleanupAction = Box<dyn FnMut() -> Result<()> + 'static>;
 
 /// Whether a decode-quality row carries a well-formed forensic source stamp.
@@ -70,6 +71,7 @@ pub struct MlxRequestScopeConfig {
     /// The layer count read from the provider's model configuration.
     pub transformer_blocks: u32,
     pub decode_validator: DecodeValidator,
+    request_validator: Option<RequestValidator>,
     decode_authorization: Option<GeometryDecodeAuthorization>,
 }
 
@@ -98,8 +100,19 @@ impl MlxRequestScopeConfig {
             transformer_window: None,
             transformer_blocks,
             decode_validator: Box::new(decode_validator),
+            request_validator: None,
             decode_authorization: None,
         })
+    }
+
+    /// Install an additional provider-owned request validator evaluated during
+    /// [`MlxRequestScopeCore::configure_request`] and
+    /// [`MlxRequestScopeCore::configure_admitted_request`] (`SW-7216`).
+    pub fn set_request_validator(
+        &mut self,
+        validator: impl Fn(&GenerationRequest) -> Result<()> + 'static,
+    ) {
+        self.request_validator = Some(Box::new(validator));
     }
 
     /// Bind the exact policy row admitted by the shared safety gate to this request scope. The
@@ -418,6 +431,9 @@ impl MlxRequestScopeCore {
                 self.config.geometry.frames,
                 self.config.geometry.reference_count
             )));
+        }
+        if let Some(validator) = &self.config.request_validator {
+            validator(request)?;
         }
         Ok(())
     }

@@ -2453,6 +2453,8 @@ mod tests {
 
     fn context(provider: &str, strategy: MemoryStrategy) -> MemoryRunContext {
         MemoryRunContext {
+            low_res_start: None,
+
             reference_resources: None,
             selection: MemorySelection {
                 strategy,

@@ -848,6 +848,8 @@ mod tests {
         tier: MemoryNumericTier,
     ) -> MemoryRunContext {
         MemoryRunContext {
+            low_res_start: None,
+
             reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated,
             selection: MemorySelection {

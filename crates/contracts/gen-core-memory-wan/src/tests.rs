@@ -1372,6 +1372,8 @@ fn context(
     evidence_revision: String,
 ) -> MemoryRunContext {
     MemoryRunContext {
+        low_res_start: None,
+
         reference_resources: None,
         selection,
         optimization_authority: if selection.strategy.is_optimized() {

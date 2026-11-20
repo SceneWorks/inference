@@ -1642,6 +1642,8 @@ mod tests {
 
     fn rung_four_context() -> MemoryRunContext {
         MemoryRunContext {
+            low_res_start: None,
+
             reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {

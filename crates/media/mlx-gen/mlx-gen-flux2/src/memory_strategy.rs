@@ -610,6 +610,7 @@ fn dev_control_fixture(
 ) -> mlx_gen::gen_core::Result<MemoryBehaviorFixture> {
     let context = MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         selection: contract.representative_selection(strategy, tier, false)?,
         // The control route intentionally has no measured calibration.  Its staged lifecycle is
         // admitted under the explicit conservative estimate class, never a borrowed Dev/Edit key.
@@ -1531,6 +1532,7 @@ mod tests {
         let bytes = |gb: f64| (gb * 1024.0 * 1024.0 * 1024.0).round() as u64;
         MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,

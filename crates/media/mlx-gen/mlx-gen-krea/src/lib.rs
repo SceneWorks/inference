@@ -893,6 +893,7 @@ mod explicit_registry_tests {
 
         let context = mlx_gen::gen_core::MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: mlx_gen::gen_core::MemorySelection {
                 strategy: mlx_gen::gen_core::MemoryStrategy::BoundedDecode,
