@@ -582,7 +582,7 @@ impl SpeculativeTarget for Qwen35Model {
         inputs: &TreeInputs,
         want_hidden: bool,
     ) -> Result<TargetOutput> {
-        let plan = std::sync::Arc::new(crate::primitives::gated_delta::TreePlan::new(
+        let plan = std::sync::Arc::new(crate::primitives::gated_delta::TreePlan::from_parents(
             &inputs.parents,
         ));
         let (logits, hidden) = Qwen35Model::forward_tree(
@@ -1386,7 +1386,8 @@ pub trait Proposer<T: SpeculativeTarget + ?Sized> {
     /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
     /// before the next [`propose`](Self::propose). The default does nothing — right for a
     /// proposer whose state is the history alone (n-gram) or that [`commit`](Self::commit)
-    /// advances on a step without a proposal (`draft_model`, which `auto` never resolves to).
+    /// advances on a step without a proposal (a block draft; `draft_model`, which `auto` never
+    /// resolves to).
     fn catch_up(
         &mut self,
         _target: &T,

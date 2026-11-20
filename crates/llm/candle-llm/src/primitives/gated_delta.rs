@@ -783,70 +783,14 @@ fn depthwise_conv_traced(
 // Tree verification (feature SW-F328, story SW-6915).
 // ---------------------------------------------------------------------------------------------
 
-/// The shape of one tree verify forward as the DeltaNet layers see it: each row's parent row
-/// (`None` for the anchor, row `0`) and its depth below the anchor. Rows are topologically
-/// ordered (a parent precedes its children).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreePlan {
-    /// The parent row of every row; `parents[0]` is `None`.
-    pub parents: Vec<Option<usize>>,
-    /// Every row's depth below the anchor.
-    pub depths: Vec<usize>,
-}
+pub use core_llm::TreePlan;
 
-impl TreePlan {
-    /// The plan of `tree`'s rows (the anchor, then every candidate).
-    pub fn new(tree: &core_llm::DraftTree) -> Self {
-        let mut parents = vec![None];
-        let mut depths = vec![0];
-        for node in tree.nodes() {
-            depths.push(depths[node.parent] + 1);
-            parents.push(Some(node.parent));
-        }
-        Self { parents, depths }
-    }
-
-    /// Rows, the anchor included.
-    pub fn rows(&self) -> usize {
-        self.parents.len()
-    }
-
-    /// The short conv's input rows for every tree row: `windows[r][j]` indexes
-    /// `[conv_state ‖ tree rows]` (`K - 1 + rows` rows) with the row tap `j` (`0` the oldest) of
-    /// row `r` reads — the row itself for the newest tap, then its ancestors, then the pre-step
-    /// conv history once the branch above the anchor runs out. A chain gives exactly the linear
-    /// conv's contiguous windows.
-    pub fn conv_windows(&self, k: usize) -> Vec<Vec<u32>> {
-        let tail = k - 1;
-        (0..self.rows())
-            .map(|r| {
-                let mut back = Vec::with_capacity(k); // newest first
-                let mut at = Some(r);
-                for m in 0..k {
-                    match at {
-                        Some(row) => {
-                            back.push((tail + row) as u32);
-                            at = self.parents[row];
-                        }
-                        // `m - depth - 1` rows into the history before the anchor.
-                        None => back.push((tail + self.depths[r] - m) as u32),
-                    }
-                }
-                back.reverse();
-                back
-            })
-            .collect()
-    }
-
-    /// Rows grouped by depth, shallowest first, each group in row order.
-    fn levels(&self) -> Vec<Vec<usize>> {
-        let max = self.depths.iter().copied().max().unwrap_or(0);
-        let mut levels = vec![Vec::new(); max + 1];
-        for (r, &d) in self.depths.iter().enumerate() {
-            levels[d].push(r);
-        }
-        levels
-    }
+/// [`TreePlan::conv_windows`] as the tensor index type the tree conv gathers with.
+pub fn tree_conv_windows(plan: &TreePlan, k: usize) -> Vec<Vec<u32>> {
+    plan.conv_windows(k)
+        .into_iter()
+        .map(|w| w.into_iter().map(|i| i as u32).collect())
+        .collect()
 }
 
 /// [`causal_depthwise_conv_traced`] over a verify **tree**: each row convolves its own branch
@@ -3086,7 +3030,7 @@ mod tests {
         for r in 0..3 {
             chain.push(r, 1, None).unwrap();
         }
-        let windows = TreePlan::new(&chain).conv_windows(4);
+        let windows = tree_conv_windows(&TreePlan::new(&chain), 4);
         let linear: Vec<Vec<u32>> = (0..4u32).map(|s| (s..s + 4).collect()).collect();
         assert_eq!(windows, linear);
         let mut tree = core_llm::DraftTree::new();
@@ -3125,7 +3069,7 @@ mod tests {
         let before = live(&cache);
         let (q, k, v, g, beta, x) = &fixture;
         let picked = [3u32, 4, 5, 6];
-        let windows = plan.conv_windows(RK);
+        let windows = tree_conv_windows(&plan, RK);
         let conv_state = cache.conv_state().unwrap().clone();
         let (_out, cat) =
             tree_depthwise_conv(&rows(x, &picked), &weight, &conv_state, &windows).unwrap();

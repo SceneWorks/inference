@@ -36,8 +36,8 @@ use crate::primitives::attention::{
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv_traced, compute_g, rms_norm_gated, tree_depthwise_conv, DeltaNetCache,
-    RingSpec, TreePlan,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, tree_conv_windows,
+    tree_depthwise_conv, DeltaNetCache, RingSpec, TreePlan,
 };
 mod mhc;
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
@@ -546,7 +546,7 @@ impl GatedDeltaNet {
                 return Err(Error::Unsupported(SENSENOVA_TREE_UNSUPPORTED.into()))
             }
             Some(plan) => {
-                let windows = plan.conv_windows(self.conv_kernel);
+                let windows = tree_conv_windows(plan, self.conv_kernel);
                 let (out, cat) =
                     tree_depthwise_conv(&mixed, &self.conv_weight, &conv_state, &windows)?;
                 (out, Err((cat, windows)))

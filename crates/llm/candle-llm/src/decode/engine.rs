@@ -448,9 +448,11 @@ pub trait Proposer {
     /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
     /// paired with its predecessor's target hidden row in `preceding_hidden`
     /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
-    /// before the next [`propose`](Self::propose). The default does nothing — right for a
-    /// proposer whose state is the history alone (n-gram); `draft_model` is never probed (`auto`
-    /// never resolves to it).
+    /// before the next [`propose`](Self::propose). Each probe step was also
+    /// [`commit`](Self::commit)ted (no drafts, its row in `kept_hidden`). The default does
+    /// nothing — right for a proposer whose state is the history alone (n-gram) or that
+    /// [`commit`](Self::commit) keeps current on a step without a proposal (a block draft);
+    /// `draft_model` is never probed (`auto` never resolves to it).
     fn catch_up(
         &mut self,
         _tokens: &[i32],
@@ -2549,6 +2551,178 @@ mod tests {
             assert_ne!(legacy.output.tokens[0], expected.output.tokens[0]);
             assert_eq!(config.sampling.presence_penalty_prompt_len, 999);
         }
+    }
+
+    /// A [`Ramp`] that also returns hidden rows `[1, n, 1]`, each holding its own position — so a
+    /// proposer can check which positions' rows it was handed.
+    struct PositionRows(Ramp);
+    impl StepModel for PositionRows {
+        type Cache = RampCache;
+        fn new_cache(&self) -> RampCache {
+            self.0.new_cache()
+        }
+        fn device(&self) -> &Device {
+            self.0.device()
+        }
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn forward_step(
+            &self,
+            cache: &mut RampCache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            let (start, n, want) = (cache.len, request.len()?, request.want_hidden);
+            let mut out = self.0.forward_step(cache, request)?;
+            if want {
+                let rows: Vec<f32> = (0..n).map(|i| (start + i as i32) as f32).collect();
+                out.hidden = Some(Tensor::from_vec(rows, (1, n, 1), &Device::Cpu)?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// A proposer keeping a block draft's context (SW-7197): the target rows of every position,
+    /// appended under [`BlockDraftProposer`](crate::decode::BlockDraftProposer)'s own continuity
+    /// rule ([`context_continuation`](crate::decode::block_draft::context_continuation)) from the
+    /// warm-up and each commit, and checked to end at the anchor at every proposal. It proposes
+    /// [`Ramp`]'s own continuation. `replay_probe` replays the probe's rows in `catch_up` — the
+    /// double append the proposer once made.
+    struct ContextRows {
+        vocab: i32,
+        positions: Vec<i32>,
+        proposals: usize,
+        replay_probe: bool,
+    }
+
+    impl ContextRows {
+        fn append(&mut self, rows: &Tensor, first: i32) -> Result<()> {
+            let next = self.positions.last().map_or(first, |&p| p + 1);
+            let rows: Vec<f32> = rows.flatten_all()?.to_vec1()?;
+            let skip = crate::decode::block_draft::context_continuation(next, first, rows.len())?;
+            for (i, &row) in rows.iter().enumerate().skip(skip) {
+                assert_eq!(row as i32, first + i as i32, "the row of its own position");
+                self.positions.push(row as i32);
+            }
+            Ok(())
+        }
+    }
+
+    impl Proposer for ContextRows {
+        fn kind(&self) -> ProposerKind {
+            ProposerKind::BlockDraft
+        }
+        fn wants_hidden(&self) -> bool {
+            true
+        }
+        fn warm(&mut self, prompt: &[i32], hidden: Option<&Tensor>) -> Result<()> {
+            let hidden = hidden.expect("tapped prompt rows");
+            self.append(hidden, (prompt.len() - hidden.dim(1)?) as i32)
+        }
+        fn propose(
+            &mut self,
+            ctx: &ProposeContext<'_>,
+            _: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            assert_eq!(
+                self.positions.last().map(|p| p + 1),
+                Some(ctx.position),
+                "the context ends at the anchor"
+            );
+            self.proposals += 1;
+            let drafts = (1..=ctx.max_drafts as i32)
+                .map(|i| (ctx.position + i) % self.vocab)
+                .collect();
+            Ok(Proposal {
+                drafts: Some(Drafts::Host(drafts)),
+                dists: Vec::new(),
+            })
+        }
+        fn commit(
+            &mut self,
+            _: i32,
+            _: &[i32],
+            rows: Option<&Tensor>,
+            position: i32,
+        ) -> Result<()> {
+            self.append(rows.expect("a committed step's rows"), position - 1)
+        }
+        fn catch_up(&mut self, _: &[i32], rows: Option<&Tensor>, position: i32) -> Result<()> {
+            if self.replay_probe {
+                self.append(rows.expect("the probe's rows"), position - 1)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// PR #1485 review 3: under `auto` on a timed clock the engine runs a plain probe before the
+    /// first proposal, and commits every probe step — with its row — to the proposer. A block
+    /// draft's context is therefore current when the first proposal comes: the run proposes past
+    /// the probe with every position's row held exactly once, and replaying the probe's rows on
+    /// top (the proposer's former `catch_up`) is refused as a discontinuous append.
+    #[test]
+    fn a_block_draft_context_needs_no_catch_up_after_the_auto_probe() {
+        let model = PositionRows(Ramp {
+            vocab: 16,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        });
+        let budget = core_llm::PLAIN_PROBE_MAX_STEPS as usize + 12;
+        let config = greedy(budget);
+        let expected = run(&model, &mut NoProposer, &PROMPT, &config, 0)
+            .output
+            .tokens;
+        let mut proposer = ContextRows {
+            vocab: 16,
+            positions: Vec::new(),
+            proposals: 0,
+            replay_probe: false,
+        };
+        let run = timed_run(&model, &mut proposer, &config, 3, 1.0);
+        assert_eq!(run.output.tokens, expected);
+        assert!(proposer.proposals > 0, "proposals past the probe");
+        assert_eq!(run.record.speculative_demoted_at, None);
+        // Every committed position's row, once and in order: the prompt's, then each step's.
+        let fed = (PROMPT.len() + run.output.tokens.len() - 1) as i32;
+        assert_eq!(proposer.positions, (0..fed).collect::<Vec<_>>());
+
+        let mut replaying = ContextRows {
+            vocab: 16,
+            positions: Vec::new(),
+            proposals: 0,
+            replay_probe: true,
+        };
+        let clock = std::rc::Rc::new(StepClock::default());
+        let timed = Timed {
+            inner: &model,
+            clock: clock.clone(),
+            plain: std::time::Duration::from_millis(10),
+            ratio: 1.0,
+        };
+        let refused = core_llm::with_decode_clock(Some(clock), || {
+            generate_speculative_monitored(
+                &timed,
+                &mut replaying,
+                SpeculativePrompt::Tokens(&PROMPT),
+                &config,
+                3,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                AUTO,
+                0,
+            )
+        });
+        let Err(err) = refused else {
+            panic!("a replayed probe is refused")
+        };
+        assert!(
+            err.to_string().contains("do not continue a context"),
+            "{err}"
+        );
+        assert_eq!(replaying.proposals, 0, "refused before the first proposal");
     }
 
     /// A [`Ramp`] whose every forward records one fused primitive leaf and one NVFP4 decode-GEMV

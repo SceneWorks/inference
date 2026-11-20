@@ -131,7 +131,7 @@ impl SpeculativeTarget for TappedQwen35<'_> {
         if !want_hidden {
             return SpeculativeTarget::forward_tree(self.model, cache, inputs, false);
         }
-        let plan = std::sync::Arc::new(crate::primitives::gated_delta::TreePlan::new(
+        let plan = std::sync::Arc::new(crate::primitives::gated_delta::TreePlan::from_parents(
             &inputs.parents,
         ));
         let (logits, hidden) = self.model.forward_tree_tapped(

@@ -2447,3 +2447,78 @@ fn greedy_image_prompt_lookup_tree_is_the_plain_loop() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::greedy_image_prompt_lookup_tree_is_the_plain_loop");
 }
+
+/// A decode clock that moves 10 ms whenever it is read, so `auto`'s acceptance monitor is timed
+/// and runs its plain probe.
+#[derive(Default)]
+struct TickClock(std::cell::Cell<std::time::Duration>);
+
+impl core_llm::DecodeClock for TickClock {
+    fn now(&self) -> std::time::Duration {
+        let now = self.0.get() + std::time::Duration::from_millis(10);
+        self.0.set(now);
+        now
+    }
+}
+
+/// PR #1485 review 3: under `auto` on a timed clock the engine runs a plain probe before the
+/// first proposal and commits every probe step to the proposer, so the block draft's context is
+/// current when it first proposes. For each format the run proposes past the probe and commits
+/// exactly the plain loop's tokens — the proposer no longer replays the probe's rows, which
+/// refused the run ("rows ... do not continue a context") before its first proposal.
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn an_auto_block_draft_proposes_past_the_plain_probe() {
+    let (_guard, device) = proof_device();
+    let model = tiny_target_on(&device, true);
+    let budget = core_llm::PLAIN_PROBE_MAX_STEPS as usize + 12;
+    let cfg = config(budget, 7);
+    let expected = plain(&model, &PROMPT, &cfg, None);
+    for (format, draft) in tiny_drafts(Some(BlockDraftPrecision::Q8), &device) {
+        let target = TappedQwen35::for_draft(&model, &draft);
+        let stepper = GraphRunner::new(&target);
+        let mut cache = stepper.new_cache_for(PROMPT.len() + budget, 3).unwrap();
+        let out = stepper
+            .forward_step(
+                &mut cache,
+                StepRequest::last(&PROMPT).with_hidden(true).as_prefill(),
+            )
+            .unwrap();
+        let mut proposer = BlockDraftProposer::new(&draft, &model);
+        let clock = std::rc::Rc::new(TickClock::default());
+        let run = core_llm::with_decode_clock(Some(clock), || {
+            generate_speculative_monitored(
+                &stepper,
+                &mut proposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits: out.logits,
+                    hidden: out.hidden,
+                    history: &PROMPT,
+                    position_delta: 0,
+                    warm_proposer: true,
+                },
+                &cfg,
+                3,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                core_llm::Speculative::Auto,
+                0,
+            )
+        })
+        .unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        assert_eq!(run.output.tokens, expected.tokens, "{format:?}");
+        assert!(
+            proposer.draft_forwards > 0,
+            "{format:?}: proposed past the probe"
+        );
+        let committed = PROMPT.len() + run.output.tokens.len() - 1;
+        assert_eq!(cache.offset() as usize, committed, "{format:?}");
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::block_draft::tests::an_auto_block_draft_proposes_past_the_plain_probe");
+}

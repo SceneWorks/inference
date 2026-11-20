@@ -34,7 +34,7 @@ use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, causal_depthwise_conv_traced_f32_accum, compute_g,
-    rms_norm_gated, tree_depthwise_conv, ConvTrace, DeltaNetCache, TreePlan,
+    rms_norm_gated, tree_conv_windows, tree_depthwise_conv, ConvTrace, DeltaNetCache, TreePlan,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -664,7 +664,7 @@ impl GatedDeltaNet {
         let tree = cache.armed_tree();
         let (conv_out, conv) = match &tree {
             Some(plan) => {
-                let windows = plan.conv_windows(self.conv_kernel);
+                let windows = tree_conv_windows(plan, self.conv_kernel);
                 let (out, cat) = self.precision.convolve_tree(
                     &mixed,
                     &self.conv_weight,

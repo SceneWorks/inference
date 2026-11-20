@@ -194,35 +194,18 @@ impl<'d> BlockDraftProposer<'d> {
         let draft = self.draft;
         let first = first - self.rope_delta;
         let context = self.context_mut()?;
-        let skip = context.next_position() - first;
-        let n = rows.dim(1)? as i32;
-        if skip < 0 || skip > n {
-            return Err(Error::Msg(format!(
-                "BlockDraftProposer: rows from position {first} do not continue a context at {}",
-                context.next_position()
-            )));
-        }
-        let rows = rows.narrow(1, skip as usize, (n - skip) as usize)?;
+        let n = rows.dim(1)?;
+        let skip = context_continuation(context.next_position(), first, n)?;
+        let rows = rows.narrow(1, skip, n - skip)?;
         draft.append_context(context, &rows)
     }
 
     /// One draft block forward for the step `ctx`: stores each scored row's candidates and the
     /// score table, and returns the vocabulary width the rows are drawn over.
     fn run_draft(&mut self, ctx: &ProposeContext<'_>) -> Result<usize> {
-        // The anchor's sequence position.
+        // The anchor's sequence position. Every step the target ran — `auto`'s plain probe
+        // included — committed its row, so the context ends exactly there.
         let position = ctx.position - self.rope_delta;
-        // After steps the target ran without a proposal (`auto`'s probe), the row before `cur`
-        // arrives as the step's previous hidden row.
-        let behind = self
-            .context
-            .as_ref()
-            .is_some_and(|c| c.next_position() < position);
-        if behind {
-            let row = ctx.previous_hidden.ok_or_else(|| {
-                Error::Msg("BlockDraftProposer: no target row before the anchor".into())
-            })?;
-            self.append_from(row, ctx.position - 1)?;
-        }
         let (draft, target) = (self.draft, self.target);
         let cfg = draft.config();
         let depth = ctx.max_drafts.min(cfg.block_size - 1);
@@ -345,19 +328,20 @@ impl Proposer for BlockDraftProposer<'_> {
         self.append_from(rows, position - 1)
     }
 
-    fn catch_up(
-        &mut self,
-        _: &[i32],
-        preceding_hidden: Option<&Tensor>,
-        position: i32,
-    ) -> Result<()> {
-        // Each probed token's predecessor row: positions `position - 1..`.
-        match preceding_hidden {
-            Some(rows) => self.append_from(rows, position - 1),
-            None => Err(Error::Msg(
-                "BlockDraftProposer: no target rows for the probed steps".into(),
-            )),
-        }
+    // No `catch_up`: the engine commits every step to the proposer — `auto`'s plain probe steps
+    // included, each with its row — so the context is current when the first proposal comes,
+    // and replaying the probe's rows would append them twice.
+}
+
+/// How many of `n` target rows starting at sequence position `first` a context ending at `next`
+/// (its next position) already holds: the rows past them continue it. An error when the rows
+/// start past the context's end (a gap) or end before it (rows the context already passed).
+pub(crate) fn context_continuation(next: i32, first: i32, n: usize) -> Result<usize> {
+    match usize::try_from(next - first) {
+        Ok(skip) if skip <= n => Ok(skip),
+        _ => Err(Error::Msg(format!(
+            "BlockDraftProposer: rows from position {first} do not continue a context at {next}"
+        ))),
     }
 }
 
