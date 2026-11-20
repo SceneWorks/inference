@@ -116,6 +116,7 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model::SPRINT_MEMORY_BEHAVIOR_REGISTRATION)
+        .register_render_plan(model::BASE_RENDER_PLAN_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Sana provider catalog.

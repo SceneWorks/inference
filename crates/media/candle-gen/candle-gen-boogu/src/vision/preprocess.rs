@@ -50,20 +50,13 @@ pub fn smart_resize(
     min_pixels: usize,
     max_pixels: usize,
 ) -> (usize, usize) {
-    let (hf, wf, ff) = (height as f64, width as f64, factor as f64);
-    let (minp, maxp) = (min_pixels as f64, max_pixels as f64);
-    let mut h_bar = (hf / ff).round_ties_even() * ff;
-    let mut w_bar = (wf / ff).round_ties_even() * ff;
-    if h_bar * w_bar > maxp {
-        let beta = ((hf * wf) / maxp).sqrt();
-        h_bar = ff.max((hf / beta / ff).floor() * ff);
-        w_bar = ff.max((wf / beta / ff).floor() * ff);
-    } else if h_bar * w_bar < minp {
-        let beta = (minp / (hf * wf)).sqrt();
-        h_bar = (hf * beta / ff).ceil() * ff;
-        w_bar = (wf * beta / ff).ceil() * ff;
-    }
-    (h_bar as usize, w_bar as usize)
+    candle_gen::gen_core::imageops::smart_resize(
+        height.max(1),
+        width.max(1),
+        factor.max(1),
+        min_pixels.max(1),
+        max_pixels.max(1),
+    )
 }
 
 /// Derive the exact smart-resized patch grid and merged-token count without touching image pixels.

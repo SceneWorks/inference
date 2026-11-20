@@ -782,7 +782,7 @@ impl MemoryRequestScope for QwenMemoryScope {
         if request.width != self.geometry.width
             || request.height != self.geometry.height
             || request.count != self.geometry.batch
-            || request.image_reference_count() != self.geometry.reference_count
+            || request.memory_reference_count() != self.geometry.reference_count
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: request geometry {}x{} count {} references={} does not match admitted {}x{} count {} references={}",
@@ -790,7 +790,7 @@ impl MemoryRequestScope for QwenMemoryScope {
                 request.width,
                 request.height,
                 request.count,
-                request.image_reference_count(),
+                request.memory_reference_count(),
                 self.geometry.width,
                 self.geometry.height,
                 self.geometry.batch,

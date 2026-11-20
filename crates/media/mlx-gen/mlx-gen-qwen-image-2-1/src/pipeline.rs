@@ -14,7 +14,9 @@ use gen_core_family::qwen_image_2_1::pag::{pag_perturb_block_flags, pag_step_ind
 use mlx_gen::gen_core::sampling::TimestepConvention;
 use mlx_gen::gen_core::PagResolved;
 use mlx_gen::image::{decoded_to_image, decoded_to_rgba_image};
-use mlx_gen::sampler::{run_flow_sampler, SamplerRun};
+use mlx_gen::sampler::{
+    run_flow_sampler_with_phase_transition_spans, MlxLatentOps, MlxPhaseTransitionFn, SamplerRun,
+};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, GenerationRequest, Image, Progress, Result, RgbaImage};
@@ -583,15 +585,32 @@ pub fn denoise_reported_with_pag(
     report: &mut DenoiseReport,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_reported_with_pag_and_run(inputs, pag, None, report, on_progress)
+}
+
+/// [`denoise_reported_with_pag`] with optional [`mlx_gen::gen_core::RenderRun`] for two-phase `low_res_start`.
+pub fn denoise_reported_with_pag_and_run(
+    inputs: DenoiseInputs<'_>,
+    pag: Option<&PagResolved>,
+    run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    report: &mut DenoiseReport,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     let (h, w) = latent_grid(inputs.width, inputs.height);
     let grid = (h as usize, w as usize);
+    let (p0_w, p0_h) = run
+        .map(|r| r.plan().phase_output_size(0))
+        .unwrap_or((inputs.width, inputs.height));
+    let p0_grid = {
+        let (lh, lw) = latent_grid(p0_w, p0_h);
+        (lh as usize, lw as usize)
+    };
     let transformer = inputs.transformer;
     let scale = inputs.true_cfg_scale;
     let references = inputs.references.as_ref();
     let total_steps = inputs.sigmas.len().saturating_sub(1);
     let num_blocks = transformer.num_blocks();
     let sampler_name = inputs.sampler;
-    let mut eval_idx = 0usize;
     // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
     let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
     mlx_gen::image_execution::policy_debug("qwen-image-2-1.kv_cached", &cached);
@@ -608,35 +627,70 @@ pub fn denoise_reported_with_pag(
         },
         ..DenoiseReport::default()
     };
-    let mut positive = BranchRun {
-        kind: PromptBranch::Positive,
-        text: inputs.prompt_embeds,
-        conditioned: references.map(|c| (c.latents, c.layout)),
-        cache: None,
-    };
-    let mut negative = inputs.negative_embeds.map(|text| BranchRun {
-        kind: PromptBranch::Negative,
-        text,
-        conditioned: references.and_then(|c| c.negative_layout.map(|layout| (c.latents, layout))),
-        cache: None,
+    struct SharedPredictState<'a, 'r> {
+        positive: BranchRun<'a>,
+        negative: Option<BranchRun<'a>>,
+        eval_idx: usize,
+        last_grid: Option<(usize, usize)>,
+        report: &'r mut DenoiseReport,
+    }
+    let state_cell = std::cell::RefCell::new(SharedPredictState {
+        positive: BranchRun {
+            kind: PromptBranch::Positive,
+            text: inputs.prompt_embeds,
+            conditioned: references.map(|c| (c.latents, c.layout)),
+            cache: None,
+        },
+        negative: inputs.negative_embeds.map(|text| BranchRun {
+            kind: PromptBranch::Negative,
+            text,
+            conditioned: references
+                .and_then(|c| c.negative_layout.map(|layout| (c.latents, layout))),
+            cache: None,
+        }),
+        eval_idx: 0,
+        last_grid: None,
+        report,
     });
-    // `move`: the closure owns both branches — and with them their caches — and the sampler
-    // consumes it, so the caches are dropped when the loop returns, whatever the outcome.
-    let predict = move |latents: &Array, sigma: f32| -> Result<Array> {
-        let velocity = positive.evaluate(transformer, cached, latents, sigma, grid, report)?;
+    let eval_step = |latents: &Array, sigma: f32, is_boundary: bool| -> Result<Array> {
+        let mut st = state_cell.borrow_mut();
+        let step_tokens = latents.shape().get(1).copied().unwrap_or(0) as usize;
+        let step_grid = if step_tokens == p0_grid.0 * p0_grid.1 {
+            p0_grid
+        } else {
+            grid
+        };
+        if st.last_grid != Some(step_grid) {
+            st.positive.cache = None;
+            if let Some(neg) = st.negative.as_mut() {
+                neg.cache = None;
+            }
+            st.report.kv_cache_bytes = 0;
+            st.last_grid = Some(step_grid);
+        }
+        let SharedPredictState {
+            positive,
+            negative,
+            eval_idx,
+            report,
+            ..
+        } = &mut *st;
+        let velocity = positive.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
         let has_negative = negative.is_some();
         let guided = match negative.as_mut() {
             Some(negative) => {
                 let uncond =
-                    negative.evaluate(transformer, cached, latents, sigma, grid, report)?;
+                    negative.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
                 // `neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)`
                 let diff = subtract(&velocity, &uncond)?;
                 add(&uncond, &multiply(&diff, Array::from_f32(scale))?)?
             }
             None => velocity.clone(),
         };
-        let current_eval = eval_idx;
-        eval_idx += 1;
+        let current_eval = *eval_idx;
+        if !is_boundary {
+            *eval_idx += 1;
+        }
         let step_idx = pag_step_index_for_eval(sampler_name, current_eval, total_steps);
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
@@ -653,7 +707,7 @@ pub fn denoise_reported_with_pag(
                     cached,
                     latents,
                     sigma,
-                    grid,
+                    step_grid,
                     &perturb_blocks,
                     report,
                 )?;
@@ -666,7 +720,113 @@ pub fn denoise_reported_with_pag(
         }
         Ok(guided)
     };
-    run_flow_sampler(
+    let single_span = 0..total_steps;
+    let plan_spans = run.map(|r| r.plan().denoise_spans());
+    let spans = plan_spans
+        .as_deref()
+        .unwrap_or_else(|| std::slice::from_ref(&single_span));
+    let seed = inputs.seed;
+    let sigmas = inputs.sigmas;
+    let cancel = inputs.cancel;
+    let mut phase_transition =
+        |_phase: usize,
+         boundary_step: usize,
+         ops: &MlxLatentOps,
+         ms: &dyn mlx_gen::gen_core::sampling::ModelSampling,
+         out: &Array,
+         state: &mut mlx_gen::gen_core::sampling::SolverRunState<MlxLatentOps>|
+         -> Result<Array> {
+            let Some(run) = run else {
+                return Ok(out.clone());
+            };
+            let Some(low_res_plan) = run.plan().low_res_start().copied() else {
+                return Ok(out.clone());
+            };
+            if boundary_step != low_res_plan.k {
+                return Ok(out.clone());
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let sigma_k = sigmas[boundary_step];
+            let boundary_state = match low_res_plan.estimate_source {
+                mlx_gen::gen_core::EstimateSource::EndpointEvaluation => {
+                    let x0_low =
+                        mlx_gen::gen_core::sampling::denoise(ops, ms, out, sigma_k, |xin, t| {
+                            eval_step(xin, t, true).map_err(mlx_gen::gen_core::Error::from)
+                        })
+                        .map_err(Error::from)?;
+                    mlx_gen::gen_core::BoundaryState::CleanEstimate {
+                        latent: x0_low,
+                        source: mlx_gen::gen_core::EstimateSource::EndpointEvaluation,
+                    }
+                }
+                mlx_gen::gen_core::EstimateSource::PreviousEvaluation => {
+                    let captured = state
+                        .take_captured_primary_estimate(boundary_step - 1)
+                        .map_err(Error::from)?;
+                    mlx_gen::gen_core::BoundaryState::CleanEstimate {
+                        latent: captured.latent,
+                        source: mlx_gen::gen_core::EstimateSource::PreviousEvaluation,
+                    }
+                }
+            };
+            let (x0_low, source) = boundary_state.into_clean_estimate().map_err(Error::from)?;
+            let target_dtype = x0_low.dtype();
+            let x0_f32 = x0_low.as_dtype(Dtype::Float32)?;
+            mlx_rs::transforms::eval([&x0_f32])?;
+            let low_slice = x0_f32.as_slice::<f32>();
+            let shape = x0_low.shape();
+            let b_sz = shape.first().copied().unwrap_or(1) as usize;
+            let packed_channels = shape.get(2).copied().unwrap_or(64) as usize;
+            let base_seed = run.plan().base_seed();
+            let output_index = seed.wrapping_sub(base_seed) as u32;
+            let pass_index = run.plan().pass_index();
+            let repacked = mlx_gen::gen_core::transition_packed_clean_estimate_f32(
+                mlx_gen::gen_core::BoundaryState::CleanEstimate {
+                    latent: low_slice,
+                    source,
+                },
+                b_sz,
+                packed_channels,
+                1,
+                VAE_SCALE_FACTOR,
+                &low_res_plan,
+                sigma_k,
+                ms,
+                base_seed,
+                output_index,
+                pass_index,
+                0,
+            )
+            .map_err(Error::from)?;
+            let (full_h, full_w) = latent_grid(low_res_plan.full_width, low_res_plan.full_height);
+            let transitioned = Array::from_slice(
+                &repacked,
+                &[b_sz as i32, full_h * full_w, packed_channels as i32],
+            );
+            let next_out = if target_dtype == Dtype::Float32 {
+                transitioned
+            } else {
+                transitioned.as_dtype(target_dtype)?
+            };
+            state.note_geometry_change(
+                (low_res_plan.low_width, low_res_plan.low_height),
+                (low_res_plan.full_width, low_res_plan.full_height),
+            );
+            state.note_renoise_transition();
+            state
+                .apply_phase_boundary(mlx_gen::gen_core::sampling::PhaseBoundary::Reset, true)
+                .map_err(Error::from)?;
+            Ok(next_out)
+        };
+    let on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>> =
+        if run.and_then(|r| r.plan().low_res_start()).is_some() {
+            Some(&mut phase_transition)
+        } else {
+            None
+        };
+    run_flow_sampler_with_phase_transition_spans(
         SamplerRun {
             sampler_name: inputs.sampler,
             sigmas: inputs.sigmas,
@@ -676,7 +836,11 @@ pub fn denoise_reported_with_pag(
         },
         TimestepConvention::Sigma,
         inputs.latents,
-        predict,
+        spans,
+        run,
+        |_, _| {},
+        |latents, sigma| eval_step(latents, sigma, false),
+        on_phase_boundary,
     )
 }
 

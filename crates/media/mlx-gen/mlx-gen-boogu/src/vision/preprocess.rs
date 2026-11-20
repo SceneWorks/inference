@@ -71,19 +71,15 @@ pub fn smart_resize(
     min_pixels: i64,
     max_pixels: i64,
 ) -> (i64, i64) {
-    let (hf, wf, ff) = (height as f64, width as f64, factor as f64);
-    let mut h_bar = py_round(hf / ff) * factor;
-    let mut w_bar = py_round(wf / ff) * factor;
-    if h_bar * w_bar > max_pixels {
-        let beta = ((hf * wf) / max_pixels as f64).sqrt();
-        h_bar = factor.max((hf / beta / ff).floor() as i64 * factor);
-        w_bar = factor.max((wf / beta / ff).floor() as i64 * factor);
-    } else if h_bar * w_bar < min_pixels {
-        let beta = (min_pixels as f64 / (hf * wf)).sqrt();
-        h_bar = (hf * beta / ff).ceil() as i64 * factor;
-        w_bar = (wf * beta / ff).ceil() as i64 * factor;
-    }
-    (h_bar, w_bar)
+    let _ = py_round as fn(f64) -> i64;
+    let (h_bar, w_bar) = mlx_gen::gen_core::imageops::smart_resize(
+        height.max(1) as usize,
+        width.max(1) as usize,
+        factor.max(1) as usize,
+        min_pixels.max(1) as usize,
+        max_pixels.max(1) as usize,
+    );
+    (h_bar as i64, w_bar as i64)
 }
 
 /// Derive the exact smart-resized patch grid and merged-token count without touching the image

@@ -270,6 +270,105 @@ pub(crate) fn denoise_cfg_with_memory(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_cfg_planned_with_memory(
+    transformer: &SanaTransformer,
+    run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+    seed: u64,
+    latents: Array,
+    conditioning: &SanaConditioning,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    plan: crate::transformer::SanaForwardPlan,
+) -> Result<Array> {
+    let cond = &conditioning.cond;
+    let cond_mask = Some(&conditioning.cond_mask);
+    let uncond = conditioning.uncond.as_ref().map(|(u, _)| u);
+    let uncond_mask = conditioning.uncond.as_ref().map(|(_, um)| um);
+    let mut forwards = 0u64;
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        forwards += 1;
+        let rows = x.shape().first().copied().unwrap_or(0) as u64;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::MODEL_ID,
+            "forward_argument",
+            forwards,
+            rows,
+            x,
+        );
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "forward",
+            &[
+                ("evaluation", forwards),
+                ("rows", rows),
+                ("conditioned", 1),
+                (
+                    "guided",
+                    u64::from(uncond.is_some() && guidance_scale > 1.0),
+                ),
+            ],
+        );
+        let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
+        let pred_cond =
+            transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?;
+        match uncond {
+            Some(uc) if guidance_scale > 1.0 => {
+                forwards += 1;
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "forward",
+                    &[
+                        ("evaluation", forwards),
+                        ("rows", rows),
+                        ("conditioned", 0),
+                        ("guided", 1),
+                        (
+                            "held_cond_prediction_dtype",
+                            mlx_gen::sampler::sampling_dtype_code(pred_cond.dtype()),
+                        ),
+                        (
+                            "held_cond_prediction_logical_bytes",
+                            mlx_gen::ios_quantum::bytes(&pred_cond),
+                        ),
+                    ],
+                );
+                let pred_uncond =
+                    transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?;
+                let delta = subtract(&pred_cond, &pred_uncond)?;
+                Ok(add(
+                    &pred_uncond,
+                    &multiply(&delta, Array::from_slice(&[guidance_scale], &[1]))?,
+                )?)
+            }
+            _ => Ok(pred_cond),
+        }
+    };
+    let sigmas = run.plan().denoise_sigmas();
+    let spans = run.plan().denoise_spans();
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    mlx_gen::sampler::run_flow_sampler_with_phase_transition_spans(
+        SamplerRun {
+            sampler_name: Some(run.plan().sampler()),
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
+        TimestepConvention::Sigma,
+        latents,
+        &spans,
+        Some(run),
+        |latents, sigma| {
+            crate::preview::emit_base_preview(preview, &previews, sigmas, sigma, latents);
+        },
+        predict,
+        None,
+    )
+}
+
 /// DC-AE-decode the final `[1, 32, H/32, W/32]` latent → an RGB8 [`Image`]. diffusers
 /// `SanaPipeline` divides by `vae.config.scaling_factor` before decode; the decoder emits NHWC and
 /// [`decoded_to_image`] expects NCHW, so the result is transposed back before the RGB8 conversion.
@@ -1203,6 +1302,8 @@ pub struct SanaGenerateRequest<'a> {
     /// img2img strength ∈ `(0, 1]` (the fork's `init_time_step` convention: higher → start later →
     /// output stays closer to the init image). `None` (or with no `init_image`) = txt2img.
     pub strength: Option<f32>,
+    /// Optional phase-0 output geometry `(width, height)` for two-phase `low_res_start` init encoding.
+    pub phase0_size: Option<(u32, u32)>,
 }
 
 impl<'a> SanaGenerateRequest<'a> {
@@ -1221,6 +1322,7 @@ impl<'a> SanaGenerateRequest<'a> {
             scheduler_shift: None,
             init_image: None,
             strength: None,
+            phase0_size: None,
         }
     }
 }
@@ -1292,12 +1394,13 @@ pub fn prepare_reference_latent(
     let encoder = encoder.ok_or_else(|| {
         Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
     })?;
+    let (encode_w, encode_h) = req.phase0_size.unwrap_or((req.width, req.height));
     let latent = encode_init_latents_with_tiling(
         encoder,
         dc_ae_cfg,
         image,
-        req.width,
-        req.height,
+        encode_w,
+        encode_h,
         cancel,
         encode_tile,
     )?;
@@ -1559,6 +1662,32 @@ impl SanaHeavy {
         preview: &PreviewSink,
         plan: crate::transformer::SanaForwardPlan,
     ) -> Result<Array> {
+        self.denoise_one_with_prepared_reference_and_run(
+            cond,
+            req,
+            guidance,
+            prepared_reference,
+            cancel,
+            on_progress,
+            preview,
+            plan,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one_with_prepared_reference_and_run(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        prepared_reference: Option<&Array>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    ) -> Result<Array> {
         if self.sprint {
             self.denoise_sprint(
                 cond,
@@ -1580,6 +1709,7 @@ impl SanaHeavy {
                 on_progress,
                 preview,
                 plan,
+                run,
             )
         }
     }
@@ -1596,6 +1726,7 @@ impl SanaHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: crate::transformer::SanaForwardPlan,
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
     ) -> Result<Array> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
@@ -1629,17 +1760,26 @@ impl SanaHeavy {
             Some(_) => init_time_step(steps, req.strength),
             None => 0,
         };
-        let noise = create_noise(seed, req.width, req.height)?;
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => req.phase0_size.unwrap_or((req.width, req.height)),
+        };
+        let noise = create_noise(seed, init_w, init_h)?;
         let latents = if start_step > 0 {
             let clean = prepared_reference.ok_or_else(|| {
                 Error::Msg("SANA img2img denoise requires a prepared reference latent".into())
             })?;
-            let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
-                Error::Msg(format!(
-                    "sana img2img: start step {start_step} out of range for {}-element schedule",
-                    scheduler.sigmas.len()
-                ))
-            })?;
+            let sigma = match run {
+                Some(run) => *run.plan().denoise_sigmas().first().ok_or_else(|| {
+                    Error::Msg("sana img2img: planned denoise schedule is empty".into())
+                })?,
+                None => *scheduler.sigmas.get(start_step).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "sana img2img: start step {start_step} out of range for {}-element schedule",
+                        scheduler.sigmas.len()
+                    ))
+                })?,
+            };
             add_noise_by_interpolation(clean, &noise, sigma)?
         } else {
             noise
@@ -1647,6 +1787,20 @@ impl SanaHeavy {
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
         let uncond_mask = cond.uncond.as_ref().map(|(_, um)| um);
+        if let Some(run) = run {
+            return denoise_cfg_planned_with_memory(
+                &self.transformer,
+                run,
+                seed,
+                latents,
+                cond,
+                guidance,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            );
+        }
         let latents = denoise_cfg_with_memory(
             &self.transformer,
             &scheduler,

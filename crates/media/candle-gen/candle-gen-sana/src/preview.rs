@@ -1043,7 +1043,7 @@ mod tests {
         // prepared-reference batch tails, the two public txt2img denoise wrappers, their img2img
         // schedule-tail twins, and the three mask-aware production implementations: every declaration
         // remains line-exact for the same reason as `model.rs` above.
-        assert_eq!(hook_parameters(pipeline), 20);
+        assert_eq!(hook_parameters(pipeline), 22);
 
         // The only hooks shipped `pipeline.rs` builds are the two documented INERT ones in the
         // `generate` convenience wrappers. A hook over anything else there would be a second wiring

@@ -154,11 +154,11 @@ pub use loader::{
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
     create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, denoise_reported,
-    denoise_reported_with_pag, encode_prompt, encode_references, joint_branch, joint_images,
-    joint_layout, missing_vision_tower, pack_latents, prepare_conditioning_references,
-    rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs, DenoiseReport,
-    EvaluationPath, JointBranch, KvCacheMode, KvCachePath, ModelEvaluation, PromptBranch,
-    ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
+    denoise_reported_with_pag, denoise_reported_with_pag_and_run, encode_prompt, encode_references,
+    joint_branch, joint_images, joint_layout, missing_vision_tower, pack_latents,
+    prepare_conditioning_references, rgba_to_rgb_over_white, text_rows, unpack_latents,
+    DenoiseInputs, DenoiseReport, EvaluationPath, JointBranch, KvCacheMode, KvCachePath,
+    ModelEvaluation, PromptBranch, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
 pub use quant::{Tier, GROUP_SIZE};
 pub use reference::{
@@ -334,6 +334,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
                 ),
                 ..gen_core::ExecutionSurface::default()
             },
+            supports_low_res_start: true,
             pag: Some(match variant {
                 Variant::Base => qwen_image_2_1_pag_capability(),
                 Variant::Turbo => qwen_image_2_1_turbo_pag_capability(),
@@ -458,6 +459,28 @@ pub enum Schedule {
     Shifted(SchedulerConfig),
     /// Turbo: the snapshot's saved sigma list ([`scheduler::resample_saved_sigmas`]).
     Saved(SavedSigmaSchedule),
+}
+
+impl Schedule {
+    /// Frozen production schedule for weights-free `RenderPlan` compilation.
+    pub fn production(variant: Variant) -> Self {
+        match variant {
+            Variant::Base => Self::Shifted(SchedulerConfig::production()),
+            Variant::Turbo => Self::Saved(SavedSigmaSchedule {
+                sample_sigmas: vec![
+                    1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568,
+                ],
+                num_train_timesteps: 1000,
+            }),
+        }
+    }
+
+    pub fn default_steps(&self) -> u32 {
+        match self {
+            Self::Shifted(_) => DEFAULT_STEPS,
+            Self::Saved(saved) => saved.default_steps(),
+        }
+    }
 }
 
 fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
@@ -622,8 +645,13 @@ impl Generator for QwenImage21 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request_for(self.variant, &self.descriptor.capabilities, req)
-            .map_err(|error| labelled(self.variant.id(), error.into()))
+        validate_request_with_schedule(
+            self.variant,
+            &self.descriptor.capabilities,
+            &self.schedule,
+            req,
+        )
+        .map_err(|error| labelled(self.variant.id(), error.into()))
     }
 
     fn generate(
@@ -631,9 +659,7 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let report = self
-            .generate_impl(req, on_progress)
-            .map_err(|error| labelled(self.variant.id(), error.into()))?;
+        let report = self.generate_with_report(req, on_progress)?;
         report.output.ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{}: the render produced no output",
@@ -650,8 +676,53 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress)
+        if let Some(plan) = compile_trajectory_for(self.variant, &self.schedule, req)? {
+            let plan = plan.bind_load(&self.spec);
+            return self.generate_planned(req, &plan, None, on_progress);
+        }
+        self.generate_impl(req, None, on_progress)
             .map_err(|error| labelled(self.variant.id(), error.into()))
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        plan.check_request(&self.descriptor, req)
+            .map_err(|error| labelled(self.variant.id(), error))?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.spec))
+            .map_err(|error| labelled(self.variant.id(), error))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let mut report = self
+            .generate_impl(req, Some(&run), on_progress)
+            .map_err(|error| labelled(self.variant.id(), error.into()))?;
+        let slot_cfg = if self.spec.adapters.is_empty() {
+            "base_dit"
+        } else {
+            "base_dit+adapters"
+        };
+        report.low_res_start = plan
+            .low_res_start_execution_report("f32", 4, slot_cfg)
+            .map_err(|error| labelled(self.variant.id(), error))?;
+        Ok(report)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.spec.adapters.len(),
+                "candle-gen-qwen-image-2-1/src/lib.rs",
+            );
+        })
     }
 }
 
@@ -744,6 +815,7 @@ impl QwenImage21 {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
@@ -752,10 +824,13 @@ impl QwenImage21 {
             .capabilities
             .resolve_pag(self.variant.id(), req)?;
         Self::record_pag_policy(resolved_pag.as_ref());
-        let params = match &self.schedule {
+        let mut params = match &self.schedule {
             Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req)?,
             Schedule::Saved(schedule) => resolve_turbo_run_params(schedule, req)?,
         };
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         let actual_steps = params.sigmas.len().saturating_sub(1) as u32;
         candle_gen::execution::policy(
             "qwen21_cfg",
@@ -775,6 +850,9 @@ impl QwenImage21 {
             "qwen-image-2-1/lib/stage_residency",
             format!("{stage_residency:?}").into(),
         );
+        let (phase0_w, phase0_h) = run
+            .map(|r| r.plan().phase_output_size(0))
+            .unwrap_or((req.width, req.height));
         // sc-25905: the prefix KV cache is a request selection; unset is the prefill path.
         let kv_cache = memory_strategy::prefix_kv_cache_for(req);
         // What the denoise loops did, written as they run (one report per image; they agree).
@@ -791,7 +869,19 @@ impl QwenImage21 {
                 // The ordered reference list, host-preprocessed against the snapshot's own
                 // Qwen3-VL processor geometry, encoded into one joint branch per CFG side.
                 // Empty ⇒ the text-to-image route, unchanged.
-                assemble_reference_branches(te, &self.tokenizer, req, drop, params.use_negative)
+                if let Some(run) = run {
+                    run.encode(|| {
+                        assemble_reference_branches(
+                            te,
+                            &self.tokenizer,
+                            req,
+                            drop,
+                            params.use_negative,
+                        )
+                    })
+                } else {
+                    assemble_reference_branches(te, &self.tokenizer, req, drop, params.use_negative)
+                }
             },
             |_| Ok(()),
             |heavy, branches, on_progress| {
@@ -860,6 +950,9 @@ impl QwenImage21 {
                 let reference_latents =
                     crate::pipeline::encode_references(&heavy.vae, &references)?;
                 let conditioned = !references.is_empty();
+                if let Some(run) = run {
+                    run.begin_rendering()?;
+                }
                 // ONE decode per image either way — upstream always decodes four channels and
                 // has no transparency flag — so this branch chooses only whether the alpha is
                 // carried (`Rgba`) or applied over white (`Rgb`, the default). The latents,
@@ -869,11 +962,16 @@ impl QwenImage21 {
                 let mut rgba_images =
                     Vec::with_capacity(if rgba_out { req.count as usize } else { 0 });
                 for i in 0..req.count {
+                    if let Some(run) = run {
+                        run.reset_image_denoise_phases();
+                    }
                     let seed = candle_gen::image_seed(params.base_seed, i);
-                    candle_gen::execution::draw("image_initial_noise", seed, i as usize);
-                    let latents = create_noise(seed, req.width, req.height, channels, &device)?;
+                    if run.is_none() {
+                        candle_gen::execution::draw("image_initial_noise", seed, i as usize);
+                    }
+                    let latents = create_noise(seed, phase0_w, phase0_h, channels, &device)?;
                     let mut report = DenoiseReport::default();
-                    let latents = denoise_reported_with_pag(
+                    let latents = denoise_reported_with_pag_and_run(
                         DenoiseInputs {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
@@ -896,33 +994,48 @@ impl QwenImage21 {
                             kv_cache: loop_mode,
                         },
                         resolved_pag.as_ref(),
+                        run,
                         &mut report,
                         on_progress,
                     )?;
+                    if let Some(run) = run {
+                        run.finish_image_denoise_phases()?;
+                    }
                     ran = Some(observe_prefix_kv_cache(&report, overflow));
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
                     }
-                    if rgba_out {
-                        rgba_images.push(decode_rgba(
-                            &heavy.vae,
-                            &latents,
-                            req.width,
-                            req.height,
-                            tiling.as_ref(),
-                            Some(&req.cancel),
-                        )?);
+                    let mut decode_body = || -> Result<()> {
+                        if rgba_out {
+                            rgba_images.push(decode_rgba(
+                                &heavy.vae,
+                                &latents,
+                                req.width,
+                                req.height,
+                                tiling.as_ref(),
+                                Some(&req.cancel),
+                            )?);
+                        } else {
+                            images.push(decode_rgb(
+                                &heavy.vae,
+                                &latents,
+                                req.width,
+                                req.height,
+                                tiling.as_ref(),
+                                Some(&req.cancel),
+                            )?);
+                        }
+                        Ok(())
+                    };
+                    if let Some(run) = run {
+                        run.decode_phase(decode_body)?;
                     } else {
-                        images.push(decode_rgb(
-                            &heavy.vae,
-                            &latents,
-                            req.width,
-                            req.height,
-                            tiling.as_ref(),
-                            Some(&req.cancel),
-                        )?);
+                        decode_body()?;
                     }
+                }
+                if let Some(run) = run {
+                    run.finish_rendering();
                 }
                 if rgba_out {
                     Ok(GenerationOutput::ImagesRgba(rgba_images))
@@ -998,9 +1111,19 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 /// [`validate_request`] for either registered id. The one variant-specific rule is the step floor:
 /// the base schedule's terminal stretch is undefined at one step, while the Turbo schedule has no
 /// stretch and resamples to any count from 1 (the shared floor already refuses an explicit 0).
+#[cfg(test)]
 pub(crate) fn validate_request_for(
     variant: Variant,
     caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
+    validate_request_with_schedule(variant, caps, &Schedule::production(variant), req)
+}
+
+pub(crate) fn validate_request_with_schedule(
+    variant: Variant,
+    caps: &Capabilities,
+    schedule: &Schedule,
     req: &GenerationRequest,
 ) -> Result<()> {
     // The reference list first, so a caller sees the actionable message (the `Mask` workaround,
@@ -1023,8 +1146,135 @@ pub(crate) fn validate_request_for(
             )));
         }
     }
+    if let Some(low_res) = &req.low_res_start {
+        if !req.conditioning.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{}: low_res_start conflicts with pass-0 reference/edit conditioning",
+                variant.id()
+            )));
+        }
+        let desc = descriptor_for(variant);
+        let executed_steps = req.steps.unwrap_or(schedule.default_steps()) as usize;
+        low_res.resolve_for_descriptor(&desc, req, executed_steps, VAE_SCALE_FACTOR)?;
+    }
     Ok(())
 }
+
+pub fn compile_trajectory_for(
+    variant: Variant,
+    schedule: &Schedule,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let desc = descriptor_for(variant);
+    validate_request_with_schedule(variant, &desc.capabilities, schedule, req)
+        .map_err(|error| labelled(variant.id(), error.into()))?;
+    if req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, gen_core::Conditioning::ReferenceRgba { .. }))
+    {
+        return Ok(None);
+    }
+    let params = match schedule {
+        Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req),
+        Schedule::Saved(saved) => resolve_turbo_run_params(saved, req),
+    }
+    .map_err(|error| labelled(variant.id(), error.into()))?;
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let executed_steps = params.sigmas.len().saturating_sub(1);
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: VAE_SCALE_FACTOR,
+        token_width: TransformerConfig::production().in_channels as u32,
+        sampler: solver.name(),
+        guidance: if params.use_negative {
+            params.true_cfg
+        } else {
+            1.0
+        },
+        sigmas: params.sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    let plan = if req.conditioning.is_empty() {
+        gen_core::RenderPlan::base_image(&desc, req, pass)?
+    } else {
+        gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)?
+    };
+    Ok(Some(plan))
+}
+
+pub(crate) fn validate_plan_load_spec(variant: Variant, spec: &LoadSpec) -> gen_core::Result<()> {
+    gen_core::reject_unknown_components(spec, &[], variant.id())?;
+    if spec.precision != Precision::Bf16 {
+        return Err(gen_core::Error::Unsupported(
+            PRECISION_OVERRIDE_REFUSAL.into(),
+        ));
+    }
+    if let Some(quant) = spec.quantize {
+        if !matches!(quant, Quant::Q4 | Quant::Q8) {
+            return Err(gen_core::Error::Unsupported(non_affine_quant_refusal(
+                quant,
+            )));
+        }
+    }
+    if spec.text_encoder.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_2_1: the Qwen3-VL text encoder is loaded from the snapshot's own \
+             text_encoder/; LoadSpec::text_encoder substitution is not advertised"
+                .into(),
+        ));
+    }
+    if matches!(spec.weights, gen_core::WeightsSource::File(_)) {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_2_1 expects a snapshot directory, not a single file".into(),
+        ));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_2_1: control / IP-adapter overlays are not wired (the reference/edit \
+             route takes ordered condition images, not a control overlay)"
+                .into(),
+        ));
+    }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_2_1: identity weights are not wired".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(Variant::Base, spec)
+        .map_err(|error| labelled(Variant::Base.id(), error))?;
+    compile_trajectory_for(Variant::Base, &Schedule::production(Variant::Base), req)
+        .map(|opt| opt.map(|plan| plan.bind_load(spec)))
+}
+
+pub fn compile_render_plan_turbo(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(Variant::Turbo, spec)
+        .map_err(|error| labelled(Variant::Turbo.id(), error))?;
+    compile_trajectory_for(Variant::Turbo, &Schedule::production(Variant::Turbo), req)
+        .map(|opt| opt.map(|plan| plan.bind_load(spec)))
+}
+
+pub const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: MODEL_ID,
+        compile: compile_render_plan,
+    };
+
+pub const TURBO_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: TURBO_MODEL_ID,
+        compile: compile_render_plan_turbo,
+    };
 
 candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
@@ -1042,7 +1292,9 @@ pub fn register_providers(
     register_memory_contract_surfaces(
         registry
             .register_generator(REGISTRATION)
+            .register_render_plan(RENDER_PLAN_REGISTRATION)
             .register_generator(TURBO_REGISTRATION)
+            .register_render_plan(TURBO_RENDER_PLAN_REGISTRATION)
             .register_trainer(training::TRAINER_REGISTRATION),
     )
 }
@@ -1742,5 +1994,69 @@ mod execution_policy_tests {
         };
         let recorded = &value["operations"]["qwen21/pag"][0]["value"];
         assert_eq!(recorded, &serde_json::to_value(&a).unwrap());
+    }
+
+    #[test]
+    fn tier0_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{Conditioning, Image, LowResStartSpec, WeightsSource};
+
+        let base_desc = descriptor();
+        let turbo_desc = descriptor_turbo();
+        assert!(base_desc.capabilities.supports_low_res_start);
+        assert!(turbo_desc.capabilities.supports_low_res_start);
+
+        let spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from(
+            "/tmp/qwen-image-2-1",
+        )));
+        let base_req = GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(20),
+            low_res_start: Some(LowResStartSpec::new(6, Some(0.5))),
+            ..Default::default()
+        };
+        let base_plan = compile_render_plan(&spec, &base_req)
+            .expect("base plan compiles")
+            .expect("some base plan");
+        assert_eq!(base_plan.phase_output_size(0), (512, 512));
+        assert_eq!(base_plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(base_plan.denoise_spans(), vec![0..6, 6..20]);
+
+        let turbo_req = GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            ..Default::default()
+        };
+        let turbo_plan = compile_render_plan_turbo(&spec, &turbo_req)
+            .expect("turbo plan compiles")
+            .expect("some turbo plan");
+        assert_eq!(turbo_plan.phase_output_size(0), (512, 512));
+        assert_eq!(turbo_plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(turbo_plan.denoise_spans(), vec![0..3, 3..8]);
+
+        // Reference / edit conditioning must refuse low_res_start with typed Unsupported.
+        let edit_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: None,
+            }],
+            ..base_req
+        };
+        assert!(matches!(
+            compile_render_plan(&spec, &edit_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            compile_render_plan_turbo(&spec, &edit_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
     }
 }

@@ -141,7 +141,11 @@ pub fn create_noise(device: &Device, seed: u64, width: u32, height: u32) -> Resu
 /// epic-7114 `scheduler` name (which re-shapes σ over the same `mu = ln(shift)`). An unset / unknown /
 /// native-aliased name returns the byte-exact `build_flow_sigmas(steps, ln(3))` schedule.
 pub fn sana_sigmas(scheduler_name: Option<&str>, steps: usize) -> Vec<f32> {
-    let _ = (SCHEDULE_SHIFT, build_flow_sigmas as fn(usize, f32) -> Vec<f32>, resolve_flow_schedule as fn(Option<&str>, f32, usize, &[f32]) -> Vec<f32>);
+    let _ = (
+        SCHEDULE_SHIFT,
+        build_flow_sigmas as fn(usize, f32) -> Vec<f32>,
+        resolve_flow_schedule as fn(Option<&str>, f32, usize, &[f32]) -> Vec<f32>,
+    );
     candle_gen::gen_core::sampling::sana_sigmas(scheduler_name, steps)
 }
 
@@ -261,6 +265,7 @@ pub fn denoise_cfg_from_memory(
         on_progress,
         preview,
         memory,
+        None,
     )
 }
 
@@ -285,6 +290,7 @@ pub(crate) fn denoise_cfg_from_masked_memory(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
     memory: Option<candle_gen::gen_core::GenerationMemory>,
+    run: Option<&candle_gen::gen_core::RenderRun<'_, '_>>,
 ) -> Result<Tensor> {
     let attention_budget = memory
         .filter(|memory| memory.chunk_attention)
@@ -322,17 +328,37 @@ pub(crate) fn denoise_cfg_from_masked_memory(
             _ => Ok(pred_cond),
         }
     };
-    run_flow_sampler(
-        sampler_name,
-        TimestepConvention::Sigma,
-        &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
-        latents,
-        seed,
-        cancel,
-        on_progress,
-        Some(preview),
-        predict,
-    )
+    match run {
+        Some(run) => {
+            let spans = run.plan().denoise_spans();
+            candle_gen::run_flow_sampler_with_phase_transition_spans(
+                Some(run.plan().sampler()),
+                TimestepConvention::Sigma,
+                run.plan().denoise_sigmas(),
+                &spans,
+                Some(run),
+                false,
+                latents,
+                seed,
+                cancel,
+                on_progress,
+                Some(preview),
+                predict,
+                None,
+            )
+        }
+        None => run_flow_sampler(
+            sampler_name,
+            TimestepConvention::Sigma,
+            &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
+            latents,
+            seed,
+            cancel,
+            on_progress,
+            Some(preview),
+            predict,
+        ),
+    }
 }
 
 /// DC-AE-decode the final `[1, 32, H/32, W/32]` latent → an RGB8 [`Image`]. diffusers `SanaPipeline`
@@ -555,6 +581,16 @@ impl SanaPipeline {
         device: &Device,
         cancel: &CancelFlag,
     ) -> Result<Option<Tensor>> {
+        self.prepare_reference_with_run(req, device, cancel, None)
+    }
+
+    pub(crate) fn prepare_reference_with_run(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+        run: Option<&candle_gen::gen_core::RenderRun<'_, '_>>,
+    ) -> Result<Option<Tensor>> {
         let start_step = resolve_init_start(
             req.init_image,
             req.steps.unwrap_or(DEFAULT_STEPS),
@@ -566,12 +602,16 @@ impl SanaPipeline {
         let image = req.init_image.ok_or_else(|| {
             CandleError::Msg("SANA positive img2img start requires an init image".into())
         })?;
+        let (encode_w, encode_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
         Ok(Some(encode_init_latents(
             &self.encoder,
             &self.dc_ae_cfg,
             image,
-            req.width,
-            req.height,
+            encode_w,
+            encode_h,
             device,
             cancel,
         )?))
@@ -619,6 +659,7 @@ impl SanaPipeline {
             on_progress,
             preview,
             memory,
+            None,
         )
     }
 
@@ -633,6 +674,7 @@ impl SanaPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<candle_gen::gen_core::GenerationMemory>,
+        run: Option<&candle_gen::gen_core::RenderRun<'_, '_>>,
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
@@ -651,7 +693,11 @@ impl SanaPipeline {
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
 
-        let noise = create_noise(device, seed, req.width, req.height)?;
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
+        let noise = create_noise(device, seed, init_w, init_h)?;
         let start_step = resolve_init_start(req.init_image, steps, req.strength);
         let latents = if start_step > 0 {
             let clean = prepared_reference.ok_or_else(|| {
@@ -661,6 +707,9 @@ impl SanaPipeline {
         } else {
             noise
         };
+        if let Some(run) = run {
+            run.reset_image_denoise_phases();
+        }
         let latents = denoise_cfg_from_masked_memory(
             &self.transformer,
             &sigmas,
@@ -678,9 +727,18 @@ impl SanaPipeline {
             on_progress,
             preview,
             memory,
+            run,
         )?;
+        if let Some(run) = run {
+            run.finish_image_denoise_phases()
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+        }
         on_progress(Progress::Decoding);
-        decode_to_image_memory(&self.decoder, &self.dc_ae_cfg, &latents, memory)
+        let decode = || decode_to_image_memory(&self.decoder, &self.dc_ae_cfg, &latents, memory);
+        match run {
+            Some(run) => run.decode_phase(decode),
+            None => decode(),
+        }
     }
 
     /// Convenience [`SanaPipeline::generate_with`] with a no-op cancel + progress (examples / tests).
@@ -765,31 +823,38 @@ pub(crate) fn generate_base_staged(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
     mut check: impl FnMut() -> candle_gen::gen_core::Result<()>,
+    run: Option<&candle_gen::gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Image>> {
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
     let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
     candle_gen::execution::policy("sana/pipeline/guidance", format!("{guidance:?}").into());
-    let conditioning = candle_gen::gen_core::with_prompt_encoding(
-        on_progress,
-        || -> std::result::Result<_, candle_gen::CandleError> {
-            let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
-            let (uncond, uncond_mask) = if guidance > 1.0 {
-                let (uncond, uncond_mask) =
-                    text.encode_with_mask(req.negative_prompt.unwrap_or(""))?;
-                (Some(uncond), Some(uncond_mask))
-            } else {
-                (None, None)
-            };
-            let conditioning = SanaConditioning {
-                cond,
-                cond_mask,
-                uncond,
-                uncond_mask,
-            };
-            Ok(conditioning)
-        },
-    )?;
+    let mut encode_prompt = || {
+        candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
+                let (uncond, uncond_mask) = if guidance > 1.0 {
+                    let (uncond, uncond_mask) =
+                        text.encode_with_mask(req.negative_prompt.unwrap_or(""))?;
+                    (Some(uncond), Some(uncond_mask))
+                } else {
+                    (None, None)
+                };
+                let conditioning = SanaConditioning {
+                    cond,
+                    cond_mask,
+                    uncond,
+                    uncond_mask,
+                };
+                Ok(conditioning)
+            },
+        )
+    };
+    let conditioning = match run {
+        Some(run) => run.encode(encode_prompt)?,
+        None => encode_prompt()?,
+    };
     device.synchronize()?;
     drop(text);
     if cancel.is_cancelled() {
@@ -797,6 +862,10 @@ pub(crate) fn generate_base_staged(
     }
 
     let cfg = DcAeConfig::sana_f32c32();
+    let (init_w, init_h) = match run {
+        Some(run) => run.plan().phase_output_size(0),
+        None => (req.width, req.height),
+    };
 
     let steps = req.steps.unwrap_or(DEFAULT_STEPS);
     let start_step = resolve_init_start(req.init_image, steps, req.strength);
@@ -807,8 +876,8 @@ pub(crate) fn generate_base_staged(
             &encoder,
             &cfg,
             req.init_image.expect("positive start requires init image"),
-            req.width,
-            req.height,
+            init_w,
+            init_h,
             device,
             cancel,
         )?;
@@ -820,6 +889,10 @@ pub(crate) fn generate_base_staged(
     };
 
     revalidate_before_load(&mut check)?;
+    if let Some(run) = run {
+        run.begin_rendering()
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+    }
     let transformer =
         load_staged_transformer(root, device, SanaTransformerConfig::sana_1600m(), memory)?;
     let native = sana_sigmas(req.scheduler, steps);
@@ -837,12 +910,15 @@ pub(crate) fn generate_base_staged(
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        let noise = create_noise(device, *seed, req.width, req.height)?;
+        if let Some(run) = run {
+            run.reset_image_denoise_phases();
+        }
+        let noise = create_noise(device, *seed, init_w, init_h)?;
         let initial = match &clean {
             Some(clean) => blend_flow_init(clean, &noise, &sigmas, start_step)?,
             None => noise,
         };
-        latents.push(denoise_cfg_from_masked_memory(
+        let latent = denoise_cfg_from_masked_memory(
             &transformer,
             &sigmas,
             req.sampler,
@@ -859,26 +935,42 @@ pub(crate) fn generate_base_staged(
             on_progress,
             preview,
             Some(memory),
-        )?);
+            run,
+        )?;
+        if let Some(run) = run {
+            run.finish_image_denoise_phases()
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+        }
+        latents.push(latent);
     }
     device.synchronize()?;
     drop(transformer);
     drop(conditioning);
 
     revalidate_before_load(&mut check)?;
-    let decoder = load_vae_decoder(root, device, &cfg)?;
-    let mut images = Vec::with_capacity(latents.len());
-    for (output_index, latent) in latents.into_iter().enumerate() {
-        candle_gen::execution::output_index(output_index);
-        on_progress(Progress::Decoding);
-        images.push(decode_to_image_memory(
-            &decoder,
-            &cfg,
-            &latent,
-            Some(memory),
-        )?);
+    let decode_all = || -> Result<Vec<Image>> {
+        let decoder = load_vae_decoder(root, device, &cfg)?;
+        let mut images = Vec::with_capacity(latents.len());
+        for (output_index, latent) in latents.into_iter().enumerate() {
+            candle_gen::execution::output_index(output_index);
+            on_progress(Progress::Decoding);
+            images.push(decode_to_image_memory(
+                &decoder,
+                &cfg,
+                &latent,
+                Some(memory),
+            )?);
+        }
+        device.synchronize()?;
+        Ok(images)
+    };
+    let images = match run {
+        Some(run) => run.decode_phase(decode_all)?,
+        None => decode_all()?,
+    };
+    if let Some(run) = run {
+        run.finish_rendering();
     }
-    device.synchronize()?;
     Ok(images)
 }
 

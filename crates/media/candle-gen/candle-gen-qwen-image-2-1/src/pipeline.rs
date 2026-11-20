@@ -12,8 +12,10 @@ use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::{
     CancelFlag, GenerationRequest, Image, PagResolved, Progress, RgbaImage,
 };
-use candle_gen::run_flow_sampler;
-use candle_gen::{CandleError as Error, Result};
+use candle_gen::sampler::{CandleLatentOps, CandlePhaseTransitionFn};
+use candle_gen::{
+    run_flow_sampler, run_flow_sampler_with_phase_transition_spans, CandleError as Error, Result,
+};
 use gen_core_family::qwen_image_2_1::pag::{pag_perturb_block_flags, pag_step_index_for_eval};
 use gen_core_tokenizer::TextTokenizer;
 
@@ -573,14 +575,28 @@ pub fn denoise_reported_with_pag(
     report: &mut DenoiseReport,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Tensor> {
+    denoise_reported_with_pag_and_run(inputs, pag, None, report, on_progress)
+}
+
+/// [`denoise_reported_with_pag`] with optional [`candle_gen::gen_core::RenderRun`] for two-phase `low_res_start`.
+pub fn denoise_reported_with_pag_and_run(
+    inputs: DenoiseInputs<'_>,
+    pag: Option<&PagResolved>,
+    run: Option<&candle_gen::gen_core::RenderRun<'_, '_>>,
+    report: &mut DenoiseReport,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Tensor> {
     let grid = latent_grid(inputs.width, inputs.height);
+    let (p0_w, p0_h) = run
+        .map(|r| r.plan().phase_output_size(0))
+        .unwrap_or((inputs.width, inputs.height));
+    let p0_grid = latent_grid(p0_w, p0_h);
     let transformer = inputs.transformer;
     let scale = inputs.true_cfg_scale as f64;
     let references = inputs.references.as_ref();
     let total_steps = inputs.sigmas.len().saturating_sub(1);
     let num_blocks = transformer.num_blocks();
     let sampler_name = inputs.sampler;
-    let mut eval_idx = 0usize;
     // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
     let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
     *report = DenoiseReport {
@@ -591,34 +607,69 @@ pub fn denoise_reported_with_pag(
         },
         ..DenoiseReport::default()
     };
-    let mut positive = BranchRun {
-        kind: PromptBranch::Positive,
-        text: inputs.prompt_embeds,
-        conditioned: references.map(|c| (c.latents, c.layout)),
-        cache: None,
-    };
-    let mut negative = inputs.negative_embeds.map(|text| BranchRun {
-        kind: PromptBranch::Negative,
-        text,
-        conditioned: references.and_then(|c| c.negative_layout.map(|layout| (c.latents, layout))),
-        cache: None,
+    struct SharedPredictState<'a, 'r> {
+        positive: BranchRun<'a>,
+        negative: Option<BranchRun<'a>>,
+        eval_idx: usize,
+        last_grid: Option<(usize, usize)>,
+        report: &'r mut DenoiseReport,
+    }
+    let state_cell = std::cell::RefCell::new(SharedPredictState {
+        positive: BranchRun {
+            kind: PromptBranch::Positive,
+            text: inputs.prompt_embeds,
+            conditioned: references.map(|c| (c.latents, c.layout)),
+            cache: None,
+        },
+        negative: inputs.negative_embeds.map(|text| BranchRun {
+            kind: PromptBranch::Negative,
+            text,
+            conditioned: references
+                .and_then(|c| c.negative_layout.map(|layout| (c.latents, layout))),
+            cache: None,
+        }),
+        eval_idx: 0,
+        last_grid: None,
+        report,
     });
-    // `move`: the closure owns both branches — and with them their caches — and the sampler
-    // consumes it, so the caches are dropped when the loop returns, whatever the outcome.
-    let predict = move |latents: &Tensor, sigma: f32| -> Result<Tensor> {
-        let velocity = positive.evaluate(transformer, cached, latents, sigma, grid, report)?;
+    let eval_step = |latents: &Tensor, sigma: f32, is_boundary: bool| -> Result<Tensor> {
+        let mut st = state_cell.borrow_mut();
+        let step_tokens = latents.dims().get(1).copied().unwrap_or(0);
+        let step_grid = if step_tokens == p0_grid.0 * p0_grid.1 {
+            p0_grid
+        } else {
+            grid
+        };
+        if st.last_grid != Some(step_grid) {
+            st.positive.cache = None;
+            if let Some(neg) = st.negative.as_mut() {
+                neg.cache = None;
+            }
+            st.report.kv_cache_bytes = 0;
+            st.last_grid = Some(step_grid);
+        }
+        let SharedPredictState {
+            positive,
+            negative,
+            eval_idx,
+            report,
+            ..
+        } = &mut *st;
+        let velocity = positive.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
         let guided = match negative.as_mut() {
             Some(negative) => {
                 let uncond =
-                    negative.evaluate(transformer, cached, latents, sigma, grid, report)?;
+                    negative.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
                 // `neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)`
                 let diff = ((&velocity - &uncond)? * scale)?;
                 (&uncond + diff)?
             }
             None => velocity.clone(),
         };
-        let current_eval = eval_idx;
-        eval_idx += 1;
+        let current_eval = *eval_idx;
+        if !is_boundary {
+            *eval_idx += 1;
+        }
         let step_idx = pag_step_index_for_eval(sampler_name, current_eval, total_steps);
         let pag_scale = pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
         if pag_scale > 0.0 {
@@ -630,7 +681,7 @@ pub fn denoise_reported_with_pag(
                     cached,
                     latents,
                     sigma,
-                    grid,
+                    step_grid,
                     &perturb_blocks,
                     report,
                 )?;
@@ -640,17 +691,139 @@ pub fn denoise_reported_with_pag(
         }
         Ok(guided)
     };
-    run_flow_sampler(
-        inputs.sampler,
-        TimestepConvention::Sigma,
-        inputs.sigmas,
-        inputs.latents,
-        inputs.seed,
-        inputs.cancel,
-        on_progress,
-        None,
-        predict,
-    )
+    let single_span = 0..total_steps;
+    let plan_spans = run.map(|r| r.plan().denoise_spans());
+    let spans = plan_spans
+        .as_deref()
+        .unwrap_or_else(|| std::slice::from_ref(&single_span));
+    let seed = inputs.seed;
+    let sigmas = inputs.sigmas;
+    let cancel = inputs.cancel;
+    let mut phase_transition =
+        |_phase: usize,
+         boundary_step: usize,
+         ops: &CandleLatentOps,
+         ms: &dyn candle_gen::gen_core::sampling::ModelSampling,
+         out: &Tensor,
+         state: &mut candle_gen::gen_core::sampling::SolverRunState<CandleLatentOps>|
+         -> Result<Tensor> {
+            let Some(run) = run else {
+                return Ok(out.clone());
+            };
+            let Some(low_res_plan) = run.plan().low_res_start().copied() else {
+                return Ok(out.clone());
+            };
+            if boundary_step != low_res_plan.k {
+                return Ok(out.clone());
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let sigma_k = sigmas[boundary_step];
+            let boundary_state = match low_res_plan.estimate_source {
+                candle_gen::gen_core::EstimateSource::EndpointEvaluation => {
+                    let x0_low =
+                        candle_gen::gen_core::sampling::denoise(ops, ms, out, sigma_k, |xin, t| {
+                            eval_step(xin, t, true).map_err(Into::into)
+                        })
+                        .map_err(Error::from)?;
+                    candle_gen::gen_core::BoundaryState::CleanEstimate {
+                        latent: x0_low,
+                        source: candle_gen::gen_core::EstimateSource::EndpointEvaluation,
+                    }
+                }
+                candle_gen::gen_core::EstimateSource::PreviousEvaluation => {
+                    let captured = state
+                        .take_captured_primary_estimate(boundary_step - 1)
+                        .map_err(Error::from)?;
+                    candle_gen::gen_core::BoundaryState::CleanEstimate {
+                        latent: captured.latent,
+                        source: candle_gen::gen_core::EstimateSource::PreviousEvaluation,
+                    }
+                }
+            };
+            let (x0_low, source) = boundary_state.into_clean_estimate().map_err(Error::from)?;
+            let target_dtype = x0_low.dtype();
+            let low_f32: Vec<f32> = x0_low.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let dims = x0_low.dims();
+            let b_sz = dims.first().copied().unwrap_or(1);
+            let packed_channels = dims.get(2).copied().unwrap_or(64);
+            let base_seed = run.plan().base_seed();
+            let output_index = seed.wrapping_sub(base_seed) as u32;
+            let pass_index = run.plan().pass_index();
+            let repacked = candle_gen::gen_core::transition_packed_clean_estimate_f32(
+                candle_gen::gen_core::BoundaryState::CleanEstimate {
+                    latent: &low_f32,
+                    source,
+                },
+                b_sz,
+                packed_channels,
+                1,
+                VAE_SCALE_FACTOR,
+                &low_res_plan,
+                sigma_k,
+                ms,
+                base_seed,
+                output_index,
+                pass_index,
+                0,
+            )
+            .map_err(Error::from)?;
+            let (full_h, full_w) = latent_grid(low_res_plan.full_width, low_res_plan.full_height);
+            let transitioned = Tensor::from_vec(
+                repacked,
+                (b_sz, full_h * full_w, packed_channels),
+                x0_low.device(),
+            )?;
+            let next_out = if target_dtype == DType::F32 {
+                transitioned
+            } else {
+                transitioned.to_dtype(target_dtype)?
+            };
+            state.note_geometry_change(
+                (low_res_plan.low_width, low_res_plan.low_height),
+                (low_res_plan.full_width, low_res_plan.full_height),
+            );
+            state.note_renoise_transition();
+            state
+                .apply_phase_boundary(candle_gen::gen_core::sampling::PhaseBoundary::Reset, true)
+                .map_err(Error::from)?;
+            Ok(next_out)
+        };
+    let on_phase_boundary: Option<&mut CandlePhaseTransitionFn<'_>> =
+        if run.and_then(|r| r.plan().low_res_start()).is_some() {
+            Some(&mut phase_transition)
+        } else {
+            None
+        };
+    match run {
+        Some(run) => run_flow_sampler_with_phase_transition_spans(
+            inputs.sampler,
+            TimestepConvention::Sigma,
+            inputs.sigmas,
+            spans,
+            Some(run),
+            false,
+            inputs.latents,
+            inputs.seed,
+            inputs.cancel,
+            on_progress,
+            None,
+            |latents, sigma| eval_step(latents, sigma, false),
+            on_phase_boundary,
+        ),
+        None => run_flow_sampler(
+            inputs.sampler,
+            TimestepConvention::Sigma,
+            inputs.sigmas,
+            inputs.latents,
+            inputs.seed,
+            inputs.cancel,
+            on_progress,
+            None,
+            |latents, sigma| eval_step(latents, sigma, false),
+        ),
+    }
 }
 
 /// Alpha-composite an RGBA NCHW tensor in `[-1, 1]` over white → RGB NCHW in `[-1, 1]` (f32).

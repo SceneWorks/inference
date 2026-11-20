@@ -550,12 +550,25 @@ impl Pipeline {
         }
     }
 
+    #[allow(dead_code)]
     fn render_phase(
         &self,
         phase: &HeavyPhase,
         req: &GenerationRequest,
         encoded: (Tensor, Option<Tensor>, f32),
         resolved_pag: Option<&gen_core::PagResolved>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32)> {
+        self.render_phase_with_run(phase, req, encoded, resolved_pag, None, on_progress)
+    }
+
+    fn render_phase_with_run(
+        &self,
+        phase: &HeavyPhase,
+        req: &GenerationRequest,
+        encoded: (Tensor, Option<Tensor>, f32),
+        resolved_pag: Option<&gen_core::PagResolved>,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         let (pos, neg, guidance) = encoded;
@@ -567,7 +580,7 @@ impl Pipeline {
             ),
             HeavyPhase::Sequential(heavy) => (&heavy.transformer, &heavy.vae, heavy.pid.as_deref()),
         };
-        self.denoise_and_decode(
+        self.denoise_and_decode_with_run(
             req,
             transformer,
             vae,
@@ -576,6 +589,7 @@ impl Pipeline {
             neg.as_ref(),
             guidance,
             resolved_pag,
+            run,
             on_progress,
         )
     }
@@ -586,7 +600,7 @@ impl Pipeline {
     /// borrows (`&QwenTransformer` / `&QwenVae` / `Option<&PidEngine>`) let both an `Arc`-resident and
     /// an owned sequential component feed the same loop.
     #[allow(clippy::too_many_arguments)]
-    fn denoise_and_decode(
+    fn denoise_and_decode_with_run(
         &self,
         req: &GenerationRequest,
         transformer: &QwenTransformer,
@@ -596,11 +610,18 @@ impl Pipeline {
         neg_embeds: Option<&Tensor>,
         guidance: f32,
         resolved_pag: Option<&gen_core::PagResolved>,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         let steps = resolve_steps(req.steps);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
+        let (phase0_w, phase0_h) = run
+            .map(|r| r.plan().phase_output_size(0))
+            .unwrap_or((req.width, req.height));
         let num_blocks = transformer.block_count();
         let memory = req.memory.unwrap_or_default();
         let attention_budget = if memory.chunk_attention {
@@ -643,10 +664,16 @@ impl Pipeline {
         // else `None` → the native QwenVae decode. Built before the loop so all `count` images share it
         // (same prompt), mirroring the MLX `decode_and_collect` seam.
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, MODEL_ID)?;
+        if let Some(run) = run {
+            run.begin_rendering()?;
+        }
 
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+            }
             let mut eval_idx = 0usize;
-            let latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
+            let latents = pipeline::create_noise(seed, phase0_w, phase0_h, &self.device)?
                 .to_dtype(DIT_DTYPE)?;
 
             // Per-step latent preview (epic 16948, sc-16952). Built per image so each seed's
@@ -654,97 +681,142 @@ impl Pipeline {
             // sampler's running latent is PACKED `[1, seq, 64]` — the projector unpacks to
             // `[1, 16, H/8, W/8]` before applying the QwenVae fit. True CFG lives entirely inside the
             // predict closure below, so the hook only ever sees the single conditional trajectory.
-            let preview = crate::preview::hook(&req.preview, req.width, req.height);
+            let preview = match run {
+                Some(run) => crate::preview::hook_for_plan(&req.preview, run.plan()),
+                None => crate::preview::hook(&req.preview, req.width, req.height),
+            };
 
-            let latents = candle_gen::run_flow_sampler(
-                req.sampler.as_deref(),
-                gen_core::sampling::TimestepConvention::Sigma,
-                &sigmas,
-                latents,
-                seed,
-                &req.cancel,
-                on_progress,
-                Some(&preview),
-                |latents, sigma| -> CResult<Tensor> {
-                    let pos = transformer.forward_with_memory(
-                        latents,
-                        pos_embeds,
-                        sigma,
-                        lat_h,
-                        lat_w,
-                        attention_plan,
-                        transformer_window,
-                        &req.cancel,
-                    )?;
-                    let guided = match neg_embeds {
-                        Some(neg) => {
-                            let neg = transformer.forward_with_memory(
-                                latents,
-                                neg,
-                                sigma,
-                                lat_h,
-                                lat_w,
-                                attention_plan,
-                                transformer_window,
-                                &req.cancel,
-                            )?;
-                            pipeline::compute_guided_noise(&pos, &neg, guidance)?
-                        }
-                        None => pos.clone(),
-                    };
-                    let current_eval = eval_idx;
-                    eval_idx += 1;
-                    let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
-                        canonical_solver,
-                        current_eval,
-                        total_steps,
-                    );
-                    let pag_scale =
-                        resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
-                    if pag_scale > 0.0 {
-                        if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(
-                            resolved_pag,
-                            num_blocks,
-                            step_idx,
-                            total_steps,
-                        ) {
-                            let perturbed = transformer.forward_with_memory_pag(
-                                latents,
-                                pos_embeds,
-                                sigma,
-                                lat_h,
-                                lat_w,
-                                attention_plan,
-                                transformer_window,
-                                &req.cancel,
-                                Some(&perturb_mask),
-                            )?;
-                            return Ok(pipeline::combine_pag_guidance(
-                                &guided, &pos, &perturbed, pag_scale,
-                            )?);
+            let mut predict = |latents: &Tensor, sigma: f32| -> CResult<Tensor> {
+                let (step_lat_h, step_lat_w) = match run {
+                    Some(run) => {
+                        let (p0_w, p0_h) = run.plan().phase_output_size(0);
+                        let (p0_lh, p0_lw) = pipeline::latent_dims(p0_w, p0_h);
+                        if latents.dims().get(1).copied() == Some(p0_lh * p0_lw) {
+                            (p0_lh, p0_lw)
+                        } else {
+                            (lat_h, lat_w)
                         }
                     }
-                    Ok(guided)
-                },
-            )?;
+                    None => (lat_h, lat_w),
+                };
+                let pos = transformer.forward_with_memory(
+                    latents,
+                    pos_embeds,
+                    sigma,
+                    step_lat_h,
+                    step_lat_w,
+                    attention_plan,
+                    transformer_window,
+                    &req.cancel,
+                )?;
+                let guided = match neg_embeds {
+                    Some(neg) => {
+                        let neg = transformer.forward_with_memory(
+                            latents,
+                            neg,
+                            sigma,
+                            step_lat_h,
+                            step_lat_w,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                        )?;
+                        pipeline::compute_guided_noise(&pos, &neg, guidance)?
+                    }
+                    None => pos.clone(),
+                };
+                let current_eval = eval_idx;
+                eval_idx += 1;
+                let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                    canonical_solver,
+                    current_eval,
+                    total_steps,
+                );
+                let pag_scale = resolved_pag.map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                if pag_scale > 0.0 {
+                    if let Some(perturb_mask) = pipeline::pag_perturb_block_flags(
+                        resolved_pag,
+                        num_blocks,
+                        step_idx,
+                        total_steps,
+                    ) {
+                        let perturbed = transformer.forward_with_memory_pag(
+                            latents,
+                            pos_embeds,
+                            sigma,
+                            step_lat_h,
+                            step_lat_w,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                            Some(&perturb_mask),
+                        )?;
+                        return Ok(pipeline::combine_pag_guidance(
+                            &guided, &pos, &perturbed, pag_scale,
+                        )?);
+                    }
+                }
+                Ok(guided)
+            };
+
+            let latents = match run {
+                Some(run) => candle_gen::run_flow_sampler_with_phase_transition_spans(
+                    Some(run.plan().sampler()),
+                    gen_core::sampling::TimestepConvention::Sigma,
+                    run.plan().denoise_sigmas(),
+                    &run.plan().denoise_spans(),
+                    Some(run),
+                    false,
+                    latents,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview),
+                    &mut predict,
+                    None,
+                )?,
+                None => candle_gen::run_flow_sampler(
+                    req.sampler.as_deref(),
+                    gen_core::sampling::TimestepConvention::Sigma,
+                    &sigmas,
+                    latents,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview),
+                    |latents, sigma| predict(latents, sigma),
+                )?,
+            };
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()?;
+            }
 
             on_progress(Progress::Decoding);
-            let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
-            // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both
-            // consume the same normalized `[1,16,H/8,W/8]` latent (QwenVae de-normalizes internally,
-            // and PiD is trained on that normalized latent) — a zero-transform seam. PiD returns a
-            // larger `[1,3,4H,4W]` tensor; `to_image` reads the size from it.
-            let decoded = decode_final_latents(
-                vae,
-                pid_decoder
-                    .as_ref()
-                    .map(|decoder| decoder as &dyn LatentDecoder),
-                &lat,
-                memory,
-                &req.cancel,
-            )?;
-            control_common::to_image(&decoded)
+            let decode_body = || -> CResult<Image> {
+                let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
+                // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both
+                // consume the same normalized `[1,16,H/8,W/8]` latent (QwenVae de-normalizes internally,
+                // and PiD is trained on that normalized latent) — a zero-transform seam. PiD returns a
+                // larger `[1,3,4H,4W]` tensor; `to_image` reads the size from it.
+                let decoded = decode_final_latents(
+                    vae,
+                    pid_decoder
+                        .as_ref()
+                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    &lat,
+                    memory,
+                    &req.cancel,
+                )?;
+                control_common::to_image(&decoded)
+            };
+            match run {
+                Some(run) => run.decode_phase(decode_body),
+                None => decode_body(),
+            }
         })?;
+        if let Some(run) = run {
+            run.finish_rendering();
+        }
         Ok((images, total_steps as u32))
     }
 
@@ -1015,6 +1087,7 @@ pub struct QwenImageGenerator {
     /// Executable shared-memory contract for registry-loaded CUDA snapshots. Bespoke ComfyUI
     /// sources remain resident-only because their in-memory remap is not block-addressable.
     memory_strategy: Option<gen_core::MemoryProviderContract>,
+    loaded_spec: LoadSpec,
 }
 
 pub(crate) fn record_pag_policy(
@@ -1033,7 +1106,18 @@ impl Generator for QwenImageGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.pipe.adapters.len(),
                 "candle-gen-qwen-image/src/lib.rs",
@@ -1080,26 +1164,7 @@ impl Generator for QwenImageGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "qwen_image: prompt must not be empty".into(),
-            ));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(
-                "qwen_image: steps must be >= 1".into(),
-            ));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "qwen_image: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        Ok(())
+        validate_request(req)
     }
 
     fn generate(
@@ -1119,7 +1184,20 @@ impl Generator for QwenImageGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         crate::record_pag_policy("qwen_image/pag", resolved_pag.as_ref());
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
@@ -1157,18 +1235,24 @@ impl Generator for QwenImageGenerator {
                     .into(),
             ));
         }
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let (images, actual_steps) = self.residency.run_request_scoped(
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text| self.pipe.encode_phase(text, req),
+            |text| run.encode(|| self.pipe.encode_phase(text, req)),
             |_| Ok(self.pipe.device.synchronize()?),
             |heavy, encoded, on_progress| {
-                let result =
-                    self.pipe
-                        .render_phase(heavy, req, encoded, resolved_pag.as_ref(), on_progress);
+                let result = self.pipe.render_phase_with_run(
+                    heavy,
+                    req,
+                    encoded,
+                    resolved_pag.as_ref(),
+                    Some(&run),
+                    on_progress,
+                );
                 candle_gen::synchronize_result(&self.pipe.device, result)
             },
         )?;
@@ -1176,10 +1260,291 @@ impl Generator for QwenImageGenerator {
             pag: resolved_pag
                 .as_ref()
                 .map(|p| p.execution_report(actual_steps)),
+            low_res_start: plan.low_res_start_execution_report("bf16", 2, "base_dit")?,
             ..gen_core::GenerationReport::from_output(GenerationOutput::Images(images))
         })
     }
 }
+
+pub(crate) fn validate_request(req: &GenerationRequest) -> gen_core::Result<()> {
+    let desc = descriptor();
+    desc.capabilities.validate_request(MODEL_ID, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(
+            "qwen_image: prompt must not be empty".into(),
+        ));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(
+            "qwen_image: steps must be >= 1".into(),
+        ));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "qwen_image: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if let Some(low_res) = &req.low_res_start {
+        let steps = resolve_steps(req.steps);
+        let native = pipeline::qwen_sigmas(steps, req.width, req.height);
+        let mu = pipeline::qwen_mu(req.width, req.height);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
+        let executed_steps = sigmas.len().saturating_sub(1);
+        low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
+    }
+    Ok(())
+}
+
+pub fn compile_trajectory_for(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+    let desc = descriptor();
+    validate_request(req)?;
+    let steps = resolve_steps(req.steps);
+    let native = pipeline::qwen_sigmas(steps, req.width, req.height);
+    let mu = pipeline::qwen_mu(req.width, req.height);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let guidance = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE);
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    gen_core::RenderPlan::base_image(&desc, req, pass)
+}
+
+fn validate_plan_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    if matches!(spec.weights, WeightsSource::Dir(_)) {
+        gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
+    } else {
+        if !spec.components.contains_key(BASE_SNAPSHOT_COMPONENT) {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: file weights require component '{BASE_SNAPSHOT_COMPONENT}'"
+            )));
+        }
+        gen_core::reject_unknown_components(
+            spec,
+            &[BASE_SNAPSHOT_COMPONENT, COMFYUI_VAE_COMPONENT],
+            MODEL_ID,
+        )?;
+    }
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle qwen_image does not support on-the-fly Q4/Q8 quantization yet".into(),
+        ));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle qwen_image does not support control / Edit yet (txt2img only)".into(),
+        ));
+    }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle qwen_image does not support identity weights".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(spec)?;
+    compile_trajectory_for(req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: MODEL_ID,
+        compile: compile_render_plan,
+    };
+
+pub fn edit_descriptor() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = "qwen_image_edit";
+    d.capabilities.supports_low_res_start = false;
+    d.capabilities.conditioning = vec![
+        gen_core::ConditioningKind::Reference,
+        gen_core::ConditioningKind::MultiReference,
+    ];
+    d
+}
+
+pub fn compile_edit_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_edit expects a snapshot directory".into(),
+        ));
+    }
+    let desc = edit_descriptor();
+    desc.capabilities.validate_request(desc.id, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_edit: prompt must not be empty".into(),
+        ));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "qwen_image_edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    let has_ref = req.conditioning.iter().any(|c| {
+        matches!(
+            c,
+            gen_core::Conditioning::Reference { .. }
+                | gen_core::Conditioning::MultiReference { .. }
+        )
+    });
+    if !has_ref {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_edit requires a Reference or MultiReference conditioning image".into(),
+        ));
+    }
+    let steps = resolve_steps(req.steps);
+    let native = pipeline::qwen_sigmas(steps, req.width, req.height);
+    let mu = pipeline::qwen_mu(req.width, req.height);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let guidance = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE);
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)
+        .map(|plan| Some(plan.bind_load(spec)))
+}
+
+pub const EDIT_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: "qwen_image_edit",
+        compile: compile_edit_render_plan,
+    };
+
+pub const EDIT_FEATURE_ROUTE_REGISTRATION: gen_core::FeatureRouteRegistration =
+    gen_core::FeatureRouteRegistration {
+        route_id: "qwen_image_edit",
+        parent_provider_id: Some(MODEL_ID),
+        descriptor: edit_descriptor,
+        render_plan: Some(EDIT_RENDER_PLAN_REGISTRATION),
+    };
+
+pub fn control_descriptor() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = "qwen_image_control";
+    d.capabilities.supports_low_res_start = false;
+    d.capabilities.conditioning = vec![gen_core::ConditioningKind::Control];
+    d.control_kinds = Some(gen_core::AcceptedControlKinds::Only(vec![
+        gen_core::ControlKind::Pose,
+        gen_core::ControlKind::Canny,
+        gen_core::ControlKind::Depth,
+    ]));
+    d
+}
+
+pub fn compile_control_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if matches!(spec.weights, WeightsSource::File(_)) || spec.control.is_none() {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_control requires a base snapshot directory and spec.control".into(),
+        ));
+    }
+    let desc = control_descriptor();
+    desc.capabilities.validate_request(desc.id, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_control: prompt must not be empty".into(),
+        ));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "qwen_image_control: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    let has_control = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, gen_core::Conditioning::Control { .. }));
+    if !has_control {
+        return Err(gen_core::Error::Msg(
+            "qwen_image_control requires a Control conditioning image".into(),
+        ));
+    }
+    let steps = resolve_steps(req.steps);
+    let native = pipeline::qwen_sigmas(steps, req.width, req.height);
+    let mu = pipeline::qwen_mu(req.width, req.height);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let guidance = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE);
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)
+        .map(|plan| Some(plan.bind_load(spec)))
+}
+
+pub const CONTROL_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: "qwen_image_control",
+        compile: compile_control_render_plan,
+    };
+
+pub const CONTROL_FEATURE_ROUTE_REGISTRATION: gen_core::FeatureRouteRegistration =
+    gen_core::FeatureRouteRegistration {
+        route_id: "qwen_image_control",
+        parent_provider_id: Some(MODEL_ID),
+        descriptor: control_descriptor,
+        render_plan: Some(CONTROL_RENDER_PLAN_REGISTRATION),
+    };
 
 /// Resolve the sampling step count for a base txt2img render: honor a caller-supplied `steps`,
 /// otherwise fall back to [`DEFAULT_STEPS`]. The base Qwen-Image is a non-distilled 20B flow-match
@@ -1237,6 +1602,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
             // bidirectional guard sc-16951 added to `candle-gen-catalog`.
             supports_preview: true,
+            supports_low_res_start: true,
             pag: Some(pag_capability()),
             ..Default::default()
         },
@@ -1291,6 +1657,7 @@ fn generator_from_pipeline(
         stream_cancel,
         loaded_quant,
         memory_strategy,
+        loaded_spec: file_pin_spec.clone(),
     }))
 }
 
@@ -1431,6 +1798,9 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(REGISTRATION)
+        .register_render_plan(RENDER_PLAN_REGISTRATION)
+        .register_feature_route(EDIT_FEATURE_ROUTE_REGISTRATION)
+        .register_feature_route(CONTROL_FEATURE_ROUTE_REGISTRATION)
         .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
             route_id: "qwen_image_edit",
             provider_id: MODEL_ID,
@@ -2471,5 +2841,53 @@ mod execution_policy_tests {
         };
         let recorded = &value["operations"]["qwen_image/pag"][0]["value"];
         assert_eq!(recorded, &serde_json::to_value(&a).unwrap());
+    }
+
+    #[test]
+    fn tier0_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{FeatureInapplicabilityCode, LowResStartSpec};
+
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+
+        let t2i_req = GenerationRequest {
+            prompt: "a fox in the forest".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(20),
+            seed: Some(42),
+            low_res_start: Some(LowResStartSpec::new(7, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &t2i_req)
+            .unwrap()
+            .expect("qwen_image T2I low_res_start plan must compile");
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(plan.denoise_spans(), vec![0..7, 7..20]);
+
+        let base_app = registry
+            .route_feature_applicability(MODEL_ID)
+            .expect("qwen_image applicability");
+        assert!(base_app["low_res_start"].applicable);
+
+        let edit_app = registry
+            .route_feature_applicability("qwen_image_edit")
+            .expect("qwen_image_edit applicability");
+        assert!(!edit_app["low_res_start"].applicable);
+        assert!(edit_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0EditConditioning));
+
+        let control_app = registry
+            .route_feature_applicability("qwen_image_control")
+            .expect("qwen_image_control applicability");
+        assert!(!control_app["low_res_start"].applicable);
+        assert!(control_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning));
     }
 }

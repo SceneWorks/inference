@@ -90,6 +90,7 @@ trait BaseBatchPipeline {
         req: &SanaGenerateRequest<'_>,
         device: &Device,
         cancel: &gen_core::CancelFlag,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
     ) -> candle_gen::Result<Option<Self::PreparedReference>>;
     #[allow(clippy::too_many_arguments)]
     fn render_seed(
@@ -102,6 +103,7 @@ trait BaseBatchPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<gen_core::GenerationMemory>,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
     ) -> candle_gen::Result<Image>;
 }
 
@@ -122,8 +124,9 @@ impl BaseBatchPipeline for SanaPipeline {
         req: &SanaGenerateRequest<'_>,
         device: &Device,
         cancel: &gen_core::CancelFlag,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
     ) -> candle_gen::Result<Option<Self::PreparedReference>> {
-        self.prepare_reference(req, device, cancel)
+        self.prepare_reference_with_run(req, device, cancel, run)
     }
 
     fn render_seed(
@@ -136,6 +139,7 @@ impl BaseBatchPipeline for SanaPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<gen_core::GenerationMemory>,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
     ) -> candle_gen::Result<Image> {
         self.generate_with_conditioning_and_reference_memory(
             req,
@@ -146,6 +150,7 @@ impl BaseBatchPipeline for SanaPipeline {
             on_progress,
             preview,
             memory,
+            run,
         )
     }
 }
@@ -206,6 +211,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `crate::preview::base_hook` over the epic-16624 BASE DC-AE fit — not Sprint's.
             supports_preview: true,
             supports_sequential_offload: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -287,7 +293,123 @@ pub(crate) fn validate_request(
             req.width, req.height
         )));
     }
+    if let Some(low_res) = &req.low_res_start {
+        if id == SPRINT_MODEL_ID {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: low_res_start is not supported on continuous-time consistency SCM Sprint"
+            )));
+        }
+        let steps = req
+            .steps
+            .unwrap_or(crate::pipeline::DEFAULT_STEPS as u32)
+            .max(1) as usize;
+        let native = crate::pipeline::sana_sigmas(req.scheduler.as_deref(), steps);
+        let full_sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            crate::pipeline::SCHEDULE_SHIFT.ln(),
+            steps,
+            &native,
+        )
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+        let start_step = match resolve_reference(req, id)? {
+            Some((_, strength)) => crate::pipeline::init_time_step(steps, Some(strength)),
+            None => 0,
+        };
+        let sigmas = &full_sigmas[start_step.min(full_sigmas.len().saturating_sub(1))..];
+        let executed_steps = sigmas.len().saturating_sub(1);
+        low_res.resolve_for_descriptor(desc, req, executed_steps, RES_MULTIPLE)?;
+    }
     Ok(())
+}
+
+/// Compile a weights-free [`gen_core::RenderPlan`] for Candle SANA-1.6B (`sana_1600m`).
+pub fn compile_trajectory_for(
+    desc: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    if desc.id == SPRINT_MODEL_ID {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: RenderPlan compilation is not supported on continuous-time consistency SCM Sprint (ENG-5)",
+            desc.id
+        )));
+    }
+    validate_request(desc, req)?;
+    let steps = req
+        .steps
+        .unwrap_or(crate::pipeline::DEFAULT_STEPS as u32)
+        .max(1) as usize;
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let native = crate::pipeline::sana_sigmas(req.scheduler.as_deref(), steps);
+    let full_sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        crate::pipeline::SCHEDULE_SHIFT.ln(),
+        steps,
+        &native,
+    )
+    .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let start_step = match resolve_reference(req, desc.id)? {
+        Some((_, strength)) => crate::pipeline::init_time_step(steps, Some(strength)),
+        None => 0,
+    };
+    let sigmas = full_sigmas[start_step.min(full_sigmas.len().saturating_sub(1))..].to_vec();
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = req
+        .true_cfg
+        .or(req.guidance)
+        .unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: RES_MULTIPLE,
+        token_width: 32,
+        sampler: solver.name(),
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    if req.conditioning.is_empty() {
+        gen_core::RenderPlan::base_image(desc, req, pass)
+    } else {
+        gen_core::RenderPlan::packed_image_trajectory(desc, req, pass)
+    }
+}
+
+/// Pre-load [`gen_core::RenderPlanRegistration`] compiler for Candle `sana_1600m`.
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Msg(
+            "sana_1600m expects a snapshot directory (transformer/ vae/ text_encoder/ tokenizer/), not a single .safetensors file"
+                .into(),
+        ));
+    }
+    if let Some(quant) = spec.quantize {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle sana_1600m has no packed {quant:?} route; only the immutable dense checkpoint is executable"
+        )));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "candle sana_1600m does not support LoRA/LoKr adapters yet".into(),
+        ));
+    }
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
+        return Err(gen_core::Error::Unsupported(
+            "candle sana_1600m supports plain txt2img and singular-reference img2img, not control / IP-adapter overlays"
+                .into(),
+        ));
+    }
+    compile_trajectory_for(&descriptor(), req).map(|plan| Some(plan.bind_load(spec)))
 }
 
 /// Resolve the single non-edit img2img reference and the common effective strength.
@@ -376,12 +498,16 @@ fn generate_base_images(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> gen_core::Result<Vec<Image>> {
     let reference = resolve_reference(req, MODEL_ID)?;
     let (init_image, strength) = reference
         .map(|(image, strength)| (Some(image), Some(strength)))
         .unwrap_or((None, None));
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let steps = req.steps.map(|s| s as usize);
     let guidance_scale = req.true_cfg.or(req.guidance);
     candle_gen::execution::policy(
@@ -390,27 +516,33 @@ fn generate_base_images(
     );
     let guidance = guidance_scale.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
     candle_gen::execution::policy("sana/model/guidance", format!("{guidance:?}").into());
-    let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-        pipeline
-            .encode_batch(
-                &SanaGenerateRequest {
-                    prompt: &req.prompt,
-                    negative_prompt: req.negative_prompt.as_deref(),
-                    height: req.height,
-                    width: req.width,
-                    steps,
-                    guidance_scale,
-                    seed: None,
-                    sampler: req.sampler.as_deref(),
-                    scheduler: req.scheduler.as_deref(),
-                    scheduler_shift: req.scheduler_shift,
-                    init_image,
-                    strength,
-                },
-                guidance,
-            )
-            .map_err(gen_core::Error::from)
-    })?;
+    let mut encode_prompt = || {
+        candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            pipeline
+                .encode_batch(
+                    &SanaGenerateRequest {
+                        prompt: &req.prompt,
+                        negative_prompt: req.negative_prompt.as_deref(),
+                        height: req.height,
+                        width: req.width,
+                        steps,
+                        guidance_scale,
+                        seed: None,
+                        sampler: req.sampler.as_deref(),
+                        scheduler: req.scheduler.as_deref(),
+                        scheduler_shift: req.scheduler_shift,
+                        init_image,
+                        strength,
+                    },
+                    guidance,
+                )
+                .map_err(gen_core::Error::from)
+        })
+    };
+    let conditioning = match run {
+        Some(run) => run.encode(encode_prompt)?,
+        None => encode_prompt()?,
+    };
     let prepared_reference = pipeline
         .prepare_reference(
             &SanaGenerateRequest {
@@ -429,10 +561,14 @@ fn generate_base_images(
             },
             device,
             &req.cancel,
+            run,
         )
         .map_err(gen_core::Error::from)?;
+    if let Some(run) = run {
+        run.begin_rendering()?;
+    }
 
-    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+    let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         pipeline
             .render_seed(
                 &SanaGenerateRequest {
@@ -456,9 +592,14 @@ fn generate_base_images(
                 on_progress,
                 preview,
                 req.memory,
+                run,
             )
             .map_err(gen_core::Error::from)
-    })
+    })?;
+    if let Some(run) = run {
+        run.finish_rendering();
+    }
+    Ok(images)
 }
 
 impl Generator for SanaGenerator {
@@ -468,6 +609,16 @@ impl Generator for SanaGenerator {
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture(self, req, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {})
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
@@ -506,13 +657,36 @@ impl Generator for SanaGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("SANA render produced no images".into()))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_trajectory_for(&self.descriptor, req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume(req)?;
         self.load_seal.ensure_unchanged()?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let preview = crate::preview::base_hook(&req.preview);
         let images = if req.memory.is_some_and(|memory| memory.stage_residency) {
             let resident = candle_gen::lock_recover(&self.pipeline).take();
@@ -524,7 +698,7 @@ impl Generator for SanaGenerator {
             let (init_image, strength) = reference
                 .map(|(image, strength)| (Some(image), Some(strength)))
                 .unwrap_or((None, None));
-            let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+            let base_seed = plan.base_seed();
             let seeds = (0..req.count)
                 .map(|index| base_seed.wrapping_add(index as u64))
                 .collect::<Vec<_>>();
@@ -552,13 +726,23 @@ impl Generator for SanaGenerator {
                 on_progress,
                 &preview,
                 || self.load_seal.ensure_unchanged(),
+                Some(&run),
             )
             .map_err(gen_core::Error::from)?
         } else {
             let pipeline = self.pipeline()?;
-            generate_base_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?
+            generate_base_images(
+                pipeline.as_ref(),
+                req,
+                &self.device,
+                on_progress,
+                &preview,
+                Some(&run),
+            )?
         };
-        Ok(GenerationOutput::Images(images))
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.low_res_start = plan.low_res_start_execution_report("f32", 4, "base_dit")?;
+        Ok(report)
     }
 }
 
@@ -891,6 +1075,12 @@ candle_gen::register_generators! {
     pub(crate) const SPRINT_REGISTRATION = sprint_descriptor => load_sprint
 }
 
+pub const BASE_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: MODEL_ID,
+        compile: compile_render_plan,
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,7 +1179,7 @@ mod tests {
         ] {
             let staged = braced_item(source, marker);
             let fanout = staged
-                .find("for seed in seeds {")
+                .find("for (index, seed) in seeds.iter().enumerate() {")
                 .ok_or_else(|| format!("{marker} lost the production seed fanout"))?;
             let (request_preamble, seed_tail) = staged.split_at(fanout);
             if request_preamble.matches("encode_init_latents(").count() != 1
@@ -1010,8 +1200,8 @@ mod tests {
             item.replacen("encode_init_latents(", "deferred_reference_encode(", 1);
         assert_ne!(item, without_preamble_encode);
         let moved = without_preamble_encode.replacen(
-            "for seed in seeds {",
-            "for seed in seeds {\n        let _moved = encode_init_latents(",
+            "for (index, seed) in seeds.iter().enumerate() {",
+            "for (index, seed) in seeds.iter().enumerate() {\n        let _moved = encode_init_latents(",
             1,
         );
         assert_ne!(without_preamble_encode, moved);
@@ -1105,6 +1295,7 @@ mod tests {
             req: &SanaGenerateRequest<'_>,
             _device: &Device,
             _cancel: &gen_core::CancelFlag,
+            _run: Option<&gen_core::RenderRun<'_, '_>>,
         ) -> candle_gen::Result<Option<Self::PreparedReference>> {
             if req.init_image.is_some() && req.strength.unwrap_or(0.0) > 0.0 {
                 let call = self.reference_encoder_calls.get() + 1;
@@ -1125,6 +1316,7 @@ mod tests {
             _on_progress: &mut dyn FnMut(Progress),
             _preview: &candle_gen::preview::PreviewHook<'_>,
             _memory: Option<gen_core::GenerationMemory>,
+            _run: Option<&gen_core::RenderRun<'_, '_>>,
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
@@ -1238,6 +1430,7 @@ mod tests {
                 phases.push(phase);
             },
             &inert_hook(&inert),
+            None,
         )
         .unwrap();
 
@@ -1292,6 +1485,7 @@ mod tests {
             &Device::Cpu,
             &mut |_| {},
             &inert_hook(&inert),
+            None,
         )
         .unwrap();
 
@@ -1415,6 +1609,7 @@ mod tests {
             &Device::Cpu,
             &mut |_| {},
             &inert_hook(&inert),
+            None,
         )
         .unwrap();
         generate_base_images(
@@ -1423,6 +1618,7 @@ mod tests {
             &Device::Cpu,
             &mut |_| {},
             &inert_hook(&inert),
+            None,
         )
         .unwrap();
         generate_base_images(
@@ -1431,6 +1627,7 @@ mod tests {
             &Device::Cpu,
             &mut |_| {},
             &inert_hook(&inert),
+            None,
         )
         .unwrap();
         assert_eq!(base.reference_encoder_calls.get(), 2);
@@ -1781,5 +1978,63 @@ mod tests {
                 .id,
             "sana_sprint_1600m"
         );
+    }
+
+    #[test]
+    fn tier0_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{FeatureInapplicabilityCode, LowResStartSpec};
+
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/sana".into()));
+
+        // T2I with low_res_start on sana_1600m compiles a two-phase RenderPlan
+        let mut t2i = req(1024, 1024);
+        t2i.steps = Some(10);
+        t2i.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &t2i)
+            .unwrap()
+            .expect("sana_1600m compiles a RenderPlan");
+        assert_eq!(plan.denoise_spans(), vec![0..4, 4..10]);
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        let lrs = plan.low_res_start().expect("low_res_start plan resolved");
+        assert_eq!(lrs.k, 4);
+        assert_eq!(lrs.executed_steps, 10);
+        assert_eq!(lrs.low_width, 512);
+        assert_eq!(lrs.low_height, 512);
+        assert_eq!(lrs.full_width, 1024);
+        assert_eq!(lrs.full_height, 1024);
+
+        // Plain img2img with low_res_start on sana_1600m truncates schedule and compiles two phases
+        let mut i2i = t2i.clone();
+        i2i.conditioning = vec![Conditioning::Reference {
+            image: reference_image(),
+            strength: Some(0.6),
+        }];
+        i2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        let i2i_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &i2i)
+            .unwrap()
+            .expect("sana_1600m img2img compiles a RenderPlan");
+        assert_eq!(i2i_plan.denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(i2i_plan.phase_output_size(0), (512, 512));
+        assert_eq!(i2i_plan.phase_output_size(1), (1024, 1024));
+
+        // Feature applicability: sana_1600m supports low_res_start; sana_sprint_1600m (ENG-5) refuses
+        let base_app = registry
+            .route_feature_applicability(MODEL_ID)
+            .expect("base route applicability");
+        assert!(base_app["low_res_start"].applicable);
+
+        let sprint_app = registry
+            .route_feature_applicability(SPRINT_MODEL_ID)
+            .expect("sprint route applicability");
+        assert!(!sprint_app["low_res_start"].applicable);
+        assert!(sprint_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingRenderPlan));
+        assert!(validate_request(&sprint_descriptor(), &t2i).is_err());
     }
 }
