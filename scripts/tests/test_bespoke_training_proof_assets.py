@@ -1,6 +1,7 @@
 """Metadata-only exact source asset binding tests; no model inputs are loaded."""
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 import yaml
 from unittest.mock import patch
@@ -45,12 +46,20 @@ class BespokeTrainingAssets(unittest.TestCase):
         self.assertIn('--request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%"', command)
         self.assertLess(command.index('model_inference_proofs.py --plan'), command.index('if errorlevel 1 exit'))
         self.assertLess(command.index('if errorlevel 1 exit'), command.index('prepare_bespoke_training_proof_assets.py'))
+        # The hash-pinned huggingface_hub a missing input is downloaded with reaches the setup in-process.
+        self.assertLess(command.index('set "PROOF_HF_HUB_PATH='), command.index('prepare_bespoke_training_proof_assets.py'))
 
     def test_base_sources_are_exact_installed_revisions(self):
+        manifest = Path(__file__).resolve().parents[2] / "release/real-weight-models.toml"
+        models = {row["key"]: row for row in tomllib.loads(manifest.read_text(encoding="utf-8"))["models"]}
         for bindings in assets.BESPOKE_TRAINING_PROOFS.values():
-            for name,path in bindings.items():
-                self.assertIn("snapshots",path.parts)
-                self.assertEqual(len(path.parts[path.parts.index("snapshots")+1]),40)
+            for name,item in bindings.items():
+                model = models[item.model]
+                self.assertRegex(model["revision"], r"^[0-9a-f]{40}$")
                 self.assertIn(name,assets.REQUIRED_FILES)
+                # The metadata admission's files are inside the row's verified slice.
+                prefix = item.path + "/" if item.path else ""
+                for relative in assets.REQUIRED_FILES[name]:
+                    self.assertIn(prefix + relative, model["expected_files"])
 
 if __name__ == "__main__": unittest.main()

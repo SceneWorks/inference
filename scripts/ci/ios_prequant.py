@@ -30,6 +30,8 @@ _hub_spec = importlib.util.spec_from_file_location(
     "pinned_hub_source", Path(__file__).with_name("pinned_hub_source.py"))
 _hub = importlib.util.module_from_spec(_hub_spec)
 _hub_spec.loader.exec_module(_hub)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.release.ensure_model_snapshot import runner_hub_cache  # noqa: E402
 
 GIB = 1024**3
 MIB = 1024**2
@@ -71,6 +73,37 @@ def source_for(route, cache_root):
     return name, f"{owner}/{repo}@{revision}", source
 
 
+def download_patterns(name):
+    """The repository paths a route reads; `None` fetches the whole pinned revision."""
+    owner, repo, revision, suffix = PINS[name]
+    if name == "anima-turbo":
+        return [f"{suffix}/{path}" for path in ("diffusion_models/anima-turbo-v1.0.safetensors",
+                                                 "text_encoders/qwen_3_06b_base.safetensors",
+                                                 "vae/qwen_image_vae.safetensors")]
+    if name == "iris-generation":
+        # The repository root holds the generation model; `depth/` and `upscaler/` (~24 GB more)
+        # belong to other routes.
+        return ["config.yaml", "model.safetensors"]
+    return [f"{suffix}/*"] if suffix else None
+
+
+def materialize_source(name, cache, download=None):
+    """Fetch a route's pinned source through the runner's hub cache and prove the slice complete.
+
+    Runs on every dispatch: a complete cached slice costs only Hub metadata calls, and a slice an
+    interrupted earlier run left partial is repaired instead of being converted as found.
+    """
+    owner, repo, revision, _ = PINS[name]
+    if download is None:
+        hub_path = os.environ.get("IOS_PREQUANT_HF_HUB_PATH", "")
+        if hub_path:
+            sys.path.insert(0, hub_path)
+        from scripts.release.ensure_model_snapshot import download_to_runner_cache as download
+    print(f"materializing {owner}/{repo}@{revision} through the runner's hub cache {cache}", flush=True)
+    return download(repo_id=f"{owner}/{repo}", revision=revision,
+                    allow_patterns=download_patterns(name), token=False, cache=cache)
+
+
 def header_rows(path):
     """Bound each header read; payload checksums are streamed only after admission."""
     files = sorted(path.rglob("*.safetensors")) if path.is_dir() else [path]
@@ -95,17 +128,20 @@ def header_rows(path):
     return rows
 
 
-def input_headers(name, source):
+def input_paths(name, source):
     if name == "anima-turbo":
-        paths = [source / "diffusion_models/anima-turbo-v1.0.safetensors",
-                 source / "text_encoders/qwen_3_06b_base.safetensors",
-                 source / "vae/qwen_image_vae.safetensors"]
-    elif name.startswith("sana-"):
-        paths = [source / "transformer", source / "text_encoder"]
-    elif name == "iris-text-encoder":
-        paths = [source]
-    else:
-        paths = [source / "model.safetensors"]
+        return [source / "diffusion_models/anima-turbo-v1.0.safetensors",
+                source / "text_encoders/qwen_3_06b_base.safetensors",
+                source / "vae/qwen_image_vae.safetensors"]
+    if name.startswith("sana-"):
+        return [source / "transformer", source / "text_encoder"]
+    if name == "iris-text-encoder":
+        return [source / "model.safetensors.index.json"]
+    return [source / "model.safetensors"]
+
+
+def input_headers(name, source):
+    paths = [source] if name == "iris-text-encoder" else input_paths(name, source)
     return [row for path in paths for row in header_rows(path)]
 
 
@@ -326,8 +362,8 @@ def main():
     try:
         binding = parse_binding(os.environ["IOS_PREQUANT_BINDING"])
         receipt["binding"] = binding
-        if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or os.environ.get("RUNNER_NAME") != "nax-macos":
-            raise ValueError("requires manual dispatch on primary nax-macos")
+        if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise ValueError("requires manual dispatch")
         if os.environ.get("GITHUB_SHA") != binding["source_sha"]:
             raise ValueError("dispatch ref differs from frozen source")
         if platform.system() != "Darwin" or platform.machine() != "arm64":
@@ -337,12 +373,12 @@ def main():
             raise ValueError("checkout differs from frozen source")
         if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo, text=True).strip():
             raise ValueError("checkout is dirty")
-        cache = Path.home() / ".cache/huggingface/hub"
-        if not cache.is_dir():
-            raise ValueError("provisioned Hugging Face cache missing")
+        # The runner's own hub cache: HF_HUB_CACHE, else $HF_HOME/hub, else the fleet root.
+        cache = runner_hub_cache()
         name, source_revision, source = source_for(binding["route"], cache)
+        materialize_source(name, cache)
         if not source.is_dir():
-            raise ValueError(f"pinned source missing: {source}")
+            raise ValueError(f"pinned source missing after download: {source}")
         receipt.update(source_revision=source_revision, source=str(source),
                        cache_realpath=str(cache.resolve()))
         headers = input_headers(name, source)

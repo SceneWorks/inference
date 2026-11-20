@@ -15,50 +15,39 @@ name: Real-weight validation
 # edit here — which is the point, because the placement below is a disk-budget decision that will
 # keep moving, and it should not cost a workflow PR each time.
 #
-#   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos-2
-#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos-2
+#   LABEL       WEIGHT SET                                          ON DISK
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB
+#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
-#   rw-mage     Qwen-Image-2.1 bf16 + the q8/q4 re-host            ~66 GB    nax-macos-2
+#   rw-mage     Qwen-Image-2.1 bf16 + the q8/q4 re-host            ~66 GB
 #               (dispatch-only `mlx-qwen-image-2-1`; estimated, unmeasured)  (sc-24163)
-#   rw-mage     FLUX 3 Image Klein distilled package (gated;          ~20 GB    nax-macos-2
+#   rw-mage     FLUX 3 Image Klein distilled package (gated;          ~20 GB
 #               dispatch-only `mlx-flux3-klein`, materialized per run)  (sc-26234)
-#   rw-mage     MiniMax-H3 upstream slice: vae/ + audio_vae/ +        ~10.8 GiB BOTH boxes
+#   rw-mage     MiniMax-H3 upstream slice: vae/ + audio_vae/ +        ~10.8 GiB
 #               FL2VA/audio_vae/ + tokenizer/ + the TE shard index,
 #               PLUS the ~840 KB operator diffusers VAE reference
 #               (`MINIMAX_H3_VIDEO_VAE_REFERENCE`)  (sc-18932)
-#   rw-sa3      Stable Audio 3 / SAME + F3 Krea q4 base cache        pinned    nax-macos
-#   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
-#   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
-#   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB   nax-macos-2
-#   rw-chroma   none stored; materializes from the Hub per run       ~0        BOTH boxes
-#   rw-starvector StarVector 1B + 8B terminal snapshots              ~19 GiB   nax-macos
+#   rw-sa3      Stable Audio 3 / SAME + F3 Krea q4 base cache        pinned
+#   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB
+#   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB
+#   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB
+#   rw-chroma   none pinned; fetched once into the runner HF cache    unmeasd.
+#   rw-starvector second route for the MLX 2.1 LoRA dispatch input   ~0
+#   nax         route label for snapshot-free fixtures and proofs     ~0
 #
-# `qwen38-bonsai-mlx` is the one campaign-local exception to this reusable weight-set scheme.
-# It is dispatch-only, selects the exact `nax` runner capability, verifies `runner.name ==
-# 'nax-macos'`, and then binds two SC-23935 preserved snapshot aliases before qualification. Those
-# frozen campaign paths are not a portable weight set, so assigning them a permanent `rw-*` label
-# would misrepresent their lifecycle. StarVector remains on `rw-starvector` because its terminal
-# snapshots are a reusable provisioned set. The workflow-policy tests pin every part of this
-# exception and continue to reject `real-weights` on every other macOS job.
-#
-# `rw-chroma` carries no stored bytes, so it is registered on both boxes and its jobs land on
-# whichever is free — verified 2026-08-04 by mapping `runner_name` across the last 40 runs, where
-# all three `Chroma packed auxiliaries` matrix legs are observed on `nax-macos` AND `nax-macos-2`.
-# This row read `nax-macos-2` until then, which understated the contention it adds to that box.
+# NO JOB CHECKS WHICH MAC IT LANDED ON. The two macOS runners are hardware-identical and
+# interchangeable: which box carries a label is an operator setting, and the `runs-on` labels are
+# the only placement mechanism. Since SW-F375 every job downloads a missing pinned snapshot into
+# the runner's Hugging Face cache, so a label no longer has to follow stored bytes. Evidence may
+# record `RUNNER_NAME` as provenance; nothing compares it to a machine name
+# (scripts/tests/test_no_mac_runner_name_checks.py).
 #
 # ON DISK is GiB as `du -sh` reports it, summed over each set's `models--*` repo directories.
-# MEASURED 2026-08-03 (sc-17271); previously these were arithmetic, and rw-audio was carrying a
-# ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
-# measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
+# MEASURED 2026-08-03 (sc-17271). If you edit a row, measure it — and say which unit, because
+# 42 GiB and 45 GB are the same number of bytes.
 #
-# `rw-mage` is currently registered only on `nax-macos-2`, verified from the live org runner
-# inventory on 2026-08-11. It had previously been registered on both boxes, so do not infer the
-# current pool from historical job placement. The label remains the placement mechanism; moving it
-# is an operator action and does not require a workflow edit.
-#
-# The invariant that makes such a move safe is the oracle bundle. `MAGE_ORACLE_SEED_DIR` is
+# The invariant that makes moving `rw-mage` safe is the oracle bundle. `MAGE_ORACLE_SEED_DIR` is
 # `~/Library/Application Support/SceneWorks/oracles/sc-14052-mage-flow` — a `~/`-relative value
 # resolved per-runner by `resolve_snapshot_paths.py`, so it is ONE setting naming a DIFFERENT
 # directory on each box. It exists on no Hub and this workflow deliberately refuses to regenerate it
@@ -79,11 +68,11 @@ name: Real-weight validation
 # enforcement: it fails closed with a named error on a cache miss, so a box that quietly loses its
 # copy surfaces as a red `mlx-media`, never a wrong oracle.
 
-# `rw-sa3` materializes its SA3/SAME rows into `RUNNER_TEMP`, but SC-18315 also uses that label to
-# select `nax-macos`, where the large F3 Krea q4 base is operator-provisioned. The lane materializes
-# the manifest-pinned Krea license and standalone Wan z16 donor itself, then verifies the donor's
-# fixed SHA-256. Moving the label requires moving the q4 base and preserving Hub access. It also
-# needs the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
+# `rw-sa3` materializes its SA3/SAME rows into the runner's Hugging Face cache. SC-18315 also needs
+# the large F3 Krea q4 base operator-provisioned on whichever box carries the label. The lane
+# materializes the manifest-pinned Krea license and standalone Wan z16 donor itself, then verifies
+# the donor's fixed SHA-256. Moving the label requires moving the q4 base and preserving Hub access.
+# It also needs the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
 #
 # The sc-17284 Qwen/FLUX set is the largest row here and it transferred almost nothing: all of it
 # but the two ~0.85 GB Lightning LoRAs was already resident. "Already there" is still not "free" —
@@ -92,12 +81,6 @@ name: Real-weight validation
 # gains `media-macos`. Measured 2026-08-04 with `du -sh` over the nine `models--*` repo dirs on
 # `nax-macos`; the two scheduled jobs consume ~131 GiB of that (`q4` is stored, no wired test
 # selects it).
-#
-# THE TWO BOXES ARE NOT EQUALLY TIGHT, so read that cost per host. `nax-macos` is the 98% box
-# (sc-17271). `nax-macos-2` reported 1.0 TiB free at 45% capacity on 2026-08-05, with the 85 GiB
-# `qwen-image-mlx` re-host already resident there too — measured by this lane's own
-# `report_runner_disk_headroom.sh` step, which is what that step is for. The other six models in
-# the set are NOT confirmed on `nax-macos-2`; a job landing there materializes whatever is missing.
 #
 # A LABEL NO RUNNER CARRIES DOES NOT FAIL — IT QUEUES, SILENTLY, UNTIL THE RUN IS CANCELLED.
 # Retiring a box means moving its labels first.
@@ -110,8 +93,8 @@ name: Real-weight validation
 # Apple's system Python 3.9. pip on 3.9 does not report the mismatch as a version problem: it
 # filters the whole reviewed set out of the candidate list and calls the pin nonexistent
 # ("No matching distribution found for anyio==4.14.2", or click==8.4.2 against an older lock).
-# That took out every rw-* job on nax-macos-2 on 2026-08-03, hours after the split above first
-# routed twelve jobs onto a box whose `python3` is 3.9.6.
+# That took out every rw-* job on one box on 2026-08-03, hours after a label split first routed
+# twelve jobs onto a box whose `python3` is 3.9.6.
 #
 # The `PYTHONPATH=… python3.12 scripts/release/…` lines are load-bearing for the same reason one
 # stage later: they import the tree the pip step installed, so they must be the same interpreter
@@ -131,7 +114,7 @@ on:
   workflow_dispatch:
     inputs:
       qwen_image_2_1_lora_runner:
-        description: "MLX 2.1 LoRA host: rw-mage (second Mac) or rw-starvector (primary Mac)"
+        description: "MLX 2.1 LoRA runner label: rw-mage or rw-starvector"
         type: choice
         required: false
         default: rw-mage
@@ -396,6 +379,14 @@ concurrency:
 # sc-17057's scope, and they stay unchanged here rather than being guessed down (sc-16981).
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+  # rust-lang/rust#157750: a fresh macOS build strips host proc-macro dylibs into E0463
+  # ("can't find crate for `*_derive`"), so keep every profile and its build overrides unstripped.
+  CARGO_PROFILE_DEV_STRIP: none
+  CARGO_PROFILE_TEST_STRIP: none
+  CARGO_PROFILE_RELEASE_STRIP: none
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
 
 jobs:
   validate-selection:
@@ -426,10 +417,9 @@ jobs:
       CARGO_PROFILE_DEV_STRIP: 'false'
       CARGO_PROFILE_TEST_STRIP: 'false'
     steps:
-      - name: Require the isolated capture host before checkout or compilation
+      - name: Require a manual dispatch before checkout or compilation
         shell: bash
         run: |
-          [[ "$RUNNER_NAME" == nax-macos-2 ]]
           [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           command -v python3.12 >/dev/null
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -459,17 +449,14 @@ jobs:
     env:
       SOURCE_SHA: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
       SOURCE_MANIFEST_SHA256: ${{ fromJSON(inputs.ios_pricing_compile_binding).manifest_sha256 }}
-      COMPILE_HOST: ${{ fromJSON(inputs.ios_pricing_compile_binding).host }}
       COMPILE_PHASE: ${{ fromJSON(inputs.ios_pricing_compile_binding).phase || 'compile-only' }}
     steps:
-      - name: Require immutable source and non-dev-Mac placement before checkout/build
+      - name: Require immutable source before checkout/build
         shell: bash
         run: |
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
-          [[ "$COMPILE_HOST" == second-mac ]]
           [[ "$COMPILE_PHASE" == compile-only || "$COMPILE_PHASE" == compile-host || "$COMPILE_PHASE" == prerequisite-probe ]]
-          [[ "$RUNNER_NAME" == nax-macos-2 ]]
           command -v python3.12 >/dev/null || { echo "::error::Preinstalled Python3.12 required; no provisioning"; exit 1; }
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -512,17 +499,16 @@ jobs:
   ios-prequant:
     needs: validate-selection
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'
-    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    runs-on: [self-hosted, macOS, ARM64, nax, rw-chroma]
     timeout-minutes: 540
     env:
       IOS_PREQUANT_BINDING: ${{ inputs.ios_pricing_compile_binding }}
       SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
       MACOSX_DEPLOYMENT_TARGET: '26.2'
     steps:
-      - name: Require primary Mac before checkout
+      - name: Require Python 3.12 before checkout
         shell: bash
         run: |
-          [[ "$RUNNER_NAME" == nax-macos ]]
           command -v python3.12 >/dev/null
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -538,6 +524,9 @@ jobs:
             [[ "$rc" == 1 ]] || exit "$rc"
             echo 'IOS_PREQUANT_NATIVE_MODE=source' >> "$GITHUB_ENV"
           fi
+      - name: Install the pinned Hugging Face client for a missing source
+        shell: bash
+        run: source scripts/ci/real-weights/ios-prequant/install-the-pinned-hugging-face-client-for-a-missing-source.sh
       - name: Convert one pinned CPU tier with external limits
         shell: bash
         run: python3.12 -I scripts/ci/ios_prequant.py
@@ -599,7 +588,6 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
         run: source scripts/ci/real-weights/mlx-chroma-auxiliary/materialize-the-exact-shipped-bf16-source.sh
       - name: Build and validate packed q4/q8 tiers
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
@@ -608,7 +596,6 @@ jobs:
           SC16462_OUT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PACKED_ROOT: ${{ runner.temp }}/chroma-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PAYLOAD_MANIFEST: ${{ runner.temp }}/chroma-sc16462-payload-sha256.json
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-chroma-sc16462
         run: source scripts/ci/real-weights/mlx-chroma-auxiliary/build-and-validate-packed-q4-q8-tiers.sh
 
@@ -671,7 +658,6 @@ jobs:
           path: ${{ runner.temp }}/chroma-sc16462-validated-${{ matrix.model }}
       - name: Rebuild the validated payload from the immutable source
         env:
-          CHROMA_SNAPSHOT: ${{ runner.temp }}/chroma-publish-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_BUILT: ${{ runner.temp }}/chroma-publish-built-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_PACKED: ${{ runner.temp }}/chroma-publish-packed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           CHROMA_VALIDATED_MANIFEST: ${{ runner.temp }}/chroma-sc16462-validated-${{ matrix.model }}/chroma-sc16462-payload-sha256.json
@@ -729,7 +715,6 @@ jobs:
       - name: Materialize exact Kolors q4 snapshot
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-kolors-${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-kolors/materialize-exact-kolors-q4-snapshot.sh
       - name: Run production-latent quality admission
         env:
@@ -813,7 +798,6 @@ jobs:
       - name: Materialize exact SDXL-family q4 snapshot
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-sdxl/materialize-exact-sdxl-family-q4-snapshot.sh
       - name: Run production-latent quality admission
         env:
@@ -882,7 +866,6 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-chroma/materialize-exact-chroma-q4-snapshot.sh
       - name: Run production-latent quality admission
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
@@ -984,8 +967,8 @@ jobs:
         run: rustc --version && cargo --version && python3.12 --version
       # No `report_runner_disk_headroom.sh` step here, deliberately. That script reports on the
       # `~/`-relative snapshot VARIABLES a lane resolves through `resolve_snapshot_paths.py`, and
-      # this lane resolves none: like `chroma-auxiliary`, `rw-chroma` stores no Chroma bytes and
-      # materializes into `runner.temp` from the Hub per run. Reporting headroom without a
+      # this lane resolves none: like `chroma-auxiliary`, it materializes through the runner's own
+      # Hugging Face cache rather than a resolved variable. Reporting headroom without a
       # resolved path is what `test_every_resolving_lane_reports_what_it_costs` forbids.
       #
       # Validate the dispatch inputs BEFORE the download, so a typo costs seconds rather than a
@@ -997,9 +980,6 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          # Step-level, not job-level: `runner.temp` in a job `env:` block is refused by
-          # `test_mage_media_lane_requires_verified_operator_cpu_oracles`.
-          CHROMA_LADDER_ROOT: ${{ runner.temp }}/chroma-ladder-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
         run: source scripts/ci/real-weights/mlx-chroma-memory-ladder/materialize-the-pinned-chroma-snapshot.sh
       - name: Run the memory ladder
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
@@ -1240,11 +1220,11 @@ jobs:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 10800 -- /bin/bash -e {0}
     name: StarVector terminal native-provider preflight (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'starvector-terminal'
-    runs-on: [self-hosted, macOS, ARM64, rw-starvector]
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
     timeout-minutes: 180
     env:
-      STARVECTOR_1B_SNAPSHOT: /Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b
-      STARVECTOR_8B_SNAPSHOT: /Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b
+      STARVECTOR_1B_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-1b-im2svg/snapshots/380ab95d25a8e9ab1dc825debe238b4953ae13b9
+      STARVECTOR_8B_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--starvector--starvector-8b-im2svg/snapshots/518beea8dcb5f7a37c5911e92d1d62a76beee7f9
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate immutable terminal corpus and receipt contract
@@ -1260,6 +1240,8 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
+      - name: Materialize exact native snapshots in the runner cache
+        run: source scripts/ci/real-weights/starvector-terminal-mlx/materialize-exact-native-snapshots-in-the-runner-cache.sh
       - name: Verify pre-provisioned exact native snapshots
         env:
           STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal-mlx
@@ -1283,8 +1265,8 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 180
     env:
-      STARVECTOR_1B_SNAPSHOT: D:\\sceneworks-terminal\\weights\\models\\starvector-1b
-      STARVECTOR_8B_SNAPSHOT: D:\\sceneworks-terminal\\weights\\models\\starvector-8b
+      STARVECTOR_1B_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--starvector--starvector-1b-im2svg\snapshots\380ab95d25a8e9ab1dc825debe238b4953ae13b9
+      STARVECTOR_8B_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--starvector--starvector-8b-im2svg\snapshots\518beea8dcb5f7a37c5911e92d1d62a76beee7f9
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -1305,6 +1287,9 @@ jobs:
       - name: Install reviewed CPython 3.12
         shell: cmd
         run: call scripts\ci\real-weights\starvector-terminal-candle\install-reviewed-cpython-3-12.cmd
+      - name: Materialize exact native snapshots in the runner cache
+        shell: cmd
+        run: call scripts\ci\real-weights\starvector-terminal-candle\materialize-exact-native-snapshots-in-the-runner-cache.cmd
       - name: Verify pre-provisioned exact native snapshots
         shell: cmd
         run: call scripts\ci\real-weights\starvector-terminal-candle\verify-pre-provisioned-exact-native-snapshots.cmd
@@ -1334,7 +1319,7 @@ jobs:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: Qwen3.8/Bonsai matched diagnostics (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'
-    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    runs-on: [self-hosted, macOS, ARM64, nax, rw-llm]
     timeout-minutes: 360
     env:
       BONSAI_QWEN38_SNAPSHOT: ${{ vars.BONSAI_QWEN38_SNAPSHOT }}
@@ -1369,9 +1354,6 @@ jobs:
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
           BONSAI_QWEN38_SNAPSHOT BONSAI_MLX_SNAPSHOT BONSAI_GGUF_SNAPSHOT BONSAI_BASELINE_SNAPSHOT
-      - name: Select preserved local campaign snapshots
-        if: runner.name == 'nax-macos'
-        run: source scripts/ci/real-weights/qwen38-bonsai-mlx/select-preserved-local-campaign-snapshots.sh
       - name: Qualify configured macOS snapshot metadata without provisioning
         id: mlx_snapshot_metadata
         continue-on-error: true
@@ -2587,8 +2569,8 @@ jobs:
   # SC-18315 — correctness-only characterization of the experimental Wan z16 terminal decoder for
   # Krea 2. This is operator-dispatch only: it runs no weekly cadence, does not join `all`, and does
   # not collect memory, latency, GPU-counter, or calibration evidence. The large Krea q4 base is
-  # resident on `nax-macos`; its `rw-sa3` label selects that host, while the lane provisions the
-  # exact manifest-pinned license and standalone Wan z16 donor. The second NAX box's `rw-krea` set
+  # operator-provisioned on the box carrying `rw-sa3`, while the lane provisions the
+  # exact manifest-pinned license and standalone Wan z16 donor. The `rw-krea` set
   # is the unrelated complete Krea Realtime video model and does not include the Krea 2 image
   # snapshot. The executable itself asserts output coherence and native/Wan distinctness. A 512 px
   # run covers the normal native-default seam and a 768 px run forces multiple 512/64 decode tiles;
@@ -4869,7 +4851,7 @@ jobs:
     with:
       model: ${{ contains(inputs.profile, '-expander-') && 'expander' || 'describer' }}
       backend: ${{ contains(inputs.profile, '-candle') && 'candle' || 'mlx' }}
-      mac_runner: ${{ contains(inputs.profile, '-mlx-nax-macos-2') && 'nax-macos-2' || 'nax-macos' }}
+      mac_runner: ${{ contains(inputs.profile, '-mlx-nax-macos-2') && 'rw-llm' || 'rw-starvector' }}
       publish: ${{ !endsWith(inputs.profile, '-convert-only') }}
 
   # sc-24114 — Qwen-Image 2.1 real-weight evidence on candle/CUDA. DISPATCH-ONLY (`qwen-image-2-1`
@@ -5166,7 +5148,7 @@ jobs:
   # ~60 GB). DISPATCH-ONLY (`iris-depth-train-mlx` profile; never `all`, never the schedule, no
   # gate). `rw-chroma` stores nothing and materializes per run into `runner.temp`, so there is no
   # `~/` snapshot to resolve and no headroom report; the 12 GB export is downloaded in its own step,
-  # never during training. The machine check routes the run to nax-macos-2 only and skips the
+  # never during training. The host check skips the
   # training (with a warning) under 128 GB RAM or under 85 GB free by `memory_pressure` (free % ×
   # total RAM: the ~65 GB peak measured on CUDA + 20 GB headroom); the run is
   # wrapped in an external phys_footprint guard (SIGTERM at 80 GB or 20 min) that prints the peak.
@@ -5190,12 +5172,10 @@ jobs:
         if: steps.machine.outputs.ok == 'true'
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
         run: source scripts/ci/real-weights/mlx-iris-depth-train/materialize-the-pinned-depth-export.sh
       - name: Run the guarded depth full fine-tune
         if: steps.machine.outputs.ok == 'true'
         env:
-          IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
           IRIS_OUT: ${{ runner.temp }}/iris-depth-train-evidence
           # The test's temp root (its 12 GB export), applied to the test process only.
           IRIS_TMPDIR: ${{ runner.temp }}
@@ -5206,9 +5186,6 @@ jobs:
           # unstripped, as `mlx-qwen-image-2-1` does.
           CARGO_PROFILE_RELEASE_STRIP: "none"
         run: source scripts/ci/real-weights/mlx-iris-depth-train/run-the-guarded-depth-full-fine-tune.sh
-      - name: Remove the materialized export
-        if: always()
-        run: rm -rf "$RUNNER_TEMP"/iris-3b-*
       - name: Upload depth-training evidence
         if: always() && steps.machine.outputs.ok == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -5410,10 +5387,9 @@ jobs:
 
   # sc-24217 (epic sc-24212) — the Apple Silicon twin of `candle-supra2`: native Supra2-IMG on MLX
   # (Metal). DISPATCH-ONLY on the same `supra2` profile (never `all`, never the schedule), so one
-  # dispatch exercises both backends. `rw-llm` (nax-macos-2; small weight sets, not the dev Mac's
-  # `nax` label) materializes per run: the same three
+  # dispatch exercises both backends. `rw-llm` (small weight sets) materializes per run: the same three
   # revision pins (`supra2-img-cuda`, `flan-t5-base-cuda`, `sd-vae-ft-mse-cuda` — the keys are the
-  # pins, shared by both lanes) are materialized into the box's task-owned hub (~1.75 GB), converted
+  # pins, shared by both lanes) are materialized into the runner's Hugging Face cache (~1.75 GB), converted
   # by the install-time converter into RUNNER_TEMP (re-verifying every SHA-256), and the three
   # `#[ignore]`d `mlx-gen-supra2` real-weight tests run on the GPU against the committed torch
   # golden the Candle lane uses (`candle-gen-supra2/tests/fixtures/supra2_real_golden.safetensors`).
@@ -5491,9 +5467,8 @@ jobs:
   # (optionally `:lokr`); it is never fabricated. A failing test does not stop the rest -- every
   # verdict and all evidence is collected, then the lane reds at the end.
   #
-  # THE BOX. `rw-mage` is the Qwen-Image weight-set label and is registered only on `nax-macos-2`
-  # (Mac17,6, M5 Max, 128 GiB, Metal working set 107.52 GiB; ~1 TiB free when last measured), NOT
-  # on the 98%-full `nax-macos`. Phase 1 measured the 2048^2 bf16 render at a 43.8 GB allocator
+  # THE BOX. `rw-mage` is the Qwen-Image weight-set label (Mac17,6, M5 Max, 128 GiB, Metal working
+  # set 107.52 GiB). Phase 1 measured the 2048^2 bf16 render at a 43.8 GB allocator
   # envelope; this lane renders at 768^2 and trains at 512^2, and the dense-bf16 LoKr overlay adds
   # ~14 GB. The tests abort themselves above a 100 GB `phys_footprint` rather than risk the host.
   #
@@ -5508,8 +5483,8 @@ jobs:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 18000 -- /bin/bash -e {0}
     name: MLX Qwen-Image 2.1 LoRA/LoKr real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'
-    # Terminal recovery may select the primary Mac's unique rw-starvector label. Both Macs
-    # carry nax, so nax alone cannot reserve the idle primary. Keep this bounded to this profile.
+    # The dispatch input picks one of two weight-set labels; the label alone decides the Mac.
+    # Keep this bounded to this profile.
     runs-on: [self-hosted, macOS, ARM64, "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]
     timeout-minutes: 300
     permissions:
@@ -5611,7 +5586,6 @@ jobs:
         if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory'
         shell: bash
         run: |
-          [[ "$RUNNER_NAME" == "nax-macos-2" ]]
           cache_base="$HOME/sceneworks-rw-weights"
           [[ "$cache_base" == /* && -d "$cache_base" && ! -L "$cache_base" ]]
           status="$(python3.12 scripts/ci/qwen21_adapter_imports.py \
@@ -5654,7 +5628,6 @@ jobs:
         if: inputs.qwen_image_2_1_lora_runner == 'rw-mage' && inputs.qwen_image_2_1_lora_phase != 'probe' && inputs.qwen_image_2_1_lora_phase != 'current-diagnostic' && inputs.qwen_image_2_1_lora_phase != 'current-trajectory' && steps.qwen21_transfer_cache.outputs.hit == 'false'
         shell: bash
         run: |
-          [[ "$RUNNER_NAME" == "nax-macos-2" ]]
           cache_base="$HOME/sceneworks-rw-weights"
           python3.12 scripts/ci/qwen21_adapter_imports.py \
             --manifest scripts/ci/qwen21_adapter_imports.json \
@@ -5719,8 +5692,8 @@ jobs:
 
   # sc-25688 — the MLX restoration trainer on real weights. DISPATCH-ONLY (`iris-restore-mlx`
   # profile; never `all`, never the schedule; nothing is gated on its numbers). `rw-chroma` stores no
-  # bytes and is registered on both Macs, so the first step checks the host and SKIPS (with the reason
-  # in the log) unless it is nax-macos-2 with >= 128 GB of unified memory and no heavy memory pressure.
+  # bytes and may be registered on either Mac, so the first step checks the host and SKIPS (with the reason
+  # in the log) unless it has >= 128 GB of unified memory and no heavy memory pressure.
   # It materializes the `upscaler/` export and the three pinned training-only resources (OpenCLIP
   # ConvNeXt-XXL critic trunk, timm VGG16, LPIPS v0.1 heads) into the runner's hub, then runs, each
   # under an external phys_footprint guard: the pinned LPIPS-VGG and critic trunk against the
@@ -5749,7 +5722,7 @@ jobs:
       IRIS_LPIPS_LIN_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--vivym--lpips/snapshots/270571f1fb2a2c4c5f920cec96cd87838c345982
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Check the host (nax-macos-2, >= 128 GB, memory pressure)
+      - name: Check the host (>= 128 GB, memory pressure)
         run: source scripts/ci/real-weights/mlx-iris-restore-train/check-the-host.sh
       - name: Resolve runner-local snapshot paths
         if: env.IRIS_RESTORE_SKIP == '0'
@@ -5785,10 +5758,10 @@ jobs:
 
   # sc-25689 — the official curriculum on MLX real weights. DISPATCH-ONLY (`iris-curricula-mlx`
   # profile; never `all`, never the schedule; nothing is gated on its numbers). Same host rule as
-  # `mlx-iris-restore-train`: `rw-chroma` is registered on both Macs, so the first step SKIPS (with
-  # the reason in the log) unless it is nax-macos-2 with >= 128 GB of unified memory and no heavy
+  # `mlx-iris-restore-train`: `rw-chroma` may be registered on either Mac, so the first step SKIPS (with
+  # the reason in the log) unless it has >= 128 GB of unified memory and no heavy
   # memory pressure. It materializes the generation backbone (repo root), Qwen3-VL-4B and the frozen
-  # REPA teacher (`facebook/dinov2-base`) into the runner's task-owned hub, then runs, each under the
+  # REPA teacher (`facebook/dinov2-base`) into the runner's Hugging Face cache, then runs, each under the
   # external phys_footprint guard: the release teacher against the committed upstream tokens (cap
   # 20 GB, 15 min) and the bounded curriculum — the shipped `stage1_256` preset with REPA for two
   # steps, then `stage2_512` (bucket shapes, full activation checkpointing) continuing it as a
@@ -5813,7 +5786,7 @@ jobs:
       IRIS_REPA_TEACHER_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--facebook--dinov2-base/snapshots/f9e44c814b77203eaa57a6bdbbd535f21ede1415
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Check the host (nax-macos-2, >= 128 GB, memory pressure)
+      - name: Check the host (>= 128 GB, memory pressure)
         run: source scripts/ci/real-weights/mlx-iris-curricula-train/check-the-host.sh
       - name: Resolve runner-local snapshot paths
         if: env.IRIS_CURRICULA_SKIP == '0'
@@ -5849,8 +5822,8 @@ jobs:
 
   # sc-25690 — the epic-25678 terminal MEMORY measurement of Iris FULL fine-tuning on MLX.
   # DISPATCH-ONLY (`iris-memory-mlx` profile; never `all`, never the schedule; nothing is gated on
-  # its numbers). nax-macos-2 only (the first step FAILS on any other runner, before any build or
-  # GPU work). One `train_memory_probe` process per shape — generation 1024² with and without
+  # its numbers). The first step FAILS under 128 GB of unified memory, before any build or
+  # GPU work. One `train_memory_probe` process per shape — generation 1024² with and without
   # activation checkpointing, depth and restoration at 1024², then all three at 512², then depth
   # 1024² and restoration 512² / 1024² activation-checkpointed — each with
   # MLX's default buffer-cache limit and again with the cache disabled by the test — each under
@@ -5878,7 +5851,7 @@ jobs:
       IRIS_PROBE_EMULATED_STEPS: ${{ inputs.iris_memory_mlx_emulated_steps }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Check the host (nax-macos-2, >= 128 GB)
+      - name: Check the host (>= 128 GB)
         run: source scripts/ci/real-weights/mlx-iris-memory-probe/check-the-host.sh
       - name: Resolve runner-local snapshot paths
         run: >-
@@ -5909,9 +5882,8 @@ jobs:
           retention-days: 30
 
   # sc-26214 — the MLX Veda sparse-attention speed pass and its on-device exact-mask check.
-  # DISPATCH-ONLY (`veda-mlx` profile; never `all`, never the schedule). nax-macos-2 only: `rw-chroma`
-  # is registered on both Macs, so the first step FAILS on any other runner (or < 128 GB), before any
-  # build or GPU work. `veda_mlx_phase=device` runs every `#[ignore]`d `veda::device_gate::` test in
+  # DISPATCH-ONLY (`veda-mlx` profile; never `all`, never the schedule). `rw-chroma` may be registered
+  # on either Mac; the first step FAILS under 128 GB of unified memory, before any build or GPU work. `veda_mlx_phase=device` runs every `#[ignore]`d `veda::device_gate::` test in
   # `mlx-gen-minimax-h3`'s lib unit-test binary (Metal sparse kernel vs the exact dense mask, plus the
   # per-layer bench's `VEDA_BENCH` lines -> bench.jsonl) against the pinned Veda predictor; a filter
   # that matches nothing is red. `ab` renders the dev-Mac A/B cells c1-c3 (`veda_mlx_cells`) at q4
@@ -5942,7 +5914,7 @@ jobs:
       VEDA_MLX_CELLS: ${{ inputs.veda_mlx_cells }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Check the host (nax-macos-2, >= 128 GB) and the dispatch inputs
+      - name: Check the host (>= 128 GB) and the dispatch inputs
         run: source scripts/ci/real-weights/mlx-veda/check-the-host.sh
       - name: Resolve runner-local snapshot paths
         run: >-
@@ -5985,9 +5957,9 @@ jobs:
   # the pinned package at 64²) and ONE text-to-image render through the ordinary catalog route
   # (`provider_registry().load("flux3_klein")`, 1024² / 16 steps by default). DISPATCH-ONLY
   # (`flux3-klein-mlx` profile; never `all`, never the schedule; nothing is gated on its numbers).
-  # The host is the `rw-mage` weight set (nax-macos-2, which already stores the Qwen3-VL-4B
+  # The host is the `rw-mage` weight set (which already stores the Qwen3-VL-4B
   # snapshot the package's text encoder duplicates); the first step SKIPS with the reason when it
-  # has < 48 GB of unified memory or heavy memory pressure. The GATED package (FLUX Kommunity License) is materialized into the box's task-owned
+  # has < 48 GB of unified memory or heavy memory pressure. The GATED package (FLUX Kommunity License) is materialized into the runner's Hugging Face
   # hub through the runner's own Hugging Face credential (`requires_auth = true` on the manifest
   # row); each case runs under the external phys_footprint guard (cap 64 GB, 30 min). The PNG, its
   # JSON record and every case log go in the evidence artifact. Run-scoped CARGO_TARGET_DIR,
@@ -6458,16 +6430,21 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: command -v python3.12
-      - name: Verify pinned Iris quant snapshots on the secondary Mac
+      - name: Verify pinned Iris quant snapshots on macOS
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
         shell: bash
-        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          IRIS_PROOF_HF_HUB_PATH="$RUNNER_TEMP/huggingface-hub" python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
       - name: Verify pinned Iris quant snapshots on Windows
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
         shell: cmd
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "IRIS_PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda
       - name: Fetch same-run SenseNova reference receipt
         if: matrix.asset_setup == 'sensenova-loop'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

@@ -4,24 +4,22 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $env:PYTHONPATH = "$env:RUNNER_TEMP\huggingface-hub"
 @'
 import os
+import sys
 from pathlib import Path
-from huggingface_hub import snapshot_download
+sys.path.insert(0, "scripts/release")
+from ensure_model_snapshot import download_to_runner_cache, runner_hub_cache
 
+hub = runner_hub_cache()
 repo = os.environ["SCAIL2_REPOSITORY"]
 revision = os.environ["SCAIL2_REVISION"]
-root = Path(snapshot_download(
+root = download_to_runner_cache(
     repo_id=repo,
-    repo_type="model",
     revision=revision,
     allow_patterns=["bf16/**"],
-    cache_dir=Path(os.environ["USERPROFILE"]) / ".cache" / "huggingface" / "hub",
     token=False,
-    max_workers=4,
-)).resolve() / "bf16"
-expected = (
-    Path(os.environ["USERPROFILE"]) / ".cache" / "huggingface" / "hub" /
-    "models--SceneWorks--scail2-mlx" / "snapshots" / revision / "bf16"
-).resolve()
+    cache=hub,
+).resolve() / "bf16"
+expected = (hub / "models--SceneWorks--scail2-mlx" / "snapshots" / revision / "bf16").resolve()
 if root != expected:
     raise SystemExit(f"resolved unexpected SCAIL package path: {root} != {expected}")
 required = {

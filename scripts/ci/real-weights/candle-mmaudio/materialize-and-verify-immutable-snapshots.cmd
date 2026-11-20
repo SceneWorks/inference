@@ -11,5 +11,7 @@ rem only the pinned checkpoint is fetched (~8 GB across the six components into 
 "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
 rem The stable catalog key still ends in 384 because MMAudio feeds 384px; its repository is
 rem the canonical -378 checkpoint declared in release/real-weight-models.toml.
-"%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
+rem The path comes from the manifest row in the runner cache, not the repository variable,
+rem whose folder (models--apple--DFN5B-CLIP-ViT-H-14-384) names no repository the row pins.
+"%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --export MMAUDIO_CLIP_SNAPSHOT --export DFN_CLIP_SNAPSHOT || exit /b 1
 "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1

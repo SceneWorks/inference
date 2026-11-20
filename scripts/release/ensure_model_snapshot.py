@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +45,59 @@ else:
 
 
 Download = Callable[..., Any]
+
+# Where the real-weight fleet keeps its Hugging Face home when the runner environment names none:
+# every Windows CUDA box uses `E:\HuggingFace`, every Mac `/Volumes/Models/huggingface`.
+FLEET_HUB_CACHE = {"nt": r"E:\HuggingFace\hub", "posix": "/Volumes/Models/huggingface/hub"}
+
+
+def runner_hub_cache(environ: dict | None = None, os_name: str | None = None) -> Path:
+    """Return the runner's Hugging Face hub cache, the one place real-weight downloads land.
+
+    Follows `huggingface_hub`'s order -- `HF_HUB_CACHE`, then the legacy `HUGGINGFACE_HUB_CACHE`,
+    then `$HF_HOME/hub` -- treating an empty value as unset. When the runner environment sets none
+    of them it uses the fleet's fixed root for this OS, not the library's `~/.cache/huggingface`
+    default, which is not where any runner keeps its weights. The result is absolute, because
+    later steps read the exported path from other working directories (`cargo test` runs test
+    binaries from the crate directory).
+    """
+    environ = os.environ if environ is None else environ
+    os_name = os.name if os_name is None else os_name
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if environ.get(name):
+            return Path(os.path.abspath(Path(environ[name]).expanduser()))
+    if environ.get("HF_HOME"):
+        return Path(os.path.abspath(Path(environ["HF_HOME"]).expanduser())) / "hub"
+    return Path(FLEET_HUB_CACHE["nt" if os_name == "nt" else "posix"])
+
+
+def runner_cache_snapshot(model: dict, cache: Path) -> Path:
+    """Return the pinned snapshot's directory in a hub cache: `models--<org>--<name>/snapshots/<rev>`."""
+    repository_directory = "models--" + model["repository"].replace("/", "--")
+    return cache / repository_directory / "snapshots" / model["revision"]
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    """True when `path` lies inside `root` once both are resolved (symlinks, case on Windows)."""
+    resolved = os.path.normcase(os.path.realpath(path))
+    resolved_root = os.path.normcase(os.path.realpath(root))
+    try:
+        return os.path.commonpath([resolved, resolved_root]) == resolved_root
+    except ValueError:  # different Windows drives share no common path
+        return False
+
+
+def export_environment(name: str, value: Path, environ: dict | None = None) -> None:
+    """Publish `name=value` to later steps of the job through `$GITHUB_ENV` (when running in one)."""
+    environ = os.environ if environ is None else environ
+    text = str(value)
+    if "\n" in text or "\r" in text:
+        raise RuntimeError(f"refusing to export a multi-line path for {name}: {text!r}")
+    github_env = environ.get("GITHUB_ENV")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as handle:
+            handle.write(f"{name}={text}\n")
+    print(f"{name}={text}", flush=True)
 
 
 def hf_cache_location(snapshot: Path) -> tuple[Path, str, str] | None:
@@ -370,8 +424,14 @@ def ensure_snapshot(
     download: Download,
     *,
     require_materialization_provenance: bool = False,
+    download_root: Path | None = None,
 ) -> bool:
-    """Return true after downloading, or false when an existing snapshot is valid."""
+    """Return true after downloading, or false when an existing snapshot is valid.
+
+    With `download_root`, a snapshot that needs any transfer must lie inside that directory (the
+    runner's Hugging Face hub cache); otherwise this refuses before a byte moves. A complete
+    snapshot elsewhere is still used as-is.
+    """
     try:
         verify_snapshot(
             model,
@@ -402,6 +462,12 @@ def ensure_snapshot(
     # fetch could not land them at this path. The staging projection below handles a cache-shaped
     # destination for them (see
     # `test_materialization_replaces_stale_destination_symlinks_and_extra_payload`).
+    if download_root is not None and not _is_inside(snapshot, download_root):
+        raise RuntimeError(
+            f"{model['key']} needs downloading, but its snapshot path {snapshot} is outside this "
+            f"runner's Hugging Face hub cache {download_root} (HF_HUB_CACHE, else $HF_HOME/hub, "
+            "else the fleet root). Point the lane's snapshot variable into that cache."
+        )
     location = hf_cache_location(snapshot)
     if location is not None and expected_materialization_receipt(model) is None:
         return _heal_in_cache(
@@ -516,7 +582,20 @@ def ensure_snapshot(
     return True
 
 
+def default_xet_cache(cache: Path, environ: dict | None = None) -> None:
+    """Keep the Xet chunk cache beside the hub cache when the runner sets no `HF_HOME`.
+
+    `huggingface_hub` otherwise falls back to `~/.cache/huggingface/xet`, a download byproduct in
+    the user profile rather than in the runner's Hugging Face home. Must run before
+    `huggingface_hub` is imported: the library reads it into a constant at import time.
+    """
+    environ = os.environ if environ is None else environ
+    if not environ.get("HF_XET_CACHE") and not environ.get("HF_HOME"):
+        environ["HF_XET_CACHE"] = str(cache.parent / "xet")
+
+
 def download_snapshot(**kwargs: Any) -> Any:
+    default_xet_cache(Path(kwargs["cache_dir"]) if kwargs.get("cache_dir") else runner_hub_cache())
     try:
         from huggingface_hub import snapshot_download
     except ImportError as error:
@@ -526,10 +605,90 @@ def download_snapshot(**kwargs: Any) -> Any:
     return snapshot_download(**kwargs)
 
 
+def download_to_runner_cache(
+    *,
+    repo_id: str,
+    revision: str,
+    allow_patterns: list[str] | None = None,
+    token: bool = False,
+    cache: Path | None = None,
+) -> Path:
+    """Download a pinned snapshot (or an allow-listed slice of it) through the runner hub cache.
+
+    For lanes whose inputs have no manifest row. Returns the snapshot directory only after proving
+    it holds every Hub file the allow-list selects at that revision: when the Hub's repo-info call
+    fails, `snapshot_download` returns an existing `snapshots/<revision>` directory without checking
+    it is complete, so an interrupted earlier run (or another lane's narrower slice of the same
+    revision) would otherwise pass. The file listing is the check, so a Hub outage fails here.
+    """
+    cache = runner_hub_cache() if cache is None else cache
+    default_xet_cache(cache)
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+    from huggingface_hub.utils import filter_repo_objects
+
+    root = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            allow_patterns=allow_patterns,
+            cache_dir=str(cache),
+            token=token,
+        )
+    )
+    expected = runner_cache_snapshot({"repository": repo_id, "revision": revision}, cache)
+    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.realpath(expected)):
+        raise RuntimeError(
+            f"{repo_id}@{revision} materialized at {root}, not the runner-cache snapshot {expected}"
+        )
+    sizes = {
+        entry.path: entry.size
+        for entry in HfApi().list_repo_tree(repo_id, revision=revision, recursive=True, token=token)
+        if getattr(entry, "size", None) is not None and not entry.path.endswith("/")
+    }
+    wanted = sorted(filter_repo_objects(sorted(sizes), allow_patterns=allow_patterns))
+    if not wanted:
+        raise RuntimeError(f"{repo_id}@{revision} has no files matching {allow_patterns}")
+
+    def damaged() -> list[str]:
+        # Present AND the Hub's byte size: an interrupted or truncated cached blob (seen on a
+        # Windows cache as "incomplete metadata, file not fully covered") is not a complete file.
+        return [name for name in wanted
+                if not (root / name).is_file() or (root / name).stat().st_size != sizes[name]]
+
+    for name in damaged():
+        # stderr: shell callers capture this function's stdout as the snapshot path.
+        print(f"re-fetching {repo_id}@{revision}:{name} (missing or not {sizes[name]} bytes)",
+              file=sys.stderr, flush=True)
+        hf_hub_download(repo_id=repo_id, revision=revision, filename=name, cache_dir=str(cache),
+                        token=token, force_download=True)
+    missing = damaged()
+    if missing:
+        raise RuntimeError(
+            f"{repo_id}@{revision} at {root} is incomplete: {len(missing)} of {len(wanted)} "
+            f"selected files are missing or the wrong size (first: {missing[0]})"
+        )
+    return root
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="model key in real-weight-models.toml")
-    parser.add_argument("--snapshot", required=True, type=snapshot_path)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--export",
+        metavar="NAME",
+        action="append",
+        help=(
+            "materialize into the runner's Hugging Face hub cache (HF_HUB_CACHE, else "
+            "$HF_HOME/hub, else the fleet root) and export the snapshot path as NAME to later "
+            "steps through $GITHUB_ENV (repeat to export it under several names)"
+        ),
+    )
+    target.add_argument(
+        "--snapshot",
+        type=snapshot_path,
+        help="materialize into this explicit directory (hand runs and non-cache lanes)",
+    )
     parser.add_argument(
         "--manifest",
         type=Path,
@@ -545,14 +704,29 @@ def main() -> int:
     )
     args = parser.parse_args()
     model = load_model(args.manifest, args.model)
-    downloaded = ensure_snapshot(
-        model,
-        args.snapshot,
-        download_snapshot,
-        require_materialization_provenance=args.require_materialization_provenance,
-    )
+    hub_cache = runner_hub_cache()
+    snapshot = runner_cache_snapshot(model, hub_cache) if args.export else args.snapshot
+    try:
+        downloaded = ensure_snapshot(
+            model,
+            snapshot,
+            download_snapshot,
+            require_materialization_provenance=args.require_materialization_provenance,
+            # In a real-weight job every download lands in the runner's own cache; a hand run
+            # keeps writing wherever its operator pointed it.
+            download_root=hub_cache if os.environ.get("GITHUB_ACTIONS") == "true" else None,
+        )
+    except RuntimeError as error:
+        print(
+            f"model snapshot: FAILED ({model['key']}@{model['revision']} at {snapshot}): {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     source = "downloaded" if downloaded else "cached"
-    print(f"model snapshot: OK ({model['key']}@{model['revision']}, {source})")
+    print(f"model snapshot: OK ({model['key']}@{model['revision']}, {source}, {snapshot})")
+    for name in args.export or ():
+        export_environment(name, snapshot)
     return 0
 
 

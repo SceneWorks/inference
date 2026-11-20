@@ -2,7 +2,10 @@ python3.12 - <<'PY'
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
+sys.path.insert(0, "scripts/release")
+from ensure_model_snapshot import runner_hub_cache
 from huggingface_hub import (
     CommitOperationAdd,
     CommitOperationDelete,
@@ -75,6 +78,7 @@ def published_payload_matches(model):
                 repo_id=repository,
                 filename=remote_path,
                 revision=model.sha,
+                cache_dir=str(runner_hub_cache()),
             ))
             if downloaded.read_bytes() != local_path.read_bytes():
                 return False

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.ci.model_inference_proofs import NAX_ROUTES, SENSENOVA_PROOFS, request, require_host
-from scripts.ci.sensenova_loop_assets import check_source_disk
+from scripts.ci.sensenova_loop_assets import check_source_disk, source_snapshot
 
 from scripts.ci.sensenova_loop_seal import (
     TIERS, verify_memory_endpoints, verify_oracle_marker, verify_semantic_margins,
@@ -86,16 +86,16 @@ class SenseNovaProvisioningTests(unittest.TestCase):
             "policy": {"backend": "darwin-mlx"},
             "sensenova_reference_policy": {"backend": "windows-cuda"},
         }
-        for route, name, label in (
-            ("nax", "nax-macos-2", "rw-llm"), ("nax-primary", "nax-macos", "rw-starvector"),
-        ):
+        for route, label in (("nax", "rw-llm"), ("nax-primary", "rw-starvector")):
             with self.subTest(route=route):
                 parsed = request(json.dumps({**value, "runner": route}), "mlx")
                 self.assertIn(label, NAX_ROUTES[parsed["runner"]]["labels"])
-                env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_OS": "macOS", "RUNNER_NAME": name}
-                require_host("mlx", env, route)
-                with self.assertRaisesRegex(ValueError, "must run on"):
-                    require_host("mlx", {**env, "RUNNER_NAME": "wrong Mac"}, route)
+                env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_OS": "macOS"}
+                # The labels choose the Mac; either interchangeable Mac satisfies either route.
+                for name in ("nax-macos", "nax-macos-2"):
+                    require_host("mlx", {**env, "RUNNER_NAME": name}, route)
+                with self.assertRaisesRegex(ValueError, "wrong proof host platform"):
+                    require_host("mlx", {**env, "RUNNER_OS": "Linux"}, route)
         with self.assertRaisesRegex(ValueError, "explicit provisioned Mac route"):
             request(json.dumps(value), "mlx")
         with self.assertRaisesRegex(ValueError, "explicit provisioned Mac route"):
@@ -134,6 +134,26 @@ class SenseNovaProvisioningTests(unittest.TestCase):
             with patch("scripts.ci.sensenova_loop_assets.shutil.disk_usage", return_value=SimpleNamespace(free=22)):
                 check_source_disk(snapshot, source, receipt)
             self.assertTrue(json.loads(receipt.read_bytes())["payload_fits_sampled_free_space"])
+
+    def test_missing_source_is_fetched_through_the_runner_hub_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / "hf-home"
+            calls = []
+
+            def refuse_after_recording(**kwargs):
+                calls.append(kwargs)
+                raise RuntimeError("no network in this test")
+
+            environment = {"HF_HOME": str(home), "GITHUB_ACTIONS": "true"}
+            with patch.dict("os.environ", environment, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "cache-correct fetch"):
+                    source_snapshot(download=refuse_after_recording)
+        # Through $HF_HOME/hub, the runner's cache, as a cache fetch (no local_dir); never the
+        # library's ~/.cache/huggingface/hub fallback.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["cache_dir"], str(home / "hub"))
+        self.assertEqual(calls[0]["repo_id"], "sensenova/SenseNova-Loop-9B")
+        self.assertNotIn("local_dir", calls[0])
 
 
 if __name__ == "__main__":

@@ -9,20 +9,42 @@ from scripts.ci import prepare_iris_quant_proof_assets as assets
 
 
 class IrisQuantProofAssets(unittest.TestCase):
-    def test_secondary_mac_uses_its_own_pinned_cache_and_rejects_other_runners(self):
+    def test_any_mac_uses_its_own_pinned_cache_and_non_macs_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            hub = home / "sceneworks-rw-weights" / "hub"
-            hub.mkdir(parents=True)
+            stale = home / "sceneworks-rw-weights" / "hub"
+            iris = Path("models--speridlabs--iris-3b") / "snapshots" / assets.IRIS_REVISION
+            qwen = Path("models--Qwen--Qwen3-VL-4B-Instruct") / "snapshots" / assets.QWEN_REVISION
+            (stale / iris).mkdir(parents=True)
+            env = {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2", "HF_HUB_CACHE": str(home / "runner-hub")}
             with patch.object(Path, "home", return_value=home):
-                paths = assets.snapshot_paths("mlx", {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2"})
-                self.assertEqual(paths[0][2], hub / "models--speridlabs--iris-3b" / "snapshots" / assets.IRIS_REVISION)
-                self.assertEqual(paths[1][2], hub / "models--Qwen--Qwen3-VL-4B-Instruct" / "snapshots" / assets.QWEN_REVISION)
-                with self.assertRaisesRegex(ValueError, "secondary Mac"):
-                    assets.snapshot_paths("mlx", {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos"})
-                hub.rmdir()
-                with self.assertRaisesRegex(ValueError, "hub is missing"):
-                    assets.snapshot_paths("mlx", {"RUNNER_OS": "macOS", "RUNNER_NAME": "nax-macos-2"})
+                paths = assets.snapshot_paths("mlx", env)
+                # Both snapshots bind in the runner's hub cache, even where the retired task-owned
+                # hub still holds an old copy.
+                self.assertEqual(paths[0][2], home / "runner-hub" / iris)
+                self.assertEqual(paths[1][2], home / "runner-hub" / qwen)
+                # Either interchangeable Mac binds the same pins; only the OS is checked.
+                self.assertEqual(assets.snapshot_paths("mlx", {**env, "RUNNER_NAME": "nax-macos"}), paths)
+                with self.assertRaisesRegex(ValueError, "macOS runner"):
+                    assets.snapshot_paths("mlx", {**env, "RUNNER_OS": "Linux"})
+
+    def test_a_missing_snapshot_is_downloaded_into_the_runner_hub_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary).resolve() / "hub"
+            path = cache / "models--speridlabs--iris-3b" / "snapshots" / assets.IRIS_REVISION
+            model = assets.load_model(assets.MANIFEST, "iris-3b-cuda")
+            calls = []
+
+            def refuse_after_recording(**kwargs):
+                calls.append(kwargs)
+                raise RuntimeError("no network in this test")
+
+            with self.assertRaisesRegex(RuntimeError, "cache-correct fetch"):
+                assets.ensure_snapshot(model, path, refuse_after_recording, download_root=cache)
+            self.assertEqual(calls[0]["cache_dir"], str(cache))
+            self.assertEqual(calls[0]["allow_patterns"], model["download_files"])
+            with self.assertRaisesRegex(RuntimeError, "outside this runner's Hugging Face hub cache"):
+                assets.ensure_snapshot(model, path, refuse_after_recording, download_root=cache / "other")
 
     def test_missing_windows_cache_root_fails_before_export(self):
         for root in ("", "relative-cache"):

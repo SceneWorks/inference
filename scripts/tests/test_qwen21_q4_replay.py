@@ -216,7 +216,8 @@ class WiringTests(unittest.TestCase):
         self.assertLess(names.index(identity["name"]), names.index(download["name"]))
         self.assertLess(names.index(download["name"]), names.index(stage["name"]))
         self.assertLess(names.index(stage["name"]), names.index(transfer["name"]))
-        self.assertIn('"$RUNNER_NAME" == "nax-macos-2"', cache["run"])
+        # The rw-mage label selects the Mac; the cache steps never compare its name.
+        self.assertNotIn("RUNNER_NAME", cache["run"] + stage["run"])
         self.assertIn("--cache-status --source-cache-root", cache["run"])
         self.assertIn("steps.qwen21_transfer_cache.outputs.hit == 'false'", identity["if"])
         self.assertEqual(identity["env"]["GH_TOKEN"], "${{ github.token }}")

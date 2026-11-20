@@ -1,47 +1,54 @@
-"""Bind installed pinned assets for exact bounded CUDA proofs (no fetch/compute)."""
+"""Bind pinned assets for exact bounded CUDA proofs, downloading a missing input into the runner's
+Hugging Face hub cache first (no compute)."""
 from __future__ import annotations
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-CACHE = Path("E:/huggingface/hub")
-def snapshot(repo: str, revision: str, subdir: str = "") -> Path:
-    return CACHE / ("models--" + repo.replace("/", "--")) / "snapshots" / revision / subdir
+from scripts.ci.proof_asset_snapshots import Input, manifest_bindings, manifest_keys, materialize  # noqa: E402
 
 BINDINGS = {
     "candle-gen-lens/trainer_e2e::lens_bounded_acceleration_acceptance": {
-        "LENS_BASE_SNAPSHOT": snapshot("SceneWorks/Lens", "5c5521d4417a3cae55816929ece69319d1e7712a")},
+        "LENS_BASE_SNAPSHOT": Input("lens-base-train-proof")},
     "candle-gen-z-image/trainer_e2e::z_image_bounded_acceleration_acceptance": {
-        "Z_IMAGE_SNAPSHOT": snapshot("Tongyi-MAI/Z-Image-Turbo", "f332072aa78be7aecdf3ee76d5c247082da564a6")},
+        "Z_IMAGE_SNAPSHOT": Input("z-image-turbo-train-proof")},
     "candle-gen-wan/trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance": {
-        "WAN_T2V_14B_SNAPSHOT": snapshot("Wan-AI/Wan2.2-T2V-A14B-Diffusers", "5be7df9619b54f4e2667b2755bc6a756675b5cd7")},
+        "WAN_T2V_14B_SNAPSHOT": Input("wan2.2-t2v-a14b-train-proof")},
     "candle-gen-wan/training_modes_cuda::wan_ti2v_5b_bounded_acceleration_acceptance": {
-        "WAN_TI2V_5B_TRAIN_SNAPSHOT": snapshot("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "b8fff7315c768468a5333511427288870b2e9635")},
+        "WAN_TI2V_5B_TRAIN_SNAPSHOT": Input("wan2.2-ti2v-5b-train-proof")},
     "candle-gen-ltx/trainer_e2e::ltx23_bounded_acceleration_acceptance": {
-        "LTX_TRAINING_TIER": snapshot("SceneWorks/ltx-2.3-mlx", "254989c3ca7ee691187647f350b112c0c448789d", "q4"),
-        "LTX_GEMMA_DIR": snapshot("SceneWorks/ltx-2.3-mlx", "254989c3ca7ee691187647f350b112c0c448789d", "gemma")},
+        "LTX_TRAINING_TIER": Input("ltx-2.3-mlx-q4-train-proof", "q4"),
+        "LTX_GEMMA_DIR": Input("ltx-2.3-mlx-q4-train-proof", "gemma")},
     "candle-gen-ltx/trainer_e2e::ltx25_bounded_acceleration_acceptance": {
-        "LTX25_TRAINING_TIER": snapshot("SceneWorks/ltx-2.5-mlx", "081658ce6886cacba20817ce0359bbefef706ff2", "dev/q4")},
+        "LTX25_TRAINING_TIER": Input("ltx-2.5-mlx-dev-q4-train-proof", "dev/q4")},
     "candle-gen-sdxl/trainer_e2e::sdxl_bounded_acceleration_acceptance": {
-        "SDXL_SNAPSHOT": snapshot("stabilityai/stable-diffusion-xl-base-1.0", "462165984030d82259a11f4367a4eed129e94a7b"),
-        "SDXL_TOKENIZER_CLIP_L_DIR": snapshot("openai/clip-vit-large-patch14", "32bd64288804d66eefd0ccbe215aa642df71cc41"),
-        "SDXL_TOKENIZER_CLIP_BIGG_DIR": snapshot("laion/CLIP-ViT-bigG-14-laion2B-39B-b160k", "743c27bd53dfe508a0ade0f50698f99b39d03bec"),
-        "SDXL_VAE_FP16_FIX_DIR": snapshot("madebyollin/sdxl-vae-fp16-fix", "207b116dae70ace3637169f1ddd2434b91b3a8cd")},
+        "SDXL_SNAPSHOT": Input("sdxl-base-1.0-fp16-train-proof"),
+        "SDXL_TOKENIZER_CLIP_L_DIR": Input("clip-vit-large-patch14-tokenizer-proof"),
+        "SDXL_TOKENIZER_CLIP_BIGG_DIR": Input("clip-vit-bigg-14-laion2b-tokenizer-proof"),
+        "SDXL_VAE_FP16_FIX_DIR": Input("sdxl-vae-fp16-fix-train-proof")},
     "candle-gen-kolors/trainer_cuda_smoke::kolors_bounded_acceleration_acceptance": {
-        "KOLORS_TRAIN_SNAPSHOT": snapshot("Kwai-Kolors/Kolors-diffusers", "7e091c75199e910a26cd1b51ed52c28de5db3711")},
+        "KOLORS_TRAIN_SNAPSHOT": Input("kolors-diffusers-fp16-train-proof")},
     "candle-gen-sd3/trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance": {
-        "SD35_MEDIUM_TRAIN_SNAPSHOT": snapshot("stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80"),
+        "SD35_MEDIUM_TRAIN_SNAPSHOT": Input("sd3.5-medium-train-proof"),
         # Generation's exact production artifact is distinct from the upstream training source.
-        "SD35_MEDIUM_SAMPLE_SNAPSHOT": snapshot("SceneWorks/sd3.5-medium-mlx", "5413e962bb326db248be2026a93b147c323392b6", "bf16")},
+        "SD35_MEDIUM_SAMPLE_SNAPSHOT": Input("sd3.5-medium-mlx-bf16-sample-proof", "bf16")},
     "candle-gen-qwen-image-2-1/train_peak_real_weights::qwen21_bounded_acceleration_acceptance": {
-        "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT": snapshot("Qwen/Qwen-Image-2.1", "790c92633540aa0cb11d9abf19eb46d861714758")},
+        "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT": Input("qwen-image-2-1-train-proof")},
 }
 
+# Upstream ChatGLM3 ships only a slow tokenizer, and the Kolors readers load the derived fast
+# `tokenizer/tokenizer.json` from the snapshot itself (candle-gen-kolors/src/tokenizer.rs:49-50). A
+# snapshot without it gets the pinned derived file the worker overlays at install time.
+OVERLAYS = {"KOLORS_TRAIN_SNAPSHOT": (Input("kolors-chatglm3-tokenizer-proof", "tokenizer.json"),
+                                      "tokenizer/tokenizer.json")}
+MANIFEST_BINDINGS = manifest_bindings(BINDINGS, {name: {name: source} for name, (source, _) in OVERLAYS.items()})
+MANIFEST_KEYS = manifest_keys(BINDINGS, {name: {name: source} for name, (source, _) in OVERLAYS.items()})
 
-def selected_binding(selection: str) -> dict[str, Path]:
+
+def selected_binding(selection: str) -> dict[str, Input]:
     # Both exact spellings accepted by the existing executor; packages/all never
     # acquire this setup route, so they cannot launch a historical trainer matrix.
     selection = selection.replace("/integration/", "/", 1)
@@ -50,12 +57,29 @@ def selected_binding(selection: str) -> dict[str, Path]:
     return BINDINGS[selection]
 
 
+def overlay_derived_files(paths: dict[str, Path]) -> None:
+    """Place each pinned derived file a bound snapshot lacks; an existing one is kept."""
+    for name, (source, relative) in OVERLAYS.items():
+        if name not in paths:
+            continue
+        target = paths[name] / relative
+        if target.is_file() and target.stat().st_size > 0:
+            continue
+        origin = materialize({name: source})[name]
+        partial = target.with_name(target.name + ".partial")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(origin, partial)
+        os.replace(partial, target)
+        print(f"{name}: placed {source.model} {source.path} at {target}", flush=True)
+
+
 def main() -> None:
     request = json.loads(os.environ["MODEL_PROOF_REQUEST"])
     from scripts.ci.training_comparison import is_recipe
     if request.get("configuration") != "fixed_cuda" and not is_recipe(request.get("configuration")):
         raise ValueError("bounded cohort setup requires fixed_cuda")
-    paths = selected_binding(request["selection"])
+    paths = materialize(selected_binding(request["selection"]))
+    overlay_derived_files(paths)
     for name, path in paths.items():
         if not path.is_dir():
             raise ValueError(f"missing pinned installed asset {name}: {path}")
@@ -65,7 +89,7 @@ def main() -> None:
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
         for name, path in paths.items():
             output.write(f"{name}={path.as_posix()}\n")
-    print("Bound existing pinned cohort paths; actual source readers must still admit content: " + ", ".join(paths))
+    print("Bound pinned runner-cache cohort paths; actual source readers must still admit content: " + ", ".join(paths))
 
 
 if __name__ == "__main__":

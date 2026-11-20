@@ -130,8 +130,9 @@ class RegisteredHubSnapshotCases(unittest.TestCase):
         self.assertEqual(bound["MLX_LLM_BLOCK_DRAFT_SOURCE"]["subfolder"], "")
 
     def test_the_nax_route_selects_only_the_rw_llm_mac(self):
+        # Routed by label only: the Macs are interchangeable, so the route names no machine.
         self.assertIn("rw-llm", proofs.NAX_ROUTES["nax"]["labels"])
-        self.assertEqual(proofs.NAX_ROUTES["nax"]["name"], "nax-macos-2")
+        self.assertNotIn("name", proofs.NAX_ROUTES["nax"])
 
 
 def sibling(name, data):

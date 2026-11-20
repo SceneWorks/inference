@@ -989,7 +989,7 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertNotIn("path: ${{ env.YUE2_PRECISION_WORK_DIR }}\n", source)
         self.assertIn("yue2-precision-listening-cuda-cc-by-nc-internal-", source)
         self.assertIn("yue2-precision-listening-metal-cc-by-nc-internal-", source)
-        self.assertIn("test \"$RUNNER_NAME\" = nax-macos-2", source)
+        self.assertNotIn("$RUNNER_NAME\" = nax-macos", source)
         self.assertIn("--test precision_real_weights", source)
         cuda = source.split("  cuda:\n", 1)[1].split("  metal:\n", 1)[0]
         for package, target in (("candle-quant-kernels", "quant"), ("candle-audio-yue2", "vae")):

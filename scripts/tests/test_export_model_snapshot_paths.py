@@ -22,25 +22,43 @@ class ExportModelSnapshotPathsTests(unittest.TestCase):
         )
         return path
 
-    def test_formats_macos_and_windows_runner_roots(self) -> None:
-        model = {"key": "sa3-test", "revision": "a" * 40}
+    def test_formats_macos_and_windows_hub_cache_layouts(self) -> None:
+        # The snapshot lives in the runner's Hugging Face hub cache layout, never RUNNER_TEMP, so a
+        # complete snapshot is reused by every later run instead of being fetched again.
+        model = {"key": "sa3-test", "repository": "example/test", "revision": "a" * 40}
         self.assertEqual(
-            EXPORT.snapshot_path("/Users/runner/work/_temp", model),
-            "/Users/runner/work/_temp/model-snapshots/sa3-test/" + "a" * 40,
+            EXPORT.snapshot_path("/Volumes/Models/huggingface/hub", model),
+            "/Volumes/Models/huggingface/hub/models--example--test/snapshots/" + "a" * 40,
         )
         self.assertEqual(
-            EXPORT.snapshot_path(r"D:\actions\_temp", model),
-            "D:\\actions\\_temp\\model-snapshots\\sa3-test\\" + "a" * 40,
+            EXPORT.snapshot_path(r"E:\HuggingFace\hub", model),
+            "E:\\HuggingFace\\hub\\models--example--test\\snapshots\\" + "a" * 40,
         )
+
+    def test_default_hub_cache_follows_the_runner_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            manifest = self.manifest(directory)
+            github_env = directory / "github-env"
+            argv = [str(SCRIPT), "--model", "sa3-test", "--manifest", str(manifest),
+                    "--github-env", str(github_env)]
+            hub = directory / "hf-home" / "hub"
+            with mock.patch.dict("os.environ", {"HF_HUB_CACHE": str(hub)}), \
+                    mock.patch("sys.argv", argv):
+                self.assertEqual(EXPORT.main(), 0)
+            self.assertEqual(
+                github_env.read_text(encoding="utf-8"),
+                f"SA3_TEST_SNAPSHOT={hub}/models--example--test/snapshots/{'a' * 40}\n",
+            )
 
     def test_manifest_revision_changes_the_exported_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             first = EXPORT.environment_assignments(
-                self.manifest(directory, "a" * 40), ["sa3-test"], "/tmp/runner"
+                self.manifest(directory, "a" * 40), ["sa3-test"], "/tmp/hub"
             )
             second = EXPORT.environment_assignments(
-                self.manifest(directory, "b" * 40), ["sa3-test"], "/tmp/runner"
+                self.manifest(directory, "b" * 40), ["sa3-test"], "/tmp/hub"
             )
         self.assertNotEqual(first, second)
         self.assertTrue(first[0].endswith("/" + "a" * 40))
@@ -50,7 +68,7 @@ class ExportModelSnapshotPathsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             manifest = self.manifest(Path(temp))
             with self.assertRaisesRegex(RuntimeError, "expected one model policy"):
-                EXPORT.environment_assignments(manifest, ["missing"], "/tmp/runner")
+                EXPORT.environment_assignments(manifest, ["missing"], "/tmp/hub")
 
     def test_main_appends_assignments_to_github_env(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -63,8 +81,8 @@ class ExportModelSnapshotPathsTests(unittest.TestCase):
                 "sa3-test",
                 "--manifest",
                 str(manifest),
-                "--runner-temp",
-                "/runner/temp",
+                "--hub-cache",
+                "/runner/hub",
                 "--github-env",
                 str(github_env),
             ]
@@ -72,7 +90,7 @@ class ExportModelSnapshotPathsTests(unittest.TestCase):
                 self.assertEqual(EXPORT.main(), 0)
             self.assertEqual(
                 github_env.read_text(encoding="utf-8"),
-                "SA3_TEST_SNAPSHOT=/runner/temp/model-snapshots/sa3-test/"
+                "SA3_TEST_SNAPSHOT=/runner/hub/models--example--test/snapshots/"
                 + "a" * 40
                 + "\n",
             )

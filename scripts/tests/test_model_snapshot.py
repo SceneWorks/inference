@@ -1,14 +1,20 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.release import ensure_model_snapshot
 from scripts.release import verify_model_snapshot as snapshot_verifier
 from scripts.release.ensure_model_snapshot import (
     _managed_staging_paths,
     ensure_snapshot,
+    export_environment,
     hf_cache_location,
+    runner_cache_snapshot,
+    runner_hub_cache,
 )
 from scripts.release.verify_model_snapshot import (
     MARKER,
@@ -725,6 +731,189 @@ class SnapshotPathExpansionTests(unittest.TestCase):
         self.assertEqual(snapshot_path("/opt/~/models"), Path("/opt/~/models"))
 
 
+class RunnerHubCacheTests(unittest.TestCase):
+    """Real-weight downloads land in the runner's own Hugging Face cache, never a variable's path."""
+
+    def test_hf_hub_cache_wins_over_hf_home(self) -> None:
+        environ = {"HF_HUB_CACHE": "/x/hub-cache", "HF_HOME": "/y/home"}
+        self.assertEqual(runner_hub_cache(environ, "posix"), Path("/x/hub-cache"))
+
+    def test_hf_home_names_its_hub_directory(self) -> None:
+        self.assertEqual(runner_hub_cache({"HF_HOME": "/y/home"}, "posix"), Path("/y/home/hub"))
+
+    def test_legacy_hub_cache_variable_is_honored_after_hf_hub_cache(self) -> None:
+        environ = {"HUGGINGFACE_HUB_CACHE": "/legacy/hub", "HF_HOME": "/y/home"}
+        self.assertEqual(runner_hub_cache(environ, "posix"), Path("/legacy/hub"))
+        environ["HF_HUB_CACHE"] = "/x/hub-cache"
+        self.assertEqual(runner_hub_cache(environ, "posix"), Path("/x/hub-cache"))
+
+    def test_relative_cache_variable_resolves_to_an_absolute_path(self) -> None:
+        resolved = runner_hub_cache({"HF_HOME": "relative-home"}, "posix")
+        self.assertTrue(resolved.is_absolute())
+        self.assertEqual(resolved, Path.cwd() / "relative-home" / "hub")
+
+    def test_unset_environment_falls_back_to_the_fleet_root_per_os(self) -> None:
+        self.assertEqual(
+            runner_hub_cache({}, "posix"), Path("/Volumes/Models/huggingface/hub")
+        )
+        self.assertEqual(str(runner_hub_cache({}, "nt")), r"E:\HuggingFace\hub")
+        # An empty value is unset, as huggingface_hub treats it.
+        self.assertEqual(
+            runner_hub_cache({"HF_HUB_CACHE": "", "HF_HOME": ""}, "posix"),
+            Path("/Volumes/Models/huggingface/hub"),
+        )
+
+    def test_snapshot_directory_follows_the_hub_layout(self) -> None:
+        snapshot = runner_cache_snapshot(MODEL, Path("/c/hub"))
+        self.assertEqual(
+            snapshot, Path("/c/hub/models--example--test-model/snapshots") / MODEL["revision"]
+        )
+        self.assertEqual(
+            hf_cache_location(snapshot),
+            (Path("/c/hub"), "models--example--test-model", MODEL["revision"]),
+        )
+
+    def test_export_appends_to_github_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            github_env = Path(temporary) / "env"
+            github_env.write_text("EARLIER=1\n", encoding="utf-8")
+            export_environment("MODEL_DIR", Path("/c/hub/x"), {"GITHUB_ENV": str(github_env)})
+            self.assertEqual(
+                github_env.read_text(encoding="utf-8"), "EARLIER=1\nMODEL_DIR=/c/hub/x\n"
+            )
+            with self.assertRaisesRegex(RuntimeError, "multi-line"):
+                export_environment("BAD", Path("/a\nB=c"), {"GITHUB_ENV": str(github_env)})
+
+    def test_cli_export_materializes_in_the_runner_cache_and_exports_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            github_env = root / "github-env"
+            manifest = root / "models.toml"
+            manifest.write_text(
+                "[[models]]\n"
+                f'key = "{MODEL["key"]}"\n'
+                f'repository = "{MODEL["repository"]}"\n'
+                f'revision = "{MODEL["revision"]}"\n'
+                'expected_files = ["config.json", "weights/model.safetensors"]\n',
+                encoding="utf-8",
+            )
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                snapshot = runner_cache_snapshot(MODEL, Path(kwargs["cache_dir"]))
+                (snapshot / "weights").mkdir(parents=True)
+                (snapshot / "config.json").write_text("{}", encoding="utf-8")
+                (snapshot / "weights/model.safetensors").write_bytes(b"fixture")
+
+            environ = {"HF_HOME": str(root / "hf-home"), "GITHUB_ENV": str(github_env)}
+            argv = [
+                "ensure_model_snapshot.py",
+                "--model", MODEL["key"],
+                "--export", "TEST_MODEL_DIR",
+                "--manifest", str(manifest),
+            ]
+            expected = runner_cache_snapshot(MODEL, root / "hf-home" / "hub")
+            with (
+                mock.patch.dict(ensure_model_snapshot.os.environ, environ, clear=True),
+                mock.patch.object(ensure_model_snapshot.sys, "argv", argv),
+                mock.patch.object(ensure_model_snapshot, "download_snapshot", download),
+            ):
+                self.assertEqual(ensure_model_snapshot.main(), 0)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(Path(calls[0]["cache_dir"]), root / "hf-home" / "hub")
+                self.assertNotIn("local_dir", calls[0])
+                self.assertEqual(
+                    github_env.read_text(encoding="utf-8"), f"TEST_MODEL_DIR={expected}\n"
+                )
+                # One materialization can feed several consumer variables.
+                github_env.write_text("", encoding="utf-8")
+                argv.extend(["--export", "SECOND_NAME"])
+                self.assertEqual(ensure_model_snapshot.main(), 0)
+                self.assertEqual(
+                    github_env.read_text(encoding="utf-8"),
+                    f"TEST_MODEL_DIR={expected}\nSECOND_NAME={expected}\n",
+                )
+                # A second run finds the complete snapshot and transfers nothing.
+                self.assertEqual(ensure_model_snapshot.main(), 0)
+                self.assertEqual(len(calls), 1)
+
+    def test_download_outside_the_runner_cache_is_refused_before_any_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elsewhere = root / "elsewhere" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+            calls = []
+            with self.assertRaisesRegex(RuntimeError, "outside this runner's Hugging Face hub cache"):
+                ensure_snapshot(
+                    MODEL, elsewhere, lambda **kwargs: calls.append(kwargs),
+                    download_root=root / "hub",
+                )
+            self.assertEqual(calls, [])
+
+    def test_complete_snapshot_outside_the_runner_cache_is_still_used(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elsewhere = root / "elsewhere" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+            (elsewhere / "weights").mkdir(parents=True)
+            (elsewhere / "config.json").write_text("{}", encoding="utf-8")
+            (elsewhere / "weights/model.safetensors").write_bytes(b"fixture")
+            self.assertFalse(
+                ensure_snapshot(MODEL, elsewhere, lambda **kwargs: None, download_root=root / "hub")
+            )
+
+    def test_download_through_a_symlinked_path_into_the_runner_cache_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "hub").mkdir()
+            (root / "alias").symlink_to(root / "hub")
+            snapshot = root / "alias" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+
+            def download(**kwargs) -> None:
+                target = runner_cache_snapshot(MODEL, Path(kwargs["cache_dir"]))
+                (target / "weights").mkdir(parents=True)
+                (target / "config.json").write_text("{}", encoding="utf-8")
+                (target / "weights/model.safetensors").write_bytes(b"fixture")
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, download, download_root=root / "hub"))
+
+    def test_cli_failure_names_the_model_and_the_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "models.toml"
+            manifest.write_text(
+                "[[models]]\n"
+                f'key = "{MODEL["key"]}"\n'
+                f'repository = "{MODEL["repository"]}"\n'
+                f'revision = "{MODEL["revision"]}"\n'
+                'expected_files = ["config.json"]\n',
+                encoding="utf-8",
+            )
+
+            def download(**kwargs) -> None:
+                raise OSError("network unreachable")
+
+            argv = [
+                "ensure_model_snapshot.py",
+                "--model", MODEL["key"],
+                "--export", "TEST_MODEL_DIR",
+                "--manifest", str(manifest),
+            ]
+            expected = runner_cache_snapshot(MODEL, root / "hub")
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(
+                    ensure_model_snapshot.os.environ, {"HF_HUB_CACHE": str(root / "hub")}, clear=True
+                ),
+                mock.patch.object(ensure_model_snapshot.sys, "argv", argv),
+                mock.patch.object(ensure_model_snapshot, "download_snapshot", download),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(ensure_model_snapshot.main(), 1)
+            self.assertIn(MODEL["key"], stderr.getvalue())
+            self.assertIn(str(expected), stderr.getvalue())
+            self.assertIn("network unreachable", stderr.getvalue())
+
+
 class CacheResidentSnapshotTests(unittest.TestCase):
     """A cache-resident snapshot is materialized THROUGH the cache, never into it via `local_dir`.
 
@@ -1092,3 +1281,104 @@ class CacheResidentSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DownloadToRunnerCacheTests(unittest.TestCase):
+    """Lanes without a manifest row download through the cache and prove the slice is complete."""
+
+    REPO = "example/sliced"
+    REVISION = "c" * 40
+    FILES = ["q4/transformer/a.safetensors", "q4/vae/b.safetensors", "q8/transformer/a.safetensors"]
+
+    def fake_hub(self, cache: Path, present: list[str], heal: bool = False):
+        snapshot = runner_cache_snapshot({"repository": self.REPO, "revision": self.REVISION}, cache)
+        calls = []
+        refetched = []
+
+        def write(name: str) -> None:
+            (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
+            (snapshot / name).write_bytes(b"x")
+
+        def snapshot_download(**kwargs):
+            calls.append(kwargs)
+            for name in present:
+                write(name)
+            return str(snapshot)
+
+        def hf_hub_download(**kwargs):
+            refetched.append(kwargs)
+            if heal:
+                write(kwargs["filename"])
+            return str(snapshot / kwargs["filename"])
+
+        files = self.FILES
+
+        class HfApi:
+            def list_repo_tree(self, repo_id, revision, recursive, token):
+                return [mock.Mock(path=name, size=1) for name in files]
+
+        def filter_repo_objects(items, allow_patterns=None):
+            import fnmatch
+            return [i for i in items if not allow_patterns or any(fnmatch.fnmatch(i, p) for p in allow_patterns)]
+
+        hub = mock.MagicMock(snapshot_download=snapshot_download, hf_hub_download=hf_hub_download, HfApi=HfApi)
+        utils = mock.MagicMock(filter_repo_objects=filter_repo_objects)
+        self.refetched = refetched
+        return snapshot, calls, {"huggingface_hub": hub, "huggingface_hub.utils": utils}
+
+    def run_helper(self, temporary: str, cache: Path, modules: dict) -> Path:
+        with mock.patch.dict("sys.modules", modules), mock.patch.dict(
+            ensure_model_snapshot.os.environ, {"HF_HOME": str(Path(temporary))}, clear=True
+        ):
+            return ensure_model_snapshot.download_to_runner_cache(
+                repo_id=self.REPO, revision=self.REVISION, allow_patterns=["q4/**"], cache=cache
+            )
+
+    def test_truncated_cached_file_is_fetched_again(self) -> None:
+        # A blob shorter than the Hub's size ("incomplete metadata, file not fully covered").
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hub"
+            snapshot, _, modules = self.fake_hub(cache, self.FILES[:2], heal=True)
+            (snapshot / self.FILES[1]).parent.mkdir(parents=True)
+            original = modules["huggingface_hub"].snapshot_download
+
+            def truncating(**kwargs):
+                root = original(**kwargs)
+                (snapshot / self.FILES[1]).write_bytes(b"")
+                return root
+
+            modules["huggingface_hub"].snapshot_download = truncating
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(self.run_helper(temporary, cache, modules), snapshot)
+            # Shell callers capture stdout as the snapshot path, so a repair must not write there.
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual([call["filename"] for call in self.refetched], [self.FILES[1]])
+            self.assertTrue(self.refetched[0]["force_download"])
+            self.assertEqual(Path(self.refetched[0]["cache_dir"]), cache)
+
+    def test_complete_slice_is_returned_from_the_runner_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hub"
+            snapshot, calls, modules = self.fake_hub(cache, self.FILES[:2])
+            self.assertEqual(self.run_helper(temporary, cache, modules), snapshot)
+            self.assertEqual(Path(calls[0]["cache_dir"]), cache)
+            self.assertNotIn("local_dir", calls[0])
+            self.assertEqual(self.refetched, [])
+
+    def test_incomplete_cached_slice_is_refused(self) -> None:
+        # The Hub-outage shape: snapshot_download hands back an existing but partial directory,
+        # and the per-file re-fetch cannot complete it either.
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hub"
+            _, _, modules = self.fake_hub(cache, self.FILES[:1])
+            with self.assertRaisesRegex(RuntimeError, "incomplete: 1 of 2"):
+                self.run_helper(temporary, cache, modules)
+
+    def test_xet_cache_defaults_beside_the_hub_cache_only_without_hf_home(self) -> None:
+        environ: dict = {}
+        ensure_model_snapshot.default_xet_cache(Path("/v/huggingface/hub"), environ)
+        self.assertEqual(environ["HF_XET_CACHE"], str(Path("/v/huggingface/xet")))
+        environ = {"HF_HOME": "/h"}
+        ensure_model_snapshot.default_xet_cache(Path("/v/huggingface/hub"), environ)
+        self.assertNotIn("HF_XET_CACHE", environ)

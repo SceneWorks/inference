@@ -9,10 +9,7 @@ free_pct=$(memory_pressure | awk -F': ' '/System-wide memory free percentage/ {g
 free_gb=$((total_gb * ${free_pct:-0} / 100))
 echo "RAM total ${total_gb} GB; memory_pressure free ${free_pct}% = ${free_gb} GB; active + wired + compressor ${used_gb} GB (informational)"
 ok=true
-if [ "$RUNNER_NAME" != "nax-macos-2" ]; then
-  echo "::warning::SKIP: the depth full fine-tune is routed to nax-macos-2 only; this job landed on $RUNNER_NAME"
-  ok=false
-elif [ "$total_gb" -lt 128 ]; then
+if [ "$total_gb" -lt 128 ]; then
   echo "::warning::SKIP: ${total_gb} GB RAM is under the 128 GB a full 3B fine-tune (~65 GB, capped at 80 GB) needs"
   ok=false
 elif [ -z "$free_pct" ] || [ "$free_gb" -lt 85 ]; then

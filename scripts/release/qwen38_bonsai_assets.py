@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -66,11 +67,23 @@ def selected_files(frozen: dict, cells: list[dict]) -> list[dict]:
              for vision in visions)]
 
 
-def provision_snapshot(model: dict, snapshot: Path, files: list[dict], download: Callable[..., Any]) -> list[dict]:
+def _is_inside(path: Path, root: Path) -> bool:
+    """True when `path` lies inside `root` once both are resolved (symlinks, case on Windows)."""
+    resolved, resolved_root = (os.path.normcase(os.path.realpath(p)) for p in (path, root))
+    try:
+        return os.path.commonpath([resolved, resolved_root]) == resolved_root
+    except ValueError:  # different Windows drives share no common path
+        return False
+
+
+def provision_snapshot(model: dict, snapshot: Path, files: list[dict], download: Callable[..., Any],
+                       download_root: Path | None = None) -> list[dict]:
     """Verify existing files first, fetch only missing pinned files, then verify publisher hashes.
 
     Corrupt existing files fail closed and are retained. No cache eviction or replacement occurs.
     Hugging Face owns resume of missing/incomplete downloads and its normal cache bookkeeping.
+    With `download_root` (the runner's hub cache), a fetch whose cache lies outside it is refused
+    before any transfer; a snapshot that needs no fetch is used wherever it is.
     """
     expected_repo = "models--" + model["repository"].replace("/", "--")
     if snapshot.name != model["revision"] or snapshot.parent.name != "snapshots" or snapshot.parent.parent.name != expected_repo:
@@ -85,6 +98,13 @@ def provision_snapshot(model: dict, snapshot: Path, files: list[dict], download:
             raise ValueError(f"broken cache symlink retained: {item['path']}")
         else:
             missing.append(item)
+    cache = snapshot.parent.parent.parent
+    if missing and download_root is not None and not _is_inside(cache, download_root):
+        raise ValueError(
+            f"{model['key']} needs {len(missing)} pinned file(s) downloaded, but its snapshot {snapshot} "
+            f"is outside this runner's Hugging Face hub cache {download_root} (HF_HUB_CACHE, else "
+            "$HF_HOME/hub, else the fleet root). Point its snapshot variable into that cache."
+        )
     required = sum(item["bytes"] for item in missing)
     existing_parent = snapshot
     while not existing_parent.exists():
@@ -94,7 +114,7 @@ def provision_snapshot(model: dict, snapshot: Path, files: list[dict], download:
         raise ValueError("insufficient disk space for selected missing pinned assets")
     for item in missing:
         downloaded = Path(download(repo_id=model["repository"], revision=model["revision"],
-                                   filename=item["path"], cache_dir=str(snapshot.parent.parent.parent), token=False))
+                                   filename=item["path"], cache_dir=str(cache), token=False))
         expected_path = snapshot / item["path"]
         if downloaded.absolute() != expected_path.absolute():
             raise ValueError("publisher download returned an unexpected snapshot path")

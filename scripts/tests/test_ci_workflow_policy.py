@@ -2,6 +2,7 @@
 
 import copy
 import functools
+import importlib
 import json
 import ntpath
 import os
@@ -919,7 +920,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 49 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-publish` job;
         # 50 since SW-7104 added the dispatch-only `mlx-minimax-h3-image-pe-render` job.
         # SW-7186 adds SenseNova provisioning on the secondary MLX runner.
-        MACOS_HUB_LOCK: 51,
+        # 54 since SW-7213 downloads missing snapshots in `starvector-terminal-mlx`, `ios-prequant`
+        # and the MLX Iris quant proof setup.
+        MACOS_HUB_LOCK: 54,
         # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
         # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
@@ -939,7 +942,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since SW-7104 added the dispatch-only `candle-minimax-h3-image-pe-render` job;
         # 28 since SW-7104's acceptance step installs it for the `minimax-h3-image-acceptance` profile.
         # SW-7186 adds separate Hub provisioning in the reference and native CUDA jobs.
-        WINDOWS_HUB_LOCK: 30,
+        # 33 since SW-7213 downloads missing snapshots in `starvector-terminal-candle`,
+        # `candle-decode-speedups-bench` and the Windows Iris quant proof setup;
+        # 32 since `candle-decode-speedups-bench` moved to its own workflow, whose pinned-Hub stager
+        # downloads without a separate lock install.
+        WINDOWS_HUB_LOCK: 32,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1123,6 +1130,30 @@ def models_exported_by_key(workflows: str) -> set[str]:
     return keys
 
 
+def models_bound_by_proof_asset_setups(workflows: str) -> set[str]:
+    """Model keys bound by an explicit-proof asset setup a workflow runs.
+
+    `scripts/ci/prepare_*_proof_assets.py` setups that declare `MANIFEST_KEYS` resolve each named
+    manifest row in the runner cache and write `<environment name>=<path>` into GITHUB_ENV
+    themselves, the same channel as `export_model_snapshot_paths.py`: the variable name lives in the
+    script, not the workflow. Only a setup the workflow code actually invokes counts.
+    """
+    return set(proof_asset_setup_bindings(workflows))
+
+
+def proof_asset_setup_bindings(workflows: str) -> dict[str, set[str]]:
+    """`{model key: environment variables it is bound to}` across the setups a workflow runs."""
+    bindings: dict[str, set[str]] = {}
+    pattern = r"scripts[\\/]ci[\\/](prepare_[a-z0-9_]+_proof_assets)\.py"
+    for name in sorted(set(re.findall(pattern, workflow_code(workflows)))):
+        module = importlib.import_module(f"scripts.ci.{name}")
+        for variable, key in getattr(module, "MANIFEST_BINDINGS", ()):
+            bindings.setdefault(key, set()).add(variable)
+        for key in getattr(module, "MANIFEST_KEYS", ()):
+            bindings.setdefault(key, set())
+    return bindings
+
+
 def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> list[str]:
     """Report manifest `environment` keys no workflow references, and exemptions that went stale.
 
@@ -1133,7 +1164,8 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
     referenced means the exemption outlived its justification, which is how the record of a
     deliberate non-goal (Mochi-1's freeze) decays into something indistinguishable from an oversight.
     """
-    exported_by_key = models_exported_by_key(workflows)
+    setup_bindings = proof_asset_setup_bindings(workflows)
+    exported_by_key = models_exported_by_key(workflows) | set(setup_bindings)
     errors: list[str] = []
     for model in models:
         key = model.get("key", "<unkeyed>")
@@ -1142,6 +1174,14 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
         if not variables:
             errors.append(f"{key}: declares no environment variable")
             continue
+        # A proof setup writes the variable itself, so the row must name what the setup binds.
+        bound = setup_bindings.get(key)
+        if bound:
+            for name in variables:
+                if name not in bound:
+                    errors.append(
+                        f"{key}: declares {name}, but its proof setup binds it as {sorted(bound)}"
+                    )
         if reason is not None and (
             not isinstance(reason, str) or len(reason.strip()) < MINIMUM_UNWIRED_REASON
         ):
@@ -1230,7 +1270,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("ios-prequant", dispatch["profile"]["options"])
         job = workflow["jobs"]["ios-prequant"]
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'")
-        self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "rw-chroma"])
         self.assertEqual(job["env"]["IOS_PREQUANT_BINDING"], "${{ inputs.ios_pricing_compile_binding }}")
         resolver = next(step["run"] for step in job["steps"] if step.get("name") == "Resolve matching MLX native artifact")
         self.assertIn("scripts/fetch-prebuilt-mlx.sh --target aarch64-apple-darwin --build-type Debug --github-env", resolver)
@@ -1668,9 +1708,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # after SW-7104 added the tier publication pair (its Windows job installs the client to
         # publish and again in the PE lane's own materialization script); 50 / 27 after SW-7104
         # added the PE-expansion render pair; 50 / 28 after the Candle acceptance step installs it
-        # for the acceptance-only profile.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 51)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 30)
+        # for the acceptance-only profile; 54 / 33 after SW-7213 made StarVector, iOS prequant,
+        # the decode benchmark and the Iris quant proof setup download missing snapshots; 54 / 32
+        # since the decode benchmark moved to its own workflow and stages through the pinned-Hub stager.
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 54)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 32)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_SENSENOVA_LOCK), 1)
@@ -3251,6 +3293,23 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             {"alpha", "beta"},
         )
+        # An explicit-proof asset setup wires the rows its MANIFEST_KEYS names, only when run.
+        lens = {"key": "lens-base-train-proof", "environment": ["LENS_BASE_SNAPSHOT"]}
+        setup = '        run: \'"%REVIEWED_PYTHON%" -I scripts\\ci\\prepare_cohort_training_proof_assets.py\'\n'
+        self.assertEqual(manifest_environment_wiring_errors([lens], setup), [])
+        self.assertIn("lens-base-train-proof", models_bound_by_proof_asset_setups(setup))
+        # The row must name the variable its setup binds it to: a stale or borrowed name is caught.
+        renamed = {"key": "lens-base-train-proof", "environment": ["LENS_SNAPSHOT_RENAMED"]}
+        self.assertIn(
+            "declares LENS_SNAPSHOT_RENAMED, but its proof setup binds it as ['LENS_BASE_SNAPSHOT']",
+            "\n".join(manifest_environment_wiring_errors([renamed], setup)),
+        )
+        for unrun in ("", "      # scripts/ci/prepare_cohort_training_proof_assets.py binds it\n"):
+            with self.subTest(unrun=unrun.strip()):
+                self.assertIn(
+                    "referenced by no workflow",
+                    "\n".join(manifest_environment_wiring_errors([lens], unrun)),
+                )
         # Materializing weights is not wiring: ensure_model_snapshot.py exports nothing.
         provisioned = "        run: python scripts/release/ensure_model_snapshot.py --model orphan\n"
         self.assertIn(
@@ -3385,6 +3444,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn('allow_patterns=["bf16/**"]', job)
         self.assertIn("models--SceneWorks--scail2-mlx", job)
+        # The package lands in the runner's own Hugging Face cache, not the user-profile default.
+        self.assertIn("download_to_runner_cache(", job)
+        self.assertIn("cache=hub", job)
+        self.assertIn("hub = runner_hub_cache()", job)
+        self.assertNotIn("USERPROFILE", job)
         git_bash = job.index("Select Git Bash")
         validate_python = job.index("Validate runner-provisioned CPython 3.14 x64")
         toolchain = job.index("uses: ./.github/actions/setup-rust")
@@ -5097,7 +5161,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     {
                         "model": "expander" if "-expander-" in profile else "describer",
                         "backend": "candle" if "-candle" in profile else "mlx",
-                        "mac_runner": "nax-macos-2" if "-mlx-nax-macos-2" in profile else "nax-macos",
+                        "mac_runner": "rw-llm" if "-mlx-nax-macos-2" in profile else "rw-starvector",
                         "publish": not profile.endswith("-convert-only"),
                     },
                 )
@@ -5118,26 +5182,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(
             mlx["runs-on"],
             ["self-hosted", "macOS", "ARM64",
-             "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"],
+             "${{ inputs.mac_runner }}"],
         )
-        refuse = mlx["steps"][1]
-        self.assertEqual(refuse["name"], "Refuse any runner but the selected Mac")
-        self.assertIn('[[ "$RUNNER_NAME" == "$MAC_RUNNER" ]] ||', refuse["run"])
-        self.assertEqual(mlx["env"]["MAC_RUNNER"], "${{ inputs.mac_runner }}")
-        for runner, selected, succeeds in (
-            ("nax-macos", "nax-macos", True),
-            ("nax-macos-2", "nax-macos-2", True),
-            ("nax-macos-2", "nax-macos", False),
-            ("nax-macos", "nax-macos-2", False),
-            ("nax-macos", "", False),
-        ):
-            with self.subTest(runner=runner, selected=selected):
-                result = subprocess.run(
-                    ["bash", "--noprofile", "--norc", "-e", "-c", refuse["run"]],
-                    env={"PATH": os.environ["PATH"], "RUNNER_NAME": runner, "MAC_RUNNER": selected},
-                    capture_output=True, text=True, encoding="utf-8", check=False,
-                )
-                self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+        # The Macs are interchangeable: the label routes the job, and no step compares runner names.
+        mlx_text = yaml.safe_dump(mlx)
+        self.assertNotIn("RUNNER_NAME\" ==", mlx_text)
+        self.assertNotIn("MAC_RUNNER", mlx_text)
+        self.assertIn("LANE_HUB=$(python3.12 scripts/release/runner_hub_cache.py)", mlx_text)
         self.assertEqual(jobs["candle"]["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
 
     def test_qwen38_bonsai_terminal_profile_is_accelerator_only_and_sealed(self) -> None:
@@ -5153,7 +5204,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         cuda = jobs["qwen38-bonsai-candle"]
         aggregate = jobs["qwen38-bonsai-aggregate"]
         self.assertNotIn("qwen38-bonsai-candle-cpu", jobs)
-        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "rw-llm"])
         self.assertEqual(cuda["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
         self.assert_qwen38_candle_requires_successful_mlx(workflow)
         self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle"])
@@ -5889,7 +5940,7 @@ class WindowsBashSelectionTests(unittest.TestCase):
             "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"
         ):
             errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
-        # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
+        # The Qwen-Image weight-set label, never the privileged `real-weights` one.
         runner = inputs.get("qwen_image_2_1_lora_runner", {})
         if runner.get("type") != "choice" or runner.get("default") != "rw-mage" or runner.get("options") != ["rw-mage", "rw-starvector"]:
             errors.append("MLX LoRA runner must be bounded to rw-mage/rw-starvector, default rw-mage")

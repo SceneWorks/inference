@@ -157,7 +157,7 @@ class ModelWorkflowRoutes(unittest.TestCase):
         steps = bridge['model-proof-execute']['steps']
         for platform, backend in (('macOS', 'mlx'), ('Windows', 'candle-cuda')):
             step = next(step for step in steps if step.get('name') ==
-                        f'Verify pinned Iris quant snapshots on {"the secondary Mac" if platform == "macOS" else "Windows"}')
+                        f'Verify pinned Iris quant snapshots on {"macOS" if platform == "macOS" else "Windows"}')
             self.assertIn("matrix.asset_setup == 'iris-quant'", step['if'])
             self.assertIn(f'--backend {backend}', step['run'])
             self.assertEqual(step, next(item for item in dedicated['steps'] if item.get('name') == step['name']))

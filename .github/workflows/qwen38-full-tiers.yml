@@ -20,11 +20,9 @@ name: Qwen3.8-27B full tiers (convert and publish)
 # report (artifact `qwen38-full-tiers-<model>-<backend>`) holds the resulting commit and every file's
 # size and sha256: the SceneWorks manifest pins are filled from it.
 #
-# MLX runs on the Mac the `mac_runner` input names, and the job refuses any other runner name before
-# doing any work. `nax-macos` (label `rw-starvector`, Michael's dev Mac) is the profiles' MLX target
-# ONLY while nax-macos-2's model disk is full: Michael approved that loan for SW-7202 on 2026-11-18.
-# Its task-owned weights root is on /Volumes/Models (~1.4 TB free), never the internal disk. Use the
-# `-mlx-nax-macos-2` profiles (`rw-llm`, weights root under $HOME) once its new drive is fitted.
+# MLX runs on whichever Mac carries the runner label `mac_runner` names (`rw-llm` or
+# `rw-starvector`); both Macs keep model data on /Volumes/Models, so downloads land in the runner's
+# Hugging Face cache and the run's scratch stays under /Volumes/Models/sceneworks-rw-weights.
 # Candle conversion is CPU-only on the Windows CUDA real-weights box. Uploads use the runner's own
 # Hugging Face login, as the SW-7104 publication lanes do. Each job checks free disk before every
 # write and removes only its own run-scoped scratch. `publish: false` (the `-convert-only`
@@ -38,11 +36,11 @@ on:
         required: true
         type: string
       backend:
-        description: mlx (the Mac `mac_runner` names) or candle (Windows CUDA real-weights box, CPU conversion)
+        description: mlx (on the Mac label `mac_runner` names) or candle (Windows CUDA real-weights box, CPU conversion)
         required: true
         type: string
       mac_runner:
-        description: MLX runner, nax-macos or nax-macos-2 (ignored by the candle backend)
+        description: MLX runner label, rw-llm or rw-starvector (ignored by the candle backend)
         required: true
         type: string
       publish:
@@ -57,43 +55,34 @@ jobs:
   mlx:
     name: Convert and publish the ${{ inputs.model }} MLX full tiers
     if: github.event_name == 'workflow_dispatch' && inputs.backend == 'mlx'
-    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"]
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.mac_runner }}"]
     timeout-minutes: 720
     env:
       QWEN38_FULL_TIERS_MODEL: ${{ inputs.model }}
-      MAC_RUNNER: ${{ inputs.mac_runner }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - name: Refuse any runner but the selected Mac
-        run: |
-          echo "runner: $RUNNER_NAME (selected: $MAC_RUNNER)"
-          [[ "$RUNNER_NAME" == "$MAC_RUNNER" ]] || { echo "::error::this run selected $MAC_RUNNER but landed on $RUNNER_NAME; nothing was started"; exit 1; }
       - name: Prepare the run
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           if [[ "${{ inputs.publish }}" == true ]]; then
             PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 -c 'from huggingface_hub import HfApi; n = HfApi().whoami().get("name"); assert n, "no Hugging Face login on this runner"; print("Hugging Face identity:", n)'
           fi
-          # nax-macos keeps model data on /Volumes/Models; nax-macos-2 under $HOME.
-          if [[ "$MAC_RUNNER" == nax-macos ]]; then
-            [[ -d /Volumes/Models && -w /Volumes/Models ]] || { echo "::error::/Volumes/Models is not a writable volume on $RUNNER_NAME"; exit 1; }
-            lane_root="/Volumes/Models/sceneworks-rw-weights"
-          else
-            lane_root="$HOME/sceneworks-rw-weights"
-          fi
+          # Both Macs keep model data on /Volumes/Models; sources download into the runner's hub cache.
+          [[ -d /Volumes/Models && -w /Volumes/Models ]] || { echo "::error::/Volumes/Models is not a writable volume on $RUNNER_NAME"; exit 1; }
+          lane_root="/Volumes/Models/sceneworks-rw-weights"
           if [[ -L "$lane_root" ]]; then
             echo "task-owned weights root must be an internal directory: $lane_root" >&2; exit 1
           fi
-          mkdir -p "$lane_root/hub"
+          mkdir -p "$lane_root"
           python3.12 scripts/ci/qwen21_weights_root.py "$lane_root"
           scratch="$lane_root/sw-7202-full-tiers-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           rm -rf "$scratch"
           mkdir -p "$scratch" "$RUNNER_TEMP/qwen38-full-tiers-reports"
           df -h "$lane_root"
           {
-            echo "LANE_HUB=$lane_root/hub"
+            echo "LANE_HUB=$(python3.12 scripts/release/runner_hub_cache.py)"
             echo "LANE_ROOT=$lane_root"
             echo "PUBLISH_SCRATCH=$scratch"
             echo "PUBLISH_REPORTS=$RUNNER_TEMP/qwen38-full-tiers-reports"

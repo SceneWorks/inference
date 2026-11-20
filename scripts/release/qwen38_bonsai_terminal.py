@@ -36,8 +36,10 @@ except ImportError:
 
 try:
     from scripts.release import qwen38_bonsai_assets as assets
+    from scripts.release.ensure_model_snapshot import runner_hub_cache
 except ImportError:
     import qwen38_bonsai_assets as assets
+    from ensure_model_snapshot import runner_hub_cache
 
 
 SCHEMA_VERSION = 1
@@ -3202,7 +3204,10 @@ def provision_assets(args: argparse.Namespace) -> int:
                 # This import occurs only after admission; metadata-only qualification never
                 # imports a network client, downloads an asset, or creates a model process.
                 from huggingface_hub import hf_hub_download
-                row["files"] = assets.provision_snapshot(plan["model"], plan["snapshot"], files, hf_hub_download)
+                # In a real-weight job every fetch lands in the runner's own hub cache.
+                download_root = runner_hub_cache() if os.environ.get("GITHUB_ACTIONS") == "true" else None
+                row["files"] = assets.provision_snapshot(plan["model"], plan["snapshot"], files, hf_hub_download,
+                                                         download_root=download_root)
                 row["status"] = "publisher_verified"
                 row["full_snapshot_verified"] = len(row["files"]) == len(plan["frozen"]["files"])
                 row["admitted_cells"] = [cell["id"] for cell in viable]

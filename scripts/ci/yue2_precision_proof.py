@@ -950,9 +950,7 @@ def _execute(args: argparse.Namespace, locks: list) -> None:
     owner_guard = None
     scheduling = getattr(args, "cuda_scheduling_mode", "shared-host")
     require(scheduling == "shared-host" or args.backend == "cuda", "GPU0 owner mode is CUDA only")
-    if args.backend == "metal":
-        require(runner == "nax-macos-2", f"Metal proof assigned to wrong runner: {runner}")
-    else:
+    if args.backend != "metal":
         require(os.environ.get("CUDA_VISIBLE_DEVICES") == "1",
                 "CUDA proof must bind logical CUDA0 to the owner's physical GPU1")
         from yue2_cuda_idle_context import SharedGpu1Lock, check_shared_gpu1_dispatch  # type: ignore[import-not-found]

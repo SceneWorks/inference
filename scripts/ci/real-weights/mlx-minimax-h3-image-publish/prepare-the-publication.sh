@@ -7,8 +7,6 @@ lane_root="$HOME/sceneworks-rw-weights"
 if [[ -L "$lane_root" ]]; then
   echo "task-owned weights root must be an internal directory: $lane_root" >&2; exit 1
 fi
-mkdir -p "$lane_root/hub"
-python3.12 scripts/ci/qwen21_weights_root.py "$lane_root"
 scratch="$lane_root/sw-7104-publish-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 reports="$RUNNER_TEMP/sw-7104-publication-reports"
 rm -rf "$reports"
@@ -16,5 +14,4 @@ mkdir -p "$scratch" "$reports"
 {
   echo "PUBLISH_SCRATCH=$scratch"
   echo "PUBLISH_REPORTS=$reports"
-  echo "LANE_ROOT=$lane_root"
 } >> "$GITHUB_ENV"

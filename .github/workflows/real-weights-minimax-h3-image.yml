@@ -37,6 +37,14 @@ permissions:
 
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+  # rust-lang/rust#157750: a fresh macOS build strips host proc-macro dylibs into E0463
+  # ("can't find crate for `*_derive`"), so keep every profile and its build overrides unstripped.
+  CARGO_PROFILE_DEV_STRIP: none
+  CARGO_PROFILE_TEST_STRIP: none
+  CARGO_PROFILE_RELEASE_STRIP: none
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
 
 jobs:
   minimax-h3-image-reference:
@@ -454,7 +462,8 @@ jobs:
   # the SceneWorks Hugging Face repositories the SceneWorks manifest names, after Michael's go-ahead
   # (2026-11-14). Dispatch-only profiles, never `all`: `minimax-h3-image-publish` runs both jobs,
   # `-mlx` / `-candle` re-run one side,
-  # `-mlx-nax-macos` runs the macOS side on `nax-macos` instead of nax-macos-2, and a profile ending
+  # `-mlx-nax-macos` runs the macOS side on the `rw-starvector` label instead of `rw-mage` (the profile
+  # name predates label routing and is kept for dispatch compatibility), and a profile ending
   # in `-pe` (`-mlx-pe`, `-mlx-nax-macos-pe`) publishes only the PE MLX tiers. `scripts/ci/publish_hf_tiers.py` uploads only what the repo
   # does not already hold, verifies every file against the hub's metadata, and writes a report.
   # Uploads use the runner's own Hugging Face login, as the Chroma publication does. Each job
@@ -472,8 +481,8 @@ jobs:
   mlx-minimax-h3-image-publish:
     name: Publish the H3-Image DiT and PE MLX tiers
     if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-mlx' || inputs.profile == 'minimax-h3-image-publish-mlx-pe' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos-pe')
-    # nax-macos-2 (`rw-mage`) by default. The `-nax-macos` profiles run this job on `nax-macos`
-    # (`rw-starvector`, Michael's dev Mac) as a one-time loan he approved for SW-7104.
+    # `rw-mage` by default; the `-nax-macos` profiles select `rw-starvector` (SW-7104). The label
+    # alone decides the Mac.
     runs-on: [self-hosted, macOS, ARM64, "${{ startsWith(inputs.profile, 'minimax-h3-image-publish-mlx-nax-macos') && 'rw-starvector' || 'rw-mage' }}"]
     timeout-minutes: 720
     env:

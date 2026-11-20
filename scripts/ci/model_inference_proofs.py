@@ -45,11 +45,11 @@ RUNNERS = {
     'candle-metal': 'macos-15',
     'candle-cuda': ['self-hosted', 'windows', 'cuda', 'real-weights'],
 }
-# Provisioned self-hosted Macs a request may select by name, each pinned by a label only it carries.
-# `nax` is the established secondary Mac (rw-llm); `nax-primary` the primary Mac (rw-starvector).
+# Provisioned self-hosted Mac routes a request may select. Each route is a runner-label set; which
+# Mac carries the label is an operator setting, and no route checks the runner's name.
 NAX_ROUTES = {
-    'nax': {'name': 'nax-macos-2', 'labels': ['self-hosted', 'macOS', 'ARM64', 'rw-llm']},
-    'nax-primary': {'name': 'nax-macos', 'labels': ['self-hosted', 'macOS', 'ARM64', 'rw-starvector']},
+    'nax': {'labels': ['self-hosted', 'macOS', 'ARM64', 'rw-llm']},
+    'nax-primary': {'labels': ['self-hosted', 'macOS', 'ARM64', 'rw-starvector']},
 }
 POLICY_BACKENDS = {'mlx': 'darwin-mlx', 'candle-metal': 'darwin-mlx',
                    'candle-cpu': 'linux-cpu', 'candle-cuda': 'windows-cuda'}
@@ -854,8 +854,6 @@ def require_host(backend: str, env: dict[str, str], route: str = 'hosted') -> No
     if env.get('RUNNER_OS') != expected:
         raise ValueError('wrong proof host platform')
     if expected == 'macOS':
-        if route in NAX_ROUTES and env.get('RUNNER_NAME') != NAX_ROUTES[route]['name']:
-            raise ValueError(f"provisioned model route {route} must run on {NAX_ROUTES[route]['name']}")
         if route == 'hosted' and env.get('MODEL_PROOF_RUNNER_ENVIRONMENT') != 'github-hosted':
             raise ValueError('fixture route requires the isolated hosted Mac environment')
 

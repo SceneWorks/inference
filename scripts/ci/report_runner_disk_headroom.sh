@@ -23,8 +23,9 @@
 # org runner settings, and no amount of placement evidence substitutes for it.
 #
 # WHAT IT IS FOR. A lane's first run on a box that does not already hold its snapshots pays
-# their full Hub transfer into the `~/.cache/huggingface` that every other `rw-*` lane on
-# that runner reads from, and an ENOSPC partway through leaves partial blobs behind rather
+# their full Hub transfer into the runner's Hugging Face cache (`$HF_HOME`, on Macs
+# `/Volumes/Models/huggingface`) that every other `rw-*` lane on that runner reads from, and
+# an ENOSPC partway through leaves partial blobs behind rather
 # than failing cleanly. This records what the box had before that transfer started.
 #
 # A RECORD, NOT A PRE-DISPATCH GATE. By the time this runs the runner is already claimed, so
@@ -47,7 +48,15 @@ echo "runner: ${RUNNER_NAME:-<unset>}  home: ${HOME:-<unset>}"
 # `$HOME` and `$RUNNER_TEMP` are one volume on both Macs, so `df` would print the same
 # filesystem twice in a step whose only purpose is to be read. `RUNNER_TEMP` is defaulted
 # rather than assumed: unset, `df` would exit non-zero on the empty operand.
-df -h "${HOME:-/}" "${RUNNER_TEMP:-${HOME:-/}}" 2>/dev/null | awk 'NR == 1 || !seen[$0]++'
+# Downloads land in the runner's Hugging Face hub cache (resolved as `ensure_model_snapshot.py`
+# resolves it), which on the Macs is a separate volume -- report that one too, via its nearest
+# existing ancestor because an empty drive may not hold the directory yet.
+hub_cache="${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-${HF_HOME:+$HF_HOME/hub}}}"
+hub_cache="${hub_cache:-/Volumes/Models/huggingface/hub}"
+hub_cache="${hub_cache/#\~/${HOME:-}}"
+while [[ ! -e "$hub_cache" && "$hub_cache" != / ]]; do hub_cache="$(dirname "$hub_cache")"; done
+echo "hub cache volume: $hub_cache"
+df -h "${HOME:-/}" "${RUNNER_TEMP:-${HOME:-/}}" "$hub_cache" 2>/dev/null | awk 'NR == 1 || !seen[$0]++'
 
 # Two variables in the same lane can name the SAME directory -- `candle-audio-chatterbox`
 # resolves both `CHATTERBOX_SNAPSHOT` and `CHATTERBOX_VE_SNAPSHOT` to one snapshot. Sizing

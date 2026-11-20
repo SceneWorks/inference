@@ -26,6 +26,14 @@ on:
 
 env:
   FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
+  # rust-lang/rust#157750: a fresh macOS build strips host proc-macro dylibs into E0463
+  # ("can't find crate for `*_derive`"), so keep every profile and its build overrides unstripped.
+  CARGO_PROFILE_DEV_STRIP: none
+  CARGO_PROFILE_TEST_STRIP: none
+  CARGO_PROFILE_RELEASE_STRIP: none
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
   MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
@@ -158,16 +166,21 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: command -v python3.12
-      - name: Verify pinned Iris quant snapshots on the secondary Mac
+      - name: Verify pinned Iris quant snapshots on macOS
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
         shell: bash
-        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          IRIS_PROOF_HF_HUB_PATH="$RUNNER_TEMP/huggingface-hub" python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
       - name: Verify pinned Iris quant snapshots on Windows
         if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
         shell: cmd
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "IRIS_PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda
       - name: Bind pinned provisioned bounded MLX training inputs
         if: matrix.asset_setup == 'mlx-training' && runner.os == 'macOS'
         shell: bash
@@ -175,9 +188,9 @@ jobs:
           MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
         run: |
           python3.12 -I scripts/ci/model_inference_proofs.py --plan --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
-          # Opt-in (request "download_missing": true): the hash-pinned huggingface_hub the MLX
-          # real-weight lanes use, so a pinned snapshot no root holds is fetched whole at its revision.
-          if python3.12 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["request"].get("download_missing") is True else 1)' "$RUNNER_TEMP/model-proof-plan.json"; then
+          # Default (unless the request sets "download_missing": false): the hash-pinned huggingface_hub
+          # the MLX real-weight lanes use, so a pin no root holds is fetched whole into the runner's hub cache.
+          if python3.12 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["request"].get("download_missing", True) is True else 1)' "$RUNNER_TEMP/model-proof-plan.json"; then
             python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
             export MLX_PROOF_HF_HUB_PATH="$RUNNER_TEMP/huggingface-hub"
           fi
@@ -188,50 +201,44 @@ jobs:
         run: |
           "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
           if errorlevel 1 exit /b %ERRORLEVEL%
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
           "%REVIEWED_PYTHON%" -I scripts\ci\prepare_bespoke_training_proof_assets.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
       - name: Bind installed native NVFP4 Krea pose inputs
         if: matrix.asset_setup == 'krea-native-nvfp4-pose' && runner.os == 'Windows'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $bindings = @{
-            KREA_IMPORTED_DIT = 'E:\huggingface\hub\models--Comfy-Org--Krea-2\snapshots\952f49d49653cb42e7d6cf7cbfad74738073ec7d\diffusion_models\krea2_turbo_nvfp4.safetensors'
-            KREA_BASE_SNAPSHOT = 'E:\huggingface\hub\models--SceneWorks--krea-2-turbo-mlx\snapshots\d009674080cc1bccf2b629d834c34bf5eccdb723\bf16'
-            KREA_CONTROL_BRANCH = 'E:\huggingface\hub\models--SceneWorks--krea2-pose-controlnet-beta\snapshots\cb3a0ac7590f5ec594a4eeb43b95ee1da0b5a0ac\control_step5000.safetensors'
-            KREA_IMPORTED_POSE_IMAGE = Join-Path $env:GITHUB_WORKSPACE 'crates/media/candle-gen/candle-gen-krea/tests/fixtures/native-pose.png'
-          }
-          foreach ($binding in $bindings.GetEnumerator()) {
-            if (-not (Test-Path -LiteralPath $binding.Value)) { throw "Missing native pose input: $($binding.Name)" }
-            "$($binding.Name)=$($binding.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
+          & $env:REVIEWED_PYTHON -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$env:RUNNER_TEMP\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          if ($LASTEXITCODE -ne 0) { throw 'huggingface_hub install failed' }
+          $env:PROOF_HF_HUB_PATH = Join-Path $env:RUNNER_TEMP 'huggingface-hub'
+          # Binds KREA_IMPORTED_DIT, KREA_BASE_SNAPSHOT and KREA_CONTROL_BRANCH, downloading a missing one.
+          & $env:REVIEWED_PYTHON -I scripts/ci/prepare_krea_proof_assets.py --setup krea-native-nvfp4-pose
+          if ($LASTEXITCODE -ne 0) { throw 'Missing native pose inputs' }
+          $pose = Join-Path $env:GITHUB_WORKSPACE 'crates/media/candle-gen/candle-gen-krea/tests/fixtures/native-pose.png'
+          if (-not (Test-Path -LiteralPath $pose)) { throw 'Missing native pose input: KREA_IMPORTED_POSE_IMAGE' }
+          "KREA_IMPORTED_POSE_IMAGE=$pose" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           # These bindings only select installed inputs; source-owned readers record consumed bytes.
       - name: Bind provisioned Raw snapshot for bounded Krea training
         if: matrix.asset_setup == 'krea-training' && runner.os == 'Windows'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $snapshot = 'E:\huggingface\hub\models--krea--Krea-2-Raw\snapshots\4ad9f4b627a647fad78b3dfeebb09f2654aeb494'
-          $required = @('model_index.json', 'transformer/config.json', 'transformer/diffusion_pytorch_model.safetensors.index.json', 'text_encoder/config.json', 'text_encoder/model.safetensors', 'tokenizer/tokenizer.json', 'tokenizer/tokenizer_config.json', 'vae/config.json', 'vae/diffusion_pytorch_model.safetensors')
-          foreach ($relative in $required) {
-            $file = Get-Item -LiteralPath (Join-Path $snapshot $relative)
-            if ($file.PSIsContainer -or $file.Length -eq 0) { throw "Missing/empty Krea asset: $relative" }
-          }
-          $index = Get-Content -LiteralPath (Join-Path $snapshot 'transformer/diffusion_pytorch_model.safetensors.index.json') -Raw | ConvertFrom-Json
-          $shards = @($index.weight_map.PSObject.Properties.Value | Sort-Object -Unique)
-          if ($shards.Count -ne 3) { throw 'Expected three provisioned Raw transformer shards' }
-          foreach ($shard in $shards) {
-            if ($shard -notmatch '^diffusion_pytorch_model-\d{5}-of-00003\.safetensors$') { throw "Invalid Raw shard name: $shard" }
-            $file = Get-Item -LiteralPath (Join-Path $snapshot "transformer/$shard")
-            if ($file.PSIsContainer -or $file.Length -eq 0) { throw "Missing/empty Raw shard: $shard" }
-          }
-          # Layout availability only. The source-owned input witnesses record the
-          # actual files consumed; this path is not a substitute for those receipts.
-          Write-Host "Bound existing Krea Raw snapshot: $snapshot; shards=$($shards -join ',')"
-          "KREA_RAW_DIR=$snapshot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $env:REVIEWED_PYTHON -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$env:RUNNER_TEMP\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          if ($LASTEXITCODE -ne 0) { throw 'huggingface_hub install failed' }
+          $env:PROOF_HF_HUB_PATH = Join-Path $env:RUNNER_TEMP 'huggingface-hub'
+          # Binds KREA_RAW_DIR after verifying (or downloading) the manifest's files, the three transformer
+          # shards its index names included. Layout availability only: the source-owned input witnesses
+          # record the actual files consumed; this path is not a substitute for those receipts.
+          & $env:REVIEWED_PYTHON -I scripts/ci/prepare_krea_proof_assets.py --setup krea-training
+          if ($LASTEXITCODE -ne 0) { throw 'Missing Krea Raw training inputs' }
       - name: Bind installed pinned assets for exact bounded cohort CUDA proof
         if: matrix.asset_setup == 'cohort-training' && runner.os == 'Windows'
         shell: cmd
-        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_cohort_training_proof_assets.py'
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PROOF_HF_HUB_PATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_cohort_training_proof_assets.py
       - name: Stage and bind declared pinned Hub snapshots (Linux/macOS)
         if: matrix.asset_setup == 'hub-snapshots' && runner.os != 'Windows'
         shell: bash
@@ -306,14 +313,6 @@ jobs:
       FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
       PYTHONUNBUFFERED: '1'
     steps:
-      - name: Require exact selected macOS runner before scanning
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          if [[ "$RUNNER_NAME" != "$INVENTORY_RUNNER" ]]; then
-            echo "::error::Selected runner differs from actual runner"
-            exit 1
-          fi
       - name: Require exact selected Windows runner before scanning
         if: runner.os == 'Windows'
         shell: cmd
