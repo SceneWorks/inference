@@ -623,7 +623,7 @@ def download_to_runner_cache(
     """
     cache = runner_hub_cache() if cache is None else cache
     default_xet_cache(cache)
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.utils import filter_repo_objects
 
     root = Path(
@@ -640,15 +640,30 @@ def download_to_runner_cache(
         raise RuntimeError(
             f"{repo_id}@{revision} materialized at {root}, not the runner-cache snapshot {expected}"
         )
-    files = HfApi().list_repo_files(repo_id, revision=revision, token=token)
-    wanted = sorted(filter_repo_objects(files, allow_patterns=allow_patterns))
+    sizes = {
+        entry.path: entry.size
+        for entry in HfApi().list_repo_tree(repo_id, revision=revision, recursive=True, token=token)
+        if getattr(entry, "size", None) is not None and not entry.path.endswith("/")
+    }
+    wanted = sorted(filter_repo_objects(sorted(sizes), allow_patterns=allow_patterns))
     if not wanted:
         raise RuntimeError(f"{repo_id}@{revision} has no files matching {allow_patterns}")
-    missing = [name for name in wanted if not (root / name).is_file()]
+
+    def damaged() -> list[str]:
+        # Present AND the Hub's byte size: an interrupted or truncated cached blob (seen on a
+        # Windows cache as "incomplete metadata, file not fully covered") is not a complete file.
+        return [name for name in wanted
+                if not (root / name).is_file() or (root / name).stat().st_size != sizes[name]]
+
+    for name in damaged():
+        print(f"re-fetching {repo_id}@{revision}:{name} (missing or not {sizes[name]} bytes)", flush=True)
+        hf_hub_download(repo_id=repo_id, revision=revision, filename=name, cache_dir=str(cache),
+                        token=token, force_download=True)
+    missing = damaged()
     if missing:
         raise RuntimeError(
             f"{repo_id}@{revision} at {root} is incomplete: {len(missing)} of {len(wanted)} "
-            f"selected files are missing (first: {missing[0]})"
+            f"selected files are missing or the wrong size (first: {missing[0]})"
         )
     return root
 
@@ -660,10 +675,11 @@ def main() -> int:
     target.add_argument(
         "--export",
         metavar="NAME",
+        action="append",
         help=(
             "materialize into the runner's Hugging Face hub cache (HF_HUB_CACHE, else "
             "$HF_HOME/hub, else the fleet root) and export the snapshot path as NAME to later "
-            "steps through $GITHUB_ENV"
+            "steps through $GITHUB_ENV (repeat to export it under several names)"
         ),
     )
     target.add_argument(
@@ -707,8 +723,8 @@ def main() -> int:
         return 1
     source = "downloaded" if downloaded else "cached"
     print(f"model snapshot: OK ({model['key']}@{model['revision']}, {source}, {snapshot})")
-    if args.export:
-        export_environment(args.export, snapshot)
+    for name in args.export or ():
+        export_environment(name, snapshot)
     return 0
 
 

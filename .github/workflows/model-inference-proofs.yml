@@ -26,6 +26,14 @@ on:
 
 env:
   FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
+  # rust-lang/rust#157750: a fresh macOS build strips host proc-macro dylibs into E0463
+  # ("can't find crate for `*_derive`"), so keep every profile and its build overrides unstripped.
+  CARGO_PROFILE_DEV_STRIP: none
+  CARGO_PROFILE_TEST_STRIP: none
+  CARGO_PROFILE_RELEASE_STRIP: none
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
   MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
