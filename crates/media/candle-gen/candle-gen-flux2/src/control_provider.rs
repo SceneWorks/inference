@@ -137,7 +137,31 @@ pub struct Flux2Control {
 pub fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
     descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
+    descriptor.capabilities.conditioning =
+        vec![candle_gen::gen_core::ConditioningKind::Control];
+    descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Any);
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
+}
+
+pub(crate) fn compile_control_feature_route(
+    spec: &candle_gen::gen_core::LoadSpec,
+    req: &candle_gen::gen_core::GenerationRequest,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::RenderPlan>> {
+    let descriptor = control_report_descriptor();
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if !matches!(
+        req.conditioning.as_slice(),
+        [candle_gen::gen_core::Conditioning::Control { .. }]
+    ) || spec.control.is_none()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "flux2_dev_control requires a Control conditioning input and control weights".into(),
+        ));
+    }
+    crate::compile_conditioned_plan(Flux2Variant::Dev, &descriptor, spec, req).map(Some)
 }
 
 impl Flux2Control {
@@ -629,13 +653,17 @@ impl Flux2Control {
             candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
         let total_steps = sigmas.len().saturating_sub(1);
         let mut eval_idx = 0usize;
+        let span = 0..total_steps;
         // The driver does cancel + progress + the integrator step. The control forward lives inside the
         // predict closure so a multi-eval solver re-runs it. dev is guidance-distilled: a single forward
         // feeding the embedded guidance scalar (no negative pass). FLUX.2 embeds σ×1000.
-        let latents = candle_gen::run_flow_sampler(
+        let latents = candle_gen::run_flow_sampler_spans(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
+            std::slice::from_ref(&span),
+            None,
+            false,
             latents,
             req.seed,
             &req.cancel,

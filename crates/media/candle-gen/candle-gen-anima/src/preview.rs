@@ -536,13 +536,13 @@ mod tests {
 
     /// The sampler driver whose call sites this inventory reads. Named without an open paren
     /// everywhere else in this crate's prose, because the scan below is textual.
-    const DRIVER: &str = "run_flow_sampler";
+    const DRIVER: &str = "run_flow_sampler_spans";
 
-    /// `run_flow_sampler`'s argument count, and the 0-based position of its `preview` argument.
+    /// `run_flow_sampler_spans`'s argument count, and the 0-based position of its `preview` argument.
     /// Pinned so a signature change — or a scanner mis-split — fails this inventory loudly instead of
     /// quietly shifting which argument is being asserted about.
-    const SAMPLER_ARITY: usize = 9;
-    const PREVIEW_ARGUMENT: usize = 7;
+    const SAMPLER_ARITY: usize = 12;
+    const PREVIEW_ARGUMENT: usize = 10;
 
     /// The test-only attribute whose item is dropped before the scan. Spelled once, and asserted to
     /// leave no survivor behind.

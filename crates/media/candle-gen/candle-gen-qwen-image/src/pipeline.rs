@@ -10,13 +10,6 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::config::{LATENT_CHANNELS, PATCH};
 
-// Dynamic-μ shift endpoints (image-area driven), from the fork's `qwen_scheduler`.
-const SIGMA_BASE_SHIFT: f32 = 0.5;
-const SIGMA_MAX_SHIFT: f32 = 0.9;
-const SIGMA_BASE_SEQ_LEN: f32 = 256.0;
-const SIGMA_MAX_SEQ_LEN: f32 = 8192.0;
-const SIGMA_SHIFT_TERMINAL: f32 = 0.02;
-
 /// Packed token grid `(lat_h, lat_w) = (H/16, W/16)`.
 pub fn latent_dims(width: u32, height: u32) -> (usize, usize) {
     ((height / 16) as usize, (width / 16) as usize)
@@ -105,9 +98,7 @@ pub fn pack_fun_control_context(
 /// same per-resolution shift the production schedule uses. The native [`qwen_sigmas`] schedule is
 /// returned verbatim regardless, so `μ` only steers the (non-default) curated scheduler.
 pub fn qwen_mu(width: u32, height: u32) -> f32 {
-    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
-    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
-    m * (width as f32 * height as f32 / 256.0) + b
+    candle_gen::gen_core::sampling::qwen_mu(width, height)
 }
 
 /// The Lightning flow-match shift `μ = ln 3` (the static `exp(μ) = 3.0`, see [`lightning_sigmas`]) —
@@ -120,63 +111,18 @@ pub fn lightning_mu() -> f32 {
 /// by an image-area-driven exponential μ shift, then rescaled so the terminal one-minus-σ hits
 /// `1 − 0.02`, then a trailing `0.0`.
 pub fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
-    let n = num_steps.max(1);
-    let nf = n as f32;
-    let (start, end) = (1.0f32, 1.0f32 / nf);
-    let linspace: Vec<f32> = (0..n)
-        .map(|i| {
-            if n == 1 {
-                start
-            } else {
-                start + (end - start) * (i as f32) / (nf - 1.0)
-            }
-        })
-        .collect();
-    let e = qwen_mu(width, height).exp();
-    let mut shifted: Vec<f32> = linspace
-        .iter()
-        .map(|&s| e / (e + (1.0 / s - 1.0)))
-        .collect();
-    // Terminal-sigma rescale: map the last 1−σ to 1 − 0.02.
-    let one_minus: Vec<f32> = shifted.iter().map(|&s| 1.0 - s).collect();
-    let scale = one_minus[n - 1] / (1.0 - SIGMA_SHIFT_TERMINAL);
-    for (s, om) in shifted.iter_mut().zip(one_minus) {
-        *s = 1.0 - om / scale;
-    }
-    shifted.push(0.0);
-    shifted
+    candle_gen::gen_core::sampling::qwen_sigmas(num_steps, width, height)
 }
 
 /// The official lightx2v Qwen-Image-Lightning flow-match shift (`exp(μ)`, μ = `ln 3`): the model card
 /// sets `base_shift = max_shift = ln 3`, so the per-resolution dynamic shift collapses to this constant.
 const LIGHTNING_SHIFT: f32 = 3.0;
-/// Flow-match training timesteps (diffusers `num_train_timesteps`): the Lightning span runs down to
-/// `1/1000`, the full diffusers minimum (NOT the production schedule's `1/n` floor).
-const LIGHTNING_NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 
 /// The few-step **Lightning** sigma schedule (length `steps + 1`, descending to 0) for the
 /// Qwen-Image-Edit-2511-Lightning distill (sc-6220) — the candle twin of `mlx-gen-qwen-image`'s
-/// `sampler::lightning`. Reproduces diffusers' `FlowMatchEulerDiscreteScheduler` under the lightx2v
-/// Lightning config: a **static** flow-match shift of 3.0 (`base_shift == max_shift`) over
-/// `linspace(1, 1/1000, n)`, with **no terminal rescale** (unlike [`qwen_sigmas`]'s 0.02). Resolution-
-/// independent. 4-step → `[1.0, 0.857.., 0.601.., 0.00299.., 0.0]`. Drives the same [`euler_step`].
+/// `sampler::lightning`.
 pub fn lightning_sigmas(num_steps: usize) -> Vec<f32> {
-    let n = num_steps.max(1);
-    let e = LIGHTNING_SHIFT; // exp(μ)
-    let sigma_min = 1.0 / LIGHTNING_NUM_TRAIN_TIMESTEPS;
-    let mut sigmas: Vec<f32> = (0..n)
-        .map(|i| {
-            // linspace(1.0, sigma_min, n)
-            let s = if n == 1 {
-                1.0
-            } else {
-                1.0 + (sigma_min - 1.0) * (i as f32) / ((n - 1) as f32)
-            };
-            e / (e + (1.0 / s - 1.0))
-        })
-        .collect();
-    sigmas.push(0.0);
-    sigmas
+    candle_gen::gen_core::sampling::qwen_lightning_sigmas(num_steps)
 }
 
 /// One flow-match Euler step: `x_{i+1} = x_i + (σ_{i+1} − σ_i)·v` (descending sigmas, negative dt, no

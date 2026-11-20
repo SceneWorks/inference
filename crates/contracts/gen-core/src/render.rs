@@ -84,6 +84,15 @@ struct SourceImageInput {
     strength_bits: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ReferenceImageInput {
+    width: u32,
+    height: u32,
+    pixels_sha256: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strength_bits: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ImageInputs {
     prompt_sha256: [u8; 32],
@@ -106,13 +115,21 @@ struct ImageInputs {
     guidance: Option<f32>,
     guidance_method: Option<String>,
     true_cfg_bits: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_guidance_bits: Option<u32>,
     timestep_to_start_cfg: Option<u32>,
     use_pid: bool,
     pid_capture_sigma: Option<f32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    enhance_prompt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enhance_temperature_bits: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enhance_max_tokens: Option<u32>,
 }
 
-/// Only the FLUX.1 image routes adopted by the first runner wave can enter a packed pass.
-/// Bind the actual bytes and controls before load so a queued request cannot swap its source.
+/// Bind the actual bytes and controls of an image pass before load so a queued request
+/// cannot swap its source or conditioning inputs after plan compilation.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 enum PackedImageConditioning {
     None,
@@ -122,12 +139,23 @@ enum PackedImageConditioning {
         pixels_sha256: [u8; 32],
         strength_bits: Option<u32>,
     },
+    MultiReference {
+        references: Vec<ReferenceImageInput>,
+    },
     Control {
         width: u32,
         height: u32,
         pixels_sha256: [u8; 32],
         kind: String,
         scale_bits: Option<u32>,
+    },
+    ControlWithReference {
+        width: u32,
+        height: u32,
+        pixels_sha256: [u8; 32],
+        kind: String,
+        scale_bits: Option<u32>,
+        reference: ReferenceImageInput,
     },
     /// A reference an earlier pass of the same multi-pass plan produces. Its pixels do not exist
     /// before load, so the plan binds the declared geometry and strength instead of a digest.
@@ -137,6 +165,15 @@ enum PackedImageConditioning {
         height: u32,
         strength_bits: Option<u32>,
     },
+}
+
+fn control_kind_key(kind: &ControlKind) -> String {
+    match kind {
+        ControlKind::Pose => "pose".to_owned(),
+        ControlKind::Canny => "canny".to_owned(),
+        ControlKind::Depth => "depth".to_owned(),
+        ControlKind::Other(value) => format!("other:{value}"),
+    }
 }
 
 fn image_digest(image: &Image) -> Result<[u8; 32]> {
@@ -173,14 +210,83 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                 width: image.width,
                 height: image.height,
                 pixels_sha256: image_digest(image)?,
-                kind: match kind {
-                    ControlKind::Pose => "pose".to_owned(),
-                    ControlKind::Canny => "canny".to_owned(),
-                    ControlKind::Depth => "depth".to_owned(),
-                    ControlKind::Other(value) => format!("other:{value}"),
-                },
+                kind: control_kind_key(kind),
                 scale_bits: scale.map(f32::to_bits),
             },
+            [
+                Conditioning::Control {
+                    image: ctrl_img,
+                    kind,
+                    scale,
+                },
+                Conditioning::Reference {
+                    image: ref_img,
+                    strength,
+                },
+            ]
+            | [
+                Conditioning::Reference {
+                    image: ref_img,
+                    strength,
+                },
+                Conditioning::Control {
+                    image: ctrl_img,
+                    kind,
+                    scale,
+                },
+            ] => PackedImageConditioning::ControlWithReference {
+                width: ctrl_img.width,
+                height: ctrl_img.height,
+                pixels_sha256: image_digest(ctrl_img)?,
+                kind: control_kind_key(kind),
+                scale_bits: scale.map(f32::to_bits),
+                reference: ReferenceImageInput {
+                    width: ref_img.width,
+                    height: ref_img.height,
+                    pixels_sha256: image_digest(ref_img)?,
+                    strength_bits: strength.map(f32::to_bits),
+                },
+            },
+            items
+                if items.iter().all(|c| {
+                    matches!(
+                        c,
+                        Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
+                    )
+                }) =>
+            {
+                let mut references = Vec::new();
+                for c in items {
+                    match c {
+                        Conditioning::Reference { image, strength } => {
+                            references.push(ReferenceImageInput {
+                                width: image.width,
+                                height: image.height,
+                                pixels_sha256: image_digest(image)?,
+                                strength_bits: strength.map(f32::to_bits),
+                            });
+                        }
+                        Conditioning::MultiReference { images } => {
+                            if images.is_empty() {
+                                return Err(Error::Unsupported(
+                                    "multi-reference conditioning requires at least one image"
+                                        .into(),
+                                ));
+                            }
+                            for image in images {
+                                references.push(ReferenceImageInput {
+                                    width: image.width,
+                                    height: image.height,
+                                    pixels_sha256: image_digest(image)?,
+                                    strength_bits: None,
+                                });
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                PackedImageConditioning::MultiReference { references }
+            }
             _ => {
                 return Err(Error::Unsupported(
                     "packed image plan needs one supported image conditioning input".into(),
@@ -230,9 +336,13 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             guidance: req.guidance,
             guidance_method: req.guidance_method.clone(),
             true_cfg_bits: req.true_cfg.map(f32::to_bits),
+            image_guidance_bits: req.image_guidance.map(f32::to_bits),
             timestep_to_start_cfg: req.timestep_to_start_cfg,
             use_pid: req.use_pid,
             pid_capture_sigma: req.pid_capture_sigma,
+            enhance_prompt: req.enhance_prompt,
+            enhance_temperature_bits: req.enhance_temperature.map(f32::to_bits),
+            enhance_max_tokens: req.enhance_max_tokens,
         })
     }
 }
@@ -407,10 +517,35 @@ impl RenderPlan {
             }
             None => None,
         };
+        let inputs = ImageInputs::try_from(req)?;
+        match &inputs.conditioning {
+            PackedImageConditioning::MultiReference { .. }
+                if !descriptor
+                    .capabilities
+                    .accepts(crate::ConditioningKind::MultiReference) =>
+            {
+                return Err(Error::Unsupported(
+                    "packed image plan needs one supported image conditioning input".into(),
+                ));
+            }
+            PackedImageConditioning::ControlWithReference { .. }
+                if !(descriptor
+                    .capabilities
+                    .accepts(crate::ConditioningKind::Control)
+                    && descriptor
+                        .capabilities
+                        .accepts(crate::ConditioningKind::Reference)) =>
+            {
+                return Err(Error::Unsupported(
+                    "packed image plan needs one supported image conditioning input".into(),
+                ));
+            }
+            _ => {}
+        }
         Ok(Self {
             backend: descriptor.backend.to_owned(),
             provider: descriptor.id.to_owned(),
-            inputs: ImageInputs::try_from(req)?,
+            inputs,
             preparation: None,
             count: CountPlan::SequentialWrappingSeeds {
                 count: req.count,
@@ -1002,6 +1137,97 @@ impl<'p, 's> RenderRun<'p, 's> {
             .collect();
         self.state.set(RunState::Finished);
         images
+    }
+
+    /// Phase-aware staged trajectory where all `count` images are denoised while the denoiser
+    /// is resident (each entering/leaving its declared denoise phase spans via
+    /// `begin_denoise_phase`/`end_denoise_phase`), `between_denoise_and_decode` runs to shed
+    /// denoiser weights and load decoder weights, and then all `count` denoised latents are
+    /// decoded under `MemoryPhase::Decode`.
+    pub fn denoise_then_decode_with_phases<I, D, Dec, O, E: From<Error>>(
+        &self,
+        progress: &mut dyn FnMut(Progress),
+        mut init: impl FnMut(u64) -> std::result::Result<I, E>,
+        mut denoise: impl FnMut(u64, I, &mut dyn FnMut(Progress)) -> std::result::Result<D, E>,
+        between_denoise_and_decode: impl FnOnce() -> std::result::Result<Dec, E>,
+        mut decode: impl FnMut(&mut Dec, u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
+    ) -> std::result::Result<Vec<O>, E> {
+        self.begin(RunState::Encoded, RunState::Rendering)?;
+        let expected_phases = self.plan.denoise_spans().len();
+        let mut denoised_batch = Vec::with_capacity(self.plan.image_count() as usize);
+        for seed in self.plan.count.seeds() {
+            if self.cancel.is_cancelled() {
+                self.state.set(RunState::Finished);
+                return Err(Error::Canceled.into());
+            }
+            self.next_denoise_phase.set(0);
+            self.active_denoise_phase.set(None);
+            let initial = init(seed)?;
+            let denoised = denoise(seed, initial, progress)?;
+            if self.active_denoise_phase.get().is_some()
+                || self.next_denoise_phase.get() != expected_phases
+            {
+                self.state.set(RunState::Finished);
+                return Err(Error::Unsupported(
+                    "denoise did not finish every compiled phase".into(),
+                )
+                .into());
+            }
+            denoised_batch.push((seed, denoised));
+        }
+        let mut decoder_ctx = between_denoise_and_decode()?;
+        let mut images = Vec::with_capacity(denoised_batch.len());
+        for (seed, denoised) in denoised_batch {
+            if self.cancel.is_cancelled() {
+                self.state.set(RunState::Finished);
+                return Err(Error::Canceled.into());
+            }
+            let image = self.phase(MemoryPhase::Decode, || {
+                decode(&mut decoder_ctx, seed, denoised, progress)
+            })?;
+            images.push(image);
+        }
+        self.state.set(RunState::Finished);
+        Ok(images)
+    }
+
+    /// Transition from `Encoded` to `Rendering` when driving staged denoise/decode closures
+    /// across an external residency seam (such as `Residency::run_staged_request_scoped`).
+    pub fn begin_rendering(&self) -> Result<()> {
+        self.begin(RunState::Encoded, RunState::Rendering)
+    }
+
+    /// Reset per-image denoise phase counters at the start of an image trajectory.
+    pub fn reset_image_denoise_phases(&self) {
+        self.next_denoise_phase.set(0);
+        self.active_denoise_phase.set(None);
+    }
+
+    /// Verify that an image trajectory completed all compiled denoise phases.
+    pub fn finish_image_denoise_phases(&self) -> Result<()> {
+        let expected_phases = self.plan.denoise_spans().len();
+        if self.active_denoise_phase.get().is_some()
+            || self.next_denoise_phase.get() != expected_phases
+        {
+            self.state.set(RunState::Finished);
+            return Err(Error::Unsupported(
+                "denoise did not finish every compiled phase".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Execute one image's decode body inside `MemoryPhase::Decode`.
+    pub fn decode_phase<T, E: From<Error>>(
+        &self,
+        body: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.phase(MemoryPhase::Decode, body)
+    }
+
+    /// Mark the render run finished after staged decode completes.
+    pub fn finish_rendering(&self) {
+        self.state.set(RunState::Finished);
     }
 }
 

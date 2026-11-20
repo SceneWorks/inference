@@ -140,6 +140,7 @@ impl ChromaVariant {
                 // to `max(T5, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
                 supports_preview: true,
+                supports_low_res_start: true,
                 ..Default::default()
             },
         }

@@ -130,6 +130,7 @@ impl ChromaVariant {
                 // `preview_advertising` guard derives this from the sources and fails if the flag and
                 // the wiring ever disagree.
                 supports_preview: true,
+                supports_low_res_start: true,
                 ..Default::default()
             },
         }

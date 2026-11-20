@@ -461,6 +461,7 @@ impl Flux2Variant {
                 // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
                 supports_sequential_offload: true,
                 supports_preview: true,
+                supports_low_res_start: !self.is_edit(),
                 // Dev (txt2img + edit) loads the Mistral3/Pixtral caption upsampler and consults
                 // `GenerationRequest::enhance_prompt`; Klein returns the raw prompt unchanged.
                 supports_prompt_enhancement: self.is_dev(),
@@ -524,6 +525,29 @@ pub struct Flux2Config {
 }
 
 impl Flux2Config {
+    /// FLUX.2-klein-4b configuration.
+    pub fn klein_4b() -> Self {
+        Self {
+            num_double_layers: 5,
+            num_single_layers: 20,
+            num_heads: 24,
+            head_dim: 128,
+            in_channels: 128,
+            out_channels: 128,
+            joint_attention_dim: 7680,
+            mlp_ratio: 3.0,
+            timestep_channels: 256,
+            axes_dim: [32, 32, 32, 32],
+            rope_theta: 2000.0,
+            te_hidden_size: 2560,
+            te_intermediate_size: 9728,
+            te_out_layers: [9, 18, 27],
+            max_sequence_length: 512,
+            num_latent_channels: 32,
+            vae_scale_factor: 8,
+        }
+    }
+
     /// FLUX.2-klein-9b (the story target).
     pub fn klein_9b() -> Self {
         Self {

@@ -1533,7 +1533,17 @@ impl Capabilities {
                     "{id}: low_res_start conflicts with multi-phase denoise (phases)"
                 )));
             }
-            if !req.conditioning.is_empty() {
+            let is_plain_single_reference_img2img = self.accepts(ConditioningKind::Reference)
+                && !id.starts_with("flux1_")
+                && !id.contains("ip_adapter")
+                && !id.contains("edit")
+                && !id.contains("fill")
+                && !id.contains("pulid")
+                && !id.contains("instantid")
+                && req.source_image.is_none()
+                && req.conditioning.len() == 1
+                && matches!(req.conditioning[0], Conditioning::Reference { .. });
+            if !req.conditioning.is_empty() && !is_plain_single_reference_img2img {
                 return Err(Error::Unsupported(format!(
                     "{id}: low_res_start conflicts with pass-0 edit/reference/control conditioning"
                 )));

@@ -80,10 +80,7 @@ pub fn resolve_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
 /// Resolve the product img2img start-step convention: positive strength selects
 /// `max(1, floor(steps * strength))`, clamped to the schedule; non-positive is txt2img.
 pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => ((num_steps as f32 * s.clamp(0.0, 1.0)) as usize).max(1),
-        _ => 0,
-    }
+    candle_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 fn resolve_init_start(init_image: Option<&Image>, steps: usize, strength: Option<f32>) -> usize {
@@ -144,9 +141,8 @@ pub fn create_noise(device: &Device, seed: u64, width: u32, height: u32) -> Resu
 /// epic-7114 `scheduler` name (which re-shapes σ over the same `mu = ln(shift)`). An unset / unknown /
 /// native-aliased name returns the byte-exact `build_flow_sigmas(steps, ln(3))` schedule.
 pub fn sana_sigmas(scheduler_name: Option<&str>, steps: usize) -> Vec<f32> {
-    let mu = SCHEDULE_SHIFT.ln();
-    let native = build_flow_sigmas(steps, mu);
-    resolve_flow_schedule(scheduler_name, mu, steps, &native)
+    let _ = (SCHEDULE_SHIFT, build_flow_sigmas as fn(usize, f32) -> Vec<f32>, resolve_flow_schedule as fn(Option<&str>, f32, usize, &[f32]) -> Vec<f32>);
+    candle_gen::gen_core::sampling::sana_sigmas(scheduler_name, steps)
 }
 
 /// One flow-match Euler denoise with **true CFG** + progress + cooperative cancellation. Each step

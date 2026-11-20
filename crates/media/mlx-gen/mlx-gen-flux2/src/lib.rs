@@ -62,11 +62,13 @@ pub use loader::{
     load_transformer_dev, load_vae, load_vision_tower_dev,
 };
 pub use model::{
-    descriptor_dev, descriptor_dev_edit, descriptor_klein_9b, descriptor_klein_9b_edit,
-    descriptor_klein_9b_kv_edit, load_dev, load_dev_edit, load_klein_9b, load_klein_9b_edit,
-    load_klein_9b_kv_edit,
+    compile_trajectory_for, descriptor_dev, descriptor_dev_edit, descriptor_klein_9b,
+    descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit, load_dev, load_dev_edit, load_klein_9b,
+    load_klein_9b_edit, load_klein_9b_kv_edit,
 };
-pub use model_control::{descriptor_dev_control, load_dev_control, Flux2DevControl};
+pub use model_control::{
+    compile_control_trajectory, descriptor_dev_control, load_dev_control, Flux2DevControl,
+};
 pub use pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
     prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
@@ -95,6 +97,30 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX2_KLEIN_9B_ID,
+            compile: |spec, req| model::compile_base(Flux2Variant::Klein9b, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX2_KLEIN_9B_EDIT_ID,
+            compile: |spec, req| model::compile_base(Flux2Variant::Klein9bEdit, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX2_KLEIN_9B_KV_EDIT_ID,
+            compile: |spec, req| model::compile_base(Flux2Variant::Klein9bKvEdit, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX2_DEV_ID,
+            compile: |spec, req| model::compile_base(Flux2Variant::Dev, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX2_DEV_EDIT_ID,
+            compile: |spec, req| model::compile_base(Flux2Variant::DevEdit, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: FLUX2_DEV_CONTROL_ID,
+            compile: model_control::compile_dev_control,
+        })
         .register_generator(model::KLEIN_REGISTRATION)
         .register_activation_memory(KLEIN_ACTIVATION_MEMORY_REGISTRATION)
         .register_memory_strategy(model::KLEIN_MEMORY_REGISTRATION)
@@ -282,6 +308,89 @@ mod explicit_registry_tests {
         assert!(registry
             .memory_behavior_registrations()
             .any(|registration| registration.provider_id == super::FLUX2_KLEIN_9B_KV_EDIT_ID));
+    }
+
+    #[test]
+    fn sw6945_flux2_render_plan_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{
+            Conditioning, FeatureInapplicabilityCode, GenerationRequest, Image, LoadSpec,
+            LowResStartSpec, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        for t2i_id in [super::FLUX2_KLEIN_9B_ID, super::FLUX2_DEV_ID] {
+            let app = &all_features[t2i_id]["low_res_start"];
+            assert!(app.applicable, "mlx {t2i_id} must support low_res_start");
+        }
+        for edit_id in [
+            super::FLUX2_KLEIN_9B_EDIT_ID,
+            super::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            super::FLUX2_DEV_EDIT_ID,
+        ] {
+            let app = &all_features[edit_id]["low_res_start"];
+            assert!(!app.applicable, "mlx {edit_id} must refuse low_res_start");
+            assert!(app.reasons.iter().any(|r| {
+                r.code == FeatureInapplicabilityCode::ConflictsWithPass0EditConditioning
+            }));
+        }
+        let ctrl_app = &all_features[super::FLUX2_DEV_CONTROL_ID]["low_res_start"];
+        assert!(!ctrl_app.applicable);
+        assert!(ctrl_app.reasons.iter().any(|r| {
+            r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning
+        }));
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(42),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(super::FLUX2_KLEIN_9B_ID, &spec, &req)
+            .unwrap()
+            .expect("flux2_klein_9b render plan");
+        assert_eq!(plan.denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(plan.phase_output_size(0), (256, 256));
+        assert_eq!(plan.phase_output_size(1), (512, 512));
+
+        // Plain single-source img2img on flux2_klein_9b via Conditioning::Reference with strength.
+        let src_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        let img2img_req = GenerationRequest {
+            steps: Some(10),
+            conditioning: vec![Conditioning::Reference {
+                image: src_img.clone(),
+                strength: Some(0.6),
+            }],
+            low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+            ..req.clone()
+        };
+        let img2img_plan = registry
+            .compile_render_plan(super::FLUX2_KLEIN_9B_ID, &spec, &img2img_req)
+            .unwrap()
+            .unwrap();
+        assert_eq!(img2img_plan.executed_steps(), 4);
+        assert_eq!(img2img_plan.denoise_spans(), vec![0..3, 3..4]);
+
+        // Edit routes refuse low_res_start with a typed error.
+        let edit_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: src_img,
+                strength: None,
+            }],
+            ..req
+        };
+        assert!(registry
+            .compile_render_plan(super::FLUX2_KLEIN_9B_EDIT_ID, &spec, &edit_req)
+            .is_err());
     }
 }
 

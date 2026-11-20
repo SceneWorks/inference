@@ -556,6 +556,9 @@ pub const FLUX2_PACKED_LATENT_SPACE: LatentSpace = LatentSpace {
     },
 };
 
+/// Lens shares the FLUX.2 `AutoencoderKLFlux2` 32-channel 2×2-patchified BatchNorm latent space.
+pub const LENS_LATENT_SPACE: LatentSpace = FLUX2_PACKED_LATENT_SPACE;
+
 #[cfg(test)]
 mod tests {
     use super::*;

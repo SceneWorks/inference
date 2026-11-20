@@ -2389,6 +2389,45 @@ mod tests {
         admission.consume_for_generate(&request).unwrap();
         assert!(admission.consume_for_generate(&request).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
+
+        // Also verify `ChromaGenerator::generate_planned` enforces `consume_for_generate` even when
+        // `scope.is_some()` (rather than skipping admission when a scope is supplied).
+        let temp = tempfile::tempdir().unwrap();
+        let route = ROUTES[1];
+        let root = fixture_root(temp.path(), route, "q4");
+        let load = spec(root, route.provider);
+        let generator = crate::load_base(&load).unwrap();
+        let contract = generator.memory_strategy_contract().unwrap().clone();
+        let run = super::tests::context(&contract, 1);
+        assert_eq!(
+            generator.memory_strategy_safety_check(&run),
+            MemorySafetyDecision::Accept
+        );
+        let mut scope = generator
+            .begin_memory_strategy_request(&run)
+            .unwrap()
+            .unwrap();
+        let mut req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(4),
+            ..Default::default()
+        };
+        let plan = crate::compile_trajectory_for(crate::ChromaVariant::Base, &req)
+            .unwrap()
+            .bind_load(&load);
+        scope.configure_request(&mut req).unwrap();
+        let unsealed_copy = req.clone();
+        let copy_err = generator
+            .generate_planned(&unsealed_copy, &plan, Some(&mut *scope), &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            copy_err.contains("request changed or admission was already consumed"),
+            "generate_planned with Some(scope) must reject an unsealed copy, got: {copy_err}"
+        );
     }
 
     #[test]

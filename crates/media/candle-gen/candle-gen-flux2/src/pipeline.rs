@@ -103,30 +103,10 @@ pub fn prepare_text_ids(seq: usize) -> Vec<[i64; 4]> {
 
 // --- Flow-match Euler schedule (empirical-mu sigma shift) ---
 
-/// The FLUX.2 empirical-mu shift for `image_seq_len` and `num_steps`, ported from gen-core's
-/// `compute_mu`. Piecewise-linear in `num_steps` below seq 4300, linear-in-seq above.
-///
-/// Deliberately **not** gen-core's `compute_mu` (sc-27383): this port evaluates the fit in f64 and
-/// casts once, while gen-core (and therefore the MLX twin, `mlx-gen-flux2`) evaluates it in f32. The
-/// two differ by an ulp of `mu` for roughly 40% of (resolution, steps) combinations, so switching
-/// would move every affected Candle FLUX.2 render. Unifying is a numerics decision that needs a
-/// real-weight re-baseline, not a dedup.
+/// The FLUX.2 empirical-mu shift for `image_seq_len` and `num_steps`, evaluated in `f64` and rounded
+/// once to `f32` (sc-27383, shared via [`candle_gen::gen_core::sampling::compute_mu_f64`]).
 pub fn compute_mu(seq_len: usize, num_steps: usize) -> f32 {
-    // Empirical-mu constants (from gen-core's `compute_mu`); computed in f64 to carry their full
-    // precision, cast to f32 at the end.
-    let (a1, b1) = (8.738_095_24e-5_f64, 1.898_333_33_f64);
-    let (a2, b2) = (0.000_169_27_f64, 0.456_666_66_f64);
-    let seq = seq_len as f64;
-    let mu = if seq_len > 4300 {
-        a2 * seq + b2
-    } else {
-        let m_200 = a2 * seq + b2;
-        let m_10 = a1 * seq + b1;
-        let a = (m_200 - m_10) / 190.0;
-        let b = m_200 - 200.0 * a;
-        a * num_steps as f64 + b
-    };
-    mu as f32
+    candle_gen::gen_core::sampling::compute_mu_f64(seq_len, num_steps)
 }
 
 /// Build the descending sigma schedule of length `num_steps + 1`: `num_steps` linspace points from
