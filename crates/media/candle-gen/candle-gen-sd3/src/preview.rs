@@ -205,7 +205,7 @@ fn check_layout(latents: &Tensor) -> Result<()> {
 /// fresh trajectory at frame 1. (The driver builds its own counter per call, so this is a property of
 /// the call rather than of the hook — but building the hook alongside the render keeps the two from
 /// drifting apart.)
-pub(crate) fn hook(sink: &PreviewSink) -> PreviewHook<'_> {
+pub fn hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::new(sink, project_latents)
 }
 
@@ -434,12 +434,19 @@ mod tests {
         // The sink: exactly one hook is built in shipped code, and it is built over the request's.
         assert_eq!(
             shipped.matches("preview::hook(").count(),
+            0,
+            "shipped pipeline.rs must use preview::hook_for_plan, not the unplanned preview::hook"
+        );
+        assert_eq!(
+            shipped.matches("preview::hook_for_plan(").count(),
             1,
             "pipeline.rs must build exactly one preview hook in shipped code — a second render lane \
              must be named in this crate's inventory (and in the catalog's) rather than appearing here"
         );
         assert_eq!(
-            shipped.matches("preview::hook(&req.preview)").count(),
+            shipped
+                .matches("preview::hook_for_plan(&req.preview, plan)")
+                .count(),
             1,
             "the render lane must build its hook over the REQUEST's sink; a hook over any other sink \
              is a dark lane that still passes every argument-shaped check"
@@ -488,5 +495,46 @@ mod tests {
                  SD3.5 would need PreviewHook::with_sigma"
             );
         }
+    }
+
+    #[test]
+    fn hook_for_plan_projects_phase0_and_full_grids_and_rejects_mismatched_grid() {
+        let req = candle_gen::gen_core::GenerationRequest {
+            prompt: "phase preview".into(),
+            width: 1024,
+            height: 768,
+            steps: Some(10),
+            low_res_start: Some(candle_gen::gen_core::LowResStartSpec::new(3, Some(0.5))),
+            source_image: Some(candle_gen::gen_core::Image {
+                width: 1200,
+                height: 700,
+                pixels: vec![90u8; 1200 * 700 * 3],
+            }),
+            strength: Some(0.4),
+            ..Default::default()
+        };
+        let plan =
+            crate::compile_trajectory_for(crate::Variant::Medium, &req).expect("compile plan");
+        assert_eq!(plan.phase_output_size(0), (512, 384));
+        assert_eq!(plan.output_size(), (1024, 768));
+
+        let sigmas = plan.denoise_sigmas();
+        let (sink, frames) = collecting_sink();
+        let hook = hook_for_plan(&sink, &plan);
+        let counter = PreviewCounter::new(sigmas);
+
+        // Phase-0 latent grid: 512/8 x 384/8 = 64x48 -> [1, 16, 48, 64]
+        hook.emit(&counter, sigmas, sigmas[0], &zeros((1, 16, 48, 64)));
+        // Mismatched grid is swallowed without failing the trajectory
+        hook.emit(&counter, sigmas, sigmas[1], &zeros((1, 16, 32, 32)));
+        // Phase-1 full latent grid: 1024/8 x 768/8 = 128x96 -> [1, 16, 96, 128]
+        hook.emit(&counter, sigmas, sigmas[2], &zeros((1, 16, 96, 128)));
+
+        let frames = candle_gen::lock_recover(&frames);
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].current, frames[0].total), (1, 6));
+        assert_eq!((frames[0].image.width, frames[0].image.height), (64, 48));
+        assert_eq!((frames[1].current, frames[1].total), (3, 6));
+        assert_eq!((frames[1].image.width, frames[1].image.height), (128, 96));
     }
 }

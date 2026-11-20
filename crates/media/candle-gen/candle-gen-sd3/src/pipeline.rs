@@ -569,7 +569,7 @@ impl Pipeline {
                 };
                 Ok(((cond, uncond), clean))
             })?;
-        let preview = request_preview(req);
+        let preview = request_preview(req, run.plan());
         run.begin_rendering()?;
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             render_core(
@@ -668,7 +668,7 @@ impl Pipeline {
             candle_gen::check_cancel(&req.cancel)?;
             let seed = base_seed.wrapping_add(u64::from(index));
             candle_gen::execution::draw("image_initial_noise", seed, index as usize);
-            let preview = request_preview(req);
+            let preview = request_preview(req, run.plan());
             latents.push(denoise_latents(
                 &denoiser,
                 &cond,
@@ -704,8 +704,11 @@ impl Pipeline {
     }
 }
 
-fn request_preview(req: &GenerationRequest) -> candle_gen::preview::PreviewHook<'_> {
-    crate::preview::hook(&req.preview)
+fn request_preview<'a>(
+    req: &'a GenerationRequest,
+    plan: &gen_core::RenderPlan,
+) -> candle_gen::preview::PreviewHook<'a> {
+    crate::preview::hook_for_plan(&req.preview, plan)
 }
 
 /// The render core shared by [`Pipeline::render_planned`] and the structural/CUDA smoke tests:

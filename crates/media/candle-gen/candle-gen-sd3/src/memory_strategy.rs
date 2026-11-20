@@ -1267,6 +1267,12 @@ struct RequestBinding {
     strength_bits: Option<u32>,
 }
 
+fn request_reference_count(request: &GenerationRequest) -> u32 {
+    request
+        .memory_reference_count()
+        .saturating_add(u32::from(request.source_image.is_some()))
+}
+
 impl RequestBinding {
     fn from_request(request: &GenerationRequest) -> Self {
         let mut conditioning = Sha256::new();
@@ -1298,7 +1304,7 @@ impl RequestBinding {
                 height: request.height,
                 batch: request.count,
                 frames: request.frames.unwrap_or(1),
-                reference_count: request.image_reference_count(),
+                reference_count: request_reference_count(request),
             },
             memory: request.memory,
             prompt: request.prompt.clone(),
@@ -1481,6 +1487,8 @@ struct Scope {
     core: candle_gen::request_scope::CandleRequestScopeCore,
     admission: AdmissionRegistry,
     token: u64,
+    admitted_reference_count: u32,
+    source_image_bound: bool,
     finished: bool,
 }
 
@@ -1514,18 +1522,83 @@ impl Scope {
             core: candle_gen::request_scope::CandleRequestScopeCore::new(config),
             admission,
             token,
+            admitted_reference_count: context.geometry.reference_count,
+            source_image_bound: false,
             finished: false,
         })
+    }
+
+    fn normalize_geometry(&self, mut geometry: MemoryGeometry) -> MemoryGeometry {
+        if self.source_image_bound && geometry.reference_count == 0 {
+            geometry.reference_count = self.admitted_reference_count;
+        }
+        geometry
     }
 }
 
 impl MemoryRequestScope for Scope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        self.core.configure_request(request)?;
+        let source_only_img2img =
+            request.source_image.is_some() && request.conditioning.is_empty();
+        if source_only_img2img {
+            request.conditioning.push(gen_core::Conditioning::Reference {
+                image: gen_core::Image {
+                    width: 0,
+                    height: 0,
+                    pixels: Vec::new(),
+                },
+                strength: request.strength,
+            });
+        }
+        let core_result = self.core.configure_request(request);
+        if source_only_img2img {
+            request.conditioning.pop();
+        }
+        core_result?;
+        self.source_image_bound = source_only_img2img;
         self.admission.configure(self.token, request)
     }
 
-    candle_gen::gen_core::delegate_memory_request_scope!(core);
+    fn enter_phase(&mut self, phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.core.enter_phase(phase)
+    }
+
+    fn enter_render_phase(
+        &mut self,
+        phase: gen_core::MemoryPhase,
+        identity: &gen_core::render::RenderPhaseIdentity,
+    ) -> gen_core::Result<()> {
+        let mut normalized = *identity;
+        normalized.geometry = self.normalize_geometry(normalized.geometry);
+        self.core.enter_render_phase(phase, &normalized)
+    }
+
+    fn leave_phase(&mut self, phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.core.leave_phase(phase)
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        geometry: MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.core
+            .configure_decode(tile_edge, overlap, self.normalize_geometry(geometry))
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
+        self.core.configure_attention(chunk_size)
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        first_block: u32,
+        block_count: u32,
+    ) -> gen_core::Result<()> {
+        self.core
+            .materialize_transformer_window(first_block, block_count)
+    }
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)?;
@@ -2414,5 +2487,75 @@ mod tests {
         .unwrap();
         drop(scope);
         admission.approve(&context).unwrap();
+    }
+
+    #[test]
+    fn source_image_img2img_request_passes_denoise_and_decode_geometry_under_request_scope() {
+        let (_temp, root) = fixture(Sd35Route::Medium, "bf16");
+        let load = spec(Sd35Route::Medium, &root, Vec::new());
+        let receipt = Sd35LoadReceipt::capture(Sd35Route::Medium, &load).unwrap();
+        let contract = contract_from_receipt(&load, &receipt);
+        let ctx = context(&receipt, MemoryMode::ImageToImage);
+
+        let admission = AdmissionRegistry::new(crate::MODEL_ID_MEDIUM);
+        admission.approve(&ctx).unwrap();
+        let mut scope = begin_request(&receipt, &contract, admission.clone(), Device::Cpu, &ctx)
+            .unwrap()
+            .expect("scope");
+
+        let mut req = GenerationRequest {
+            prompt: "source_image img2img scope".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(10),
+            low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
+            source_image: Some(gen_core::Image {
+                width: 1200,
+                height: 700,
+                pixels: vec![64u8; 1200 * 700 * 3],
+            }),
+            strength: Some(0.4),
+            ..Default::default()
+        };
+
+        scope
+            .configure_request(&mut req)
+            .expect("source_image img2img request must match admitted reference_count=1");
+        admission
+            .consume(&req)
+            .expect("consumed request binding must match configured source_image binding");
+
+        let plan = crate::compile_trajectory_for(crate::Variant::Medium, &req)
+            .unwrap()
+            .bind_load(&load);
+        {
+            let run = gen_core::RenderRun::new(&plan, &req.cancel, Some(&mut *scope));
+            run.encode(|| Ok::<_, gen_core::Error>(()))
+                .expect("conditioning phase");
+            run.begin_rendering().expect("begin_rendering");
+            run.reset_image_denoise_phases();
+            run.begin_denoise_phase(0).expect("enter phase-0 denoise");
+            run.end_denoise_phase(0).expect("leave phase-0 denoise");
+            run.begin_denoise_phase(1).expect("enter phase-1 denoise");
+            run.end_denoise_phase(1).expect("leave phase-1 denoise");
+            run.finish_image_denoise_phases()
+                .expect("finish denoise phases");
+            run.decode_phase(|| Ok::<_, gen_core::Error>(()))
+                .expect("decode phase geometry validation");
+            run.finish_rendering();
+        }
+
+        // configure_decode validates hook geometry (reference_count=1) before hitting the
+        // SD3.5 bounded-decode Missing validator:
+        let decode_err = scope
+            .configure_decode(512, 64, ctx.geometry)
+            .expect_err("SD3.5 bounded decode is Missing")
+            .to_string();
+        assert!(
+            decode_err.contains("bounded decode is Missing"),
+            "configure_decode must pass geometry check and reach decode_validator, got: {decode_err}"
+        );
+
+        scope.finish(MemoryRunOutcome::Complete).expect("finish");
     }
 }
