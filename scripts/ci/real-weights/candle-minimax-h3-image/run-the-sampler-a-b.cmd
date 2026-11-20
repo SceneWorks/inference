@@ -1,7 +1,8 @@
 rem SW-7106 - the H3-Image sampler A/B on candle/CUDA: the registered generator renders two
 rem prompts at two seeds, 2048x2048 bf16, with the released velocity Euler and with ComfyUI's
-rem stochastic LCM, s_noise 1.1 to 0.9. The gate asserts every render is non-degenerate - pixel
-rem std above 10 - and that each LCM render differs from its Euler twin; the eight PNGs and the
+rem stochastic LCM, s_noise 1.1 to 0.9, and - SW-7224 - Euler ancestral and LCM on the normal
+rem scheduler. The gate asserts every render is non-degenerate - pixel
+rem std above 10 - and that each render differs from its Euler twin; the sixteen PNGs and the
 rem log are uploaded as minimax-h3-image-sampler-ab-candle. The bf16 DiT stays resident, so the
 rem card with the most free memory is selected, as the gates step does, and the gate is REFUSED
 rem when that card has less free memory than the DiT's shard bytes plus H3I_HEADROOM_MIB.

@@ -874,6 +874,32 @@ impl MiniMaxH3Dit {
         norm_out: &NormOutModulation,
         pdd_step: usize,
         cancel: Option<&CancelFlag>,
+        trace: Option<&mut ImageDitTrace>,
+        pag_perturbation: Option<(&[u32], usize)>,
+    ) -> Result<Tensor> {
+        self.forward_image_heads_traced(
+            packed,
+            blocks,
+            norm_out,
+            &[(pdd_step, 1.0)],
+            cancel,
+            trace,
+            pag_perturbation,
+        )
+    }
+
+    /// [`Self::forward_image_pag_traced`] projecting through a weighted mix of PDD heads,
+    /// `Σ wₖ · pdd_proj_out.{k}(x)` over `heads` — the step's
+    /// [`candle_gen::gen_core::h3_image::pdd_head_mix`] (SW-7224). A single head at weight `1` is
+    /// that head's forward exactly, so the published grid's output is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_image_heads_traced(
+        &self,
+        packed: &ImageForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        heads: &[(usize, f32)],
+        cancel: Option<&CancelFlag>,
         mut trace: Option<&mut ImageDitTrace>,
         pag_perturbation: Option<(&[u32], usize)>,
     ) -> Result<Tensor> {
@@ -898,8 +924,16 @@ impl MiniMaxH3Dit {
                 )));
             }
         }
-        // Resolve the head FIRST: a step past the last head is refused before 50 blocks run.
-        let head = self.projections.output_head(Some(pdd_step))?;
+        // Resolve the heads FIRST: a step past the last head is refused before 50 blocks run.
+        if heads.is_empty() {
+            return Err(CandleError::Msg(
+                "minimax-h3-image dit: a forward needs at least one output head".into(),
+            ));
+        }
+        let heads = heads
+            .iter()
+            .map(|&(k, w)| Ok((self.projections.output_head(Some(k))?, w)))
+            .collect::<Result<Vec<_>>>()?;
         candle_gen::execution::runtime(&self.device, self.dtype);
         candle_gen::execution::runtime(packed.text_rows.device(), packed.text_rows.dtype());
         let x = self.image_stack_input(
@@ -934,11 +968,8 @@ impl MiniMaxH3Dit {
             trace.pre_head = Some(x.clone());
         }
         let seq_len = x.dims()[1];
-        head.forward(&crate::denoise::packing::gather_rows(
-            &x,
-            packed.image_indices,
-            seq_len,
-        )?)
+        let rows = crate::denoise::packing::gather_rows(&x, packed.image_indices, seq_len)?;
+        DitProjections::mix_output_heads(&heads, &rows)
     }
 }
 
@@ -1864,6 +1895,19 @@ impl ImageDit {
         trace: Option<&mut ImageDitTrace>,
         pag_perturbation: Option<(&[u32], usize)>,
     ) -> Result<Tensor> {
+        self.forward_inner_heads(step, &[(step, 1.0)], image_rows, trace, pag_perturbation)
+    }
+
+    /// One evaluation at sampling step `step` (its AdaLN row), projected through the PDD head mix
+    /// `heads` (SW-7224).
+    fn forward_inner_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+        trace: Option<&mut ImageDitTrace>,
+        pag_perturbation: Option<(&[u32], usize)>,
+    ) -> Result<Tensor> {
         self.forwards += 1;
         let device = self.dit.device.clone();
         let adaln_indices = self.cache.schedule().adaln_indices(
@@ -1882,11 +1926,11 @@ impl ImageDit {
             text_indices: &self.text_indices,
             image_indices: &self.image_indices,
         };
-        self.dit.forward_image_pag_traced(
+        self.dit.forward_image_heads_traced(
             &packed,
             BlockModulation::Cached(&self.cache),
             &self.norm_out,
-            step,
+            heads,
             self.cancel.as_ref(),
             trace,
             pag_perturbation,
@@ -2021,6 +2065,32 @@ pub(crate) fn image_modulation(
 impl crate::image_pipeline::ImageVelocity for ImageDit {
     fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor> {
         self.forward_inner(step, image_rows, None, None)
+    }
+
+    fn forward_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_inner_heads(step, heads, image_rows, None, None)
+    }
+
+    fn forward_perturbed_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+        perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        let prefix = self.conditioning_rows;
+        self.forward_inner_heads(
+            step,
+            heads,
+            image_rows,
+            None,
+            Some((perturbed_layers, prefix)),
+        )
     }
 
     fn forward_perturbed(

@@ -152,7 +152,9 @@ pub fn image_descriptor() -> ModelDescriptor {
             // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
             samplers: contract::SAMPLER_NAMES.to_vec(),
             supports_h3_image_sampler: true,
-            schedulers: Vec::new(),
+            // SW-7224: ComfyUI's schedulers over H3-Image's model sampling; no scheduler is the
+            // published grid.
+            schedulers: contract::SCHEDULER_NAMES.to_vec(),
             min_size: 1,
             max_size: MAX_EDGE,
             // Any positive size: the canvas rounding is internal and resized back.
@@ -559,8 +561,14 @@ impl MiniMaxH3Image {
         // The same canvas admission sized this request's resources from.
         let (canvas_w, canvas_h) = crate::image_memory_strategy::admission_canvas(width, height)?;
         let (latent_h, latent_w) = latent_grid(canvas_w, canvas_h)?;
+        let scheduler =
+            contract::request_scheduler(req).map_err(|r| CandleError::Msg(r.to_string()))?;
         let schedule =
-            SigmaSchedule::h3_image_distilled().map_err(|e| CandleError::Msg(e.to_string()))?;
+            SigmaSchedule::h3_image(scheduler).map_err(|e| CandleError::Msg(e.to_string()))?;
+        candle_gen::execution::policy(
+            "h3_image_scheduler",
+            serde_json::json!({ "scheduler": scheduler.name() }),
+        );
         let seed = resolve_seed(req);
         let sampler =
             contract::request_sampler(req).map_err(|r| CandleError::Msg(r.to_string()))?;
@@ -925,6 +933,7 @@ pub fn validate_image_request(
         contract::edit_reference_images(&req.conditioning)?.len(),
     )?;
     contract::request_sampler(req)?;
+    contract::request_scheduler(req)?;
     let mut sized = req.clone();
     sized.width = width;
     sized.height = height;
@@ -1060,7 +1069,23 @@ mod tests {
         assert!(validate_image_request(&d, &request(0, 2048)).is_err());
         // SW-7106: euler / lcm by name or block; a bad LCM parameter, an unknown name and a
         // name that contradicts the block are refused.
-        assert_eq!(d.capabilities.samplers, vec!["euler", "lcm"]);
+        assert_eq!(
+            d.capabilities.samplers,
+            vec!["euler", "lcm", "euler_ancestral"]
+        );
+        // SW-7224: euler_ancestral by name, the advertised schedulers, and no other scheduler.
+        assert_eq!(
+            d.capabilities.schedulers,
+            vec!["simple", "sgm_uniform", "beta", "normal", "beta_1_1"]
+        );
+        let mut r = request(2048, 2048);
+        r.sampler = Some("euler_ancestral".into());
+        for scheduler in ["simple", "sgm_uniform", "beta", "normal", "beta_1_1"] {
+            r.scheduler = Some(scheduler.into());
+            validate_image_request(&d, &r).unwrap();
+        }
+        r.scheduler = Some("karras".into());
+        assert!(validate_image_request(&d, &r).is_err());
         let mut r = request(2048, 2048);
         r.sampler = Some("lcm".into());
         validate_image_request(&d, &r).unwrap();

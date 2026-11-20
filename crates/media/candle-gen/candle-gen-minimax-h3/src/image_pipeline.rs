@@ -389,6 +389,40 @@ pub trait ImageVelocity {
                 .into(),
         ))
     }
+
+    /// Evaluate at sampling step `step` projecting through the PDD head mix `heads`
+    /// ([`candle_gen::gen_core::h3_image::pdd_head_mix`], SW-7224). The default serves only the
+    /// one-head-per-step mix `[(step, 1)]`, through [`Self::forward`].
+    fn forward_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+    ) -> Result<Tensor> {
+        if heads == [(step, 1.0)] {
+            return self.forward(step, image_rows);
+        }
+        Err(CandleError::Unsupported(format!(
+            "minimax-h3-image: ImageVelocity implementation cannot mix output heads {heads:?}"
+        )))
+    }
+
+    /// [`Self::forward_perturbed`] through the PDD head mix `heads`; the default serves only
+    /// `[(step, 1)]`.
+    fn forward_perturbed_heads(
+        &mut self,
+        step: usize,
+        heads: &[(usize, f32)],
+        image_rows: &Tensor,
+        perturbed_layers: &[u32],
+    ) -> Result<Tensor> {
+        if heads == [(step, 1.0)] {
+            return self.forward_perturbed(step, image_rows, perturbed_layers);
+        }
+        Err(CandleError::Unsupported(format!(
+            "minimax-h3-image: ImageVelocity implementation cannot mix output heads {heads:?}"
+        )))
+    }
 }
 
 /// **The six-step loop**: one forward per step, then gen-core's shared
@@ -468,6 +502,11 @@ pub fn denoise_image_with_pag(
         "h3_image_sampler",
         match *sampler {
             H3ImageSampler::Euler => serde_json::json!({ "solver": "euler" }),
+            H3ImageSampler::EulerAncestral => serde_json::json!({
+                "solver": "euler_ancestral",
+                "eta_bits": candle_gen::gen_core::h3_image::ANCESTRAL_ETA.to_bits(),
+                "s_noise_bits": candle_gen::gen_core::h3_image::ANCESTRAL_S_NOISE.to_bits(),
+            }),
             H3ImageSampler::Lcm {
                 s_noise,
                 s_noise_end,
@@ -507,7 +546,11 @@ pub fn denoise_image_with_pag(
         } else {
             Tensor::cat(&[&condition, &x], 1)?
         };
-        let velocity_cond = model.forward(step, &packed)?;
+        // The step's output heads: head `step` on the published grid, ComfyUI's dt-weighted mix of
+        // the spanned heads when a scheduler's step crosses grid points (SW-7224).
+        let heads = candle_gen::gen_core::h3_image::pdd_head_mix(schedule.sigmas(), step)
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        let velocity_cond = model.forward_heads(step, &heads, &packed)?;
         if velocity_cond.dims() != packed.dims() {
             return Err(CandleError::Msg(format!(
                 "minimax-h3-image denoise: step {step} returned a {:?} velocity for {:?} rows",
@@ -521,7 +564,7 @@ pub fn denoise_image_with_pag(
         let step_pag_scale = pag.map_or(0.0, |p| p.step_scale(step, num_steps));
         let velocity = if step_pag_scale > 0.0 {
             let layers = pag.map_or(&[][..], |p| p.step_layers(step, num_steps));
-            let velocity_pert = model.forward_perturbed(step, &packed, layers)?;
+            let velocity_pert = model.forward_perturbed_heads(step, &heads, &packed, layers)?;
             if velocity_pert.dims() != packed.dims() {
                 return Err(CandleError::Msg(format!(
                     "minimax-h3-image denoise: step {step} perturbed pass returned a {:?} \
@@ -743,6 +786,102 @@ mod tests {
             Err(CandleError::Canceled)
         ));
         assert!(model.steps.is_empty());
+    }
+
+    /// Records the head mix each step asks for (SW-7224).
+    struct HeadRecorder {
+        heads: Vec<Vec<(usize, f32)>>,
+    }
+
+    impl ImageVelocity for HeadRecorder {
+        fn forward(&mut self, _step: usize, _rows: &Tensor) -> Result<Tensor> {
+            unreachable!("the loop evaluates through forward_heads")
+        }
+        fn forward_heads(
+            &mut self,
+            _step: usize,
+            heads: &[(usize, f32)],
+            rows: &Tensor,
+        ) -> Result<Tensor> {
+            self.heads.push(heads.to_vec());
+            Ok(Tensor::ones_like(rows)?)
+        }
+    }
+
+    /// Under a ComfyUI scheduler the loop steps on that scheduler's grid and hands each step its
+    /// PDD head mix: `normal`'s step 2 mixes heads 2 and 3, and its last two steps share head 5.
+    /// Euler ancestral lands on the clean estimate, so a unit velocity still moves the rows by the
+    /// grid's whole span of 1.
+    #[test]
+    fn a_scheduler_grid_drives_the_steps_and_the_head_mix() {
+        use candle_gen::gen_core::h3_image::{pdd_head_mix, H3ImageScheduler};
+        let d = Device::Cpu;
+        let schedule = SigmaSchedule::h3_image(H3ImageScheduler::Normal).unwrap();
+        assert_eq!(schedule.sigmas(), &H3ImageScheduler::Normal.sigmas()[..]);
+        let x0 = Tensor::zeros((1, 2, 96), DType::F32, &d).unwrap();
+        let mut model = HeadRecorder { heads: Vec::new() };
+        denoise_image(
+            &mut model,
+            &schedule,
+            &H3ImageSampler::Euler,
+            0,
+            &x0,
+            0,
+            &d,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let want: Vec<_> = (0..6)
+            .map(|i| pdd_head_mix(schedule.sigmas(), i).unwrap())
+            .collect();
+        assert_eq!(model.heads, want);
+        assert_eq!(
+            model.heads[2].iter().map(|h| h.0).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(model.heads[4], vec![(5, 1.0)]);
+        assert_eq!(model.heads[5], vec![(5, 1.0)]);
+
+        let mut model = HeadRecorder { heads: Vec::new() };
+        let out = denoise_image(
+            &mut model,
+            &schedule,
+            &H3ImageSampler::EulerAncestral,
+            7,
+            &x0,
+            0,
+            &d,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(model.heads.len(), 6);
+        assert_eq!(out.dims(), x0.dims());
+    }
+
+    /// A model that cannot mix heads refuses a mixed step rather than projecting through one head.
+    #[test]
+    fn a_model_without_head_mixing_refuses_a_mixed_step() {
+        use candle_gen::gen_core::h3_image::H3ImageScheduler;
+        let d = Device::Cpu;
+        let schedule = SigmaSchedule::h3_image(H3ImageScheduler::Normal).unwrap();
+        let x0 = Tensor::zeros((1, 2, 96), DType::F32, &d).unwrap();
+        let mut model = Recorder { steps: Vec::new() };
+        let err = denoise_image(
+            &mut model,
+            &schedule,
+            &H3ImageSampler::Euler,
+            0,
+            &x0,
+            0,
+            &d,
+            &CancelFlag::default(),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, CandleError::Unsupported(_)), "{err:?}");
+        assert_eq!(model.steps, vec![0, 1], "steps 0 and 1 are single-head");
     }
 
     /// Delivery: ImageNet revert, clamp, truncating 8-bit quantize, and a resize only when the

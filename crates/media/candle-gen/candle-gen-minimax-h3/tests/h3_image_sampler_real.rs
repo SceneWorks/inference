@@ -1,8 +1,9 @@
 //! SW-7106: the H3-Image sampler A/B on real weights (candle/CUDA). The registered
-//! `minimax_h3_image` generator renders the same two prompts at two seeds, 2048² bf16, once with
-//! the released velocity Euler and once with ComfyUI's stochastic LCM (`s_noise` 1.1 → 0.9).
-//! Every render must be non-degenerate, and each LCM render must differ from its Euler twin. The
-//! images are written to `MINIMAX_H3_IMAGE_SAMPLER_AB_OUT` for review.
+//! `minimax_h3_image` generator renders the same two prompts at two seeds, 2048² bf16, with the
+//! released velocity Euler, ComfyUI's stochastic LCM (`s_noise` 1.1 → 0.9), and (SW-7224) ComfyUI's
+//! Euler ancestral and LCM on the `normal` scheduler, whose step 2 mixes two PDD heads. Every
+//! render must be non-degenerate, and each must differ from its Euler twin. The images are written
+//! to `MINIMAX_H3_IMAGE_SAMPLER_AB_OUT` for review.
 //!
 //! `#[ignore]`d: it needs `MiniMaxAI/MiniMax-H3-Image` (`MINIMAX_H3_IMAGE_SNAPSHOT`), MiniMax-H3's
 //! `text_encoder/` (`MINIMAX_H3_SNAPSHOT`) and CUDA. The `minimax-h3-image` real-weights profile
@@ -42,7 +43,7 @@ fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
 }
 
 #[test]
-#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT), MiniMax-H3's text encoder (MINIMAX_H3_SNAPSHOT) and CUDA; eight 2048x2048 renders"]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT), MiniMax-H3's text encoder (MINIMAX_H3_SNAPSHOT) and CUDA; sixteen 2048x2048 renders"]
 fn image_sampler_ab_renders_2048_on_cuda() {
     let _ = (PROMPTS, SEEDS);
     #[cfg(not(feature = "cuda"))]
@@ -97,13 +98,20 @@ fn image_sampler_ab_renders_2048_on_cuda() {
         for (p, prompt) in PROMPTS.iter().enumerate() {
             for seed in SEEDS {
                 let mut renders = Vec::new();
-                for (name, sampler) in [("euler", H3ImageSampler::Euler), ("lcm", lcm)] {
+                let cases = [
+                    ("euler", H3ImageSampler::Euler, None),
+                    ("lcm", lcm, None),
+                    ("euler_ancestral", H3ImageSampler::EulerAncestral, None),
+                    ("lcm-normal", lcm, Some("normal")),
+                ];
+                for (name, sampler, scheduler) in cases {
                     let req = GenerationRequest {
                         prompt: (*prompt).into(),
                         width: 2048,
                         height: 2048,
                         seed: Some(seed),
                         h3_image_sampler: Some(sampler),
+                        scheduler: scheduler.map(str::to_owned),
                         ..Default::default()
                     };
                     generator.validate(&req).expect("validate");
@@ -149,15 +157,18 @@ fn image_sampler_ab_renders_2048_on_cuda() {
                     }
                     renders.push(img.pixels);
                 }
-                let diff = mean_abs_diff(&renders[0], &renders[1]);
-                println!(
-                    "sampler-ab candle prompt {p} seed {seed}: euler vs lcm mean |diff| {diff:.2}"
-                );
-                if diff < 0.5 {
-                    failures.push(format!(
-                        "prompt {p} seed {seed}: lcm is identical to euler (mean |diff| \
-                         {diff:.3})"
-                    ));
+                for (i, (name, ..)) in cases.iter().enumerate().skip(1) {
+                    let diff = mean_abs_diff(&renders[0], &renders[i]);
+                    println!(
+                        "sampler-ab candle prompt {p} seed {seed}: euler vs {name} mean |diff| \
+                         {diff:.2}"
+                    );
+                    if diff < 0.5 {
+                        failures.push(format!(
+                            "prompt {p} seed {seed}: {name} is identical to euler (mean |diff| \
+                             {diff:.3})"
+                        ));
+                    }
                 }
             }
         }

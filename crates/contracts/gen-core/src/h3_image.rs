@@ -192,6 +192,11 @@ pub enum H3ImageRefusal {
     #[error("sampler {name:?} refused: H3-Image samples with one of {SAMPLER_NAMES:?}")]
     UnknownSampler { name: String },
     #[error(
+        "scheduler {name:?} refused: H3-Image schedules with one of {SCHEDULER_NAMES:?}, or \
+         omit it for the published grid"
+    )]
+    UnknownScheduler { name: String },
+    #[error(
         "sampler {named:?} conflicts with the h3_image_sampler block, which selects {typed:?}; \
          name one sampler"
     )]
@@ -280,14 +285,18 @@ pub fn validate_request(
 
 // ── sampler ─────────────────────────────────────────────────────────────────────────────────────
 //
-// Both samplers step on the same fixed grid ([`sampler_sigmas`], six steps). ComfyUI's H3-Image
-// model sampling puts its `simple` scheduler at six steps exactly on that grid, so the LCM sampler
-// below is ComfyUI's `comfy/k_diffusion/sampling.py::sample_lcm` on the published sigmas.
+// Every sampler steps on the request's six-step sigma grid: the published grid
+// ([`sampler_sigmas`]) by default, or one of ComfyUI's schedulers ([`H3ImageScheduler`]). ComfyUI's
+// H3-Image model sampling puts its `simple` scheduler at six steps within float32 noise of the
+// published grid, so the LCM sampler below is ComfyUI's
+// `comfy/k_diffusion/sampling.py::sample_lcm` on the published sigmas, and the ancestral sampler
+// is its `sample_euler_ancestral_RF`.
 
 /// The sampler names a request may give in [`crate::GenerationRequest::sampler`], in the order the
 /// descriptor advertises them. `lcm` (at [`H3ImageSampler::lcm_default`]) is the default;
-/// `euler` is the released deterministic sampler, selected by name or block.
-pub const SAMPLER_NAMES: &[&str] = &["euler", "lcm"];
+/// `euler` is the released deterministic sampler and `euler_ancestral` ComfyUI's rectified-flow
+/// ancestral Euler (SW-7224), each selected by name or block.
+pub const SAMPLER_NAMES: &[&str] = &["euler", "lcm", "euler_ancestral"];
 /// The default LCM noise scale at step 0.
 pub const LCM_S_NOISE_DEFAULT: f32 = 1.1;
 /// The default LCM noise scale at the last step; `s` ramps linearly from [`LCM_S_NOISE_DEFAULT`].
@@ -316,6 +325,11 @@ pub enum H3ImageSampler {
         s_noise_end: f32,
         noise_clip_std: f32,
     },
+    /// ComfyUI `sample_euler_ancestral_RF` at its defaults (`eta = 1`, `s_noise = 1`), SW-7224:
+    /// an Euler step down to `σ_down = σᵢ₊₁²/σᵢ`, then a rescale by `(1 − σᵢ₊₁)/(1 − σ_down)` and
+    /// fresh seeded noise back up to `σᵢ₊₁`. The last step (`σᵢ₊₁ = 0`) lands on the clean estimate
+    /// `x0 = x + σᵢ·v`. See [`ancestral_step`].
+    EulerAncestral,
 }
 
 /// The default sampler is [`H3ImageSampler::lcm_default`].
@@ -349,13 +363,14 @@ impl H3ImageSampler {
         match self {
             Self::Euler => "euler",
             Self::Lcm { .. } => "lcm",
+            Self::EulerAncestral => "euler_ancestral",
         }
     }
 
     /// The first non-finite parameter as `(field, value)`, or `None`.
     pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
         match *self {
-            Self::Euler => None,
+            Self::Euler | Self::EulerAncestral => None,
             Self::Lcm {
                 s_noise,
                 s_noise_end,
@@ -399,10 +414,12 @@ impl H3ImageSampler {
 
     /// The noise scale `s` at step `step` of `num_steps`:
     /// `s_noise + (s_noise_end − s_noise)·t` with `t = step / (num_steps − 1)`, and `t = 0` for a
-    /// single step. `0` under Euler, which adds no noise.
+    /// single step. `0` under Euler, which adds no noise, and the constant
+    /// [`ANCESTRAL_S_NOISE`] under Euler ancestral.
     pub fn noise_scale(&self, step: usize, num_steps: usize) -> f32 {
         match *self {
             Self::Euler => 0.0,
+            Self::EulerAncestral => ANCESTRAL_S_NOISE,
             Self::Lcm {
                 s_noise,
                 s_noise_end,
@@ -421,7 +438,8 @@ impl H3ImageSampler {
 
 /// The sampler a request runs: the typed `h3_image_sampler` block when present (validated), else
 /// the `sampler` name — `None` or `"lcm"` is the default [`H3ImageSampler::lcm_default`],
-/// `"euler"` is [`H3ImageSampler::Euler`]. A name that disagrees with the typed block is refused rather
+/// `"euler"` is [`H3ImageSampler::Euler`], `"euler_ancestral"` is
+/// [`H3ImageSampler::EulerAncestral`]. A name that disagrees with the typed block is refused rather
 /// than either one winning.
 pub fn resolve_sampler(
     name: Option<&str>,
@@ -441,6 +459,7 @@ pub fn resolve_sampler(
         }
         (_, Some(typed)) => typed,
         (Some("euler"), None) => H3ImageSampler::Euler,
+        (Some("euler_ancestral"), None) => H3ImageSampler::EulerAncestral,
         // No name, or `"lcm"`: the only other name the check above admits.
         (_, None) => H3ImageSampler::lcm_default(),
     };
@@ -453,6 +472,250 @@ pub fn request_sampler(req: &crate::GenerationRequest) -> Result<H3ImageSampler,
     resolve_sampler(req.sampler.as_deref(), req.h3_image_sampler)
 }
 
+// ── schedulers (SW-7224) ────────────────────────────────────────────────────────────────────────
+//
+// Sources (read 2026-11-19): ComfyUI master `comfy/ldm/minimax/sampling.py`
+// (`MiniMaxH3ImageModelSampling`), `comfy/samplers.py` (`simple_scheduler`, `normal_scheduler`,
+// `beta_scheduler`), `comfy/ldm/minimax/model.py` (`FinalLayer.forward`, `_pdd_head`), and
+// pamparamm/ComfyUI-ppm `src/schedulers.py` (`beta_1_1`).
+//
+// ComfyUI maps a timestep `t ∈ [0, 1000]` to a sigma LINEARLY IN THE PDD GRID INDEX, so its stock
+// schedulers at six steps land on or near the grid the heads were distilled for. A step whose
+// sigmas fall between grid points takes the `dt`-weighted mean of the heads its interval spans
+// ([`pdd_head_mix`]).
+
+/// The scheduler names a request may give in [`crate::GenerationRequest::scheduler`], in the order
+/// the descriptor advertises them: ComfyUI's stock `simple`, `sgm_uniform`, `beta` and `normal`, and
+/// ComfyUI-ppm's `beta_1_1` (`beta_scheduler` at `α = β = 1`). No scheduler is the published grid.
+pub const SCHEDULER_NAMES: &[&str] = &["simple", "sgm_uniform", "beta", "normal", "beta_1_1"];
+
+/// The six-step sigma grid a request samples on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H3ImageScheduler {
+    /// The published PDD grid ([`sampler_sigmas`]), what diffusers runs. The default.
+    #[default]
+    Published,
+    /// ComfyUI `simple_scheduler`: the 1000-entry sigma table at a fixed stride from the noisy end.
+    Simple,
+    /// ComfyUI `normal_scheduler(sgm=True)`: `linspace(t_max, t_min, 7)[:-1]` through the model
+    /// sampling.
+    SgmUniform,
+    /// ComfyUI `beta_scheduler` at `α = β = 0.6`.
+    Beta,
+    /// ComfyUI `normal_scheduler`: `linspace(t_max, t_min, 6)` through the model sampling.
+    Normal,
+    /// ComfyUI-ppm `beta_1_1`: `beta_scheduler` at `α = β = 1` (uniform in table index).
+    Beta11,
+}
+
+impl H3ImageScheduler {
+    /// The scheduler a [`SCHEDULER_NAMES`] entry names, or `None`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "simple" => Self::Simple,
+            "sgm_uniform" => Self::SgmUniform,
+            "beta" => Self::Beta,
+            "normal" => Self::Normal,
+            "beta_1_1" => Self::Beta11,
+            _ => return None,
+        })
+    }
+
+    /// The name [`SCHEDULER_NAMES`] lists this scheduler under; `"published"` for the default
+    /// grid, which a request selects by naming no scheduler.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Simple => "simple",
+            Self::SgmUniform => "sgm_uniform",
+            Self::Beta => "beta",
+            Self::Normal => "normal",
+            Self::Beta11 => "beta_1_1",
+        }
+    }
+
+    /// The descending sigma grid this scheduler gives at [`FIXED_STEPS`] steps, ending at `0.0`.
+    pub fn sigmas(self) -> Vec<f32> {
+        let steps = FIXED_STEPS as usize;
+        match self {
+            Self::Published => sampler_sigmas().to_vec(),
+            Self::Simple => {
+                let table = model_sampling_table();
+                let ss = table.len() as f64 / steps as f64;
+                let mut sigmas: Vec<f32> = (0..steps)
+                    .map(|x| table[table.len() - 1 - (x as f64 * ss) as usize])
+                    .collect();
+                sigmas.push(0.0);
+                sigmas
+            }
+            Self::SgmUniform => normal_scheduler(steps, true),
+            Self::Normal => normal_scheduler(steps, false),
+            Self::Beta => table_indices_to_sigmas(&BETA_INDICES),
+            Self::Beta11 => table_indices_to_sigmas(&BETA_1_1_INDICES),
+        }
+    }
+}
+
+/// The scheduler a request runs: `None` is the published grid; a name outside [`SCHEDULER_NAMES`]
+/// is refused.
+pub fn resolve_scheduler(name: Option<&str>) -> Result<H3ImageScheduler, H3ImageRefusal> {
+    match name {
+        None => Ok(H3ImageScheduler::Published),
+        Some(name) => {
+            H3ImageScheduler::from_name(name).ok_or_else(|| H3ImageRefusal::UnknownScheduler {
+                name: name.to_owned(),
+            })
+        }
+    }
+}
+
+/// [`resolve_scheduler`] over a request's `scheduler` field.
+pub fn request_scheduler(
+    req: &crate::GenerationRequest,
+) -> Result<H3ImageScheduler, H3ImageRefusal> {
+    resolve_scheduler(req.scheduler.as_deref())
+}
+
+/// ComfyUI's `multiplier`: model-sampling timesteps run over `[0, 1000]`.
+const MODEL_SAMPLING_MULTIPLIER: f32 = 1000.0;
+/// ComfyUI's `set_parameters` table length.
+const MODEL_SAMPLING_TIMESTEPS: usize = 1000;
+
+/// ComfyUI `MiniMaxH3ImageModelSampling.sigma`: the PDD grid (float32, ascending) interpolated
+/// LINEARLY IN ITS INDEX, `pos = clamp(t / 1000, 0, 1)·6`, `σ = lerp(grid[⌊pos⌋], grid[⌊pos⌋ + 1],
+/// pos − ⌊pos⌋)` with torch's two-sided `lerp`. The flow shift is unused.
+pub fn model_sampling_sigma(timestep: f32) -> f32 {
+    let mut grid = [0.0f32; 7];
+    for (slot, &s) in grid.iter_mut().zip(SIGMAS_F64.iter().rev()) {
+        *slot = s as f32;
+    }
+    let n = grid.len() - 1;
+    let pos = (timestep / MODEL_SAMPLING_MULTIPLIER).clamp(0.0, 1.0) * n as f32;
+    let i = (pos.floor() as usize).min(n - 1);
+    let (a, b, w) = (grid[i], grid[i + 1], pos - i as f32);
+    // torch.lerp: `w < 0.5 ? a + w·(b − a) : b − (b − a)·(1 − w)`.
+    if w < 0.5 {
+        a + w * (b - a)
+    } else {
+        b - (b - a) * (1.0 - w)
+    }
+}
+
+/// ComfyUI's `model_sampling.sigmas`: [`model_sampling_sigma`] at `t = (k / 1000)·1000` for
+/// `k = 1..=1000`, ascending (`sigma_min = table[0]`, `sigma_max = table[999] = 1`).
+pub fn model_sampling_table() -> Vec<f32> {
+    (1..=MODEL_SAMPLING_TIMESTEPS)
+        .map(|k| {
+            model_sampling_sigma(
+                (k as f32 / MODEL_SAMPLING_TIMESTEPS as f32) * MODEL_SAMPLING_MULTIPLIER,
+            )
+        })
+        .collect()
+}
+
+/// `torch.linspace(start, end, steps)` in float32, the CPU kernel's two-sided form.
+fn torch_linspace(start: f32, end: f32, steps: usize) -> Vec<f32> {
+    if steps == 1 {
+        return vec![start];
+    }
+    let step = (end - start) / (steps - 1) as f32;
+    let halfway = steps / 2;
+    (0..steps)
+        .map(|i| {
+            if i < halfway {
+                start + step * i as f32
+            } else {
+                end - step * (steps - 1 - i) as f32
+            }
+        })
+        .collect()
+}
+
+/// ComfyUI `normal_scheduler`. `timestep(σ) = σ·1000` (`ModelSamplingDiscreteFlow`, which the H3
+/// model sampling does not override).
+fn normal_scheduler(steps: usize, sgm: bool) -> Vec<f32> {
+    let table = model_sampling_table();
+    let start = table[table.len() - 1] * MODEL_SAMPLING_MULTIPLIER;
+    let end = table[0] * MODEL_SAMPLING_MULTIPLIER;
+    let (timesteps, append_zero) = if sgm {
+        let mut ts = torch_linspace(start, end, steps + 1);
+        ts.pop();
+        (ts, true)
+    } else if model_sampling_sigma(end).abs() <= 1e-5 {
+        (torch_linspace(start, end, steps + 1), false)
+    } else {
+        (torch_linspace(start, end, steps), true)
+    };
+    let mut sigmas: Vec<f32> = timesteps.into_iter().map(model_sampling_sigma).collect();
+    if append_zero {
+        sigmas.push(0.0);
+    }
+    sigmas
+}
+
+/// ComfyUI `beta_scheduler(α = β = 0.6)` at six steps: the table indices
+/// `rint(scipy.stats.beta.ppf(1 − i/6, α, β)·999)`, as ComfyUI's scipy evaluates them (scipy 1.18,
+/// numpy 2.5). Pinned rather than recomputed so a quantile on a `.5` tie rounds the way ComfyUI
+/// rounds it; `beta_quantiles_land_on_the_pinned_indices` checks each against the shared inverse
+/// Beta CDF.
+const BETA_INDICES: [usize; 6] = [999, 908, 724, 500, 275, 91];
+/// ComfyUI-ppm `beta_1_1` (`beta_scheduler(α = β = 1)`) at six steps, pinned as [`BETA_INDICES`]:
+/// three of its quantiles (`832.5`, `499.5`, `166.5`) are exact ties that scipy's float rounding
+/// decides as `832`, `500` and `167`.
+const BETA_1_1_INDICES: [usize; 6] = [999, 832, 666, 500, 333, 167];
+
+/// The table sigmas at `indices` (consecutive repeats dropped, as `beta_scheduler` does), then `0.0`.
+fn table_indices_to_sigmas(indices: &[usize]) -> Vec<f32> {
+    let table = model_sampling_table();
+    let mut sigmas = Vec::with_capacity(indices.len() + 1);
+    let mut last = None;
+    for &i in indices {
+        if last != Some(i) {
+            sigmas.push(table[i]);
+        }
+        last = Some(i);
+    }
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// The PDD output heads sampling step `step` of the descending grid `sigmas` projects through, with
+/// their weights (summing to 1) — ComfyUI `FinalLayer.forward` / `_pdd_head`.
+///
+/// The step moving from `σᵢ` to `σᵢ₊₁` spans the published grid intervals from the grid point
+/// nearest `σᵢ` (at most the last head) to the one nearest `σᵢ₊₁` (at least one interval), and takes
+/// the mean of those intervals' heads weighted by their published `dt`. On the published grid, and
+/// wherever a scheduler's step stays within one interval, that is head `i` at weight exactly `1`.
+pub fn pdd_head_mix(sigmas: &[f32], step: usize) -> Result<Vec<(usize, f32)>, Error> {
+    let heads = SIGMAS_F64.len() - 1;
+    if step + 1 >= sigmas.len() {
+        return Err(Error::Msg(format!(
+            "MiniMax-H3-Image step {step} is past the {}-sigma grid's last step",
+            sigmas.len()
+        )));
+    }
+    let nearest = |sigma: f32| -> usize {
+        let sigma = f64::from(sigma);
+        (0..=heads)
+            .min_by(|&a, &b| {
+                (SIGMAS_F64[a] - sigma)
+                    .abs()
+                    .total_cmp(&(SIGMAS_F64[b] - sigma).abs())
+            })
+            .unwrap_or(0)
+    };
+    let start = nearest(sigmas[step]).min(heads - 1);
+    let stop = nearest(sigmas[step + 1]).max(start + 1);
+    let dt: Vec<f64> = (start..stop)
+        .map(|k| SIGMAS_F64[k] - SIGMAS_F64[k + 1])
+        .collect();
+    let total: f64 = dt.iter().sum();
+    Ok((start..stop)
+        .zip(dt)
+        .map(|(k, d)| (k, (d / total) as f32))
+        .collect())
+}
+
 /// The seed of the LCM noise one step draws, from the seed of the image being rendered.
 ///
 /// `splitmix64((image_seed ⊕ "LCM_NOIS") + (step + 1)·φ)`, with `φ = 0x9E3779B97F4A7C15` and the
@@ -462,12 +725,46 @@ pub fn request_sampler(req: &crate::GenerationRequest) -> Result<H3ImageSampler,
 /// Each backend turns the returned seed into standard-normal noise with its own generator, so the
 /// noise is the same across runs of one backend, not across backends.
 pub fn lcm_noise_seed(image_seed: u64, step: usize) -> u64 {
-    const DOMAIN: u64 = 0x4C43_4D5F_4E4F_4953;
+    step_noise_seed(0x4C43_4D5F_4E4F_4953, image_seed, step)
+}
+
+/// The seed of the noise one [`H3ImageSampler::EulerAncestral`] step draws: [`lcm_noise_seed`]'s
+/// derivation under its own domain word `0x45415F4E4F495345` (ASCII `EA_NOISE`), so the ancestral
+/// and LCM draws of one seed never coincide.
+pub fn ancestral_noise_seed(image_seed: u64, step: usize) -> u64 {
+    step_noise_seed(0x4541_5F4E_4F49_5345, image_seed, step)
+}
+
+fn step_noise_seed(domain: u64, image_seed: u64, step: usize) -> u64 {
     let mut z =
-        (image_seed ^ DOMAIN).wrapping_add((step as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        (image_seed ^ domain).wrapping_add((step as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// [`H3ImageSampler::EulerAncestral`]'s `eta` (ComfyUI's default): the full ancestral step.
+pub const ANCESTRAL_ETA: f32 = 1.0;
+/// [`H3ImageSampler::EulerAncestral`]'s noise scale (ComfyUI's `s_noise` default; H3-Image's
+/// ComfyUI model sampling has `noise_scale = 1`).
+pub const ANCESTRAL_S_NOISE: f32 = 1.0;
+
+/// The scalars of one rectified-flow ancestral step from `sigma` to `sigma_next > 0`
+/// (`sample_euler_ancestral_RF` at eta [`ANCESTRAL_ETA`]): `(euler_delta, rescale, renoise)` for
+/// the update `x ← rescale·(x + euler_delta·v) + renoise·s_noise·ε`.
+///
+/// `σ_down = σᵢ₊₁·(1 + (σᵢ₊₁/σᵢ − 1)·eta)`. ComfyUI's `x ← (σ_down/σᵢ)·x + (1 − σ_down/σᵢ)·x0`
+/// with `x0 = x + σᵢ·v` is the Euler step `x + (σᵢ − σ_down)·v`; then
+/// `rescale = (1 − σᵢ₊₁)/(1 − σ_down)` and `renoise = √(σᵢ₊₁² − σ_down²·rescale²)`, floored at 0
+/// against rounding.
+pub fn ancestral_step(sigma: f32, sigma_next: f32) -> (f32, f32, f32) {
+    let downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * ANCESTRAL_ETA;
+    let sigma_down = sigma_next * downstep_ratio;
+    let rescale = (1.0 - sigma_next) / (1.0 - sigma_down);
+    let renoise = (sigma_next * sigma_next - sigma_down * sigma_down * rescale * rescale)
+        .max(0.0)
+        .sqrt();
+    (sigma - sigma_down, rescale, renoise)
 }
 
 /// The tensor operations [`sampler_step`] needs. A backend implements these over its own float32
@@ -520,6 +817,8 @@ pub struct SamplerStep {
 /// * [`H3ImageSampler::Lcm`]: `x0 = x + σᵢ·v`; returns `x0` when `σᵢ₊₁ = 0`, otherwise
 ///   `(1 − σᵢ₊₁)·x0 + σᵢ₊₁·s·ε` with `ε` drawn from [`lcm_noise_seed`] and clamped to
 ///   `±noise_clip_std·std(ε)` when the clip is on.
+/// * [`H3ImageSampler::EulerAncestral`]: `x0 = x + σᵢ·v` when `σᵢ₊₁ = 0`, otherwise
+///   [`ancestral_step`]'s update with `ε` drawn from [`ancestral_noise_seed`].
 pub fn sampler_step<O: H3ImageStepOps + ?Sized>(
     ops: &mut O,
     sampler: &H3ImageSampler,
@@ -542,6 +841,16 @@ pub fn sampler_step<O: H3ImageStepOps + ?Sized>(
             let s = sampler.noise_scale(at.step, at.num_steps);
             let kept = ops.scale(&x0, 1.0 - at.sigma_next)?;
             ops.add_scaled(&kept, &eps, at.sigma_next * s)
+        }
+        H3ImageSampler::EulerAncestral => {
+            if at.sigma_next <= 0.0 {
+                return ops.add_scaled(x, v, at.sigma);
+            }
+            let (euler_delta, rescale, renoise) = ancestral_step(at.sigma, at.sigma_next);
+            let down = ops.add_scaled(x, v, euler_delta)?;
+            let eps = ops.gaussian_like(&down, ancestral_noise_seed(at.image_seed, at.step))?;
+            let kept = ops.scale(&down, rescale)?;
+            ops.add_scaled(&kept, &eps, renoise * ANCESTRAL_S_NOISE)
         }
     }
 }
@@ -1809,7 +2118,7 @@ mod tests {
         };
         assert_eq!(resolve_sampler(Some("lcm"), Some(typed)).unwrap(), typed);
         assert_eq!(resolve_sampler(None, Some(typed)).unwrap(), typed);
-        assert_eq!(SAMPLER_NAMES, &["euler", "lcm"]);
+        assert_eq!(SAMPLER_NAMES, &["euler", "lcm", "euler_ancestral"]);
     }
 
     #[test]
@@ -2069,5 +2378,244 @@ mod tests {
             ),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    // ── SW-7224: euler_ancestral and the schedulers ─────────────────────────────────────────────
+
+    /// Euler ancestral is ComfyUI `sample_euler_ancestral_RF` at eta 1, s_noise 1:
+    /// `σ_down = σ'²/σ`, `x ← (σ_down/σ)·x + (1 − σ_down/σ)·x0`, then
+    /// `x ← (α'/α_down)·x + √(σ'² − σ_down²·α'²/α_down²)·ε`, the noise drawn from
+    /// `ancestral_noise_seed(image_seed, step)`.
+    #[test]
+    fn euler_ancestral_matches_comfyui_rf_arithmetic() {
+        let (sigma, sigma_next) = (0.75f64, 0.5f64);
+        let (x, v, eps) = ([1.0f64, 2.0], [0.5f64, -1.0], [1.0f64, -2.0]);
+        // ComfyUI's own form, in f64.
+        let sigma_down = sigma_next * (1.0 + (sigma_next / sigma - 1.0));
+        let (alpha_ip1, alpha_down) = (1.0 - sigma_next, 1.0 - sigma_down);
+        let renoise = (sigma_next.powi(2)
+            - sigma_down.powi(2) * alpha_ip1.powi(2) / alpha_down.powi(2))
+        .sqrt();
+        let ratio = sigma_down / sigma;
+        let want: Vec<f32> = (0..2)
+            .map(|i| {
+                let x0 = x[i] + sigma * v[i];
+                let down = ratio * x[i] + (1.0 - ratio) * x0;
+                ((alpha_ip1 / alpha_down) * down + eps[i] * renoise) as f32
+            })
+            .collect();
+        let mut ops = host(&[1.0, -2.0]);
+        let out = sampler_step(
+            &mut ops,
+            &H3ImageSampler::EulerAncestral,
+            at(2, 0.75, 0.5),
+            &vec![1.0, 2.0],
+            &vec![0.5, -1.0],
+        )
+        .unwrap();
+        close(&out, &want);
+        assert_eq!(ops.seeds, vec![ancestral_noise_seed(42, 2)]);
+        assert_ne!(ancestral_noise_seed(42, 2), lcm_noise_seed(42, 2));
+    }
+
+    /// The last ancestral step lands on the clean estimate and draws no noise.
+    #[test]
+    fn euler_ancestral_last_step_is_the_clean_estimate() {
+        let mut ops = host(&[9.0, 9.0]);
+        let out = sampler_step(
+            &mut ops,
+            &H3ImageSampler::EulerAncestral,
+            at(5, 0.25, 0.0),
+            &vec![1.0, 2.0],
+            &vec![0.5, -1.0],
+        )
+        .unwrap();
+        close(&out, &[1.125, 1.75]);
+        assert!(ops.seeds.is_empty());
+    }
+
+    /// `euler_ancestral` resolves by name and by block, and is advertised.
+    #[test]
+    fn euler_ancestral_resolves_by_name_and_block() {
+        assert!(SAMPLER_NAMES.contains(&"euler_ancestral"));
+        assert_eq!(
+            resolve_sampler(Some("euler_ancestral"), None).unwrap(),
+            H3ImageSampler::EulerAncestral
+        );
+        assert_eq!(
+            resolve_sampler(None, Some(H3ImageSampler::EulerAncestral)).unwrap(),
+            H3ImageSampler::EulerAncestral
+        );
+        assert!(matches!(
+            resolve_sampler(Some("euler"), Some(H3ImageSampler::EulerAncestral)),
+            Err(H3ImageRefusal::SamplerConflict { .. })
+        ));
+    }
+
+    fn close_grid(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 2e-6, "{got:?} vs {want:?}");
+        }
+    }
+
+    /// The model-sampling table is ComfyUI's: `sigma_min = σ(1)` on the first grid interval,
+    /// `sigma_max = 1`, and every grid point lands on its index (`t = 1000·k/6`).
+    #[test]
+    fn model_sampling_interpolates_the_grid_by_index() {
+        let table = model_sampling_table();
+        assert_eq!(table.len(), 1000);
+        assert!((table[0] - 0.001_392_053_2).abs() < 1e-9, "{}", table[0]);
+        assert_eq!(table[999], 1.0);
+        assert!(table.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(model_sampling_sigma(0.0), 0.0);
+        assert_eq!(model_sampling_sigma(500.0), 0.75);
+    }
+
+    /// Each scheduler's six-step grid matches ComfyUI's (reference: the ComfyUI functions over
+    /// `MiniMaxH3ImageModelSampling`, evaluated in float32 with numpy 2.5 / scipy 1.18).
+    #[test]
+    fn scheduler_grids_match_comfyui() {
+        close_grid(
+            &H3ImageScheduler::Simple.sigmas(),
+            &[
+                1.0,
+                0.967_653_6,
+                0.887_708_4,
+                0.75,
+                0.533_642_8,
+                0.232_610_39,
+                0.0,
+            ],
+        );
+        close_grid(
+            &H3ImageScheduler::Normal.sigmas(),
+            &[
+                1.0,
+                0.951_662_2,
+                0.832_988_7,
+                0.620_752_9,
+                0.294_171_54,
+                0.001_937_812,
+                0.0,
+            ],
+        );
+        close_grid(
+            &H3ImageScheduler::SgmUniform.sigmas(),
+            &[
+                1.0,
+                0.967_568_9,
+                0.887_771_1,
+                0.750_574_4,
+                0.533_983_4,
+                0.234_102_2,
+                0.0,
+            ],
+        );
+        close_grid(
+            &H3ImageScheduler::Beta.sigmas(),
+            &[
+                1.0,
+                0.982_267_9,
+                0.915_539_86,
+                0.750_825_3,
+                0.429_310_7,
+                0.128_068_9,
+                0.0,
+            ],
+        );
+        close_grid(
+            &H3ImageScheduler::Beta11.sigmas(),
+            &[
+                1.0,
+                0.967_363_8,
+                0.887_708_4,
+                0.750_825_3,
+                0.533_642_8,
+                0.234_415,
+                0.0,
+            ],
+        );
+        assert_eq!(
+            H3ImageScheduler::Published.sigmas(),
+            sampler_sigmas().to_vec()
+        );
+    }
+
+    /// The pinned beta indices are the inverse-Beta quantiles `ppf(1 − i/6)·999`, each within its
+    /// rounding (ties at `.5` included).
+    #[test]
+    fn beta_quantiles_land_on_the_pinned_indices() {
+        for (indices, a) in [(BETA_INDICES, 0.6), (BETA_1_1_INDICES, 1.0)] {
+            for (i, &idx) in indices.iter().enumerate() {
+                let q = crate::sampling::schedulers::beta_ppf(1.0 - i as f64 / 6.0, a, a) * 999.0;
+                assert!(
+                    (q - idx as f64).abs() <= 0.5 + 1e-6,
+                    "alpha=beta={a}: quantile {i} is {q}, pinned {idx}"
+                );
+            }
+        }
+    }
+
+    /// Names round-trip; no name is the published grid; an unknown name is a typed refusal.
+    #[test]
+    fn schedulers_resolve_by_name() {
+        for &name in SCHEDULER_NAMES {
+            let s = resolve_scheduler(Some(name)).unwrap();
+            assert_eq!(s.name(), name);
+            let sigmas = s.sigmas();
+            assert_eq!(sigmas.len(), FIXED_STEPS as usize + 1, "{name}");
+            assert!(sigmas.windows(2).all(|w| w[1] < w[0]), "{name}: {sigmas:?}");
+            assert_eq!(sigmas.last(), Some(&0.0));
+        }
+        assert_eq!(
+            resolve_scheduler(None).unwrap(),
+            H3ImageScheduler::Published
+        );
+        assert!(matches!(
+            resolve_scheduler(Some("karras")),
+            Err(H3ImageRefusal::UnknownScheduler { .. })
+        ));
+    }
+
+    /// On the published grid every step projects through its own head at weight exactly 1, so the
+    /// default output is unchanged.
+    #[test]
+    fn the_published_grid_selects_head_i_at_step_i() {
+        let sigmas = sampler_sigmas();
+        for step in 0..6 {
+            assert_eq!(pdd_head_mix(&sigmas, step).unwrap(), vec![(step, 1.0)]);
+        }
+        assert!(pdd_head_mix(&sigmas, 6).is_err());
+    }
+
+    /// ComfyUI's head mix: `normal`'s step 2 (0.833 → 0.621) spans grid intervals 2 and 3 and takes
+    /// their `dt`-weighted mean; its last two steps both use head 5. Every other shipped scheduler
+    /// stays on one head per step.
+    #[test]
+    fn off_grid_steps_mix_the_heads_they_span() {
+        let normal = H3ImageScheduler::Normal.sigmas();
+        let mix = pdd_head_mix(&normal, 2).unwrap();
+        assert_eq!(mix.iter().map(|m| m.0).collect::<Vec<_>>(), vec![2, 3]);
+        assert!((mix[0].1 - 0.387_706_75).abs() < 1e-6, "{mix:?}");
+        assert!((mix[1].1 - 0.612_293_25).abs() < 1e-6, "{mix:?}");
+        assert_eq!(pdd_head_mix(&normal, 3).unwrap(), vec![(4, 1.0)]);
+        assert_eq!(pdd_head_mix(&normal, 4).unwrap(), vec![(5, 1.0)]);
+        assert_eq!(pdd_head_mix(&normal, 5).unwrap(), vec![(5, 1.0)]);
+        for s in [
+            H3ImageScheduler::Simple,
+            H3ImageScheduler::SgmUniform,
+            H3ImageScheduler::Beta,
+            H3ImageScheduler::Beta11,
+        ] {
+            let sigmas = s.sigmas();
+            for step in 0..6 {
+                assert_eq!(
+                    pdd_head_mix(&sigmas, step).unwrap(),
+                    vec![(step, 1.0)],
+                    "{s:?}"
+                );
+            }
+        }
     }
 }

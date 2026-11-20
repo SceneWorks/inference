@@ -753,6 +753,42 @@ impl PddHeads {
         pdd_head_index(step, self.heads.len()).map(|i| &self.heads[i])
     }
 
+    /// Refuse a head mix naming a head outside the table, or no head at all — checked before the
+    /// 50 blocks run.
+    pub fn check_mix(&self, mix: &[(usize, f32)]) -> Result<()> {
+        if mix.is_empty() {
+            return Err(Error::Msg(
+                "minimax-h3-image dit: a forward needs at least one output head".into(),
+            ));
+        }
+        for &(k, _) in mix {
+            self.select(k)?;
+        }
+        Ok(())
+    }
+
+    /// The PDD head mix `Σ wₖ · headₖ(rows)` (SW-7224): ComfyUI's `_pdd_head`, the `dt`-weighted
+    /// mean of the heads a step spans ([`mlx_gen::gen_core::h3_image::pdd_head_mix`]), as a mix of
+    /// the heads' outputs (the projection is linear). One head at weight `1` is exactly that head's
+    /// forward, so the published grid's output is unchanged.
+    pub fn forward_mix(&self, mix: &[(usize, f32)], rows: &Array) -> Result<Array> {
+        self.check_mix(mix)?;
+        if let [(k, w)] = mix {
+            if *w == 1.0 {
+                return self.select(*k)?.forward(rows);
+            }
+        }
+        let mut mixed: Option<Array> = None;
+        for &(k, w) in mix {
+            let term = multiply(&self.select(k)?.forward(rows)?, Array::from_f32(w))?;
+            mixed = Some(match mixed {
+                None => term,
+                Some(acc) => add(&acc, &term)?,
+            });
+        }
+        mixed.ok_or_else(|| Error::Msg("minimax-h3-image dit: no output head".into()))
+    }
+
     /// Device bytes held.
     pub fn nbytes(&self) -> usize {
         self.heads.iter().map(LinearBias::nbytes).sum()
@@ -913,6 +949,18 @@ mod image_tests {
             assert_eq!(b, vec![i as f32 + 1.0; 2]);
         }
         assert!(heads.select(3).is_err());
+        // SW-7224: a mix is the weighted sum of the heads' outputs; one head at weight 1 is the
+        // head itself. Head `i` is all `i + 1`, so over ones(4) it outputs `4(i + 1) + (i + 1)`.
+        let rows = Array::from_slice(&[1.0f32; 4], &[1, 4]);
+        let mixed = heads.forward_mix(&[(1, 0.25), (2, 0.75)], &rows).unwrap();
+        let mixed: Vec<f32> = mixed.as_slice::<f32>().to_vec();
+        // 0.25·(5·2) + 0.75·(5·3) = 13.75.
+        assert!(mixed.iter().all(|&v| (v - 13.75).abs() < 1e-4), "{mixed:?}");
+        let one = heads.forward_mix(&[(2, 1.0)], &rows).unwrap();
+        let direct = heads.select(2).unwrap().forward(&rows).unwrap();
+        assert_eq!(one.as_slice::<f32>(), direct.as_slice::<f32>());
+        assert!(heads.forward_mix(&[], &rows).is_err());
+        assert!(heads.forward_mix(&[(3, 1.0)], &rows).is_err());
         assert!(PddHeads::from_weights(&mut w, "pdd_proj_out", 0, 4, 2).is_err());
         // A wrong head width is refused at load.
         assert!(PddHeads::from_weights(&mut w, "pdd_proj_out", 3, 4, 3).is_err());

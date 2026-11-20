@@ -249,11 +249,15 @@ impl SigmaSchedule {
     /// their float32 timesteps the way the released sampler does — so [`Self::timesteps`] are the
     /// exact `1 - sigma` values diffusers conditions the transformer on.
     pub fn h3_image_distilled() -> Result<Self> {
-        Self::from_sigmas(
-            DenoiseModality::Video,
-            1.0,
-            gen_core::h3_image::sampler_sigmas().to_vec(),
-        )
+        Self::h3_image(gen_core::h3_image::H3ImageScheduler::Published)
+    }
+
+    /// The MiniMax-H3-Image grid `scheduler` gives (SW-7224): [`Self::h3_image_distilled`]'s
+    /// published grid for [`gen_core::h3_image::H3ImageScheduler::Published`], otherwise the
+    /// ComfyUI scheduler's six-step grid ([`gen_core::h3_image::H3ImageScheduler::sigmas`]),
+    /// adopted as-is with the same `t = 1 − σ` timesteps.
+    pub fn h3_image(scheduler: gen_core::h3_image::H3ImageScheduler) -> Result<Self> {
+        Self::from_sigmas(DenoiseModality::Video, 1.0, scheduler.sigmas())
     }
 
     /// The velocity-form Euler coefficient at `index`: `sigma[i] - sigma[i+1]`, in float32.
