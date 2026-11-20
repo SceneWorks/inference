@@ -1654,6 +1654,12 @@ pub(crate) fn compile_ip_adapter(
             variant.id()
         )));
     }
+    if req.low_res_start.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}_ip_adapter: low_res_start is not supported by this model route",
+            variant.id()
+        )));
+    }
     compile_base(variant, spec, req)
 }
 
@@ -1879,6 +1885,12 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
         if !desc.capabilities.supports_low_res_start {
             return Err(Error::Unsupported(format!(
                 "{}: low_res_start is not supported by this model route",
+                desc.id
+            )));
+        }
+        if has_reference || !req.conditioning.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{}: low_res_start conflicts with pass-0 edit/reference/control conditioning",
                 desc.id
             )));
         }
@@ -3461,6 +3473,52 @@ mod tests {
             );
             assert_eq!(trace_ep.len(), expected_p0_evals + 1 + expected_p1_evals);
             assert_eq!(trace_pr.len(), expected_p0_evals + expected_p1_evals);
+        }
+    }
+
+    #[test]
+    fn flux1_rejects_reference_conditioning_with_low_res_start_on_base_and_ip_adapter() {
+        use mlx_gen::gen_core::{Conditioning, Image, LowResStartSpec};
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_ip_adapter(WeightsSource::File("/nonexistent/ip.safetensors".into()));
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(4),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![0; 64 * 64 * 3],
+                },
+                strength: Some(0.75),
+            }],
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+
+        for (variant, base_desc, ip_desc) in [
+            (FluxVariant::Dev, descriptor_dev(), descriptor_dev_ip_adapter()),
+            (
+                FluxVariant::Schnell,
+                descriptor_schnell(),
+                descriptor_schnell_ip_adapter(),
+            ),
+        ] {
+            assert!(base_desc
+                .capabilities
+                .validate_request(base_desc.id, &req)
+                .is_err());
+            assert!(ip_desc
+                .capabilities
+                .validate_request(ip_desc.id, &req)
+                .is_err());
+            assert!(validate_request(&base_desc, &req).is_err());
+            assert!(validate_request(&ip_desc, &req).is_err());
+            assert!(compile_base(variant, &spec, &req).is_err());
+            assert!(compile_ip_adapter(variant, &spec, &req).is_err());
         }
     }
 }

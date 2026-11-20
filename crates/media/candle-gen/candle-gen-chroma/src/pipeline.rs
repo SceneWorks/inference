@@ -374,7 +374,7 @@ impl Pipeline {
                 self.initial_packed_noise(seed, phase0_h, phase0_w)
             },
             |seed, latents, on_progress| {
-                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                let preview = crate::preview::hook_for_plan(&req.preview, run.plan());
                 self.denoise_planned(
                     run,
                     &components.transformer,
@@ -463,98 +463,87 @@ impl Pipeline {
 
         candle_gen::check_cancel(&req.cancel)?;
         check_calibration_fault(req, gen_core::MemoryPhase::Denoise)?;
-        let denoise = std::cell::RefCell::new(Some(SynchronizedPhase::new(
+        let denoise = SynchronizedPhase::new(
             self.load_denoise_components()?,
             self.device.clone(),
             "denoise components",
-        )));
+        );
+        run.begin_rendering().map_err(CandleError::from)?;
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            candle_gen::check_cancel(&req.cancel)?;
+            let seed = base_seed.wrapping_add(u64::from(index));
+            run.reset_image_denoise_phases();
+            candle_gen::execution::draw("image_initial_noise", seed, index as usize);
+            let noise = self.initial_packed_noise(seed, phase0_h, phase0_w)?;
+            let preview = crate::preview::hook_for_plan(&req.preview, run.plan());
+            let denoised = self.denoise_planned(
+                run,
+                &denoise.transformer,
+                noise,
+                &pos_embeds,
+                neg.as_ref(),
+                &phase0_ropes,
+                phase1_ropes.as_ref(),
+                seed,
+                &preview,
+                &req.cancel,
+                on_progress,
+            )?;
+            run.finish_image_denoise_phases()
+                .map_err(CandleError::from)?;
+            latents.push(denoised);
+        }
+        denoise.release()?;
 
-        let images = run.denoise_then_decode_with_phases(
-            on_progress,
-            |seed| {
-                let output_index = seed.wrapping_sub(base_seed) as usize;
-                candle_gen::execution::draw("image_initial_noise", seed, output_index);
-                self.initial_packed_noise(seed, phase0_h, phase0_w)
+        candle_gen::check_cancel(&req.cancel)?;
+        check_calibration_fault(req, gen_core::MemoryPhase::Decode)?;
+        let decoder = SynchronizedPhase::new(
+            if req.use_pid {
+                DecoderComponents::Pid(Box::new(self.load_pid_decoder()?.ok_or_else(|| {
+                    CandleError::Msg(format!(
+                        "{}: PiD was requested but no exact PiD load receipt is present",
+                        self.variant.id()
+                    ))
+                })?))
+            } else {
+                DecoderComponents::Native(Box::new(self.load_native_decoder()?))
             },
-            |seed, noise, on_progress| {
-                let denoise_guard = denoise.borrow();
-                let denoise_ref = denoise_guard
-                    .as_ref()
-                    .expect("denoise components remain loaded during denoise");
-                let preview = crate::preview::hook(&req.preview, req.width, req.height);
-                self.denoise_planned(
-                    run,
-                    &denoise_ref.transformer,
-                    noise,
-                    &pos_embeds,
-                    neg.as_ref(),
-                    &phase0_ropes,
-                    phase1_ropes.as_ref(),
-                    seed,
-                    &preview,
-                    &req.cancel,
-                    on_progress,
-                )
-            },
-            || {
-                if let Some(d) = denoise.borrow_mut().take() {
-                    d.release()?;
-                }
-                candle_gen::check_cancel(&req.cancel)?;
-                check_calibration_fault(req, gen_core::MemoryPhase::Decode)?;
-                let decoder = SynchronizedPhase::new(
-                    if req.use_pid {
-                        DecoderComponents::Pid(Box::new(self.load_pid_decoder()?.ok_or_else(
-                            || {
-                                CandleError::Msg(format!(
-                                    "{}: PiD was requested but no exact PiD load receipt is present",
-                                    self.variant.id()
-                                ))
-                            },
-                        )?))
-                    } else {
-                        DecoderComponents::Native(Box::new(self.load_native_decoder()?))
-                    },
-                    self.device.clone(),
-                    "decode components",
-                );
-                Ok(decoder)
-            },
-            |decoder, seed, latent, on_progress| {
-                let output_index = seed.wrapping_sub(base_seed) as usize;
-                candle_gen::execution::output_index(output_index);
+            self.device.clone(),
+            "decode components",
+        );
+        let pid_decoder = match &*decoder {
+            DecoderComponents::Pid(pid) => Some(
+                candle_gen_pid::resolve_pid_decoder(Some(pid), req, base_seed, self.variant.id())?
+                    .ok_or_else(|| {
+                        CandleError::Msg(format!(
+                            "{}: PiD decoder resolution returned none",
+                            self.variant.id()
+                        ))
+                    })?,
+            ),
+            DecoderComponents::Native(_) => None,
+        };
+        let mut images = Vec::with_capacity(latents.len());
+        for (output_index, latent) in latents.iter().enumerate() {
+            candle_gen::execution::output_index(output_index);
+            candle_gen::check_cancel(&req.cancel)?;
+            let image = run.decode_phase(|| {
                 on_progress(Progress::Decoding);
-                let pid_decoder = match &**decoder {
-                    DecoderComponents::Pid(pid) => Some(
-                        candle_gen_pid::resolve_pid_decoder(
-                            Some(pid),
-                            req,
-                            base_seed,
-                            self.variant.id(),
-                        )?
-                        .ok_or_else(|| {
-                            CandleError::Msg(format!(
-                                "{}: PiD decoder resolution returned none",
-                                self.variant.id()
-                            ))
-                        })?,
-                    ),
-                    DecoderComponents::Native(_) => None,
-                };
-                match &**decoder {
+                match &*decoder {
                     DecoderComponents::Native(vae) => {
-                        self.decode(vae, None, &latent, req.height, req.width)
+                        self.decode(vae, None, latent, req.height, req.width)
                     }
-                    DecoderComponents::Pid(_) => self.decode_tensor(
-                        None,
-                        pid_decoder.as_ref(),
-                        &latent,
-                        req.height,
-                        req.width,
-                    ),
+                    DecoderComponents::Pid(_) => {
+                        self.decode_tensor(None, pid_decoder.as_ref(), latent, req.height, req.width)
+                    }
                 }
-            },
-        )?;
+            })?;
+            images.push(image);
+        }
+        drop(pid_decoder);
+        decoder.release()?;
+        run.finish_rendering();
         Ok(images)
     }
 

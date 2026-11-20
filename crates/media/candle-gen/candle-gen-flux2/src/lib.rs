@@ -1235,7 +1235,7 @@ impl Pipeline {
             },
             |seed, latents, on_progress| {
                 let mut eval_idx = 0usize;
-                let preview = preview::hook(&req.preview, vae, lat_h, lat_w);
+                let preview = preview::hook_for_plan(&req.preview, vae, run.plan());
                 candle_gen::run_flow_sampler_spans(
                     Some(run.plan().sampler()),
                     TimestepConvention::Sigma,

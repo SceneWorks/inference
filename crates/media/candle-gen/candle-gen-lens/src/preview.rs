@@ -33,7 +33,7 @@
 //! latent is batch 1 at every step.
 
 pub use candle_gen_flux2::preview::{
-    hook, project_packed_tokens, project_raw_latents, PACKED_LATENT_CHANNELS,
+    hook, hook_for_plan, project_packed_tokens, project_raw_latents, PACKED_LATENT_CHANNELS,
     PREVIEW_LATENT_CHANNELS,
 };
 
@@ -206,7 +206,7 @@ mod tests {
     fn both_render_lanes_build_a_hook_and_the_parity_seam_passes_none() {
         let source = include_str!("lib.rs");
         let hooks = source
-            .matches(concat!("preview::", "hook(&req.preview,"))
+            .matches(concat!("preview::", "hook_for_plan(&req.preview,"))
             .count();
         assert_eq!(
             hooks, 2,

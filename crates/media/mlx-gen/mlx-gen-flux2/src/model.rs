@@ -1037,8 +1037,18 @@ impl Generator for Flux2 {
         plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
             &self.loaded_spec,
         ))?;
-        self.generate_planned_impl(req, plan, scope, on_progress)
-            .map_err(Into::into)
+        let snapshot_root = match &self.loaded_spec.weights {
+            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
+        };
+        mlx_gen::sc20686::observe_generation(
+            snapshot_root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_planned_impl(req, plan, scope, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -4992,5 +5002,53 @@ mod execution_policy_tests {
         assert_ne!(quality(&absent), quality(&fallback));
         assert_ne!(quality(&fallback), quality(&enhanced));
         assert_ne!(quality(&enhanced), quality(&other));
+    }
+
+    #[test]
+    fn generate_planned_activates_armed_sc20686_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_root = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_root).unwrap();
+        std::fs::write(snapshot_root.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            snapshot_root.join(".snapshot-revision"),
+            b"fedcba9876543210fedcba9876543210fedcba98",
+        )
+        .unwrap();
+        let events_path = dir.path().join("sc20686-events.jsonl");
+
+        let mut model = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        model.loaded_spec = LoadSpec::new(WeightsSource::Dir(snapshot_root));
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            ..Default::default()
+        };
+        let plan = compile_trajectory_for(Flux2Variant::Klein9b, &req)
+            .unwrap()
+            .bind_load(&model.loaded_spec);
+        let _armed = mlx_gen::sc20686::request_output(
+            events_path.clone(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "resident",
+        )
+        .unwrap()
+        .arm();
+
+        let err = model
+            .generate_planned(&req, &plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not loaded"), "unexpected error: {err}");
+        let events = std::fs::read_to_string(&events_path)
+            .expect("generate_planned must activate the armed SC-20686 session and write events");
+        assert!(
+            events.contains("\"phase\":\"phase-window\"")
+                && events.contains("\"operation\":\"encode\"")
+                && events.contains("\"operation\":\"release-remnant\""),
+            "expected SC-20686 events in output, got: {events}"
+        );
     }
 }

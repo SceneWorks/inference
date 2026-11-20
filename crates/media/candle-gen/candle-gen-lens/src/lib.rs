@@ -728,7 +728,7 @@ impl Pipeline {
                     .map_err(CandleError::from)
             },
             |seed, init, on_progress| {
-                let preview = preview::hook(&req.preview, &comps.heavy.vae, latent_h, latent_w);
+                let preview = preview::hook_for_plan(&req.preview, &comps.heavy.vae, run.plan());
                 self.denoise(
                     Some(run),
                     &comps.heavy,
@@ -850,7 +850,7 @@ impl Pipeline {
                     .map_err(CandleError::from)
             },
             |seed, init, on_progress| {
-                let preview = preview::hook(&req.preview, &heavy.vae, latent_h, latent_w);
+                let preview = preview::hook_for_plan(&req.preview, &heavy.vae, run.plan());
                 self.denoise(
                     Some(run),
                     &heavy,

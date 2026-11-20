@@ -336,6 +336,9 @@ impl LowResStartSpec {
         let pass0_conditioning = classify_descriptor_pass0_conditioning(descriptor);
         let is_plain_single_reference_img2img = pass0_conditioning
             == Pass0ConditioningRequirement::NoiseStartSupported
+            && descriptor.family != "flux"
+            && !descriptor.id.starts_with("flux1_")
+            && !descriptor.id.contains("ip_adapter")
             && descriptor
                 .capabilities
                 .accepts(crate::ConditioningKind::Reference)
@@ -6734,6 +6737,36 @@ mod tests {
             .low_res_start
             .unwrap()
             .resolve_for_descriptor(&flux2_desc, &multi_ref_req, 4, 16)
+            .is_err());
+
+        // FLUX.1 descriptors treat `Conditioning::Reference` as XLabs IP-Adapter conditioning
+        // (plain img2img uses `req.source_image`), so `Conditioning::Reference` + `low_res_start`
+        // must be rejected on both `flux1_dev` and `flux1_dev_ip_adapter`.
+        let mut flux1_desc = flux2_desc.clone();
+        flux1_desc.id = "flux1_dev";
+        flux1_desc.family = "flux";
+        flux1_desc.capabilities.conditioning = vec![ConditioningKind::Reference];
+        flux1_desc.capabilities.supports_low_res_start = true;
+        assert!(req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&flux1_desc, &req, 4, 16)
+            .is_err());
+        assert!(flux1_desc
+            .capabilities
+            .validate_request(flux1_desc.id, &req)
+            .is_err());
+        let mut flux1_ip_desc = flux1_desc.clone();
+        flux1_ip_desc.id = "flux1_dev_ip_adapter";
+        flux1_ip_desc.capabilities.supports_low_res_start = false;
+        assert!(req
+            .low_res_start
+            .unwrap()
+            .resolve_for_descriptor(&flux1_ip_desc, &req, 4, 16)
+            .is_err());
+        assert!(flux1_ip_desc
+            .capabilities
+            .validate_request(flux1_ip_desc.id, &req)
             .is_err());
 
         // Unpacked latent space (Anima QWEN_KREA_Z16_LATENT_SPACE) + transition_clean_estimate_f32.

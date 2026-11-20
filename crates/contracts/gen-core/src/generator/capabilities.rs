@@ -1534,6 +1534,12 @@ impl Capabilities {
                 )));
             }
             let is_plain_single_reference_img2img = self.accepts(ConditioningKind::Reference)
+                && !id.starts_with("flux1_")
+                && !id.contains("ip_adapter")
+                && !id.contains("edit")
+                && !id.contains("fill")
+                && !id.contains("pulid")
+                && !id.contains("instantid")
                 && req.source_image.is_none()
                 && req.conditioning.len() == 1
                 && matches!(req.conditioning[0], Conditioning::Reference { .. });

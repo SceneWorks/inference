@@ -259,9 +259,7 @@ impl Generator for ChromaGenerator {
         plan.check_load(&self.load_binding)?;
         self.validate(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        if scope.is_none() {
-            self.memory_admission.consume_for_generate(req)?;
-        }
+        self.memory_admission.consume_for_generate(req)?;
         if let Some(receipt) = &self.load_receipt {
             receipt.ensure_unchanged()?;
         }

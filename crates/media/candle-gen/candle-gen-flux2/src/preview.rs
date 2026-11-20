@@ -301,6 +301,39 @@ pub fn hook<'a>(
     })
 }
 
+pub(crate) fn hook_for_plan_with_stats<'a>(
+    sink: &'a PreviewSink,
+    bn_std: &'a Tensor,
+    bn_mean: &'a Tensor,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    let (phase0_w, phase0_h) = plan.phase_output_size(0);
+    let (phase0_lat_h, phase0_lat_w) = crate::pipeline::latent_dims(phase0_w, phase0_h);
+    let phase0_tokens = phase0_lat_h * phase0_lat_w;
+    let (full_w, full_h) = plan.output_size();
+    let (full_lat_h, full_lat_w) = crate::pipeline::latent_dims(full_w, full_h);
+    PreviewHook::new(sink, move |tokens: &Tensor| {
+        let (lat_h, lat_w) = if tokens.dims().get(1).copied() == Some(phase0_tokens) {
+            (phase0_lat_h, phase0_lat_w)
+        } else {
+            (full_lat_h, full_lat_w)
+        };
+        project_packed_tokens(tokens, bn_std, bn_mean, lat_h, lat_w)
+    })
+}
+
+/// Phase-geometry-aware preview hook for planned FLUX.2-family renders: projects Phase-0 packed
+/// tokens at `(phase0_lat_h, phase0_lat_w)` and Phase-1 packed tokens at `(full_lat_h, full_lat_w)`
+/// when `low_res_start` is active, and at `(full_lat_h, full_lat_w)` throughout when inactive.
+pub fn hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    vae: &'a Flux2Vae,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    let (bn_std, bn_mean) = vae.bn_stats();
+    hook_for_plan_with_stats(sink, bn_std, bn_mean, plan)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1060,5 +1093,64 @@ mod tests {
     fn the_geometry_modules_drive_no_sampler() {
         assert!(sampler_call_sites("pipeline.rs", include_str!("pipeline.rs")).is_empty());
         assert!(sampler_call_sites("vae.rs", include_str!("vae.rs")).is_empty());
+    }
+
+    #[test]
+    fn hook_for_plan_projects_phase0_and_phase1_frames_across_low_res_start() {
+        use candle_gen::gen_core::{
+            GenerationRequest, LoadSpec, LowResStartSpec, RenderRun, WeightsSource,
+        };
+
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(7),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let plan = crate::compile_base_plan(crate::Flux2Variant::Klein9b, &req)
+            .unwrap()
+            .bind_load(&spec);
+        let (std, mean) = identity_stats();
+        let (sink, captured) = collecting_sink();
+        let hook = hook_for_plan_with_stats(&sink, &std, &mean, &plan);
+
+        let run_ctx = RenderRun::new(&plan, &req.cancel, None);
+        run_ctx
+            .encode(|| Ok::<_, candle_gen::CandleError>(()))
+            .unwrap();
+        let out = run_ctx
+            .images_with_denoise_phases(
+                &mut |_| {},
+                |_| Ok::<_, candle_gen::CandleError>(packed_latent(256, 256)),
+                |seed, start, progress| {
+                    candle_gen::run_flow_sampler_spans(
+                        Some(plan.sampler()),
+                        candle_gen::gen_core::sampling::TimestepConvention::Sigma,
+                        plan.denoise_sigmas(),
+                        &plan.denoise_spans(),
+                        Some(&run_ctx),
+                        false,
+                        start,
+                        seed,
+                        &req.cancel,
+                        progress,
+                        Some(&hook),
+                        zero_velocity,
+                    )
+                },
+                |_, lat, _| Ok(lat),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let frames = candle_gen::lock_recover(&captured);
+        assert_eq!(frames.len(), 4);
+        assert_eq!((frames[0].image.width, frames[0].image.height), (32, 32));
+        assert_eq!((frames[1].image.width, frames[1].image.height), (32, 32));
+        assert_eq!((frames[2].image.width, frames[2].image.height), (64, 64));
+        assert_eq!((frames[3].image.width, frames[3].image.height), (64, 64));
     }
 }

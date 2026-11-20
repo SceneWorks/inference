@@ -987,16 +987,17 @@ impl LensGenerator {
             req.use_pid,
             on_progress,
             |text| {
-                run.begin_conditioning()?;
-                calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
-                text.encode_prompt_windowed(
-                    &req.prompt,
-                    negative,
-                    DEFAULT_DATE,
-                    guidance,
-                    Some(&req.cancel),
-                    encoder_window,
-                )
+                run.encode(|| {
+                    calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
+                    text.encode_prompt_windowed(
+                        &req.prompt,
+                        negative,
+                        DEFAULT_DATE,
+                        guidance,
+                        Some(&req.cancel),
+                        encoder_window,
+                    )
+                })
             },
             |encoded| {
                 if let Some((features, mask)) = encoded {
@@ -1004,7 +1005,6 @@ impl LensGenerator {
                     arrays.push(mask);
                     mlx_rs::transforms::eval(arrays)?;
                 }
-                run.end_conditioning()?;
                 Ok(())
             },
             |heavy, (features, mask), progress| {
@@ -2329,5 +2329,98 @@ mod tests {
                 "phase staging is selected per request, not baked into the shared owner"
             );
         }
+    }
+
+    #[test]
+    fn staged_request_scoped_encode_closes_conditioning_when_unstaged_and_on_error() {
+        struct StubHeavy;
+        impl mlx_gen::residency::StagedHeavy for StubHeavy {
+            type Light = ();
+            type DecodeView<'a> = ();
+            fn shed_dit(self) -> Self::Light {}
+            fn decode_view(&self) -> Self::DecodeView<'_> {}
+            fn light_view(_light: &Self::Light) -> Self::DecodeView<'_> {}
+        }
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let req = GenerationRequest {
+            prompt: "a lens scene".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            ..Default::default()
+        };
+        let plan = compile_trajectory_for(MODEL_ID_BASE, &req)
+            .unwrap()
+            .bind_load(&spec);
+
+        // 1. When `stage_residency == false`, `materialize_encoded` is skipped on the success path;
+        // `run.encode` must close conditioning so `run.begin_rendering()` succeeds in `denoise`.
+        let residency = Residency::request_scoped(|_| Ok(()), |_, _| Ok(StubHeavy));
+        let run = mlx_gen::gen_core::RenderRun::new(&plan, &req.cancel, None);
+        let mut progress = |_| {};
+        let out: Result<usize> = residency.run_staged_request_scoped(
+            false,
+            false,
+            &req.cancel,
+            false,
+            &mut progress,
+            |_| {
+                run.encode(|| {
+                    calibration_fault(&req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
+                    Ok::<_, Error>(7usize)
+                })
+            },
+            |_| {
+                panic!("materialize_encoded is not called on the unstaged success path");
+            },
+            |_heavy, encoded, _| {
+                run.begin_rendering()?;
+                run.reset_image_denoise_phases();
+                run.begin_denoise_phase(0)?;
+                run.end_denoise_phase(0)?;
+                run.finish_image_denoise_phases()?;
+                Ok(encoded)
+            },
+            |_| Ok(()),
+            |_decode, denoised, _| {
+                let value = run.decode_phase(|| Ok::<_, Error>(denoised))?;
+                run.finish_rendering();
+                Ok(value)
+            },
+        );
+        assert_eq!(out.unwrap(), 7);
+
+        // 2. When `encode` errors (e.g. conditioning calibration fault), `materialize_encoded(None)`
+        // runs for cleanup and must not call `run.end_conditioning()`.
+        let mut fault_req = req.clone();
+        fault_req.memory = Some(mlx_gen::gen_core::GenerationMemory {
+            calibration_fault_harness_authorized: true,
+            calibration_error_phase: Some(mlx_gen::gen_core::MemoryPhase::Conditioning),
+            ..Default::default()
+        });
+        let run_err = mlx_gen::gen_core::RenderRun::new(&plan, &fault_req.cancel, None);
+        let mut materialize_saw_none = false;
+        let err: Result<()> = residency.run_staged_request_scoped(
+            true,
+            false,
+            &fault_req.cancel,
+            false,
+            &mut progress,
+            |_| {
+                run_err.encode(|| {
+                    calibration_fault(&fault_req, mlx_gen::gen_core::MemoryPhase::Conditioning)
+                })
+            },
+            |encoded| {
+                materialize_saw_none = encoded.is_none();
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+            |_| unreachable!(),
+            |_, _: (), _| unreachable!(),
+        );
+        assert!(err.is_err());
+        assert!(materialize_saw_none);
     }
 }
