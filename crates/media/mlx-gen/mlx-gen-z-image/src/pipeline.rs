@@ -12,9 +12,27 @@ use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
-pub use mlx_gen::img2img::{
-    add_noise_by_interpolation, init_time_step, preprocess_init_image, resolve_reference,
-};
+pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+
+/// Resolve the single img2img init image from a generation request (`Conditioning::Reference` or
+/// `req.source_image` when `req.conditioning` is empty).
+pub fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
+    if let Some(reference) = mlx_gen::img2img::resolve_reference(req, id)? {
+        if req.source_image.is_some() {
+            return Err(Error::Msg(format!(
+                "{id}: specify img2img input via source_image or Conditioning::Reference, not both"
+            )));
+        }
+        return Ok(Some(reference));
+    }
+    if let Some(image) = req.source_image.as_ref() {
+        return Ok(Some((image, req.strength)));
+    }
+    Ok(None)
+}
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
@@ -434,6 +452,132 @@ pub fn denoise_cfg_with_progress_preview_and_pag(
         latents,
         |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
+    )
+}
+
+/// Planned [`denoise_cfg_with_progress_preview_and_pag`] driven by [`mlx_gen::gen_core::RenderRun`]
+/// spans and phase-boundary transitions (`SW-6947`).
+///
+/// Re-prepares the transformer's patchify metadata and RoPE frequencies whenever the input latent's
+/// spatial dimensions change across the phase-0 (`low_w x low_h`) -> phase-1 (`full_w x full_h`)
+/// boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_planned(
+    transformer: &ZImageTransformer,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    budget: AttentionBudget,
+    block_window: Option<usize>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    pag: Option<&mlx_gen::gen_core::PagResolved>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    mlx_gen::image_execution::scalar("guidance", guidance);
+    let sh = latents.shape();
+    let mut cached_dims = (sh[0], sh[1], sh[2], sh[3]);
+    let mut prep = transformer.prepare(cached_dims, cap_feats)?;
+    let cfg_on = guidance != 1.0;
+    let mut neg_prep = match (cfg_on, neg_cap_feats) {
+        (true, Some(neg)) => Some(transformer.prepare(cached_dims, neg)?),
+        _ => None,
+    };
+    let g = Array::from_slice(&[guidance], &[1]);
+    let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
+    let window = transformer.block_window(block_window, cancel)?;
+    let total_steps = sigmas.len().saturating_sub(1);
+    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let has_low_res_start = phase_scope.is_some_and(|run| run.plan().low_res_start().is_some());
+    let mut eval_idx = 0usize;
+    let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let x_sh = x.shape();
+        let dims = (x_sh[0], x_sh[1], x_sh[2], x_sh[3]);
+        if dims != cached_dims {
+            prep = transformer.prepare(dims, cap_feats)?;
+            neg_prep = match (cfg_on, neg_cap_feats) {
+                (true, Some(neg)) => Some(transformer.prepare(dims, neg)?),
+                _ => None,
+            };
+            cached_dims = dims;
+        }
+        let current_eval = eval_idx;
+        eval_idx += 1;
+        let step_idx = if has_low_res_start && total_steps > 0 {
+            let sigma = 1.0 - timestep;
+            sigmas[..total_steps]
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs())))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        } else {
+            mlx_gen::gen_core::sampling::step_index_for_eval(
+                canonical_solver,
+                current_eval,
+                total_steps,
+            )
+        };
+        let v_cond = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
+        let eps_base = match &neg_prep {
+            Some(np) => {
+                let v_uncond = transformer.forward_with_rungs(np, x, timestep, plan, window)?;
+                let delta = v_cond.subtract(&v_uncond)?;
+                v_uncond.add(&delta.multiply(&g)?)?
+            }
+            None => v_cond.clone(),
+        };
+        finalize_cfg_and_pag(
+            &v_cond,
+            eps_base,
+            step_idx,
+            total_steps,
+            pag,
+            neg_prep.is_some(),
+            |pag_ctx| {
+                transformer.forward_with_rungs_with_pag(
+                    &prep,
+                    x,
+                    timestep,
+                    plan,
+                    window,
+                    Some(pag_ctx),
+                )
+            },
+        )
+    };
+    mlx_gen::run_flow_sampler_with_phase_transition_spans(
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
+        TimestepConvention::OneMinusSigma,
+        latents,
+        spans,
+        phase_scope,
+        |latents, sigma| match phase_scope {
+            Some(run) => crate::preview::emit_preview_for_plan(
+                preview,
+                &previews,
+                sigmas,
+                sigma,
+                latents,
+                run.plan(),
+            ),
+            None => crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
+        },
+        predict,
+        None,
     )
 }
 
@@ -1352,6 +1496,85 @@ pub(crate) fn denoise_batch(
         let out = denoise(init, seed, on_progress)?;
         // Materialize so the DiT is no longer referenced through MLX's lazy graph (the caller's shed
         // would otherwise free nothing).
+        mlx_rs::transforms::eval([&out])?;
+        latents.push(out);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "z_image",
+            "serial_complete",
+            &[
+                ("schema", 1),
+                ("serial", i as u64),
+                ("completed_batches", latents.len() as u64),
+            ],
+        );
+    }
+    Ok(latents)
+}
+
+/// Planned [`denoise_batch`] driven by [`mlx_gen::gen_core::RenderRun`]: initializes phase-0 noise
+/// at `run.plan().phase_output_size(0)` and blends with `run.plan().denoise_sigmas()[0]` (`SW-6947`).
+pub(crate) fn denoise_batch_planned(
+    run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+    count: u32,
+    clean: Option<&Array>,
+    on_progress: &mut dyn FnMut(Progress),
+    mut denoise: impl FnMut(Array, u64, &mut dyn FnMut(Progress)) -> Result<Array>,
+) -> Result<Vec<Array>> {
+    let _compile_glue = crate::CompileGlueGuard::enable();
+    let base_seed = run.plan().base_seed();
+    let (init_w, init_h) = run.plan().phase_output_size(0);
+    let sigmas = run.plan().denoise_sigmas();
+    let mut latents = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let seed = base_seed.wrapping_add(i as u64);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "z_image",
+            "serial",
+            &[
+                ("schema", 1),
+                ("serial", i as u64),
+                ("completed_batches", latents.len() as u64),
+                ("forward_rows", 1),
+                ("init_present", u64::from(clean.is_some())),
+                (
+                    "init_logical_bytes",
+                    clean.map(mlx_gen::ios_quantum::bytes).unwrap_or(0),
+                ),
+            ],
+        );
+        let quanta = mlx_gen::ios_quantum::enabled();
+        if quanta {
+            let elements = u64::from(LATENT_CHANNELS as u32)
+                * u64::from(init_h / SPATIAL_SCALE)
+                * u64::from(init_w / SPATIAL_SCALE);
+            mlx_gen::ios_quantum::before(
+                crate::quantum::LATENTS,
+                crate::quantum::latents_bytes(elements, clean.is_some()),
+            )?;
+        }
+        let noise = create_noise(seed, init_w, init_h)?.as_dtype(Dtype::Bfloat16)?;
+        let init = match clean {
+            Some(clean) => {
+                let sigma = sigmas.first().ok_or_else(|| {
+                    Error::Msg("img2img planned schedule has no starting sigma".to_string())
+                })?;
+                add_noise_by_interpolation(clean, &noise, *sigma)?
+            }
+            None => noise,
+        };
+        if quanta {
+            mlx_gen::ios_quantum::finish(crate::quantum::LATENTS, &[&init])?;
+        }
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "z_image",
+            "solver_initial_state",
+            0,
+            1,
+            &init,
+        );
+        run.reset_image_denoise_phases();
+        let out = denoise(init, seed, on_progress)?;
+        run.finish_image_denoise_phases()?;
         mlx_rs::transforms::eval([&out])?;
         latents.push(out);
         mlx_gen::ios_quantum::diagnostic_metadata(

@@ -363,6 +363,10 @@ pub fn register_turbo_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: model::MODEL_ID,
+            compile: model::compile_turbo,
+        })
         .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -381,6 +385,10 @@ pub fn register_base_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model_base::REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: model_base::MODEL_ID,
+            compile: model::compile_base,
+        })
         .register_memory_strategy(model_base::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -398,6 +406,19 @@ pub fn register_base_control_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model_base_control::REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: model_base_control::MODEL_ID,
+            compile: model::compile_base_control,
+        })
+        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
+            route_id: model_base_control::MODEL_ID,
+            parent_provider_id: Some(model_base::MODEL_ID),
+            descriptor: model_base_control::descriptor,
+            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
+                provider_id: model_base_control::MODEL_ID,
+                compile: model::compile_base_control,
+            }),
+        })
         .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -418,6 +439,19 @@ pub fn register_turbo_control_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model_control::REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: model_control::MODEL_ID,
+            compile: model::compile_turbo_control,
+        })
+        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
+            route_id: model_control::MODEL_ID,
+            parent_provider_id: Some(model::MODEL_ID),
+            descriptor: model_control::descriptor,
+            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
+                provider_id: model_control::MODEL_ID,
+                compile: model::compile_turbo_control,
+            }),
+        })
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -677,6 +711,144 @@ mod explicit_registry_tests {
                     .len()
                     > 1,
                 "{id}: the decode ladder must be sweepable, not a single point"
+            );
+        }
+    }
+
+    #[test]
+    fn z_image_shared_driver_render_plans_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{
+            sampling::{FlowModelSampling, TimestepConvention},
+            BoundaryState, Conditioning, ControlKind, EstimateSource, GenerationRequest, Image,
+            LoadSpec, LowResStartSpec, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/tmp/z-image".into()));
+
+        for (id, expected_steps) in [("z_image_turbo", 4usize), ("z_image", 50usize)] {
+            let desc = registry
+                .generators()
+                .map(|r| (r.descriptor)())
+                .find(|d| d.id == id)
+                .expect("registered descriptor");
+            assert!(desc.capabilities.supports_low_res_start, "{id}");
+            let app = &all_features[id]["low_res_start"];
+            assert!(app.applicable, "{id} must qualify for LowResStart");
+
+            let k = expected_steps / 2;
+            let req = GenerationRequest {
+                prompt: "a red fox in snow".into(),
+                width: 1024,
+                height: 1024,
+                low_res_start: Some(LowResStartSpec::new(k, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("compiled plan");
+            assert_eq!(plan.executed_steps(), expected_steps);
+            assert_eq!(plan.phase_output_size(0), (512, 512));
+            assert_eq!(plan.output_size(), (1024, 1024));
+            assert_eq!(plan.denoise_spans(), vec![0..k, k..expected_steps]);
+
+            // Plain single-reference img2img truncates the full schedule and resolves low_res_start
+            // against the remaining executed steps.
+            let ref_img = Image {
+                width: 64,
+                height: 64,
+                pixels: vec![128; 64 * 64 * 3],
+            };
+            let img2img_req = GenerationRequest {
+                prompt: "a red fox in snow".into(),
+                width: 1024,
+                height: 1024,
+                steps: Some(8),
+                conditioning: vec![Conditioning::Reference {
+                    image: ref_img,
+                    strength: Some(0.5),
+                }],
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            };
+            let img2img_plan = registry
+                .compile_render_plan(id, &spec, &img2img_req)
+                .unwrap()
+                .expect("compiled img2img plan");
+            assert_eq!(img2img_plan.executed_steps(), 4);
+            assert_eq!(img2img_plan.phase_output_size(0), (512, 512));
+            assert_eq!(img2img_plan.denoise_spans(), vec![0..2, 2..4]);
+
+            // Verify two-phase transition arithmetic on Z-Image's [16, 1, H/8, W/8] layout.
+            let low_res_plan = *img2img_plan.low_res_start().unwrap();
+            let sigma_k = img2img_plan.denoise_sigmas()[low_res_plan.k];
+            let ms = FlowModelSampling::new(TimestepConvention::OneMinusSigma);
+            let low_latent = vec![0.25f32; 16 * 64 * 64];
+            let transitioned = mlx_gen::gen_core::transition_clean_estimate_f32(
+                BoundaryState::CleanEstimate {
+                    latent: &low_latent,
+                    source: EstimateSource::EndpointEvaluation,
+                },
+                16,
+                1,
+                8,
+                &low_res_plan,
+                sigma_k,
+                &ms,
+                img2img_plan.base_seed(),
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(transitioned.len(), 16 * 128 * 128);
+            assert!(transitioned.iter().all(|v| v.is_finite()));
+        }
+
+        // Control variants register FeatureRouteRegistration and refuse low_res_start with typed
+        // ConflictsWithPass0ControlConditioning.
+        for control_id in ["z_image_turbo_control", "z_image_control"] {
+            let desc = registry
+                .generators()
+                .map(|r| (r.descriptor)())
+                .find(|d| d.id == control_id)
+                .expect("control descriptor");
+            assert!(!desc.capabilities.supports_low_res_start, "{control_id}");
+            let app = &all_features[control_id]["low_res_start"];
+            assert!(!app.applicable, "{control_id}");
+            assert!(
+                app.reasons.iter().any(|r| r.message.contains("control")),
+                "{control_id}: unexpected incompatibility reasons {:?}",
+                app.reasons
+            );
+            let ctrl_img = Image {
+                width: 64,
+                height: 64,
+                pixels: vec![64; 64 * 64 * 3],
+            };
+            let bad_req = GenerationRequest {
+                prompt: "pose".into(),
+                width: 1024,
+                height: 1024,
+                conditioning: vec![Conditioning::Control {
+                    image: ctrl_img,
+                    kind: ControlKind::Pose,
+                    scale: Some(0.8),
+                }],
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            };
+            let ctrl_spec =
+                spec.clone()
+                    .with_control(WeightsSource::File("/tmp/ctrl.safetensors".into()));
+            let err = registry
+                .compile_render_plan(control_id, &ctrl_spec, &bad_req)
+                .unwrap_err();
+            assert!(
+                matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                "{control_id}: expected typed Unsupported error, got {err:?}"
             );
         }
     }

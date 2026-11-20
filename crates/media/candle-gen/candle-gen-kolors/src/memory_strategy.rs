@@ -1853,7 +1853,7 @@ impl RequestBinding {
                 height: request.height,
                 batch: request.count,
                 frames: request.frames.unwrap_or(1),
-                reference_count: request.image_reference_count(),
+                reference_count: request.memory_reference_count(),
             },
             memory: request.memory,
             use_pid: request.use_pid,

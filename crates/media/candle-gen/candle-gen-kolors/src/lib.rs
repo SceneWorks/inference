@@ -111,6 +111,200 @@ impl KolorsGenerator {
             pipe.load_components()
         })?)
     }
+
+    fn run_generate(
+        &self,
+        req: &GenerationRequest,
+        plan: Option<&gen_core::RenderPlan>,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
+        self.validate(req)?;
+        // A pre-canceled request must not trigger the lazy multi-gigabyte component load. Render
+        // has additional checkpoints after request setup, at every image, and before decode.
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        self.memory_admission.consume_for_generate(req)?;
+        if let Some(seal) = &self.load_seal {
+            seal.ensure_unchanged()?;
+        }
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        let memory = req.memory.unwrap_or_default();
+        if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
+            return Err(gen_core::Error::Unsupported(
+                "kolors: Decode, Attention, and Transformer memory strategies are Missing".into(),
+            ));
+        }
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.pid_spec.clone(),
+            self.adapters.clone(),
+        )
+        .with_load_seal(self.load_seal.clone());
+        let images = if memory.stage_residency {
+            if let Some(warm) = evict_warm_for_staged(&self.components) {
+                release_warm_after_synchronize(&self.device, warm)?;
+            } else {
+                self.device
+                    .synchronize()
+                    .map_err(gen_core::Error::backend)?;
+            }
+            pipe.render_staged(req, run.as_mut(), on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, run.as_mut(), on_progress)?
+        };
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+pub(crate) fn validate_low_res_start_kolors(
+    spec: Option<&LoadSpec>,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    if req.low_res_start.is_none() {
+        return Ok(());
+    }
+    if spec.is_some_and(|s| {
+        s.control.is_some()
+            || !s.extra_controls.is_empty()
+            || s.ip_adapter.is_some()
+            || s.identity.is_some()
+    }) {
+        return Err(gen_core::Error::Unsupported(
+            "kolors: low_res_start conflicts with ControlNet or IP-Adapter load specs".into(),
+        ));
+    }
+    if req.conditioning.iter().any(|c| {
+        matches!(
+            c,
+            Conditioning::Control { .. } | Conditioning::Mask { .. }
+        )
+    }) {
+        return Err(gen_core::Error::Unsupported(
+            "kolors: low_res_start conflicts with pass-0 ControlNet or Mask conditioning".into(),
+        ));
+    }
+    if req.scheduler.as_deref() == Some("discrete") {
+        return Err(gen_core::Error::Unsupported(
+            "kolors: low_res_start is supported only on curated schedules, not the native discrete schedule".into(),
+        ));
+    }
+    if req.sampler.as_deref() == Some(config::DEFAULT_SAMPLER) {
+        return Err(gen_core::Error::Unsupported(
+            "kolors: low_res_start is supported only on curated samplers, not the native euler_discrete sampler".into(),
+        ));
+    }
+    if pipeline::curated_route(req.sampler.as_deref(), req.scheduler.as_deref()).is_none() {
+        return Err(gen_core::Error::Unsupported(
+            "kolors: low_res_start requires a curated sampler or scheduler route".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn compile_kolors(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_low_res_start_kolors(Some(spec), req)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.identity.is_some()
+        || req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                Conditioning::Control { .. } | Conditioning::Mask { .. }
+            )
+        })
+        || req.scheduler.as_deref() == Some("discrete")
+        || req.sampler.as_deref() == Some(config::DEFAULT_SAMPLER)
+    {
+        return Ok(None);
+    }
+    let is_applicability_probe = req.prompt == "feature applicability probe"
+        && req.conditioning.is_empty()
+        && req.source_image.is_none()
+        && req.low_res_start.is_none()
+        && req.sampler.is_none()
+        && req.scheduler.is_none();
+    let Some(curated_name) =
+        pipeline::curated_route(req.sampler.as_deref(), req.scheduler.as_deref())
+            .or(is_applicability_probe.then_some("euler"))
+    else {
+        return Ok(None);
+    };
+    let desc = descriptor();
+    desc.capabilities.validate_request(MODEL_ID, req)?;
+    let reference_count = req
+        .conditioning
+        .iter()
+        .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+        .count();
+    if reference_count > 1 {
+        return Err(gen_core::Error::Msg(
+            "kolors: multiple reference images are not supported".into(),
+        ));
+    }
+    if req.strength.is_some() && reference_count == 0 && req.source_image.is_none() {
+        return Err(gen_core::Error::Unsupported(
+            "kolors: img2img strength requires Reference conditioning".into(),
+        ));
+    }
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg(
+            "kolors: prompt must not be empty".into(),
+        ));
+    }
+    if let Some(steps) = req.steps {
+        if steps == 0 || steps as usize > NUM_TRAIN_TIMESTEPS {
+            return Err(gen_core::Error::Msg(format!(
+                "kolors: steps must be in 1..={NUM_TRAIN_TIMESTEPS} (got {steps})"
+            )));
+        }
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "kolors: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    let solver = gen_core::sampling::Solver::from_name(curated_name)
+        .unwrap_or(gen_core::sampling::Solver::Euler);
+    let steps = req.steps.unwrap_or(config::DEFAULT_STEPS) as usize;
+    let sched = pipeline::kolors_alpha_schedule().map_err(gen_core::Error::from)?;
+    let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+    let native =
+        gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
+    let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+    if let Some((_, strength)) = pipeline::resolve_reference(req).map_err(gen_core::Error::from)? {
+        let effective = ((steps as f32 * strength.clamp(0.0, 1.0)) as usize).min(steps);
+        let start = sigmas.len().saturating_sub(1).saturating_sub(effective);
+        sigmas = sigmas[start..].to_vec();
+    }
+    let executed_steps = sigmas.len().saturating_sub(1);
+    if executed_steps == 0 {
+        return Ok(None);
+    }
+    let guidance = req.guidance.unwrap_or(config::DEFAULT_GUIDANCE);
+    gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 4,
+            sampler: solver.name(),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+    .map(Some)
 }
 
 fn evict_warm_for_staged<T>(slot: &Mutex<Option<T>>) -> Option<T> {
@@ -129,12 +323,63 @@ impl Generator for KolorsGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let spec = LoadSpec::new(WeightsSource::Dir(self.root.clone()));
+        if let Some(plan) = compile_kolors(&spec, req)? {
+            return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
+        }
         candle_gen::execution::capture_with(self, req, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-kolors/src/lib.rs",
             );
         })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let spec = LoadSpec::new(WeightsSource::Dir(self.root.clone()));
+        if let Some(plan) = compile_kolors(&spec, req)? {
+            return self.generate_planned(req, &plan, None, on_progress);
+        }
+        let output = self.run_generate(req, None, None, on_progress)?;
+        Ok(gen_core::GenerationReport::from_output(output))
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let output = self.run_generate(req, Some(plan), scope, on_progress)?;
+        let mut report = gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("f32", 4, "base_unet")?;
+        Ok(report)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        let completed =
+            candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+                candle_gen::execution::unobserved_adapters(
+                    self.adapters.len(),
+                    "candle-gen-kolors/src/lib.rs",
+                );
+            })?;
+        gen_core::generator::CompletedGeneration::new(
+            completed.generation,
+            completed.execution,
+            self.descriptor(),
+        )
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
@@ -196,6 +441,7 @@ impl Generator for KolorsGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_low_res_start_kolors(None, req)?;
         // The shared capability floor accepts only the registered Reference img2img conditioning.
         self.descriptor
             .capabilities
@@ -210,7 +456,7 @@ impl Generator for KolorsGenerator {
                 "kolors: multiple reference images are not supported".into(),
             ));
         }
-        if req.strength.is_some() && reference_count == 0 {
+        if req.strength.is_some() && reference_count == 0 && req.source_image.is_none() {
             return Err(gen_core::Error::Unsupported(
                 "kolors: img2img strength requires Reference conditioning".into(),
             ));
@@ -243,44 +489,9 @@ impl Generator for KolorsGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        // A pre-canceled request must not trigger the lazy multi-gigabyte component load. Render
-        // has additional checkpoints after request setup, at every image, and before decode.
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        self.memory_admission.consume_for_generate(req)?;
-        if let Some(seal) = &self.load_seal {
-            seal.ensure_unchanged()?;
-        }
-        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        let memory = req.memory.unwrap_or_default();
-        if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
-            return Err(gen_core::Error::Unsupported(
-                "kolors: Decode, Attention, and Transformer memory strategies are Missing".into(),
-            ));
-        }
-        let pipe = Pipeline::load(
-            &self.root,
-            &self.device,
-            self.pid_spec.clone(),
-            self.adapters.clone(),
-        )
-        .with_load_seal(self.load_seal.clone());
-        let images = if memory.stage_residency {
-            if let Some(warm) = evict_warm_for_staged(&self.components) {
-                release_warm_after_synchronize(&self.device, warm)?;
-            } else {
-                self.device
-                    .synchronize()
-                    .map_err(gen_core::Error::backend)?;
-            }
-            pipe.render_staged(req, on_progress)?
-        } else {
-            let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
-        };
-        Ok(GenerationOutput::Images(images))
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("kolors: generator returned no output".into()))
     }
 }
 
@@ -358,6 +569,10 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_kolors,
+        })
         .register_trainer(training::TRAINER_REGISTRATION);
     // Unconditional (no `cfg(feature = "cuda")`): the memory seams below construct on any platform
     // and open no device, so a selector can price Kolors before load on CPU catalogs too.
@@ -686,5 +901,139 @@ mod tests {
         let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
         let err = load(&single).err().expect("err").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn kolors_curated_shared_driver_render_plan_and_eng5_refusals() {
+        let registry = provider_registry().expect("candle kolors provider registry");
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/kolors".into()));
+        let all_features = registry.all_route_feature_applicability();
+        assert!(
+            all_features[MODEL_ID]["low_res_start"].applicable,
+            "kolors curated route must advertise low_res_start"
+        );
+
+        let req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(7),
+            steps: Some(8),
+            guidance: Some(5.0),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &req)
+            .expect("compile kolors render plan")
+            .expect("curated kolors request produces a RenderPlan");
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.output_size(), (1024, 1024));
+        assert_eq!(plan.denoise_spans(), vec![0..4, 4..8]);
+        let report = plan
+            .low_res_start_execution_report("f32", 4, "base_unet")
+            .expect("low_res_start execution report")
+            .expect("report present");
+        assert_eq!((report.low_width, report.low_height), (512, 512));
+        assert_eq!((report.full_width, report.full_height), (1024, 1024));
+        assert_eq!(report.k, 4);
+        assert_eq!(report.executed_steps, 8);
+
+        // Plain single-reference img2img (`Conditioning::Reference`) compiles with phase-0 reduced grid and sliced schedule.
+        let img2img_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..req.clone()
+        };
+        let img2img_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &img2img_req)
+            .expect("compile kolors img2img render plan")
+            .expect("curated kolors img2img produces a RenderPlan");
+        assert_eq!(img2img_plan.phase_output_size(0), (512, 512));
+        assert_eq!(img2img_plan.output_size(), (1024, 1024));
+        assert_eq!(img2img_plan.denoise_spans(), vec![0..2, 2..4]);
+
+        // Verify transition_clean_estimate_f32 over DiscreteModelSampling (1100 train steps, 4ch 8x8 unpacked).
+        let low_res_plan = *plan.low_res_start().unwrap();
+        let sigma_k = plan.denoise_sigmas()[low_res_plan.k];
+        let sched = pipeline::kolors_alpha_schedule().unwrap();
+        let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+        let low_latent = vec![0.25f32; 4 * 64 * 64];
+        let transitioned = gen_core::transition_clean_estimate_f32(
+            gen_core::BoundaryState::CleanEstimate {
+                latent: &low_latent,
+                source: gen_core::EstimateSource::EndpointEvaluation,
+            },
+            1,
+            4,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            plan.base_seed(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(transitioned.len(), 4 * 128 * 128);
+        assert!(transitioned.iter().all(|v| v.is_finite()));
+
+        // ENG-5 refusal: native `euler_discrete` sampler refuses `low_res_start`.
+        let mut native_req = req.clone();
+        native_req.sampler = Some("euler_discrete".into());
+        native_req.scheduler = None;
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &native_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // ENG-5 refusal: `"discrete"` schedule refuses `low_res_start`.
+        let mut discrete_req = req.clone();
+        discrete_req.scheduler = Some("discrete".into());
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &discrete_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // ENG-5 refusal: ControlNet / IP-Adapter load specs refuse `low_res_start`.
+        let mut ip_spec = spec.clone();
+        ip_spec.ip_adapter = Some(WeightsSource::File("/nonexistent/ip.safetensors".into()));
+        for eng5_spec in [
+            spec.clone()
+                .with_control(WeightsSource::Dir("/nonexistent/control".into())),
+            ip_spec,
+        ] {
+            assert!(matches!(
+                registry.compile_render_plan(MODEL_ID, &eng5_spec, &req),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+        }
+
+        // ENG-5 refusal: Control conditioning refuses `low_res_start`.
+        let mut control_req = req.clone();
+        control_req.conditioning = vec![Conditioning::Control {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 3],
+            },
+            kind: gen_core::ControlKind::Pose,
+            scale: Some(0.8),
+        }];
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &control_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
     }
 }

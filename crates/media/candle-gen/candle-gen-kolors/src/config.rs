@@ -106,6 +106,7 @@ pub fn descriptor() -> ModelDescriptor {
             // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
             // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
             supports_preview: true,
+            supports_low_res_start: true,
             // sc-18317: Kolors runs real classifier-free guidance, and the one convention this lane
             // implements is the doubled `[uncond, cond]` batch `common::cfg_batch_context` builds.
             // Declaring the single mode makes it planner-selectable and makes `sequential` a refusal

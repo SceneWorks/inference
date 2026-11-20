@@ -32,6 +32,10 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(crate::registry::REGISTRATION)
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: crate::registry::compile_kolors,
+        })
         .register_memory_strategy(crate::registry::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -94,6 +98,148 @@ mod explicit_registry_tests {
                 .with_load_shape(shape);
             gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
                 &registry, &spec,
+            );
+        }
+    }
+
+    #[test]
+    fn kolors_curated_shared_driver_render_plan_and_eng5_refusals() {
+        use mlx_gen::gen_core::{
+            BoundaryState, Conditioning, ControlKind, EstimateSource, GenerationRequest, Image,
+            LoadSpec, LowResStartSpec, WeightsSource,
+        };
+        use mlx_gen::{AlphaSchedule, DiscreteModelSampling};
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        assert!(
+            all_features[super::MODEL_ID]["low_res_start"].applicable,
+            "kolors curated route must advertise low_res_start applicability"
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/tmp/kolors".into()));
+        let t2i_req = GenerationRequest {
+            prompt: "a misty mountain landscape".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            scheduler: Some("normal".into()),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &t2i_req)
+            .unwrap()
+            .expect("compiled curated plan");
+        assert_eq!(plan.executed_steps(), 8);
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        assert_eq!(plan.denoise_spans(), vec![0..2, 2..8]);
+
+        let img2img_req = GenerationRequest {
+            prompt: "a misty mountain landscape".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("karras".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            ..Default::default()
+        };
+        let img_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &img2img_req)
+            .unwrap()
+            .expect("compiled curated img2img plan");
+        assert_eq!(img_plan.executed_steps(), 4);
+        assert_eq!(img_plan.phase_output_size(0), (512, 512));
+        assert_eq!(img_plan.denoise_spans(), vec![0..1, 1..4]);
+
+        let low_res_plan = *img_plan.low_res_start().unwrap();
+        let sigma_k = img_plan.denoise_sigmas()[low_res_plan.k];
+        let alpha = AlphaSchedule::scaled_linear(
+            crate::sampler::NUM_TRAIN_TIMESTEPS,
+            crate::sampler::BETA_START,
+            crate::sampler::BETA_END,
+        );
+        let ms = DiscreteModelSampling::sdxl(&alpha);
+        let low_latent = vec![0.25f32; 4 * 64 * 64];
+        let transitioned = mlx_gen::gen_core::transition_clean_estimate_f32(
+            BoundaryState::CleanEstimate {
+                latent: &low_latent,
+                source: EstimateSource::EndpointEvaluation,
+            },
+            1,
+            4,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            img_plan.base_seed(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(transitioned.len(), 4 * 128 * 128);
+        assert!(transitioned.iter().all(|v| v.is_finite()));
+
+        // Native euler_discrete/discrete, ControlNet-pose, and IP-Adapter refuse low_res_start
+        // with typed Error::Unsupported.
+        let dummy_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        for (bad_spec, bad_req) in [
+            (
+                spec.clone(),
+                GenerationRequest {
+                    sampler: None,
+                    scheduler: None,
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone(),
+                GenerationRequest {
+                    sampler: Some("euler_discrete".into()),
+                    scheduler: Some("discrete".into()),
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone()
+                    .with_control(WeightsSource::Dir("/tmp/ctrl".into())),
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Control {
+                        image: dummy_img,
+                        kind: ControlKind::Pose,
+                        scale: Some(0.8),
+                    }],
+                    ..t2i_req.clone()
+                },
+            ),
+            (
+                spec.clone()
+                    .with_ip_adapter(WeightsSource::Dir("/tmp/ip".into())),
+                t2i_req.clone(),
+            ),
+        ] {
+            let err = registry
+                .compile_render_plan(super::MODEL_ID, &bad_spec, &bad_req)
+                .unwrap_err();
+            assert!(
+                matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                "expected typed Unsupported error, got {err:?}"
             );
         }
     }

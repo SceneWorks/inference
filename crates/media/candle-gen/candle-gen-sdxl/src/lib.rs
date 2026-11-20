@@ -460,6 +460,321 @@ impl SdxlGenerator {
             })
         })
     }
+
+    fn run_generate(
+        &self,
+        req: &GenerationRequest,
+        plan: Option<&gen_core::RenderPlan>,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
+        self.validate(req)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
+        let _request = candle_gen::lock_recover(&self.request);
+        let staged = staged_execution(self.file_pin_spec.offload_policy, req.memory);
+        let mut effective_req = req.clone();
+        effective_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
+        if staged {
+            effective_req
+                .memory
+                .get_or_insert_with(|| gen_core::GenerationMemory {
+                    tile_vae_decode: crate::vae_tiling_enabled(),
+                    ..Default::default()
+                })
+                .stage_residency = true;
+        }
+        let req = &effective_req;
+        candle_gen::residency::check_cancel(&req.cancel)?;
+        if staged {
+            clear_resident_caches(&self.components, &self.text_models, || {
+                Ok(self.device.synchronize()?)
+            })?;
+        }
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.dtype,
+            req.width,
+            req.height,
+            &self.adapters,
+            self.pid_spec.clone(),
+            self.component_paths.vae_fp16_fix.clone(),
+            self.ldm.clone(),
+            self.quant,
+        )?;
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        verify_artifacts(&self.artifact_seal)?;
+        let tokenizers = self.tokenizers()?;
+        let images = with_request_attention_budget(req, || -> candle_gen::Result<_> {
+            if staged {
+                // The shared driver synchronizes before every phase's owner is dropped, including
+                // body failures. Only small embeddings/latents cross the boundaries.
+                let mut state = (None, Vec::new(), on_progress, run.as_mut());
+                let images = candle_gen::residency::run_three_stage_sequential(
+                    &mut state,
+                    |_| Ok(()),
+                    |_, state| {
+                        candle_gen::residency::check_cancel(&req.cancel)?;
+                        verify_artifacts(&self.artifact_seal)?;
+                        let mut encode_text = || {
+                            self.file_pin_spec.read_prepared_files_unchanged(|| {
+                                pipe.text_embeddings(&tokenizers, &req.prompt, negative, state.2)
+                            })
+                        };
+                        let encoded = if let Some(ref mut run) = state.3 {
+                            run.encode(&mut encode_text)?
+                        } else {
+                            encode_text()?
+                        };
+                        state.0 = Some(encoded);
+                        Ok(())
+                    },
+                    |_| {
+                        candle_gen::residency::check_cancel(&req.cancel)?;
+                        verify_artifacts(&self.artifact_seal)?;
+                        self.file_pin_spec
+                            .read_prepared_files_unchanged(|| pipe.load_unet(false))
+                    },
+                    |unet, state| {
+                        if let Some(ref run) = state.3 {
+                            run.begin_rendering().map_err(candle_gen::CandleError::from)?;
+                        }
+                        state.1 = pipe.denoise_images(
+                            req,
+                            state.0.as_ref().ok_or_else(|| {
+                                candle_gen::CandleError::Msg(
+                                    "sdxl: missing text phase output".into(),
+                                )
+                            })?,
+                            unet,
+                            state.3.as_deref(),
+                            state.2,
+                        )?;
+                        state.0.take();
+                        Ok(())
+                    },
+                    |_| {
+                        candle_gen::residency::check_cancel(&req.cancel)?;
+                        verify_artifacts(&self.artifact_seal)?;
+                        self.file_pin_spec
+                            .read_prepared_files_unchanged(|| pipe.load_decoders())
+                    },
+                    |(vae, pid), state| {
+                        pipe.decode_images(
+                            req,
+                            &state.1,
+                            vae,
+                            pid.as_deref(),
+                            state.3.as_deref(),
+                            state.2,
+                        )
+                    },
+                    || Ok(self.device.synchronize()?),
+                )?;
+                if let Some(ref run) = state.3 {
+                    run.finish_rendering();
+                }
+                Ok(images)
+            } else {
+                let text = self.file_pin_spec.read_prepared_files_unchanged(|| {
+                    candle_gen::cached(&self.text_models, || -> candle_gen::Result<Arc<_>> {
+                        Ok(Arc::new(pipe.load_text_models()?))
+                    })
+                })?;
+                verify_artifacts(&self.artifact_seal)?;
+                let components = self
+                    .components(&pipe)
+                    .map_err(candle_gen::CandleError::from)?;
+                let result = (|| {
+                    let embeddings = if let Some(ref mut run) = run {
+                        run.encode(|| {
+                            candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                                pipe.text_embeddings_resident(
+                                    &tokenizers,
+                                    &text,
+                                    &req.prompt,
+                                    negative,
+                                )
+                            })
+                        })?
+                    } else {
+                        candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                            pipe.text_embeddings_resident(&tokenizers, &text, &req.prompt, negative)
+                        })?
+                    };
+                    if let Some(ref run) = run {
+                        run.begin_rendering().map_err(candle_gen::CandleError::from)?;
+                    }
+                    let images = pipe.render(
+                        req,
+                        &embeddings,
+                        &components.unet,
+                        &components.vae,
+                        components.pid.as_deref(),
+                        run.as_ref(),
+                        on_progress,
+                    )?;
+                    if let Some(ref run) = run {
+                        run.finish_rendering();
+                    }
+                    Ok(images)
+                })();
+                candle_gen::residency::synchronize_result(&self.device, result)
+            }
+        })?;
+        Ok(GenerationOutput::Images(images))
+    }
+}
+
+pub(crate) fn validate_low_res_start_sdxl(
+    spec: Option<&LoadSpec>,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    if req.low_res_start.is_none() {
+        return Ok(());
+    }
+    if spec.is_some_and(|s| {
+        s.control.is_some()
+            || !s.extra_controls.is_empty()
+            || s.ip_adapter.is_some()
+            || s.identity.is_some()
+    }) {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: low_res_start conflicts with ControlNet, IP-Adapter, or InstantID load specs"
+                .into(),
+        ));
+    }
+    if req.conditioning.iter().any(|c| {
+        matches!(
+            c,
+            gen_core::Conditioning::Control { .. } | gen_core::Conditioning::Mask { .. }
+        )
+    }) {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: low_res_start conflicts with pass-0 ControlNet or inpaint Mask conditioning"
+                .into(),
+        ));
+    }
+    if matches!(
+        req.sampler.as_deref(),
+        Some(pipeline::LIGHTNING_SAMPLER | "hyper")
+    ) {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: low_res_start is supported only on the curated shared-driver sampler path, not distilled acceleration samplers (lightning/hyper)".into(),
+        ));
+    }
+    if req.scheduler.as_deref() == Some("discrete") {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: low_res_start is supported only on curated schedules, not the native discrete schedule".into(),
+        ));
+    }
+    if let Some(sampler) = req.sampler.as_deref() {
+        if gen_core::sampling::Solver::from_name(sampler).is_none() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "sdxl: low_res_start is not supported with non-curated sampler {sampler:?}"
+            )));
+        }
+    }
+    if let Some(scheduler) = req.scheduler.as_deref() {
+        if gen_core::sampling::Scheduler::from_name(scheduler).is_none() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "sdxl: low_res_start is not supported with non-curated scheduler {scheduler:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn compile_sdxl(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_low_res_start_sdxl(Some(spec), req)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.identity.is_some()
+        || req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                gen_core::Conditioning::Control { .. } | gen_core::Conditioning::Mask { .. }
+            )
+        })
+        || matches!(
+            req.sampler.as_deref(),
+            Some(pipeline::LIGHTNING_SAMPLER | "hyper")
+        )
+        || req.scheduler.as_deref() == Some("discrete")
+        || req
+            .sampler
+            .as_deref()
+            .is_some_and(|s| gen_core::sampling::Solver::from_name(s).is_none())
+        || req
+            .scheduler
+            .as_deref()
+            .is_some_and(|s| gen_core::sampling::Scheduler::from_name(s).is_none())
+    {
+        return Ok(None);
+    }
+    let desc = plain_descriptor();
+    desc.capabilities.validate_request(MODEL_ID, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(
+            "sdxl: prompt must not be empty".into(),
+        ));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(
+            "sdxl: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "sdxl: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    let solver = req
+        .sampler
+        .as_deref()
+        .and_then(gen_core::sampling::Solver::from_name)
+        .unwrap_or(gen_core::sampling::Solver::Ddim);
+    let steps = req.steps.unwrap_or(30) as usize;
+    let sched = pipeline::sdxl_alpha_schedule().map_err(gen_core::Error::from)?;
+    let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+    let native =
+        gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
+    let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+    if req.source_image.is_some() {
+        let raw_strength = req.strength.unwrap_or(DEFAULT_EDIT_STRENGTH);
+        let start_step = gen_core::resolve_img2img_init_time_step(
+            sigmas.len().saturating_sub(1),
+            Some(raw_strength),
+        )?;
+        sigmas = sigmas[start_step..].to_vec();
+    }
+    let executed_steps = sigmas.len().saturating_sub(1);
+    if executed_steps == 0 {
+        return Ok(None);
+    }
+    let guidance = req.guidance.unwrap_or(7.0);
+    gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 4,
+            sampler: solver.name(),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+    .map(Some)
 }
 
 impl Generator for SdxlGenerator {
@@ -468,6 +783,9 @@ impl Generator for SdxlGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        if let Some(plan) = compile_sdxl(&self.file_pin_spec, req)? {
+            return self.generate_planned_with_execution_report(req, &plan, None, on_progress);
+        }
         let mut completed = candle_gen::execution::capture_with(self, req, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
@@ -476,6 +794,71 @@ impl Generator for SdxlGenerator {
             candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
             candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
         })?;
+        if self.adapters.is_empty()
+            && self.pid_spec.is_none()
+            && self.ldm.is_none()
+            && self.quant.is_none()
+            && self.dtype == DType::F16
+        {
+            if let (ExecutionIdentity::Resolved { identity }, Ok(tier)) = (
+                &mut completed.execution,
+                resolved_numeric_tier(&self.file_pin_spec),
+            ) {
+                if qualified_replay_route(req, identity, tier.quant) {
+                    identity.deterministic_replay = ExecutionReplaySupport::Deterministic {
+                        scope: "same_device_pinned_runtime".into(),
+                    };
+                }
+            }
+        }
+        gen_core::generator::CompletedGeneration::new(
+            completed.generation,
+            completed.execution,
+            self.descriptor(),
+        )
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        if let Some(plan) = compile_sdxl(&self.file_pin_spec, req)? {
+            return self.generate_planned(req, &plan, None, on_progress);
+        }
+        let output = self.run_generate(req, None, None, on_progress)?;
+        Ok(gen_core::GenerationReport::from_output(output))
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let output = self.run_generate(req, Some(plan), scope, on_progress)?;
+        let mut report = gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("f16", 4, "base_unet")?;
+        Ok(report)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        let mut completed =
+            candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+                candle_gen::execution::unobserved_adapters(
+                    self.adapters.len(),
+                    "candle-gen-sdxl/src/lib.rs",
+                );
+                candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
+                candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
+            })?;
         if self.adapters.is_empty()
             && self.pid_spec.is_none()
             && self.ldm.is_none()
@@ -546,6 +929,7 @@ impl Generator for SdxlGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_low_res_start_sdxl(Some(&self.file_pin_spec), req)?;
         // The shared capability floor (count/size range/guidance/negative/sampler/conditioning):
         // since the descriptor advertises NO conditioning, any conditioning entry is rejected here.
         self.descriptor
@@ -597,120 +981,9 @@ impl Generator for SdxlGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        if let Some(seal) = &self.artifact_seal {
-            seal.ensure_unchanged()?;
-        }
-        let _request = candle_gen::lock_recover(&self.request);
-        let staged = staged_execution(self.file_pin_spec.offload_policy, req.memory);
-        let mut effective_req = req.clone();
-        effective_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
-        if staged {
-            effective_req
-                .memory
-                .get_or_insert_with(|| gen_core::GenerationMemory {
-                    tile_vae_decode: crate::vae_tiling_enabled(),
-                    ..Default::default()
-                })
-                .stage_residency = true;
-        }
-        let req = &effective_req;
-        candle_gen::residency::check_cancel(&req.cancel)?;
-        if staged {
-            clear_resident_caches(&self.components, &self.text_models, || {
-                Ok(self.device.synchronize()?)
-            })?;
-        }
-        let pipe = Pipeline::load(
-            &self.root,
-            &self.device,
-            self.dtype,
-            req.width,
-            req.height,
-            &self.adapters,
-            self.pid_spec.clone(),
-            self.component_paths.vae_fp16_fix.clone(),
-            self.ldm.clone(),
-            self.quant,
-        )?;
-        let negative = req.negative_prompt.as_deref().unwrap_or("");
-        verify_artifacts(&self.artifact_seal)?;
-        let tokenizers = self.tokenizers()?;
-        let images = with_request_attention_budget(req, || -> candle_gen::Result<_> {
-            if staged {
-                // The shared driver synchronizes before every phase's owner is dropped, including
-                // body failures. Only small embeddings/latents cross the boundaries.
-                let mut state = (None, Vec::new(), on_progress);
-                candle_gen::residency::run_three_stage_sequential(
-                    &mut state,
-                    |_| Ok(()),
-                    |_, state| {
-                        candle_gen::residency::check_cancel(&req.cancel)?;
-                        verify_artifacts(&self.artifact_seal)?;
-                        state.0 = Some(self.file_pin_spec.read_prepared_files_unchanged(|| {
-                            pipe.text_embeddings(&tokenizers, &req.prompt, negative, state.2)
-                        })?);
-                        Ok(())
-                    },
-                    |_| {
-                        candle_gen::residency::check_cancel(&req.cancel)?;
-                        verify_artifacts(&self.artifact_seal)?;
-                        self.file_pin_spec
-                            .read_prepared_files_unchanged(|| pipe.load_unet(false))
-                    },
-                    |unet, state| {
-                        state.1 = pipe.denoise_images(
-                            req,
-                            state.0.as_ref().ok_or_else(|| {
-                                candle_gen::CandleError::Msg(
-                                    "sdxl: missing text phase output".into(),
-                                )
-                            })?,
-                            unet,
-                            state.2,
-                        )?;
-                        state.0.take();
-                        Ok(())
-                    },
-                    |_| {
-                        candle_gen::residency::check_cancel(&req.cancel)?;
-                        verify_artifacts(&self.artifact_seal)?;
-                        self.file_pin_spec
-                            .read_prepared_files_unchanged(|| pipe.load_decoders())
-                    },
-                    |(vae, pid), state| {
-                        pipe.decode_images(req, &state.1, vae, pid.as_deref(), state.2)
-                    },
-                    || Ok(self.device.synchronize()?),
-                )
-            } else {
-                let text = self.file_pin_spec.read_prepared_files_unchanged(|| {
-                    candle_gen::cached(&self.text_models, || -> candle_gen::Result<Arc<_>> {
-                        Ok(Arc::new(pipe.load_text_models()?))
-                    })
-                })?;
-                verify_artifacts(&self.artifact_seal)?;
-                let components = self
-                    .components(&pipe)
-                    .map_err(candle_gen::CandleError::from)?;
-                let result = (|| {
-                    let embeddings =
-                        candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-                            pipe.text_embeddings_resident(&tokenizers, &text, &req.prompt, negative)
-                        })?;
-                    pipe.render(
-                        req,
-                        &embeddings,
-                        &components.unet,
-                        &components.vae,
-                        components.pid.as_deref(),
-                        on_progress,
-                    )
-                })();
-                candle_gen::residency::synchronize_result(&self.device, result)
-            }
-        })?;
-        Ok(GenerationOutput::Images(images))
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("sdxl: generator returned no output".into()))
     }
 }
 
@@ -888,11 +1161,13 @@ fn plain_descriptor() -> ModelDescriptor {
             // LoadSpec `quant` overlay is an advisory no-op on an already-packed tier (as with
             // boogu/flux2-dev). bf16 tiers stay dense (Quant::None), verbatim.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            supported_guidance_methods: vec!["cfg", "cfg_pp"],
             // Per-step latent previews (epic 16948, sc-16954): every shipped SDXL render lane
             // emits -- the curated driver lane and the bespoke Lightning loop on this registered
             // route, plus the name-driven edit / IP-Adapter providers. `crate::preview` reuses the
             // epic-16624 four-channel fit; the trainer's sample render stays deliberately dark.
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -1008,7 +1283,12 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry.register_generator(REGISTRATION);
+    let registry = registry
+        .register_generator(REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_sdxl,
+        });
     register_memory_contract_surfaces(registry)
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
@@ -1777,5 +2057,167 @@ mod tests {
             ..request.clone()
         };
         assert!(!qualified_replay_route(&changed, &identity(), None));
+    }
+
+    #[test]
+    fn sdxl_curated_shared_driver_render_plan_and_eng5_refusals() {
+        let registry = provider_registry().expect("candle sdxl provider registry");
+        let spec = sdxl_spec(WeightsSource::Dir("/nonexistent/sdxl".into()));
+        let all_features = registry.all_route_feature_applicability();
+        assert!(
+            all_features[MODEL_ID]["low_res_start"].applicable,
+            "sdxl curated route must advertise low_res_start"
+        );
+
+        let req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(7),
+            steps: Some(8),
+            guidance: Some(7.0),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &req)
+            .expect("compile sdxl render plan")
+            .expect("curated sdxl request produces a RenderPlan");
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.output_size(), (1024, 1024));
+        assert_eq!(plan.denoise_spans(), vec![0..4, 4..8]);
+        let report = plan
+            .low_res_start_execution_report("f16", 4, "base_unet")
+            .expect("low_res_start execution report")
+            .expect("report present");
+        assert_eq!((report.low_width, report.low_height), (512, 512));
+        assert_eq!((report.full_width, report.full_height), (1024, 1024));
+        assert_eq!(report.k, 4);
+        assert_eq!(report.executed_steps, 8);
+
+        // Plain single-source img2img (`source_image`) compiles with phase-0 reduced grid and sliced schedule.
+        let img2img_req = GenerationRequest {
+            source_image: Some(Image {
+                width: 64,
+                height: 64,
+                pixels: vec![128; 64 * 64 * 3],
+            }),
+            strength: Some(0.5),
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..req.clone()
+        };
+        let img2img_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &img2img_req)
+            .expect("compile sdxl img2img render plan")
+            .expect("curated sdxl img2img produces a RenderPlan");
+        assert_eq!(img2img_plan.phase_output_size(0), (512, 512));
+        assert_eq!(img2img_plan.output_size(), (1024, 1024));
+        assert_eq!(img2img_plan.denoise_spans(), vec![0..2, 2..4]);
+
+        // CFG++ (`cfg_pp`) compiles with EndpointEvaluation.
+        let cfgpp_req = GenerationRequest {
+            guidance_method: Some("cfg_pp".into()),
+            ..req.clone()
+        };
+        let cfgpp_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &cfgpp_req)
+            .expect("compile sdxl cfg_pp render plan")
+            .expect("curated sdxl cfg_pp produces a RenderPlan");
+        assert_eq!(cfgpp_plan.denoise_spans(), vec![0..4, 4..8]);
+
+        // Verify transition_clean_estimate_f32 over DiscreteModelSampling::sdxl (4ch 8x8 unpacked).
+        let low_res_plan = *plan.low_res_start().unwrap();
+        let sigma_k = plan.denoise_sigmas()[low_res_plan.k];
+        let sched = pipeline::sdxl_alpha_schedule().unwrap();
+        let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+        let low_latent = vec![0.25f32; 4 * 64 * 64];
+        let transitioned = gen_core::transition_clean_estimate_f32(
+            gen_core::BoundaryState::CleanEstimate {
+                latent: &low_latent,
+                source: gen_core::EstimateSource::EndpointEvaluation,
+            },
+            1,
+            4,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            plan.base_seed(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(transitioned.len(), 4 * 128 * 128);
+        assert!(transitioned.iter().all(|v| v.is_finite()));
+
+        // ENG-5 refusal: distilled `lightning` sampler refuses `low_res_start`.
+        let mut lightning_req = req.clone();
+        lightning_req.sampler = Some("lightning".into());
+        lightning_req.scheduler = None;
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &lightning_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // ENG-5 refusal: `"discrete"` schedule refuses `low_res_start`.
+        let mut discrete_req = req.clone();
+        discrete_req.scheduler = Some("discrete".into());
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &discrete_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // ENG-5 refusal: ControlNet / IP-Adapter / InstantID load specs refuse `low_res_start`.
+        let mut ip_spec = spec.clone();
+        ip_spec.ip_adapter = Some(WeightsSource::File("/nonexistent/ip.safetensors".into()));
+        let mut id_spec = spec.clone();
+        id_spec.identity = Some(gen_core::IdentityWeights {
+            encoder: Some(WeightsSource::File("/nonexistent/ip.safetensors".into())),
+            eva: Some(WeightsSource::File("/nonexistent/eva.safetensors".into())),
+            face_dir: Some(WeightsSource::Dir("/nonexistent/antelopev2".into())),
+        });
+        for eng5_spec in [
+            spec.clone()
+                .with_control(WeightsSource::Dir("/nonexistent/control".into())),
+            ip_spec,
+            id_spec,
+        ] {
+            assert!(matches!(
+                registry.compile_render_plan(MODEL_ID, &eng5_spec, &req),
+                Err(gen_core::Error::Unsupported(_))
+            ));
+        }
+
+        // ENG-5 refusal: Control / Mask conditioning refuses `low_res_start`.
+        let mut control_req = req.clone();
+        control_req.conditioning = vec![Conditioning::Control {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 3],
+            },
+            kind: gen_core::ControlKind::Canny,
+            scale: Some(0.8),
+        }];
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &control_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        let mut mask_req = req.clone();
+        mask_req.conditioning = vec![Conditioning::Mask {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![255; 64 * 64 * 3],
+            },
+        }];
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &mask_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
     }
 }

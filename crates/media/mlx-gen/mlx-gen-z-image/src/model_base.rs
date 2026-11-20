@@ -25,16 +25,14 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, ConditioningKind,
-    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec,
-    Modality, ModelDescriptor, Progress, Quant, Residency, Result,
+    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind,
+    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
+    ModelDescriptor, Progress, Quant, Residency, Result,
 };
-use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma};
+use mlx_gen_pid::resolve_pid_decoder_at_sigma;
 
 use crate::model::{validate_request, ZImageHeavyOwned};
-use crate::pipeline::{
-    self, denoise_cfg_with_progress_preview_and_pag, encode_init_latents, init_time_step,
-};
+use crate::pipeline::{self, encode_init_latents, init_time_step};
 use crate::text_encoder::TextEncoder;
 
 /// Base Z-Image default steps — undistilled foundation model. The card recommends 28–50; 50 matches
@@ -107,6 +105,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             pag: Some(base_pag_capability()),
             ..Default::default()
         },
@@ -179,14 +178,10 @@ impl Generator for ZImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_report_impl(req, on_progress)
-                .map_err(Into::<gen_core::Error>::into)?
-                .output
-                .ok_or_else(|| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
-                })
-        })
+        let plan = crate::model::compile_base_trajectory(req)?;
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output")))
     }
 
     fn generate_with_report(
@@ -194,15 +189,37 @@ impl Generator for ZImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_report_impl(req, on_progress)
-                .map_err(Into::into)
-        })
+        let plan = crate::model::compile_base_trajectory(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
     }
 
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let plan = crate::model::compile_base_trajectory(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.render_planned(req, plan, scope, on_progress)
+                .map_err(Into::into)
+        })
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::image_execution::complete_image_report_attempt(
@@ -215,7 +232,7 @@ impl Generator for ZImage {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_report_impl(req, &mut progress)
+                self.render_planned(req, plan, scope, &mut progress)
                     .map_err(Into::into)
             },
         )
@@ -246,32 +263,40 @@ impl Generator for ZImage {
 }
 
 impl ZImage {
-    /// The rich-`Result` body behind [`Generator::generate`].
+    /// The rich-`Result` body behind [`Generator::generate`] and [`Generator::generate_planned`].
     ///
     /// The staged residency lifecycle (encode cond+uncond → drop the text encoder under `Sequential`
     /// → load the DiT/VAE/PiD → denoise/decode → free the heavy bundle) is driven by the shared
-    /// [`Residency::run`] seam (sc-11124), which owns the eval/drop/clear discipline, the
-    /// stage-boundary cancel checks, and the error-safe cache flush — identically to the Turbo
-    /// flagship. Base delta vs Turbo: real CFG (a negative-prompt uncond branch) and no bf16 cap cast.
-    fn generate_report_impl(
+    /// [`Residency::run_staged_request_scoped`] seam (sc-11124) and [`gen_core::RenderRun`] (`SW-6947`).
+    /// Base delta vs Turbo: real CFG (a negative-prompt uncond branch) and no bf16 cap cast.
+    fn render_planned(
         &self,
         req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
 
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed = run.plan().base_seed();
         // Real CFG: the request's `guidance` is the classifier-free guidance scale; default 4.0. A
         // value of 1.0 turns CFG off (single cond forward, Turbo-equivalent cost).
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let guidance = run.plan().guidance();
         let cfg_on = guidance != 1.0;
 
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         let reference = pipeline::resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
-            Some((_, strength)) => init_time_step(steps, strength),
+            Some((_, strength)) => {
+                if req.low_res_start.is_some() {
+                    gen_core::resolve_img2img_init_time_step(steps, strength)?
+                } else {
+                    init_time_step(steps, strength)
+                }
+            }
             None => 0,
         };
         let is_img2img = start_step > 0;
@@ -307,35 +332,32 @@ impl ZImage {
             // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
             // encoder's native precision and let the DiT promote per-op against the bf16 weights.
             |text_encoder: &TextEncoder| {
-                // Calibration-only fault injection at a physical phase boundary (SC-15449);
-                // `None` for every production request, so this is a `None` comparison.
-                pipeline::calibration_fault(
-                    req,
-                    mlx_gen::gen_core::MemoryPhase::Conditioning,
-                    MODEL_ID,
-                )?;
-                let cap = pipeline::encode_prompt(
-                    &self.tokenizer,
-                    text_encoder,
-                    &req.prompt,
-                    MODEL_ID,
-                    encoder_window,
-                )?;
-                // Uncond conditioning = the negative prompt (empty string when unset), encoded only
-                // when CFG is active. Empty prompt is valid for the negative branch (the
-                // unconditional embedding).
-                let neg_cap = if cfg_on {
-                    let neg = req.negative_prompt.as_deref().unwrap_or("");
-                    Some(pipeline::encode_uncond(
+                run.encode(|| {
+                    pipeline::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Conditioning,
+                        MODEL_ID,
+                    )?;
+                    let cap = pipeline::encode_prompt(
                         &self.tokenizer,
                         text_encoder,
-                        neg,
+                        &req.prompt,
+                        MODEL_ID,
                         encoder_window,
-                    )?)
-                } else {
-                    None
-                };
-                Ok((cap, neg_cap))
+                    )?;
+                    let neg_cap = if cfg_on {
+                        let neg = req.negative_prompt.as_deref().unwrap_or("");
+                        Some(pipeline::encode_uncond(
+                            &self.tokenizer,
+                            text_encoder,
+                            neg,
+                            encoder_window,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((cap, neg_cap))
+                })
             },
             // Materialize cap (+neg_cap) while the encoder is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated output keeps the encoder referenced through the graph and the
@@ -352,33 +374,13 @@ impl ZImage {
             },
             // ── Phase B (denoise): heavy bundle + (cap, neg_cap) → (evaluated latents, PiD decoder).
             |heavy: &ZImageHeavyOwned, (cap, neg_cap), on_progress| {
+                run.begin_rendering()?;
                 pipeline::calibration_fault(
                     req,
                     mlx_gen::gen_core::MemoryPhase::Denoise,
                     MODEL_ID,
                 )?;
-                // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
-                // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
-                // over `shift=6.0`.
-                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let resolved_sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-                    req.scheduler.as_deref(),
-                    req.scheduler_shift,
-                    SCHEDULE_SHIFT.ln(),
-                    steps,
-                    &native.sigmas,
-                )?;
-                // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): mint a
-                // decoder when `use_pid` is set AND a PiD overlay was loaded, else `None` → the native
-                // VAE (errors loudly if requested without one). Z-Image base is flow-match
-                // (`vp_frame=false`), so the schedule σ *is* the degrade σ: `flow_capture_for_request`
-                // folds a `pid_capture_sigma` ceiling + schedule into `(capture_sigma, keep)` — mint
-                // the decoder at `capture_sigma` and build the scheduler over the *truncated*
-                // `resolved_sigmas[..keep]` (the img2img blend still reads `sigmas[start_step]`, valid
-                // since `keep > start_step`). The clean path yields `(0.0, len())` → full schedule,
-                // σ=0, byte-identical. `start_step` is the img2img noise-blend offset.
-                let (capture_sigma, keep) =
-                    flow_capture_for_request(req, &resolved_sigmas, start_step);
+                let capture_sigma = run.plan().capture_sigma();
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy.pid.as_ref(),
                     req,
@@ -386,46 +388,39 @@ impl ZImage {
                     MODEL_ID,
                     capture_sigma,
                 )?;
-                let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
 
-                // VAE-encode the init image once (constant across the count loop — only the noise
-                // varies).
+                // VAE-encode the init image once at Phase-0 output dimensions.
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
-                    Some(encode_init_latents(
-                        &heavy.vae, image, req.width, req.height,
-                    )?)
+                    let (init_w, init_h) = run.plan().phase_output_size(0);
+                    Some(encode_init_latents(&heavy.vae, image, init_w, init_h)?)
                 } else {
                     None
                 };
 
                 let sampler_name = req.sampler.as_deref();
+                let sigmas = run.plan().denoise_sigmas();
+                let spans = run.plan().denoise_spans();
                 let neg_cap_ref = neg_cap.as_ref();
                 let resolved_pag_ref = resolved_pag.as_ref();
-                let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
-                let actual_steps = scheduler
-                    .sigmas
-                    .len()
-                    .saturating_sub(1)
-                    .saturating_sub(start) as u32;
-                let latents = pipeline::denoise_batch(
-                    &scheduler,
+                let actual_steps = run.plan().executed_steps() as u32;
+                let latents = pipeline::denoise_batch_planned(
+                    &run,
+                    req.count,
                     clean.as_ref(),
-                    start_step,
-                    base_seed,
-                    req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_cfg_with_progress_preview_and_pag(
+                        pipeline::denoise_cfg_planned(
                             &heavy.transformer,
-                            &scheduler,
+                            sigmas,
+                            &spans,
+                            Some(&run),
                             sampler_name,
                             seed,
                             latents,
                             &cap,
                             neg_cap_ref,
                             guidance,
-                            start_step,
                             attention_budget,
                             block_window,
                             &req.cancel,
@@ -441,23 +436,33 @@ impl ZImage {
             |mid| Ok(mlx_rs::transforms::eval(mid.0.iter())?),
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder, actual_steps), on_progress| {
-                pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
-                let decoder: &dyn LatentDecoder = pid_decoder
-                    .as_ref()
-                    .map(|d| d as &dyn LatentDecoder)
-                    .unwrap_or(view.vae);
-                let images = pipeline::decode_batch(
-                    decoder,
-                    tiling.as_ref(),
-                    latents,
-                    &req.cancel,
-                    on_progress,
-                )?;
-                let mut report =
-                    gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
-                report.pag = resolved_pag
-                    .as_ref()
-                    .map(|resolved| resolved.execution_report(actual_steps));
+                let report = run.decode_phase(|| -> Result<_> {
+                    pipeline::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Decode,
+                        MODEL_ID,
+                    )?;
+                    let decoder: &dyn LatentDecoder = pid_decoder
+                        .as_ref()
+                        .map(|d| d as &dyn LatentDecoder)
+                        .unwrap_or(view.vae);
+                    let images = pipeline::decode_batch(
+                        decoder,
+                        tiling.as_ref(),
+                        latents,
+                        &req.cancel,
+                        on_progress,
+                    )?;
+                    let mut report =
+                        gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+                    report.pag = resolved_pag
+                        .as_ref()
+                        .map(|resolved| resolved.execution_report(actual_steps));
+                    report.low_res_start =
+                        plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                    Ok(report)
+                })?;
+                run.finish_rendering();
                 Ok(report)
             },
         )?;

@@ -200,6 +200,44 @@ pub(crate) fn hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::new(sink, project_frame_latents)
 }
 
+/// Plan-aware preview hook that validates the `[1, 16, 1, h, w]` latent grid against the plan's
+/// phase-0 or final output dimensions before projecting to RGB (`SW-6947`).
+#[allow(dead_code)]
+pub(crate) fn hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    plan: &'a candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    PreviewHook::new(sink, move |latents| {
+        let dims = latents.dims();
+        if dims.len() != 5
+            || dims[0] != 1
+            || dims[1] != PREVIEW_LATENT_CHANNELS
+            || dims[LATENT_FRAME_AXIS] != 1
+            || dims[3] == 0
+            || dims[4] == 0
+        {
+            return Err(CandleError::Msg(format!(
+                "z-image preview latent must have shape [1, {PREVIEW_LATENT_CHANNELS}, 1, h, w], got {dims:?}"
+            )));
+        }
+        let (h, w) = (dims[3] as u32, dims[4] as u32);
+        let (p0_w, p0_h) = plan.phase_output_size(0);
+        let (full_w, full_h) = plan.output_size();
+        let matches_phase0 = (w, h) == (p0_w / 8, p0_h / 8);
+        let matches_full = (w, h) == (full_w / 8, full_h / 8);
+        if !matches_phase0 && !matches_full {
+            return Err(CandleError::Msg(format!(
+                "z-image preview latent ({w}x{h}) does not match phase-0 ({}x{}) or full ({}x{}) latent grid",
+                p0_w / 8,
+                p0_h / 8,
+                full_w / 8,
+                full_h / 8
+            )));
+        }
+        project_frame_latents(latents)
+    })
+}
+
 /// The frame counter a **bespoke** Z-Image loop numbers against: the three distilled-Turbo lanes
 /// (control staged, control resident, img2img/edit) walk `for step in 0..n` with the scheduler's own
 /// Euler step rather than driving a shared sampler, so there is no driver to build the counter for
@@ -974,6 +1012,10 @@ mod tests {
     /// them to the advertised `supports_preview`.
     #[test]
     fn every_shipped_render_lane_emits_a_preview() {
+        const DRIVERS: &[(&str, usize, usize)] = &[
+            ("run_flow_sampler(", SAMPLER_ARITY, PREVIEW_ARGUMENT),
+            ("run_flow_sampler_spans(", 12, 10),
+        ];
         for (file, source, hooked, direct, step_index) in [
             (
                 "pipeline.rs",
@@ -985,28 +1027,29 @@ mod tests {
             ("control.rs", include_str!("control.rs"), 2, 2, "step_i"),
             ("edit.rs", include_str!("edit.rs"), 0, 1, "step_i - start"),
         ] {
-            let sites = call_sites(file, &format!("{DRIVER}("), source);
-            assert_eq!(
-                sites.len(),
-                hooked,
-                "{file}: expected exactly {hooked} sampler call sites, found {}. A new render route \
-                 must pass a preview hook and be named in this inventory (and in the catalog's).",
-                sites.len()
-            );
-            for (index, args) in sites.iter().enumerate() {
-                assert_eq!(
-                    args.len(),
-                    SAMPLER_ARITY,
-                    "{file}: {DRIVER} #{index} expected {SAMPLER_ARITY} arguments, parsed {args:?}"
-                );
-                // Positional, not `contains`: the preview is a specific argument, so this cannot be
-                // satisfied by the word appearing anywhere else in the call.
-                assert_eq!(
-                    args[PREVIEW_ARGUMENT].as_str(),
-                    "Some(&preview)",
-                    "{file}: {DRIVER} #{index} does not pass a preview hook: {args:?}"
-                );
+            let mut total_sites = 0usize;
+            for &(driver_call, arity, preview_arg) in DRIVERS {
+                let sites = call_sites(file, driver_call, source);
+                total_sites += sites.len();
+                for (index, args) in sites.iter().enumerate() {
+                    assert_eq!(
+                        args.len(),
+                        arity,
+                        "{file}: {driver_call} #{index} expected {arity} arguments, parsed {args:?}"
+                    );
+                    assert_eq!(
+                        args[preview_arg].as_str(),
+                        "Some(&preview)",
+                        "{file}: {driver_call} #{index} does not pass a preview hook: {args:?}"
+                    );
+                }
             }
+            assert_eq!(
+                total_sites,
+                hooked,
+                "{file}: expected exactly {hooked} sampler call sites, found {total_sites}. A new render route \
+                 must pass a preview hook and be named in this inventory (and in the catalog's).",
+            );
 
             let emissions = call_sites(file, EMIT, source);
             assert_eq!(

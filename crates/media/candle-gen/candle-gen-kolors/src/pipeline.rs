@@ -393,6 +393,7 @@ impl Pipeline {
         &self,
         req: &GenerationRequest,
         components: &Components,
+        mut run: Option<&mut gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         ensure_not_cancelled(req)?;
@@ -407,9 +408,13 @@ impl Pipeline {
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
+        let (init_w, init_h) = match run.as_deref() {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (w, h),
+        };
         let img2img = resolve_reference(req)?;
         let init_latents = match img2img {
-            Some((image, _)) => Some(self.encode_reference(components, image, w, h)?),
+            Some((image, _)) => Some(self.encode_reference(components, image, init_w, init_h)?),
             None => None,
         };
 
@@ -441,19 +446,25 @@ impl Pipeline {
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
         // order); without guidance only the positive branch is built. The ChatGLM3 encode stays local
         // (it threads `components`); the shared helper owns only the identical CFG-concat convention.
-        let (context, pooled, batch) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let (context, pooled, batch) = common::cfg_batch_context(
-                    &req.prompt,
-                    negative,
-                    use_guide,
-                    common::resolve_cfg_batching(req),
-                    |p| self.encode(components, p),
-                )?;
-                Ok((context, pooled, batch))
-            },
-        )?;
+        let mut encode_prompt = || {
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (context, pooled, batch) = common::cfg_batch_context(
+                        &req.prompt,
+                        negative,
+                        use_guide,
+                        common::resolve_cfg_batching(req),
+                        |p| self.encode(components, p),
+                    )?;
+                    Ok((context, pooled, batch))
+                },
+            )
+        };
+        let (context, pooled, batch) = match run {
+            Some(ref mut run) => run.encode(&mut encode_prompt)?,
+            None => encode_prompt()?,
+        };
         let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
 
         // The Kolors `encoder_hid_proj` (ChatGLM3 4096 → cross-attention 2048) is step-invariant, so
@@ -462,12 +473,19 @@ impl Pipeline {
         // `KolorsUNet::forward_projected`.
         let encoder_hidden_states = components.unet.project_context(&context)?;
 
-        let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
+        let run = run.as_deref();
+        if let Some(run) = run {
+            run.begin_rendering().map_err(CandleError::from)?;
+        }
+        let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
         let total = sampler.num_steps() as u32;
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // A cancellation raised during prompt/reference setup must be observed even when this
             // image's strength selects an empty denoise schedule.
             ensure_not_cancelled(req)?;
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+            }
             let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
 
             let latents = if let Some(name) = curated {
@@ -485,6 +503,7 @@ impl Pipeline {
                     use_guide,
                     guidance,
                     seed,
+                    run,
                     on_progress,
                 )?
             } else {
@@ -536,13 +555,28 @@ impl Pipeline {
                 }
                 latents
             };
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()
+                    .map_err(CandleError::from)?;
+            }
 
             // Zero-strength img2img executes no denoise iteration on either route, so this explicit
             // checkpoint is the final guard against decoding a canceled request.
             ensure_not_cancelled(req)?;
-            on_progress(Progress::Decoding);
-            common::decode(&components.vae, pid_decoder.as_ref(), &latents)
-        })
+            let mut do_decode = || {
+                on_progress(Progress::Decoding);
+                common::decode(&components.vae, pid_decoder.as_ref(), &latents)
+            };
+            if let Some(run) = run {
+                run.decode_phase(&mut do_decode)
+            } else {
+                do_decode()
+            }
+        })?;
+        if let Some(run) = run {
+            run.finish_rendering();
+        }
+        Ok(images)
     }
 
     /// Request-authoritative staged execution.  The conditioning tower, denoiser, and decoder are
@@ -553,6 +587,7 @@ impl Pipeline {
     pub(crate) fn render_staged(
         &self,
         req: &GenerationRequest,
+        mut run: Option<&mut gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         ensure_not_cancelled(req)?;
@@ -567,6 +602,10 @@ impl Pipeline {
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
+        let (init_w, init_h) = match run.as_deref() {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (w, h),
+        };
         let img2img = resolve_reference(req)?;
 
         // Edit's latent-init phase precedes ChatGLM and does not retain the VAE encoder once the
@@ -574,7 +613,7 @@ impl Pipeline {
         let init_latents = match img2img {
             Some((image, _)) => {
                 let encoder = SynchronizedPhase::new(self.load_vae_encoder()?, self.device.clone());
-                let latents = self.encode_reference_with(&encoder, image, w, h)?;
+                let latents = self.encode_reference_with(&encoder, image, init_w, init_h)?;
                 encoder.release()?;
                 Some(latents)
             }
@@ -583,22 +622,32 @@ impl Pipeline {
 
         ensure_not_cancelled(req)?;
         let conditioner = SynchronizedPhase::new(self.load_conditioner()?, self.device.clone());
-        let (context, pooled, batch) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let (context, pooled, batch) = common::cfg_batch_context(
-                    &req.prompt,
-                    negative,
-                    use_guide,
-                    common::resolve_cfg_batching(req),
-                    |prompt| self.encode_with(&conditioner.0, &conditioner.1, prompt),
-                )?;
-                Ok((context, pooled, batch))
-            },
-        )?;
+        let mut encode_prompt = || {
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (context, pooled, batch) = common::cfg_batch_context(
+                        &req.prompt,
+                        negative,
+                        use_guide,
+                        common::resolve_cfg_batching(req),
+                        |prompt| self.encode_with(&conditioner.0, &conditioner.1, prompt),
+                    )?;
+                    Ok((context, pooled, batch))
+                },
+            )
+        };
+        let (context, pooled, batch) = match run {
+            Some(ref mut run) => run.encode(&mut encode_prompt)?,
+            None => encode_prompt()?,
+        };
         let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
         conditioner.release()?;
 
+        let run = run.as_deref();
+        if let Some(run) = run {
+            run.begin_rendering().map_err(CandleError::from)?;
+        }
         ensure_not_cancelled(req)?;
         let unet = SynchronizedPhase::new(self.load_unet()?, self.device.clone());
         let encoder_hidden_states = unet.project_context(&context)?;
@@ -609,11 +658,14 @@ impl Pipeline {
             None => KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?,
         };
         let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
-        let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
+        let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
         let total = sampler.num_steps() as u32;
         let mut latents = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             ensure_not_cancelled(req)?;
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+            }
             let seed = base_seed.wrapping_add(u64::from(index));
             candle_gen::execution::draw("image_initial_noise", seed, index as usize);
             let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
@@ -632,6 +684,7 @@ impl Pipeline {
                     use_guide,
                     guidance,
                     seed,
+                    run,
                     on_progress,
                 )?
             } else {
@@ -676,6 +729,10 @@ impl Pipeline {
                 }
                 current
             };
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()
+                    .map_err(CandleError::from)?;
+            }
             latents.push(rendered);
         }
         unet.release()?;
@@ -695,11 +752,22 @@ impl Pipeline {
         for (output_index, latent) in latents.iter().enumerate() {
             candle_gen::execution::output_index(output_index);
             ensure_not_cancelled(req)?;
-            on_progress(Progress::Decoding);
-            images.push(common::decode(&decoder.0, pid_decoder.as_ref(), latent)?);
+            let mut do_decode = || {
+                on_progress(Progress::Decoding);
+                common::decode(&decoder.0, pid_decoder.as_ref(), latent)
+            };
+            let decoded = if let Some(run) = run {
+                run.decode_phase(&mut do_decode)?
+            } else {
+                do_decode()?
+            };
+            images.push(decoded);
         }
         drop(pid_decoder);
         decoder.release()?;
+        if let Some(run) = run {
+            run.finish_rendering();
+        }
         Ok(images)
     }
 
@@ -731,6 +799,7 @@ impl Pipeline {
         use_guide: bool,
         guidance: f32,
         seed: u64,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         self.denoise_curated_with_unet(
@@ -747,6 +816,7 @@ impl Pipeline {
             use_guide,
             guidance,
             seed,
+            run,
             on_progress,
         )
     }
@@ -767,6 +837,7 @@ impl Pipeline {
         use_guide: bool,
         guidance: f32,
         seed: u64,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
@@ -781,42 +852,83 @@ impl Pipeline {
         // not restructured and the driver owns frame numbering plus the multi-eval dedup. `ve_hook`
         // because the running latent here is raw k-diffusion VE sigma-space. Built per image: the
         // driver starts a fresh counter per call.
-        let preview = crate::preview::ve_hook(&req.preview);
-        let out = candle_gen::run_curated_sampler(
-            Some(sampler),
-            &setup.model_sampling,
-            &setup.sigmas,
-            setup.prior,
-            seed,
-            &req.cancel,
-            on_progress,
-            Some(&preview),
-            |x_in, t| -> Result<Tensor> {
-                // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
-                // index the UNet embeds. CFG batches/combines exactly like the native leading-Euler path.
-                let model_in = if use_guide {
-                    Tensor::cat(&[x_in, x_in], 0)?
+        let preview = match run {
+            Some(run) => crate::preview::ve_hook_for_plan(&req.preview, run.plan()),
+            None => crate::preview::ve_hook(&req.preview),
+        };
+        let mut predict = |x_in: &Tensor, t: f32| -> Result<Tensor> {
+            // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
+            // index the UNet embeds. CFG batches/combines exactly like the native leading-Euler path.
+            let model_in = if use_guide {
+                Tensor::cat(&[x_in, x_in], 0)?
+            } else {
+                x_in.clone()
+            };
+            let eps = unet.forward_projected(
+                &model_in,
+                t as f64,
+                encoder_hidden_states,
+                pooled,
+                time_ids,
+            )?;
+            let eps = if use_guide {
+                let ch = eps.chunk(2, 0)?;
+                let (uncond, cond) = (&ch[0], &ch[1]);
+                (uncond + ((cond - uncond)? * guidance as f64)?)?
+            } else {
+                eps
+            };
+            // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
+            Ok(eps.to_dtype(DType::F32)?)
+        };
+        let out = match run {
+            Some(run) => {
+                let (run_sigmas, spans) = if init_latents.is_some() {
+                    let spans = match run.plan().low_res_start() {
+                        Some(low_res) if low_res.k > 0 => {
+                            let p0 = low_res.k.min(setup.sigmas.len().saturating_sub(1));
+                            if p0 < setup.sigmas.len().saturating_sub(1) {
+                                vec![0..p0, p0..setup.sigmas.len().saturating_sub(1)]
+                            } else {
+                                std::iter::once(0..setup.sigmas.len().saturating_sub(1)).collect()
+                            }
+                        }
+                        _ => std::iter::once(0..setup.sigmas.len().saturating_sub(1)).collect(),
+                    };
+                    (setup.sigmas.as_slice(), spans)
                 } else {
-                    x_in.clone()
+                    (
+                        run.plan().denoise_sigmas(),
+                        run.plan().denoise_spans().to_vec(),
+                    )
                 };
-                let eps = unet.forward_projected(
-                    &model_in,
-                    t as f64,
-                    encoder_hidden_states,
-                    pooled,
-                    time_ids,
-                )?;
-                let eps = if use_guide {
-                    let ch = eps.chunk(2, 0)?;
-                    let (uncond, cond) = (&ch[0], &ch[1]);
-                    (uncond + ((cond - uncond)? * guidance as f64)?)?
-                } else {
-                    eps
-                };
-                // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
-                Ok(eps.to_dtype(DType::F32)?)
-            },
-        )?;
+                candle_gen::sampler::run_curated_sampler_spans(
+                    Some(sampler),
+                    &setup.model_sampling,
+                    run_sigmas,
+                    &spans,
+                    Some(run),
+                    false,
+                    setup.prior,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview),
+                    &mut predict,
+                )?
+            }
+            None => candle_gen::run_curated_sampler(
+                Some(sampler),
+                &setup.model_sampling,
+                &setup.sigmas,
+                setup.prior,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                &mut predict,
+            )?,
+        };
         // The shared `decode` consumes the compute dtype (f32 for Kolors), like the native latents.
         Ok(out.to_dtype(DType::F32)?)
     }
@@ -976,7 +1088,7 @@ fn ensure_not_cancelled(req: &GenerationRequest) -> Result<()> {
 
 /// Resolve Kolors' one latent-init reference. Per-reference strength wins over the request-level
 /// value, then the diffusers default (0.3); more than one reference is unsupported and fails closed.
-fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
+pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
     const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
     let mut reference = None;
     for conditioning in &req.conditioning {
@@ -990,6 +1102,16 @@ fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
                 image,
                 strength
                     .or(req.strength)
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+                    .clamp(0.0, 1.0),
+            ));
+        }
+    }
+    if reference.is_none() {
+        if let Some(source) = req.source_image.as_ref() {
+            reference = Some((
+                source,
+                req.strength
                     .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
                     .clamp(0.0, 1.0),
             ));
