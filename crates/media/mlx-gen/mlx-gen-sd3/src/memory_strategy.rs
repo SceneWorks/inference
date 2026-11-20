@@ -597,6 +597,60 @@ pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<T
     )
 }
 
+/// Price the reduced-grid plain single-source `img2img` live-set plan with `low_res_start` for
+/// any SD3.5 variant (`sd3_5_large`, `sd3_5_large_turbo`, `sd3_5_medium`) (`§6.13`, `M3`, `SW-6946`).
+///
+/// Accounts for:
+/// - raw source RGB8 pixel buffer (`source_width * source_height * 3` B)
+/// - fitted phase-0 normalized float32 input (`low_width * low_height * 3 * 4` B)
+/// - VAE encode workspace at the phase-0 grid
+/// - retained clean initial latent at the phase-0 grid (`16 * (low_h / 8) * (low_w / 8) * 4` B)
+/// - seeded phase-0 noise + blend buffers at full-pass `sigmas[start_step]`
+/// - phase-0 first forward at `(low_width, low_height)`
+/// - node-`start_step + K` 6-buffer fp32 transition ceiling to `(full_width, full_height)`
+pub fn price_sd3_low_res_img2img_live_set_plan(
+    contract: &MemoryProviderContract,
+    low_res_plan: &mlx_gen::gen_core::ResolvedLowResStartPlan,
+    source_width: u32,
+    source_height: u32,
+    full_sigmas: &[f32],
+    start_step: usize,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::memory_strategy::LowResImg2ImgInitCodecPricing> {
+    provider_static(&contract.provider_id)?;
+    let facts = contract.asset_facts;
+    let cond_weights = facts.conditioning_bytes.max(1024 * 1024 * 1024);
+    let vae_weights = facts.decoder_bytes.max(160 * 1024 * 1024);
+    let dit_weights = facts.transformer_bytes.max(3 * 1024 * 1024 * 1024);
+    let low_area =
+        u64::from(low_res_plan.low_width).saturating_mul(u64::from(low_res_plan.low_height));
+    let full_area =
+        u64::from(low_res_plan.full_width).saturating_mul(u64::from(low_res_plan.full_height));
+    let vae_encode_workspace_bytes = low_area.saturating_mul(256).max(32 * 1024 * 1024);
+    let phase0_first_forward_workspace_bytes = low_area.saturating_mul(768).max(128 * 1024 * 1024);
+    let phase1_forward_workspace_bytes = full_area.saturating_mul(768).max(384 * 1024 * 1024);
+    let decode_workspace_bytes = full_area.saturating_mul(384).max(96 * 1024 * 1024);
+
+    mlx_gen::gen_core::memory_strategy::price_low_res_img2img_request_live_set_plan(
+        mlx_gen::gen_core::memory_strategy::MemoryBudgetDomain::UnifiedMemory,
+        low_res_plan,
+        source_width,
+        source_height,
+        1,
+        16,
+        8,
+        cond_weights,
+        vae_weights,
+        vae_encode_workspace_bytes,
+        dit_weights,
+        phase0_first_forward_workspace_bytes,
+        phase1_forward_workspace_bytes,
+        vae_weights,
+        decode_workspace_bytes,
+        full_sigmas,
+        start_step,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

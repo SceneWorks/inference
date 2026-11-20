@@ -209,6 +209,36 @@ pub(crate) fn hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::new(sink, project_latents)
 }
 
+/// Phase-aware preview hook for a compiled [`candle_gen::gen_core::RenderPlan`] (`SW-6946`).
+///
+/// Validates that the incoming `[1, 16, h, w]` latent matches either phase 0's reduced grid
+/// `(p0_w / 8, p0_h / 8)` or the final target grid `(full_w / 8, full_h / 8)` before projecting
+/// to RGB.
+pub fn hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    let (p0_w, p0_h) = plan.phase_output_size(0);
+    let (full_w, full_h) = plan.output_size();
+    PreviewHook::new(sink, move |latents| {
+        check_layout(latents)?;
+        let dims = latents.dims();
+        let (h, w) = (dims[2] as u32, dims[3] as u32);
+        let matches_phase0 = (w, h) == (p0_w / 8, p0_h / 8);
+        let matches_full = (w, h) == (full_w / 8, full_h / 8);
+        if !matches_phase0 && !matches_full {
+            return Err(CandleError::Msg(format!(
+                "SD3.5 preview latent ({w}x{h}) does not match phase-0 ({}x{}) or full ({}x{}) latent grid",
+                p0_w / 8,
+                p0_h / 8,
+                full_w / 8,
+                full_h / 8
+            )));
+        }
+        project_latents(latents)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

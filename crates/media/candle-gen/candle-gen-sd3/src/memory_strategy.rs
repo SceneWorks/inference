@@ -1270,6 +1270,12 @@ struct RequestBinding {
 impl RequestBinding {
     fn from_request(request: &GenerationRequest) -> Self {
         let mut conditioning = Sha256::new();
+        if let Some(image) = &request.source_image {
+            update_framed(&mut conditioning, b"source_image");
+            update_framed(&mut conditioning, &image.width.to_le_bytes());
+            update_framed(&mut conditioning, &image.height.to_le_bytes());
+            update_framed(&mut conditioning, &image.pixels);
+        }
         for item in &request.conditioning {
             match item {
                 gen_core::Conditioning::Reference { image, strength } => {
@@ -1436,6 +1442,10 @@ impl AdmissionRegistry {
         }
         active.consumed = true;
         Ok(())
+    }
+
+    pub fn consume_for_generate(&self, request: &GenerationRequest) -> gen_core::Result<()> {
+        self.consume(request)
     }
 
     fn finish(&self, token: u64) -> gen_core::Result<()> {
