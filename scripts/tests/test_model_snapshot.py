@@ -826,6 +826,14 @@ class RunnerHubCacheTests(unittest.TestCase):
                 self.assertEqual(
                     github_env.read_text(encoding="utf-8"), f"TEST_MODEL_DIR={expected}\n"
                 )
+                # One materialization can feed several consumer variables.
+                github_env.write_text("", encoding="utf-8")
+                argv.extend(["--export", "SECOND_NAME"])
+                self.assertEqual(ensure_model_snapshot.main(), 0)
+                self.assertEqual(
+                    github_env.read_text(encoding="utf-8"),
+                    f"TEST_MODEL_DIR={expected}\nSECOND_NAME={expected}\n",
+                )
                 # A second run finds the complete snapshot and transfers nothing.
                 self.assertEqual(ensure_model_snapshot.main(), 0)
                 self.assertEqual(len(calls), 1)
@@ -1282,57 +1290,86 @@ class DownloadToRunnerCacheTests(unittest.TestCase):
     REVISION = "c" * 40
     FILES = ["q4/transformer/a.safetensors", "q4/vae/b.safetensors", "q8/transformer/a.safetensors"]
 
-    def fake_hub(self, cache: Path, present: list[str]):
+    def fake_hub(self, cache: Path, present: list[str], heal: bool = False):
         snapshot = runner_cache_snapshot({"repository": self.REPO, "revision": self.REVISION}, cache)
         calls = []
+        refetched = []
+
+        def write(name: str) -> None:
+            (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
+            (snapshot / name).write_bytes(b"x")
 
         def snapshot_download(**kwargs):
             calls.append(kwargs)
             for name in present:
-                (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
-                (snapshot / name).write_bytes(b"x")
+                write(name)
             return str(snapshot)
+
+        def hf_hub_download(**kwargs):
+            refetched.append(kwargs)
+            if heal:
+                write(kwargs["filename"])
+            return str(snapshot / kwargs["filename"])
 
         files = self.FILES
 
         class HfApi:
-            def list_repo_files(self, repo_id, revision, token):
-                return files
+            def list_repo_tree(self, repo_id, revision, recursive, token):
+                return [mock.Mock(path=name, size=1) for name in files]
 
         def filter_repo_objects(items, allow_patterns=None):
             import fnmatch
             return [i for i in items if not allow_patterns or any(fnmatch.fnmatch(i, p) for p in allow_patterns)]
 
-        hub = mock.MagicMock(snapshot_download=snapshot_download, HfApi=HfApi)
+        hub = mock.MagicMock(snapshot_download=snapshot_download, hf_hub_download=hf_hub_download, HfApi=HfApi)
         utils = mock.MagicMock(filter_repo_objects=filter_repo_objects)
+        self.refetched = refetched
         return snapshot, calls, {"huggingface_hub": hub, "huggingface_hub.utils": utils}
+
+    def run_helper(self, temporary: str, cache: Path, modules: dict) -> Path:
+        with mock.patch.dict("sys.modules", modules), mock.patch.dict(
+            ensure_model_snapshot.os.environ, {"HF_HOME": str(Path(temporary))}, clear=True
+        ):
+            return ensure_model_snapshot.download_to_runner_cache(
+                repo_id=self.REPO, revision=self.REVISION, allow_patterns=["q4/**"], cache=cache
+            )
+
+    def test_truncated_cached_file_is_fetched_again(self) -> None:
+        # A blob shorter than the Hub's size ("incomplete metadata, file not fully covered").
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "hub"
+            snapshot, _, modules = self.fake_hub(cache, self.FILES[:2], heal=True)
+            (snapshot / self.FILES[1]).parent.mkdir(parents=True)
+            original = modules["huggingface_hub"].snapshot_download
+
+            def truncating(**kwargs):
+                root = original(**kwargs)
+                (snapshot / self.FILES[1]).write_bytes(b"")
+                return root
+
+            modules["huggingface_hub"].snapshot_download = truncating
+            self.assertEqual(self.run_helper(temporary, cache, modules), snapshot)
+            self.assertEqual([call["filename"] for call in self.refetched], [self.FILES[1]])
+            self.assertTrue(self.refetched[0]["force_download"])
+            self.assertEqual(Path(self.refetched[0]["cache_dir"]), cache)
 
     def test_complete_slice_is_returned_from_the_runner_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary) / "hub"
             snapshot, calls, modules = self.fake_hub(cache, self.FILES[:2])
-            with mock.patch.dict("sys.modules", modules), mock.patch.dict(
-                ensure_model_snapshot.os.environ, {"HF_HOME": str(Path(temporary))}, clear=True
-            ):
-                root = ensure_model_snapshot.download_to_runner_cache(
-                    repo_id=self.REPO, revision=self.REVISION, allow_patterns=["q4/**"], cache=cache
-                )
-            self.assertEqual(root, snapshot)
+            self.assertEqual(self.run_helper(temporary, cache, modules), snapshot)
             self.assertEqual(Path(calls[0]["cache_dir"]), cache)
             self.assertNotIn("local_dir", calls[0])
+            self.assertEqual(self.refetched, [])
 
     def test_incomplete_cached_slice_is_refused(self) -> None:
-        # The Hub-outage shape: snapshot_download hands back an existing but partial directory.
+        # The Hub-outage shape: snapshot_download hands back an existing but partial directory,
+        # and the per-file re-fetch cannot complete it either.
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary) / "hub"
             _, _, modules = self.fake_hub(cache, self.FILES[:1])
-            with mock.patch.dict("sys.modules", modules), mock.patch.dict(
-                ensure_model_snapshot.os.environ, {"HF_HOME": str(Path(temporary))}, clear=True
-            ):
-                with self.assertRaisesRegex(RuntimeError, "incomplete: 1 of 2"):
-                    ensure_model_snapshot.download_to_runner_cache(
-                        repo_id=self.REPO, revision=self.REVISION, allow_patterns=["q4/**"], cache=cache
-                    )
+            with self.assertRaisesRegex(RuntimeError, "incomplete: 1 of 2"):
+                self.run_helper(temporary, cache, modules)
 
     def test_xet_cache_defaults_beside_the_hub_cache_only_without_hf_home(self) -> None:
         environ: dict = {}
