@@ -707,11 +707,7 @@ pub fn smart_resize_bicubic_u8(
 
 /// Convert a uint8 HWC RGBA buffer (`[H, W, 4]`, `[0, 255]`) to a planar NCHW float buffer
 /// (`[1, 4, H, W]`) normalized to `[-1.0, 1.0]` via `byte / 127.5 - 1.0` (`COMP-6`).
-pub fn rgba8_to_nchw_f32(
-    rgba_hwc: &[u8],
-    width: usize,
-    height: usize,
-) -> crate::Result<Vec<f32>> {
+pub fn rgba8_to_nchw_f32(rgba_hwc: &[u8], width: usize, height: usize) -> crate::Result<Vec<f32>> {
     let hw = width
         .checked_mul(height)
         .ok_or_else(|| Error::Msg("rgba8_to_nchw_f32: dimension overflow".into()))?;

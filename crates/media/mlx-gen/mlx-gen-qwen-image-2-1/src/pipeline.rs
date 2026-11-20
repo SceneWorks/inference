@@ -675,8 +675,7 @@ pub fn denoise_reported_with_pag_and_run(
             report,
             ..
         } = &mut *st;
-        let velocity =
-            positive.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
+        let velocity = positive.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
         let has_negative = negative.is_some();
         let guided = match negative.as_mut() {
             Some(negative) => {
@@ -821,14 +820,12 @@ pub fn denoise_reported_with_pag_and_run(
                 .map_err(Error::from)?;
             Ok(next_out)
         };
-    let on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>> = if run
-        .and_then(|r| r.plan().low_res_start())
-        .is_some()
-    {
-        Some(&mut phase_transition)
-    } else {
-        None
-    };
+    let on_phase_boundary: Option<&mut MlxPhaseTransitionFn<'_>> =
+        if run.and_then(|r| r.plan().low_res_start()).is_some() {
+            Some(&mut phase_transition)
+        } else {
+            None
+        };
     run_flow_sampler_with_phase_transition_spans(
         SamplerRun {
             sampler_name: inputs.sampler,

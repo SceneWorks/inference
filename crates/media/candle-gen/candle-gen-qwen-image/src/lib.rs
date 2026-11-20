@@ -614,7 +614,10 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         let steps = resolve_steps(req.steps);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
         let (phase0_w, phase0_h) = run
             .map(|r| r.plan().phase_output_size(0))
@@ -678,7 +681,10 @@ impl Pipeline {
             // sampler's running latent is PACKED `[1, seq, 64]` — the projector unpacks to
             // `[1, 16, H/8, W/8]` before applying the QwenVae fit. True CFG lives entirely inside the
             // predict closure below, so the hook only ever sees the single conditional trajectory.
-            let preview = crate::preview::hook(&req.preview, req.width, req.height);
+            let preview = match run {
+                Some(run) => crate::preview::hook_for_plan(&req.preview, run.plan()),
+                None => crate::preview::hook(&req.preview, req.width, req.height),
+            };
 
             let mut predict = |latents: &Tensor, sigma: f32| -> CResult<Tensor> {
                 let (step_lat_h, step_lat_w) = match run {
@@ -755,9 +761,9 @@ impl Pipeline {
 
             let latents = match run {
                 Some(run) => candle_gen::run_flow_sampler_with_phase_transition_spans(
-                    req.sampler.as_deref(),
+                    Some(run.plan().sampler()),
                     gen_core::sampling::TimestepConvention::Sigma,
-                    &sigmas,
+                    run.plan().denoise_sigmas(),
                     &run.plan().denoise_spans(),
                     Some(run),
                     false,

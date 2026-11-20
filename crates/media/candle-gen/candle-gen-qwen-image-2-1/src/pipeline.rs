@@ -655,8 +655,7 @@ pub fn denoise_reported_with_pag_and_run(
             report,
             ..
         } = &mut *st;
-        let velocity =
-            positive.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
+        let velocity = positive.evaluate(transformer, cached, latents, sigma, step_grid, report)?;
         let guided = match negative.as_mut() {
             Some(negative) => {
                 let uncond =
@@ -745,10 +744,7 @@ pub fn denoise_reported_with_pag_and_run(
             };
             let (x0_low, source) = boundary_state.into_clean_estimate().map_err(Error::from)?;
             let target_dtype = x0_low.dtype();
-            let low_f32: Vec<f32> = x0_low
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1()?;
+            let low_f32: Vec<f32> = x0_low.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
             let dims = x0_low.dims();
             let b_sz = dims.first().copied().unwrap_or(1);
             let packed_channels = dims.get(2).copied().unwrap_or(64);
@@ -794,14 +790,12 @@ pub fn denoise_reported_with_pag_and_run(
                 .map_err(Error::from)?;
             Ok(next_out)
         };
-    let on_phase_boundary: Option<&mut CandlePhaseTransitionFn<'_>> = if run
-        .and_then(|r| r.plan().low_res_start())
-        .is_some()
-    {
-        Some(&mut phase_transition)
-    } else {
-        None
-    };
+    let on_phase_boundary: Option<&mut CandlePhaseTransitionFn<'_>> =
+        if run.and_then(|r| r.plan().low_res_start()).is_some() {
+            Some(&mut phase_transition)
+        } else {
+            None
+        };
     match run {
         Some(run) => run_flow_sampler_with_phase_transition_spans(
             inputs.sampler,

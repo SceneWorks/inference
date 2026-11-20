@@ -534,7 +534,10 @@ impl QwenImageEdit {
         // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
         // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
-        let params = resolve_run_params(req, out_w, out_h)?;
+        let mut params = resolve_run_params(req, out_w, out_h)?;
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
         mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         let mut actual_steps = 0u32;

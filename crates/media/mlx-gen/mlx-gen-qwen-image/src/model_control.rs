@@ -535,7 +535,10 @@ impl QwenImageControl {
         } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117).
-        let params = resolve_run_params(req, req.width, req.height)?;
+        let mut params = resolve_run_params(req, req.width, req.height)?;
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
         mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         let (control_image, control_scale) = self.resolve_control(req)?;

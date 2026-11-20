@@ -485,8 +485,8 @@ fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
 /// prediction (over the channel axis). Keeps the guided velocity's magnitude matched to the
 /// conditional one — prevents the over-saturation plain CFG would introduce at `g = 4`.
 pub fn compute_guided_noise(pos: &Array, neg: &Array, guidance: f32) -> Result<Array> {
-    let _ = mlx_gen::gen_core::guidance::GuidanceOperator::QwenChannelL2NormRescale;
-    let combined = add(neg, &multiply(&subtract(pos, neg)?, scalar(guidance))?)?;
+    let (_uncond_weight, diff_weight) = mlx_gen::gen_core::guidance::true_cfg_weights(guidance);
+    let combined = add(neg, &multiply(&subtract(pos, neg)?, scalar(diff_weight))?)?;
     let cond_norm = l2_over_channels(pos)?;
     let comb_norm = l2_over_channels(&combined)?;
     Ok(multiply(&combined, &divide(&cond_norm, &comb_norm)?)?)
@@ -496,7 +496,11 @@ pub fn compute_guided_noise(pos: &Array, neg: &Array, guidance: f32) -> Result<A
 fn l2_over_channels(x: &Array) -> Result<Array> {
     let last = (x.shape().len() - 1) as i32;
     let sq = sum_axes(&multiply(x, x)?, &[last], true)?;
-    Ok(add(&sq, scalar(1e-12))?.sqrt()?)
+    Ok(add(
+        &sq,
+        scalar(mlx_gen::gen_core::guidance::TRUE_CFG_L2_NORM_EPS),
+    )?
+    .sqrt()?)
 }
 
 /// Flow-match denoise loop driven by a [`mlx_gen::DiffusionSampler`] (the production
@@ -662,9 +666,17 @@ pub(crate) fn denoise_with_progress_windowed_pag_and_run(
     // RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
+    let sliced = match run {
+        Some(run) => run.plan().denoise_sigmas(),
+        None => &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
+    };
     let total_steps = sliced.len().saturating_sub(1);
-    let canonical_solver = mlx_gen::gen_core::sampling::canonical_solver_or_euler(sampler_name);
+    let effective_sampler = match run {
+        Some(run) => Some(run.plan().sampler()),
+        None => sampler_name,
+    };
+    let canonical_solver =
+        mlx_gen::gen_core::sampling::canonical_solver_or_euler(effective_sampler);
     let mut eval_idx = 0usize;
     let num_blocks = transformer.num_blocks();
     let block_window = transformer.block_window(window_size, cancel)?;
@@ -763,7 +775,7 @@ pub(crate) fn denoise_with_progress_windowed_pag_and_run(
     match run {
         Some(run) => mlx_gen::run_flow_sampler_with_phase_transition_spans(
             SamplerRun {
-                sampler_name,
+                sampler_name: effective_sampler,
                 sigmas: sliced,
                 seed,
                 cancel,

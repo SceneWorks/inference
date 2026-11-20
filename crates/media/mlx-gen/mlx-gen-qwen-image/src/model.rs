@@ -488,7 +488,10 @@ impl QwenImage {
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
-        let params = resolve_run_params(req, req.width, req.height)?;
+        let mut params = resolve_run_params(req, req.width, req.height)?;
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
         mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
@@ -563,9 +566,7 @@ impl QwenImage {
                 // encoder was dropped and the VAE loaded — independent of `pos`/`neg`, so byte-identical.
                 let clean = if is_img2img {
                     let (image, _) = reference.expect("is_img2img implies a reference");
-                    Some(encode_init_latents(
-                        heavy.vae, image, phase0_w, phase0_h,
-                    )?)
+                    Some(encode_init_latents(heavy.vae, image, phase0_w, phase0_h)?)
                 } else {
                     None
                 };
@@ -622,15 +623,21 @@ impl QwenImage {
                             // Blend the (hoisted) clean latents with this image's noise at
                             // `sigma = sigmas[init_time_step]` (fork `create_for_txt2img_or_img2img`).
                             Some(clean) => {
-                                let sigma = params.sigmas[start_step];
+                                let sigma = run
+                                    .and_then(|r| r.plan().denoise_sigmas().first().copied())
+                                    .unwrap_or(params.sigmas[start_step]);
                                 add_noise_by_interpolation(clean, &noise, sigma)?
                             }
                             None => noise,
                         };
+                        let (active_sigmas, active_start_step) = match run {
+                            Some(run) => (run.plan().denoise_sigmas(), 0),
+                            None => (denoise_sigmas, start_step),
+                        };
                         let latents = crate::pipeline::denoise_with_progress_windowed_pag_and_run(
                             heavy.transformer,
                             params.sampler_name.as_deref(),
-                            denoise_sigmas,
+                            active_sigmas,
                             seed,
                             latents,
                             &pos,
@@ -638,7 +645,7 @@ impl QwenImage {
                             params.guidance,
                             req.width,
                             req.height,
-                            start_step,
+                            active_start_step,
                             attention_budget,
                             block_window,
                             resolved_pag.as_ref(),

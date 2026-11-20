@@ -152,17 +152,7 @@ pub fn project_spatial_latents(latents: &Tensor) -> Result<Image> {
 /// Errors — a latent that is not this route's packed shape, or a `width`/`height` that does not
 /// describe it — are what the shared emitter swallows to lose exactly one decorative frame.
 pub fn project_packed_latents(packed: &Tensor, width: u32, height: u32) -> Result<Image> {
-    let (w, h) = match packed.dims() {
-        &[1, seq, _]
-            if width.is_multiple_of(32)
-                && height.is_multiple_of(32)
-                && seq == ((height / 32) as usize) * ((width / 32) as usize) =>
-        {
-            (width / 2, height / 2)
-        }
-        _ => (width, height),
-    };
-    let spatial = crate::pipeline::unpack_latents(packed, w, h)?;
+    let spatial = crate::pipeline::unpack_latents(packed, width, height)?;
     project_spatial_latents(&spatial)
 }
 
@@ -177,6 +167,27 @@ pub fn project_packed_latents(packed: &Tensor, width: u32, height: u32) -> Resul
 /// impossible to separate.)
 pub(crate) fn hook(sink: &PreviewSink, width: u32, height: u32) -> PreviewHook<'_> {
     PreviewHook::new(sink, move |packed: &Tensor| {
+        project_packed_latents(packed, width, height)
+    })
+}
+
+/// Phase-geometry-aware preview hook for planned Qwen-Image renders: projects Phase-0
+/// packed tokens at `(phase0_w, phase0_h)` and Phase-1 packed tokens at `(full_w, full_h)`
+/// when `low_res_start` is active, and at `(full_w, full_h)` throughout when inactive.
+pub(crate) fn hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    let (phase0_w, phase0_h) = plan.phase_output_size(0);
+    let (phase0_lat_h, phase0_lat_w) = crate::pipeline::latent_dims(phase0_w, phase0_h);
+    let phase0_tokens = phase0_lat_h * phase0_lat_w;
+    let (full_w, full_h) = plan.output_size();
+    PreviewHook::new(sink, move |packed: &Tensor| {
+        let (width, height) = if packed.dims().get(1).copied() == Some(phase0_tokens) {
+            (phase0_w, phase0_h)
+        } else {
+            (full_w, full_h)
+        };
         project_packed_latents(packed, width, height)
     })
 }
@@ -828,5 +839,58 @@ mod tests {
     #[test]
     fn the_geometry_module_drives_no_sampler() {
         assert!(sampler_call_sites("pipeline.rs", include_str!("pipeline.rs")).is_empty());
+    }
+
+    #[test]
+    fn hook_for_plan_projects_phase0_and_phase1_frames_across_low_res_start() {
+        use candle_gen::gen_core::{
+            GenerationRequest, LoadSpec, LowResStartSpec, RenderRun, WeightsSource,
+        };
+
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(7),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let plan = crate::compile_trajectory_for(&req)
+            .unwrap()
+            .bind_load(&spec);
+        let (sink, captured) = collecting_sink();
+        let hook = hook_for_plan(&sink, &plan);
+        let run_ctx = RenderRun::new(&plan, &req.cancel, None);
+        run_ctx
+            .encode(|| Ok::<_, candle_gen::CandleError>(()))
+            .unwrap();
+        run_ctx.begin_rendering().unwrap();
+        run_ctx.reset_image_denoise_phases();
+        let out = candle_gen::run_flow_sampler_with_phase_transition_spans(
+            Some(plan.sampler()),
+            candle_gen::gen_core::sampling::TimestepConvention::Sigma,
+            plan.denoise_sigmas(),
+            &plan.denoise_spans(),
+            Some(&run_ctx),
+            false,
+            packed_latent(256, 256),
+            7,
+            &req.cancel,
+            &mut |_| {},
+            Some(&hook),
+            zero_velocity,
+            None,
+        )
+        .unwrap();
+        run_ctx.finish_image_denoise_phases().unwrap();
+        assert_eq!(out.dims(), [1, 32 * 32, 64]);
+        let frames = candle_gen::lock_recover(&captured);
+        assert_eq!(frames.len(), 4);
+        assert_eq!((frames[0].image.width, frames[0].image.height), (32, 32));
+        assert_eq!((frames[1].image.width, frames[1].image.height), (32, 32));
+        assert_eq!((frames[2].image.width, frames[2].image.height), (64, 64));
+        assert_eq!((frames[3].image.width, frames[3].image.height), (64, 64));
     }
 }

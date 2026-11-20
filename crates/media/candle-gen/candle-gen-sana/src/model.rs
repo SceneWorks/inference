@@ -504,8 +504,10 @@ fn generate_base_images(
     let (init_image, strength) = reference
         .map(|(image, strength)| (Some(image), Some(strength)))
         .unwrap_or((None, None));
-    let base_seed =
-        run.map_or_else(|| req.seed.unwrap_or_else(gen_core::default_seed), |r| r.plan().base_seed());
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let steps = req.steps.map(|s| s as usize);
     let guidance_scale = req.true_cfg.or(req.guidance);
     candle_gen::execution::policy(

@@ -135,9 +135,9 @@ pub fn euler_step(latents: &Tensor, velocity: &Tensor, sigmas: &[f32], i: usize)
 /// True-CFG combine with norm correction: `combined = neg + g·(pos − neg)`, then rescale `combined`
 /// to the per-token channel L2 norm of `pos`. Shapes `[1, seq, 64]`.
 pub fn compute_guided_noise(pos: &Tensor, neg: &Tensor, guidance: f32) -> Result<Tensor> {
-    let _ = candle_gen::gen_core::guidance::GuidanceOperator::QwenChannelL2NormRescale;
-    candle_gen::execution::f32_policy("qwen/consumed_cfg", guidance);
-    let combined = (neg + ((pos - neg)? * guidance as f64)?)?;
+    let (_uncond_weight, diff_weight) = candle_gen::gen_core::guidance::true_cfg_weights(guidance);
+    candle_gen::execution::f32_policy("qwen/consumed_cfg", diff_weight);
+    let combined = (neg + ((pos - neg)? * diff_weight as f64)?)?;
     let cond_norm = l2_over_channels(pos)?;
     let comb_norm = l2_over_channels(&combined)?;
     combined.broadcast_mul(&cond_norm.broadcast_div(&comb_norm)?)
@@ -148,7 +148,8 @@ pub fn compute_guided_noise(pos: &Tensor, neg: &Tensor, guidance: f32) -> Result
 fn l2_over_channels(x: &Tensor) -> Result<Tensor> {
     let dtype = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
-    ((xf.sqr()?.sum_keepdim(D::Minus1)? + 1e-12)?.sqrt()?).to_dtype(dtype)
+    let eps = candle_gen::gen_core::guidance::TRUE_CFG_L2_NORM_EPS as f64;
+    ((xf.sqr()?.sum_keepdim(D::Minus1)? + eps)?.sqrt()?).to_dtype(dtype)
 }
 
 /// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this

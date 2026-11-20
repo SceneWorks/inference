@@ -824,10 +824,13 @@ impl QwenImage21 {
             .capabilities
             .resolve_pag(self.variant.id(), req)?;
         Self::record_pag_policy(resolved_pag.as_ref());
-        let params = match &self.schedule {
+        let mut params = match &self.schedule {
             Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req)?,
             Schedule::Saved(schedule) => resolve_turbo_run_params(schedule, req)?,
         };
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         let actual_steps = params.sigmas.len().saturating_sub(1) as u32;
         candle_gen::execution::policy(
             "qwen21_cfg",
@@ -966,8 +969,7 @@ impl QwenImage21 {
                     if run.is_none() {
                         candle_gen::execution::draw("image_initial_noise", seed, i as usize);
                     }
-                    let latents =
-                        create_noise(seed, phase0_w, phase0_h, channels, &device)?;
+                    let latents = create_noise(seed, phase0_w, phase0_h, channels, &device)?;
                     let mut report = DenoiseReport::default();
                     let latents = denoise_reported_with_pag_and_run(
                         DenoiseInputs {
@@ -1248,12 +1250,8 @@ pub fn compile_render_plan(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Base, spec)
         .map_err(|error| labelled(Variant::Base.id(), error))?;
-    compile_trajectory_for(
-        Variant::Base,
-        &Schedule::production(Variant::Base),
-        req,
-    )
-    .map(|opt| opt.map(|plan| plan.bind_load(spec)))
+    compile_trajectory_for(Variant::Base, &Schedule::production(Variant::Base), req)
+        .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
 pub fn compile_render_plan_turbo(
@@ -1262,12 +1260,8 @@ pub fn compile_render_plan_turbo(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Turbo, spec)
         .map_err(|error| labelled(Variant::Turbo.id(), error))?;
-    compile_trajectory_for(
-        Variant::Turbo,
-        &Schedule::production(Variant::Turbo),
-        req,
-    )
-    .map(|opt| opt.map(|plan| plan.bind_load(spec)))
+    compile_trajectory_for(Variant::Turbo, &Schedule::production(Variant::Turbo), req)
+        .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
 pub const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =

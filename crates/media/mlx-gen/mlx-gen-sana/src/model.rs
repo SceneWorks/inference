@@ -798,8 +798,7 @@ impl Generator for Sana {
                     .generate_impl(req, Some(&run), &mut progress)
                     .map_err(mlx_gen::gen_core::Error::from)?;
                 let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
-                report.low_res_start =
-                    plan.low_res_start_execution_report("f32", 4, "base_dit")?;
+                report.low_res_start = plan.low_res_start_execution_report("f32", 4, "base_dit")?;
                 Ok(report)
             },
         )
@@ -907,8 +906,10 @@ impl Sana {
             None => (None, None),
         };
 
-        let base_seed =
-            run.map_or_else(|| req.seed.unwrap_or_else(default_seed), |r| r.plan().base_seed());
+        let base_seed = run.map_or_else(
+            || req.seed.unwrap_or_else(default_seed),
+            |r| r.plan().base_seed(),
+        );
         // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
         // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
         let sprint_sampling = if self.sprint {
@@ -1024,8 +1025,9 @@ impl Sana {
             let mut images = Vec::with_capacity(latents.len());
             for latent in &latents {
                 let image = match run {
-                    Some(run) => run
-                        .decode_phase(|| view.decode_one(latent, &req.cancel, tiling.as_ref()))?,
+                    Some(run) => {
+                        run.decode_phase(|| view.decode_one(latent, &req.cancel, tiling.as_ref()))?
+                    }
                     None => view.decode_one(latent, &req.cancel, tiling.as_ref())?,
                 };
                 images.push(image);

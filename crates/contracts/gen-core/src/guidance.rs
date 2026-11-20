@@ -114,6 +114,65 @@ impl GuidanceOperator {
     }
 }
 
+/// Named guidance combine variants for shared and model-family CFG operators (`PIPE-8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombineVariant {
+    /// Standard classifier-free guidance: `uncond + scale · (cond − uncond)`.
+    PlainCfg,
+    /// Axis-parameterized Lin et al. L2 norm-rescaled CFG (`cfg_rescale`).
+    CfgRescale,
+    /// Qwen-Image per-token channel-axis (`[-1]`) L2 norm-rescaled True CFG.
+    TrueCfgL2NormRescale,
+    /// Boogu residual CFG combine (`cond + (scale − 1) · (cond − uncond)`) with negated velocity (`-pred`).
+    BooguResidualCfgNegated,
+}
+
+impl CombineVariant {
+    /// Canonical lowercase identifier for this combine variant.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PlainCfg => "plain_cfg",
+            Self::CfgRescale => "cfg_rescale",
+            Self::TrueCfgL2NormRescale => "true_cfg_l2_norm_rescale",
+            Self::BooguResidualCfgNegated => "boogu_residual_cfg_negated",
+        }
+    }
+
+    /// Map this combine variant to its [`GuidanceOperator`].
+    pub const fn operator(self) -> GuidanceOperator {
+        match self {
+            Self::PlainCfg => GuidanceOperator::PlainCfg,
+            Self::CfgRescale => GuidanceOperator::CfgRescale,
+            Self::TrueCfgL2NormRescale => GuidanceOperator::QwenChannelL2NormRescale,
+            Self::BooguResidualCfgNegated => GuidanceOperator::BooguResidualCfgNegated,
+        }
+    }
+}
+
+/// Per-token channel-axis L2 norm epsilon floor (`1e-12`) for True-CFG norm rescaling (`PIPE-8`).
+pub const TRUE_CFG_L2_NORM_EPS: f32 = RESCALE_EPS;
+
+/// Linear weights `(uncond_weight, diff_weight)` for True-CFG `uncond + scale · (cond − uncond)` (`PIPE-8`).
+pub const fn true_cfg_weights(scale: f32) -> (f32, f32) {
+    let _ = CombineVariant::TrueCfgL2NormRescale;
+    (1.0, scale)
+}
+
+/// Scalar per-token L2 norm rescale factor `‖cond‖₂ / max(‖comb‖₂, 1e-12)` (`PIPE-8`).
+pub fn true_cfg_l2_norm_rescale_scale(cond_norm: f32, comb_norm: f32) -> f32 {
+    if comb_norm > 0.0 {
+        cond_norm / comb_norm.max(TRUE_CFG_L2_NORM_EPS)
+    } else {
+        1.0
+    }
+}
+
+/// Residual difference weight and velocity negation sign `(scale - 1.0, -1.0)` for Boogu (`PIPE-8`).
+pub const fn boogu_residual_cfg_weights(scale: f32) -> (f32, f32) {
+    let _ = CombineVariant::BooguResidualCfgNegated;
+    (scale - 1.0, -1.0)
+}
+
 // =================================================================================================
 // GuidanceOps — the axis-parameterized backend op extension (sc-7437).
 // =================================================================================================
@@ -915,12 +974,30 @@ mod tests {
 
         let unguided_negated = boogu_guided_negated_velocity(&OPS, &cond, None, scale).unwrap();
         let expected_unguided: Vec<f32> = cond.iter().map(|&v| -v).collect();
-        assert!(max_abs(&unguided_negated, &expected_ungated_check(&expected_unguided)) < 1e-6);
+        assert!(
+            max_abs(
+                &unguided_negated,
+                &expected_ungated_check(&expected_unguided)
+            ) < 1e-6
+        );
 
         // Qwen per-token channel L2 norm rescale
         let qwen_rescaled = qwen_cfg_l2_rescale_slice(&cond, &uncond, scale, 2, 2).unwrap();
         let direct = cfg_rescale(&OPS, &cond, &uncond, scale, &[1, 2, 2], &[-1]).unwrap();
         assert!(max_abs(&qwen_rescaled, &direct) < 1e-6);
+
+        assert_eq!(
+            CombineVariant::TrueCfgL2NormRescale.operator(),
+            GuidanceOperator::QwenChannelL2NormRescale
+        );
+        assert_eq!(
+            CombineVariant::BooguResidualCfgNegated.operator(),
+            GuidanceOperator::BooguResidualCfgNegated
+        );
+        assert_eq!(true_cfg_weights(4.0), (1.0, 4.0));
+        assert!((true_cfg_l2_norm_rescale_scale(5.0, 10.0) - 0.5).abs() < 1e-6);
+        assert_eq!(true_cfg_l2_norm_rescale_scale(5.0, 0.0), 1.0);
+        assert_eq!(boogu_residual_cfg_weights(4.0), (3.0, -1.0));
     }
 
     fn expected_ungated_check(v: &[f32]) -> Vec<f32> {

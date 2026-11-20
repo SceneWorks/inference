@@ -851,7 +851,10 @@ impl QwenImage21 {
             .capabilities
             .resolve_pag(self.variant.id(), req)?;
         mlx_gen::image_execution::policy_debug("qwen-image-2-1.pag", &resolved_pag);
-        let params = resolve_run_params(&self.schedule, req)?;
+        let mut params = resolve_run_params(&self.schedule, req)?;
+        if let Some(run) = run {
+            params.base_seed = run.plan().base_seed();
+        }
         let actual_steps = params.sigmas.len().saturating_sub(1) as u32;
         let tiling = crate::pipeline::decode_tiling(req);
         mlx_gen::image_execution::policy_debug("qwen-image-2-1.tiling", &tiling);
@@ -1329,12 +1332,8 @@ pub fn compile_render_plan(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Base, spec)
         .map_err(|error| labelled(Variant::Base.id(), error))?;
-    compile_trajectory_for(
-        Variant::Base,
-        &Schedule::production(Variant::Base),
-        req,
-    )
-    .map(|opt| opt.map(|plan| plan.bind_load(spec)))
+    compile_trajectory_for(Variant::Base, &Schedule::production(Variant::Base), req)
+        .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
 pub fn compile_render_plan_turbo(
@@ -1343,12 +1342,8 @@ pub fn compile_render_plan_turbo(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_plan_load_spec(Variant::Turbo, spec)
         .map_err(|error| labelled(Variant::Turbo.id(), error))?;
-    compile_trajectory_for(
-        Variant::Turbo,
-        &Schedule::production(Variant::Turbo),
-        req,
-    )
-    .map(|opt| opt.map(|plan| plan.bind_load(spec)))
+    compile_trajectory_for(Variant::Turbo, &Schedule::production(Variant::Turbo), req)
+        .map(|opt| opt.map(|plan| plan.bind_load(spec)))
 }
 
 pub const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =

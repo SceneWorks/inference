@@ -497,8 +497,10 @@ impl Boogu {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-        let base_seed =
-            run.map_or_else(|| req.seed.unwrap_or_else(default_seed), |r| r.plan().base_seed());
+        let base_seed = run.map_or_else(
+            || req.seed.unwrap_or_else(default_seed),
+            |r| r.plan().base_seed(),
+        );
         if self.descriptor.id == BOOGU_IMAGE_TURBO_ID {
             self.generate_turbo(req, base_seed, on_progress)
         } else if self.descriptor.id == BOOGU_IMAGE_EDIT_ID {
@@ -670,9 +672,9 @@ impl Boogu {
             req.use_pid,
             on_progress,
             |enc: &BooguEncoders| match run {
-                Some(run) => {
-                    run.encode(|| enc.encode_edit_preflight(&references, &edit_opts, Some(&preflight)))
-                }
+                Some(run) => run.encode(|| {
+                    enc.encode_edit_preflight(&references, &edit_opts, Some(&preflight))
+                }),
                 None => enc.encode_edit_preflight(&references, &edit_opts, Some(&preflight)),
             },
             |c: Option<&BooguBaseCond>| match c {

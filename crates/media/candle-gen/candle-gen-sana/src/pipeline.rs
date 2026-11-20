@@ -141,7 +141,11 @@ pub fn create_noise(device: &Device, seed: u64, width: u32, height: u32) -> Resu
 /// epic-7114 `scheduler` name (which re-shapes σ over the same `mu = ln(shift)`). An unset / unknown /
 /// native-aliased name returns the byte-exact `build_flow_sigmas(steps, ln(3))` schedule.
 pub fn sana_sigmas(scheduler_name: Option<&str>, steps: usize) -> Vec<f32> {
-    let _ = (SCHEDULE_SHIFT, build_flow_sigmas as fn(usize, f32) -> Vec<f32>, resolve_flow_schedule as fn(Option<&str>, f32, usize, &[f32]) -> Vec<f32>);
+    let _ = (
+        SCHEDULE_SHIFT,
+        build_flow_sigmas as fn(usize, f32) -> Vec<f32>,
+        resolve_flow_schedule as fn(Option<&str>, f32, usize, &[f32]) -> Vec<f32>,
+    );
     candle_gen::gen_core::sampling::sana_sigmas(scheduler_name, steps)
 }
 

@@ -538,8 +538,10 @@ pub(crate) fn stage_denoise_base(
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed =
-        run.map_or_else(|| req.seed.unwrap_or_else(gen_core::default_seed), |r| r.plan().base_seed());
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
@@ -550,24 +552,26 @@ pub(crate) fn stage_denoise_base(
     )?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let run_sigmas = &sigmas[start..];
-    let (init_w, init_h) =
-        run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    let start_sigma = run
+        .and_then(|r| r.plan().denoise_sigmas().first().copied())
+        .unwrap_or(sigmas[start]);
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
     if let Some(run) = run {
         run.begin_rendering()
             .map_err(|e| CandleError::Msg(e.to_string()))?;
     }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(init_h, init_w, seed, 0, device)?;
-        let x_t = blend_reference(clean.as_ref(), noise, sigmas[start])?;
+        let x_t = blend_reference(clean.as_ref(), noise, start_sigma)?;
         let preview_hook = crate::preview::hook(&req.preview);
         let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
-            let _ = gen_core::guidance::GuidanceOperator::BooguResidualCfgNegated;
             let t = Tensor::from_vec(vec![timestep], (1,), device)?;
             let cond_v = heavy.dit.forward(x, &t, &cond)?;
             let pred = match &uncond {
                 Some(uncond) => {
                     let uncond_v = heavy.dit.forward(x, &t, uncond)?;
-                    (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
                 }
                 None => cond_v,
             };
@@ -787,8 +791,10 @@ pub(crate) fn stage_denoise_edit(
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed =
-        run.map_or_else(|| req.seed.unwrap_or_else(gen_core::default_seed), |r| r.plan().base_seed());
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
@@ -797,23 +803,22 @@ pub(crate) fn stage_denoise_edit(
         steps,
         &native,
     )?;
-    let (init_w, init_h) =
-        run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
     if let Some(run) = run {
         run.begin_rendering()
             .map_err(|e| CandleError::Msg(e.to_string()))?;
     }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(init_h, init_w, seed, 0, device)?;
         let preview_hook = crate::preview::hook(&req.preview);
         let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
-            let _ = gen_core::guidance::GuidanceOperator::BooguResidualCfgNegated;
             let t = Tensor::from_vec(vec![timestep], (1,), device)?;
             let cond_v = heavy.dit.forward_edit(x, &ref_latents, &t, &cond)?;
             let pred = match &uncond {
                 Some(uncond) => {
                     let uncond_v = heavy.dit.forward_edit(x, &ref_latents, &t, uncond)?;
-                    (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
                 }
                 None => cond_v,
             };
@@ -922,8 +927,10 @@ pub(crate) fn render_base(
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed =
-        run.map_or_else(|| req.seed.unwrap_or_else(gen_core::default_seed), |r| r.plan().base_seed());
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
 
     // Condition encoding (seed-independent): positive instruction + CFG-negative (empty) instruction.
     let mut encode_prompt = || {
@@ -981,26 +988,28 @@ pub(crate) fn render_base(
     // full schedule from pure noise — byte-identical to the pre-sc-11786 path.
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let run_sigmas = &sigmas[start..];
-    let (init_w, init_h) =
-        run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    let start_sigma = run
+        .and_then(|r| r.plan().denoise_sigmas().first().copied())
+        .unwrap_or(sigmas[start]);
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
     if let Some(run) = run {
         run.begin_rendering()
             .map_err(|e| CandleError::Msg(e.to_string()))?;
     }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
 
     let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(init_h, init_w, seed, 0, device)?;
-        let x_t = blend_reference(clean, noise, sigmas[start])?;
+        let x_t = blend_reference(clean, noise, start_sigma)?;
         let preview_hook = crate::preview::hook(&req.preview);
         let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
-            let _ = gen_core::guidance::GuidanceOperator::BooguResidualCfgNegated;
             let t = Tensor::from_vec(vec![timestep], (1,), device)?;
             let cond_v = comps.dit.forward(x, &t, &cond)?;
             let pred = match &uncond {
                 Some(u_hidden) => {
                     let uncond_v = comps.dit.forward(x, &t, u_hidden)?;
                     // pred = cond + (scale − 1)·(cond − uncond)
-                    (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
                 }
                 None => cond_v,
             };
@@ -1281,8 +1290,10 @@ pub(crate) fn render_edit(
     validate_edit_reference_dims(references)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = resolved_guidance(req.guidance, false);
-    let base_seed =
-        run.map_or_else(|| req.seed.unwrap_or_else(gen_core::default_seed), |r| r.plan().base_seed());
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
 
     // Each reference → clean VAE latent [1, 16, rH/8, rW/8] (seed-independent).
     let ref_latents: Vec<Tensor> = references
@@ -1340,25 +1351,24 @@ pub(crate) fn render_edit(
         crate::BOOGU_IMAGE_EDIT_ID,
     )?;
 
-    let (init_w, init_h) =
-        run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
+    let (init_w, init_h) = run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
     if let Some(run) = run {
         run.begin_rendering()
             .map_err(|e| CandleError::Msg(e.to_string()))?;
     }
+    let (residual_weight, _negate_sign) = gen_core::guidance::boogu_residual_cfg_weights(guidance);
 
     let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(init_h, init_w, seed, 0, device)?;
         let preview_hook = crate::preview::hook(&req.preview);
         let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
-            let _ = gen_core::guidance::GuidanceOperator::BooguResidualCfgNegated;
             let t = Tensor::from_vec(vec![timestep], (1,), device)?;
             let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;
             let pred = match &uncond {
                 Some(u_hidden) => {
                     let uncond_v = comps.dit.forward_edit(x, &ref_latents, &t, u_hidden)?;
                     // pred = cond + (scale − 1)·(cond − uncond)
-                    (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    (&cond_v + ((&cond_v - &uncond_v)? * residual_weight as f64)?)?
                 }
                 None => cond_v,
             };

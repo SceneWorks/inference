@@ -600,7 +600,8 @@ impl BooguHeavy {
         c: &BooguBaseCond,
         scale: f32,
     ) -> Result<Array> {
-        let _ = mlx_gen::gen_core::guidance::GuidanceOperator::BooguResidualCfgNegated;
+        let (residual_weight, negate_sign) =
+            mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
         let t = Array::from_slice(&[timestep], &[1]);
         let cond_v = self.dit.forward(x, &t, &c.cond, &c.cond_mask)?;
         let pred = match &c.uncond {
@@ -608,14 +609,17 @@ impl BooguHeavy {
                 let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
                 add(
                     &cond_v,
-                    &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                    &multiply(
+                        &subtract(&cond_v, &uncond_v)?,
+                        Array::from_f32(residual_weight),
+                    )?,
                 )?
             }
             None => cond_v,
         };
         Ok(multiply(
             &pred.as_dtype(Dtype::Float32)?,
-            Array::from_f32(-1.0),
+            Array::from_f32(negate_sign),
         )?)
     }
 
@@ -629,7 +633,8 @@ impl BooguHeavy {
         c: &BooguBaseCond,
         scale: f32,
     ) -> Result<Array> {
-        let _ = mlx_gen::gen_core::guidance::GuidanceOperator::BooguResidualCfgNegated;
+        let (residual_weight, negate_sign) =
+            mlx_gen::gen_core::guidance::boogu_residual_cfg_weights(scale);
         let t = Array::from_slice(&[timestep], &[1]);
         let cond_v = self
             .dit
@@ -641,14 +646,17 @@ impl BooguHeavy {
                     .forward_edit_multi(x, ref_latents, &t, u_hidden, u_mask)?;
                 add(
                     &cond_v,
-                    &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                    &multiply(
+                        &subtract(&cond_v, &uncond_v)?,
+                        Array::from_f32(residual_weight),
+                    )?,
                 )?
             }
             None => cond_v,
         };
         Ok(multiply(
             &pred.as_dtype(Dtype::Float32)?,
-            Array::from_f32(-1.0),
+            Array::from_f32(negate_sign),
         )?)
     }
 
