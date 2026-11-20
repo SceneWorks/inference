@@ -2389,6 +2389,8 @@ mod tests {
         use_pid: bool,
     ) -> MemoryRunContext {
         MemoryRunContext {
+            low_res_start: None,
+
             reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::StagedResidency,
