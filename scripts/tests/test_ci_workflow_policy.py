@@ -326,6 +326,15 @@ def evaluate_policy(
     return evaluate_condition(expression, values)
 
 
+# SW-7202: every dispatch-only route into the reusable qwen38-full-tiers.yml.
+QWEN38_FULL_TIERS_PROFILES = tuple(
+    f"qwen38-full-tiers-{model}-{target}{suffix}"
+    for suffix in ("", "-convert-only")
+    for model in ("describer", "expander")
+    for target in ("mlx-nax-macos", "mlx-nax-macos-2", "candle")
+)
+
+
 def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
     """Exercise the real group expression across both hosts and dispatch boundaries."""
     concurrency = workflow["concurrency"]
@@ -345,6 +354,9 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
                     "moss-edit-cuda", "moss-edit-metal", "moss-cpu-fixture",
                     "moss-metal-fixture", "llm-decoder-fixture", "moss-cuda-unit"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
+                # SW-7202: the full-tier conversions serialize per backend, outside the shared group.
+                if event == "workflow_dispatch" and profile in QWEN38_FULL_TIERS_PROFILES:
+                    expected = "inference-qwen38-full-tiers-" + ("candle" if "-candle" in profile else "mlx")
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
                             ("3", "c" * 40, "imports"), ("4", "d" * 40, "full"),
@@ -5044,6 +5056,90 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.assert_qwen38_candle_requires_successful_mlx(mutated)
 
+    def test_qwen38_full_tiers_route_through_the_main_resident_dispatch(self) -> None:
+        """SW-7202: GitHub dispatches only workflows on the default branch, so the full-tier
+        conversion is a reusable workflow reached through real-weights.yml profiles."""
+        caller = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        callee_path = REAL_WEIGHTS_WORKFLOW.with_name("qwen38-full-tiers.yml")
+        callee = yaml.safe_load(callee_path.read_text(encoding="utf-8"))
+        options = caller[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        for profile in QWEN38_FULL_TIERS_PROFILES:
+            self.assertEqual(options.count(profile), 1, profile)
+        self.assertEqual(
+            sorted(option for option in options if option.startswith("qwen38-full-tiers")),
+            sorted(QWEN38_FULL_TIERS_PROFILES),
+        )
+        # GitHub caps workflow_dispatch at 25 inputs: routes are profile values, never new inputs.
+        self.assertLessEqual(len(caller[True]["workflow_dispatch"]["inputs"]), 25)
+
+        job = caller["jobs"]["qwen38-full-tiers"]
+        self.assertEqual(job["needs"], "validate-selection")
+        self.assertEqual(job["uses"], "./.github/workflows/qwen38-full-tiers.yml")
+        self.assertEqual(
+            job["if"],
+            "github.event_name == 'workflow_dispatch' && ("
+            + " || ".join(f"inputs.profile == '{profile}'" for profile in QWEN38_FULL_TIERS_PROFILES)
+            + ")",
+        )
+
+        def render(expression: str, profile: str):
+            body = expression.removeprefix("${{").removesuffix("}}").strip()
+            body = re.sub(r"contains\(inputs\.profile, ('[^']*')\)", r"(\1 in profile)", body)
+            body = re.sub(r"!endsWith\(inputs\.profile, ('[^']*')\)", r"(not profile.endswith(\1))", body)
+            body = body.replace("&&", " and ").replace("||", " or ")
+            return eval(body, {"__builtins__": {}}, {"profile": profile})
+
+        for profile in QWEN38_FULL_TIERS_PROFILES:
+            with self.subTest(profile=profile):
+                rendered = {key: render(value, profile) for key, value in job["with"].items()}
+                self.assertEqual(
+                    rendered,
+                    {
+                        "model": "expander" if "-expander-" in profile else "describer",
+                        "backend": "candle" if "-candle" in profile else "mlx",
+                        "mac_runner": "nax-macos-2" if "-mlx-nax-macos-2" in profile else "nax-macos",
+                        "publish": not profile.endswith("-convert-only"),
+                    },
+                )
+
+        events = callee[True]
+        self.assertEqual(set(events), {"workflow_call"})
+        self.assertEqual(set(events["workflow_call"]["inputs"]), {"model", "backend", "mac_runner", "publish"})
+        self.assertNotIn("concurrency", callee)
+        jobs = callee["jobs"]
+        self.assertEqual(set(jobs), {"mlx", "candle"})
+        for name, job in jobs.items():
+            self.assertNotIn("concurrency", job)
+            self.assertEqual(
+                job["if"],
+                f"github.event_name == 'workflow_dispatch' && inputs.backend == '{name}'",
+            )
+        mlx = jobs["mlx"]
+        self.assertEqual(
+            mlx["runs-on"],
+            ["self-hosted", "macOS", "ARM64",
+             "${{ inputs.mac_runner == 'nax-macos-2' && 'rw-llm' || 'rw-starvector' }}"],
+        )
+        refuse = mlx["steps"][1]
+        self.assertEqual(refuse["name"], "Refuse any runner but the selected Mac")
+        self.assertIn('[[ "$RUNNER_NAME" == "$MAC_RUNNER" ]] ||', refuse["run"])
+        self.assertEqual(mlx["env"]["MAC_RUNNER"], "${{ inputs.mac_runner }}")
+        for runner, selected, succeeds in (
+            ("nax-macos", "nax-macos", True),
+            ("nax-macos-2", "nax-macos-2", True),
+            ("nax-macos-2", "nax-macos", False),
+            ("nax-macos", "nax-macos-2", False),
+            ("nax-macos", "", False),
+        ):
+            with self.subTest(runner=runner, selected=selected):
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-c", refuse["run"]],
+                    env={"PATH": os.environ["PATH"], "RUNNER_NAME": runner, "MAC_RUNNER": selected},
+                    capture_output=True, text=True, encoding="utf-8", check=False,
+                )
+                self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+        self.assertEqual(jobs["candle"]["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
+
     def test_qwen38_bonsai_terminal_profile_is_accelerator_only_and_sealed(self) -> None:
         workflow = yaml.safe_load(real_weights_inline_text())
         options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
@@ -5500,8 +5596,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
             ("DECODE_BENCH_SNAPSHOT_QWEN38", "${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}"),
             ("DECODE_BENCH_SNAPSHOT_BONSAI_MLX", "${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}"),
-            ("CUDA_VISIBLE_DEVICES", "1"),
-            # CUDA numbers the cards as nvidia-smi does, so ordinal 1 is the inventory's GPU 1.
+            # SW-7200: the campaign card is bound by UUID at run time, never by a fixed index.
+            ("DECODE_BENCH_CUDA_UUID", "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"),
             ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
             ("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"),
         ):
@@ -5510,6 +5606,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for name in campaign.SNAPSHOT_ALIASES.values():
             if name not in env:
                 errors.append(f"snapshot alias variable {name} is not mapped")
+        if "CUDA_VISIBLE_DEVICES" in env:
+            errors.append("the job pins CUDA_VISIBLE_DEVICES instead of selecting the card by UUID")
+        select = next((s for s in job["steps"] if s.get("name") == "Select the campaign card by UUID"), {})
+        if ("decode_bench_select_cuda_card.py" not in select.get("run", "")
+                or "%DECODE_BENCH_CUDA_UUID%" not in select.get("run", "")
+                or select.get("continue-on-error")):
+            errors.append("the campaign card is not selected by UUID, fail closed")
         # The untrusted matrix reaches the job through `env:` only, never a step body or `with:`.
         steps = job["steps"]
         if "inputs.decode_bench_matrix" in json.dumps(steps):
@@ -5612,7 +5715,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         for mutate in (
             lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
-            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
+            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "1"}),
+            lambda job: job["env"].update({"DECODE_BENCH_CUDA_UUID": "GPU-00000000-0000-0000-0000-000000000000"}),
             lambda job: job["env"].pop("CUDA_DEVICE_ORDER"),
             lambda job: job.update({"timeout-minutes": 240}),
             lambda job: job["steps"][1]["with"].update({"ref": "main"}),
@@ -5627,6 +5731,123 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             mutate(mutated["jobs"]["candle-decode-speedups-bench"])
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.decode_speedups_bench_errors(mutated))
+
+
+    def mlx_decode_speedups_bench_errors(self, workflow: dict) -> list[str]:
+        """Everything the SW-7200 MLX campaign lane binds, as a list of findings."""
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "decode-speedups-bench-mlx" not in inputs["profile"]["options"]:
+            errors.append("`decode-speedups-bench-mlx` is not a dispatchable profile")
+        job = workflow["jobs"].get("mlx-decode-speedups-bench")
+        if job is None:
+            return errors + ["no `mlx-decode-speedups-bench` job"]
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench-mlx'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        # The loaned primary Mac, by its unique label.
+        if job["runs-on"] != [
+            "self-hosted", "macOS", "ARM64",
+            "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' && 'rw-llm' || 'rw-starvector' }}",
+        ]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        shell = job.get("defaults", {}).get("run", {}).get("shell", "")
+        if "scripts/ci/inference_metal_launcher.py" not in shell:
+            errors.append("the lane does not run under the Metal lease launcher")
+        env = job.get("env", {})
+        for name, value in (
+            ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
+            ("MODEL_PROOF_HUB_ROOT", "${{ vars.MLX_GEN_MODELS_ROOT }}"),
+        ):
+            if env.get(name) != value:
+                errors.append(f"job env {name} is {env.get(name)!r}, expected {value!r}")
+        # The runner stops starting processes inside the loan; the job timeout is only a guard
+        # that must leave the last process time to finish.
+        budget = int(env.get("DECODE_BENCH_BUDGET_MINUTES", "0"))
+        if not 0 < budget <= 110 or job.get("timeout-minutes", 0) < budget + 60:
+            errors.append(f"budget {budget} / timeout {job.get('timeout-minutes')} out of bounds")
+        steps = job["steps"]
+        if "inputs.decode_bench_matrix" in json.dumps(steps):
+            errors.append("a step interpolates the untrusted matrix input")
+        # `real_weights_inline_text` restores each sourced step body inline.
+        bodies = {step.get("name"): step.get("run", "") for step in steps}
+        plan = bodies.get("Validate the matrix and initialize the run-scoped evidence directory", "")
+        if "speculative_bench_campaign.py plan --lane mlx " not in plan:
+            errors.append("the matrix is not planned for the mlx lane")
+        if "stage_pinned_hub_snapshots.py --plan" not in bodies.get("Stage the pinned Hub snapshots", ""):
+            errors.append("the matrix's Hub pins are not staged")
+        run = bodies.get("Build and run every matrix row", "")
+        for fragment in (
+            "speculative_bench_campaign.py run ",
+            '--epic-sha "$GITHUB_SHA"',
+            '--stop-starting-after-minutes "$DECODE_BENCH_BUDGET_MINUTES"',
+            '--epic-target-dir "$DECODE_BENCH_TARGET_DIR"',
+            '--guard "python3.12 -I scripts/ci/mlx_tree_guard.py {cap_gib} ',
+        ):
+            if fragment not in run:
+                errors.append(f"the run step lacks {fragment!r}")
+        if "--pre-epic-root" in run:
+            errors.append("the MLX lane measures epic rows only")
+        # rust-lang/rust#157750: a stripped release build failed `castaway` with E0463.
+        for name in ("CARGO_PROFILE_RELEASE_STRIP", "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP"):
+            if f"export {name}=none" not in run.split("speculative_bench_campaign.py run ")[0]:
+                errors.append(f"the build does not export {name}=none before it runs")
+        target = str(env.get("DECODE_BENCH_TARGET_DIR", ""))
+        if "'/Volumes/Models/sceneworks-ci/decode-speedups-bench/cargo-target'" not in target:
+            errors.append("the rw-starvector build target is not job-owned on /Volumes/Models")
+        if "runner == 'rw-llm'" not in target or "format('{0}/../decode-speedups-bench-target', github.workspace)" not in target:
+            errors.append("the rw-llm build target is not the workspace-sibling directory")
+        if target.count("/Volumes") != 1:
+            errors.append("the rw-llm build target must not be under /Volumes")
+        upload = next((s for s in steps if s.get("name") == "Keep the decode-speedups benchmark documents"), {})
+        if upload.get("if") != "always()" or upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("the documents upload must survive a failed row, a cancel and a timeout")
+        if upload.get("with", {}).get("path") != (
+            "${{ runner.temp }}/decode-speedups-bench-mlx-${{ github.run_id }}-${{ github.run_attempt }}"
+        ):
+            errors.append("the upload is not the run-scoped directory")
+        cuda = workflow["jobs"]["candle-decode-speedups-bench"]
+        names = [s.get("name") for s in cuda["steps"]]
+        if cuda.get("env", {}).get("MODEL_PROOF_HUB_ROOT") != "${{ vars.CANDLE_GEN_MODELS_ROOT }}":
+            errors.append("the CUDA lane does not bind Hub pins under its model root")
+        stage = "Stage the pinned Hub snapshots"
+        if stage not in names or names.index(stage) > names.index(
+            "Build both checkouts and run every matrix row (epic and baseline alternating)"
+        ):
+            errors.append("the CUDA lane does not stage the Hub pins before it runs")
+        card = "Select the campaign card by UUID"
+        if card not in names or names.index(card) > names.index(
+            "Build both checkouts and run every matrix row (epic and baseline alternating)"
+        ):
+            errors.append("the CUDA lane does not select its card before it builds")
+        return errors
+
+    def test_mlx_decode_speedups_bench_is_dispatch_only_on_the_loaned_mac_and_bounded(self) -> None:
+        """SW-7200: the paired speculative-paths campaign on MLX — dispatch-only, on the primary
+        Mac under the Metal lease, the untrusted matrix only through `env:`, its Hub pins staged,
+        a time budget inside the loan, and every document kept; the CUDA lane stages pins too."""
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.mlx_decode_speedups_bench_errors(workflow), [])
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench-mlx'"}),
+            lambda job: job.update({"runs-on": ["self-hosted", "macOS", "ARM64", "rw-llm"]}),
+            lambda job: job["env"].update({"DECODE_BENCH_BUDGET_MINUTES": "170"}),
+            lambda job: job.update({"timeout-minutes": 110}),
+            lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["defaults"]["run"].update({"shell": "bash"}),
+            lambda job: job["env"].update({"DECODE_BENCH_TARGET_DIR": "target"}),
+            lambda job: [
+                step.update({"run": step["run"].replace("export CARGO_PROFILE_RELEASE_STRIP=none", "")})
+                for step in job["steps"]
+                if step.get("name") == "Build and run every matrix row"
+            ],
+            lambda job: job["steps"][2].update({"run": job["steps"][2]["run"] + ' && echo "${{ inputs.decode_bench_matrix }}"'}),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["mlx-decode-speedups-bench"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.mlx_decode_speedups_bench_errors(mutated))
 
 
 class WindowsBashSelectionTests(unittest.TestCase):

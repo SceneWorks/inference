@@ -12,7 +12,7 @@
 
 use candle_core::Tensor;
 use core_llm::speculative::ngram_propose;
-use core_llm::ProposerKind;
+use core_llm::{ngram_propose_tree, DraftTree, ProposerKind};
 
 use crate::decode::engine::{DraftSampler, Drafts, Proposal, ProposeContext, Proposer};
 use crate::decode::step::{StepModel, StepRequest};
@@ -370,6 +370,22 @@ impl Proposer for NgramProposer {
             drafts: Some(Drafts::Host(drafts)),
             dists,
         })
+    }
+
+    /// Every earlier occurrence of the trailing n-gram as one candidate tree (feature SW-F328,
+    /// [`ngram_propose_tree`]); its first branch is [`propose`](Proposer::propose)'s. Every
+    /// candidate is deterministic (a point mass), as the linear proposal's are.
+    fn propose_tree(
+        &mut self,
+        ctx: &ProposeContext<'_>,
+        _: &mut DraftSampler<'_, '_>,
+    ) -> Result<Option<DraftTree>> {
+        Ok(Some(ngram_propose_tree(
+            ctx.history,
+            self.max_ngram,
+            ctx.max_drafts,
+            ctx.max_rows,
+        )))
     }
 
     fn commit(&mut self, _: i32, _: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {

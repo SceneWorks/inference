@@ -17,7 +17,7 @@
 //! (prompt + budget), which is where a preallocated KV cache (story sc-24132) is sized and where
 //! an over-budget request fails closed.
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::engine::RewindableConstraintMask;
@@ -290,6 +290,81 @@ pub trait StepModel {
     /// traits are in scope.
     fn forward_step(&self, cache: &mut Self::Cache, request: StepRequest<'_>)
         -> Result<StepOutput>;
+
+    /// Why this model cannot verify a candidate tree on `cache`, or `None` when it can (feature
+    /// SW-F328). A tree request on a model that cannot verifies linearly, the reason named.
+    fn tree_unsupported(&self, cache: &Self::Cache) -> Option<&'static str> {
+        let _ = cache;
+        Some(TREE_MODEL_UNSUPPORTED)
+    }
+
+    /// Verify `tree` in one forward (feature SW-F328): the anchor and every candidate row, each
+    /// attending only the cached prefix and its own ancestors at the RoPE position of its depth.
+    /// Every row's logits come back (`[1, rows, vocab]`); the cache holds every row until
+    /// [`DecodeCache::commit_tree`] keeps one branch or [`DecodeCache::abort_tree`] drops them.
+    /// Always eager: a tree step is never captured as a CUDA graph.
+    fn forward_tree(&self, cache: &mut Self::Cache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
+        let _ = (cache, tree);
+        Err(Error::Unsupported(TREE_MODEL_UNSUPPORTED.into()))
+    }
+}
+
+/// Why a model without a tree forward verifies linearly (feature SW-F328).
+pub const TREE_MODEL_UNSUPPORTED: &str = "this model verifies only linear proposals";
+
+/// One tree verify forward's inputs (feature SW-F328): the anchor (the last committed token, not
+/// yet in the cache) and the candidate tree after it.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeVerify<'a> {
+    /// The candidates, rows in topological order (row `0` is the anchor).
+    pub tree: &'a core_llm::DraftTree,
+    /// The anchor token.
+    pub anchor: i32,
+    /// Also return the final-normalized hidden rows `[1, rows, hidden]`.
+    pub want_hidden: bool,
+}
+
+impl TreeVerify<'_> {
+    /// The verify rows' ids — the anchor, then every candidate in row order — as `[1, rows]` u32.
+    pub fn ids(&self, device: &Device) -> Result<Tensor> {
+        let mut ids = Vec::with_capacity(self.tree.rows());
+        ids.push(self.anchor);
+        ids.extend(self.tree.nodes().iter().map(|n| n.token));
+        crate::primitives::input_ids(&ids, device)
+    }
+
+    /// Every row's RoPE position: the anchor's `start` plus the row's depth below it.
+    pub fn positions(&self, start: i32) -> Vec<i32> {
+        self.tree.depths().into_iter().map(|d| start + d).collect()
+    }
+
+    /// The additive ancestor-only mask over `[cache ‖ rows]` for a cache of `base` positions,
+    /// `[1, 1, rows, base + rows]`: `0` where a row may attend (the whole prefix, itself and its
+    /// ancestors), a large negative elsewhere.
+    pub fn mask(&self, base: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+        let rows = self.tree.rows();
+        let cols = base + rows;
+        let visible = self.tree.visibility();
+        let mut mask = vec![0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..rows {
+                if !visible[i * rows + j] {
+                    mask[i * cols + base + j] = crate::primitives::attention::MASK_NEG;
+                }
+            }
+        }
+        Ok(Tensor::from_vec(mask, (1, 1, rows, cols), device)?.to_dtype(dtype)?)
+    }
+}
+
+/// One tree verify forward's outputs (feature SW-F328).
+#[derive(Clone, Debug)]
+pub struct TreeOutput {
+    /// Every row's logits and, when asked, the final-normalized hidden rows.
+    pub step: StepOutput,
+    /// Bytes of the forward's ancestor mask — the part of the tree workspace the cache does not
+    /// report ([`DecodeCache::tree_bytes`]).
+    pub mask_bytes: usize,
 }
 
 /// Generate from `prompt_ids` through the [`StepModel`] seam, returning the output and the
@@ -536,6 +611,44 @@ mod tests {
             steps: Cell::new(0),
             vocab: 4,
         }
+    }
+
+    /// SW-F328: a tree verify's ids, RoPE positions and ancestor-only mask over `[cache ‖ rows]`.
+    #[test]
+    fn tree_verify_inputs_follow_the_tree() {
+        let mut tree = core_llm::DraftTree::new();
+        tree.push(0, 7, None).unwrap(); // row 1
+        tree.push(0, 8, None).unwrap(); // row 2
+        tree.push(1, 9, None).unwrap(); // row 3
+        let verify = TreeVerify {
+            tree: &tree,
+            anchor: 5,
+            want_hidden: false,
+        };
+        let ids: Vec<u32> = verify
+            .ids(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(ids, vec![5, 7, 8, 9]);
+        assert_eq!(verify.positions(10), vec![10, 11, 11, 12]);
+        let mask = verify.mask(2, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(mask.dims(), &[1, 1, 4, 6]);
+        let m: Vec<Vec<f32>> = mask
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2()
+            .unwrap();
+        let neg = crate::primitives::attention::MASK_NEG;
+        // Every row sees the two cached positions, itself and its ancestors only.
+        assert_eq!(m[0], vec![0.0, 0.0, 0.0, neg, neg, neg]);
+        assert_eq!(m[1], vec![0.0, 0.0, 0.0, 0.0, neg, neg]);
+        assert_eq!(m[2], vec![0.0, 0.0, 0.0, neg, 0.0, neg]);
+        assert_eq!(m[3], vec![0.0, 0.0, 0.0, 0.0, neg, 0.0]);
     }
 
     #[test]

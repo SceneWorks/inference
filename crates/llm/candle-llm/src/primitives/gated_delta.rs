@@ -779,6 +779,59 @@ fn depthwise_conv_traced(
     ))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tree verification (feature SW-F328, story SW-6915).
+// ---------------------------------------------------------------------------------------------
+
+pub use core_llm::TreePlan;
+
+/// [`TreePlan::conv_windows`] as the tensor index type the tree conv gathers with.
+pub fn tree_conv_windows(plan: &TreePlan, k: usize) -> Vec<Vec<u32>> {
+    plan.conv_windows(k)
+        .into_iter()
+        .map(|w| w.into_iter().map(|i| i as u32).collect())
+        .collect()
+}
+
+/// [`causal_depthwise_conv_traced`] over a verify **tree**: each row convolves its own branch
+/// ([`TreePlan::conv_windows`]) instead of the rows packed before it, with the same per-tap
+/// arithmetic as the linear op chain (so a chain is bit-identical to it). Returns
+/// `(silu(conv) [B, rows, C], [conv_state ‖ x])`.
+pub fn tree_depthwise_conv(
+    x: &Tensor,
+    weight: &Tensor,
+    conv_state: &Tensor,
+    windows: &[Vec<u32>],
+) -> Result<(Tensor, Tensor)> {
+    let c = x.dim(2)?;
+    let kk = weight.dim(1)?;
+    let cat = Tensor::cat(&[conv_state, x], 1)?; // [B, K-1+rows, C]
+    let mut acc: Option<Tensor> = None;
+    for j in 0..kk {
+        let taps: Vec<u32> = windows.iter().map(|w| w[j]).collect();
+        let idx = Tensor::from_vec(taps, windows.len(), x.device())?;
+        let window = cat.index_select(&idx, 1)?; // [B, rows, C]
+        let wj = weight.narrow(1, j, 1)?.contiguous()?.reshape((1, 1, c))?;
+        let term = window.broadcast_mul(&wj)?;
+        acc = Some(match acc {
+            None => term,
+            Some(a) => a.broadcast_add(&term)?,
+        });
+    }
+    Ok((silu(&acc.expect("conv kernel size must be >= 1"))?, cat))
+}
+
+/// A tree verify forward's per-row states, held until the engine keeps one branch.
+#[derive(Clone, Debug)]
+struct TreeStates {
+    /// The conv input `[conv_state ‖ tree rows]`.
+    cat: Tensor,
+    /// Every row's conv taps ([`TreePlan::conv_windows`]).
+    windows: Vec<Vec<u32>>,
+    /// Every row's recurrent state after the row, `[1, Hv, Dv, Dk]`.
+    states: Vec<Tensor>,
+}
+
 /// Gated RMSNorm (`Qwen3NextRMSNormGated`): `rms_norm(x, weight, eps) · silu(gate)`. Applied to the
 /// delta-net output before the out-projection (`x`, `gate`, and `weight` share the head-value dim).
 pub fn rms_norm_gated(x: &Tensor, weight: &Tensor, gate: &Tensor, eps: f64) -> Result<Tensor> {
@@ -947,6 +1000,8 @@ pub struct DeltaNetCache {
     /// `(position, conv tail, SSM state)` the last prefill captured — compact copies, never views
     /// of the ring ([`captured`](Self::captured)).
     captured: Option<(i32, Tensor, Tensor)>,
+    /// The per-row states of a tree verify forward not yet kept or dropped (feature SW-F328).
+    tree: Option<TreeStates>,
 }
 
 impl DeltaNetCache {
@@ -1032,6 +1087,7 @@ impl DeltaNetCache {
                 ring: None,
                 capture: None,
                 captured: None,
+                tree: None,
             });
         };
         spec.validate()?;
@@ -1043,6 +1099,7 @@ impl DeltaNetCache {
             ring: None,
             capture: None,
             captured: None,
+            tree: None,
         };
         if self.ring.is_none() && self.conv_state.is_none() {
             // Nothing to carry: only the geometry changes (still lazily allocated).
@@ -1505,6 +1562,138 @@ impl DeltaNetCache {
         Ok(y)
     }
 
+    /// Run the recurrence over a verify **tree** (feature SW-F328): every row continues the state
+    /// of its parent row (the live state for the anchor), so each row's state is the one a linear
+    /// decode of its branch reaches. The rows of one depth run as one batched single-token step,
+    /// so a tree costs one recurrence dispatch per depth level. The live state, the ring and the
+    /// position are untouched until [`commit_tree`](Self::commit_tree) keeps one branch
+    /// ([`abort_tree`](Self::abort_tree) drops them all). `cat` and `windows` are the forward's
+    /// [`tree_depthwise_conv`] input and taps; `q`, `k`, `v`, `g`, `beta` are shaped as for
+    /// [`gated_delta_recurrence`] with `B = 1`, `T = rows`. Returns `y` `[1, rows, Hv, Dv]` in
+    /// row order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_tree(
+        &mut self,
+        plan: &TreePlan,
+        cat: Tensor,
+        windows: Vec<Vec<u32>>,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> Result<Tensor> {
+        let rows = plan.rows();
+        if q.dims()[..2] != [1, rows] || windows.len() != rows {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance_tree: inputs {:?} for a {rows}-row tree",
+                q.dims()
+            )));
+        }
+        if self.offset > 0 && self.ssm_state.is_none() {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance_tree: the live state at position {} was lost to a failed \
+                 forward; reset the cache first",
+                self.offset
+            )));
+        }
+        self.tree = None;
+        let device = q.device();
+        let mut states: Vec<Option<Tensor>> = vec![None; rows];
+        let mut ys = Vec::with_capacity(rows);
+        let mut order = Vec::with_capacity(rows);
+        for level in plan.levels() {
+            let m = level.len();
+            let idx: Vec<u32> = level.iter().map(|&r| r as u32).collect();
+            let idx = Tensor::from_vec(idx, m, device)?;
+            // `[1, rows, ...]` → `[m, 1, ...]`: the level's rows are one decode step's batch.
+            let batch = |x: &Tensor| -> Result<Tensor> {
+                let picked = x.index_select(&idx, 1)?;
+                let mut shape = picked.dims().to_vec();
+                shape[0] = m;
+                shape[1] = 1;
+                Ok(picked.reshape(shape)?)
+            };
+            let start = match plan.parents[level[0]] {
+                // The anchor level: the live state (a fresh cache starts from zeros).
+                None => self.ssm_state.clone(),
+                Some(_) => {
+                    let parents = level
+                        .iter()
+                        .map(|&r| {
+                            plan.parents[r]
+                                .and_then(|p| states[p].as_ref())
+                                .ok_or_else(|| Error::Msg("tree row before its parent".into()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Some(Tensor::cat(&parents, 0)?)
+                }
+            };
+            let (y, next) = gated_delta_recurrence(
+                &batch(q)?,
+                &batch(k)?,
+                &batch(v)?,
+                &batch(g)?,
+                &batch(beta)?,
+                start.as_ref(),
+            )?;
+            for (i, &r) in level.iter().enumerate() {
+                states[r] = Some(next.narrow(0, i, 1)?);
+            }
+            let (_, _, hv, dv) = y.dims4()?; // [m, 1, Hv, Dv]
+            ys.push(y.reshape((1, m, hv, dv))?);
+            order.extend(level);
+        }
+        // Back from level order to row order.
+        let mut inverse = vec![0u32; rows];
+        for (packed, &row) in order.iter().enumerate() {
+            inverse[row] = packed as u32;
+        }
+        let inverse = Tensor::from_vec(inverse, rows, device)?;
+        let y = Tensor::cat(&ys, 1)?.index_select(&inverse, 1)?;
+        self.tree = Some(TreeStates {
+            cat,
+            windows,
+            states: states
+                .into_iter()
+                .map(|s| s.expect("every row ran"))
+                .collect(),
+        });
+        Ok(y)
+    }
+
+    /// Keep the tree branch `path` (rows from the anchor) of the last tree forward (feature
+    /// SW-F328): each kept row's conv tail and recurrent state are committed as a linear step of
+    /// one token would commit them — written into the ring slot of its position, the live state
+    /// a view of the newest — so the cache equals a linear decode of the branch, rollback window
+    /// included.
+    pub fn commit_tree(&mut self, path: &[usize]) -> Result<()> {
+        let tree = self.tree.take().ok_or_else(|| {
+            Error::Msg("DeltaNetCache::commit_tree: no tree forward to keep a branch of".into())
+        })?;
+        for &row in path {
+            let taps = &tree.windows[row];
+            let tail = Tensor::from_slice(&taps[1..], taps.len() - 1, tree.cat.device())?;
+            let conv = tree.cat.index_select(&tail, 1)?;
+            self.update(conv, tree.states[row].clone(), 1)?;
+        }
+        Ok(())
+    }
+
+    /// Drop a tree forward's per-row states, keeping the live state (feature SW-F328).
+    pub fn abort_tree(&mut self) {
+        self.tree = None;
+    }
+
+    /// Bytes a pending tree forward holds (its conv input and per-row states).
+    pub fn tree_bytes(&self) -> usize {
+        self.tree.as_ref().map_or(0, |t| {
+            t.states.iter().fold(tensor_bytes(&t.cat), |acc, s| {
+                acc.saturating_add(tensor_bytes(s))
+            })
+        })
+    }
+
     /// The host side of a `t`-token step whose device work a CUDA-graph replay did (sc-24441):
     /// exactly the restorable-window and live-view bookkeeping [`advance_at`](Self::advance_at)
     /// does with device positions, and the position advances by `t`. Needs the ring, and a
@@ -1604,6 +1793,7 @@ impl DeltaNetCache {
         self.offset = 0;
         self.capture = None;
         self.captured = None;
+        self.tree = None;
         if let Some(ring) = self.ring.as_mut() {
             ring.lo = 1;
         }
@@ -1637,6 +1827,7 @@ impl DeltaNetCache {
             ring,
             capture: None,
             captured: self.captured.clone(),
+            tree: None,
         })
     }
 
@@ -2831,6 +3022,111 @@ mod tests {
     /// max abs error `<= 1e-6` — for every `K in 1..=5`, `j in 0..=K + 1`; the rollback is a slot
     /// selection (the ring's addresses never change) and positions past the ring's depth are the
     /// typed refusal.
+    /// SW-F328: the tree conv windows of a chain are the linear conv's, and a tree row's taps
+    /// follow its branch then the pre-step history.
+    #[test]
+    fn tree_conv_windows_follow_each_branch() {
+        let mut chain = core_llm::DraftTree::new();
+        for r in 0..3 {
+            chain.push(r, 1, None).unwrap();
+        }
+        let windows = tree_conv_windows(&TreePlan::new(&chain), 4);
+        let linear: Vec<Vec<u32>> = (0..4u32).map(|s| (s..s + 4).collect()).collect();
+        assert_eq!(windows, linear);
+        let mut tree = core_llm::DraftTree::new();
+        tree.push(0, 1, None).unwrap(); // row 1
+        tree.push(0, 2, None).unwrap(); // row 2
+        tree.push(2, 3, None).unwrap(); // row 3
+        let plan = TreePlan::new(&tree);
+        assert_eq!(plan.depths, vec![0, 1, 1, 2]);
+        // `[h0 h1 h2 | r0 r1 r2 r3]`: row 3 reads h2, r0, r2, r3 (oldest first).
+        assert_eq!(plan.conv_windows(4)[3], vec![2, 3, 5, 6]);
+        assert_eq!(plan.conv_windows(4)[2], vec![1, 2, 3, 5]);
+        assert_eq!(plan.levels(), vec![vec![0], vec![1, 2], vec![3]]);
+    }
+
+    /// SW-F328 (the recurrence and conv primitives, no learned layer): a tree step from a live
+    /// ringed state gives every row on a branch the output a linear decode of the branch gives,
+    /// and committing the branch leaves the linear decode's live state, rollback window and
+    /// position; an abort leaves the cache as it was.
+    #[test]
+    fn a_tree_step_commits_exactly_the_linear_decode_of_its_branch() {
+        let fixture = ring_inputs(7, 3);
+        let weight = Tensor::from_slice(CW, (RC, RK), &Device::Cpu).unwrap();
+        let rows = |x: &Tensor, idx: &[u32]| {
+            x.index_select(&Tensor::new(idx, &Device::Cpu).unwrap(), 1)
+                .unwrap()
+        };
+        // Prefix: fixture rows 0..3. Tree: anchor = row 3, candidates rows 4, 5, 6 with parents
+        // (anchor, anchor, row 1); keep the branch anchor → row 1 → row 3.
+        let mut tree = core_llm::DraftTree::new();
+        for parent in [0, 0, 1] {
+            tree.push(parent, 0, None).unwrap();
+        }
+        let plan = TreePlan::new(&tree);
+        let mut cache = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+        feed(&mut cache, &fixture, 0, 3);
+        let before = live(&cache);
+        let (q, k, v, g, beta, x) = &fixture;
+        let picked = [3u32, 4, 5, 6];
+        let windows = tree_conv_windows(&plan, RK);
+        let conv_state = cache.conv_state().unwrap().clone();
+        let (_out, cat) =
+            tree_depthwise_conv(&rows(x, &picked), &weight, &conv_state, &windows).unwrap();
+        let y = cache
+            .advance_tree(
+                &plan,
+                cat.clone(),
+                windows.clone(),
+                &rows(q, &picked),
+                &rows(k, &picked),
+                &rows(v, &picked),
+                &rows(g, &picked),
+                &rows(beta, &picked),
+            )
+            .unwrap();
+        assert_eq!(cache.offset(), 3, "nothing advances before a commit");
+        assert!(cache.tree_bytes() > 0);
+        // The branch decoded linearly, one token at a time.
+        let mut linear = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+        feed(&mut linear, &fixture, 0, 3);
+        let branch = [3u32, 4, 6];
+        let mut ys = Vec::new();
+        for &r in &branch {
+            let one = |t: &Tensor| rows(t, &[r]);
+            let fx: Fixture = (one(q), one(k), one(v), one(g), one(beta), one(x));
+            ys.push(host(&feed(&mut linear, &fx, 0, 1)));
+        }
+        for (i, row) in [0usize, 1, 3].into_iter().enumerate() {
+            let tree_y = host(&y.narrow(1, row, 1).unwrap());
+            assert!(max_abs_diff(&tree_y, &ys[i]) < 1e-6, "row {row}");
+        }
+        cache.commit_tree(&[0, 1, 3]).unwrap();
+        assert_eq!(cache.offset(), linear.offset());
+        assert_eq!(cache.tree_bytes(), 0);
+        let (a, b) = (live(&cache).unwrap(), live(&linear).unwrap());
+        assert!(max_abs_diff(&a.0, &b.0) < 1e-6 && max_abs_diff(&a.1, &b.1) < 1e-6);
+        assert_eq!(cache.restorable(), linear.restorable());
+        // An aborted tree step leaves the live state and position untouched.
+        let mut aborted = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+        feed(&mut aborted, &fixture, 0, 3);
+        aborted
+            .advance_tree(
+                &plan,
+                cat,
+                windows,
+                &rows(q, &picked),
+                &rows(k, &picked),
+                &rows(v, &picked),
+                &rows(g, &picked),
+                &rows(beta, &picked),
+            )
+            .unwrap();
+        aborted.abort_tree();
+        assert_eq!((aborted.offset(), live(&aborted)), (3, before));
+        assert_eq!(aborted.tree_bytes(), 0);
+    }
+
     #[test]
     fn ring_restores_every_position_of_a_verify_step_exactly() {
         for k in 1..=5usize {

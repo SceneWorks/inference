@@ -57,6 +57,7 @@ mod model_input_macros;
 #[path = "../../gen-core/src/model_input_proof.rs"]
 pub mod model_input_proof;
 
+pub mod block_draft;
 pub mod cancel;
 pub mod capabilities;
 pub mod constraint;
@@ -96,10 +97,15 @@ pub mod tokenizer;
 pub mod tool;
 pub mod vision_preprocess;
 
+pub use block_draft::{
+    block_draft_capabilities, block_draft_refusal_reason, BlockDraftConfig, BlockDraftFormat,
+    BlockDraftHead, BlockDraftLoadGroup, BlockDraftPrecision, BlockDraftRefusal, BlockDraftTarget,
+    BLOCK_DRAFT_GROUP_SIZE, BLOCK_DRAFT_RECOMMENDED_DEPTH, DFLASH2_CONVS,
+};
 pub use cancel::CancelFlag;
 pub use capabilities::{
     ModelSamplingDefaults, MtpCapabilities, ProposerCapabilities, TextLlmCapabilities,
-    TextLlmDescriptor,
+    TextLlmDescriptor, TreeVerifyCapabilities,
 };
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
@@ -160,12 +166,13 @@ pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use report::{
-    prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeReport, DraftReport,
-    FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
+    prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeDraft, DecodeReport,
+    DraftReport, DraftTime, FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
+    TreeVerifyReport,
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
-    Speculative, SpeculativeProposer, TextLlmRequest, ThinkingMode,
+    Speculative, SpeculativeProposer, SpeculativeVerify, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_draft_load, admit_load_memory, admit_request_memory, admit_request_memory_with_geometry,
@@ -177,14 +184,22 @@ pub use resource::{
     tiled_prefill_activation_bytes, LlmMemoryGeometry, AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
+pub use speculative::tree::{
+    build_lattice_tree, ngram_propose_tree, resolve_tree_verify, resolve_tree_verify_with,
+    tree_workspace_rows, DraftLattice, DraftTree, LatticeSampler, LatticeTreeError, TreePlan,
+    TreeResolution, TreeWalk, MAX_TREE_ROWS,
+};
 pub use speculative::{
-    accept_greedy_run, accept_token, decode_clock, demotion_threshold, draft_compatibility,
+    accept_greedy_run, accept_token, auto_block_draft_decision, auto_block_draft_tier,
+    auto_prefers_block_draft, decode_clock, demotion_threshold, draft_compatibility,
     draft_load_refusal, draft_model_capabilities, draft_refusal, draft_tokenizer_refusal,
     draft_unpriced_refusal, fit_draft_context, greedy_commit, ngram_propose, no_proposer_fallback,
-    prompt_lookup_capabilities, resolve_speculative, settle_draft, verify_depth_bound,
-    with_decode_clock, Acceptance, AcceptanceMonitor, DecodeClock, DemotionBasis, MonitorDecision,
-    PlainDecode, ProposerKind, SpeculativePlan, SpeculativeResolution, StepObservation, WallClock,
-    ACCEPTANCE_PROBE_VERIFIES, CANDLE_MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
+    prompt_lookup_capabilities, resolve_speculative, resolve_speculative_with, settle_draft,
+    verify_depth_bound, with_decode_clock, withdraws_auto_block_draft, Acceptance,
+    AcceptanceMonitor, AutoBlockDraftDecision, DecodeClock, DemotionBasis, MonitorDecision,
+    PlainDecode, ProposerKind, ResidentQuantization, SpeculativePlan, SpeculativeResolution,
+    StepObservation, WallClock, ACCEPTANCE_PROBE_VERIFIES, AUTO_BLOCK_DRAFT_DECISIONS,
+    AUTO_BLOCK_DRAFT_NOT_ADMITTED, CANDLE_MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT,
     CANDLE_PROMPT_LOOKUP_DEMOTE_BELOW_AT_ONE_DRAFT,
     CANDLE_PROMPT_LOOKUP_DEMOTE_BELOW_PER_EXTRA_DRAFT, CAPTIONER_NO_PREFIX_CACHE,
     CAPTIONER_NO_PROPOSER, CLEAR_LOSS_CONFIDENCE_Z, CLEAR_LOSS_GAIN, CLEAR_LOSS_MIN_TIMED_STEPS,

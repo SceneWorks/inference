@@ -122,8 +122,8 @@ pub fn load_memory_required_bytes(spec: &core_llm::LoadSpec) -> core_llm::Result
     load_memory::required_bytes(spec)
 }
 pub use snapshot::{
-    write_hf_snapshot, write_hf_snapshot_without_native_mtp, write_snapshot, SnapshotReport,
-    SnapshotTokenizer,
+    write_hf_snapshot, write_hf_snapshot_tier, write_hf_snapshot_without_native_mtp,
+    write_snapshot, write_snapshot_tier, SnapshotReport, SnapshotTokenizer,
 };
 pub use starvector_1b::StarVector1bProvider;
 pub use starvector_8b::StarVector8bProvider;

@@ -50,17 +50,34 @@ pub enum ProposerKind {
     PromptLookup,
     /// A separate draft model.
     DraftModel,
+    /// A block draft reading the target's hidden rows (SW-F360).
+    BlockDraft,
 }
 
 impl ProposerKind {
     /// Stable lower-case label for logs and evidence rows (`none`, `mtp`, `prompt_lookup`,
-    /// `draft_model`).
+    /// `draft_model`, `block_draft`).
     pub fn label(self) -> &'static str {
         match self {
             ProposerKind::None => "none",
             ProposerKind::Mtp => "mtp",
             ProposerKind::PromptLookup => "prompt_lookup",
             ProposerKind::DraftModel => "draft_model",
+            ProposerKind::BlockDraft => "block_draft",
+        }
+    }
+
+    /// Whether this proposer can put more than one candidate at a position — a **branching**
+    /// tree under a tree request (feature SW-F328). Prompt lookup does
+    /// ([`ngram_propose_tree`](tree::ngram_propose_tree)), and so does a block draft (SW-7196:
+    /// every scored row carries its top-`K` candidates); the MTP head and a draft model propose
+    /// one branch, which a tree request caps at its row bound and verifies on the linear path.
+    /// Admission and cache sizing price tree workspace only for a proposer that builds trees
+    /// ([`tree_workspace_rows`](tree::tree_workspace_rows)).
+    pub fn builds_trees(self) -> bool {
+        match self {
+            ProposerKind::PromptLookup | ProposerKind::BlockDraft => true,
+            ProposerKind::None | ProposerKind::Mtp | ProposerKind::DraftModel => false,
         }
     }
 }
@@ -71,6 +88,7 @@ impl From<crate::SpeculativeProposer> for ProposerKind {
             crate::SpeculativeProposer::Mtp => ProposerKind::Mtp,
             crate::SpeculativeProposer::PromptLookup => ProposerKind::PromptLookup,
             crate::SpeculativeProposer::DraftModel => ProposerKind::DraftModel,
+            crate::SpeculativeProposer::BlockDraft => ProposerKind::BlockDraft,
         }
     }
 }
@@ -137,15 +155,31 @@ pub fn resolve_speculative(
     mode: crate::Speculative,
     capabilities: &crate::TextLlmCapabilities,
 ) -> SpeculativeResolution {
+    resolve_speculative_with(mode, capabilities, false)
+}
+
+/// [`resolve_speculative`] with `auto`'s block-draft preference (SW-7200): when
+/// `auto_prefers_block_draft`, `auto` runs an advertised `block_draft` at its recommended depth
+/// before MTP and prompt lookup; otherwise it is exactly [`resolve_speculative`]. A provider
+/// passes [`auto_prefers_block_draft`] for its backend, resident draft format and target tier —
+/// `false` with no resident draft, and wherever no decision is recorded or the recorded one does
+/// not prefer the draft.
+pub fn resolve_speculative_with(
+    mode: crate::Speculative,
+    capabilities: &crate::TextLlmCapabilities,
+    auto_prefers_block_draft: bool,
+) -> SpeculativeResolution {
     use crate::{Speculative, SpeculativeProposer};
     let run = |proposer, depth| SpeculativeResolution {
         plan: SpeculativePlan::Run { proposer, depth },
         fallback: None,
     };
+    let block_draft = auto_prefers_block_draft.then_some(SpeculativeProposer::BlockDraft);
     match mode {
         Speculative::Off => SpeculativeResolution::default(),
-        Speculative::Auto => [SpeculativeProposer::Mtp, SpeculativeProposer::PromptLookup]
+        Speculative::Auto => block_draft
             .into_iter()
+            .chain([SpeculativeProposer::Mtp, SpeculativeProposer::PromptLookup])
             .find_map(|p| capabilities.proposer(p))
             .map(|cap| {
                 run(
@@ -182,6 +216,174 @@ pub fn resolve_speculative(
             }
         },
     }
+}
+
+/// Whether `auto` runs a resident block draft ahead of MTP on one backend, block-draft format and
+/// target tier (SW-7200) — a decision the paired speculative-paths campaign
+/// (`scripts/release/speculative_bench_campaign.py paths`) measured, with the reason. A block draft
+/// is trained for one target model and the load refuses it on any other, so the format names the
+/// model; the tier is the target's resident projection format (`q4`, `q8`, `bf16`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoBlockDraftDecision {
+    /// The decode backend measured.
+    pub backend: crate::DecodeBackend,
+    /// The resident draft's format.
+    pub format: crate::BlockDraftFormat,
+    /// The target's resident tier (`q4`, `q8`, `bf16`).
+    pub tier: &'static str,
+    /// Whether `auto` runs the block draft ahead of MTP and prompt lookup.
+    pub prefer: bool,
+    /// The measured reason (the campaign row and the margins it showed).
+    pub reason: &'static str,
+}
+
+/// Every recorded [`AutoBlockDraftDecision`], from the SW-7200 speculative-paths campaigns on a
+/// Qwen3.8-27B target (report: `docs/migration/evidence/sw-7200/speculative-paths.md`, data
+/// beside it). The rule: a pair is preferred where its block draft — at its recommended depth,
+/// linear check — beats MTP at its recommended depth on mean decode speed **and** matches or beats
+/// it on mean full-request time, in **both** cold (256-token) and reused (64-token) context. A
+/// preferred draft still runs under `auto`'s acceptance monitor, which demotes it to plain decoding
+/// on a request where it is measurably slower. A pair with no entry is unmeasured and keeps
+/// `auto`'s MTP-then-prompt-lookup order. Ratios below are decode / request against MTP.
+pub const AUTO_BLOCK_DRAFT_DECISIONS: &[AutoBlockDraftDecision] = &[
+    // Candle/CUDA — campaign run 44516873473.
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q4",
+        prefer: false,
+        reason: "run 44516873473: DFlash2 1.49x plain vs MTP 1.70x — loses",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q4",
+        prefer: false,
+        reason: "run 44516873473: DSpine 1.48x plain vs MTP 1.70x — loses",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q8",
+        prefer: false,
+        reason: "run 44516873473: DFlash2 2.00x plain vs MTP 2.04x — loses on every prompt",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::CandleCuda,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q8",
+        prefer: false,
+        reason: "run 44516873473: DSpine 1.92x plain vs MTP 2.04x — loses",
+    },
+    // MLX (M5 Max 128 GB) — campaign runs 44587316639 (every row but q4 cold) and 44605799110
+    // (the q4 cold rows).
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q4",
+        prefer: true,
+        reason: "runs 44605799110/44587316639: DFlash2 vs MTP cold 1.33/1.29, reused 1.84/1.81 \
+                 — beats it on every prompt",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DFlash2,
+        tier: "q8",
+        prefer: true,
+        reason: "run 44587316639: DFlash2 vs MTP cold 1.16/1.03, reused 1.20/1.19",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q4",
+        prefer: true,
+        reason: "runs 44605799110/44587316639: DSpine vs MTP cold 1.29/1.25, reused 1.07/1.00",
+    },
+    AutoBlockDraftDecision {
+        backend: crate::DecodeBackend::Mlx,
+        format: crate::BlockDraftFormat::DSpine,
+        tier: "q8",
+        prefer: true,
+        reason: "run 44587316639: DSpine vs MTP cold 1.13/1.10, reused 1.07/1.06",
+    },
+];
+
+/// The recorded decision for `backend`, `format` and `tier`, or `None` (not measured — `auto` keeps
+/// its MTP-then-prompt-lookup order).
+pub fn auto_block_draft_decision(
+    backend: crate::DecodeBackend,
+    format: crate::BlockDraftFormat,
+    tier: &str,
+) -> Option<&'static AutoBlockDraftDecision> {
+    AUTO_BLOCK_DRAFT_DECISIONS
+        .iter()
+        .find(|d| d.backend == backend && d.format == format && d.tier == tier)
+}
+
+/// What a loaded target's projections actually hold — the resident fact the tier an
+/// [`AutoBlockDraftDecision`] is keyed by comes from, whether the weights were quantized at load
+/// or stored quantized in a prepared snapshot. Projections a quantized load keeps dense (an LM
+/// head, a predictor) do not make it mixed; quantized projections of more than one width or
+/// representation do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentQuantization {
+    /// Every projection dense.
+    Dense,
+    /// Every quantized projection is an integer block/group code of this bit width.
+    Bits(u32),
+    /// Every quantized projection is NVFP4.
+    Nvfp4,
+    /// Mixed widths or representations, a representation with no tier (Prism), or not known.
+    Unknown,
+}
+
+/// The target tier an [`AutoBlockDraftDecision`] is keyed by, from the resident projections:
+/// 4 bits → `q4`, 8 bits → `q8`, dense → `bf16`, NVFP4 → `nvfp4`; anything else (mixed,
+/// another width, unknown) → `None`, which no decision matches.
+pub fn auto_block_draft_tier(resident: ResidentQuantization) -> Option<&'static str> {
+    match resident {
+        ResidentQuantization::Dense => Some("bf16"),
+        ResidentQuantization::Bits(4) => Some("q4"),
+        ResidentQuantization::Bits(8) => Some("q8"),
+        ResidentQuantization::Nvfp4 => Some("nvfp4"),
+        ResidentQuantization::Bits(_) | ResidentQuantization::Unknown => None,
+    }
+}
+
+/// The `auto_prefers_block_draft` argument of [`resolve_speculative_with`] for a provider on
+/// `backend` holding `resident_draft` (its format, `None` with no block draft resident) beside a
+/// target whose projections hold `resident`: the recorded decision's `prefer`, `false` when no
+/// draft is resident, the tier is unknown or nothing is recorded.
+pub fn auto_prefers_block_draft(
+    backend: crate::DecodeBackend,
+    resident_draft: Option<crate::BlockDraftFormat>,
+    resident: ResidentQuantization,
+) -> bool {
+    resident_draft
+        .zip(auto_block_draft_tier(resident))
+        .and_then(|(format, tier)| auto_block_draft_decision(backend, format, tier))
+        .is_some_and(|d| d.prefer)
+}
+
+/// The fallback a request names when `auto`'s preferred block draft did not fit the request's
+/// memory and `auto` resolved again without it (SW-7200): a request `auto` admitted before a block
+/// draft was preferred is never refused for the preference.
+pub const AUTO_BLOCK_DRAFT_NOT_ADMITTED: &str = "speculative: auto's block draft did not fit this \
+     request's memory; resolved without it";
+
+/// Whether a request's memory refusal `error` withdraws `auto`'s block draft (SW-7200): the request
+/// asked for `auto` (`mode`), the route it priced runs a block draft (`route`), and the refusal is
+/// the request's memory ([`Error::RequestResourceExhausted`](crate::Error::RequestResourceExhausted)).
+/// The provider then resolves again without the preference and names
+/// [`AUTO_BLOCK_DRAFT_NOT_ADMITTED`]; an explicit `block_draft` request keeps its refusal.
+pub fn withdraws_auto_block_draft(
+    mode: crate::Speculative,
+    route: ProposerKind,
+    error: &crate::Error,
+) -> bool {
+    mode == crate::Speculative::Auto
+        && route == ProposerKind::BlockDraft
+        && matches!(error, crate::Error::RequestResourceExhausted(_))
 }
 
 /// How an `auto` fallback with no runnable proposer begins; the reason follows in parentheses.
@@ -548,9 +750,10 @@ pub enum PlainDecode {
 /// The mean accepted length per verify below which `proposer` at `depth` loses to `plain`
 /// decoding at the cheapest measured verify cost (see the constants above), or `None` when no
 /// demotion applies: no proposer, a zero depth, prompt lookup falling back to MLX's unpipelined
-/// loop (no measured regression there), or `draft_model` — which [`Speculative::Auto`] never
-/// resolves to ([`resolve_speculative`] picks MTP, else prompt lookup) and whose cost the campaign
-/// did not measure.
+/// loop (no measured regression there), or `draft_model` / `block_draft`, whose verify cost no
+/// campaign measured. [`Speculative::Auto`] never resolves to `draft_model`; it resolves to
+/// `block_draft` only where a recorded decision prefers it ([`resolve_speculative_with`]), and
+/// there the timed [`AcceptanceMonitor`] judges it on its own measured costs.
 ///
 /// [`Speculative::Auto`]: crate::Speculative::Auto
 pub fn demotion_threshold(proposer: ProposerKind, depth: u32, plain: PlainDecode) -> Option<f64> {
@@ -571,7 +774,7 @@ pub fn demotion_threshold(proposer: ProposerKind, depth: u32, plain: PlainDecode
         (ProposerKind::Mtp, PlainDecode::MlxPipelined | PlainDecode::MlxUnpipelined) => {
             Some(MTP_DEMOTE_BELOW_AT_ONE_DRAFT + MTP_DEMOTE_BELOW_PER_EXTRA_DRAFT * extra)
         }
-        (ProposerKind::None | ProposerKind::DraftModel, _) => None,
+        (ProposerKind::None | ProposerKind::DraftModel | ProposerKind::BlockDraft, _) => None,
     }
 }
 
@@ -926,8 +1129,9 @@ impl AcceptanceMonitor {
     /// [`Speculative::Auto`](crate::Speculative::Auto) and it resolved to a proposer (`proposer` /
     /// `depth` are what the engine will actually run, after any route fallback) the monitor can
     /// judge against the `plain` loop a demotion would fall back to — one with a static
-    /// [`demotion_threshold`] there, or, when the engine times its steps (`timed`), MTP or prompt
-    /// lookup at a non-zero depth (its own measured costs decide).
+    /// [`demotion_threshold`] there, or, when the engine times its steps (`timed`), MTP, prompt
+    /// lookup or a block draft (SW-7200: `auto` runs one where a recorded decision prefers it) at
+    /// a non-zero depth (its own measured costs decide).
     pub fn for_request(
         mode: crate::Speculative,
         proposer: ProposerKind,
@@ -941,7 +1145,10 @@ impl AcceptanceMonitor {
         let threshold = demotion_threshold(proposer, depth, plain);
         let measurable = timed
             && depth > 0
-            && matches!(proposer, ProposerKind::Mtp | ProposerKind::PromptLookup);
+            && matches!(
+                proposer,
+                ProposerKind::Mtp | ProposerKind::PromptLookup | ProposerKind::BlockDraft
+            );
         if threshold.is_none() && !measurable {
             return None;
         }
@@ -1368,6 +1575,8 @@ fn weight_of(candidates: &[(i32, f32)], token: i32) -> f32 {
         .map(|&(_, w)| w)
         .unwrap_or(0.0)
 }
+
+pub mod tree;
 
 #[cfg(test)]
 mod tests;

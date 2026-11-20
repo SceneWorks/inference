@@ -25,8 +25,8 @@
 
 use core_llm::{
     DecodeReport, FinishReason, LoadReport, LoadSpec, Message, ProposerKind, Quantize,
-    ReasoningEffort, Sampling, Speculative, SpeculativeProposer, StreamEvent, TextLlm,
-    TextLlmCapabilities, TextLlmRequest, ThinkingMode,
+    ReasoningEffort, Sampling, Speculative, SpeculativeProposer, SpeculativeVerify, StreamEvent,
+    TextLlm, TextLlmCapabilities, TextLlmRequest, ThinkingMode,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -589,24 +589,88 @@ struct Observed {
     wall: Duration,
     prompt_tokens: u32,
     timings: Option<core_llm::GenerationTimings>,
+    memory: MemoryReading,
+}
+
+/// What a [`BenchMemory`] read around one generation (both `None` without a reader).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryReading {
+    /// Bytes in use as the request began.
+    before: Option<u64>,
+    /// The most bytes in use while it ran.
+    peak: Option<u64>,
+}
+
+/// A backend's memory reader for the benchmark's per-request peak (SW-7200), handed in by the
+/// entry point. The readings include the resident weights (and, on a device, whatever else holds
+/// it), so a row's peak minus its `memory_before_bytes` is what the request itself added.
+pub struct BenchMemory<'a> {
+    /// What the readings are, recorded verbatim (`mlx_allocator`, `cuda_device_used`).
+    pub source: &'static str,
+    /// The bytes in use now, or `None` when the device cannot say.
+    pub used: &'a dyn Fn() -> Option<u64>,
+    /// The backend's own high-water mark, when it keeps one: `reset` restarts it before a
+    /// request and `read` returns it after. Without one the bench takes the largest `used`
+    /// reading at the request's start, at every streamed token and at its end — a lower bound on
+    /// a transient between tokens.
+    pub peak: Option<BenchHighWater<'a>>,
+}
+
+/// A backend's own memory high-water mark ([`BenchMemory::peak`]): restart it, then read it.
+pub type BenchHighWater<'a> = (&'a dyn Fn(), &'a dyn Fn() -> Option<u64>);
+
+impl BenchMemory<'_> {
+    /// The document's `memory` object: the reader's source and how its peak is taken.
+    fn to_json(&self) -> Value {
+        json!({
+            "source": self.source,
+            "peak": if self.peak.is_some() { "backend_high_water" } else { "max_at_tokens" },
+        })
+    }
 }
 
 fn observe(provider: &dyn TextLlm, req: &TextLlmRequest) -> Result<Observed, String> {
+    observe_with(provider, req, None)
+}
+
+fn observe_with(
+    provider: &dyn TextLlm,
+    req: &TextLlmRequest,
+    memory: Option<&BenchMemory<'_>>,
+) -> Result<Observed, String> {
     provider
         .validate(req)
         .map_err(|e| format!("validate refused the request: {e}"))?;
     let mut tokens = Vec::new();
     let mut ttft = None;
+    if let Some((reset, _)) = memory.and_then(|m| m.peak) {
+        reset();
+    }
+    let before = memory.and_then(|m| (m.used)());
+    let mut sampled = before;
+    // Only a reader without its own high-water mark is read per token.
+    let per_token = memory.filter(|m| m.peak.is_none());
     let started = Instant::now();
     let out = provider
         .generate(req, &mut |event| {
             if let StreamEvent::Token { id, text, .. } = event {
                 ttft.get_or_insert_with(|| started.elapsed());
                 tokens.push((id, text));
+                if let Some(used) = per_token.and_then(|m| (m.used)()) {
+                    sampled = Some(sampled.map_or(used, |s| s.max(used)));
+                }
             }
         })
         .map_err(|e| format!("generate failed: {e}"))?;
     let wall = started.elapsed();
+    let peak = match memory {
+        Some(BenchMemory {
+            peak: Some((_, read)),
+            ..
+        }) => read(),
+        Some(m) => (m.used)().map_or(sampled, |end| Some(sampled.map_or(end, |s| s.max(end)))),
+        None => None,
+    };
     Ok(Observed {
         tokens,
         text: out.text,
@@ -617,6 +681,7 @@ fn observe(provider: &dyn TextLlm, req: &TextLlmRequest) -> Result<Observed, Str
         wall,
         prompt_tokens: out.usage.prompt_tokens,
         timings: out.timings,
+        memory: MemoryReading { before, peak },
     })
 }
 
@@ -775,6 +840,197 @@ pub const BENCH_DEFAULT_REPEATS: u32 = 3;
 /// request itself — the closest warm-up, and nothing for it to leak.
 pub const BENCH_WARMUP_PROMPT: &str = "Count from one to ten in words, one number per line.";
 
+/// A [`BenchOption`]'s value that may name what the loaded model advertises: a number, `"max"` —
+/// the proposer's `max_depth` / the tree's `max_rows` — or, for a depth, `"recommended"` — the
+/// proposer's `recommended_depth`, the depth `auto` runs it at (SW-7200).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchBound {
+    /// Exactly this value.
+    Fixed(u32),
+    /// The loaded model's advertised maximum.
+    Max,
+    /// The loaded model's advertised recommended depth (a depth only).
+    Recommended,
+}
+
+impl BenchBound {
+    fn from_wire(value: &Value, key: &str) -> Result<Self, String> {
+        match value {
+            Value::String(s) if s == "max" => Ok(Self::Max),
+            Value::String(s) if s == "recommended" && key == "depth" => Ok(Self::Recommended),
+            v => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n >= 1)
+                .map(Self::Fixed)
+                .ok_or_else(|| format!("`{key}` must be a positive integer or \"max\", got {v}")),
+        }
+    }
+
+    fn to_wire(self) -> Value {
+        match self {
+            Self::Fixed(n) => json!(n),
+            Self::Max => json!("max"),
+            Self::Recommended => json!("recommended"),
+        }
+    }
+
+    /// The value, with `Max` / `Recommended` read as the advertised `(max, recommended)`
+    /// (`fallback` when nothing is advertised — the request then falls back with the reason
+    /// named, never a failure).
+    fn resolve(self, advertised: Option<(u32, u32)>, fallback: u32) -> u32 {
+        match self {
+            Self::Fixed(n) => n,
+            Self::Max => advertised.map_or(fallback, |(max, _)| max).max(1),
+            Self::Recommended => advertised.map_or(fallback, |(_, rec)| rec).max(1),
+        }
+    }
+}
+
+/// One option a benchmark runs every prompt under (`SPECULATIVE_BENCH_OPTIONS`): either a
+/// speculative option exactly as the request wire spells it (`"off"`, `"auto"`,
+/// `{"proposer", "depth": N}`), verified linearly — every pre-SW-7200 option — or a **path**
+/// (SW-7200) `{"proposer", "depth": N | "max" | "recommended", "verify": "linear" | {"tree":
+/// {"max_rows": N | "max"}}}` whose `"max"` reads the loaded model's advertised bound and
+/// `"recommended"` its recommended depth, so a campaign row asks for the verify bound — or the
+/// depth `auto` runs — on each backend without naming it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchOption {
+    /// A request-wire speculative option, verified linearly.
+    Plain(Speculative),
+    /// A proposer at a depth, under a verify layout.
+    Path {
+        /// The proposal source.
+        proposer: SpeculativeProposer,
+        /// Drafts per verify pass.
+        depth: BenchBound,
+        /// `None` verifies linearly; `Some` asks for a tree of at most this many rows.
+        tree_rows: Option<BenchBound>,
+    },
+}
+
+impl From<Speculative> for BenchOption {
+    fn from(speculative: Speculative) -> Self {
+        Self::Plain(speculative)
+    }
+}
+
+impl PartialEq<Speculative> for BenchOption {
+    fn eq(&self, other: &Speculative) -> bool {
+        *self == Self::Plain(*other)
+    }
+}
+
+impl BenchOption {
+    /// Parse one option (see the type docs), naming what was wrong on a refusal.
+    pub fn from_wire(value: &Value) -> Result<Self, String> {
+        let path = value.as_object().filter(|map| {
+            map.contains_key("verify") || map.get("depth").is_some_and(Value::is_string)
+        });
+        let Some(map) = path else {
+            return serde_json::from_value(value.clone())
+                .map(Self::Plain)
+                .map_err(|e| e.to_string());
+        };
+        if let Some(extra) = map
+            .keys()
+            .find(|k| !["proposer", "depth", "verify"].contains(&k.as_str()))
+        {
+            return Err(format!("unexpected option field `{extra}`"));
+        }
+        let proposer = map
+            .get("proposer")
+            .and_then(Value::as_str)
+            .ok_or("an option path needs a string `proposer`")?
+            .parse::<SpeculativeProposer>()
+            .map_err(|e| e.to_string())?;
+        let depth = BenchBound::from_wire(map.get("depth").unwrap_or(&Value::Null), "depth")?;
+        let tree_rows = match map.get("verify") {
+            None => None,
+            Some(Value::String(s)) if s == "linear" => None,
+            Some(Value::Object(verify)) if verify.len() == 1 && verify.contains_key("tree") => {
+                let tree = verify["tree"]
+                    .as_object()
+                    .filter(|t| t.len() == 1 && t.contains_key("max_rows"))
+                    .ok_or("`verify.tree` must be {\"max_rows\": N | \"max\"}")?;
+                Some(BenchBound::from_wire(&tree["max_rows"], "max_rows")?)
+            }
+            Some(other) => {
+                return Err(format!(
+                    "`verify` must be \"linear\" or {{\"tree\": {{\"max_rows\": N | \"max\"}}}}, got {other}"
+                ))
+            }
+        };
+        Ok(Self::Path {
+            proposer,
+            depth,
+            tree_rows,
+        })
+    }
+
+    /// The option as written (a plain option in the request wire form).
+    pub fn to_wire(&self) -> Value {
+        match *self {
+            Self::Plain(speculative) => json!(speculative),
+            Self::Path {
+                proposer,
+                depth,
+                tree_rows,
+            } => json!({
+                "proposer": proposer,
+                "depth": depth.to_wire(),
+                "verify": tree_rows.map_or(json!("linear"), |rows| {
+                    json!({"tree": {"max_rows": rows.to_wire()}})
+                }),
+            }),
+        }
+    }
+
+    /// The speculative option and verify layout a request under this option carries on a model
+    /// advertising `caps`: `"max"` reads the advertised bound; a proposer or tree the model does
+    /// not advertise is still requested (at depth 1 / [`core_llm::MAX_TREE_ROWS`]), so the
+    /// request falls back with the reason named in its report instead of the row going missing.
+    pub fn request(&self, caps: &TextLlmCapabilities) -> (Speculative, SpeculativeVerify) {
+        match *self {
+            Self::Plain(speculative) => (speculative, SpeculativeVerify::Linear),
+            Self::Path {
+                proposer,
+                depth,
+                tree_rows,
+            } => {
+                let advertised = caps
+                    .proposer(proposer)
+                    .map(|c| (c.max_depth, c.recommended_depth));
+                let depth = depth.resolve(advertised, 1);
+                let verify =
+                    tree_rows.map_or(SpeculativeVerify::Linear, |rows| SpeculativeVerify::Tree {
+                        max_rows: rows.resolve(
+                            caps.tree_verify.map(|t| (t.max_rows, t.max_rows)),
+                            core_llm::MAX_TREE_ROWS,
+                        ),
+                    });
+                (Speculative::proposer(proposer, depth), verify)
+            }
+        }
+    }
+}
+
+/// The row keys the harness writes beyond the pre-epic schema (SW-7200's per-path telemetry):
+/// the baseline driver predates them, so a schema comparison leaves them out.
+pub const BENCH_PATH_ROW_KEYS: [&str; 8] = [
+    "speculative",
+    "verify",
+    "wall_ms",
+    "draft_ms",
+    "draft",
+    "draft_time",
+    "tree_verify",
+    "peak_memory_bytes",
+];
+
+/// The document keys the harness writes beyond the pre-epic schema (SW-7200).
+pub const BENCH_PATH_DOCUMENT_KEYS: [&str; 1] = ["memory"];
+
 /// What a benchmark run measures and labels.
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
@@ -788,7 +1044,7 @@ pub struct BenchConfig {
     /// greedy baseline, or a seeded stochastic setting — the product's `auto` + temperature path.
     pub sampling: Sampling,
     /// The options each prompt runs under, in row order.
-    pub options: Vec<Speculative>,
+    pub options: Vec<BenchOption>,
     /// Run each (prompt, option) once untimed before its measured repeats (see
     /// [`BENCH_WARMUP_PROMPT`] for which request the warm-up sends).
     pub warmup: bool,
@@ -814,6 +1070,15 @@ pub struct BenchSample {
     /// Prompt tokens this repeat restored from the cross-turn prefix cache (`None` without a
     /// decode report).
     pub prefix_hit_tokens: Option<u64>,
+    /// Wall time of the whole request, from the `generate` call to its return (SW-7200).
+    pub wall_ms: Option<f64>,
+    /// The proposer's summed wall time ([`DecodeReport::draft_time`]); `None` when no proposer
+    /// call ran or the backend does not time it.
+    pub draft_ms: Option<f64>,
+    /// Bytes in use as the request began ([`BenchMemory`]); `None` without a reader.
+    pub memory_before_bytes: Option<u64>,
+    /// The most bytes in use while it ran; `None` without a reader.
+    pub peak_memory_bytes: Option<u64>,
 }
 
 impl BenchSample {
@@ -826,6 +1091,10 @@ impl BenchSample {
             "decode_ms": self.decode_ms,
             "generated_tokens": self.generated_tokens,
             "prefix_hit_tokens": self.prefix_hit_tokens,
+            "wall_ms": self.wall_ms,
+            "draft_ms": self.draft_ms,
+            "memory_before_bytes": self.memory_before_bytes,
+            "peak_memory_bytes": self.peak_memory_bytes,
         })
     }
 }
@@ -903,7 +1172,20 @@ impl BenchStats {
 /// | `graph_path` | [`DecodeReport::graph_path`] |
 /// | `fused` | `{"path", "reason"}` — [`DecodeReport::fused_primitives`] |
 /// | `fallbacks` | [`DecodeReport::fallbacks`] |
-/// | `samples` | one object per repeat: `ttft_ms`, `decode_tok_s`, `prefill_ms`, `decode_ms`, `generated_tokens`, `prefix_hit_tokens` |
+/// | `samples` | one object per repeat: `ttft_ms`, `decode_tok_s`, `prefill_ms`, `decode_ms`, `generated_tokens`, `prefix_hit_tokens`, and (SW-7200) `wall_ms`, `draft_ms`, `memory_before_bytes`, `peak_memory_bytes` |
+///
+/// SW-7200 adds the per-path keys ([`BENCH_PATH_ROW_KEYS`]; the pre-epic driver writes none of
+/// them):
+///
+/// | key | meaning |
+/// |-----|---------|
+/// | `speculative`, `verify` | the speculative option and verify layout the request carried — `requested` with any `"max"` read from the advertised bound |
+/// | `wall_ms` | [`BenchStats`] of the whole request's wall time (`generate` call to return) |
+/// | `draft_ms` | [`BenchStats`] of the proposer's summed wall time per repeat ([`DecodeReport::draft_time`]) |
+/// | `draft` | `{"source", "format", "precision"}` — [`DecodeReport::draft`] — or `null` |
+/// | `draft_time` | the first repeat's `{"calls", "host_synchronized_calls", "total_ms", "per_call_ms"}`; `null` when no proposer call ran or the backend does not time it |
+/// | `tree_verify` | [`TreeVerifyReport`](core_llm::TreeVerifyReport)'s counters plus `rows_per_pass`, `accepted_per_pass`, `rows_per_tree_pass`, `accepted_per_tree_pass`; `null` unless the tree ran |
+/// | `peak_memory_bytes` | [`BenchStats`] of each repeat's peak bytes in use ([`BenchMemory`]); `null` without a reader |
 ///
 /// Every key above `samples` but the timing statistics is the **first** measured repeat's (the
 /// repeat the warm-up isolation covers, [`BENCH_WARMUP_PROMPT`]). With a prefix cache on, later
@@ -916,7 +1198,11 @@ pub struct BenchRow {
     /// Its class.
     pub class: PromptClass,
     /// The option requested.
-    pub requested: Speculative,
+    pub requested: BenchOption,
+    /// The speculative option the request carried (`requested` with `"max"` resolved).
+    pub speculative: Speculative,
+    /// The verify layout the request carried.
+    pub verify: SpeculativeVerify,
     /// The reasoning setting the request carried.
     pub thinking: BenchThinking,
     /// Prompt tokens.
@@ -939,10 +1225,16 @@ impl BenchRow {
             BenchStats::json_of(&self.samples.iter().filter_map(f).collect::<Vec<_>>())
         };
         let path_json = |p: &core_llm::PathReport| json!({"path": p.path, "reason": p.reason});
-        json!({
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let peaks: Vec<f64> = self
+            .samples
+            .iter()
+            .filter_map(|s| s.peak_memory_bytes.map(|b| b as f64))
+            .collect();
+        let mut row = json!({
             "prompt_id": self.prompt_id,
             "class": self.class.label(),
-            "requested": self.requested,
+            "requested": self.requested.to_wire(),
             "thinking": self.thinking.label(),
             "proposer": report.map(|r| r.proposer.label()),
             "path": report.map(|r| r.path.clone()),
@@ -975,7 +1267,52 @@ impl BenchRow {
             "fused": report.map(|r| path_json(&r.fused_primitives)),
             "fallbacks": report.map(|r| r.fallbacks.clone()),
             "samples": self.samples.iter().map(BenchSample::to_json).collect::<Vec<_>>(),
-        })
+        });
+        let tree = report.and_then(|r| r.tree_verify).map(|t| {
+            json!({
+                "max_rows": t.max_rows,
+                "passes": t.passes,
+                "tree_passes": t.tree_passes,
+                "rows_verified": t.rows_verified,
+                "tree_rows_verified": t.tree_rows_verified,
+                "tree_accepted_tokens": t.tree_accepted_tokens,
+                "max_rows_per_pass": t.max_rows_per_pass,
+                "accepted_tokens": t.accepted_tokens,
+                "peak_workspace_bytes": t.peak_workspace_bytes,
+                "rows_per_pass": t.rows_per_pass(),
+                "accepted_per_pass": t.accepted_per_pass(),
+                "rows_per_tree_pass": t.rows_per_tree_pass(),
+                "accepted_per_tree_pass": t.accepted_per_tree_pass(),
+            })
+        });
+        let draft_time = report.and_then(|r| r.draft_time).map(|t| {
+            json!({
+                "calls": t.calls,
+                "host_synchronized_calls": t.host_synchronized_calls,
+                "total_ms": ms(t.total),
+                "per_call_ms": t.per_call().map(ms),
+            })
+        });
+        let draft = report
+            .and_then(|r| r.draft.as_ref())
+            .map(|d| json!({"source": d.source, "format": d.format, "precision": d.precision}));
+        // The SW-7200 per-path keys (`BENCH_PATH_ROW_KEYS`), added beside the pre-epic schema.
+        let path_keys = [
+            ("speculative", json!(self.speculative)),
+            ("verify", json!(self.verify)),
+            ("wall_ms", series(|s| s.wall_ms)),
+            ("draft_ms", series(|s| s.draft_ms)),
+            ("draft", draft.unwrap_or(Value::Null)),
+            ("draft_time", draft_time.unwrap_or(Value::Null)),
+            ("tree_verify", tree.unwrap_or(Value::Null)),
+            ("peak_memory_bytes", BenchStats::json_of(&peaks)),
+        ];
+        if let Some(object) = row.as_object_mut() {
+            for (key, value) in path_keys {
+                object.insert(key.into(), value);
+            }
+        }
+        row
     }
 }
 
@@ -1010,6 +1347,8 @@ pub struct BenchDocument {
     pub provenance: BenchProvenance,
     /// One row per (prompt, option), prompt-major.
     pub rows: Vec<BenchRow>,
+    /// The memory reader's `{"source", "peak"}` (SW-7200), or `null` without one.
+    pub memory: Value,
 }
 
 impl BenchDocument {
@@ -1037,10 +1376,11 @@ impl BenchDocument {
             "thinking": self.config.thinking.to_json(&self.capabilities),
             "warmup": self.config.warmup,
             "repeats": self.config.repeats,
-            "options": self.config.options,
+            "options": self.config.options.iter().map(BenchOption::to_wire).collect::<Vec<_>>(),
             "load": load,
             "provenance": self.provenance.to_json(),
             "rows": self.rows.iter().map(BenchRow::to_json).collect::<Vec<_>>(),
+            "memory": self.memory,
         })
     }
 
@@ -1075,6 +1415,14 @@ fn bench_sample(run: &Observed) -> (BenchSample, &'static str) {
         decode_tok_s: (decode_s > 0.0).then(|| f64::from(run.generated) / decode_s),
         generated_tokens: run.generated,
         prefix_hit_tokens: run.report.as_ref().map(|r| r.prefix_hit_tokens),
+        wall_ms: Some(run.wall.as_secs_f64() * 1e3),
+        draft_ms: run
+            .report
+            .as_ref()
+            .and_then(|r| r.draft_time)
+            .map(|t| t.total.as_secs_f64() * 1e3),
+        memory_before_bytes: run.memory.before,
+        peak_memory_bytes: run.memory.peak,
     };
     (sample, timing_source)
 }
@@ -1091,6 +1439,17 @@ pub fn run_speculative_bench(
     prompts: &[BenchPrompt],
     config: &BenchConfig,
 ) -> Result<BenchDocument, String> {
+    run_speculative_bench_with(provider, prompts, config, None)
+}
+
+/// [`run_speculative_bench`] with a backend memory reader (SW-7200): every measured repeat records
+/// the bytes in use as it began and its peak ([`BenchMemory`]); the warm-up is not read.
+pub fn run_speculative_bench_with(
+    provider: &dyn TextLlm,
+    prompts: &[BenchPrompt],
+    config: &BenchConfig,
+    memory: Option<&BenchMemory<'_>>,
+) -> Result<BenchDocument, String> {
     if config.repeats == 0 {
         return Err("a benchmark row needs at least one measured repeat".into());
     }
@@ -1100,20 +1459,19 @@ pub fn run_speculative_bench(
         .and_then(|r| r.prefix_cache_bytes)
         .is_some_and(|bytes| bytes > 0);
     let warmup_prompt = BenchPrompt::user("warmup", PromptClass::OpenEnded, BENCH_WARMUP_PROMPT);
-    let request = |prompt: &BenchPrompt, option: Speculative| {
-        let mut req = bench_request(prompt, option, &config.sampling, config.max_new_tokens);
+    let capabilities = provider.descriptor().capabilities.clone();
+    let request = |prompt: &BenchPrompt, option: &BenchOption| {
+        let (speculative, verify) = option.request(&capabilities);
+        let mut req = bench_request(prompt, speculative, &config.sampling, config.max_new_tokens);
+        req.speculative_verify = verify;
         config.thinking.apply(&mut req);
         req
     };
     let mut rows = Vec::with_capacity(prompts.len() * config.options.len());
     for prompt in prompts {
-        for &option in &config.options {
+        for option in &config.options {
             let req = request(prompt, option);
-            let tag = format!(
-                "[{}] {}",
-                prompt.id,
-                serde_json::to_string(&option).unwrap_or_default()
-            );
+            let tag = format!("[{}] {}", prompt.id, option.to_wire());
             if config.warmup {
                 let warm = if isolated_warmup {
                     request(&warmup_prompt, option)
@@ -1125,8 +1483,8 @@ pub fn run_speculative_bench(
             let mut first = None;
             let mut samples = Vec::with_capacity(config.repeats as usize);
             for repeat in 0..config.repeats {
-                let run =
-                    observe(provider, &req).map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
+                let run = observe_with(provider, &req, memory)
+                    .map_err(|e| format!("{tag} repeat {repeat}: {e}"))?;
                 let (sample, timing_source) = bench_sample(&run);
                 samples.push(sample);
                 first.get_or_insert((run, timing_source));
@@ -1135,7 +1493,9 @@ pub fn run_speculative_bench(
             rows.push(BenchRow {
                 prompt_id: prompt.id.clone(),
                 class: prompt.class,
-                requested: option,
+                requested: *option,
+                speculative: req.speculative_mode(),
+                verify: req.speculative_verify,
                 thinking: config.thinking,
                 prompt_tokens: run.prompt_tokens,
                 generated_tokens: run.generated,
@@ -1148,9 +1508,10 @@ pub fn run_speculative_bench(
     Ok(BenchDocument {
         config: config.clone(),
         load,
-        capabilities: provider.descriptor().capabilities.clone(),
+        capabilities,
         provenance: BenchProvenance::collect(Vec::new(), &bench_env)?,
         rows,
+        memory: memory.map_or(Value::Null, BenchMemory::to_json),
     })
 }
 
@@ -1196,6 +1557,7 @@ pub fn bench_load_spec(
         quantize: parse_bench_format(&format)?,
         mtp_head_source: var("SPECULATIVE_BENCH_MTP_HEAD"),
         draft_source: var("SPECULATIVE_BENCH_DRAFT"),
+        draft_quantize: None,
         prefix_cache_bytes,
         ..LoadSpec::dense(snapshot)
     })
@@ -1228,9 +1590,11 @@ pub fn bench_config(
         }
     });
     let options = match var("SPECULATIVE_BENCH_OPTIONS") {
-        Some(json) => serde_json::from_str(&json)
+        Some(json) => serde_json::from_str::<Vec<Value>>(&json)
+            .map_err(|e| e.to_string())
+            .and_then(|list| list.iter().map(BenchOption::from_wire).collect())
             .map_err(|e| format!("SPECULATIVE_BENCH_OPTIONS is not a JSON option list: {e}"))?,
-        None => vec![Speculative::Off, Speculative::Auto],
+        None => vec![Speculative::Off.into(), Speculative::Auto.into()],
     };
     let sampling = match var("SPECULATIVE_BENCH_SAMPLING") {
         Some(spec) => {
@@ -1260,7 +1624,7 @@ pub fn bench_config(
 /// |----------|---------|
 /// | `SPECULATIVE_BENCH_SNAPSHOT` | snapshot directory (config.json, tokenizer*.json, shards) |
 /// | `SPECULATIVE_BENCH_OUTPUT` | JSON path to write (must not exist) |
-/// | `SPECULATIVE_BENCH_OPTIONS` | JSON array of speculative options (default `["off","auto"]`), e.g. `["off",{"proposer":"prompt_lookup","depth":4}]` |
+/// | `SPECULATIVE_BENCH_OPTIONS` | JSON array of [`BenchOption`]s (default `["off","auto"]`), e.g. `["off",{"proposer":"prompt_lookup","depth":4},{"proposer":"block_draft","depth":"max","verify":{"tree":{"max_rows":"max"}}}]` |
 /// | `SPECULATIVE_BENCH_SAMPLING` | JSON sampling spec (default `"greedy"`; [`parse_bench_sampling`]), e.g. `{"temperature":0.7,"top_p":0.9}` (seed pinned to 0) |
 /// | `SPECULATIVE_BENCH_FORMAT` | projection format quantized at load ([`parse_bench_format`]): `bf16` (default), `q8`, `q4`, `nvfp4` |
 /// | `SPECULATIVE_BENCH_DRAFT` | draft model snapshot (`LoadSpec::draft_source`; default none) |
@@ -1280,11 +1644,13 @@ pub fn bench_config(
 /// `switches` (the backend's runtime switches, read after the run) and the raw
 /// [`BENCH_SWITCHES`] / [`BENCH_ENV`] variables. The provenance is collected once before the load
 /// too, so a binary that is not the checkout's ([`reconcile_git_provenance`]) is refused before it
-/// measures anything.
+/// measures anything. `memory` is the backend's reader for each repeat's peak bytes in use
+/// ([`BenchMemory`]; `None` records `null`).
 pub fn run_speculative_bench_from_env(
     default_backend: &str,
     load: DraftLoader<'_>,
     switches: BenchSwitches<'_>,
+    memory: Option<&BenchMemory<'_>>,
 ) -> Result<(PathBuf, BenchDocument), String> {
     let snapshot =
         bench_env("SPECULATIVE_BENCH_SNAPSHOT").ok_or("set SPECULATIVE_BENCH_SNAPSHOT")?;
@@ -1300,7 +1666,12 @@ pub fn run_speculative_bench_from_env(
     let config = bench_config(&snapshot, default_backend, &bench_env)?;
     BenchProvenance::collect(Vec::new(), &bench_env)?;
     let provider = load(&spec).map_err(|e| format!("load {snapshot}: {e}"))?;
-    let mut doc = run_speculative_bench(provider.as_ref(), &speculative_prompt_set(), &config)?;
+    let mut doc = run_speculative_bench_with(
+        provider.as_ref(),
+        &speculative_prompt_set(),
+        &config,
+        memory,
+    )?;
     doc.provenance = BenchProvenance::collect(switches(), &bench_env)?;
     doc.write_new(&output)
         .map_err(|e| format!("write {}: {e}", output.display()))?;
@@ -1339,9 +1710,9 @@ pub fn check_speculative_bench_on_fixture(
         max_new_tokens: 8,
         sampling: Sampling::greedy(),
         options: vec![
-            Speculative::Off,
-            Speculative::proposer(SpeculativeProposer::PromptLookup, 3),
-            Speculative::Auto,
+            Speculative::Off.into(),
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 3).into(),
+            Speculative::Auto.into(),
         ],
         warmup: true,
         repeats: 2,
@@ -1472,7 +1843,7 @@ pub fn check_speculative_bench_on_fixture(
         warm.as_ref(),
         &prompts[..1],
         &BenchConfig {
-            options: vec![Speculative::Off],
+            options: vec![Speculative::Off.into()],
             ..config
         },
     )?;
@@ -1528,6 +1899,8 @@ mod tests {
         seen: RefCell<Vec<String>>,
         /// Each request's reasoning controls, in request order.
         seen_thinking: RefCell<Vec<(ThinkingMode, Option<ReasoningEffort>)>>,
+        /// Each request's speculative option and verify layout, in request order.
+        seen_speculative: RefCell<Vec<(Speculative, SpeculativeVerify)>>,
     }
 
     fn stub(diverge: bool, mislabel: bool) -> SpeculativeStub {
@@ -1551,6 +1924,7 @@ mod tests {
             prefix_cache_bytes: Some(0),
             seen: RefCell::default(),
             seen_thinking: RefCell::default(),
+            seen_speculative: RefCell::default(),
         }
     }
 
@@ -1586,6 +1960,9 @@ mod tests {
             self.seen_thinking
                 .borrow_mut()
                 .push((req.thinking, req.reasoning_effort));
+            self.seen_speculative
+                .borrow_mut()
+                .push((req.speculative_mode(), req.speculative_verify));
             let speculating = plan.proposer() != ProposerKind::None;
             let mut text = String::new();
             for i in 0..req.max_new_tokens as usize {
@@ -1649,6 +2026,11 @@ mod tests {
                         plain_step_ns: Some(10_000_000),
                         basis: core_llm::DemotionBasis::Measured,
                         demoted: true,
+                    }),
+                    draft_time: speculating.then_some(core_llm::DraftTime {
+                        calls: 4,
+                        host_synchronized_calls: 4,
+                        total: Duration::from_millis(8),
                     }),
                     ..Default::default()
                 }),
@@ -1733,8 +2115,8 @@ mod tests {
             backend: "test".into(),
             max_new_tokens: 5,
             options: vec![
-                Speculative::Off,
-                Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
+                Speculative::Off.into(),
+                Speculative::proposer(SpeculativeProposer::PromptLookup, 4).into(),
             ],
             warmup: true,
             sampling: Sampling::greedy(),
@@ -1770,6 +2152,7 @@ mod tests {
                 "backend",
                 "load",
                 "max_new_tokens",
+                "memory",
                 "model",
                 "options",
                 "provenance",
@@ -1916,7 +2299,7 @@ mod tests {
     fn the_warmup_runs_the_measured_request_unless_a_prefix_cache_could_carry_it_over() {
         let prompts = speculative_prompt_set();
         let config = BenchConfig {
-            options: vec![Speculative::Off],
+            options: vec![Speculative::Off.into()],
             repeats: 2,
             ..stub_config()
         };
@@ -2129,7 +2512,7 @@ mod tests {
         provider.descriptor.capabilities.supports_thinking = true;
         provider.descriptor.capabilities.supports_reasoning_effort = true;
         let config = BenchConfig {
-            options: vec![Speculative::Off],
+            options: vec![Speculative::Off.into()],
             repeats: 2,
             thinking: BenchThinking::Effort(ReasoningEffort::Medium),
             ..stub_config()
@@ -2317,5 +2700,238 @@ mod tests {
         };
         assert!(reconcile_git_provenance(checkout(false), (None, None), &wrong).is_err());
         assert!(reconcile_git_provenance(checkout(false), (None, None), &unpermitted).is_err());
+    }
+
+    /// SW-7200: a path option names a proposer, a depth and a verify layout, `"max"` reading the
+    /// loaded model's advertised bound; a plain option keeps the request wire form it always had;
+    /// a malformed option is refused, never run as something else.
+    #[test]
+    fn a_bench_option_resolves_its_depth_and_tree_against_the_advertised_bounds() {
+        let parse = |text: &str| BenchOption::from_wire(&serde_json::from_str(text).unwrap());
+        assert_eq!(parse(r#""off""#), Ok(Speculative::Off.into()));
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 4);
+        assert_eq!(
+            parse(r#"{"proposer": "prompt_lookup", "depth": 4}"#),
+            Ok(lookup.into())
+        );
+        let tree = parse(
+            r#"{"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": "max"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tree,
+            BenchOption::Path {
+                proposer: SpeculativeProposer::BlockDraft,
+                depth: BenchBound::Max,
+                tree_rows: Some(BenchBound::Max),
+            }
+        );
+        let linear = parse(r#"{"proposer": "mtp", "depth": 3, "verify": "linear"}"#).unwrap();
+        let recommended =
+            parse(r#"{"proposer": "block_draft", "depth": "recommended", "verify": "linear"}"#)
+                .unwrap();
+        // The wire form round-trips; a plain option is written as the request writes it.
+        for option in [
+            tree,
+            linear,
+            recommended,
+            lookup.into(),
+            Speculative::Auto.into(),
+        ] {
+            assert_eq!(BenchOption::from_wire(&option.to_wire()), Ok(option));
+        }
+        assert_eq!(BenchOption::from(lookup).to_wire(), json!(lookup));
+        for bad in [
+            r#"{"proposer": "block_draft", "depth": "most"}"#,
+            r#"{"proposer": "block_draft", "depth": 0, "verify": "linear"}"#,
+            r#"{"proposer": "block_draft", "depth": 4, "verify": "tree"}"#,
+            r#"{"proposer": "block_draft", "depth": 4, "verify": {"tree": {}}}"#,
+            r#"{"proposer": "block_draft", "depth": 4, "verify": {"tree": {"max_rows": "recommended"}}}"#,
+            r#"{"proposer": "sometimes", "depth": "max"}"#,
+            r#"{"proposer": "mtp", "depth": "max", "format": "dspine"}"#,
+            r#""sometimes""#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+
+        let caps = TextLlmCapabilities {
+            speculative: vec![ProposerCapabilities {
+                proposer: SpeculativeProposer::BlockDraft,
+                max_depth: 4,
+                recommended_depth: 3,
+            }],
+            tree_verify: Some(core_llm::TreeVerifyCapabilities { max_rows: 12 }),
+            ..Default::default()
+        };
+        assert_eq!(
+            recommended.request(&caps),
+            (
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 3),
+                SpeculativeVerify::Linear
+            )
+        );
+        assert_eq!(
+            tree.request(&caps),
+            (
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+                SpeculativeVerify::Tree { max_rows: 12 }
+            )
+        );
+        assert_eq!(
+            linear.request(&caps),
+            (
+                Speculative::proposer(SpeculativeProposer::Mtp, 3),
+                SpeculativeVerify::Linear
+            )
+        );
+        // Nothing advertised: the request still names the proposer and a tree, so the provider
+        // falls back with the reason in its report.
+        assert_eq!(
+            tree.request(&TextLlmCapabilities::default()),
+            (
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 1),
+                SpeculativeVerify::Tree {
+                    max_rows: core_llm::MAX_TREE_ROWS
+                }
+            )
+        );
+        // The env knob takes the path form beside the plain one.
+        let knobs = |name: &str| {
+            (name == "SPECULATIVE_BENCH_OPTIONS").then(|| {
+                r#"["off", {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 16}}}]"#
+                    .to_string()
+            })
+        };
+        let config = bench_config("/snap/m", "mlx", &knobs).unwrap();
+        assert_eq!(config.options[0], Speculative::Off);
+        assert_eq!(
+            config.options[1],
+            BenchOption::Path {
+                proposer: SpeculativeProposer::BlockDraft,
+                depth: BenchBound::Max,
+                tree_rows: Some(BenchBound::Fixed(16)),
+            }
+        );
+    }
+
+    /// SW-7200: every row records the request it actually sent (`speculative`, `verify`), the
+    /// whole-request wall time, the proposer's time and each repeat's memory — the backend's own
+    /// high-water mark when it keeps one, else the largest reading at the streamed tokens.
+    #[test]
+    fn the_bench_records_each_paths_request_draft_time_and_memory() {
+        let prompts = speculative_prompt_set();
+        let path = BenchOption::Path {
+            proposer: SpeculativeProposer::PromptLookup,
+            depth: BenchBound::Max,
+            tree_rows: Some(BenchBound::Fixed(3)),
+        };
+        let config = BenchConfig {
+            options: vec![Speculative::Off.into(), path],
+            repeats: 2,
+            ..stub_config()
+        };
+        let provider = stub(false, false);
+
+        // A reader without a high-water mark: one reading per token, rising by one each time.
+        let used = std::cell::Cell::new(100u64);
+        let next = || {
+            used.set(used.get() + 1);
+            Some(used.get())
+        };
+        let sampled = BenchMemory {
+            source: "test_used",
+            used: &next,
+            peak: None,
+        };
+        let doc =
+            run_speculative_bench_with(&provider, &prompts[..1], &config, Some(&sampled)).unwrap();
+        // The stub advertises prompt lookup at max depth 7 and no tree: the path asked for both.
+        assert_eq!(
+            provider.seen_speculative.borrow()[3],
+            (
+                Speculative::proposer(SpeculativeProposer::PromptLookup, 7),
+                SpeculativeVerify::Tree { max_rows: 3 }
+            )
+        );
+        let json = doc.to_json();
+        assert_eq!(
+            json["memory"],
+            json!({"source": "test_used", "peak": "max_at_tokens"})
+        );
+        let off = &json["rows"][0];
+        assert_eq!(off["requested"], "off");
+        assert_eq!(off["speculative"], "off");
+        assert_eq!(off["verify"], "linear");
+        assert_eq!(off["draft_time"], Value::Null);
+        assert_eq!(off["draft_ms"], Value::Null);
+        let lookup = &json["rows"][1];
+        assert_eq!(lookup["requested"], path.to_wire());
+        assert_eq!(
+            lookup["speculative"],
+            json!({"proposer": "prompt_lookup", "depth": 7})
+        );
+        assert_eq!(lookup["verify"], json!({"tree": {"max_rows": 3}}));
+        assert_eq!(
+            lookup["draft_time"],
+            json!({"calls": 4, "host_synchronized_calls": 4, "total_ms": 8.0, "per_call_ms": 2.0})
+        );
+        assert_eq!(lookup["draft_ms"]["mean"], 8.0);
+        assert_eq!(lookup["wall_ms"]["n"], 2);
+        for row in [off, lookup] {
+            for sample in row["samples"].as_array().unwrap() {
+                // Five tokens: a reading before, one per token and one at the end.
+                let before = sample["memory_before_bytes"].as_u64().unwrap();
+                assert_eq!(
+                    sample["peak_memory_bytes"].as_u64(),
+                    Some(before + 6),
+                    "{sample}"
+                );
+                assert!(sample["wall_ms"].is_number(), "{sample}");
+            }
+            assert_eq!(row["peak_memory_bytes"]["n"], 2);
+        }
+
+        // A reader with its own high-water mark: reset before, read after, no per-token reads.
+        let resets = std::cell::Cell::new(0);
+        let reset = || resets.set(resets.get() + 1);
+        let reads = std::cell::Cell::new(0);
+        let current = || {
+            reads.set(reads.get() + 1);
+            Some(7)
+        };
+        let high_water = || Some(42);
+        let tracked = BenchMemory {
+            source: "test_allocator",
+            used: &current,
+            peak: Some((&reset, &high_water)),
+        };
+        let doc =
+            run_speculative_bench_with(&provider, &prompts[..1], &config, Some(&tracked)).unwrap();
+        // Two options x two repeats; the warm-ups are not read.
+        assert_eq!((resets.get(), reads.get()), (4, 4));
+        let json = doc.to_json();
+        assert_eq!(json["memory"]["peak"], "backend_high_water");
+        let sample = &json["rows"][1]["samples"][0];
+        assert_eq!(
+            (&sample["memory_before_bytes"], &sample["peak_memory_bytes"]),
+            (&json!(7), &json!(42))
+        );
+
+        // Without a reader nothing is invented.
+        let json = run_speculative_bench(&provider, &prompts[..1], &config)
+            .unwrap()
+            .to_json();
+        assert_eq!(json["memory"], Value::Null);
+        assert_eq!(json["rows"][0]["peak_memory_bytes"], Value::Null);
+        assert_eq!(
+            json["rows"][0]["samples"][0]["peak_memory_bytes"],
+            Value::Null
+        );
+        // Every SW-7200 key is on every row.
+        for row in json["rows"].as_array().unwrap() {
+            for key in BENCH_PATH_ROW_KEYS {
+                assert!(row.get(key).is_some(), "row lacks `{key}`");
+            }
+        }
     }
 }

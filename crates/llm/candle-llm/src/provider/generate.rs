@@ -146,6 +146,64 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        self.generate_resolving(req, on_event, false)
+    }
+}
+
+/// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
+/// switch, carrying the speculative resolution's and the route's fallback reasons verbatim (epic
+/// sc-24432 E2), then the engine's own (a tree request it verified linearly, SW-F328).
+pub(super) fn request_report(
+    record: &DecodeRecord,
+    cuda_graphs_on: bool,
+    mut fallbacks: Vec<String>,
+) -> core_llm::DecodeReport {
+    let mut report = record.report(cuda_graphs_on);
+    // The engine's own (a tree its model or cache could not run, SW-F328) follow the request's.
+    fallbacks.append(&mut report.fallbacks);
+    core_llm::DecodeReport {
+        fallbacks,
+        ..report
+    }
+}
+
+pub(super) fn validate_context_window(
+    cap: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> CoreResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let total = prompt_tokens
+        .checked_add(max_new_tokens as usize)
+        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
+    if total > cap {
+        return Err(CoreError::InvalidRequest(format!(
+            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn map_finish(f: FinishReason) -> CoreFinish {
+    match f {
+        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
+        FinishReason::MaxTokens => CoreFinish::Length,
+        FinishReason::Cancelled => CoreFinish::Cancelled,
+    }
+}
+
+impl LlamaProvider {
+    /// [`TextLlm::generate`]; `block_draft_withheld` resolves `auto` without its block-draft
+    /// preference (a request whose memory refused the preferred draft, SW-7200) and names
+    /// [`core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED`].
+    fn generate_resolving(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        block_draft_withheld: bool,
+    ) -> CoreResult<TextLlmOutput> {
         let _progress = req.install_progress();
         // Request start: a request that fails or is cancelled (anywhere below, before the record
         // is written on success) must not leave the previous request's record readable.
@@ -263,8 +321,16 @@ impl TextLlm for LlamaProvider {
         // an explicit `{proposer, depth}` runs as asked. (Named apart from the MTP branch's
         // `speculative` flag, which shadows `speculative` below.)
         let requested_speculative = speculative;
+        // Under `auto`, a resident block draft runs ahead of MTP only where the SW-7200 paths
+        // campaign recorded it faster for this device's backend, draft format and target tier —
+        // and not on a request whose memory refused it once already (resolved again without it,
+        // by name).
         let resolution = core_llm::fit_draft_context(
-            core_llm::resolve_speculative(speculative, &self.descriptor.capabilities),
+            core_llm::resolve_speculative_with(
+                speculative,
+                &self.descriptor.capabilities,
+                !block_draft_withheld && self.auto_prefers_block_draft(),
+            ),
             &self.descriptor.capabilities,
             self.draft_context(),
             admitted_prompt,
@@ -273,13 +339,47 @@ impl TextLlm for LlamaProvider {
         // Which loop decodes this request (sc-24140): decided once, so admission prices the
         // cache and graphs that loop will actually hold.
         let (mut route, route_fallback) = self.decode_route(resolution.plan);
-        let mut fallbacks: Vec<String> = resolution
-            .fallback
+        let mut fallbacks: Vec<String> = block_draft_withheld
+            .then(|| core_llm::AUTO_BLOCK_DRAFT_NOT_ADMITTED.to_string())
             .into_iter()
+            .chain(resolution.fallback)
             .chain(route_fallback)
             .collect();
+        // Tree verification (feature SW-F328): the request's explicit opt-in, on the route that
+        // will actually run (a proposer on the engine), at the advertised row bound — else
+        // linear, by name. An image or video request verifies its tree too (SW-7209): the
+        // candidates are text tokens after the prompt, at the anchor's M-RoPE text position (the
+        // cache's `rope_delta`, all three axes equal) plus their depth, so the ancestor mask and
+        // the per-row recurrence are the text path's. A decoder that cannot keep a tree branch
+        // (Gemma 4's sliding-window layers) advertises no tree, which the resolution names.
+        // Admission prices the tree's rows, mask and per-row states.
+        let tree = core_llm::resolve_tree_verify(
+            req.speculative_verify,
+            match route {
+                DecodeRoute::Engine { proposer, drafts }
+                    if proposer != ProposerKind::None && drafts > 0 =>
+                {
+                    resolution.plan
+                }
+                _ => SpeculativePlan::Off,
+            },
+            &self.descriptor.capabilities,
+        );
+        fallbacks.extend(tree.fallback);
+        let tree_rows = tree.max_rows as usize;
         let required = self
             .request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
+            .and_then(|bytes| {
+                bytes.checked_add(tree_request_bytes(
+                    &self.model,
+                    route.proposer(),
+                    route.drafts(),
+                    tree_rows,
+                    admitted_prompt,
+                    req.max_new_tokens,
+                    self.tree_tap_width(route.proposer()),
+                )?)
+            })
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
         // The cross-turn prefix cache (sc-24437) serves the engine's text routes. It keys on token
         // ids, which cannot tell two images (or clips) behind the same placeholder ids apart — a
@@ -334,7 +434,7 @@ impl TextLlm for LlamaProvider {
         if prefix_on && prefix_route && !keep_prefix {
             prefix_reason = Some(PREFIX_NOT_ADMITTED);
         }
-        core_llm::admit_request_memory_with_geometry(
+        if let Err(error) = core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
@@ -344,7 +444,18 @@ impl TextLlm for LlamaProvider {
                 required
             },
             prefix_admission.available,
-        )?;
+        ) {
+            // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
+            // prompt lookup or plain — what `auto` admitted before the preference), by name.
+            // Nothing has run: no K/V, no prefill, no preprocessing.
+            if core_llm::withdraws_auto_block_draft(requested_speculative, route.proposer(), &error)
+            {
+                drop(_cuda_graphs_scope);
+                drop(_progress);
+                return self.generate_resolving(req, on_event, true);
+            }
+            return Err(error);
+        }
         let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         let mut prefix_hit = 0usize;
 
@@ -479,6 +590,8 @@ impl TextLlm for LlamaProvider {
         let tokenizer = &self.tokenizer;
         let mut mtp_stats = None;
         let mut engine_record: Option<DecodeRecord> = None;
+        // The block draft a `block_draft` run proposed with (SW-F360 E8), named in the report.
+        let mut decode_draft: Option<core_llm::DecodeDraft> = None;
         let phase_prefill;
         let phase_decode_started;
         let out = {
@@ -573,6 +686,9 @@ impl TextLlm for LlamaProvider {
                 // and CUDA-graph runner, for a request whose speculation is off. The reference
                 // `Decode` loop stays selectable (`set_decode_path`) as the oracle.
                 let drafts = drafts as usize;
+                // The tree rows the cache holds past the linear overshoot: only a tree-building
+                // proposer's (SW-F328, E6), as admission priced them.
+                let tree_workspace = core_llm::tree_workspace_rows(route_proposer, tree_rows);
                 let mut mtp_proposer = match route_proposer {
                     ProposerKind::Mtp => {
                         Some(MtpProposer::new(self.mtp.as_ref().ok_or_else(|| {
@@ -595,19 +711,39 @@ impl TextLlm for LlamaProvider {
                     )?),
                     _ => None,
                 };
+                // The resident block draft (SW-F360) over the target tapped at its layers: the
+                // engine's steps, prefill and rollback are the tapped target's.
+                let block = match route_proposer {
+                    ProposerKind::BlockDraft => {
+                        Some(self.block_draft.as_ref().ok_or_else(|| {
+                            CoreError::Load(
+                                "`block_draft` was routed without a resident draft".into(),
+                            )
+                        })?)
+                    }
+                    _ => None,
+                };
+                let tapped = block.map(|b| TappedQwen35::for_draft(target, &b.model));
+                let mut block_proposer = block.map(|b| BlockDraftProposer::new(&b.model, target));
+                // A block draft over an image or video prompt (SW-7198) reads the target's own
+                // tapped rows at the visual positions, prefilled below.
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
                 // The CUDA-graph runner (sc-24134) wraps the target when the switch is on: it
                 // replays captured decode / verify steps where it can and falls back eager with
                 // a named reason otherwise (`decode_record.cuda_graphs`); the engine is the
-                // same either way.
+                // same either way. A block draft's verify steps are ordinary linear verify steps
+                // of the tapped target, captured and replayed alike.
                 let graphs = GraphRunner::new(target);
-                let stepper: &dyn StepModel<Cache = Qwen35Cache> = if cuda_graphs_enabled() {
-                    &graphs
-                } else {
-                    target
-                };
+                let tapped_graphs = tapped.as_ref().map(GraphRunner::new);
+                let stepper: &dyn StepModel<Cache = Qwen35Cache> =
+                    match (&tapped, &tapped_graphs, cuda_graphs_enabled()) {
+                        (Some(_), Some(runner), true) => runner,
+                        (Some(tapped), _, false) => tapped,
+                        (_, _, true) => &graphs,
+                        _ => target,
+                    };
                 let run = match &mm {
                     Some(m) => {
                         // Multimodal: the fused-embedding / M-RoPE prefill is the caller's, into
@@ -616,20 +752,39 @@ impl TextLlm for LlamaProvider {
                         // inside the cache.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_workspace),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
                         let positions = [t.as_slice(), h.as_slice(), w.as_slice()];
-                        let (logits, hidden) = target
-                            .prefill_from_embeds_deepstack_with_hidden(
+                        let (logits, hidden) = match &tapped {
+                            // The block draft's context reads the tapped rows of the fused
+                            // prompt, under the MTP prefill's M-RoPE positions and DeepStack
+                            // fusion; its own positions count the sequence (`rope_delta`).
+                            Some(tapped) => target.prefill_tapped_from_embeds_deepstack(
                                 &m.embeds,
                                 positions,
                                 &mut cache,
                                 &m.visual_pos_mask,
                                 &m.deepstack,
-                            )
-                            .map_err(to_core)?;
+                                &tapped.layers,
+                                tapped.keep,
+                            ),
+                            None => target.prefill_from_embeds_deepstack_with_hidden(
+                                &m.embeds,
+                                positions,
+                                &mut cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            ),
+                        }
+                        .map_err(to_core)?;
                         cache.set_rope_delta(*delta);
+                        if let Some(proposer) = block_proposer.as_mut() {
+                            proposer.set_rope_delta(*delta);
+                        }
                         if let Some(proposer) = mtp_proposer.as_mut() {
                             proposer
                                 .warm_multimodal(&m.embeds, &hidden, positions)
@@ -641,26 +796,31 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let proposer: &mut dyn Proposer =
-                            match (mtp_proposer.as_mut(), draft_proposer.as_deref_mut()) {
-                                (Some(mtp), _) => mtp,
-                                (None, Some(draft)) => draft,
-                                (None, None) if route_proposer == ProposerKind::PromptLookup => {
-                                    &mut ngram_proposer
-                                }
-                                (None, None) => &mut no_proposer,
-                            };
+                        let proposer: &mut dyn Proposer = match (
+                            mtp_proposer.as_mut(),
+                            draft_proposer.as_deref_mut(),
+                            block_proposer.as_mut(),
+                        ) {
+                            (Some(mtp), _, _) => mtp,
+                            (None, Some(draft), _) => draft,
+                            (None, None, Some(block)) => block,
+                            (None, None, None) if route_proposer == ProposerKind::PromptLookup => {
+                                &mut ngram_proposer
+                            }
+                            (None, None, None) => &mut no_proposer,
+                        };
                         let run = generate_speculative_monitored(
                             stepper,
                             proposer,
                             SpeculativePrompt::Prefilled {
                                 cache: &mut cache,
                                 logits,
-                                hidden: speculative.then_some(hidden),
+                                hidden: (speculative || block.is_some()).then_some(hidden),
                                 history: &m.expanded_ids,
                                 position_delta: *delta,
                                 // The MTP head was warmed from the fused rows above; any other
-                                // proposer (a draft model) warms over the expanded prompt ids.
+                                // proposer warms here — a draft model over the expanded prompt
+                                // ids, a block draft from the tapped rows.
                                 warm_proposer: !speculative,
                             },
                             &config,
@@ -671,6 +831,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             None,
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -693,7 +854,10 @@ impl TextLlm for LlamaProvider {
                         let prefill_started = generation_started;
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = target
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_workspace),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let restored = self
                             .prefix_cache()
@@ -705,7 +869,7 @@ impl TextLlm for LlamaProvider {
                             restored,
                             &prompt_ids,
                             prefix_boundary,
-                            speculative,
+                            speculative || block.is_some(),
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
@@ -729,15 +893,19 @@ impl TextLlm for LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let proposer: &mut dyn Proposer =
-                            match (mtp_proposer.as_mut(), draft_proposer.as_deref_mut()) {
-                                (Some(mtp), _) => mtp,
-                                (None, Some(draft)) => draft,
-                                (None, None) if route_proposer == ProposerKind::PromptLookup => {
-                                    &mut ngram_proposer
-                                }
-                                (None, None) => &mut no_proposer,
-                            };
+                        let proposer: &mut dyn Proposer = match (
+                            mtp_proposer.as_mut(),
+                            draft_proposer.as_deref_mut(),
+                            block_proposer.as_mut(),
+                        ) {
+                            (Some(mtp), _, _) => mtp,
+                            (None, Some(draft), _) => draft,
+                            (None, None, Some(block)) => block,
+                            (None, None, None) if route_proposer == ProposerKind::PromptLookup => {
+                                &mut ngram_proposer
+                            }
+                            (None, None, None) => &mut no_proposer,
+                        };
                         let run = generate_speculative_monitored(
                             stepper,
                             proposer,
@@ -757,6 +925,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             Some(&mut boundary),
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         target
@@ -776,6 +945,9 @@ impl TextLlm for LlamaProvider {
                         run
                     }
                 };
+                if run.record.proposer == ProposerKind::BlockDraft {
+                    decode_draft = block.map(|b| b.report.clone());
+                }
                 if speculative {
                     mtp_stats = Some(MtpStats {
                         proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
@@ -807,6 +979,9 @@ impl TextLlm for LlamaProvider {
                     ));
                 }
                 let drafts = drafts as usize;
+                // The tree rows the cache holds past the linear overshoot: only a tree-building
+                // proposer's (SW-F328, E6), as admission priced them.
+                let tree_workspace = core_llm::tree_workspace_rows(route_proposer, tree_rows);
                 let mut ngram_proposer = NgramProposer::default();
                 let mut no_proposer = NoProposer;
                 // A resident draft model (sc-24436): its cache spans the effective prompt (the
@@ -848,7 +1023,10 @@ impl TextLlm for LlamaProvider {
                         // above priced the expanded prompt from the visual geometry.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_workspace),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let (t, h, w, delta) = &m.positions;
                         let logits = model
@@ -886,6 +1064,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             None,
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -917,7 +1096,10 @@ impl TextLlm for LlamaProvider {
                             self.prefix_cache().reclaim_for(required, available),
                         )?;
                         let mut cache = model
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_workspace),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let logits = model
                             .step_prefill_from_embeds(&m.embeds, &mut cache)
@@ -947,6 +1129,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             None,
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -966,7 +1149,10 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
                         let mut cache = model
-                            .new_cache_for(capacity, drafts)
+                            .new_cache_for(
+                                capacity + tree_extra_positions(drafts, tree_workspace),
+                                drafts,
+                            )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         let restored = self
                             .prefix_cache()
@@ -1014,6 +1200,7 @@ impl TextLlm for LlamaProvider {
                             should_stop_opt,
                             Some(&mut boundary),
                             requested_speculative,
+                            tree_rows,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
                         model
@@ -1340,50 +1527,42 @@ impl TextLlm for LlamaProvider {
             tool_calls,
             usage,
             mtp: mtp_stats,
-            decode: Some(request_report(&decode_record, cuda_graphs_on, fallbacks)),
+            decode: Some(core_llm::DecodeReport {
+                draft: decode_draft,
+                ..request_report(&decode_record, cuda_graphs_on, fallbacks)
+            }),
             finish_reason: Some(finish),
             kv_cache: Some(kv_cache),
         })
     }
 }
 
-/// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
-/// switch, carrying the speculative resolution's and the route's fallback reasons verbatim (epic
-/// sc-24432 E2) — the record is the engine's and starts with none.
-pub(super) fn request_report(
-    record: &DecodeRecord,
-    cuda_graphs_on: bool,
-    fallbacks: Vec<String>,
-) -> core_llm::DecodeReport {
-    core_llm::DecodeReport {
-        fallbacks,
-        ..record.report(cuda_graphs_on)
+impl LlamaProvider {
+    /// Whether `auto` runs this provider's resident block draft ahead of MTP (SW-7200): the
+    /// decision recorded for this device's backend, the draft's format and the target's resident
+    /// tier.
+    pub(crate) fn auto_prefers_block_draft(&self) -> bool {
+        self.auto_block_draft_key()
+            .is_some_and(|(backend, format, resident)| {
+                core_llm::auto_prefers_block_draft(backend, Some(format), resident)
+            })
     }
-}
 
-pub(super) fn validate_context_window(
-    cap: usize,
-    prompt_tokens: usize,
-    max_new_tokens: u32,
-) -> CoreResult<()> {
-    if cap == 0 {
-        return Ok(());
-    }
-    let total = prompt_tokens
-        .checked_add(max_new_tokens as usize)
-        .ok_or_else(|| CoreError::InvalidRequest("prompt + generation length overflow".into()))?;
-    if total > cap {
-        return Err(CoreError::InvalidRequest(format!(
-            "expanded prompt ({prompt_tokens} tokens) + requested generation ({max_new_tokens}) exceeds context window {cap}"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn map_finish(f: FinishReason) -> CoreFinish {
-    match f {
-        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
-        FinishReason::MaxTokens => CoreFinish::Length,
-        FinishReason::Cancelled => CoreFinish::Cancelled,
+    /// What `auto`'s block-draft decision is looked up by: this device's backend, the resident
+    /// draft's format and the target decoder's own resident quantization; `None` with no block
+    /// draft.
+    pub(crate) fn auto_block_draft_key(
+        &self,
+    ) -> Option<(
+        core_llm::DecodeBackend,
+        core_llm::BlockDraftFormat,
+        core_llm::ResidentQuantization,
+    )> {
+        let draft = self.block_draft.as_ref()?;
+        Some((
+            crate::device::decode_backend(self.model.device()),
+            draft.model.config().format,
+            self.load_record.target_quantization(),
+        ))
     }
 }

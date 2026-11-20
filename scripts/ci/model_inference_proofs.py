@@ -68,6 +68,79 @@ IRIS_CUDA_CORRECTNESS_PROOFS = frozenset(
 )
 IRIS_CUDA_CORRECTNESS_PROFILE = 'non-isolated-correctness-low-activity'
 SHARED_CUDA_HEADROOM_PROFILE = 'non-isolated-correctness-headroom'
+# A product-pinned Hub snapshot: `org/name@<40-hex revision>` plus an optional subfolder path.
+HUB_PIN = re.compile(r'^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@([0-9a-f]{40})((?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*)$')
+HUB_SLOT_SOURCES = ('pin', 'choices', 'request_bound')
+
+
+def parse_hub_pin(value: object) -> dict:
+    match = HUB_PIN.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError('hub snapshot pin must be org/name@<40-hex revision>[/subfolder]')
+    return {'repository': match[1], 'revision': match[2], 'subfolder': match[3].removeprefix('/')}
+
+
+def validate_hub_snapshot_slots(row: dict) -> None:
+    """`hub_snapshots`: the product-pinned Hub snapshots a case reads, one slot per environment name.
+
+    Each slot is `{"environment": NAME, <source>}` with exactly one source: `"pin"` (one fixed
+    `org/name@<revision>[/subfolder]`), `"choices"` (the request picks one of these exact pins) or
+    `"request_bound": true` (the request supplies any public pin, e.g. a tier published after the
+    case was registered). NAME must be one of the row's `required_environment` names.
+    """
+    if 'hub_snapshots' not in row:
+        return
+    slots = row['hub_snapshots']
+    if not isinstance(slots, list) or not slots:
+        raise ValueError('hub_snapshots must be a nonempty list of slots')
+    names = set()
+    for slot in slots:
+        if (not isinstance(slot, dict) or not set(slot) <= {'environment', *HUB_SLOT_SOURCES}
+                or len(set(slot).intersection(HUB_SLOT_SOURCES)) != 1):
+            raise ValueError('a hub snapshot slot names its environment and exactly one of pin, choices or request_bound')
+        name = slot.get('environment')
+        if (not isinstance(name, str) or not re.fullmatch(r'[A-Z][A-Z0-9_]*', name) or name in names
+                or name not in row.get('required_environment', [])):
+            raise ValueError('a hub snapshot environment must be a unique required_environment name')
+        names.add(name)
+        if 'pin' in slot:
+            parse_hub_pin(slot['pin'])
+        elif 'choices' in slot:
+            choices = slot['choices']
+            if not isinstance(choices, list) or not choices or len(set(map(str, choices))) != len(choices):
+                raise ValueError('hub snapshot choices must be a nonempty list of unique pins')
+            for choice in choices:
+                parse_hub_pin(choice)
+        elif slot['request_bound'] is not True:
+            raise ValueError('request_bound is only ever true')
+
+
+def bind_hub_snapshots(rows: tuple[dict, ...], value: dict) -> dict[str, dict]:
+    """Each selected slot's environment name -> its exact pin, from the registry or the request."""
+    requested = value.get('hub_snapshots', {})
+    bound: dict[str, dict] = {}
+    declared = set()
+    for row in rows:
+        validate_hub_snapshot_slots(row)
+        for slot in row.get('hub_snapshots', []):
+            name = slot['environment']
+            declared.add(name)
+            if 'pin' in slot:
+                if name in requested:
+                    raise ValueError(f'{name} is pinned by the registry; a request cannot rebind it')
+                pin = slot['pin']
+            else:
+                if name not in requested:
+                    raise ValueError(f'request must bind hub snapshot {name}')
+                pin = requested[name]
+                if 'choices' in slot and pin not in slot['choices']:
+                    raise ValueError(f'{name} must be one of its registered pins')
+            parsed = parse_hub_pin(pin)
+            if bound.setdefault(name, parsed) != parsed:
+                raise ValueError(f'selected cases bind {name} to different snapshots')
+    if set(requested) - declared:
+        raise ValueError('request binds hub snapshots no selected case declares')
+    return bound
 
 
 def identity(row: dict) -> str:
@@ -490,6 +563,7 @@ def load_registry(path: Path = REGISTRY_PATH, *, root: Path = ROOT) -> tuple[dic
             if not row[field]:
                 raise ValueError('missing proof identity/configuration/output contract')
         features(row)
+        validate_hub_snapshot_slots(row)
         for field in ('required_environment', 'forbidden_root_environment', 'optional_environment', 'external_asset_environment'):
             values = row.get(field, [])
             if not isinstance(values, list) or any(not isinstance(name, str) or not re.fullmatch(r'[A-Z][A-Z0-9_]*', name) for name in values):
@@ -568,7 +642,9 @@ def request(raw: str, backend: str) -> dict:
         raise ValueError('unknown fixed proof backend')
     value = json.loads(raw)
     if (not isinstance(value, dict) or not {'selection', 'policy'} <= set(value)
-            or not set(value) <= {'selection', 'policy', 'runner', 'configuration', 'training_comparison', 'download_missing', 'sensenova_reference_policy', 'sensenova_publish', 'sensenova_source_sha'} | multi_cuda.FIELDS):
+            or not set(value) <= {'selection', 'policy', 'runner', 'configuration', 'training_comparison', 'download_missing',
+                                  'hub_snapshots', 'sensenova_reference_policy', 'sensenova_publish',
+                                  'sensenova_source_sha'} | multi_cuda.FIELDS):
         raise ValueError('request requires selection and explicit resource policy; only declared runner/configuration/comparison/resource options may be optional')
     if 'configuration' in value and (not isinstance(value['configuration'], str) or not NAME.fullmatch(value['configuration'])):
         raise ValueError('configuration must select one fixed declared name')
@@ -579,6 +655,9 @@ def request(raw: str, backend: str) -> dict:
     if 'download_missing' in value and (type(value['download_missing']) is not bool
                                         or (value['download_missing'] and backend != 'mlx')):
         raise ValueError('download_missing is an explicit boolean, honoured only by the MLX training asset setup')
+    if 'hub_snapshots' in value and (not isinstance(value['hub_snapshots'], dict) or not value['hub_snapshots']
+                                     or any(not isinstance(pin, str) for pin in value['hub_snapshots'].values())):
+        raise ValueError('hub_snapshots binds environment names to org/name@<revision>[/subfolder] pins')
     if not isinstance(value['selection'], str) or not value['selection']:
         raise ValueError('selection must be explicitly provided')
     policy = value['policy']
@@ -743,6 +822,29 @@ def repository_identity(expected: str) -> dict:
     if git('status', '--porcelain', '--untracked-files=no'):
         raise ValueError('proof source has tracked modifications')
     return {'revision': expected, 'tree': git('rev-parse', 'HEAD^{tree}')}
+
+
+def staged_hub_snapshots(row: dict, bound: dict[str, dict], env: dict[str, str]) -> dict:
+    """The staging receipt must cover each of the row's slots at its exact pin, and each
+    environment name must point at the verified snapshot directory. `bound` is the whole
+    selection's binding (`bind_hub_snapshots` over every selected row, which validates the
+    request once): a request binding another selected case's slot is not this case's to refuse."""
+    path = env.get('MODEL_PROOF_HUB_SNAPSHOT_RECEIPT')
+    if not path:
+        raise ValueError('missing pinned Hub snapshot staging receipt')
+    staged = json.loads(Path(path).read_text(encoding='utf-8')).get('snapshots', {})
+    receipt = {}
+    for slot in row.get('hub_snapshots', []):
+        name = slot['environment']
+        pin = bound.get(name)
+        if pin is None:
+            raise ValueError(f'{name} is not bound by the selection')
+        entry = staged.get(name)
+        if (not isinstance(entry, dict) or entry.get('status') != 'hub_content_verified'
+                or any(entry.get(key) != pin[key] for key in pin) or env.get(name) != entry.get('path')):
+            raise ValueError(f'{name} is not bound to its verified pinned Hub snapshot')
+        receipt[name] = entry
+    return receipt
 
 
 def require_host(backend: str, env: dict[str, str], route: str = 'hosted') -> None:
@@ -1077,6 +1179,15 @@ def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
     if not cargo_home.is_absolute():
         raise ValueError('Cargo home must be absolute for verified Rustup selection')
     bin_dir = cargo_home / 'bin'
+    # Mirror posix-rust.sh: GitHub-hosted macOS images install rustup with Homebrew, so the
+    # proxies live in `brew --prefix rustup`/bin; they still honour rust-toolchain.toml.
+    if (not (bin_dir / 'rustup').is_file() and env.get('RUNNER_OS') == 'macOS'
+            and env.get('MODEL_PROOF_RUNNER_ENVIRONMENT') == 'github-hosted'):
+        bin_dir = Path(subprocess.run(['brew', '--prefix', 'rustup'], env=env, check=True,
+                                      capture_output=True, text=True, timeout=30,
+                                      encoding='utf-8').stdout.strip()) / 'bin'
+        if not bin_dir.is_absolute():
+            raise ValueError('Homebrew rustup prefix must be absolute for verified Rustup selection')
     suffix = '.exe' if os.name == 'nt' else ''
     proxies = {tool: bin_dir / (tool + suffix) for tool in ('cargo', 'rustc', 'rustup')}
     if not all(path.is_file() and os.access(path, os.X_OK) for path in proxies.values()):
@@ -1174,6 +1285,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     write_json(policy_path, value['policy'])
     policy = load_policy(policy_path)
     approved_uuids = multi_cuda.bind_rows(rows, value, backend)
+    # The request's Hub bindings are validated once against the complete selection; each case
+    # then checks only its own slots against the staging receipt.
+    selection_snapshots = bind_hub_snapshots(rows, value)
     additional_policies = []
     for role, raw in enumerate(value.get('additional_cuda_policies', []), 1):
         extra_path = work / f'cuda-policy-role-{role}.json'
@@ -1237,6 +1351,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 missing = [name for name in row.get('required_environment', []) if not env.get(name)]
                 if missing:
                     raise ValueError('missing declared model/fixture prerequisites: ' + ','.join(missing))
+                if row.get('hub_snapshots'):
+                    result['hub_snapshots'] = staged_hub_snapshots(row, selection_snapshots, env)
                 if identity(row) in IRIS_QUANT_PROOFS:
                     path = env.get('MODEL_PROOF_ASSET_RECEIPT')
                     if not path:
@@ -1783,6 +1899,11 @@ def main() -> int:
                 asset_setup = 'mlx-training'
             if value.get('download_missing') and asset_setup != 'mlx-training':
                 raise ValueError('download_missing applies only to a bound MLX training proof')
+            hub_snapshots = bind_hub_snapshots(rows, value)
+            if hub_snapshots:
+                if asset_setup != 'none':
+                    raise ValueError('pinned Hub snapshots cannot combine with another asset setup')
+                asset_setup = 'hub-snapshots'
             if (args.backend == 'candle-cuda' and len(rows) == 1
                     and rows[0]['package'] == 'candle-gen-krea'
                     and rows[0]['fqn'] == 'imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose'):
@@ -1793,6 +1914,8 @@ def main() -> int:
                 asset_setup = 'sensenova-loop'
             plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
                     'bindings': [identity(row) for row in rows]}
+            if hub_snapshots:
+                plan['hub_snapshots'] = hub_snapshots
             configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}
             if configured:
                 plan['configurations'] = configured

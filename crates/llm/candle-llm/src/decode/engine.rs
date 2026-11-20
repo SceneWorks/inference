@@ -48,15 +48,17 @@
 //! [`accept_token`]: core_llm::speculative::accept_token
 
 use candle_core::Tensor;
+use core_llm::speculative::tree::{greedy_tree_step, sampled_tree_step, walk_tree, TreeStep};
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
-    AcceptanceMonitor, PlainDecode, ProposerKind, SamplerPath, Speculative, StepObservation,
+    AcceptanceMonitor, DraftTree, PlainDecode, ProposerKind, SamplerPath, Speculative,
+    StepObservation, TreeVerifyReport, TreeWalk,
 };
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
 use crate::decode::speculative::SpeculativeStats;
-use crate::decode::step::{LogitsScope, StepModel, StepRequest, StepTokens};
+use crate::decode::step::{LogitsScope, StepModel, StepRequest, StepTokens, TreeVerify};
 use crate::decode::stream::{
     ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
@@ -128,8 +130,15 @@ pub struct ProposeContext<'a> {
     pub previous_hidden: Option<&'a Tensor>,
     /// The RoPE position `cur` will occupy.
     pub position: i32,
-    /// At most this many drafts (already clamped to the remaining budget).
+    /// At most this many drafts (already clamped to the remaining budget) — in a tree, the
+    /// deepest a candidate may sit below `cur`.
     pub max_drafts: usize,
+    /// The most drafts the remaining token budget alone allows (`>= max_drafts`): a proposer whose
+    /// draft runs a fixed-size block shortens it only here (a non-causal block draft, SW-F360).
+    pub budget_drafts: usize,
+    /// At most this many candidate rows in a tree proposal ([`Proposer::propose_tree`], feature
+    /// SW-F328); `max_drafts` on a linear run.
+    pub max_rows: usize,
 }
 
 /// One host-sampled draft: the token and, for a stochastic run, the shaped proposal distribution
@@ -188,6 +197,186 @@ impl DraftSampler<'_, '_> {
         }
         Ok((draft, dist))
     }
+
+    /// Sample one draft among `candidates` (distinct ids below `width`) scored `scores`, every
+    /// other id of the `width`-wide vocabulary at `-inf` — a block draft's scored row (SW-F360,
+    /// the MLX engine's rule). The draw is [`sample_draft`](Self::sample_draft)'s over that dense
+    /// host row, so the knobs, penalties and constraint apply and a stochastic draft's `q` is the
+    /// shaped distribution it was drawn from. A plain greedy run (no penalty, no constraint)
+    /// takes the row's argmax on the host — the lowest id among equal scores, as the dense argmax.
+    /// `None` when the constraint allows no candidate: the proposal stops there.
+    pub fn sample_among(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        draft_history: &[i32],
+    ) -> Result<Option<DraftSample>> {
+        if self.allowed_among(candidates).is_empty() {
+            return Ok(None);
+        }
+        if self.greedy() && self.constraint.is_none() && self.config.sampling.is_plain_greedy() {
+            let best =
+                candidates
+                    .iter()
+                    .zip(scores)
+                    .fold(None, |best: Option<(i32, f32)>, (&t, &s)| match best {
+                        Some((b, bs)) if s < bs || (s == bs && t > b) => best,
+                        _ => Some((t, s)),
+                    });
+            return Ok(best.map(|(t, _)| (t, None)));
+        }
+        let logits = dense_row(candidates, scores, width)?;
+        self.sample_draft(&logits, draft_history).map(Some)
+    }
+
+    /// The stochastic proposal distribution `q` over a block draft's row — exactly the one
+    /// [`sample_among`](Self::sample_among) draws a stochastic draft from — without drawing, or
+    /// `None` when the constraint allows no candidate. A tree proposal (SW-7198) reads it to rank
+    /// a node's deterministic siblings and draws the node's sampled child from it with
+    /// [`draw`](Self::draw).
+    pub fn among_distribution(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        draft_history: &[i32],
+    ) -> Result<Option<Vec<(i32, f32)>>> {
+        if self.allowed_among(candidates).is_empty() {
+            return Ok(None);
+        }
+        let logits = dense_row(candidates, scores, width)?;
+        let mask = self.constraint.as_mut().map(|c| c.allowed());
+        shaped_candidates(&logits, draft_history, &self.config.sampling, mask).map(Some)
+    }
+
+    /// One draw from `dist` with the run's seeded stream (an inverse-CDF walk over a fresh
+    /// uniform), so the draft is distributed exactly as `dist`. The constraint is not advanced.
+    pub fn draw(&mut self, dist: &[(i32, f32)]) -> i32 {
+        let fallback = dist.first().map_or(0, |&(t, _)| t);
+        core_llm::speculative::sample_weighted(dist, self.rng.next_f32(), fallback)
+    }
+
+    /// The constraint's checkpoint at the proposal's start (`None` without a constraint).
+    pub fn constraint_checkpoint(&self) -> Option<usize> {
+        self.constraint.as_ref().map(|c| c.checkpoint())
+    }
+
+    /// Put the constraint in its state at a tree node (SW-7198): rewound to `checkpoint` (the
+    /// proposal's start), then advanced by the node's `path` from the anchor, stop tokens
+    /// excepted. The engine rewinds the constraint after the proposal as for any draft.
+    pub fn enter_branch(&mut self, checkpoint: Option<usize>, path: &[i32]) {
+        let stops = &self.config.stop_tokens;
+        if let (Some(c), Some(checkpoint)) = (self.constraint.as_mut(), checkpoint) {
+            c.rewind(checkpoint);
+            for &token in path.iter().filter(|t| !stops.contains(t)) {
+                c.accept(token);
+            }
+        }
+    }
+
+    /// The `candidates` the constraint (if any) allows in its current state, in order.
+    pub fn allowed_among(&mut self, candidates: &[i32]) -> Vec<i32> {
+        match self.constraint.as_mut() {
+            Some(c) => {
+                let allowed = c.allowed();
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        usize::try_from(t).is_ok_and(|t| allowed.get(t).copied().unwrap_or(false))
+                    })
+                    .collect()
+            }
+            None => candidates.to_vec(),
+        }
+    }
+}
+
+/// The engine's draft sampler as the shared block-draft tree builder's policy
+/// ([`core_llm::build_lattice_tree`]): each operation is the sampler's own.
+impl core_llm::LatticeSampler for DraftSampler<'_, '_> {
+    type Error = Error;
+
+    fn greedy(&self) -> bool {
+        DraftSampler::greedy(self)
+    }
+
+    fn is_stop(&self, token: i32) -> bool {
+        DraftSampler::is_stop(self, token)
+    }
+
+    fn constraint_checkpoint(&self) -> Option<usize> {
+        DraftSampler::constraint_checkpoint(self)
+    }
+
+    fn enter_branch(&mut self, checkpoint: Option<usize>, path: &[i32]) {
+        DraftSampler::enter_branch(self, checkpoint, path);
+    }
+
+    fn allowed_among(&mut self, candidates: &[i32]) -> Vec<i32> {
+        DraftSampler::allowed_among(self, candidates)
+    }
+
+    fn choose_among(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        history: &[i32],
+    ) -> Result<Option<i32>> {
+        Ok(self
+            .sample_among(candidates, scores, width, history)?
+            .map(|(token, _)| token))
+    }
+
+    fn among_distribution(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        history: &[i32],
+    ) -> Result<Option<Vec<(i32, f32)>>> {
+        DraftSampler::among_distribution(self, candidates, scores, width, history)
+    }
+
+    fn draw(&mut self, dist: &[(i32, f32)]) -> i32 {
+        DraftSampler::draw(self, dist)
+    }
+}
+
+#[cfg(test)]
+impl<'a, 'c> DraftSampler<'a, 'c> {
+    /// A sampler over `config`, `rng` and `constraint` with host-sampled drafts — for unit tests
+    /// of a proposal builder that run no model.
+    pub(crate) fn for_tests(
+        config: &'a GenerationConfig,
+        rng: &'a mut SplitMix64,
+        constraint: Option<&'a mut (dyn RewindableConstraintMask + 'c)>,
+    ) -> Self {
+        Self {
+            config,
+            rng,
+            constraint,
+            device_greedy: false,
+        }
+    }
+}
+
+/// A block draft's scored row as dense host `[1, width]` logits: `scores` at `candidates`, `-inf`
+/// elsewhere.
+fn dense_row(candidates: &[i32], scores: &[f32], width: usize) -> Result<Tensor> {
+    let mut row = vec![f32::NEG_INFINITY; width];
+    for (&t, &s) in candidates.iter().zip(scores) {
+        if let Some(slot) = usize::try_from(t).ok().and_then(|t| row.get_mut(t)) {
+            *slot = s;
+        }
+    }
+    Ok(Tensor::from_vec(
+        row,
+        (1, width),
+        &candle_core::Device::Cpu,
+    )?)
 }
 
 /// A proposal source for the engine. Implementations: [`MtpProposer`](super::proposers::MtpProposer),
@@ -223,6 +412,24 @@ pub trait Proposer {
         sampler: &mut DraftSampler<'_, '_>,
     ) -> Result<Proposal>;
 
+    /// Propose a **tree** of candidates after `ctx.cur` (feature SW-F328): at most `ctx.max_rows`
+    /// candidates, none deeper than `ctx.max_drafts`, each with the proposal distribution it was
+    /// drawn from (`None`: a deterministic candidate). Called instead of
+    /// [`propose`](Self::propose) on a tree run; [`commit`](Self::commit) then receives the
+    /// accepted branch's candidates. `None` (the default) is a proposer with one candidate per
+    /// position: the engine asks it for its linear proposal of at most `ctx.max_rows` drafts,
+    /// which is the one-branch tree and is verified on the linear path — so its drafts may stay on
+    /// the device. Only a [`ProposerKind::builds_trees`] proposer may return a branching tree:
+    /// tree workspace is sized and priced for no other.
+    fn propose_tree(
+        &mut self,
+        ctx: &ProposeContext<'_>,
+        sampler: &mut DraftSampler<'_, '_>,
+    ) -> Result<Option<DraftTree>> {
+        let _ = (ctx, sampler);
+        Ok(None)
+    }
+
     /// The verify outcome: `accepted` is the accepted draft prefix (host ids); `kept_hidden` the
     /// target's hidden rows `[1, 1 + accepted.len(), hidden]` for `[cur, accepted…]` when
     /// [`wants_hidden`](Self::wants_hidden); `position` the RoPE position of `accepted[0]`
@@ -241,9 +448,11 @@ pub trait Proposer {
     /// [`AcceptanceMonitor::probing`]): `tokens` were fed at RoPE positions `position..`, each
     /// paired with its predecessor's target hidden row in `preceding_hidden`
     /// (`[1, tokens.len(), hidden]`, when [`wants_hidden`](Self::wants_hidden)). Called once,
-    /// before the next [`propose`](Self::propose). The default does nothing — right for a
-    /// proposer whose state is the history alone (n-gram); `draft_model` is never probed (`auto`
-    /// never resolves to it).
+    /// before the next [`propose`](Self::propose). Each probe step was also
+    /// [`commit`](Self::commit)ted (no drafts, its row in `kept_hidden`). The default does
+    /// nothing — right for a proposer whose state is the history alone (n-gram) or that
+    /// [`commit`](Self::commit) keeps current on a step without a proposal (a block draft);
+    /// `draft_model` is never probed (`auto` never resolves to it).
     fn catch_up(
         &mut self,
         _tokens: &[i32],
@@ -371,6 +580,7 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         should_stop,
         on_prefill_complete,
         Speculative::Off,
+        0,
     )
 }
 
@@ -394,6 +604,21 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
 /// its own). The output is unchanged — a step without drafts is the plain draw — and the record
 /// names where and on what ([`DecodeRecord::speculative_demoted_at`],
 /// [`DecodeRecord::speculative_monitor`]).
+///
+/// ## Tree verification (feature SW-F328)
+/// `tree_rows > 0` (with drafts) asks the proposer for a candidate **tree** of at most that many
+/// rows ([`Proposer::propose_tree`]; `None`, the default, is the linear proposal). A one-branch
+/// tree takes the linear step. A branching tree is verified in one target forward
+/// ([`StepModel::forward_tree`]: the anchor and every candidate, each row attending only its
+/// ancestors at the RoPE position of its depth, always eager — a graph runner counts it as an
+/// eager `tree_verify` step), walked from the anchor with `core_llm`'s tree rules (greedy, or
+/// recursive rejection sampling over each row's children), and the cache keeps only the accepted
+/// branch ([`DecodeCache::commit_tree`]; any failure or a cancel after the forward returns it to
+/// the step start, [`DecodeCache::abort_tree`]). A model or cache that cannot keep a tree branch
+/// ([`StepModel::tree_unsupported`]) verifies linearly and the record names why
+/// ([`DecodeRecord::tree_fallback`]); a run under a tree bound reports its passes, rows, accepted
+/// candidates and peak tree workspace ([`DecodeRecord::tree_verify`]). An owned cache is sized
+/// for the tree's extra rows ([`tree_extra_positions`]).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     model: &M,
@@ -407,6 +632,7 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
     should_stop: Option<&dyn Fn() -> bool>,
     on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
     speculative_mode: Speculative,
+    tree_rows: usize,
 ) -> Result<SpeculativeRun> {
     run_engine(
         model,
@@ -421,6 +647,7 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
         on_prefill_complete,
         None,
         speculative_mode,
+        tree_rows,
     )
 }
 
@@ -484,6 +711,7 @@ pub fn generate_with_sampler<M: StepModel + ?Sized>(
         None,
         Some(sampler),
         Speculative::Off,
+        0,
     )
 }
 
@@ -522,6 +750,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     mut on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
     mut sampler: Option<&mut dyn TokenSampler>,
     speculative_mode: Speculative,
+    tree_rows: usize,
 ) -> Result<SpeculativeRun> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
@@ -559,7 +788,13 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             if prompt_ids.is_empty() {
                 return Err(Error::Msg("generate_speculative: empty prompt".into()));
             }
-            let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
+            let capacity = prompt_ids
+                .len()
+                .saturating_add(config.max_new_tokens)
+                .saturating_add(tree_extra_positions(
+                    drafts,
+                    core_llm::tree_workspace_rows(kind, tree_rows),
+                ));
             let cache = owned.insert(model.new_cache_for(capacity, drafts)?);
             // A prompt prefill: no position inside it is ever rolled back to (sc-24446).
             core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
@@ -618,6 +853,23 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     }
 
+    // Tree verification (feature SW-F328): only on a run with a proposer and drafts (a caller
+    // sampler runs neither), at most the shared row bound, and only where the model can keep a tree branch on this cache — otherwise the run
+    // verifies linearly and the record names why.
+    let tree_rows = if drafts == 0 || tree_rows == 0 || kind == ProposerKind::None {
+        0
+    } else if let Some(why) = model.tree_unsupported(cache) {
+        stats.tree_fallback = Some(why);
+        0
+    } else {
+        tree_rows.min(core_llm::MAX_TREE_ROWS as usize)
+    };
+    if tree_rows > 0 {
+        stats.tree = Some(TreeVerifyReport {
+            max_rows: tree_rows as u32,
+            ..TreeVerifyReport::default()
+        });
+    }
     let mut rng = SplitMix64::new(config.execution_seed());
     let greedy = config.sampling.temperature <= 0.0;
     let plain_greedy = config.sampling.is_plain_greedy();
@@ -640,6 +892,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             },
             ProposerKind::PromptLookup => DecodePath::PromptLookup,
             ProposerKind::DraftModel => DecodePath::DraftModel,
+            ProposerKind::BlockDraft => DecodePath::BlockDraft,
         };
         let record = DecodeRecord::speculative(path, stats, generated.len(), span.counters())
             .with_kv_cache(cache.kv_kind())
@@ -762,9 +1015,11 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         let cur_ids = input_ids(&[cur], device)?;
         let constraint_checkpoint = constraint.as_ref().map(|c| c.checkpoint());
 
-        // 1. Propose.
-        let proposal = if k == 0 {
-            Proposal::default()
+        // 1. Propose. A tree run (feature SW-F328) asks for a tree; a one-branch tree takes the
+        //    linear path below, whose decision is the same rule, so only a branching tree runs a
+        //    tree forward.
+        let (proposal, branching) = if k == 0 {
+            (Proposal::default(), None)
         } else {
             let ctx = ProposeContext {
                 cur,
@@ -773,6 +1028,8 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 previous_hidden: previous_hidden.as_ref(),
                 position,
                 max_drafts: k,
+                budget_drafts: remaining.saturating_sub(1),
+                max_rows: if tree_rows > 0 { tree_rows } else { k },
             };
             let device_greedy = plain_greedy && constraint.is_none();
             let mut sampler = DraftSampler {
@@ -781,117 +1038,239 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 constraint: constraint.as_deref_mut(),
                 device_greedy,
             };
-            proposer.propose(&ctx, &mut sampler)?
+            let draft_started = std::time::Instant::now();
+            let tree = if tree_rows > 0 {
+                proposer.propose_tree(&ctx, &mut sampler)?
+            } else {
+                None
+            };
+            let proposed =
+                match tree.map(|t| t.pruned(k, tree_rows, |t| config.stop_tokens.contains(&t))) {
+                    Some(tree) if !tree.is_chain() => (Proposal::default(), Some(tree)),
+                    Some(chain) => (
+                        Proposal {
+                            drafts: Some(Drafts::Host(
+                                chain.nodes().iter().map(|n| n.token).collect(),
+                            )),
+                            dists: chain.nodes().iter().map_while(|n| n.dist.clone()).collect(),
+                        },
+                        None,
+                    ),
+                    // A one-branch proposer (MTP, a draft model): its linear proposal is the tree,
+                    // capped at the row bound as MLX prunes it (`pruned(k, tree_rows, …)`), so a pass
+                    // never verifies more candidate rows than the request allows.
+                    None if tree_rows > 0 => {
+                        let capped = ProposeContext {
+                            max_drafts: k.min(tree_rows),
+                            ..ctx
+                        };
+                        (proposer.propose(&capped, &mut sampler)?, None)
+                    }
+                    None => (proposer.propose(&ctx, &mut sampler)?, None),
+                };
+            // A proposal left on the device was timed only up to its enqueue (SW-7200).
+            let on_device = matches!(proposed.0.drafts, Some(Drafts::Device(_)));
+            stats
+                .draft_time
+                .get_or_insert_with(core_llm::DraftTime::default)
+                .record(draft_started.elapsed(), !on_device);
+            proposed
         };
         if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
             c.rewind(checkpoint);
         }
-        let drafted = proposal.drafts.unwrap_or(Drafts::Host(Vec::new()));
-        let num_drafts = drafted.len()?;
-        stats.proposed += num_drafts;
-        if cancel.is_cancelled() {
-            // Nothing has been written to the target cache yet.
-            finish = FinishReason::Cancelled;
-            break;
-        }
-
-        // 2. Verify `[cur, drafts…]` in one target step.
-        let verify_ids = match &drafted {
-            Drafts::Host(d) => {
-                let mut verify = Vec::with_capacity(1 + d.len());
-                verify.push(cur);
-                verify.extend_from_slice(d);
-                input_ids(&verify, device)?
+        let (draft_ids, committed, accepted, kept_hidden, num_drafts) = if let Some(tree) =
+            branching
+        {
+            // A branching tree (SW-F328): verify every candidate in one forward, walk the tree,
+            // keep only the accepted branch.
+            stats.proposed += tree.len();
+            if cancel.is_cancelled() {
+                // Nothing has been written to the target cache yet.
+                finish = FinishReason::Cancelled;
+                break;
             }
-            Drafts::Device(d) => Tensor::cat(&[&cur_ids, d], 1)?,
-        };
-        let out = model.forward_step(
-            cache,
-            StepRequest {
-                tokens: StepTokens::Device(&verify_ids),
-                scope: LogitsScope::All,
+            let verify = TreeVerify {
+                tree: &tree,
+                anchor: cur,
                 want_hidden: wants_hidden,
-                prefill: false,
-                snapshot_at: None,
-            },
-        )?;
-        stats.forwards += 1;
-        stats.verify_steps += 1;
-        if cancel.is_cancelled() {
-            // The old loop checked right after the verify forward too (E7): nothing of this step
-            // is committed; the cache goes back to the step start.
-            cache.rollback_to(base)?;
-            finish = FinishReason::Cancelled;
-            break;
-        }
-
-        // 3. Decide, on host, from one transfer. A caller sampler only ever runs without drafts:
-        //    its one row is the caller's draw.
-        let (draft_ids, committed, accepted) = match sampler.as_deref_mut() {
-            Some(sampler) => {
-                let n = out.logits.dim(1)?;
-                if n != 1 {
-                    return Err(Error::Msg(format!(
-                        "verify returned {n} positions for 0 drafts"
-                    )));
+            };
+            let out = match model.forward_tree(cache, &verify) {
+                Ok(out) => out,
+                Err(e) => {
+                    cache.abort_tree(base)?;
+                    return Err(e);
                 }
-                let mask = constraint.as_mut().map(|c| c.allowed());
-                let token = draw(Some(sampler), &out.logits, &history, config, &mut rng, mask)?;
-                (Vec::new(), vec![token], 0)
+            };
+            stats.forwards += 1;
+            stats.verify_steps += 1;
+            let workspace = out.mask_bytes.saturating_add(cache.tree_bytes()) as u64;
+            if cancel.is_cancelled() {
+                // As after a linear verify forward: nothing of this step is committed.
+                cache.abort_tree(base)?;
+                finish = FinishReason::Cancelled;
+                break;
             }
-            None => decide(
-                &out.logits,
-                &drafted,
-                &proposal.dists,
+            let walk = tree_walk(
+                &out.step.logits,
+                &tree,
                 &history,
                 config,
                 &mut rng,
-                greedy,
                 plain_greedy,
                 constraint.as_deref_mut(),
-            )?,
-        };
-        if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
-            c.rewind(checkpoint);
-        }
-        // Drafts past a stop token were never a proposal (the decision dropped them); the cache
-        // still holds all `num_drafts + 1` verify positions, so `accepted < num_drafts` below
-        // rolls it back to the kept prefix.
-        stats.proposed -= num_drafts - draft_ids.len();
-        stats.accepted += accepted;
-
-        // 4. Recover the cache to `[cur, accepted…]`: a direct rollback when the cache can, else
-        //    back to the step start plus a replay of the kept prefix (a cache without per-token
-        //    checkpoints).
-        let keep_len = 1 + accepted;
-        let kept_hidden = if accepted == num_drafts {
-            out.hidden
-        } else {
-            let target = base + keep_len as i32;
-            match cache.rollback_to(target) {
-                Ok(()) => {
-                    stats.direct_rollbacks += 1;
-                    match out.hidden {
-                        Some(h) => Some(h.narrow(1, 0, keep_len)?),
-                        None => None,
-                    }
+            )
+            .and_then(|walk| cache.commit_tree(base, &walk.path).map(|()| walk));
+            let walk = match walk {
+                Ok(walk) => walk,
+                Err(e) => {
+                    cache.abort_tree(base)?;
+                    return Err(e);
                 }
-                Err(Error::RollbackUnavailable { .. }) => {
-                    cache.rollback_to(base)?;
-                    let mut replay = Vec::with_capacity(keep_len);
-                    replay.push(cur);
-                    replay.extend_from_slice(&draft_ids[..accepted]);
-                    let replayed = model.forward_step(
-                        cache,
-                        StepRequest::last(&replay).with_hidden(wants_hidden),
-                    )?;
-                    stats.forwards += 1;
-                    stats.replays += 1;
-                    replayed.hidden
-                }
-                Err(e) => return Err(e),
+            };
+            if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
+                c.rewind(checkpoint);
             }
+            let kept_hidden = match out.step.hidden {
+                Some(h) => {
+                    let rows: Vec<u32> = walk.path.iter().map(|&r| r as u32).collect();
+                    let idx = Tensor::from_vec(rows, walk.path.len(), h.device())?;
+                    Some(h.index_select(&idx, 1)?)
+                }
+                None => None,
+            };
+            stats.accepted += walk.accepted;
+            if walk.accepted < tree.len() {
+                stats.direct_rollbacks += 1;
+            }
+            if let Some(report) = stats.tree.as_mut() {
+                report.tree_passes += 1;
+                report.tree_rows_verified += 1 + tree.len() as u64;
+                report.tree_accepted_tokens += walk.accepted as u64;
+                report.peak_workspace_bytes = report.peak_workspace_bytes.max(workspace);
+            }
+            let TreeWalk {
+                committed,
+                accepted,
+                ..
+            } = walk;
+            let draft_ids = committed[..accepted].to_vec();
+            (draft_ids, committed, accepted, kept_hidden, tree.len())
+        } else {
+            let drafted = proposal.drafts.unwrap_or(Drafts::Host(Vec::new()));
+            let num_drafts = drafted.len()?;
+            stats.proposed += num_drafts;
+            if cancel.is_cancelled() {
+                // Nothing has been written to the target cache yet.
+                finish = FinishReason::Cancelled;
+                break;
+            }
+
+            // 2. Verify `[cur, drafts…]` in one target step.
+            let verify_ids = match &drafted {
+                Drafts::Host(d) => {
+                    let mut verify = Vec::with_capacity(1 + d.len());
+                    verify.push(cur);
+                    verify.extend_from_slice(d);
+                    input_ids(&verify, device)?
+                }
+                Drafts::Device(d) => Tensor::cat(&[&cur_ids, d], 1)?,
+            };
+            let out = model.forward_step(
+                cache,
+                StepRequest {
+                    tokens: StepTokens::Device(&verify_ids),
+                    scope: LogitsScope::All,
+                    want_hidden: wants_hidden,
+                    prefill: false,
+                    snapshot_at: None,
+                },
+            )?;
+            stats.forwards += 1;
+            stats.verify_steps += 1;
+            if cancel.is_cancelled() {
+                // The old loop checked right after the verify forward too (E7): nothing of this step
+                // is committed; the cache goes back to the step start.
+                cache.rollback_to(base)?;
+                finish = FinishReason::Cancelled;
+                break;
+            }
+
+            // 3. Decide, on host, from one transfer. A caller sampler only ever runs without drafts:
+            //    its one row is the caller's draw.
+            let (draft_ids, committed, accepted) = match sampler.as_deref_mut() {
+                Some(sampler) => {
+                    let n = out.logits.dim(1)?;
+                    if n != 1 {
+                        return Err(Error::Msg(format!(
+                            "verify returned {n} positions for 0 drafts"
+                        )));
+                    }
+                    let mask = constraint.as_mut().map(|c| c.allowed());
+                    let token = draw(Some(sampler), &out.logits, &history, config, &mut rng, mask)?;
+                    (Vec::new(), vec![token], 0)
+                }
+                None => decide(
+                    &out.logits,
+                    &drafted,
+                    &proposal.dists,
+                    &history,
+                    config,
+                    &mut rng,
+                    greedy,
+                    plain_greedy,
+                    constraint.as_deref_mut(),
+                )?,
+            };
+            if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
+                c.rewind(checkpoint);
+            }
+            // Drafts past a stop token were never a proposal (the decision dropped them); the cache
+            // still holds all `num_drafts + 1` verify positions, so `accepted < num_drafts` below
+            // rolls it back to the kept prefix.
+            stats.proposed -= num_drafts - draft_ids.len();
+            stats.accepted += accepted;
+
+            // 4. Recover the cache to `[cur, accepted…]`: a direct rollback when the cache can, else
+            //    back to the step start plus a replay of the kept prefix (a cache without per-token
+            //    checkpoints).
+            let keep_len = 1 + accepted;
+            let kept_hidden = if accepted == num_drafts {
+                out.hidden
+            } else {
+                let target = base + keep_len as i32;
+                match cache.rollback_to(target) {
+                    Ok(()) => {
+                        stats.direct_rollbacks += 1;
+                        match out.hidden {
+                            Some(h) => Some(h.narrow(1, 0, keep_len)?),
+                            None => None,
+                        }
+                    }
+                    Err(Error::RollbackUnavailable { .. }) => {
+                        cache.rollback_to(base)?;
+                        let mut replay = Vec::with_capacity(keep_len);
+                        replay.push(cur);
+                        replay.extend_from_slice(&draft_ids[..accepted]);
+                        let replayed = model.forward_step(
+                            cache,
+                            StepRequest::last(&replay).with_hidden(wants_hidden),
+                        )?;
+                        stats.forwards += 1;
+                        stats.replays += 1;
+                        replayed.hidden
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            (draft_ids, committed, accepted, kept_hidden, num_drafts)
         };
+        if let Some(report) = stats.tree.as_mut() {
+            report.passes += 1;
+            report.rows_verified += 1 + num_drafts as u64;
+            report.max_rows_per_pass = report.max_rows_per_pass.max(1 + num_drafts as u64);
+            report.accepted_tokens += accepted as u64;
+        }
         if !demoted {
             proposer.commit(
                 cur,
@@ -1166,6 +1545,91 @@ fn decide(
     let bonus = sample_row_host(row, &running, &config.sampling, rng, mask);
     committed.push(bonus);
     Ok((draft_ids, committed, accepted))
+}
+
+/// Positions a tree verify writes past a linear verify of `drafts` drafts (feature SW-F328): the
+/// tree's `1 + tree_rows` rows against the linear step's `1 + drafts`, at most
+/// [`core_llm::MAX_TREE_ROWS`] rows and `0` without drafts (no tree runs). A caller that sizes a
+/// request's cache adds them to its capacity, beside the `drafts` overshoot
+/// ([`StepModel::new_cache_for`]); admission prices them.
+pub fn tree_extra_positions(drafts: usize, tree_rows: usize) -> usize {
+    if drafts == 0 {
+        return 0;
+    }
+    tree_rows
+        .min(core_llm::MAX_TREE_ROWS as usize)
+        .saturating_sub(drafts)
+}
+
+/// The tree decision over every row's logits `[1, rows, vocab]` (feature SW-F328), walked from
+/// the anchor with `core_llm`'s rules: for a plain greedy run the per-row device argmax in one
+/// transfer; with penalties, a constraint or temperature every row in one copy, each visited row
+/// shaped on the host with the running history and constraint of its branch — the greedy target,
+/// or recursive rejection sampling over the row's children against its distribution. The
+/// constraint is advanced along the accepted branch (the caller rewinds it).
+#[allow(clippy::too_many_arguments)]
+fn tree_walk(
+    logits: &Tensor,
+    tree: &DraftTree,
+    history: &[i32],
+    config: &GenerationConfig,
+    rng: &mut SplitMix64,
+    plain_greedy: bool,
+    mut constraint: Option<&mut (dyn RewindableConstraintMask + '_)>,
+) -> Result<TreeWalk> {
+    let n = logits.dim(1)?;
+    if n != tree.rows() {
+        return Err(Error::Msg(format!(
+            "tree verify returned {n} positions for {} rows",
+            tree.rows()
+        )));
+    }
+    let is_stop = |t: i32| config.stop_tokens.contains(&t);
+    if plain_greedy && constraint.is_none() {
+        let argmax = argmax_rows_tensor(logits)?;
+        crate::primitives::host_sync::note_host_sync();
+        let argmax: Vec<i32> = argmax
+            .to_vec1::<u32>()?
+            .into_iter()
+            .map(|t| t as i32)
+            .collect();
+        let walk = walk_tree(tree, is_stop, |row, children| {
+            Ok::<_, Error>(greedy_tree_step(tree, children, argmax[row]))
+        })?;
+        // Every committed token is a device argmax (the sampler telemetry's device path).
+        for _ in &walk.committed {
+            note_sampler_path(SamplerPath::Device);
+        }
+        return Ok(walk);
+    }
+    let rows = logits_rows_host(logits)?;
+    let greedy = config.sampling.temperature <= 0.0;
+    let mut running = history.to_vec();
+    walk_tree(tree, is_stop, |row, children| -> Result<TreeStep> {
+        let mask = constraint.as_mut().map(|c| c.allowed());
+        let step = if greedy {
+            let target = sample_row_host(rows[row].clone(), &running, &config.sampling, rng, mask);
+            greedy_tree_step(tree, children, target)
+        } else {
+            // The acceptance walk over a host row: recorded as one host draw.
+            note_sampler_path(SamplerPath::Host(host_row_reason(
+                &config.sampling,
+                mask.is_some(),
+            )));
+            let p = acceptance_target_host(rows[row].clone(), &running, &config.sampling, mask);
+            sampled_tree_step(tree, &p, children, &mut || rng.next_f32())
+        };
+        if let TreeStep::Child(child) = step {
+            let token = tree.node(child).token;
+            if !is_stop(token) {
+                if let Some(c) = constraint.as_mut() {
+                    c.accept(token);
+                }
+                running.push(token);
+            }
+        }
+        Ok(step)
+    })
 }
 
 #[cfg(test)]
@@ -2089,6 +2553,178 @@ mod tests {
         }
     }
 
+    /// A [`Ramp`] that also returns hidden rows `[1, n, 1]`, each holding its own position — so a
+    /// proposer can check which positions' rows it was handed.
+    struct PositionRows(Ramp);
+    impl StepModel for PositionRows {
+        type Cache = RampCache;
+        fn new_cache(&self) -> RampCache {
+            self.0.new_cache()
+        }
+        fn device(&self) -> &Device {
+            self.0.device()
+        }
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn forward_step(
+            &self,
+            cache: &mut RampCache,
+            request: StepRequest<'_>,
+        ) -> Result<StepOutput> {
+            let (start, n, want) = (cache.len, request.len()?, request.want_hidden);
+            let mut out = self.0.forward_step(cache, request)?;
+            if want {
+                let rows: Vec<f32> = (0..n).map(|i| (start + i as i32) as f32).collect();
+                out.hidden = Some(Tensor::from_vec(rows, (1, n, 1), &Device::Cpu)?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// A proposer keeping a block draft's context (SW-7197): the target rows of every position,
+    /// appended under [`BlockDraftProposer`](crate::decode::BlockDraftProposer)'s own continuity
+    /// rule ([`context_continuation`](crate::decode::block_draft::context_continuation)) from the
+    /// warm-up and each commit, and checked to end at the anchor at every proposal. It proposes
+    /// [`Ramp`]'s own continuation. `replay_probe` replays the probe's rows in `catch_up` — the
+    /// double append the proposer once made.
+    struct ContextRows {
+        vocab: i32,
+        positions: Vec<i32>,
+        proposals: usize,
+        replay_probe: bool,
+    }
+
+    impl ContextRows {
+        fn append(&mut self, rows: &Tensor, first: i32) -> Result<()> {
+            let next = self.positions.last().map_or(first, |&p| p + 1);
+            let rows: Vec<f32> = rows.flatten_all()?.to_vec1()?;
+            let skip = crate::decode::block_draft::context_continuation(next, first, rows.len())?;
+            for (i, &row) in rows.iter().enumerate().skip(skip) {
+                assert_eq!(row as i32, first + i as i32, "the row of its own position");
+                self.positions.push(row as i32);
+            }
+            Ok(())
+        }
+    }
+
+    impl Proposer for ContextRows {
+        fn kind(&self) -> ProposerKind {
+            ProposerKind::BlockDraft
+        }
+        fn wants_hidden(&self) -> bool {
+            true
+        }
+        fn warm(&mut self, prompt: &[i32], hidden: Option<&Tensor>) -> Result<()> {
+            let hidden = hidden.expect("tapped prompt rows");
+            self.append(hidden, (prompt.len() - hidden.dim(1)?) as i32)
+        }
+        fn propose(
+            &mut self,
+            ctx: &ProposeContext<'_>,
+            _: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            assert_eq!(
+                self.positions.last().map(|p| p + 1),
+                Some(ctx.position),
+                "the context ends at the anchor"
+            );
+            self.proposals += 1;
+            let drafts = (1..=ctx.max_drafts as i32)
+                .map(|i| (ctx.position + i) % self.vocab)
+                .collect();
+            Ok(Proposal {
+                drafts: Some(Drafts::Host(drafts)),
+                dists: Vec::new(),
+            })
+        }
+        fn commit(
+            &mut self,
+            _: i32,
+            _: &[i32],
+            rows: Option<&Tensor>,
+            position: i32,
+        ) -> Result<()> {
+            self.append(rows.expect("a committed step's rows"), position - 1)
+        }
+        fn catch_up(&mut self, _: &[i32], rows: Option<&Tensor>, position: i32) -> Result<()> {
+            if self.replay_probe {
+                self.append(rows.expect("the probe's rows"), position - 1)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// PR #1485 review 3: under `auto` on a timed clock the engine runs a plain probe before the
+    /// first proposal, and commits every probe step — with its row — to the proposer. A block
+    /// draft's context is therefore current when the first proposal comes: the run proposes past
+    /// the probe with every position's row held exactly once, and replaying the probe's rows on
+    /// top (the proposer's former `catch_up`) is refused as a discontinuous append.
+    #[test]
+    fn a_block_draft_context_needs_no_catch_up_after_the_auto_probe() {
+        let model = PositionRows(Ramp {
+            vocab: 16,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        });
+        let budget = core_llm::PLAIN_PROBE_MAX_STEPS as usize + 12;
+        let config = greedy(budget);
+        let expected = run(&model, &mut NoProposer, &PROMPT, &config, 0)
+            .output
+            .tokens;
+        let mut proposer = ContextRows {
+            vocab: 16,
+            positions: Vec::new(),
+            proposals: 0,
+            replay_probe: false,
+        };
+        let run = timed_run(&model, &mut proposer, &config, 3, 1.0);
+        assert_eq!(run.output.tokens, expected);
+        assert!(proposer.proposals > 0, "proposals past the probe");
+        assert_eq!(run.record.speculative_demoted_at, None);
+        // Every committed position's row, once and in order: the prompt's, then each step's.
+        let fed = (PROMPT.len() + run.output.tokens.len() - 1) as i32;
+        assert_eq!(proposer.positions, (0..fed).collect::<Vec<_>>());
+
+        let mut replaying = ContextRows {
+            vocab: 16,
+            positions: Vec::new(),
+            proposals: 0,
+            replay_probe: true,
+        };
+        let clock = std::rc::Rc::new(StepClock::default());
+        let timed = Timed {
+            inner: &model,
+            clock: clock.clone(),
+            plain: std::time::Duration::from_millis(10),
+            ratio: 1.0,
+        };
+        let refused = core_llm::with_decode_clock(Some(clock), || {
+            generate_speculative_monitored(
+                &timed,
+                &mut replaying,
+                SpeculativePrompt::Tokens(&PROMPT),
+                &config,
+                3,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                None,
+                AUTO,
+                0,
+            )
+        });
+        let Err(err) = refused else {
+            panic!("a replayed probe is refused")
+        };
+        assert!(
+            err.to_string().contains("do not continue a context"),
+            "{err}"
+        );
+        assert_eq!(replaying.proposals, 0, "refused before the first proposal");
+    }
+
     /// A [`Ramp`] whose every forward records one fused primitive leaf and one NVFP4 decode-GEMV
     /// call, as a real decoder's forward records its primitives.
     struct Tallied(Ramp);
@@ -2445,6 +3081,8 @@ mod tests {
             previous_hidden: None,
             position: PROMPT.len() as i32,
             max_drafts: 4,
+            budget_drafts: 4,
+            max_rows: 4,
         };
         let mut rng = SplitMix64::new(11);
         let mut sampler = DraftSampler {
@@ -3199,6 +3837,7 @@ mod tests {
                 None,
                 None,
                 AUTO,
+                0,
             )
         })
         .inspect(assert_demotion_agrees)
@@ -3265,6 +3904,7 @@ mod tests {
                 None,
                 None,
                 mode,
+                0,
             )
         })
         .inspect(assert_demotion_agrees)
@@ -3844,6 +4484,8 @@ mod tests {
                 previous_hidden: Some(&previous),
                 position,
                 max_drafts: 1,
+                budget_drafts: 1,
+                max_rows: 1,
             };
             let mut sampler = DraftSampler {
                 config: &config,
@@ -3927,3 +4569,6 @@ mod tests {
         println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_demoted_mtp_head_decodes_the_rest_plainly");
     }
 }
+
+#[cfg(test)]
+mod tree_tests;

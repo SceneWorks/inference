@@ -1,0 +1,201 @@
+name: Real-weight validation (decode-speedups benchmark campaigns)
+
+# The decode-speedups benchmark campaigns (sc-24446 on Candle/CUDA, SW-7200 on MLX), called by
+# `real-weights.yml`'s `decode-speedups-bench` job after its `validate-selection` barrier, with the
+# dispatched `profile` and `decode_bench_matrix`. Moved out of `real-weights.yml` (which is at its
+# size budget) unchanged: same job ids, names, runners and scripts under
+# `scripts/ci/real-weights/<job>/`. No `concurrency` here: the caller's group already serializes
+# the whole run against the physical host, and a nested copy of it would deadlock.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: The caller's dispatched real-weight profile
+        type: string
+        required: true
+      decode_bench_matrix:
+        description: The caller's dispatched decode-speedups matrix (JSON)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+
+jobs:
+  # sc-24446 (epic sc-24432 terminal campaign): the decode-speedups benchmark on the CUDA box — per
+  # matrix row, the epic's `speculative_bench` entry point and the pre-epic baseline driver as
+  # alternating processes (epic, baseline, epic, … — the row's `process_repeats`), one at a time,
+  # every document into one run-scoped directory uploaded as one artifact. `compare` in the same
+  # script turns the artifact into the E6 verdicts and E5 defaults decisions.
+  # Dispatch-only on its own profile (never `all`, never a PR or push): one matrix is hours of one
+  # card.
+  #
+  # TWO SHALLOW CHECKOUTS side by side under the workspace: the dispatched ref (`inference`) and the
+  # pre-epic revision c1e8f8e02 (`inference-pre-epic`), into which the epic's baseline driver is
+  # copied as its header says. Neither nests in the other, so each document's recorded `git status`
+  # describes only its own tree — the runner refuses a head document from a dirty tree and a
+  # baseline document whose tree differs by more than the copied driver. The runner script builds
+  # both (the pre-epic one in its own persistent target directory beside the shared one) with the
+  # commit and dirty flag stamped at compile time, so a stale binary is refused, not measured.
+  #
+  # The box has two RTX PRO 6000s and CI's CUDA lanes use cuda:0. The campaign card is bound by
+  # UUID (SW-7200): `Select the campaign card by UUID` sets CUDA_VISIBLE_DEVICES to
+  # DECODE_BENCH_CUDA_UUID through the trusted System32 nvidia-smi and refuses when it is absent,
+  # so candle-llm's device 0 is that card whatever its index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` keeps
+  # CUDA's numbering nvidia-smi's).
+  #
+  # `timeout-minutes: 600` is a runaway guard, not a budget: two cold `--release --features cuda`
+  # builds, then every row's runs back to back. Re-size it from the first campaign that completes.
+  candle-decode-speedups-bench:
+    name: Decode-speedups benchmark campaign (Candle/CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 600
+    defaults:
+      run:
+        working-directory: inference
+    env:
+      DECODE_BENCH_MATRIX: ${{ inputs.decode_bench_matrix }}
+      DECODE_BENCH_SNAPSHOT_QWEN38: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
+      DECODE_BENCH_SNAPSHOT_BONSAI_MLX: ${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}
+      DECODE_BENCH_PRE_EPIC_TARGET: ${{ github.workspace }}/../cargo-target-pre-epic
+      # SW-7200: where a matrix's `hub:` pins are bound and staged.
+      MODEL_PROOF_HUB_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      # SW-7200: the card the campaign is measured on, selected by UUID: the step below sets
+      # CUDA_VISIBLE_DEVICES to it (fail closed when it is absent), so no index is assumed.
+      DECODE_BENCH_CUDA_UUID: GPU-e4b79931-7be6-f216-460a-f5405cfafffe
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - name: Check out the dispatched ref
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: inference
+      - name: Check out the pre-epic revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: c1e8f8e023bf4e1fe94a61c4c39e08f881fdd8e6
+          path: inference-pre-epic
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\install-reviewed-cpython-3-12.cmd
+      - name: Validate the matrix and initialize the run-scoped evidence directory
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\validate-the-matrix-and-initialize-the-run-scoped-evidence.cmd
+      - name: Stage the pinned Hub snapshots
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\stage-the-pinned-hub-snapshots.cmd
+      # `dtolnay/rust-toolchain` runs its steps with `shell: bash`; on this runner a bare `bash` is
+      # WSL's `C:\Windows\System32\bash.exe`, which has no distribution (sc-24446).
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
+      # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Copy the baseline driver into the pre-epic checkout
+        shell: cmd
+        run: copy /Y crates\contracts\core-llm\core-llm-testkit\baseline\speculative_bench_baseline.rs ..\inference-pre-epic\crates\llm\candle-llm\tests\speculative_bench_baseline.rs || exit /b 1
+      # Records every card's uuid / bus id and binds the campaign card by UUID, fail closed.
+      - name: Select the campaign card by UUID
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\select-the-campaign-card-by-uuid.cmd
+      # The runner builds both checkouts first (stamped: `SPECULATIVE_BENCH_BUILD_GIT_SHA`), then
+      # alternates the epic and baseline processes per row.
+      - name: Build both checkouts and run every matrix row (epic and baseline alternating)
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\run-every-matrix-row.cmd
+      # `always()`, not `!cancelled()`: a job that hits `timeout-minutes` counts as cancelled, and
+      # run 36891326535 lost all 32 finished rows that way. The runner rewrites summary.json after
+      # every process, so a timed-out campaign's documents still compare (sc-24446).
+      - name: Keep the decode-speedups benchmark documents
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decode-speedups-bench-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/decode-speedups-bench-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # SW-7200 (feature SW-F360 terminal campaign): the same campaign runner on MLX, epic rows only,
+  # for the paired speculative-paths comparison. Dispatch-only on its own profile, on the primary
+  # Mac (`rw-starvector` = nax-macos, the owner's dev Mac, used only on a loan) by default; the
+  # matrix may select nax-macos-2 instead (see `runs-on`). The runner starts no benchmark process once
+  # DECODE_BENCH_BUDGET_MINUTES have passed since the build and never interrupts the running one
+  # (signalling an MLX process mid-command-buffer can hang the GPU); `timeout-minutes` is only a
+  # runaway guard. Every process runs under scripts/ci/mlx_tree_guard.py at its row's
+  # `memory_cap_gib` (SIGTERM only). The build target is job-owned and persistent on
+  # /Volumes/Models on nax-macos (off the internal disk), or beside the
+  # workspace on nax-macos-2.
+  mlx-decode-speedups-bench:
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 900 -- /bin/bash -e {0}
+    name: Decode-speedups benchmark campaign (MLX)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench-mlx'
+    # The default runner is rw-starvector (nax-macos, the owner's dev Mac, used only on a loan).
+    # Set "runner":"rw-llm" in the matrix for nax-macos-2, whose hub cache starts empty: only
+    # `hub:` pins are fetched there, so its rows must use `hub:` pins. Any other value runs on
+    # rw-starvector and the matrix validator refuses it once the job starts.
+    runs-on: [self-hosted, macOS, ARM64, "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' && 'rw-llm' || 'rw-starvector' }}"]
+    timeout-minutes: 180
+    env:
+      DECODE_BENCH_MATRIX: ${{ inputs.decode_bench_matrix }}
+      DECODE_BENCH_SNAPSHOT_QWEN38: ${{ vars.BONSAI_QWEN38_SNAPSHOT }}
+      DECODE_BENCH_SNAPSHOT_BONSAI_MLX: ${{ vars.BONSAI_MLX_SNAPSHOT }}
+      MODEL_PROOF_HUB_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      DECODE_BENCH_BUDGET_MINUTES: "100"
+      DECODE_BENCH_TARGET_DIR: ${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' && format('{0}/../decode-speedups-bench-target', github.workspace) || '/Volumes/Models/sceneworks-ci/decode-speedups-bench/cargo-target' }}
+    steps:
+      - shell: bash
+        name: Prepare the persistent build target
+        # A pending macOS volume permission must not consume the loan.
+        timeout-minutes: 2
+        run: mkdir -p "$DECODE_BENCH_TARGET_DIR"
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          DECODE_BENCH_SNAPSHOT_QWEN38 DECODE_BENCH_SNAPSHOT_BONSAI_MLX MODEL_PROOF_HUB_ROOT
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          DECODE_BENCH_SNAPSHOT_QWEN38 DECODE_BENCH_SNAPSHOT_BONSAI_MLX MODEL_PROOF_HUB_ROOT
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Validate the matrix and initialize the run-scoped evidence directory
+        run: source scripts/ci/real-weights/mlx-decode-speedups-bench/validate-the-matrix-and-initialize-the-run-scoped-evidence.sh
+      - name: Stage the pinned Hub snapshots
+        run: source scripts/ci/real-weights/mlx-decode-speedups-bench/stage-the-pinned-hub-snapshots.sh
+      - name: Build and run every matrix row
+        run: source scripts/ci/real-weights/mlx-decode-speedups-bench/run-every-matrix-row.sh
+      - name: Keep the decode-speedups benchmark documents
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decode-speedups-bench-mlx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/decode-speedups-bench-mlx-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30

@@ -52,7 +52,7 @@ pub enum MtpMode {
 }
 
 /// A proposal source a speculative request can name (epic sc-24432 E4). The wire and label
-/// spellings are `mtp`, `prompt_lookup` and `draft_model`.
+/// spellings are `mtp`, `prompt_lookup`, `draft_model` and `block_draft`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeculativeProposer {
@@ -64,23 +64,30 @@ pub enum SpeculativeProposer {
     PromptLookup,
     /// A separate, smaller draft model sharing the target's vocabulary.
     DraftModel,
+    /// A block draft (SW-F360): a small draft model that reads the target's hidden rows at its
+    /// configured layers and proposes a whole block of tokens in one forward (DSpine;
+    /// [`BlockDraftFormat`](crate::BlockDraftFormat)).
+    BlockDraft,
 }
 
 impl SpeculativeProposer {
     /// Every proposer, in declaration order; [`Speculative::Auto`] considers only `mtp` then
     /// `prompt_lookup` ([`resolve_speculative`](crate::resolve_speculative)).
-    pub const ALL: [SpeculativeProposer; 3] = [
+    pub const ALL: [SpeculativeProposer; 4] = [
         SpeculativeProposer::Mtp,
         SpeculativeProposer::PromptLookup,
         SpeculativeProposer::DraftModel,
+        SpeculativeProposer::BlockDraft,
     ];
 
-    /// The stable lower-case wire / evidence label (`mtp`, `prompt_lookup`, `draft_model`).
+    /// The stable lower-case wire / evidence label (`mtp`, `prompt_lookup`, `draft_model`,
+    /// `block_draft`).
     pub const fn label(self) -> &'static str {
         match self {
             SpeculativeProposer::Mtp => "mtp",
             SpeculativeProposer::PromptLookup => "prompt_lookup",
             SpeculativeProposer::DraftModel => "draft_model",
+            SpeculativeProposer::BlockDraft => "block_draft",
         }
     }
 }
@@ -100,15 +107,15 @@ impl std::str::FromStr for SpeculativeProposer {
             .find(|p| p.label() == value)
             .ok_or_else(|| {
                 crate::Error::InvalidRequest(format!(
-                    "unknown speculative proposer `{value}`; expected mtp, prompt_lookup or \
-                     draft_model"
+                    "unknown speculative proposer `{value}`; expected mtp, prompt_lookup, \
+                     draft_model or block_draft"
                 ))
             })
     }
 }
 
 /// The one proposer-agnostic speculative-decoding option (epic sc-24432 E4):
-/// `off | auto | {proposer: mtp|prompt_lookup|draft_model, depth}`.
+/// `off | auto | {proposer: mtp|prompt_lookup|draft_model|block_draft, depth}`.
 ///
 /// Speculation changes the speed, never the output: greedy output is the plain path's, and a
 /// stochastic run keeps the target distribution through exact rejection sampling. What a request
@@ -147,6 +154,34 @@ impl Speculative {
     pub const fn proposer(proposer: SpeculativeProposer, depth: u32) -> Self {
         Speculative::Proposer { proposer, depth }
     }
+}
+
+/// How a speculative verify pass lays out its candidates (feature SW-F328): one proposed
+/// continuation (`linear`, the default and every pre-SW-F328 request's behaviour), or a bounded
+/// **tree** of candidate continuations verified in one target forward with ancestor-only
+/// visibility, keeping only the accepted branch's state.
+///
+/// The tree is an explicit opt-in: [`Speculative::Auto`] never turns it on. It runs only when a
+/// proposer runs and the loaded model advertises it
+/// ([`TextLlmCapabilities::tree_verify`](crate::TextLlmCapabilities::tree_verify)); otherwise the
+/// request verifies linearly and [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) says
+/// why ([`resolve_tree_verify`](crate::speculative::tree::resolve_tree_verify)). Like every
+/// speculative option it changes the speed, never the output distribution.
+///
+/// **Wire form.** `"linear"` or `{"tree": {"max_rows": N}}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculativeVerify {
+    /// One proposed continuation per verify pass.
+    #[default]
+    Linear,
+    /// A tree of at most `max_rows` candidate rows (beyond the anchor) per verify pass. Above
+    /// the advertised bound it runs at that bound, the clamp named in the decode report; `0` is
+    /// refused by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request).
+    Tree {
+        /// Candidate rows per verify pass (`>= 1`).
+        max_rows: u32,
+    },
 }
 
 impl From<MtpMode> for Speculative {
@@ -194,7 +229,7 @@ impl Speculative {
     fn from_wire(value: &serde_json::Value) -> std::result::Result<Self, String> {
         use serde_json::Value;
         const EXPECTED: &str = "expected \"off\", \"auto\", {\"proposer\": \"mtp\" | \
-                                \"prompt_lookup\" | \"draft_model\", \"depth\": N} or the legacy \
+                                \"prompt_lookup\" | \"draft_model\" | \"block_draft\", \"depth\": N} or the legacy \
                                 mtp form {\"mode\": \"off\" | \"auto\" | \"enabled\", \
                                 \"draft_tokens\": N}";
         let mode = |s: &str| match s {
@@ -500,6 +535,9 @@ pub struct TextLlmRequest {
     /// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
     /// rather than silently preferring one.
     pub mtp: Option<MtpMode>,
+    /// How a speculative verify pass lays out its candidates (feature SW-F328): linear (the
+    /// default) or an explicitly requested tree. Inert when no proposer runs.
+    pub speculative_verify: SpeculativeVerify,
     /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
     /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
     /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a
@@ -665,6 +703,10 @@ mod tests {
             (
                 Speculative::proposer(SpeculativeProposer::DraftModel, 2),
                 serde_json::json!({"proposer": "draft_model", "depth": 2}),
+            ),
+            (
+                Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+                serde_json::json!({"proposer": "block_draft", "depth": 4}),
             ),
         ];
         for (option, wire) in cases {
@@ -884,6 +926,12 @@ pub struct LoadSpec {
     /// [`TextLlmCapabilities::speculative`](crate::TextLlmCapabilities::speculative) only while a
     /// compatible draft is resident.
     pub draft_source: Option<String>,
+    /// The load-time precision of a **block draft** named by [`draft_source`](Self::draft_source)
+    /// (SW-F360 E8): `None` or [`Quantize::Q8`] quantizes its projections to 8-bit (the default),
+    /// [`Quantize::Q4`] to 4-bit. Independent of the target's [`quantize`](Self::quantize) tier,
+    /// which a prequantized target snapshot leaves unset. Any other value refuses the draft by
+    /// name; a draft model (not a block draft) ignores it.
+    pub draft_quantize: Option<Quantize>,
 }
 
 /// Load-time quantization request.
@@ -912,6 +960,7 @@ impl LoadSpec {
             mtp_head_source: None,
             prefix_cache_bytes: None,
             draft_source: None,
+            draft_quantize: None,
         }
     }
 
@@ -932,6 +981,12 @@ impl LoadSpec {
     /// ([`draft_source`](Self::draft_source)).
     pub fn with_draft(mut self, source: impl Into<String>) -> Self {
         self.draft_source = Some(source.into());
+        self
+    }
+
+    /// Load a named block draft at `precision` ([`draft_quantize`](Self::draft_quantize)).
+    pub fn with_draft_quantize(mut self, precision: Quantize) -> Self {
+        self.draft_quantize = Some(precision);
         self
     }
 }

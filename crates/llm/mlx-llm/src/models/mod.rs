@@ -5,7 +5,10 @@
 //! single loaded model can be shared and driven concurrently in the batch dimension later. The only
 //! mutable state in a forward pass is the KV cache, threaded in as `&mut dyn KvCache`.
 
+pub mod block_draft;
 pub mod deepstack;
+pub mod dflash2;
+pub mod dspine;
 pub mod gemma4_mm;
 pub mod gpt_bigcode;
 pub mod llama;
@@ -15,6 +18,9 @@ pub mod siglip;
 pub mod starcoder2;
 pub mod starvector_vision;
 
+pub use block_draft::{BlockDraft, BlockDraftContext};
+pub use dflash2::DFlash2Draft;
+pub use dspine::{DSpineBlock, DSpineDraft};
 pub use gemma4_mm::{
     Gemma4AudioConfig, Gemma4AudioEmbedder, Gemma4Layout, Gemma4Mm, Gemma4MmConfig,
     Gemma4VisionConfig, Gemma4VisionEmbedder,

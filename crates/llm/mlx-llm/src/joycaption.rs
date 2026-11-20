@@ -555,7 +555,8 @@ impl TextLlm for JoyCaptionProvider {
         // Candle's LLaVA uses — never a silent downgrade (E2, E8).
         let report = gen
             .report
-            .with_captioner_reasons(req.speculative_or(self.speculative_default));
+            .with_captioner_reasons(req.speculative_or(self.speculative_default))
+            .with_captioner_tree_reason(req.speculative_verify);
         on_event(CoreEvent::Done {
             finish_reason: finish,
             usage,
@@ -616,6 +617,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             mtp: None,
             speculative: Vec::new(),
             supported_constraints: Vec::new(),
+            tree_verify: None,
         },
     }
 }

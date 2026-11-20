@@ -98,6 +98,7 @@ pub(super) fn provider_descriptor_on(backend: core_llm::DecodeBackend) -> TextLl
             speculative: vec![prompt_lookup_capabilities(backend)],
             // JSON-constrained decoding.
             supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
+            tree_verify: None,
         },
     }
 }

@@ -3,7 +3,7 @@
 //! the request sets — including an explicit off, in the new or the legacy spelling — wins.
 
 use core_llm::{
-    resolve_speculative, MtpMode, ProposerKind, Sampling, Speculative, TextLlm, TextLlmOutput,
+    resolve_speculative_with, MtpMode, ProposerKind, Sampling, Speculative, TextLlm, TextLlmOutput,
     TextLlmRequest,
 };
 
@@ -14,15 +14,22 @@ use crate::speculative::BenchPrompt;
 /// `mtp: Some(MtpMode::Off)` run plain; all three emit the same greedy text (E1). Run it once with
 /// the provider as loaded (`default` = its defaults-table row) and once after setting a default
 /// that resolves to a proposer, so the hook is observable whatever the table says.
+/// `auto_prefers_block_draft` is the preference the provider passes its resolver (SW-7200: a
+/// resident block draft a recorded decision prefers runs first under `auto`).
 pub fn check_speculative_default(
     provider: &dyn TextLlm,
     default: Speculative,
+    auto_prefers_block_draft: bool,
     prompt: &BenchPrompt,
     max_new_tokens: u32,
 ) {
-    let expected = resolve_speculative(default, &provider.descriptor().capabilities)
-        .plan
-        .proposer();
+    let expected = resolve_speculative_with(
+        default,
+        &provider.descriptor().capabilities,
+        auto_prefers_block_draft,
+    )
+    .plan
+    .proposer();
     let run = |speculative: Option<Speculative>, mtp: Option<MtpMode>| -> TextLlmOutput {
         let request = TextLlmRequest {
             messages: prompt.messages.clone(),

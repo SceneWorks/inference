@@ -189,6 +189,7 @@ fn run_quantized_conformance(env_var: &str, quant: Quantize) {
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     };
     textllm_conformance(
         || {

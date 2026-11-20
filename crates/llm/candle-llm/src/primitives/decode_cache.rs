@@ -147,7 +147,40 @@ pub trait DecodeCache {
     fn graph_identity(&self) -> usize {
         self as *const Self as *const u8 as usize
     }
+
+    /// Why this cache cannot keep an arbitrary branch of a tree verify forward (feature
+    /// SW-F328), or `None` when [`commit_tree`](Self::commit_tree) can. The default refuses, so a
+    /// cache that never learned the tree verifies linearly with the reason named.
+    fn tree_unsupported(&self) -> Option<&'static str> {
+        Some(TREE_CACHE_UNSUPPORTED)
+    }
+
+    /// Keep the branch `path` (tree rows from the anchor, `path[0] == 0`, increasing) of the tree
+    /// verify forward that started at position `base`: the cache then holds exactly what a
+    /// linear decode of the branch would have left — positions `base..base + path.len()`, every
+    /// other tree row dropped (feature SW-F328).
+    fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        let _ = (base, path);
+        Err(crate::error::Error::Unsupported(
+            TREE_CACHE_UNSUPPORTED.into(),
+        ))
+    }
+
+    /// Return the cache to position `base`, keeping nothing of a tree forward that will not be
+    /// committed (a failed forward or decision, a cancel). The default rolls back.
+    fn abort_tree(&mut self, base: i32) -> Result<()> {
+        self.rollback_to(base.min(self.len()))
+    }
+
+    /// Bytes a pending tree forward's per-row state holds beside the cache (the hybrid's per-row
+    /// recurrent states and conv inputs); `0` for a cache that keeps none.
+    fn tree_bytes(&self) -> usize {
+        0
+    }
 }
+
+/// Why a cache without a tree implementation verifies linearly (feature SW-F328).
+pub const TREE_CACHE_UNSUPPORTED: &str = "this KV cache cannot keep an arbitrary tree branch";
 
 /// Fold device-buffer addresses into a graph identity (sc-24441): the caches that back graphs
 /// start from their own address and fold in every buffer a captured step reads or writes, so a

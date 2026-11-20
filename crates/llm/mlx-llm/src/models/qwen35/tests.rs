@@ -3336,6 +3336,66 @@ fn stored_quantized_scales_keep_activations_and_kv_in_compute_dtype() {
     println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::stored_quantized_scales_keep_activations_and_kv_in_compute_dtype");
 }
 
+/// SW-7200: the resident quantization `auto`'s block-draft tier reads is what the projections
+/// hold — a snapshot's stored Q4 triples loaded as stored, a load-time Q8, or dense. Construction
+/// only (lazy graphs; nothing is evaluated, no forward).
+#[test]
+fn resident_quant_is_the_stored_or_load_time_spec() {
+    use crate::primitives::quant::QuantizedLinear;
+    let mut value = cfg_json();
+    // qwen3_5 stores 64-wide groups: widen every stored projection's input to a multiple.
+    let text = &mut value["text_config"];
+    text["hidden_size"] = json!(64);
+    text["intermediate_size"] = json!(128);
+    text["head_dim"] = json!(16);
+    text["linear_value_head_dim"] = json!(16);
+    let dense_cfg = Qwen35Config::from_json(&value).unwrap();
+    let dense = synthetic_weights(&dense_cfg);
+    let prefix = "model.language_model";
+
+    let model = Qwen35Model::build_lazy(&dense, prefix, dense_cfg.clone(), None).unwrap();
+    assert!(!model.is_quantized());
+    assert_eq!(model.resident_quant(), None);
+
+    let model =
+        Qwen35Model::build_lazy(&dense, prefix, dense_cfg.clone(), Some(QuantSpec::q8())).unwrap();
+    assert!(model.is_quantized());
+    assert_eq!(model.resident_quant().map(|q| q.bits), Some(8));
+
+    value["quantization"] = json!({"group_size": 64, "bits": 4});
+    let stored_cfg = Qwen35Config::from_json(&value).unwrap();
+    const STORED: [&str; 10] = [
+        "in_proj_qkv",
+        "in_proj_z",
+        "out_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ];
+    let mut map = HashMap::new();
+    for key in dense.keys() {
+        let array = dense.require(key).unwrap().clone();
+        let base = key.strip_suffix(".weight").unwrap_or(key);
+        if key.starts_with("model.language_model.layers.")
+            && STORED.iter().any(|p| base.ends_with(p))
+        {
+            let q = QuantizedLinear::quantize(&array, 64, 4, None).unwrap();
+            map.insert(format!("{base}.weight"), q.weight);
+            map.insert(format!("{base}.scales"), q.scales);
+            map.insert(format!("{base}.biases"), q.biases);
+        } else {
+            map.insert(key.to_string(), array);
+        }
+    }
+    let model = Qwen35Model::build_lazy(&Weights::from_map(map), prefix, stored_cfg, None).unwrap();
+    assert!(model.is_quantized());
+    assert_eq!(model.resident_quant().map(|q| q.bits), Some(4));
+}
+
 #[test]
 fn sensenova_refuses_foreign_cache_with_same_virtual_depth() {
     let cfg = Qwen35Config::from_json(

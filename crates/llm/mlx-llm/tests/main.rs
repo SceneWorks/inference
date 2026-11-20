@@ -25,6 +25,9 @@ mod architecture_regression;
 #[path = "batch.rs"]
 mod batch;
 
+#[path = "block_draft.rs"]
+mod block_draft;
+
 #[path = "breadth.rs"]
 mod breadth;
 
@@ -105,6 +108,9 @@ mod qwen35_vision;
 
 #[path = "qwen38_bonsai.rs"]
 mod qwen38_bonsai;
+
+#[path = "qwen38_quantized_tiers.rs"]
+mod qwen38_quantized_tiers;
 
 #[path = "qwen3vl.rs"]
 mod qwen3vl;

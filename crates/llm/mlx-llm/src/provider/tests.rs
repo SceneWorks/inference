@@ -1038,7 +1038,11 @@ fn causal_provider() -> LlamaProvider {
 }
 
 fn qwen35_mtp_provider() -> LlamaProvider {
-    let model = crate::decode::engine::tests::qwen35(true);
+    qwen35_provider(crate::decode::engine::tests::qwen35(true))
+}
+
+/// A provider over a Qwen35 `model` (its tokenizer the 50-word one).
+fn qwen35_provider(model: Qwen35Model) -> LlamaProvider {
     let descriptor = descriptor_for_qwen35(model.config());
     LlamaProvider {
         descriptor,
@@ -1064,6 +1068,7 @@ fn qwen35_mtp_provider() -> LlamaProvider {
         )),
         speculative_default: core_llm::defaults::MLX.speculative,
         draft: None,
+        block_draft: None,
         load_report: core_llm::LoadReport::default(),
     }
 }
@@ -1098,6 +1103,7 @@ fn qwen35_moe_provider() -> LlamaProvider {
         )),
         speculative_default: core_llm::defaults::MLX.speculative,
         draft: None,
+        block_draft: None,
         load_report: core_llm::LoadReport::default(),
     }
 }
@@ -2725,16 +2731,25 @@ fn every_proposer_is_greedy_exact_on_the_vector_kernel_geometry() {
         "a max-depth ({deepest}) verify in one vector-kernel call"
     );
 
-    // And that max is the geometry's: every proposer advertises it, the table covers it.
+    // And that max is the geometry's: every proposer the fixture loads advertises it — all but
+    // the block draft, which the fixture names none of — and the table covers it.
     let max = speculative_max_depth([geometry]);
     assert_eq!(max, 4, "the vector kernel's 5 rows, not the 8-row ceiling");
     assert_eq!(deepest, max);
-    for proposer in SpeculativeProposer::ALL {
-        assert_eq!(
-            caps.proposer(proposer).unwrap().max_depth,
-            max,
-            "{proposer:?}"
-        );
+    let advertised = caps.speculative_proposers();
+    assert_eq!(
+        advertised
+            .iter()
+            .map(|c| c.proposer)
+            .collect::<std::collections::HashSet<_>>(),
+        SpeculativeProposer::ALL
+            .into_iter()
+            .filter(|&p| p != SpeculativeProposer::BlockDraft)
+            .collect::<std::collections::HashSet<_>>(),
+        "every proposer but the block draft"
+    );
+    for c in advertised {
+        assert_eq!(c.max_depth, max, "{:?}", c.proposer);
     }
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry");
@@ -5809,11 +5824,18 @@ fn an_unset_speculative_option_runs_the_providers_default() {
     core_llm_testkit::check_speculative_default(
         &provider,
         core_llm::defaults::MLX.speculative,
+        provider.auto_prefers_block_draft(),
         prompt,
         8,
     );
     provider.set_speculative_default(core_llm::Speculative::Auto);
-    core_llm_testkit::check_speculative_default(&provider, core_llm::Speculative::Auto, prompt, 8);
+    core_llm_testkit::check_speculative_default(
+        &provider,
+        core_llm::Speculative::Auto,
+        provider.auto_prefers_block_draft(),
+        prompt,
+        8,
+    );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");
 }
@@ -6834,4 +6856,620 @@ fn a_modelopt_nvfp4_snapshot_is_refused_by_name_before_admission() {
         Err(other) => panic!("expected the by-name refusal, got {other}"),
         Ok(_) => panic!("a ModelOpt NVFP4 snapshot loaded on MLX"),
     }
+}
+
+// ---- Block drafts (epic SW-F360, story SW-7193). ----
+
+/// A draft directory holding only `config` — enough for every check before a weight is read.
+fn block_draft_dir(config: &serde_json::Value) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    dir
+}
+
+fn block_draft_spec(dir: &tempfile::TempDir) -> LoadSpec {
+    LoadSpec::dense(dir.path().to_string_lossy()).with_draft_quantize(Quantize::Q8)
+}
+
+/// AC2: a block draft whose hidden size, vocabulary, mask token or target layers do not fit the
+/// target is refused before any weight is read, every reason typed and named in the load report;
+/// `block_draft` is not advertised and a request naming it decodes without a proposer, by name.
+#[test]
+fn a_block_draft_that_does_not_fit_the_target_is_refused_by_type() {
+    use crate::models::dspine::tests::tiny_config_json;
+    // The tiny draft is 64 wide; the MTP hybrid is 32 wide with a 50-word tokenizer.
+    let mut config = tiny_config_json();
+    config["vocab_size"] = 64.into();
+    config["dflash_config"]["mask_token_id"] = 60.into();
+    config["dflash_config"]["target_layer_ids"] = json!([0, 4]);
+    let dir = block_draft_dir(&config);
+    let mut provider = qwen35_mtp_provider();
+    provider.attach_block_draft(&block_draft_spec(&dir), core_llm::BlockDraftFormat::DSpine);
+    let report = provider.load_report.draft.clone().unwrap();
+    let why = report.refusal.clone().unwrap();
+    for kind in ["hidden_size", "vocabulary", "mask_token", "target_layers"] {
+        assert!(
+            why.contains(&format!("block draft: {kind}:")),
+            "{kind}: {why}"
+        );
+    }
+    assert!(provider.block_draft.is_none());
+    assert!(provider.load_report.fallbacks.contains(&why));
+    let caps = &provider.descriptor.capabilities;
+    assert!(caps.proposer(SpeculativeProposer::BlockDraft).is_none());
+    let resolution = core_llm::resolve_speculative(
+        core_llm::Speculative::proposer(SpeculativeProposer::BlockDraft, 4),
+        caps,
+    );
+    assert_eq!(resolution.plan, SpeculativePlan::Off);
+    assert!(resolution
+        .fallback
+        .unwrap()
+        .contains("`block_draft` is not available"));
+    let mut why = Vec::new();
+    let plan = SpeculativePlan::Run {
+        proposer: SpeculativeProposer::BlockDraft,
+        depth: 4,
+    };
+    assert_eq!(
+        provider.speculative_route(plan, false, &mut why),
+        SpeculativeRoute::Plain
+    );
+    assert_eq!(why, [BLOCK_DRAFT_NOT_LOADED]);
+}
+
+/// AC2: a block draft beside a target that cannot tap its hidden rows — a causal decoder — is
+/// refused by its typed family reason; an unsupported precision is refused by name too.
+#[test]
+fn a_block_draft_needs_a_hybrid_target_and_a_draft_precision() {
+    use crate::models::dspine::tests::tiny_config_json;
+    let dir = block_draft_dir(&tiny_config_json());
+    let mut provider = causal_provider();
+    provider.attach_block_draft(&block_draft_spec(&dir), core_llm::BlockDraftFormat::DSpine);
+    let why = provider.load_report.draft.unwrap().refusal.unwrap();
+    assert!(why.starts_with("block draft: target_family:"), "{why}");
+    let mut spec = block_draft_spec(&dir);
+    spec.draft_quantize = Some(Quantize::Nvfp4);
+    assert!(draft_required_bytes(&spec)
+        .unwrap_err()
+        .to_string()
+        .contains("block draft: precision:"));
+}
+
+/// AC3: a block draft's load is priced by the shared contract at its requested precision — 8-bit
+/// unless 4-bit is asked for — and the dispatch reads the format from `architectures`.
+#[test]
+fn a_block_draft_load_is_priced_at_its_precision() {
+    use crate::models::dspine::tests::{tiny_config, tiny_config_json};
+    let dir = block_draft_dir(&tiny_config_json());
+    let cfg = tiny_config();
+    let mut spec = LoadSpec::dense(dir.path().to_string_lossy());
+    let slack = crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES;
+    assert_eq!(
+        draft_required_bytes(&spec).unwrap(),
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q8) + slack,
+        "8-bit by default"
+    );
+    spec.draft_quantize = Some(Quantize::Q4);
+    assert_eq!(
+        draft_required_bytes(&spec).unwrap(),
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q4) + slack
+    );
+    assert!(
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q4)
+            < cfg.load_bytes(core_llm::BlockDraftPrecision::Q8)
+    );
+    // The parent load hands the block draft its own precision, not the target's tier.
+    let parent = LoadSpec::dense("target")
+        .with_draft(dir.path().to_string_lossy())
+        .with_draft_quantize(Quantize::Q4);
+    assert_eq!(
+        draft_load_spec(&parent, &dir.path().to_string_lossy()).draft_quantize,
+        Some(Quantize::Q4)
+    );
+}
+
+/// AC2 (SW-7194): the format is read from the checkpoint's `architectures` — a DFlash2 draft
+/// dispatches to DFlash2 — and a DFlash2 draft trained for another target is refused before any
+/// weight is read, every reason typed and named in the load report; `block_draft` is not
+/// advertised.
+#[test]
+fn a_dflash2_draft_for_another_target_is_refused_by_type() {
+    use crate::models::dflash2::tests::tiny_config_json;
+    let mut config = tiny_config_json();
+    assert_eq!(
+        core_llm::BlockDraftFormat::from_config(&config),
+        Some(core_llm::BlockDraftFormat::DFlash2)
+    );
+    // The tiny draft is 64 wide; the MTP hybrid is 32 wide with a 50-word tokenizer.
+    config["dflash_config"]["target_layer_ids"] = json!([0, 7]);
+    let dir = block_draft_dir(&config);
+    assert_eq!(
+        core_llm::BlockDraftFormat::of_dir(dir.path()),
+        Some(core_llm::BlockDraftFormat::DFlash2)
+    );
+    let mut provider = qwen35_mtp_provider();
+    provider.attach_block_draft(&block_draft_spec(&dir), core_llm::BlockDraftFormat::DFlash2);
+    let why = provider.load_report.draft.clone().unwrap().refusal.unwrap();
+    for kind in ["hidden_size", "target_layers"] {
+        assert!(
+            why.contains(&format!("block draft: {kind}:")),
+            "{kind}: {why}"
+        );
+    }
+    assert!(provider.block_draft.is_none());
+    assert!(provider.load_report.fallbacks.contains(&why));
+    assert!(provider
+        .descriptor
+        .capabilities
+        .proposer(SpeculativeProposer::BlockDraft)
+        .is_none());
+    // A causal decoder cannot tap its rows for DFlash2 either.
+    let mut causal = causal_provider();
+    causal.attach_block_draft(&block_draft_spec(&dir), core_llm::BlockDraftFormat::DFlash2);
+    let why = causal.load_report.draft.unwrap().refusal.unwrap();
+    assert!(why.starts_with("block draft: target_family:"), "{why}");
+}
+
+/// E8 (SW-7194): a DFlash2 draft's load is priced by its own format's groups at its requested
+/// precision — 8-bit unless 4-bit is asked for.
+#[test]
+fn a_dflash2_load_is_priced_at_its_precision() {
+    use crate::models::dflash2::tests::{tiny_config, tiny_config_json};
+    let dir = block_draft_dir(&tiny_config_json());
+    let cfg = tiny_config();
+    let slack = crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES;
+    let mut spec = LoadSpec::dense(dir.path().to_string_lossy());
+    assert_eq!(
+        draft_required_bytes(&spec).unwrap(),
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q8) + slack
+    );
+    spec.draft_quantize = Some(Quantize::Q4);
+    assert_eq!(
+        draft_required_bytes(&spec).unwrap(),
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q4) + slack
+    );
+    assert_ne!(
+        cfg.load_bytes(core_llm::BlockDraftPrecision::Q8),
+        crate::models::dspine::tests::tiny_config().load_bytes(core_llm::BlockDraftPrecision::Q8),
+        "each format prices its own tensors"
+    );
+}
+
+/// The tiny hybrid with the tiny draft of `format` resident at 8-bit, `block_draft` advertised
+/// as a load would leave it.
+fn qwen35_provider_with_block_draft(format: core_llm::BlockDraftFormat) -> LlamaProvider {
+    use crate::models::dspine::tests::tiny_target;
+    let mut provider = qwen35_provider(tiny_target());
+    let q8 = Some(core_llm::BlockDraftPrecision::Q8);
+    let model = match format {
+        core_llm::BlockDraftFormat::DSpine => {
+            crate::models::BlockDraft::DSpine(crate::models::dspine::tests::tiny_draft(q8))
+        }
+        core_llm::BlockDraftFormat::DFlash2 => crate::models::dflash2::tests::tiny_draft(q8),
+    };
+    let max_depth = core_llm::verify_depth_bound(&provider.descriptor.capabilities);
+    provider
+        .descriptor
+        .capabilities
+        .speculative
+        .push(core_llm::block_draft_capabilities(
+            max_depth,
+            model.config().max_depth(),
+            &MLX_ROW.recommended_depths,
+        ));
+    provider.block_draft = Some(ResidentBlockDraft {
+        model,
+        report: core_llm::DecodeDraft {
+            source: format!("tiny-{}", format.label()),
+            format: format.label().into(),
+            precision: "q8".into(),
+        },
+    });
+    provider
+}
+
+/// [`qwen35_provider_with_block_draft`] made a Qwen3.5 VLM (SW-7209): the tiny target with room
+/// for an image's tokens, a one-block synthetic vision tower merging into its width, and the
+/// word tokenizer with the Qwen-VL specials (`<|vision_start|>`, `<|image_pad|>`,
+/// `<|vision_end|>`) as its last three ids — the Candle VLM fixture's shape.
+fn qwen35_vl_provider_with_block_draft(format: core_llm::BlockDraftFormat) -> LlamaProvider {
+    use crate::primitives::sampler::{SplitMix64, TokenRng};
+    let mut provider = qwen35_provider_with_block_draft(format);
+    let mut v = crate::models::qwen35::tests::cfg_json();
+    v["text_config"]["hidden_size"] = 64.into();
+    v["text_config"]["intermediate_size"] = 128.into();
+    v["text_config"]["max_position_embeddings"] = 512.into();
+    let cfg = Qwen35Config::from_json(&v).unwrap();
+    let weights = crate::models::qwen35::tests::synthetic_weights(&cfg);
+    let model = Qwen35Model::from_weights(&weights, "model.language_model", cfg).unwrap();
+    provider.descriptor.capabilities.max_context_tokens = 512;
+    provider.model = Decoder::Qwen35(Box::new(model));
+    let (hid, inter, positions, out) = (16i32, 32i32, 16i32, 64i32);
+    let mut rng = SplitMix64::new(0x0056_1510);
+    let mut tensors = std::collections::HashMap::new();
+    let mut put = |key: &str, dims: &[i32]| {
+        let n: i32 = dims.iter().product();
+        let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+        tensors.insert(
+            format!("model.visual.{key}"),
+            Array::from_slice(&data, dims),
+        );
+    };
+    put("patch_embed.proj.weight", &[hid, 3, 2, 16, 16]);
+    put("patch_embed.proj.bias", &[hid]);
+    put("pos_embed.weight", &[positions, hid]);
+    for (key, dims) in [
+        ("norm1.weight", vec![hid]),
+        ("norm1.bias", vec![hid]),
+        ("norm2.weight", vec![hid]),
+        ("norm2.bias", vec![hid]),
+        ("attn.qkv.weight", vec![3 * hid, hid]),
+        ("attn.qkv.bias", vec![3 * hid]),
+        ("attn.proj.weight", vec![hid, hid]),
+        ("attn.proj.bias", vec![hid]),
+        ("mlp.linear_fc1.weight", vec![inter, hid]),
+        ("mlp.linear_fc1.bias", vec![inter]),
+        ("mlp.linear_fc2.weight", vec![hid, inter]),
+        ("mlp.linear_fc2.bias", vec![hid]),
+    ] {
+        put(&format!("blocks.0.{key}"), &dims);
+    }
+    put("merger.norm.weight", &[hid]);
+    put("merger.norm.bias", &[hid]);
+    put("merger.linear_fc1.weight", &[4 * hid, 4 * hid]);
+    put("merger.linear_fc1.bias", &[4 * hid]);
+    put("merger.linear_fc2.weight", &[out, 4 * hid]);
+    put("merger.linear_fc2.bias", &[out]);
+    let vcfg = crate::models::Qwen35VisionConfig {
+        depth: 1,
+        hidden_size: hid,
+        num_heads: 2,
+        intermediate_size: inter,
+        in_channels: 3,
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        out_hidden_size: out,
+        num_position_embeddings: positions,
+        deepstack_visual_indexes: Vec::new(),
+    };
+    let tower = Qwen35VisionModel::from_weights(
+        &crate::primitives::Weights::from_map(tensors),
+        "model.visual",
+        vcfg,
+    )
+    .unwrap();
+    let vocab = 50usize;
+    let specials = [
+        (vocab - 3, "<|vision_start|>"),
+        (vocab - 2, "<|image_pad|>"),
+        (vocab - 1, "<|vision_end|>"),
+    ];
+    let piece = |i: usize| {
+        specials
+            .iter()
+            .find(|(id, _)| *id == i)
+            .map_or_else(|| format!("t{i}"), |(_, s)| s.to_string())
+    };
+    let entries: Vec<String> = (0..vocab)
+        .map(|i| format!("\"{}\": {i}", piece(i)))
+        .collect();
+    let added: Vec<String> = specials
+        .iter()
+        .map(|(id, content)| {
+            format!(
+                r#"{{"id": {id}, "content": "{content}", "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true}}"#
+            )
+        })
+        .collect();
+    provider.tokenizer = Tokenizer::from_json(&format!(
+        r#"{{"version": "1.0", "added_tokens": [{}], "normalizer": null,
+            "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null, "decoder": null,
+            "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+        added.join(", "),
+        entries.join(", ")
+    ))
+    .unwrap();
+    provider.vision = Some(Qwen35Vision {
+        tower,
+        processor: Qwen35ImageProcessor::default(),
+        image_token_id: (vocab - 2) as i32,
+        // No video placeholder occurs in these prompts.
+        video_token_id: (vocab - 4) as i32,
+        spatial_merge_size: 2,
+    });
+    provider.descriptor.capabilities.supports_vision = true;
+    provider
+}
+
+/// SW-7209 AC1 through the provider: a Qwen3.5 VLM with a resident draft of either format runs
+/// a greedy image + text `block_draft` request under a 16-row tree bound — the image at the head
+/// of the prompt and mid-prompt — that decodes exactly `off`'s stream, its report naming the
+/// draft, no tree or `block_draft` fallback, and the tree passes with their rows checked and
+/// accepted tokens; a seeded sampled tree request reproduces and verifies its trees too.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn a_block_draft_tree_verifies_an_image_request() {
+    use core_llm::{Content, ImageRef, Role, Speculative, SpeculativeVerify};
+    let (w, h) = (256u32, 256u32);
+    let pixels = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            [x as u8, y as u8, ((x + y) / 2) as u8]
+        })
+        .collect();
+    let image = Content::Image(ImageRef::new(w, h, pixels).unwrap());
+    let text = Content::text("t3 t7 t11 t2 t7 t11 t3 t7 t11 t2");
+    for format in core_llm::BlockDraftFormat::ALL {
+        let provider = qwen35_vl_provider_with_block_draft(format);
+        let mut tree_passes = 0;
+        for (id, content) in [
+            ("image_then_text", vec![image.clone(), text.clone()]),
+            ("text_then_image", vec![text.clone(), image.clone()]),
+        ] {
+            let label = format!("{} {id}", format.label());
+            let request = |speculative, sampling, verify| TextLlmRequest {
+                messages: vec![Message {
+                    role: Role::User,
+                    content: content.clone(),
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                }],
+                sampling,
+                max_new_tokens: 24,
+                seed: Some(3),
+                speculative: Some(speculative),
+                speculative_verify: verify,
+                ..Default::default()
+            };
+            let block = Speculative::proposer(SpeculativeProposer::BlockDraft, 3);
+            let tree = SpeculativeVerify::Tree { max_rows: 16 };
+            let (off, off_ids) = run(
+                &provider,
+                &request(
+                    Speculative::Off,
+                    Sampling::greedy(),
+                    SpeculativeVerify::Linear,
+                ),
+            );
+            assert!(
+                off.usage.prompt_tokens > 64,
+                "{label}: the image tokens are in the prompt"
+            );
+            let sampled = Sampling {
+                temperature: 1.0,
+                top_k: 6,
+                ..Sampling::greedy()
+            };
+            for (mode, sampling) in [("greedy", Sampling::greedy()), ("sampled", sampled)] {
+                let label = format!("{label} {mode}");
+                let (out, ids) = run(&provider, &request(block, sampling, tree));
+                if mode == "greedy" {
+                    assert_eq!(ids, off_ids, "{label}: the off stream");
+                } else {
+                    let (_, again) = run(&provider, &request(block, sampling, tree));
+                    assert_eq!(
+                        ids, again,
+                        "{label}: a seeded sampled tree request reproduces"
+                    );
+                }
+                let report = out.decode.unwrap();
+                assert_eq!(report.proposer, ProposerKind::BlockDraft, "{label}");
+                assert_eq!(
+                    report.draft.as_ref().map(|d| d.format.as_str()),
+                    Some(format.label())
+                );
+                assert!(
+                    report
+                        .fallbacks
+                        .iter()
+                        .all(|f| !f.contains("tree") && !f.contains("block_draft")),
+                    "{label}: {:?}",
+                    report.fallbacks
+                );
+                let t = report
+                    .tree_verify
+                    .expect("an image tree request reports its tree");
+                assert_eq!(t.max_rows, 16, "{label}");
+                assert_eq!(t.passes, report.verify_steps, "{label}: every pass counted");
+                assert_eq!(t.accepted_tokens, report.accepted_tokens, "{label}");
+                assert!(t.tree_passes == 0 || t.tree_rows_verified > t.tree_passes);
+                println!(
+                    "BLOCK_DRAFT_IMAGE_TREE {label}: passes={} tree_passes={} \
+                     rows_per_tree_pass={:.2} accepted_per_tree_pass={:.2}",
+                    t.passes,
+                    t.tree_passes,
+                    t.rows_per_tree_pass().unwrap_or(0.0),
+                    t.accepted_per_tree_pass().unwrap_or(0.0)
+                );
+                tree_passes += t.tree_passes;
+            }
+        }
+        assert!(
+            tree_passes > 0,
+            "{}: branching trees verified",
+            format.label()
+        );
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_block_draft_tree_verifies_an_image_request"
+    );
+}
+
+/// A `block_draft` request's activations — the target's tapped rows the draft reads among them —
+/// are priced at the target's compute element: an f32 element (a Prism target's priced compute)
+/// holds exactly twice a bf16 one's, and the provider passes its own geometry's element.
+#[test]
+fn a_block_draft_request_prices_its_rows_at_the_compute_element() {
+    let provider = qwen35_provider_with_block_draft(core_llm::BlockDraftFormat::DSpine);
+    let cfg = provider.block_draft.as_ref().unwrap().model.config();
+    let at = |element: u64| cfg.request_bytes(64, 32, 4, element).unwrap();
+    let (f32_element, bf16_element) = (
+        priced_compute_element_bytes(Dtype::Bfloat16, true),
+        priced_compute_element_bytes(Dtype::Bfloat16, false),
+    );
+    assert_eq!((f32_element, bf16_element), (4, 2));
+    let fixed = at(0);
+    assert_eq!(at(f32_element) - fixed, 2 * (at(bf16_element) - fixed));
+    let window = cfg.context_rows().map_or(64, |c| c.min(64)) as u64;
+    assert!(at(bf16_element) - fixed >= (window + 5) * cfg.tap_width() as u64 * 2);
+    let price = |route| {
+        provider
+            .speculative_request_bytes(route, None, 64, 32, 0)
+            .unwrap()
+    };
+    assert_eq!(
+        price(SpeculativeRoute::BlockDraft { width: 4 })
+            - price(SpeculativeRoute::PromptLookup { width: 4 }),
+        at(provider.model.memory_geometry().element_bytes)
+    );
+}
+
+/// AC3: admission prices a `block_draft` request as the target's verify overshoot plus the
+/// draft's own request (the shared [`core_llm::BlockDraftConfig::request_bytes`]); without a
+/// resident draft the route never forms.
+#[test]
+fn a_block_draft_request_is_priced_beside_the_target() {
+    for format in core_llm::BlockDraftFormat::ALL {
+        let provider = qwen35_provider_with_block_draft(format);
+        let caps = provider
+            .descriptor
+            .capabilities
+            .proposer(SpeculativeProposer::BlockDraft)
+            .unwrap();
+        assert_eq!(
+            (caps.max_depth, caps.recommended_depth),
+            (5, 4),
+            "bounded by block 6"
+        );
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, None, 64, 32, 0)
+                .unwrap()
+        };
+        let draft = provider
+            .block_draft
+            .as_ref()
+            .unwrap()
+            .model
+            .config()
+            .request_bytes(64, 32, 4, provider.model.memory_geometry().element_bytes)
+            .unwrap();
+        assert!(draft > 0);
+        assert_eq!(
+            price(SpeculativeRoute::BlockDraft { width: 4 }),
+            price(SpeculativeRoute::PromptLookup { width: 4 }) + draft
+        );
+        let mut why = Vec::new();
+        let plan = SpeculativePlan::Run {
+            proposer: SpeculativeProposer::BlockDraft,
+            depth: 4,
+        };
+        assert_eq!(
+            provider.speculative_route(plan, false, &mut why),
+            SpeculativeRoute::BlockDraft { width: 4 }
+        );
+        assert!(why.is_empty());
+    }
+}
+
+/// AC1/AC3 through the provider: a `block_draft` request decodes exactly `off`'s greedy stream,
+/// its report naming the proposer, the draft, its precision, the target passes and the accepted
+/// tokens; on a provider whose draft was refused (AC2) the same request completes without it.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn a_resident_block_draft_runs_block_draft_and_is_named() {
+    use core_llm::Speculative;
+    for format in core_llm::BlockDraftFormat::ALL {
+        let provider = qwen35_provider_with_block_draft(format);
+        let (block, ids) = run(
+            &provider,
+            &spec_request(Speculative::proposer(SpeculativeProposer::BlockDraft, 3)),
+        );
+        let (off, off_ids) = run(&provider, &spec_request(Speculative::Off));
+        assert_eq!(ids, off_ids);
+        assert_eq!(block.text, off.text);
+        let report = block.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::BlockDraft);
+        assert_eq!(report.draft_tokens, Some(3));
+        assert_eq!(
+            report.draft,
+            Some(core_llm::DecodeDraft {
+                source: format!("tiny-{}", format.label()),
+                format: format.label().into(),
+                precision: "q8".into(),
+            })
+        );
+        assert!(report.verify_steps > 0 && report.proposed_tokens > 0);
+        assert!(report.mean_accepted_length().is_some());
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+
+        let config = match format {
+            core_llm::BlockDraftFormat::DSpine => crate::models::dspine::tests::tiny_config_json(),
+            core_llm::BlockDraftFormat::DFlash2 => {
+                crate::models::dflash2::tests::tiny_config_json()
+            }
+        };
+        let dir = block_draft_dir(&config);
+        let mut refused = qwen35_mtp_provider();
+        refused.attach_block_draft(&block_draft_spec(&dir), format);
+        let (out, _) = run(
+            &refused,
+            &spec_request(Speculative::proposer(SpeculativeProposer::BlockDraft, 3)),
+        );
+        let report = out.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::None);
+        assert!(report
+            .fallbacks
+            .iter()
+            .any(|f| f.contains("`block_draft` is not available")));
+        assert_eq!(out.usage.generated_tokens, 16);
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_resident_block_draft_runs_block_draft_and_is_named"
+    );
+}
+
+/// SW-7200: `auto`'s block-draft tier reads the resident projections — a prepared Q4/Q8 snapshot
+/// loaded as stored reports its stored bit width exactly as a load-time quantization does.
+#[test]
+fn resident_quantization_follows_the_affine_bit_width() {
+    use core_llm::ResidentQuantization as R;
+    assert_eq!(resident_quantization(false, None), R::Dense);
+    // A config spec whose weights loaded dense is dense.
+    assert_eq!(resident_quantization(false, Some(4)), R::Dense);
+    assert_eq!(resident_quantization(true, Some(4)), R::Bits(4));
+    assert_eq!(resident_quantization(true, Some(8)), R::Bits(8));
+    // Quantized with no affine spec (Prism) has no tier.
+    assert_eq!(resident_quantization(true, None), R::Unknown);
+    assert_eq!(
+        core_llm::auto_block_draft_tier(resident_quantization(true, Some(4))),
+        Some("q4")
+    );
+}
+
+/// SW-7200: the provider looks `auto`'s block-draft decision up by the resident draft's own format
+/// and the target's resident quantization, and passes the result to the resolver — no block
+/// draft, no preference.
+#[test]
+fn auto_block_draft_decision_is_keyed_on_the_resident_draft_and_target() {
+    use core_llm::ResidentQuantization as R;
+    for format in core_llm::BlockDraftFormat::ALL {
+        let provider = qwen35_provider_with_block_draft(format);
+        assert!(!provider.model.is_quantized(), "the tiny target is dense");
+        assert_eq!(provider.auto_block_draft_key(), Some((format, R::Dense)));
+        let recorded =
+            core_llm::auto_block_draft_decision(core_llm::DecodeBackend::Mlx, format, "bf16");
+        assert_eq!(
+            provider.auto_prefers_block_draft(),
+            recorded.is_some_and(|d| d.prefer)
+        );
+    }
+    let without = qwen35_mtp_provider();
+    assert_eq!(without.auto_block_draft_key(), None);
+    assert!(!without.auto_prefers_block_draft());
 }

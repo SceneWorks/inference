@@ -2,7 +2,7 @@
 # A RATCHET, not a zero-gate: --check-baseline fails only when a count RISES or a new
 # flagged file appears. See that script's header for why zero is not the target and
 # why the total is a triage inbox size rather than a defect count.
-# 287 assertion(s) across 69 file(s); 3140 .rs file(s) scanned.
+# 296 assertion(s) across 72 file(s); 3140 .rs file(s) scanned.
 crates/audio/candle-audio-acestep/src/model.rs: 5
 crates/audio/candle-audio-acestep/src/text.rs: 2
 crates/audio/candle-audio-acestep/tests/conformance.rs: 1
@@ -30,6 +30,9 @@ crates/audio/candle-audio-stable-audio-3/tests/provider.rs: 4
 crates/audio/candle-audio-stable-audio-3/tests/reference_audio.rs: 4
 crates/audio/candle-audio-stable-audio-3/tests/same_oracle.rs: 1
 crates/audio/candle-audio/src/harness.rs: 19
+# SW-7200: stub-constant durations (DraftTime, draft_ms/total_ms) and the wall_ms key; no wall clock is compared.
+crates/contracts/core-llm/core-llm-testkit/src/speculative.rs: 5
+crates/contracts/core-llm/src/report.rs: 2
 crates/contracts/core-llm/src/template.rs: 1
 crates/contracts/gen-core-h3/src/veda/workspace.rs: 3
 crates/contracts/gen-core-ltx/src/duration_head.rs: 15
@@ -37,7 +40,7 @@ crates/contracts/gen-core-ltx/src/ltx_checkpoint.rs: 9
 crates/contracts/gen-core-telemetry/src/lib.rs: 2
 crates/contracts/gen-core/src/generator/tests.rs: 9
 crates/contracts/gen-core/src/transcribe.rs: 1
-crates/llm/mlx-llm/server/src/main.rs: 8
+crates/llm/mlx-llm/server/src/main.rs: 9
 crates/llm/mlx-llm/src/campaign/tests.rs: 4
 crates/media/candle-gen/candle-gen-joycaption/src/lib.rs: 2
 crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs: 1

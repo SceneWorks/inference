@@ -690,7 +690,8 @@ fn caption_output(
 /// A caption's measured report (sc-24139): the engine record with the CUDA-graph switch off (no
 /// graph runner wraps this decoder), and — the captioner advertising no proposer and having no
 /// prefix cache — the request's speculative fallback and the prefix-cache reason named in the
-/// words MLX's JoyCaption uses (E2, E8). The request's option is resolved against the provider's
+/// words MLX's JoyCaption uses (E2, E8) — and, for a request that asked for a tree, why it
+/// verified linearly (SW-F328, E5). The request's option is resolved against the provider's
 /// per-backend `default` (E5), so a table default of `auto` is named too.
 fn caption_report(
     record: &DecodeRecord,
@@ -700,6 +701,7 @@ fn caption_report(
     record
         .report(false)
         .with_captioner_reasons(req.speculative_or(default))
+        .with_captioner_tree_reason(req.speculative_verify)
 }
 
 /// The LLaVA provider descriptor (constructible without weights; used for catalog composition).
@@ -727,6 +729,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             mtp: None,
             speculative: Vec::new(),
             supported_constraints: Vec::new(),
+            tree_verify: None,
         },
     }
 }
@@ -847,6 +850,23 @@ mod tests {
             caption_report(&record, &request(Speculative::Off), Speculative::Auto)
                 .fallbacks
                 .is_empty()
+        );
+        // SW-F328 E5: a tree request names why it verified linearly (no tree advertisement, no
+        // proposer), in the shared words; a linear one adds nothing.
+        let tree = core_llm::TextLlmRequest {
+            speculative_verify: core_llm::SpeculativeVerify::Tree { max_rows: 8 },
+            ..request(Speculative::Off)
+        };
+        assert_eq!(
+            caption_report(&record, &tree, Speculative::Off).fallbacks,
+            core_llm::resolve_tree_verify_with(
+                tree.speculative_verify,
+                core_llm::SpeculativePlan::Off,
+                None
+            )
+            .fallback
+            .into_iter()
+            .collect::<Vec<_>>()
         );
         let off = caption_report(&record, &request(Speculative::Off), Speculative::Off);
         assert!(off.fallbacks.is_empty());

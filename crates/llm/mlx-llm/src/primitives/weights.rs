@@ -191,6 +191,13 @@ impl Weights {
         self.tensors.contains_key(key) || self.released.contains(key)
     }
 
+    /// A held tensor's shape, **without** recording an access — a layout probe like
+    /// [`Weights::contains`], for checking a checkpoint before a group-by-group load
+    /// ([`Weights::materialize_groups`]) whose final verification covers every accessed key.
+    pub fn shape(&self, key: &str) -> Option<Vec<i32>> {
+        self.tensors.get(key).map(|a| a.shape().to_vec())
+    }
+
     /// Number of loaded tensors, released ones included.
     pub fn len(&self) -> usize {
         self.tensors.len() + self.released.len()

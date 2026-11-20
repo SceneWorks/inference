@@ -82,6 +82,7 @@ fn llama_quantize_on_load_q8() {
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     })
     .unwrap();
     assert!(q8.is_quantized());
@@ -104,6 +105,7 @@ fn llama_quantize_on_load_q4() {
         cuda_graphs: None,
         mtp_head_source: None,
         prefix_cache_bytes: None,
+        draft_quantize: None,
         draft_source: None,
     })
     .unwrap();
