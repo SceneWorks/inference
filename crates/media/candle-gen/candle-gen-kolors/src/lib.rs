@@ -165,9 +165,9 @@ pub(crate) fn validate_low_res_start_kolors(
     spec: Option<&LoadSpec>,
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
-    if req.low_res_start.is_none() {
+    let Some(low_res) = req.low_res_start.as_ref() else {
         return Ok(());
-    }
+    };
     if spec.is_some_and(|s| {
         s.control.is_some()
             || !s.extra_controls.is_empty()
@@ -203,6 +203,31 @@ pub(crate) fn validate_low_res_start_kolors(
             "kolors: low_res_start requires a curated sampler or scheduler route".into(),
         ));
     }
+    if let Some(steps) = req.steps {
+        if steps == 0 || steps as usize > NUM_TRAIN_TIMESTEPS {
+            return Err(gen_core::Error::Msg(format!(
+                "kolors: steps must be in 1..={NUM_TRAIN_TIMESTEPS} (got {steps})"
+            )));
+        }
+    }
+    let steps = req.steps.unwrap_or(config::DEFAULT_STEPS) as usize;
+    let sched = pipeline::kolors_alpha_schedule().map_err(gen_core::Error::from)?;
+    let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+    let native =
+        gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
+    let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+    if let Some((_, raw_strength)) =
+        pipeline::resolve_raw_reference(req).map_err(gen_core::Error::from)?
+    {
+        let start = gen_core::resolve_img2img_init_time_step(
+            sigmas.len().saturating_sub(1),
+            Some(raw_strength),
+        )?;
+        sigmas = sigmas[start..].to_vec();
+    }
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let desc = descriptor();
+    low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
     Ok(())
 }
 
@@ -281,13 +306,22 @@ pub(crate) fn compile_kolors(
     let native =
         gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
     let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
-    if let Some((_, strength)) = pipeline::resolve_reference(req).map_err(gen_core::Error::from)? {
-        let effective = ((steps as f32 * strength.clamp(0.0, 1.0)) as usize).min(steps);
-        let start = sigmas.len().saturating_sub(1).saturating_sub(effective);
+    if let Some((_, raw_strength)) =
+        pipeline::resolve_raw_reference(req).map_err(gen_core::Error::from)?
+    {
+        let start = if req.low_res_start.is_some() {
+            gen_core::resolve_img2img_init_time_step(
+                sigmas.len().saturating_sub(1),
+                Some(raw_strength),
+            )?
+        } else {
+            let effective = ((steps as f32 * raw_strength.clamp(0.0, 1.0)) as usize).min(steps);
+            sigmas.len().saturating_sub(1).saturating_sub(effective)
+        };
         sigmas = sigmas[start..].to_vec();
     }
     let executed_steps = sigmas.len().saturating_sub(1);
-    if executed_steps == 0 {
+    if executed_steps == 0 && req.low_res_start.is_none() {
         return Ok(None);
     }
     let guidance = req.guidance.unwrap_or(config::DEFAULT_GUIDANCE);
@@ -1035,5 +1069,111 @@ mod tests {
             registry.compile_render_plan(MODEL_ID, &spec, &control_req),
             Err(gen_core::Error::Unsupported(_))
         ));
+
+        let g = registry.load(MODEL_ID, &spec).expect("load kolors");
+        // Small non-zero strength with `low_res_start` uses `resolve_img2img_init_time_step` (`start = 1`, `M = 7`),
+        // matching `mlx-gen-kolors` instead of truncating to `steps - (steps * strength) = 0`.
+        let small_strength_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.05),
+            }],
+            low_res_start: Some(gen_core::LowResStartSpec::new(3, Some(0.5))),
+            ..req.clone()
+        };
+        assert!(g.validate(&small_strength_req).is_ok());
+        let small_strength_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &small_strength_req)
+            .expect("compile small-strength kolors low_res_start plan")
+            .expect("plan present");
+        assert_eq!(small_strength_plan.denoise_spans(), vec![0..3, 3..7]);
+
+        // Out-of-range reference strength (`1.5`) with `low_res_start` must be refused with `Unsupported`
+        // rather than silently clamped in both `compile_render_plan` and `validate`.
+        let out_of_range_strength_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(1.5),
+            }],
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..req.clone()
+        };
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &out_of_range_strength_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            g.validate(&out_of_range_strength_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // `executed_steps == 0` (`strength == 1.0` -> `start == steps`) with `low_res_start` must fail
+        // with `Error::Unsupported`, not return `Ok(None)` or `Ok(())`.
+        let zero_executed_steps_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(1.0),
+            }],
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..req.clone()
+        };
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &zero_executed_steps_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            g.validate(&zero_executed_steps_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // `validate(&req)` must reject illegal `low_res_start` step splits (`k == 0`, `k >= executed_steps`)
+        // and illegal phase-0 geometries (`scale: Some(0.3)` or phase-0 dimensions below `min_size`).
+        for bad_low_res_req in [
+            GenerationRequest {
+                low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                width: 256,
+                height: 256,
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                ..req.clone()
+            },
+        ] {
+            assert!(
+                matches!(
+                    g.validate(&bad_low_res_req),
+                    Err(gen_core::Error::Unsupported(_))
+                ),
+                "validate must reject illegal low_res_start request: {bad_low_res_req:?}"
+            );
+            assert!(
+                matches!(
+                    registry.compile_render_plan(MODEL_ID, &spec, &bad_low_res_req),
+                    Err(gen_core::Error::Unsupported(_))
+                ),
+                "compile_render_plan must reject illegal low_res_start request: {bad_low_res_req:?}"
+            );
+        }
     }
 }

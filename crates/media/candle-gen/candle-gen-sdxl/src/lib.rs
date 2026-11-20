@@ -633,9 +633,9 @@ pub(crate) fn validate_low_res_start_sdxl(
     spec: Option<&LoadSpec>,
     req: &GenerationRequest,
 ) -> gen_core::Result<()> {
-    if req.low_res_start.is_none() {
+    let Some(low_res) = req.low_res_start.as_ref() else {
         return Ok(());
-    }
+    };
     if spec.is_some_and(|s| {
         s.control.is_some()
             || !s.extra_controls.is_empty()
@@ -685,6 +685,28 @@ pub(crate) fn validate_low_res_start_sdxl(
             )));
         }
     }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(
+            "sdxl: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
+    let steps = req.steps.unwrap_or(30) as usize;
+    let sched = pipeline::sdxl_alpha_schedule().map_err(gen_core::Error::from)?;
+    let ms = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+    let native =
+        gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, steps);
+    let mut sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+    if req.source_image.is_some() {
+        let raw_strength = req.strength.unwrap_or(DEFAULT_EDIT_STRENGTH);
+        let start_step = gen_core::resolve_img2img_init_time_step(
+            sigmas.len().saturating_sub(1),
+            Some(raw_strength),
+        )?;
+        sigmas = sigmas[start_step..].to_vec();
+    }
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let desc = plain_descriptor();
+    low_res.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
     Ok(())
 }
 
@@ -757,7 +779,7 @@ pub(crate) fn compile_sdxl(
         sigmas = sigmas[start_step..].to_vec();
     }
     let executed_steps = sigmas.len().saturating_sub(1);
-    if executed_steps == 0 {
+    if executed_steps == 0 && req.low_res_start.is_none() {
         return Ok(None);
     }
     let guidance = req.guidance.unwrap_or(7.0);
@@ -2219,5 +2241,93 @@ mod tests {
             registry.compile_render_plan(MODEL_ID, &spec, &mask_req),
             Err(gen_core::Error::Unsupported(_))
         ));
+
+        let g = registry.load(MODEL_ID, &spec).expect("load sdxl");
+        // Out-of-range img2img strength (`1.5`) with `low_res_start` must be refused with `Unsupported`
+        // in both `compile_render_plan` and `validate`.
+        let out_of_range_strength_req = GenerationRequest {
+            source_image: Some(Image {
+                width: 64,
+                height: 64,
+                pixels: vec![128; 64 * 64 * 3],
+            }),
+            strength: Some(1.5),
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..req.clone()
+        };
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &out_of_range_strength_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            g.validate(&out_of_range_strength_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // `executed_steps == 0` (`strength == 1.0` -> `start_step == steps`) with `low_res_start` must
+        // fail with `Error::Unsupported`, not return `Ok(None)` or `Ok(())`.
+        let zero_executed_steps_req = GenerationRequest {
+            source_image: Some(Image {
+                width: 64,
+                height: 64,
+                pixels: vec![128; 64 * 64 * 3],
+            }),
+            strength: Some(1.0),
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..req.clone()
+        };
+        assert!(matches!(
+            registry.compile_render_plan(MODEL_ID, &spec, &zero_executed_steps_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            g.validate(&zero_executed_steps_req),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+
+        // `validate(&req)` must reject illegal `low_res_start` step splits (`k == 0`, `k >= executed_steps`)
+        // and illegal phase-0 geometries (`scale: Some(0.3)`, phase-0 width not a multiple of `SIZE_MULTIPLE`,
+        // or phase-0 dimensions below `min_size`).
+        for bad_low_res_req in [
+            GenerationRequest {
+                low_res_start: Some(gen_core::LowResStartSpec::new(0, Some(0.5))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                low_res_start: Some(gen_core::LowResStartSpec::new(8, Some(0.5))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.3))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                width: 544,
+                height: 544,
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                ..req.clone()
+            },
+            GenerationRequest {
+                width: 256,
+                height: 256,
+                low_res_start: Some(gen_core::LowResStartSpec::new(4, Some(0.5))),
+                ..req.clone()
+            },
+        ] {
+            assert!(
+                matches!(
+                    g.validate(&bad_low_res_req),
+                    Err(gen_core::Error::Unsupported(_))
+                ),
+                "validate must reject illegal low_res_start request: {bad_low_res_req:?}"
+            );
+            assert!(
+                matches!(
+                    registry.compile_render_plan(MODEL_ID, &spec, &bad_low_res_req),
+                    Err(gen_core::Error::Unsupported(_))
+                ),
+                "compile_render_plan must reject illegal low_res_start request: {bad_low_res_req:?}"
+            );
+        }
     }
 }

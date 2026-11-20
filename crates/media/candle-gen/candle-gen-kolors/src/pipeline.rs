@@ -840,14 +840,6 @@ impl Pipeline {
         run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
-        // identical across the three entry points. `init` is the raw seeded noise (lifted to σ-space).
-        let setup = match init_latents {
-            Some(init) => {
-                CuratedSetup::new_img2img(req.scheduler.as_deref(), steps, strength, noise, init)?
-            }
-            None => CuratedSetup::new(req.scheduler.as_deref(), steps, noise)?,
-        };
         // Per-step latent preview (epic 16948, sc-16954). The sc-16949 projector hook, so the loop is
         // not restructured and the driver owns frame numbering plus the multi-eval dedup. `ve_hook`
         // because the running latent here is raw k-diffusion VE sigma-space. Built per image: the
@@ -883,32 +875,51 @@ impl Pipeline {
         };
         let out = match run {
             Some(run) => {
-                let (run_sigmas, spans) = if init_latents.is_some() {
-                    let spans = match run.plan().low_res_start() {
-                        Some(low_res) if low_res.k > 0 => {
-                            let p0 = low_res.k.min(setup.sigmas.len().saturating_sub(1));
-                            if p0 < setup.sigmas.len().saturating_sub(1) {
-                                vec![0..p0, p0..setup.sigmas.len().saturating_sub(1)]
-                            } else {
-                                std::iter::once(0..setup.sigmas.len().saturating_sub(1)).collect()
-                            }
-                        }
-                        _ => std::iter::once(0..setup.sigmas.len().saturating_sub(1)).collect(),
-                    };
-                    (setup.sigmas.as_slice(), spans)
-                } else {
-                    (
-                        run.plan().denoise_sigmas(),
-                        run.plan().denoise_spans().to_vec(),
-                    )
+                let sched = kolors_alpha_schedule()?;
+                let model_sampling = gen_core::sampling::DiscreteModelSampling::sdxl(&sched);
+                let run_sigmas = run.plan().denoise_sigmas();
+                if let Some(init) = init_latents {
+                    if run_sigmas.len() <= 1 {
+                        return Ok(init.to_dtype(DType::F32)?);
+                    }
+                }
+                let prior = match init_latents {
+                    Some(init) => (init + (noise * run_sigmas[0] as f64)?)?,
+                    None => (noise * run_sigmas[0] as f64)?,
                 };
+                let spans = run.plan().denoise_spans();
                 candle_gen::sampler::run_curated_sampler_spans(
                     Some(sampler),
-                    &setup.model_sampling,
+                    &model_sampling,
                     run_sigmas,
                     &spans,
                     Some(run),
                     false,
+                    prior,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview),
+                    &mut predict,
+                )?
+            }
+            None => {
+                // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
+                // identical across the three entry points. `init` is the raw seeded noise (lifted to σ-space).
+                let setup = match init_latents {
+                    Some(init) => CuratedSetup::new_img2img(
+                        req.scheduler.as_deref(),
+                        steps,
+                        strength,
+                        noise,
+                        init,
+                    )?,
+                    None => CuratedSetup::new(req.scheduler.as_deref(), steps, noise)?,
+                };
+                candle_gen::run_curated_sampler(
+                    Some(sampler),
+                    &setup.model_sampling,
+                    &setup.sigmas,
                     setup.prior,
                     seed,
                     &req.cancel,
@@ -917,17 +928,6 @@ impl Pipeline {
                     &mut predict,
                 )?
             }
-            None => candle_gen::run_curated_sampler(
-                Some(sampler),
-                &setup.model_sampling,
-                &setup.sigmas,
-                setup.prior,
-                seed,
-                &req.cancel,
-                on_progress,
-                Some(&preview),
-                &mut predict,
-            )?,
         };
         // The shared `decode` consumes the compute dtype (f32 for Kolors), like the native latents.
         Ok(out.to_dtype(DType::F32)?)
@@ -1086,9 +1086,10 @@ fn ensure_not_cancelled(req: &GenerationRequest) -> Result<()> {
     }
 }
 
-/// Resolve Kolors' one latent-init reference. Per-reference strength wins over the request-level
-/// value, then the diffusers default (0.3); more than one reference is unsupported and fails closed.
-pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
+/// Resolve Kolors' one latent-init reference without clamping strength. Per-reference strength wins
+/// over the request-level value, then the diffusers default (0.3); more than one reference is
+/// unsupported and fails closed.
+pub(crate) fn resolve_raw_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
     const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
     let mut reference = None;
     for conditioning in &req.conditioning {
@@ -1102,22 +1103,21 @@ pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Imag
                 image,
                 strength
                     .or(req.strength)
-                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
-                    .clamp(0.0, 1.0),
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
             ));
         }
     }
     if reference.is_none() {
         if let Some(source) = req.source_image.as_ref() {
-            reference = Some((
-                source,
-                req.strength
-                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
-                    .clamp(0.0, 1.0),
-            ));
+            reference = Some((source, req.strength.unwrap_or(DEFAULT_IMG2IMG_STRENGTH)));
         }
     }
     Ok(reference)
+}
+
+/// Resolve Kolors' one latent-init reference with strength clamped to `0.0..=1.0`.
+pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
+    Ok(resolve_raw_reference(req)?.map(|(image, strength)| (image, strength.clamp(0.0, 1.0))))
 }
 
 /// Parse the packed `group_size` out of a component `config.json` (sc-10819): `Some(group_size)` when

@@ -1508,6 +1508,7 @@ impl Pipeline {
                 &ehs,
                 unet,
                 guidance,
+                seed,
                 run,
                 &preview,
                 on_progress,
@@ -1601,6 +1602,7 @@ impl Pipeline {
         ehs: &Tensor,
         unet: &SdxlUnet,
         guidance: f64,
+        seed: u64,
         run: Option<&gen_core::RenderRun<'_, '_>>,
         preview: &candle_gen::preview::PreviewHook<'_>,
         on_progress: &mut dyn FnMut(Progress),
@@ -1716,6 +1718,8 @@ impl Pipeline {
                     if let Some(low_res_plan) = run.plan().low_res_start().cloned() {
                         let sigma_k = sigmas[span.end];
                         let base_seed = run.plan().base_seed();
+                        let output_index = seed.wrapping_sub(base_seed) as u32;
+                        let pass_index = run.plan().pass_index();
                         let x0_low = gen_core::sampling::denoise(
                             &ops,
                             ms,
@@ -1744,8 +1748,8 @@ impl Pipeline {
                             sigma_k,
                             ms,
                             base_seed,
-                            0,
-                            0,
+                            output_index,
+                            pass_index,
                             0,
                         )
                         .map_err(CandleError::from)?;
