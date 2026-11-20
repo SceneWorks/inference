@@ -907,6 +907,48 @@ pub(crate) fn safety_check(
                 contract.provider_id
             )));
         }
+        if let Some(low_res_ctx) = context.low_res_start() {
+            let variant = match contract.provider_id.as_str() {
+                crate::FLUX1_SCHNELL_ID => crate::config::FluxVariant::Schnell,
+                crate::FLUX1_DEV_ID => crate::config::FluxVariant::Dev,
+                _ => {
+                    return Err(CoreError::Msg(format!(
+                        "{}: low_res_start is only supported on base FLUX.1 routes",
+                        contract.provider_id
+                    )));
+                }
+            };
+            if context.geometry.reference_count > 0 || context.overlay.is_some() {
+                return Err(CoreError::Msg(format!(
+                    "{}: low_res_start cannot be combined with reference or control conditioning",
+                    contract.provider_id
+                )));
+            }
+            if let Some(plan) = &low_res_ctx.plan {
+                if plan.full_width != context.geometry.width
+                    || plan.full_height != context.geometry.height
+                {
+                    return Err(CoreError::Msg(format!(
+                        "{}: low_res_start plan full geometry {}x{} does not match admitted {}x{}",
+                        contract.provider_id,
+                        plan.full_width,
+                        plan.full_height,
+                        context.geometry.width,
+                        context.geometry.height
+                    )));
+                }
+            }
+            evaluate_mlx_flux1_low_res_admission(
+                variant,
+                context.predicted_peak_bytes,
+                low_res_ctx.evidence_basis,
+                context.budget,
+                low_res_ctx.plan.as_ref(),
+                context.geometry.batch,
+                &low_res_ctx.posture,
+            )
+            .map_err(|refusal| CoreError::Msg(refusal.to_string()))?;
+        }
         Ok(())
     };
     mlx_gen::gen_core::standard_memory_strategy_safety_check(
@@ -914,6 +956,54 @@ pub(crate) fn safety_check(
         context,
         Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
+    )
+}
+
+/// Qualify the conservative transition bound for an MLX FLUX.1 (`flux1_schnell`, `flux1_dev`)
+/// `low_res_start` trajectory (`§6.12`, `E4`, `SW-6941`, `SW-7216`).
+pub fn qualify_mlx_flux1_low_res_transition_bound(
+    variant: crate::config::FluxVariant,
+    ordinary_t2i_peak_bytes: u64,
+    evidence_basis: mlx_gen::gen_core::EvidencePeakBasis,
+    plan: &mlx_gen::gen_core::ResolvedLowResStartPlan,
+    batch: u32,
+) -> CoreResult<mlx_gen::gen_core::LowResTransitionCoverageTrace> {
+    mlx_gen::gen_core::qualify_flux1_low_res_transition_bound(
+        ordinary_t2i_peak_bytes,
+        evidence_basis,
+        plan,
+        batch,
+        crate::LATENT_CHANNELS as u32,
+        8,
+        crate::LATENT_PATCH_SIZE as u32,
+        variant.max_sequence_length() as u32,
+        crate::transformer::HEAD_DIM as u32,
+    )
+}
+
+/// Evaluate MLX FLUX.1 memory admission for a request with optional `low_res_start` (`§6.12`, `E4`, `SW-6941`, `SW-7216`).
+pub fn evaluate_mlx_flux1_low_res_admission(
+    variant: crate::config::FluxVariant,
+    ordinary_t2i_peak_bytes: u64,
+    evidence_basis: mlx_gen::gen_core::EvidencePeakBasis,
+    budget: mlx_gen::gen_core::MemoryBudget,
+    low_res_plan: Option<&mlx_gen::gen_core::ResolvedLowResStartPlan>,
+    batch: u32,
+    posture: &mlx_gen::gen_core::LowResTransitionPricingPosture,
+) -> std::result::Result<
+    mlx_gen::gen_core::LowResTransitionAdmissionReceipt,
+    mlx_gen::gen_core::LowResTransitionAdmissionRefusal,
+> {
+    mlx_gen::gen_core::evaluate_low_res_transition_admission(
+        variant.id(),
+        ordinary_t2i_peak_bytes,
+        evidence_basis,
+        budget,
+        low_res_plan,
+        batch,
+        crate::LATENT_CHANNELS as u32,
+        8,
+        posture,
     )
 }
 
@@ -1007,6 +1097,10 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    let budget = context.budget;
+    let predicted_peak_bytes = context.predicted_peak_bytes;
+    let batch = context.geometry.batch;
+    let low_res_context = context.low_res_start();
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
@@ -1027,6 +1121,61 @@ fn begin_request_with_cleanup(
         config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
         config.transformer_window =
             mlx_gen::request_scope::selected_transformer_window(contract, context);
+        config.set_request_validator(move |request| {
+            let admitted_plan = low_res_context.as_ref().and_then(|ctx| ctx.plan.as_ref());
+            let Some(_spec) = &request.low_res_start else {
+                if admitted_plan.is_some() {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: request low_res_start plan changed after memory admission"
+                    )));
+                }
+                return Ok(());
+            };
+            let variant = match provider_id {
+                crate::FLUX1_SCHNELL_ID => crate::config::FluxVariant::Schnell,
+                crate::FLUX1_DEV_ID => crate::config::FluxVariant::Dev,
+                _ => {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: low_res_start is only supported on base FLUX.1 routes"
+                    )));
+                }
+            };
+            let plan = crate::model::compile_trajectory_for(
+                variant,
+                &crate::model::descriptor_for(variant),
+                request,
+            )?;
+            let resolved_plan = plan.low_res_start().copied().ok_or_else(|| {
+                CoreError::Unsupported(format!(
+                    "{provider_id}: low_res_start plan did not resolve"
+                ))
+            })?;
+            if let Some(expected_plan) = admitted_plan {
+                if &resolved_plan != expected_plan {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: request low_res_start plan changed after memory admission"
+                    )));
+                }
+            }
+            let (evidence_basis, posture) = match &low_res_context {
+                Some(ctx) => (ctx.evidence_basis, ctx.posture.clone()),
+                None => (
+                    mlx_gen::gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES,
+                    mlx_gen::gen_core::LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+                ),
+            };
+            evaluate_mlx_flux1_low_res_admission(
+                variant,
+                predicted_peak_bytes,
+                evidence_basis,
+                budget,
+                Some(&resolved_plan),
+                batch,
+                &posture,
+            )
+            .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
+            Ok(())
+        });
         Ok(config)
     })
 }
@@ -2408,6 +2557,129 @@ mod tests {
             registered_safety_check(&spec, &runtime, &context),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn sw_7216_mlx_flux1_registered_safety_check_and_configure_request_enforce_low_res_transition_pricing(
+    ) {
+        let spec = sequential_spec()
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        let contract = weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        let mut fixture = registered_valid_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0);
+        fixture.context.predicted_peak_bytes =
+            mlx_gen::gen_core::CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES;
+        fixture.request.prompt = "sw-7216 mlx admission pricing".to_owned();
+        fixture.request.width = 1024;
+        fixture.request.height = 1024;
+        fixture.request.steps = Some(8);
+        fixture.request.low_res_start = Some(mlx_gen::gen_core::LowResStartSpec::new(4, Some(0.5)));
+
+        let plan = crate::model::compile_trajectory_for(
+            crate::config::FluxVariant::Dev,
+            &crate::model::descriptor_dev(),
+            &fixture.request,
+        )
+        .unwrap();
+        let low_res = *plan.low_res_start().expect("low_res_start resolved");
+        let basis = mlx_gen::gen_core::EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES;
+
+        // 1. Exact fit at 17,655,793,562 B admits through registered_safety_check and configure_request:
+        let mut exact_ctx = fixture.context.clone().with_low_res_start_plan(low_res);
+        exact_ctx.budget = mlx_gen::gen_core::MemoryBudget {
+            total_bytes: mlx_gen::gen_core::CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &exact_ctx),
+            MemorySafetyDecision::Accept
+        );
+        let mut exact_scope =
+            registered_begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &exact_ctx)
+                .unwrap()
+                .unwrap();
+        let mut exact_req = fixture.request.clone();
+        exact_scope.configure_request(&mut exact_req).unwrap();
+
+        // 2. One byte under (17,655,793,561 B): ordinary T2I admits, low_res_start refuses at both
+        // registered_safety_check and configure_request:
+        let mut one_under_t2i_ctx = fixture.context.clone();
+        one_under_t2i_ctx.budget = mlx_gen::gen_core::MemoryBudget {
+            total_bytes: mlx_gen::gen_core::CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES
+                - 1,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &one_under_t2i_ctx),
+            MemorySafetyDecision::Accept
+        );
+        let one_under_low_res_ctx = one_under_t2i_ctx.clone().with_low_res_start_plan(low_res);
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &one_under_low_res_ctx),
+            MemorySafetyDecision::Reject { ref reason } if reason.contains("17655793562 B exceeds effective budget 17655793561 B by 1 B")
+        ));
+        let mut one_under_scope =
+            registered_begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &one_under_t2i_ctx)
+                .unwrap()
+                .unwrap();
+        let mut ordinary_req = fixture.request.clone();
+        ordinary_req.low_res_start = None;
+        one_under_scope
+            .configure_request(&mut ordinary_req)
+            .expect("ordinary T2I configure_request must succeed");
+        let mut low_res_req = fixture.request.clone();
+        let err = one_under_scope
+            .configure_request(&mut low_res_req)
+            .expect_err("configure_request must refuse 1-byte-under low_res_start transition");
+        assert!(
+            err.to_string()
+                .contains("17655793562 B exceeds effective budget 17655793561 B by 1 B"),
+            "unexpected error: {err}"
+        );
+
+        // 3. UnqualifiedRealEvidence posture: ordinary T2I admits, low_res_start refuses fail-closed:
+        let mut unqualified_ctx = fixture.context.clone().with_low_res_start_posture(
+            basis,
+            mlx_gen::gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        );
+        unqualified_ctx.budget = mlx_gen::gen_core::MemoryBudget {
+            total_bytes: 24 * 1024 * 1024 * 1024,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &unqualified_ctx),
+            MemorySafetyDecision::Accept
+        );
+        let mut unqualified_scope =
+            registered_begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &unqualified_ctx)
+                .unwrap()
+                .unwrap();
+        let mut ordinary_req = fixture.request.clone();
+        ordinary_req.low_res_start = None;
+        unqualified_scope
+            .configure_request(&mut ordinary_req)
+            .expect("ordinary T2I under UnqualifiedRealEvidence must succeed");
+        let mut low_res_req = fixture.request.clone();
+        let err = unqualified_scope
+            .configure_request(&mut low_res_req)
+            .expect_err("low_res_start under UnqualifiedRealEvidence must refuse fail-closed");
+        assert!(
+            err.to_string()
+                .contains("low_res_start refused fail-closed before load"),
+            "unexpected error: {err}"
+        );
     }
 }
 

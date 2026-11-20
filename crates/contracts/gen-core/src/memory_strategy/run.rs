@@ -59,6 +59,121 @@ impl MemoryRunContext {
         // subtracted from this scalar a second time.
         MemoryPeakBreakdown::from_unattributed(self.predicted_peak_bytes)
     }
+
+    /// Attach a resolved `low_res_start` plan and transition pricing posture directly to this
+    /// [`MemoryRunContext`] so engine-side request admission (`registered_safety_check`,
+    /// `safety_check`, `validate_context`, `begin_request`, and `configure_request`) enforces
+    /// incremental transition workspace pricing (`SW-7216`).
+    pub fn with_low_res_start(
+        mut self,
+        plan: crate::ResolvedLowResStartPlan,
+        evidence_basis: EvidencePeakBasis,
+        posture: LowResTransitionPricingPosture,
+    ) -> Self {
+        self.set_low_res_start(Some(MemoryLowResStartContext {
+            plan: Some(plan),
+            evidence_basis,
+            posture,
+        }));
+        self
+    }
+
+    /// Attach a resolved `low_res_start` plan using the default conditional 6-buffer increment
+    /// pricing posture (`LowResTransitionPricingPosture::ConditionalSixBufferIncrement`) (`SW-7216`).
+    pub fn with_low_res_start_plan(self, plan: crate::ResolvedLowResStartPlan) -> Self {
+        self.with_low_res_start(
+            plan,
+            EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES,
+            LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+        )
+    }
+
+    /// Attach a `low_res_start` transition pricing posture (`UnqualifiedRealEvidence`,
+    /// `ConditionalSixBufferIncrement`, or `QualifiedConservativeBound`) to this context so
+    /// subsequent `configure_request` calls enforce that posture when `request.low_res_start` is
+    /// present (`SW-7216`).
+    pub fn with_low_res_start_posture(
+        mut self,
+        evidence_basis: EvidencePeakBasis,
+        posture: LowResTransitionPricingPosture,
+    ) -> Self {
+        self.set_low_res_start(Some(MemoryLowResStartContext {
+            plan: None,
+            evidence_basis,
+            posture,
+        }));
+        self
+    }
+
+    /// Set or clear the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
+    pub fn set_low_res_start(&mut self, low_res: Option<MemoryLowResStartContext>) {
+        let base = self.base_evidence_revision().to_owned();
+        self.evidence_revision = match low_res {
+            Some(ctx) => {
+                let id = intern_low_res_start_context(ctx);
+                format!("{base}{LOW_RES_CONTEXT_MARKER}{id}")
+            }
+            None => base,
+        };
+    }
+
+    /// Retrieve the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
+    pub fn low_res_start(&self) -> Option<MemoryLowResStartContext> {
+        let (_, tail) = self
+            .evidence_revision
+            .rsplit_once(LOW_RES_CONTEXT_MARKER)?;
+        let id: usize = tail.parse().ok()?;
+        lookup_low_res_start_context(id)
+    }
+
+    /// Retrieve the resolved [`crate::ResolvedLowResStartPlan`] attached to this context, if any (`SW-7216`).
+    pub fn low_res_start_plan(&self) -> Option<crate::ResolvedLowResStartPlan> {
+        self.low_res_start().and_then(|ctx| ctx.plan)
+    }
+
+    /// Return `evidence_revision` with any internal `low_res_start` context tag stripped.
+    pub fn base_evidence_revision(&self) -> &str {
+        match self.evidence_revision.rsplit_once(LOW_RES_CONTEXT_MARKER) {
+            Some((base, tail)) if tail.parse::<usize>().is_ok() => base,
+            _ => self.evidence_revision.as_str(),
+        }
+    }
+}
+
+const LOW_RES_CONTEXT_MARKER: &str = "#low_res_start=";
+
+/// Optional `low_res_start` transition pricing attachment for [`MemoryRunContext`] (`SW-7216`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryLowResStartContext {
+    pub plan: Option<crate::ResolvedLowResStartPlan>,
+    pub evidence_basis: EvidencePeakBasis,
+    pub posture: LowResTransitionPricingPosture,
+}
+
+fn low_res_context_table(
+) -> &'static std::sync::Mutex<Vec<MemoryLowResStartContext>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<MemoryLowResStartContext>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn intern_low_res_start_context(ctx: MemoryLowResStartContext) -> usize {
+    let mut guard = low_res_context_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pos) = guard.iter().position(|existing| existing == &ctx) {
+        return pos;
+    }
+    let id = guard.len();
+    guard.push(ctx);
+    id
+}
+
+fn lookup_low_res_start_context(id: usize) -> Option<MemoryLowResStartContext> {
+    let guard = low_res_context_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.get(id).cloned()
 }
 
 /// Build a deterministic, finite, weights-free context from provider-owned route facts.
