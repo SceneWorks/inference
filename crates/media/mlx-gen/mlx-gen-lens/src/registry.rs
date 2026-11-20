@@ -2074,6 +2074,7 @@ mod tests {
             };
             let context = MemoryRunContext {
                 reference_resources: None,
+                low_res_start: None,
                 selection,
                 optimization_authority: authority,
                 calibration_abi: MEMORY_CALIBRATION_ABI,

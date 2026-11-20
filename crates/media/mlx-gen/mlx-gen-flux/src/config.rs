@@ -138,6 +138,7 @@ impl FluxVariant {
                 supports_sequential_offload: true,
                 supports_preview: true,
                 pag: Some(self.pag_capability()),
+                supports_low_res_start: true,
                 ..Default::default()
             },
         }

@@ -30,6 +30,7 @@ SHARED_MATERIALIZER = re.compile(
     r"|sensenova_loop_assets"
     r"|ios_prequant"
     r"|qwen38_bonsai_terminal\.py provision"
+    r"|stage_pinned_hub_snapshots|stage-the-pinned-hub-snapshots"  # digest-verified fleet-cache stager
 )
 
 # Download locations that are never the runner's hub cache.

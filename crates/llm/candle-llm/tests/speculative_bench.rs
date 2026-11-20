@@ -52,12 +52,49 @@ fn switches() -> Vec<(&'static str, serde_json::Value)> {
     switches
 }
 
+/// The device's bytes in use (`cuMemGetInfo` total minus free) on the CUDA card this process sees
+/// (SW-7200): device-wide, so it includes the weights; the bench reads it at every streamed token.
+/// `None` off CUDA.
+#[cfg(feature = "cuda")]
+fn cuda_used_bytes() -> Option<u64> {
+    static CONTEXT: std::sync::OnceLock<
+        Option<std::sync::Arc<candle_core::cuda_backend::cudarc::driver::CudaContext>>,
+    > = std::sync::OnceLock::new();
+    let context = CONTEXT
+        .get_or_init(|| {
+            let device = candle_core::Device::new_cuda(0).ok()?;
+            Some(
+                device
+                    .as_cuda_device()
+                    .ok()?
+                    .cuda_stream()
+                    .context()
+                    .clone(),
+            )
+        })
+        .as_ref()?;
+    let (free, total) = context.mem_get_info().ok()?;
+    Some((total - free) as u64)
+}
+
 #[test]
 #[ignore = "needs a snapshot via SPECULATIVE_BENCH_SNAPSHOT and an output path via SPECULATIVE_BENCH_OUTPUT"]
 fn speculative_bench_writes_the_baseline_document() {
-    let (output, doc) =
-        core_llm_testkit::run_speculative_bench_from_env("candle", &load, &switches)
-            .unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(feature = "cuda")]
+    let memory = Some(core_llm_testkit::BenchMemory {
+        source: "cuda_device_used",
+        used: &cuda_used_bytes,
+        peak: None,
+    });
+    #[cfg(not(feature = "cuda"))]
+    let memory = None;
+    let (output, doc) = core_llm_testkit::run_speculative_bench_from_env(
+        "candle",
+        &load,
+        &switches,
+        memory.as_ref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     println!("wrote {} ({} rows)", output.display(), doc.rows.len());
 
     #[cfg(feature = "model-inference-proof")]
@@ -215,7 +252,9 @@ fn the_baseline_driver_writes_the_harness_schema() {
     let harness_row = BenchRow {
         prompt_id: "chat".into(),
         class: PromptClass::OpenEnded,
-        requested: Speculative::Off,
+        requested: Speculative::Off.into(),
+        speculative: Speculative::Off,
+        verify: core_llm::SpeculativeVerify::Linear,
         thinking: BenchThinking::Off,
         prompt_tokens: 9,
         generated_tokens: 4,
@@ -230,6 +269,10 @@ fn the_baseline_driver_writes_the_harness_schema() {
                 decode_tok_s: Some(tok_s),
                 generated_tokens: 4,
                 prefix_hit_tokens: Some(0),
+                wall_ms: None,
+                draft_ms: None,
+                memory_before_bytes: None,
+                peak_memory_bytes: None,
             })
             .collect(),
     }
@@ -250,9 +293,11 @@ fn the_baseline_driver_writes_the_harness_schema() {
         .collect();
     let off = baseline::parse_thinking("off").unwrap();
     let baseline_row = baseline::row_json("chat", "open_ended", &MtpMode::Off, &off, &measured);
-    // The harness's populated `prefix_cache` object; pre-epic reports have none (`null`).
+    // The harness's populated `prefix_cache` object; pre-epic reports have none (`null`). The
+    // SW-7200 per-path keys postdate the driver.
     let mut want = keys(&harness_row);
     want.retain(|k| !k.starts_with("prefix_cache."));
+    want.retain(|k| !core_llm_testkit::BENCH_PATH_ROW_KEYS.contains(&k.split('.').next().unwrap()));
     assert_eq!(keys(&baseline_row), want);
     for key in [
         "prompt_id",
@@ -291,7 +336,7 @@ fn the_baseline_driver_writes_the_harness_schema() {
             backend: "candle".into(),
             max_new_tokens: 4,
             sampling: Sampling::greedy(),
-            options: vec![Speculative::Off, Speculative::Auto],
+            options: vec![Speculative::Off.into(), Speculative::Auto.into()],
             warmup: true,
             repeats: 3,
             thinking: BenchThinking::Off,
@@ -300,6 +345,7 @@ fn the_baseline_driver_writes_the_harness_schema() {
         capabilities: caps.clone(),
         provenance: BenchProvenance::collect(switches.clone(), &var).unwrap(),
         rows: Vec::new(),
+        memory: serde_json::Value::Null,
     }
     .to_json();
     let baseline_config = baseline::Config {
@@ -319,7 +365,9 @@ fn the_baseline_driver_writes_the_harness_schema() {
         baseline::provenance_json(&switches, &var).unwrap(),
         Vec::new(),
     );
-    assert_eq!(keys(&baseline_doc), keys(&harness_doc));
+    let mut want = keys(&harness_doc);
+    want.retain(|k| !core_llm_testkit::BENCH_PATH_DOCUMENT_KEYS.contains(&k.as_str()));
+    assert_eq!(keys(&baseline_doc), want);
     for key in [
         "schema",
         "model",

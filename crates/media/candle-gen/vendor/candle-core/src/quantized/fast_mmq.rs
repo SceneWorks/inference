@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::cuda::{QCudaStorage, MATRIX_ROW_PADDING};
+use super::fast_mmvq::{capturing, Scratch};
 use super::GgmlDType;
 use crate::cuda_backend::DeviceId;
 use crate::{backend::BackendStorage, CudaDevice, CudaStorage, DType, Result, Shape};
@@ -129,7 +130,7 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-device workspaces (grows-only, reused across calls).
+// Per-device workspaces (grows-only, reused across eager calls; never by a capture).
 // ---------------------------------------------------------------------------
 
 struct WorkspaceSlot {
@@ -142,11 +143,20 @@ type WsMap = Mutex<HashMap<DeviceId, &'static Mutex<WorkspaceSlot>>>;
 static MMQ_WORKSPACE: OnceLock<WsMap> = OnceLock::new();
 static FIXUP_WORKSPACE: OnceLock<WsMap> = OnceLock::new();
 
+/// Returns a device pointer to `bytes` of scratch from `ws` and what keeps it valid — inside a
+/// CUDA graph capture a buffer of this call's own, never the shared workspace (see
+/// [`super::fast_mmvq::Scratch`]: a graph must not keep the address of a grows-only buffer an eager
+/// call may later free). Hold the returned [`Scratch`] until the kernels are launched.
 fn workspace_ensure(
     ws: &'static OnceLock<WsMap>,
     dev: &CudaDevice,
     bytes: usize,
-) -> Result<(u64, std::sync::MutexGuard<'static, WorkspaceSlot>)> {
+) -> Result<(u64, Scratch<std::sync::MutexGuard<'static, WorkspaceSlot>>)> {
+    if capturing(dev)? {
+        let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
+        let ptr = slice.device_ptr(slice.stream()).0;
+        return Ok((ptr, Scratch::Owned(slice)));
+    }
     let map = ws.get_or_init(|| Mutex::new(HashMap::new()));
     let device_key = dev.id();
     let device_mtx: &'static Mutex<WorkspaceSlot> = {
@@ -170,7 +180,7 @@ fn workspace_ensure(
         slot.cap = bytes;
     }
     let ptr = slot.slice.device_ptr(slot.slice.stream()).0;
-    Ok((ptr, slot))
+    Ok((ptr, Scratch::Shared(slot)))
 }
 
 // ---------------------------------------------------------------------------

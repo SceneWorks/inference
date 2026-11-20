@@ -209,6 +209,7 @@ fn render_admitted(label: &str, spec: &LoadSpec, req: GenerationRequest, budget:
     let calibration = contract.calibration.clone().expect("calibration identity");
     let context = MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         selection: admission.estimate.selection,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
         calibration_abi: calibration.abi,

@@ -287,6 +287,41 @@ impl StepKvCache {
     }
 }
 
+/// A tree branch's kept rows (feature SW-F328): the branch's tree rows `path` (`path[0] == 0`,
+/// increasing) as a u32 index into the `len - base` tree rows the cache holds past `base` after
+/// the tree forward, checked against them.
+pub(crate) fn tree_branch_rows(base: i32, path: &[usize], len: i32) -> Result<Vec<u32>> {
+    if path.first() != Some(&0) || path.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(Error::Msg(format!(
+            "tree branch {path:?} does not start at the anchor and increase"
+        )));
+    }
+    let rows = i64::from(len) - i64::from(base);
+    if base < 0 || path.last().is_some_and(|&r| r as i64 >= rows) {
+        return Err(Error::Msg(format!(
+            "tree branch {path:?} at base {base} past the {len} cached positions"
+        )));
+    }
+    Ok(path.iter().map(|&r| r as u32).collect())
+}
+
+/// The branch `rows` of the tree rows past `base` in one layer's `[1, heads, len, dim]` keys and
+/// values: only the tree's rows are copied out (contiguous), then gathered.
+pub(crate) fn gather_tree_branch(
+    k: &Tensor,
+    v: &Tensor,
+    base: i32,
+    rows: &[u32],
+) -> Result<(Tensor, Tensor)> {
+    let base = base as usize;
+    let idx = Tensor::from_slice(rows, rows.len(), k.device())?;
+    let pick = |t: &Tensor| -> Result<Tensor> {
+        let tail = t.narrow(2, base, t.dim(2)? - base)?.contiguous()?;
+        Ok(tail.index_select(&idx, 2)?)
+    };
+    Ok((pick(k)?, pick(v)?))
+}
+
 impl KvCache for StepKvCache {
     fn update(&mut self, layer: usize, keys: &Tensor, values: &Tensor) -> Result<(Tensor, Tensor)> {
         match &mut self.backing {
@@ -492,6 +527,39 @@ impl DecodeCache for StepKvCache {
         }
     }
 
+    /// The static and growing backings keep any branch (gather, then rewrite in place / append);
+    /// a paged backing's blocks may be shared with other sequences and are not rewritten.
+    fn tree_unsupported(&self) -> Option<&'static str> {
+        match self.backing {
+            Backing::Paged(_) => Some("a paged KV cache cannot keep an arbitrary tree branch"),
+            Backing::Static(_) | Backing::Growing(_) => None,
+        }
+    }
+
+    /// Every caching layer gathers the branch's rows (copies), drops the tree's rows and writes
+    /// the branch back at `base` — in place on the static backing (addresses unchanged).
+    fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        if let Some(why) = DecodeCache::tree_unsupported(self) {
+            return Err(Error::Unsupported(why.into()));
+        }
+        let len = DecodeCache::len(self);
+        let rows = tree_branch_rows(base, path, len)?;
+        let mut kept = Vec::with_capacity(KvCache::num_layers(self));
+        for layer in 0..KvCache::num_layers(self) {
+            kept.push(match self.layer_kv(layer)? {
+                Some((k, v)) => Some(gather_tree_branch(&k, &v, base, &rows)?),
+                None => None,
+            });
+        }
+        self.truncate(base)?;
+        for (layer, kv) in kept.into_iter().enumerate() {
+            if let Some((k, v)) = kv {
+                KvCache::update(self, layer, &k, &v)?;
+            }
+        }
+        Ok(())
+    }
+
     /// A replayed step's host side: the capacity check and every static layer's length.
     fn replay_advance(&mut self, n: usize) -> Result<()> {
         match (&mut self.backing, &self.positions) {
@@ -561,6 +629,70 @@ mod tests {
 
     fn host(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// SW-F328: committing a tree branch on either backing leaves exactly the cache a linear
+    /// write of the branch leaves (KV-cache ops only, no model), and malformed branches are
+    /// refused; a paged backing refuses trees by name.
+    #[test]
+    fn a_committed_tree_branch_equals_writing_the_branch_linearly() {
+        let pick = |t: &Tensor, rows: &[u32]| {
+            t.index_select(&Tensor::new(rows, &Device::Cpu).unwrap(), 2)
+                .unwrap()
+        };
+        for static_backing in [false, true] {
+            let fresh = || {
+                if static_backing {
+                    StepKvCache::preallocated(&layout(), 16).unwrap()
+                } else {
+                    StepKvCache::growing(&layout())
+                }
+            };
+            assert_eq!(DecodeCache::tree_unsupported(&fresh()), None);
+            // Prefix of 3, then a 5-row tree (anchor + 4 candidates); keep rows [0, 2, 4].
+            let mut tree = fresh();
+            feed(&mut tree, 3, 0.0);
+            feed(&mut tree, 5, 100.0);
+            tree.commit_tree(3, &[0, 2, 4]).unwrap();
+            assert_eq!(DecodeCache::len(&tree), 6);
+            let mut linear = fresh();
+            feed(&mut linear, 3, 0.0);
+            for (layer, h, dk, dv) in [(0usize, 2usize, 4usize, 4usize), (1, 1, 8, 8), (2, 3, 6, 4)]
+            {
+                let (k, v) = (step(h, 5, dk, 100.0), step(h, 5, dv, 100.5));
+                linear
+                    .update(layer, &pick(&k, &[0, 2, 4]), &pick(&v, &[0, 2, 4]))
+                    .unwrap();
+            }
+            for layer in 0..3 {
+                let (a, b) = (
+                    tree.layer_kv(layer).unwrap().unwrap(),
+                    linear.layer_kv(layer).unwrap().unwrap(),
+                );
+                assert_eq!(
+                    host(&a.0),
+                    host(&b.0),
+                    "static={static_backing} layer {layer}"
+                );
+                assert_eq!(
+                    host(&a.1),
+                    host(&b.1),
+                    "static={static_backing} layer {layer}"
+                );
+            }
+            for bad in [&[1usize, 2][..], &[0, 2, 2], &[0, 3]] {
+                let mut c = fresh();
+                feed(&mut c, 3, 0.0);
+                feed(&mut c, 3, 1.0);
+                assert!(c.commit_tree(3, bad).is_err(), "{bad:?}");
+            }
+            // An abort drops every tree row.
+            let mut c = fresh();
+            feed(&mut c, 3, 0.0);
+            feed(&mut c, 4, 1.0);
+            c.abort_tree(3).unwrap();
+            assert_eq!(DecodeCache::len(&c), 3);
+        }
     }
 
     #[test]
@@ -776,6 +908,9 @@ mod tests {
         };
         let mut paged = StepKvCache::paged(PagedKvCache::new(2, 4), &uniform);
         let mut growing = StepKvCache::growing(&uniform);
+        // SW-F328: a paged backing never keeps a tree branch, by name.
+        assert!(DecodeCache::tree_unsupported(&paged).is_some());
+        assert!(paged.commit_tree(0, &[0]).is_err());
         for cache in [&mut paged, &mut growing] {
             for layer in 0..2 {
                 cache

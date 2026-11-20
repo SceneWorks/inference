@@ -17,6 +17,7 @@ use core_llm::FinishReason as CoreFinish;
 use self::stream::{FinishReason as StreamFinishReason, StreamEvent as DecodeEvent};
 
 pub mod batch;
+pub mod block_draft;
 pub mod cancel;
 pub mod continuous;
 pub mod engine;
@@ -29,18 +30,20 @@ pub mod step;
 pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
+pub use block_draft::{BlockDraftProposer, TappedQwen35};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
     generate_speculative, generate_speculative_monitored, generate_speculative_with,
-    generate_with_sampler, DraftSample, DraftSampler, Drafts, NoProposer, Proposal, ProposeContext,
-    Proposer, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, TokenSampler,
+    generate_with_sampler, tree_extra_positions, DraftSample, DraftSampler, Drafts, NoProposer,
+    Proposal, ProposeContext, Proposer, RewindableConstraintMask, SpeculativePrompt,
+    SpeculativeRun, TokenSampler,
 };
 pub use graph::{
     cuda_graphs_enabled, cuda_graphs_scope, graph_demoted_step_admission_bytes,
-    graph_param_cache_load_bytes, graph_tally, graph_workspace_admission_bytes, set_cuda_graphs,
-    CudaGraphsScope, GraphRunner, GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV,
-    PARAM_CACHE_ADMISSION_BYTES,
+    graph_param_cache_load_bytes, graph_tally, graph_workspace_admission_bytes,
+    graph_workspace_admission_bytes_with_hidden_row, set_cuda_graphs, CudaGraphsScope, GraphRunner,
+    GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV, PARAM_CACHE_ADMISSION_BYTES,
 };
 pub use prefix::{
     generate_cached, prefill_restored, Boundary, PrefixCache, PrefixEntry, PrefixPrefill,
@@ -53,7 +56,7 @@ pub use record::{
 pub use speculative::SpeculativeStats;
 pub use step::{
     generate_step, generate_step_from_prefill, generate_step_timed, LogitsScope, StepModel,
-    StepOutput, StepRequest, StepTokens,
+    StepOutput, StepRequest, StepTokens, TreeOutput, TreeVerify, TREE_MODEL_UNSUPPORTED,
 };
 pub use stream::{
     generate, generate_from_prefill, generate_from_prefill_with_stop, generate_with,

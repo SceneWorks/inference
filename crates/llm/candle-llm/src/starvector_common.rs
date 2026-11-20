@@ -53,4 +53,5 @@ pub(crate) fn svg_report(
     record
         .report(false)
         .with_captioner_reasons(request.speculative_or(default))
+        .with_captioner_tree_reason(request.speculative_verify)
 }

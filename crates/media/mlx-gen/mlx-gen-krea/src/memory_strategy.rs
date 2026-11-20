@@ -1210,6 +1210,7 @@ mod tests {
         assert_eq!(contract.calibration, None);
         let context_for = |quant| MemoryRunContext {
             reference_resources: None,
+            low_res_start: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,

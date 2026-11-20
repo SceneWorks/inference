@@ -386,6 +386,18 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
             ):
                 errors.append(f"{name} changed its bounded weight-set dispatch route")
             continue
+        if name == "mlx-decode-speedups-bench":
+            # SW-7200: the dispatched matrix picks nax-macos-2 (`rw-llm`); every other value runs on
+            # nax-macos (`rw-starvector`), the owner's dev Mac on a loan.
+            expected = ["self-hosted", "macOS", "ARM64",
+                        "${{ fromJSON(inputs.decode_bench_matrix || '{}').runner == 'rw-llm' "
+                        "&& 'rw-llm' || 'rw-starvector' }}"]
+            if runs_on != expected or job.get("if") != (
+                "github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench-mlx'"
+            ):
+                errors.append(f"{name} changed its bounded weight-set dispatch route")
+            continue
+
         if any(step.get('run', '').strip() == 'python3.12 -I scripts/ci/ios_prequant.py'
                for step in job.get('steps', [])):
             errors.extend(f'{name}: {error}' for error in primary_cpu_cache_route_errors(job))

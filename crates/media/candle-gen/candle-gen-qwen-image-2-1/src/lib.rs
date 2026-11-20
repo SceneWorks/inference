@@ -939,6 +939,7 @@ impl QwenImage21 {
             pag: resolved_pag
                 .as_ref()
                 .map(|p| p.execution_report(actual_steps)),
+            low_res_start: None,
         })
     }
 }

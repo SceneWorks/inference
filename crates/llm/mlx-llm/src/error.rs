@@ -129,6 +129,14 @@ impl From<core_llm::vision_preprocess::PreprocessError> for Error {
     }
 }
 
+/// A shared block-draft tree builder failure (the lattice and the sampler disagree) keeps its
+/// message.
+impl From<core_llm::LatticeTreeError> for Error {
+    fn from(e: core_llm::LatticeTreeError) -> Self {
+        Error::Msg(e.to_string())
+    }
+}
+
 impl From<String> for Error {
     fn from(s: String) -> Self {
         Error::Msg(s)

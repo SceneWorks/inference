@@ -195,5 +195,10 @@ pub use profile::*;
 mod evidence;
 pub use evidence::*;
 
+/// Plan-based live-set memory pricing (`MEM-3`), equivalent-only admission (`MEM-4`),
+/// scope lifecycle verification (`MEM-5`), and `low_res_start` transition workspace admission (`SW-6941`, `SW-7216`).
+mod pricing;
+pub use pricing::*;
+
 #[cfg(test)]
 mod tests;

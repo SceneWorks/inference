@@ -53,7 +53,9 @@ pub use solvers::{
     sampler_by_name, Ddim, Dpmpp2m, Dpmpp2mSde, DpmppSde, ErSde, EulerAncestral, Heun, Lcm, Solver,
     UniPc,
 };
-pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler, SolverRunState};
+pub use unified::{
+    apply_coeffs, CapturedPrimaryEstimate, DenoiseFn, Euler, PhaseBoundary, Sampler, SolverRunState,
+};
 
 /// Resolve the canonical solver for `sampler_name`, falling back to `Solver::Euler` (the
 /// curated driver's N3 fallback for `None` or native aliases such as `flow_match`).

@@ -80,6 +80,8 @@ pub struct RecommendedDepths {
     pub prompt_lookup: u32,
     /// A draft model.
     pub draft_model: u32,
+    /// A block draft (SW-F360).
+    pub block_draft: u32,
 }
 
 impl RecommendedDepths {
@@ -89,6 +91,7 @@ impl RecommendedDepths {
             SpeculativeProposer::Mtp => self.mtp,
             SpeculativeProposer::PromptLookup => self.prompt_lookup,
             SpeculativeProposer::DraftModel => self.draft_model,
+            SpeculativeProposer::BlockDraft => self.block_draft,
         }
     }
 }
@@ -99,6 +102,7 @@ const RECOMMENDED_DEPTHS: RecommendedDepths = RecommendedDepths {
     mtp: MTP_RECOMMENDED_DEPTH,
     prompt_lookup: PROMPT_LOOKUP_RECOMMENDED_DEPTH,
     draft_model: DRAFT_MODEL_RECOMMENDED_DEPTH,
+    block_draft: crate::BLOCK_DRAFT_RECOMMENDED_DEPTH,
 };
 
 /// The prefix-cache budget every row reserves when `LoadSpec::prefix_cache_bytes` is unset: 1 GiB,

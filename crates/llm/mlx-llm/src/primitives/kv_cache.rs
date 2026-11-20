@@ -264,6 +264,23 @@ pub trait KvCache {
     /// records.
     fn record_events(&mut self) {}
 
+    /// Whether [`compact_tail`](Self::compact_tail) can keep an arbitrary accepted branch of a
+    /// tree verify pass (feature SW-F328). `false` by default: a cache that cannot is never
+    /// handed a tree, and the request verifies linearly with the reason named.
+    fn supports_tree_verify(&self) -> bool {
+        false
+    }
+
+    /// Keep the accepted branch of a tree verify pass (feature SW-F328): positions `base + rows[i]`
+    /// move to `base + i` and every position past `base + rows.len()` is dropped, so the cache
+    /// holds exactly what a linear decode of the branch would have appended. `rows` are the
+    /// branch's tree rows from the anchor (`rows[0] == 0`), increasing, all already cached.
+    fn compact_tail(&mut self, _base: i32, _rows: &[i32]) -> Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "this KV cache cannot keep an arbitrary tree branch".into(),
+        ))
+    }
+
     /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
     /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
     /// through the softmax-only [`KvCache::update`] path.
@@ -823,6 +840,36 @@ impl KvCache for ContiguousKvCache {
 
     fn record_events(&mut self) {
         self.events.get_or_insert_with(Vec::new);
+    }
+
+    fn supports_tree_verify(&self) -> bool {
+        true
+    }
+
+    fn compact_tail(&mut self, base: i32, rows: &[i32]) -> Result<()> {
+        let keep = base + rows.len() as i32;
+        let in_place = rows.iter().enumerate().all(|(i, &r)| r == i as i32);
+        let sources: Vec<i32> = rows.iter().map(|r| base + r).collect();
+        let idx = Array::from_slice(&sources, &[sources.len() as i32]);
+        for slot in self.layers.iter_mut().flatten() {
+            if sources.last().is_some_and(|&last| last >= slot.offset) || keep > slot.offset {
+                return Err(crate::error::Error::Msg(format!(
+                    "compact_tail: branch rows {sources:?} past the {} cached positions",
+                    slot.offset
+                )));
+            }
+            if !in_place {
+                // Gather the branch, then write it over the tree's leading rows in place.
+                let keys = slot.keys.take_axis(&idx, SEQ_AXIS)?;
+                let values = slot.values.take_axis(&idx, SEQ_AXIS)?;
+                slot.keys.try_index_mut((.., .., base..keep, ..), &keys)?;
+                slot.values
+                    .try_index_mut((.., .., base..keep, ..), &values)?;
+                slot.borrowed = false;
+            }
+            slot.offset = keep;
+        }
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

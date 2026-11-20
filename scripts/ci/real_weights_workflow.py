@@ -33,7 +33,10 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "real-weights.yml"
 SCRIPT_DIR = "scripts/ci/real-weights"
 # Reusable workflows `real-weights.yml` calls whose jobs are part of the real-weight surface.
-CALLED_WORKFLOWS = (ROOT / ".github" / "workflows" / "real-weights-minimax-h3-image.yml",)
+CALLED_WORKFLOWS = (
+    ROOT / ".github" / "workflows" / "real-weights-minimax-h3-image.yml",
+    ROOT / ".github" / "workflows" / "real-weights-decode-speedups-bench.yml",
+)
 
 _REFERENCE = re.compile(
     r"^(?P<lead>\s*(?:- )?)run: (?:"

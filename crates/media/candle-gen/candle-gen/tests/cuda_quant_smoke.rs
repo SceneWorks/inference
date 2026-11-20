@@ -68,7 +68,12 @@
 //! putting the canary on an automatic lane, and this change does not claim to. What it restores is
 //! that a dispatch of that lane evaluates the canary instead of reporting it `ignored`.
 
-#![cfg(feature = "cuda")]
+// `testkit` as well: this module imports `candle_gen::testkit`, which only that feature compiles,
+// and it shares the crate's one `integration` binary — without the gate a `--features cuda` build
+// of `-p candle-gen` alone (every candle-gen CUDA proof) cannot compile the binary. CI's CUDA lane
+// builds `-p "candle-gen*"` together, where the provider crates' dev-dependencies unify `testkit`
+// on, so the canary still runs there.
+#![cfg(all(feature = "cuda", feature = "testkit"))]
 
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{Device, Module, Tensor};

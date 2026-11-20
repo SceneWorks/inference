@@ -103,6 +103,7 @@ impl Args {
             mtp_head_source: self.mtp_head.clone(),
             prefix_cache_bytes: self.prefix_cache_bytes,
             draft_source: self.draft_model.clone(),
+            draft_quantize: None,
         }
     }
 }
@@ -1225,6 +1226,7 @@ mod tests {
                         path: "prompt_lookup".into(),
                         proposer: core_llm::ProposerKind::PromptLookup,
                         draft_tokens: Some(4),
+                        draft: None,
                         sampler: "host:penalty".into(),
                         kv_cache: "growing".into(),
                         attention: "gqa".into(),
@@ -1270,6 +1272,12 @@ mod tests {
                             reason: Some("why".into()),
                         },
                         fallbacks: vec!["speculative: x".into()],
+                        tree_verify: None,
+                        draft_time: Some(core_llm::DraftTime {
+                            calls: 4,
+                            host_synchronized_calls: 4,
+                            total: std::time::Duration::from_millis(6),
+                        }),
                     }),
                     ..Default::default()
                 })
@@ -1299,6 +1307,7 @@ mod tests {
                 "path": "prompt_lookup",
                 "proposer": "prompt_lookup",
                 "draft_tokens": 4,
+                "draft": null,
                 "mean_accepted_length": 1.5,
                 "sampler": "host:penalty",
                 "kv_cache": "growing",
@@ -1326,6 +1335,7 @@ mod tests {
                 "prefix_cache": {"path": "hit", "reason": "why"},
                 "prefix_hit_tokens": 5,
                 "fallbacks": ["speculative: x"],
+                "draft_time": {"calls": 4, "host_synchronized_calls": 4, "total_ms": 6.0},
             })
         );
     }

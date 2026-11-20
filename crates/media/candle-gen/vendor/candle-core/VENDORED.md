@@ -12,6 +12,16 @@ lifetime, refusing cap changes and current-pool replacement. A restart is requir
 to change or remove it. `candle-gen/tests/cuda_proof_pool.rs` is an ignored
 raw-allocation proof executed only by the separate explicit workflow.
 
+SW-7197 (2026-11-19): `src/quantized/fast_mmvq.rs` and `src/quantized/fast_mmq.rs` never hand
+their shared per-device scratch workspaces to a CUDA graph capture. The workspaces are grows-only
+and free the slice they outgrow; a captured graph keeps the address of every buffer it touched, so
+a graph that read a workspace wrote its Q8_1 activations into freed memory on every replay after a
+later eager call grew it (a Qwen3.8-27B DSpine block draft's context on its cold, graph-captured
+request). While the device's stream is capturing (`cuStreamIsCapturing`, one driver query per
+call), `workspace_ensure` instead allocates the call's own scratch, a stream-ordered allocation the
+graph records and frees inside itself; the shared workspace is never grown during a capture and
+nothing is retained. `candle-gen/tests/quantized_workspace_graph.rs` is the explicit CUDA proof.
+
 Dependency maintenance (2026-10-17): the standalone `Cargo.toml` now requires
 `zip = "9"` instead of `7.2.0` to address RUSTSEC-2026-0367, RUSTSEC-2026-0368,
 and RUSTSEC-2026-0369. Features remain disabled by default. `src/npy.rs` and

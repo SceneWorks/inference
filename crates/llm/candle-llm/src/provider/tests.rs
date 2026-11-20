@@ -26,6 +26,70 @@ fn actual_cpu_provider_exposes_its_owned_release_fence() {
     engine.synchronize_before_release().unwrap();
 }
 
+/// SW-F328 E5/E6 (constructors and pricing only, no forward): a loaded llama-family decoder
+/// advertises tree verification at the shared bound, and a tree route prices its extra rows,
+/// mask and states on top of the linear route; no tree, no proposer or no drafts prices nothing.
+#[test]
+fn a_loaded_decoder_advertises_tree_verification_and_a_tree_is_priced() {
+    let (cfg, weights) = tiny_llama_parts();
+    let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
+    let tokenizer = core_llm::Tokenizer::from_json(&synthetic_tokenizer_json(vocab)).unwrap();
+    let provider =
+        super::LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tokenizer, vec![]);
+    let caps = &provider.descriptor.capabilities;
+    assert_eq!(
+        caps.tree_verify,
+        Some(core_llm::TreeVerifyCapabilities {
+            max_rows: core_llm::MAX_TREE_ROWS
+        })
+    );
+    let lookup = ProposerKind::PromptLookup;
+    let tree = super::tree_request_bytes(&provider.model, lookup, 4, 16, 100, 50, 0).unwrap();
+    assert!(tree > 0);
+    assert!(super::tree_request_bytes(&provider.model, lookup, 4, 32, 100, 50, 0).unwrap() == tree);
+    assert_eq!(
+        super::tree_request_bytes(&provider.model, lookup, 4, 0, 100, 50, 0),
+        Some(0)
+    );
+    assert_eq!(
+        super::tree_request_bytes(&provider.model, lookup, 0, 16, 100, 50, 0),
+        Some(0)
+    );
+    // A one-branch proposer (a draft model, the MTP head) verifies at most `drafts` candidates on
+    // the linear path its route already prices: a tree request adds no tree workspace (E6).
+    for one_branch in [ProposerKind::DraftModel, ProposerKind::Mtp] {
+        assert_eq!(
+            super::tree_request_bytes(&provider.model, one_branch, 4, 16, 100, 50, 0),
+            Some(0),
+            "{}",
+            one_branch.label()
+        );
+    }
+    // A block draft builds branching trees (SW-7198): its tree is priced, and its eager tree
+    // forward also holds every tree row's tapped layer outputs.
+    let block = ProposerKind::BlockDraft;
+    let plain = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 0).unwrap();
+    let tapped = super::tree_request_bytes(&provider.model, block, 4, 16, 100, 50, 256).unwrap();
+    let element = provider.model.step_memory_geometry(4).element_bytes;
+    assert_eq!(plain, tree);
+    // Every tree row's taps — the anchor and 16 candidates — and the accepted branch's copy.
+    assert_eq!(tapped - plain, 17 * 256 * element * 2);
+    // The request resolves against the advertisement: a tree needs a running proposer.
+    let verify = core_llm::SpeculativeVerify::Tree { max_rows: 40 };
+    let run = core_llm::resolve_tree_verify(
+        verify,
+        core_llm::SpeculativePlan::Run {
+            proposer: core_llm::SpeculativeProposer::PromptLookup,
+            depth: 4,
+        },
+        caps,
+    );
+    assert_eq!(run.max_rows, core_llm::MAX_TREE_ROWS);
+    assert!(run.fallback.is_some(), "the clamp is named");
+    let off = core_llm::resolve_tree_verify(verify, core_llm::SpeculativePlan::Off, caps);
+    assert_eq!(off.max_rows, 0);
+}
+
 #[test]
 fn partial_load_failure_fences_after_drop_and_preserves_primary_error() {
     use std::{cell::RefCell, rc::Rc};
@@ -1383,6 +1447,7 @@ fn nvfp4_spec(source: &str) -> core_llm::LoadSpec {
         mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
+        draft_quantize: None,
     }
 }
 
@@ -2106,6 +2171,222 @@ fn qwen35_q8_estimate_prices_exactly_the_copy_the_loader_builds() {
     let census = loaded_census(&spec_at(moe.path(), Some(Quantize::Q8)));
     assert_eq!(census.projections.ggml.count, 62);
     assert_eq!(estimate(&moe), ggml_copy_built(&census, GgmlDType::Q8_0));
+}
+
+/// SW-7201: the fully quantized tiers prepared from the synthetic qwen3_5 (dense, with its MTP
+/// head) and the plain tier of the same body bits.
+fn qwen35_full_and_plain_tiers(
+    quant: core_llm::Quantize,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use core_llm::PrepareSpec;
+    let src = q8_capable_qwen35_snapshot(false);
+    let out = tempfile::tempdir().unwrap();
+    let (full, plain) = (out.path().join("full"), out.path().join("plain"));
+    crate::prepare::prepare_fully_quantized(&PrepareSpec::quantized(src.path(), &full, quant))
+        .unwrap();
+    crate::prepare::prepare(&PrepareSpec::quantized(src.path(), &plain, quant)).unwrap();
+    (src, out, full, plain)
+}
+
+/// The checkpoint stems a fully quantized tier of the synthetic qwen3_5 stores beyond the plain
+/// tier: the head, the embedding and the three DeltaNet layers' `in_proj_a` / `in_proj_b`.
+fn qwen35_remaining_stems() -> Vec<String> {
+    let mut stems = vec![
+        "lm_head".to_string(),
+        "model.language_model.embed_tokens".to_string(),
+    ];
+    for layer in 0..3 {
+        for part in ["a", "b"] {
+            stems.push(format!(
+                "model.language_model.layers.{layer}.linear_attn.in_proj_{part}"
+            ));
+        }
+    }
+    stems
+}
+
+/// SW-7201: a fully quantized tier stores the head, the embedding and every `in_proj_a` /
+/// `in_proj_b` as Q8_0 blocks beside its body (Q4 / Q8), names each in the `quantization` block
+/// when the body's bits differ, loads (constructor only, no forward) with those tensors served as
+/// Q8_0 and the embedding as a Q8 table, and admission prices exactly that: the plain tier's copy
+/// with the head at Q8_0 instead of the body's format, plus the decay / delta-strength inputs and
+/// the embedding table's device bytes.
+#[test]
+fn qwen35_fully_quantized_tiers_store_load_and_price_every_language_matrix() {
+    use crate::primitives::projection::{ggml_device_bytes, QuantSpec};
+    use crate::primitives::quant::Q8RowEmbedding;
+    use candle_core::quantized::GgmlDType;
+    use core_llm::Quantize;
+    let estimate = |dir: &std::path::Path| {
+        super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true)
+            .unwrap()
+            .quantized_copy_bytes
+    };
+    let stems = qwen35_remaining_stems();
+    for (quant, body) in [
+        (Quantize::Q4, QuantSpec::q4()),
+        (Quantize::Q8, QuantSpec::q8()),
+    ] {
+        let (_src, _out, full, plain) = qwen35_full_and_plain_tiers(quant);
+        let header =
+            crate::provider::read_safetensors_header(&full.join("model.safetensors")).unwrap();
+        for stem in &stems {
+            let entry = &header[&format!("{stem}.weight")];
+            assert_eq!(entry["dtype"], "U8", "{stem}");
+            assert_eq!(entry["shape"][2], 34, "{stem} is Q8_0");
+        }
+        let qkv = &header["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"];
+        assert_eq!(
+            qkv["shape"][2],
+            if body.bits() == 8 { 34 } else { 18 },
+            "the body keeps its own blocks"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(full.join("config.json")).unwrap())
+                .unwrap();
+        let block = config["quantization"].as_object().unwrap();
+        assert_eq!(block["storage"], "ggml");
+        if body.bits() == 8 {
+            assert_eq!(block.len(), 2, "an int8 tier needs no per-tensor entry");
+        } else {
+            assert_eq!(block.len(), 2 + stems.len());
+            for stem in &stems {
+                assert_eq!(
+                    block[stem.as_str()],
+                    serde_json::json!({"bits": 8}),
+                    "{stem}"
+                );
+            }
+        }
+
+        let census = loaded_census(&spec_at(&full, None));
+        let plain_census = loaded_census(&spec_at(&plain, None));
+        assert_eq!(
+            census.projections.ggml.count,
+            plain_census.projections.ggml.count + 6,
+            "the in_proj_a / in_proj_b join the GGML projections"
+        );
+        let device = crate::device::select_device().unwrap();
+        let dense_embedding = 50 * 32 * crate::device::compute_dtype(&device).size_in_bytes();
+        assert_eq!(census.other.params, plain_census.other.params);
+        assert_eq!(
+            census.other.resident_bytes,
+            plain_census.other.resident_bytes - dense_embedding as u64
+                + Q8RowEmbedding::device_bytes(50, 32).unwrap(),
+            "the dense embedding is replaced by its Q8 table"
+        );
+
+        let q8 = |rows: u64, cols: u64| ggml_device_bytes(rows * cols, GgmlDType::Q8_0).unwrap();
+        let body_head = ggml_device_bytes(50 * 32, body.dtype).unwrap();
+        assert_eq!(
+            estimate(&full),
+            estimate(&plain) - body_head
+                + q8(50, 32)
+                + 6 * q8(4, 32)
+                + Q8RowEmbedding::device_bytes(50, 32).unwrap()
+        );
+    }
+}
+
+/// SW-7201: a mixed tier read without its per-tensor entries is refused at the first Q8_0 tensor
+/// the 4-bit format cannot read, never served at the wrong precision.
+#[test]
+fn a_mixed_qwen35_tier_without_its_entries_is_refused() {
+    let (_src, _out, full, _plain) = qwen35_full_and_plain_tiers(core_llm::Quantize::Q4);
+    let path = full.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["quantization"] = serde_json::json!({"bits": 4, "storage": "ggml"});
+    std::fs::write(&path, config.to_string()).unwrap();
+    match super::LlamaProvider::load(&spec_at(&full, None)) {
+        Err(e) => assert!(e.to_string().contains("Q8"), "{e}"),
+        Ok(_) => panic!("a Q8_0 table read as Q4 must be refused"),
+    }
+}
+
+/// SW-7201 (AC2 on the tiny fixture): each fully quantized tier decodes like the plain tier of
+/// the same body bits — its logits stay within a small fraction of the plain tier's range, and at
+/// every prompt position the greedy token agrees unless the plain tier's top two are nearer than
+/// the logit difference between the tiers (a near-tie). A `cuda` build runs both tiers on CUDA,
+/// where the stored Q8 embedding table is gathered row by row from its U8 blocks.
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen35_fully_quantized_tiers_decode_like_the_plain_tier() {
+    use crate::models::{Qwen35Config, Qwen35Model};
+    use crate::primitives::projection::ProjectionFormat;
+    #[cfg(feature = "cuda")]
+    let device =
+        crate::device::new_cuda_for_test().expect("a cuda build proves the tiers on a CUDA device");
+    #[cfg(not(feature = "cuda"))]
+    let device = candle_core::Device::Cpu;
+    let load = |dir: &std::path::Path| {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let format = crate::prepare::persisted_ggml_blocks(&config).map(ProjectionFormat::from);
+        let weights = crate::primitives::Weights::from_dir(dir, &device).unwrap();
+        Qwen35Model::from_weights_format(
+            &weights,
+            "model.language_model",
+            Qwen35Config::from_json(&config).unwrap(),
+            format.as_ref(),
+        )
+        .unwrap()
+    };
+    for quant in [core_llm::Quantize::Q4, core_llm::Quantize::Q8] {
+        let (_src, _out, full, plain) = qwen35_full_and_plain_tiers(quant);
+        let ids = Tensor::from_vec(vec![3u32, 1, 4, 1, 5, 9, 2, 6], (1, 8), &device).unwrap();
+        let logits = |model: &Qwen35Model| -> Vec<f32> {
+            model
+                .forward(&ids, &mut model.new_cache(), 0)
+                .unwrap()
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let (full_logits, plain_logits) = (logits(&load(&full)), logits(&load(&plain)));
+        assert!(full_logits.iter().all(|v| v.is_finite()));
+        let diff = full_logits
+            .iter()
+            .zip(&plain_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let range = plain_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            diff <= 0.1 * range,
+            "{quant:?}: full/plain logit difference {diff} vs range {range}"
+        );
+        for (pos, (f, p)) in full_logits
+            .chunks(50)
+            .zip(plain_logits.chunks(50))
+            .enumerate()
+        {
+            let argmax = |row: &[f32]| {
+                (0..row.len())
+                    .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+                    .unwrap()
+            };
+            if argmax(f) != argmax(p) {
+                let mut sorted = p.to_vec();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                assert!(
+                    sorted[0] - sorted[1] <= 2.0 * diff,
+                    "{quant:?} position {pos}: greedy tokens differ outside a near-tie"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen35_fully_quantized_tiers_decode_like_the_plain_tier");
 }
 
 /// sc-24140 review: a qwen3_5 MoE snapshot loads under `Quantize::Q8` on every device and
@@ -4584,6 +4865,228 @@ fn a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback() {
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback");
 }
 
+/// A constraint forbidding fixed ids, rewindable, recording what it accepted (SW-7209).
+struct ForbidIds {
+    allow: Vec<bool>,
+    accepted: Vec<i32>,
+}
+
+impl ConstraintMask for ForbidIds {
+    fn allowed(&mut self) -> &[bool] {
+        &self.allow
+    }
+    fn accept(&mut self, token: i32) {
+        self.accepted.push(token);
+    }
+}
+
+impl RewindableConstraintMask for ForbidIds {
+    fn checkpoint(&self) -> usize {
+        self.accepted.len()
+    }
+    fn rewind(&mut self, checkpoint: usize) {
+        self.accepted.truncate(checkpoint);
+    }
+}
+
+/// SW-7209 (Causal multimodal): the Qwen3-VL decoder's path — the [`synthetic_qwen3vl_provider`]
+/// `CausalLm` with interleaved M-RoPE, prefilled into its step cache with hand-built M-RoPE rows
+/// over an image run (`mrope_delta` −6) and a text tail whose trailing n-gram had two
+/// continuations, the cache shifted by the
+/// delta — runs prompt lookup's candidate trees at two depths, plain and constrained: each commits
+/// exactly the plain loop's greedy tokens (the prefill, then one step per token at its shifted
+/// text position), verifies branching trees with no tree fallback, and keeps only the accepted
+/// branch. Through the provider, a prompt-lookup image request under a 16-row tree bound on both
+/// image prompts decodes exactly `off`'s stream with tree verification and no tree fallback.
+#[test]
+#[ignore = "model inference; explicit model workflow only"]
+fn qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop() {
+    use crate::decode::stream::GenerationConfig;
+    use crate::decode::{CancelFlag, StepModel, StepRequest};
+    use crate::primitives::sampler::SamplingParams;
+    use core_llm::{Sampling, Speculative, SpeculativeProposer, SpeculativeVerify};
+
+    let (_dir, provider) = synthetic_qwen3vl_provider();
+    let Decoder::Causal(model) = &provider.model else {
+        unreachable!("synthetic_qwen3vl_provider loads a CausalLm")
+    };
+    let device = model.device().clone();
+    let image = vl_special_ids(40).1 as i32;
+    let mut ids = vec![3, 9];
+    ids.extend([image; 9]);
+    // The trailing `11 3 9` was followed by both 4 and 6: the first lookup branches.
+    ids.extend([4, 11, 3, 9, 4, 11, 3, 9, 6, 11, 3, 9]);
+    let (t, h, w, delta) = model.mrope_positions(&ids, &[[1, 6, 6]], image, 2).unwrap();
+    assert_eq!(delta, -6, "the 3 × 3 grid spans 3 positions, not 9");
+    let visual: Vec<bool> = ids.iter().map(|&id| id == image).collect();
+    let embeds = model
+        .embed_input_ids(&crate::primitives::input_ids(&ids, &device).unwrap())
+        .unwrap();
+    let (_, seq, hidden) = embeds.dims3().unwrap();
+    let shift: Vec<f32> = (0..seq * hidden)
+        .map(|i| {
+            let (row, col) = (i / hidden, i % hidden);
+            if visual[row] {
+                0.25 + ((row * 7 + col) % 13) as f32 * 0.02
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let shift = Tensor::from_vec(shift, (1, seq, hidden), &device)
+        .and_then(|t| t.to_dtype(embeds.dtype()))
+        .unwrap();
+    let embeds = (embeds + shift).unwrap();
+    let max_new = 24;
+    let prefill = |cache: &mut crate::primitives::StepKvCache| {
+        let logits = model
+            .step_prefill_mrope_deepstack(
+                &embeds,
+                [t.as_slice(), h.as_slice(), w.as_slice()],
+                cache,
+                &visual,
+                &[],
+            )
+            .unwrap();
+        cache.set_rope_delta(delta);
+        logits
+    };
+    let host = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    };
+    let forbidden = [1usize, 9];
+    let mut tree_passes = 0;
+    for depth in [2usize, 5] {
+        for constrained in [false, true] {
+            let label = format!("qwen3-vl prompt lookup depth {depth} constrained {constrained}");
+            let allow: Vec<bool> = (0..40)
+                .map(|i| !constrained || !forbidden.contains(&i))
+                .collect();
+            let capacity = ids.len()
+                + max_new
+                + crate::decode::tree_extra_positions(
+                    depth,
+                    core_llm::tree_workspace_rows(ProposerKind::PromptLookup, 16),
+                );
+            // The plain loop: the prefill, then one greedy step per token.
+            let mut cache = model.new_cache_for(capacity, depth).unwrap();
+            let mut logits = prefill(&mut cache);
+            let mut expected = Vec::new();
+            loop {
+                let row = host(&logits);
+                let token = (0..row.len())
+                    .filter(|&i| allow[i])
+                    .fold(None, |b: Option<usize>, i| match b {
+                        Some(b) if row[b] >= row[i] => Some(b),
+                        _ => Some(i),
+                    })
+                    .unwrap() as i32;
+                expected.push(token);
+                if expected.len() == max_new {
+                    break;
+                }
+                logits = model
+                    .forward_step(&mut cache, StepRequest::last(&[token]))
+                    .unwrap()
+                    .logits;
+            }
+            let mut constraint = ForbidIds {
+                allow: allow.clone(),
+                accepted: Vec::new(),
+            };
+            let mut cache = model.new_cache_for(capacity, depth).unwrap();
+            let logits = prefill(&mut cache);
+            let run = crate::decode::generate_speculative_monitored(
+                model,
+                &mut crate::decode::NgramProposer::default(),
+                crate::decode::SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &ids,
+                    position_delta: delta,
+                    warm_proposer: true,
+                },
+                &GenerationConfig {
+                    max_new_tokens: max_new,
+                    sampling: SamplingParams::default(),
+                    seed: Some(7),
+                    stop_tokens: Vec::new(),
+                },
+                depth,
+                &CancelFlag::new(),
+                &mut |_| {},
+                constrained.then_some(&mut constraint as &mut dyn RewindableConstraintMask),
+                None,
+                None,
+                Speculative::Off,
+                16,
+            )
+            .unwrap();
+            assert_eq!(run.output.tokens, expected, "{label}");
+            if constrained {
+                assert_eq!(constraint.accepted, expected, "{label}: constraint");
+            }
+            assert_eq!(run.record.proposer, ProposerKind::PromptLookup, "{label}");
+            assert_eq!(run.record.tree_fallback, None, "{label}");
+            assert_eq!(
+                crate::primitives::DecodeCache::len(&cache) as usize,
+                ids.len() + expected.len() - 1,
+                "{label}: the accepted branch only"
+            );
+            let tree = run.record.tree_verify.expect("a tree run reports its tree");
+            assert_eq!(tree.passes, run.record.verify_steps, "{label}");
+            println!(
+                "QWEN3VL_PROMPT_LOOKUP_TREE {label}: passes={} tree_passes={} accepted={}",
+                tree.passes, tree.tree_passes, run.record.accepted_tokens
+            );
+            tree_passes += tree.tree_passes;
+        }
+    }
+    assert!(tree_passes > 0, "prompt lookup verified branching trees");
+
+    // Through the provider: the Qwen3-VL multimodal route under a tree bound.
+    let mut provider_tree_passes = 0;
+    for prompt in image_fixture_prompts() {
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 3);
+        let off =
+            core_llm_testkit::bench_request(&prompt, Speculative::Off, &Sampling::greedy(), 24);
+        let tree = core_llm::TextLlmRequest {
+            speculative_verify: SpeculativeVerify::Tree { max_rows: 16 },
+            ..core_llm_testkit::bench_request(&prompt, lookup, &Sampling::greedy(), 24)
+        };
+        let (off_events, _) = token_events(&provider, &off);
+        let (events, out) = token_events(&provider, &tree);
+        assert_eq!(events, off_events, "{}: the off stream", prompt.id);
+        let report = out.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::PromptLookup, "{}", prompt.id);
+        assert!(
+            report.fallbacks.iter().all(|f| !f.contains("tree")),
+            "{}: {:?}",
+            prompt.id,
+            report.fallbacks
+        );
+        let t = report
+            .tree_verify
+            .expect("the tree request reports its tree");
+        assert_eq!(t.passes, report.verify_steps, "{}", prompt.id);
+        provider_tree_passes += t.tree_passes;
+    }
+    println!("QWEN3VL_PROMPT_LOOKUP_TREE provider: {provider_tree_passes} branching tree passes");
+    assert!(
+        provider_tree_passes > 0,
+        "the provider verified branching trees"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen3vl_multimodal_prompt_lookup_tree_is_the_plain_loop");
+}
+
 /// The report the output carries is the record's, with the provider's fallback reasons passed
 /// through verbatim and in order.
 #[test]
@@ -4621,9 +5124,9 @@ fn the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model() {
         backend: "candle-cpu".into(),
         max_new_tokens: 12,
         options: vec![
-            Speculative::Off,
-            Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
-            Speculative::Auto,
+            Speculative::Off.into(),
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 4).into(),
+            Speculative::Auto.into(),
         ],
         warmup: false,
         sampling: core_llm::Sampling::greedy(),
@@ -5268,11 +5771,18 @@ fn an_unset_speculative_option_runs_the_providers_default() {
     core_llm_testkit::check_speculative_default(
         &provider,
         crate::device::decode_defaults(provider.model.device()).speculative,
+        provider.auto_prefers_block_draft(),
         prompt,
         8,
     );
     provider.set_speculative_default(core_llm::Speculative::Auto);
-    core_llm_testkit::check_speculative_default(&provider, core_llm::Speculative::Auto, prompt, 8);
+    core_llm_testkit::check_speculative_default(
+        &provider,
+        core_llm::Speculative::Auto,
+        provider.auto_prefers_block_draft(),
+        prompt,
+        8,
+    );
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");
@@ -5810,3 +6320,6 @@ fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell
         Ok(_) => panic!("a ModelOpt NVFP4 snapshot was re-quantized to Q8"),
     }
 }
+
+/// The block draft through the provider (SW-F360, SW-7197).
+mod block_draft;

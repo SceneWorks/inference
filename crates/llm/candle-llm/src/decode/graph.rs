@@ -94,7 +94,9 @@ use candle_core::Tensor;
 
 #[cfg(feature = "cuda")]
 use crate::decode::step::StepTokens;
-use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
+use crate::decode::step::{
+    LogitsScope, StepModel, StepOutput, StepRequest, TreeOutput, TreeVerify,
+};
 use crate::error::Result;
 use crate::primitives::attention::AttnFormulation;
 use crate::primitives::decode_cache::DecodeCache;
@@ -172,6 +174,11 @@ pub const REASON_LAUNCH_FAILED: &str = "launch_failed";
 pub const REASON_REPLAY_MISMATCH: &str = "replay_mismatch";
 /// Fallback reason: the step's outputs are not a shape the staging tensors can hold.
 pub const REASON_OUTPUT_SHAPE: &str = "output_shape";
+/// Fallback reason: a tree verify step (feature SW-F328). Its ancestor-only mask, its row count
+/// and its per-row branch states change with every tree's shape, so it is never captured: it runs
+/// eager through the runner and is counted as such, while the run's linear verify and plain steps
+/// keep their graphs.
+pub const REASON_TREE_VERIFY: &str = "tree_verify";
 
 fn env_value_enables(v: &str) -> bool {
     matches!(v, "1" | "on" | "true" | "yes")
@@ -493,10 +500,27 @@ pub fn graph_workspace_admission_bytes(
     total_positions: u64,
     max_step_tokens: u32,
 ) -> Option<u64> {
+    graph_workspace_admission_bytes_with_hidden_row(
+        geometry,
+        total_positions,
+        max_step_tokens,
+        geometry.hidden_size,
+    )
+}
+
+/// [`graph_workspace_admission_bytes`] for steps whose staged hidden output is `hidden_row`
+/// elements per token instead of `hidden_size`: a block draft's verify steps stage the outputs of
+/// its tapped layers, `layers × hidden` per row (SW-7197). `None` on overflow.
+pub fn graph_workspace_admission_bytes_with_hidden_row(
+    geometry: &core_llm::LlmMemoryGeometry,
+    total_positions: u64,
+    max_step_tokens: u32,
+    hidden_row: u64,
+) -> Option<u64> {
     // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
     let n = u64::from(max_step_tokens);
     let rows = n.checked_mul(n.checked_add(1)?)? / 2;
-    graph_token_row_bytes(geometry, total_positions)?
+    graph_token_row_bytes(geometry, total_positions, hidden_row)?
         .checked_mul(rows)?
         .checked_mul(2)
 }
@@ -509,13 +533,15 @@ pub fn graph_demoted_step_admission_bytes(
     geometry: &core_llm::LlmMemoryGeometry,
     total_positions: u64,
 ) -> Option<u64> {
-    graph_token_row_bytes(geometry, total_positions)
+    graph_token_row_bytes(geometry, total_positions, geometry.hidden_size)
 }
 
-/// One captured token-row's working set (see [`graph_workspace_admission_bytes`]).
+/// One captured token-row's working set (see [`graph_workspace_admission_bytes`]), its staged
+/// hidden row `hidden_row` elements wide.
 fn graph_token_row_bytes(
     geometry: &core_llm::LlmMemoryGeometry,
     total_positions: u64,
+    hidden_row: u64,
 ) -> Option<u64> {
     let e = geometry.element_bytes;
     let chunk = candle_quant_kernels::DECODE_ATTN_CHUNK as u64;
@@ -543,7 +569,7 @@ fn graph_token_row_bytes(
         .checked_add(
             geometry
                 .vocab_size
-                .checked_add(geometry.hidden_size)?
+                .checked_add(hidden_row)?
                 .checked_mul(e)?,
         )?;
     Some(per_token)
@@ -884,6 +910,17 @@ impl<M: StepModel> StepModel for GraphRunner<'_, M> {
             note_eager(Some(REASON_CUDA_FEATURE_OFF));
             self.model.forward_step(cache, request)
         }
+    }
+    fn tree_unsupported(&self, cache: &M::Cache) -> Option<&'static str> {
+        self.model.tree_unsupported(cache)
+    }
+
+    /// A tree verify step always runs eager (feature SW-F328): it is counted as an eager step with
+    /// the reason [`REASON_TREE_VERIFY`], never as a replay. The graphs the runner holds stay
+    /// valid — the tree writes and keeps its branch in the same stable buffers.
+    fn forward_tree(&self, cache: &mut M::Cache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
+        note_eager(Some(REASON_TREE_VERIFY));
+        self.model.forward_tree(cache, tree)
     }
 }
 

@@ -407,6 +407,7 @@ fn render_base_ladder_at(
     let calibration = contract.calibration.as_ref().unwrap();
     let context = MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         optimization_authority: MemoryOptimizationAuthority::Calibrated,
         selection,
         calibration_abi: calibration.abi,

@@ -31,7 +31,9 @@
 use candle_core::{DType, Device, Tensor};
 
 use crate::config::{Architecture, LayerAttentionType, LayerRope, ModelConfig};
-use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
+use crate::decode::step::{
+    LogitsScope, StepModel, StepOutput, StepRequest, TreeOutput, TreeVerify,
+};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
@@ -2095,6 +2097,67 @@ impl StepModel for CausalLm {
             None
         };
         Ok(StepOutput { logits, hidden })
+    }
+
+    /// The decoder's own refusal ([`CausalLm::tree_unsupported`]), then the cache's (a paged
+    /// backing cannot keep a branch).
+    fn tree_unsupported(&self, cache: &StepKvCache) -> Option<&'static str> {
+        CausalLm::tree_unsupported(self).or_else(|| DecodeCache::tree_unsupported(cache))
+    }
+
+    /// The tree rows appended at the cache's position on the host path, each at the RoPE
+    /// position of its depth (the cache's length plus its RoPE delta) and attending through the
+    /// ancestor-only additive mask — un-expanded where the layer can express it, as the static
+    /// cache's linear verify does.
+    fn forward_tree(&self, cache: &mut StepKvCache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
+        if let Some(why) = StepModel::tree_unsupported(self, cache) {
+            return Err(Error::Unsupported(why.into()));
+        }
+        let base = DecodeCache::len(cache);
+        let ids = tree.ids(&self.device)?;
+        let embeds = self.embed(&ids)?;
+        let rows = tree.tree.rows();
+        let positions = tree.positions(base + cache.rope_delta());
+        let tables = self.rope_tables(&positions, 1, rows as i32)?;
+        let mask = tree.mask(base as usize, self.dtype, &self.device)?;
+        let mask_bytes = mask.elem_count() * mask.dtype().size_in_bytes();
+        let formulation = self.cache_formulation(cache);
+        let h = self.run_decoder_stack_collecting(
+            &embeds,
+            cache,
+            &tables,
+            AttnMask::Additive(&mask),
+            None,
+            formulation,
+            true,
+            false,
+        )?;
+        let logits = self.project_logits(&h)?;
+        let hidden = if tree.want_hidden {
+            Some(rms_norm(&h, &self.norm, self.cfg.rms_norm_eps as f64)?)
+        } else {
+            None
+        };
+        Ok(TreeOutput {
+            step: StepOutput { logits, hidden },
+            mask_bytes,
+        })
+    }
+}
+
+impl CausalLm {
+    /// Why this decoder cannot verify a candidate tree, or `None` when it can (feature SW-F328).
+    /// A sliding-window layer bounds its keys by packed row offset, not by a row's depth on its
+    /// branch, and a KV-sharing tail reads another layer's whole forward — neither keeps
+    /// ancestor-only visibility exact (MLX refuses the same Gemma 4 layers).
+    pub fn tree_unsupported(&self) -> Option<&'static str> {
+        if self.kv_sharing {
+            return Some("KV-sharing layers cannot verify a tree exactly");
+        }
+        self.layers
+            .iter()
+            .any(|l| matches!(&l.attn, Attention::Gqa(a) if a.sliding_window.is_some()))
+            .then_some("sliding-window attention layers cannot verify a tree exactly")
     }
 }
 

@@ -24,15 +24,20 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 use serde_json::Value;
 
-use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
+use crate::decode::step::{
+    LogitsScope, StepModel, StepOutput, StepRequest, TreeOutput, TreeVerify,
+};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
-use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
+use crate::primitives::attention::{
+    repeat_kv, sdpa, sdpa_gqa, sdpa_gqa_causal, AttnFormulation, AttnMask,
+};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, tree_conv_windows,
+    tree_depthwise_conv, DeltaNetCache, RingSpec, TreePlan,
 };
 mod mhc;
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
@@ -187,6 +192,8 @@ fn checkpoint_norm_weight(weight: Tensor, prism: bool) -> Result<Tensor> {
 #[derive(Clone)]
 enum QwenEmbedding {
     Dense(Tensor),
+    /// A fully quantized tier's stored Q8_0 table (SW-7201).
+    Q8(std::sync::Arc<crate::primitives::quant::Q8RowEmbedding>),
     Prism(std::sync::Arc<crate::primitives::PrismPackedWeight>),
 }
 
@@ -194,6 +201,7 @@ impl QwenEmbedding {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(weight) => __model_proof_output!(embed(weight, ids)),
+            Self::Q8(table) => __model_proof_output!(table.forward(ids)),
             Self::Prism(weight) => __model_proof_output!(weight.embedding(ids)),
         }
     }
@@ -252,9 +260,26 @@ pub struct Qwen35Config {
     /// Whether the MTP predictor owns an embedding table rather than sharing the target embedding.
     /// Qwen3.8-27B publishes `false` and carries no `mtp.embed_tokens.weight` tensor.
     pub mtp_use_dedicated_embeddings: bool,
+    /// Stored GGML block tensors whose format differs from the tier's own (a mixed tier, SW-7201:
+    /// a Q4_K body with a Q8_0 `lm_head` / `embed_tokens`), keyed by checkpoint tensor stem
+    /// (`crate::prepare::persisted_ggml_overrides`).
+    pub stored_overrides: std::collections::BTreeMap<String, QuantSpec>,
 }
 
+/// Why a SenseNova-Loop decoder cannot verify a candidate tree: its routed layers and its
+/// depthwise conv's activation-dtype rounding have no tree forward (PR #1485 review).
+pub const SENSENOVA_TREE_UNSUPPORTED: &str = "SenseNova-Loop: tree verification is not supported";
+
 impl Qwen35Config {
+    /// Why a decoder of this config cannot verify a candidate tree, or `None` when it can
+    /// (feature SW-F328): every qwen3_5 hybrid but SenseNova-Loop
+    /// ([`SENSENOVA_TREE_UNSUPPORTED`]).
+    pub fn tree_unsupported(&self) -> Option<&'static str> {
+        self.sensenova_loop
+            .is_some()
+            .then_some(SENSENOVA_TREE_UNSUPPORTED)
+    }
+
     /// Parse from a `config.json` value, descending into `text_config` for the VLM wrapper.
     pub fn from_json(v: &Value) -> Result<Self> {
         let sensenova_loop = SenseNovaLoop::from_config(v).map_err(Error::Config)?;
@@ -325,7 +350,22 @@ impl Qwen35Config {
                 .get("mtp_use_dedicated_embeddings")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            stored_overrides: crate::prepare::persisted_ggml_overrides(v)?,
         })
+    }
+
+    /// The format the stored tensor `key` is read in under the load's `format`: its per-tensor
+    /// entry when the load reads GGML blocks (a mixed tier), else `format` itself.
+    fn tensor_format(
+        &self,
+        key: &str,
+        format: Option<&ProjectionFormat>,
+    ) -> Option<ProjectionFormat> {
+        let stem = key.strip_suffix(".weight").unwrap_or(key);
+        match (format, self.stored_overrides.get(stem)) {
+            (Some(ProjectionFormat::Ggml(_)), Some(spec)) => Some(ProjectionFormat::Ggml(*spec)),
+            (format, _) => format.cloned(),
+        }
     }
 
     /// The interleaved M-RoPE section `[t, h, w]`, defaulting to an even split of `rotary_dim/2` when
@@ -450,6 +490,28 @@ impl GatedDeltaNet {
         cache: &mut DeltaNetCache,
         positions: Option<&DevicePositions>,
     ) -> Result<Tensor> {
+        self.forward_mode(x, cache, positions, None)
+    }
+
+    /// The layer over a verify **tree** (feature SW-F328): each row convolves and recurs along
+    /// its own branch ([`tree_depthwise_conv`], [`DeltaNetCache::advance_tree`]); the cache keeps
+    /// the per-row states aside until the engine keeps one branch.
+    fn forward_tree(
+        &self,
+        x: &Tensor,
+        cache: &mut DeltaNetCache,
+        plan: &TreePlan,
+    ) -> Result<Tensor> {
+        self.forward_mode(x, cache, None, Some(plan))
+    }
+
+    fn forward_mode(
+        &self,
+        x: &Tensor,
+        cache: &mut DeltaNetCache,
+        positions: Option<&DevicePositions>,
+        tree: Option<&TreePlan>,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
         // Four independent in-projections (dtype follows the projection weights).
@@ -464,70 +526,89 @@ impl GatedDeltaNet {
 
         // Short conv over the q‖k‖v channels (only these are convolved), seeded by the cache tail,
         // then a *contiguous* split into q [key_dim] ‖ k [key_dim] ‖ v [value_dim] and reshape to heads.
+        // A tree row convolves its own branch instead of the rows packed before it.
         let conv_state = match cache.live_conv_state(positions)? {
             Some(cs) => cs,
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
-        let conv = if self.sensenova {
-            crate::primitives::gated_delta::sensenova_depthwise_conv
-        } else {
-            causal_depthwise_conv_traced
+        let (conv_out, conv) = match tree {
+            None => {
+                let causal = if self.sensenova {
+                    crate::primitives::gated_delta::sensenova_depthwise_conv
+                } else {
+                    causal_depthwise_conv_traced
+                };
+                let (out, trace) = causal(&mixed, &self.conv_weight, &conv_state)?;
+                (out, Ok(trace))
+            }
+            // The tree conv does not reproduce the SenseNova wrapper's activation-dtype rounding.
+            Some(_) if self.sensenova => {
+                return Err(Error::Unsupported(SENSENOVA_TREE_UNSUPPORTED.into()))
+            }
+            Some(plan) => {
+                let windows = tree_conv_windows(plan, self.conv_kernel);
+                let (out, cat) =
+                    tree_depthwise_conv(&mixed, &self.conv_weight, &conv_state, &windows)?;
+                (out, Err((cat, windows)))
+            }
         };
-        let (conv_out, conv_trace) = conv(&mixed, &self.conv_weight, &conv_state)?;
         // Fused preparation (bit-identical to the chains below) when it serves this layer.
         let q_scale = (self.head_k_dim as f64).powf(-0.5);
-        if let Some(prepared) = self.fused_prep(&conv_out, &a_in, &b_in, q_scale)? {
-            let (q, k, v, g, beta) = prepared;
-            let y = if crate::primitives::in_prefill() {
-                cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
-            } else {
-                cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
-            };
-            let out = rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-            return self.out_proj.forward(&out.reshape((b, s, self.value_dim))?);
-        }
-        let qc = conv_out
-            .narrow(2, 0, self.key_dim)?
-            .contiguous()?
-            .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
-        let kc = conv_out
-            .narrow(2, self.key_dim, self.key_dim)?
-            .contiguous()?
-            .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
-        let vc = conv_out
-            .narrow(2, 2 * self.key_dim, self.value_dim)?
-            .contiguous()?
-            .reshape((b, s, self.num_v_heads, self.head_v_dim))?;
+        let (q, k, v, g, beta) = match self.fused_prep(&conv_out, &a_in, &b_in, q_scale)? {
+            Some(prepared) => prepared,
+            None => {
+                let qc = conv_out
+                    .narrow(2, 0, self.key_dim)?
+                    .contiguous()?
+                    .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
+                let kc = conv_out
+                    .narrow(2, self.key_dim, self.key_dim)?
+                    .contiguous()?
+                    .reshape((b, s, self.num_k_heads, self.head_k_dim))?;
+                let vc = conv_out
+                    .narrow(2, 2 * self.key_dim, self.value_dim)?
+                    .contiguous()?
+                    .reshape((b, s, self.num_v_heads, self.head_v_dim))?;
 
-        // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim — `use_qk_l2norm_in_kernel`.
-        let inv = (self.head_k_dim as f64).powf(-0.5);
-        let prep_dtype = if self.sensenova { DType::F32 } else { dt };
-        let qn = l2norm(&qc.to_dtype(prep_dtype)?, 1e-6)?.affine(inv, 0.0)?;
-        let kn = l2norm(&kc.to_dtype(prep_dtype)?, 1e-6)?;
+                // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim —
+                // `use_qk_l2norm_in_kernel`.
+                let inv = (self.head_k_dim as f64).powf(-0.5);
+                let prep_dtype = if self.sensenova { DType::F32 } else { dt };
+                let qn = l2norm(&qc.to_dtype(prep_dtype)?, 1e-6)?.affine(inv, 0.0)?;
+                let kn = l2norm(&kc.to_dtype(prep_dtype)?, 1e-6)?;
+                let beta = sigmoid(&b_in)?;
+                let g = compute_g(&a_in.to_dtype(prep_dtype)?, &self.a_log, &self.dt_bias)?;
+                let f = DType::F32;
+                (
+                    qn.to_dtype(f)?,
+                    kn.to_dtype(f)?,
+                    vc.to_dtype(f)?,
+                    g.to_dtype(f)?,
+                    beta.to_dtype(f)?,
+                )
+            }
+        };
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel), run by
         // the cache so every token's post-step state (conv tail + SSM state) lands in its
         // checkpoint ring (sc-24131) — except in a prompt prefill, whose positions are never
         // rolled back to: it runs final-state-only and rings just its last state (sc-24446).
         // GQA (q/k from Hk key heads → Hv value heads) is handled inside the recurrence
-        // primitive.
-        let beta = sigmoid(&b_in)?;
-        let g = compute_g(&a_in.to_dtype(prep_dtype)?, &self.a_log, &self.dt_bias)?;
-        let f = DType::F32;
-        let (q, k, v, g, beta) = (
-            qn.to_dtype(f)?,
-            kn.to_dtype(f)?,
-            vc.to_dtype(f)?,
-            g.to_dtype(f)?,
-            beta.to_dtype(f)?,
-        );
-        let y = if crate::primitives::in_prefill() {
-            cache.advance_prefill(&conv_trace, &q, &k, &v, &g, &beta)?
-        } else {
-            cache.advance_at(&conv_trace, &q, &k, &v, &g, &beta, positions)?
+        // primitive. A tree forward recurs along each row's branch and keeps the per-row states
+        // aside (SW-F328).
+        let y = match conv {
+            Err((cat, windows)) => {
+                let plan = tree.expect("a tree conv implies a plan");
+                cache.advance_tree(plan, cat, windows, &q, &k, &v, &g, &beta)?
+            }
+            Ok(trace) if crate::primitives::in_prefill() => {
+                cache.advance_prefill(&trace, &q, &k, &v, &g, &beta)?
+            }
+            Ok(trace) => cache.advance_at(&trace, &q, &k, &v, &g, &beta, positions)?,
         };
 
-        // Gated RMS-norm with z (back in the layer dtype), then the output projection.
+        // Gated RMS-norm with z (back in the layer dtype), then the output projection. The fused
+        // preparation never serves a SenseNova layer, so only the chains above reach its norm.
         let out = if self.sensenova {
             let y = y.to_dtype(dt)?.to_dtype(DType::F32)?;
             let normed = crate::primitives::nn::rms_norm_unscaled(&y, self.eps)?.to_dtype(dt)?;
@@ -540,10 +621,7 @@ impl GatedDeltaNet {
         } else {
             rms_norm_gated(&y.to_dtype(dt)?, &self.norm_weight, &z, self.eps)?
         };
-        let result = self
-            .out_proj
-            .forward(&out.reshape((b, s, self.value_dim))?)?;
-        Ok(result)
+        self.out_proj.forward(&out.reshape((b, s, self.value_dim))?)
     }
 }
 
@@ -613,6 +691,11 @@ enum KvSlot<'a> {
     /// The static cache on the device-positions step (sc-24441): written at the staged device
     /// start, attended by the length-aware decode attention over the whole buffers.
     Indexed(&'a mut StaticKvCache, &'a DevicePositions),
+    /// A tree verify forward (feature SW-F328): the rows appended to the growing slot, attended
+    /// through the ancestor-only additive mask over `[cache ‖ rows]`.
+    GrowingTree(&'a mut AttnKv, &'a Tensor),
+    /// A tree verify forward on the static slot, written at its host offset.
+    StaticTree(&'a mut StaticKvCache, &'a Tensor),
 }
 
 impl Qwen35Attention {
@@ -661,6 +744,16 @@ impl Qwen35Attention {
             )
         };
         let out = match (cache, formulation) {
+            // A tree verify forward (SW-F328): the same un-expanded grouped-query attention as
+            // the causal step, through the ancestor-only mask.
+            (KvSlot::GrowingTree(growing, mask), _) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                sdpa_gqa(&q, &k_all, &v_all, self.scale, AttnMask::Additive(mask))?
+            }
+            (KvSlot::StaticTree(fixed, mask), _) => {
+                let (k_all, v_all) = fixed.update(0, &k, &v)?;
+                sdpa_gqa(&q, &k_all, &v_all, self.scale, AttnMask::Additive(mask))?
+            }
             // A short cached step of a model with device positions (sc-24441): the static
             // path's length-aware attention, over the growing concat — one arithmetic still.
             (
@@ -864,10 +957,51 @@ impl DecoderLayer {
             });
         }
         let r = attention(x)?;
-        // Residual add + post-attention norm as one fused leaf (sc-24137); `h` carries forward.
-        let (h, normed) = rms_norm_residual(x, &r, &self.post_ln, self.eps)?;
+        self.finish(x, &r)
+    }
+
+    /// Residual add + post-attention norm as one fused leaf (sc-24137), then the FFN; `h` carries
+    /// forward.
+    fn finish(&self, x: &Tensor, r: &Tensor) -> Result<Tensor> {
+        let (h, normed) = rms_norm_residual(x, r, &self.post_ln, self.eps)?;
         let m = self.ffn.forward(&normed)?;
         Ok(h.broadcast_add(&m)?)
+    }
+
+    /// The layer over a verify tree (feature SW-F328): a DeltaNet layer recurs along each row's
+    /// branch, an attention layer attends through the ancestor-only `mask`.
+    fn forward_tree(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35LayerCache,
+        plan: &TreePlan,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        if self.routers.is_some() {
+            return Err(Error::Unsupported(SENSENOVA_TREE_UNSUPPORTED.into()));
+        }
+        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let r = match (&self.mixer, cache) {
+            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward_tree(&normed, c, plan)?,
+            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(
+                &normed,
+                cos,
+                sin,
+                KvSlot::GrowingTree(c, mask),
+                AttnFormulation::Gqa,
+            )?,
+            (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => a.forward(
+                &normed,
+                cos,
+                sin,
+                KvSlot::StaticTree(c, mask),
+                AttnFormulation::Gqa,
+            )?,
+            _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
+        };
+        self.finish(x, &r)
     }
 }
 
@@ -983,7 +1117,9 @@ pub const STEP_MAX_CHECKPOINTS: usize = 2;
 /// `Clone` that would have to panic.
 #[derive(Debug)]
 pub enum Qwen35LayerCache {
-    Delta(DeltaNetCache),
+    /// Boxed: the recurrent slot (state, conv tail and checkpoint ring) is several times the
+    /// attention slots' size, and every access already goes through a reference.
+    Delta(Box<DeltaNetCache>),
     Attn(AttnKv),
     StaticAttn(StaticKvCache),
 }
@@ -992,7 +1128,7 @@ impl Qwen35LayerCache {
     /// A deep copy of the slot (see [`StaticKvCache::try_clone`] for the static case).
     pub fn try_clone(&self) -> Result<Self> {
         Ok(match self {
-            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(c.try_clone()?),
+            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(Box::new(c.try_clone()?)),
             Qwen35LayerCache::Attn(a) => Qwen35LayerCache::Attn(a.clone()),
             Qwen35LayerCache::StaticAttn(s) => Qwen35LayerCache::StaticAttn(s.try_clone()?),
         })
@@ -1240,7 +1376,7 @@ impl Qwen35Cache {
             }
         }
         for (at, c) in replacements {
-            self.layers[at] = Qwen35LayerCache::Delta(c);
+            self.layers[at] = Qwen35LayerCache::Delta(Box::new(c));
         }
         self.max_checkpoints = max;
         Ok(())
@@ -1581,6 +1717,24 @@ impl DecodeCache for Qwen35Cache {
         self.offset()
     }
 
+    /// Every layer kind keeps a branch: the attention KV by gather, the DeltaNet layers from the
+    /// tree forward's per-row states (feature SW-F328).
+    fn tree_unsupported(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        Qwen35Cache::commit_tree(self, base, path)
+    }
+
+    fn abort_tree(&mut self, base: i32) -> Result<()> {
+        Qwen35Cache::abort_tree(self, base)
+    }
+
+    fn tree_bytes(&self) -> usize {
+        Qwen35Cache::tree_bytes(self)
+    }
+
     fn rollback_to(&mut self, n: i32) -> Result<()> {
         Qwen35Cache::rollback_to(self, n)
     }
@@ -1702,6 +1856,78 @@ impl DecodeCache for Qwen35Cache {
     }
 }
 
+impl Qwen35Cache {
+    /// Keep the tree branch `path` (rows from the anchor, `path[0] == 0`) of the tree forward that
+    /// started at position `base` (feature SW-F328): every attention layer gathers the branch's
+    /// rows and writes them back at `base` (in place on a static slot), every DeltaNet layer
+    /// commits the branch's per-row conv tails and recurrent states as one-token steps — the
+    /// cache a linear decode of the branch would have left.
+    pub fn commit_tree(&mut self, base: i32, path: &[usize]) -> Result<()> {
+        // The attention layers hold every tree row (a schedule without one has no rows to check).
+        let len = self
+            .layers
+            .iter()
+            .find_map(|l| match l {
+                Qwen35LayerCache::Attn(a) => Some(a.offset()),
+                Qwen35LayerCache::StaticAttn(s) => Some(s.offset()),
+                Qwen35LayerCache::Delta(_) => None,
+            })
+            .unwrap_or(i32::MAX);
+        let rows = crate::primitives::step_kv_cache::tree_branch_rows(base, path, len)?;
+        let gather = |k: &Tensor, v: &Tensor| {
+            crate::primitives::step_kv_cache::gather_tree_branch(k, v, base, &rows)
+        };
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.commit_tree(path)?,
+                Qwen35LayerCache::Attn(a) => {
+                    let Some((k, v)) = a.kv.as_ref() else {
+                        return Err(Error::Msg("Qwen35Cache::commit_tree: no tree rows".into()));
+                    };
+                    let (k, v) = gather(k, v)?;
+                    a.truncate(base)?;
+                    a.update(&k, &v)?;
+                }
+                Qwen35LayerCache::StaticAttn(s) => {
+                    let (k, v) = s.views(0)?;
+                    let (k, v) = gather(&k, &v)?;
+                    s.truncate(base)?;
+                    s.update(0, &k, &v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo a tree forward that started at position `base`, keeping nothing of it (a failed
+    /// forward or decision, a cancel; feature SW-F328): the attention KV truncates back to `base`
+    /// and the DeltaNet layers drop their per-row states, their live state and ring untouched.
+    pub fn abort_tree(&mut self, base: i32) -> Result<()> {
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.abort_tree();
+                    // A commit that failed part-way may have advanced this layer already.
+                    if c.offset() > base {
+                        c.rollback_to(base)?;
+                    }
+                }
+                Qwen35LayerCache::Attn(a) => a.truncate(base.min(a.offset()))?,
+                Qwen35LayerCache::StaticAttn(s) => s.truncate(base.min(s.offset()))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes a pending tree forward's per-row recurrent states and conv inputs hold.
+    pub fn tree_bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |acc, l| match l {
+            Qwen35LayerCache::Delta(c) => acc.saturating_add(c.tree_bytes()),
+            Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_) => acc,
+        })
+    }
+}
+
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 pub struct Qwen35Model {
     /// Physical layer index for each independent cache slot.
@@ -1731,6 +1957,13 @@ pub struct Qwen35Model {
     /// ([`device_positions_default`](crate::primitives::device_positions_default)) — on CUDA, off
     /// on the CPU.
     device_positions: bool,
+    /// Whether this model was built from a Prism checkpoint (any projection, embedding or head
+    /// read from a Prism registry) — MLX's `is_prism`, which a DSpine draft refuses whatever the
+    /// head ended up as (SW-7197).
+    prism: bool,
+    /// The LM head's row access for a block draft's candidate scoring (SW-7197), built on first
+    /// use ([`Qwen35Model::head_rows`]).
+    head_rows: std::sync::OnceLock<crate::primitives::head_rows::HeadRows>,
 }
 
 /// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
@@ -2472,6 +2705,10 @@ impl Qwen35Model {
         match &self.embed_tokens {
             QwenEmbedding::Dense(t) if !head_is_embedding => census.record_tensor(t),
             QwenEmbedding::Dense(_) => {}
+            QwenEmbedding::Q8(table) => {
+                let (rows, cols) = table.dims().unwrap_or((0, 0));
+                census.record_packed((rows * cols) as u64, table.resident_bytes())
+            }
             QwenEmbedding::Prism(p) => {
                 census.record_unmeasured((p.rows() * p.input_width()) as u64)
             }
@@ -2626,7 +2863,7 @@ impl Qwen35Model {
             .copied()
             .map(|i| {
                 if self.cfg.is_linear(i) {
-                    Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
+                    Qwen35LayerCache::Delta(Box::new(Self::delta_slot(&shape, max_checkpoints)))
                 } else {
                     Qwen35LayerCache::Attn(AttnKv::default())
                 }
@@ -2681,7 +2918,7 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(self.visits.len());
         for &i in self.visits.iter() {
             layers.push(if self.cfg.is_linear(i) {
-                Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
+                Qwen35LayerCache::Delta(Box::new(Self::delta_slot(&shape, max_checkpoints)))
             } else {
                 Qwen35LayerCache::StaticAttn(StaticKvCache::new(
                     1,
@@ -2869,15 +3106,24 @@ impl Qwen35Model {
     /// cache and the static path stay one arithmetic); both keep the cache's host-side state
     /// identical.
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
-        self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()))
+        self.hidden_checked(
+            input_ids,
+            cache,
+            offset,
+            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
+        )
     }
 
+    /// [`Self::hidden`] with `check` before and after every decoder block and `tap` handed each
+    /// decoder layer's output with its index (a block draft's target taps, SW-F360).
     fn hidden_checked(
         &self,
         input_ids: &Tensor,
         cache: &mut Qwen35Cache,
         offset: i32,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
+        tap: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
     ) -> Result<Tensor> {
         self.validate_cache(cache)?;
         check(input_ids)?;
@@ -2899,7 +3145,7 @@ impl Qwen35Model {
                 .device_rope
                 .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
             let mut h = h;
-            for (&physical, slot) in self.visits.iter().zip(layers.iter_mut()) {
+            for (i, (&physical, slot)) in self.visits.iter().zip(layers.iter_mut()).enumerate() {
                 let layer = &self.layers[physical];
                 check(&h)?;
                 h = layer.forward_with(
@@ -2912,13 +3158,14 @@ impl Qwen35Model {
                     None,
                 )?;
                 check(&h)?;
+                tap(i, &h)?;
             }
             return Ok(h);
         }
         let (cos, sin) = self
             .rope
             .cos_sin(s as i32, offset, self.dtype, &self.device)?;
-        self.hidden_from_embeds_checked(&h, &cos, &sin, cache, check)
+        self.hidden_from_embeds_checked(&h, &cos, &sin, cache, check, tap)
     }
 
     /// The step start a short cached step attends from with the length-aware decode attention
@@ -2947,7 +3194,14 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
-        self.hidden_from_embeds_checked(embeds, cos, sin, cache, &mut |_| Ok(()))
+        self.hidden_from_embeds_checked(
+            embeds,
+            cos,
+            sin,
+            cache,
+            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
+        )
     }
 
     fn hidden_from_embeds_checked(
@@ -2957,13 +3211,14 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
         check: &mut dyn FnMut(&Tensor) -> Result<()>,
+        tap: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
     ) -> Result<Tensor> {
         self.validate_cache(cache)?;
         check(embeds)?;
         let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
-        for (&physical, slot) in self.visits.iter().zip(cache.layers.iter_mut()) {
+        for (i, (&physical, slot)) in self.visits.iter().zip(cache.layers.iter_mut()).enumerate() {
             let layer = &self.layers[physical];
             check(&h)?;
             h = layer.forward_with(
@@ -2976,6 +3231,7 @@ impl Qwen35Model {
                 decode_start.as_ref(),
             )?;
             check(&h)?;
+            tap(i, &h)?;
         }
         Ok(h)
     }
@@ -3048,7 +3304,7 @@ impl Qwen35Model {
         // a canceled or failed forward on our own cache must reset its state.
         self.validate_cache(cache)?;
         let result = (|| {
-            let h = self.hidden_checked(input_ids, cache, offset, check)?;
+            let h = self.hidden_checked(input_ids, cache, offset, check, &mut |_, _| Ok(()))?;
             check(&h)?;
             let hidden = self.normalize(&h)?;
             check(&hidden)?;
@@ -3100,6 +3356,234 @@ impl Qwen35Model {
     ) -> Result<Tensor> {
         let h = self.hidden(input_ids, cache, offset)?;
         self.project_last(&h)
+    }
+
+    /// A block draft's target forward (SW-F360): the logits of `scope` and the outputs of decoder
+    /// `layers` (0-based, in that order) concatenated `[B, n, layers × hidden]`, at most the last
+    /// `keep` rows of them (the draft's context window — a long prefill never holds every prompt
+    /// row's taps). The cache advances exactly as [`Self::forward`]'s.
+    pub fn forward_tapped(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        layers: &[usize],
+        keep: Option<usize>,
+        scope: LogitsScope,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut taps = Taps::new(layers, keep);
+        let h = self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()), &mut |i, h| {
+            taps.take(i, h)
+        })?;
+        let taps = taps.finish(self.layers.len())?;
+        let logits = match scope {
+            LogitsScope::Last => self.project_last(&h)?,
+            LogitsScope::All => self.project(&h)?,
+        };
+        Ok((logits, taps))
+    }
+
+    /// The tapped decoder over a fused multimodal prompt (SW-7198, E7): the prompt's decoder input
+    /// `embeds` `[1, S, hidden]` — the vision encoder's rows already spliced in — run under their
+    /// explicit three-axis M-RoPE `positions` with the DeepStack features added after the first
+    /// layers, exactly as [`Self::prefill_from_embeds_deepstack_with_hidden`] (the MTP multimodal
+    /// prefill) runs them. Returns the last position's logits `[1, vocab]` and the tapped rows of
+    /// [`Self::forward_tapped`] — image positions included, the last `keep` of them. A layer's tap
+    /// is the residual stream the next layer reads, so a DeepStack layer's tap carries its fused
+    /// features (MLX's `prefill_tapped_from_embeds_with_deepstack`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tapped_from_embeds_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+        layers: &[usize],
+        keep: Option<usize>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.validate_cache(cache)?;
+        // A prompt prefill (sc-24446): the linear layers ring only its final state.
+        let _prefill = crate::primitives::prefill_scope(true);
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            self.dtype,
+            &self.device,
+        )?;
+        let mut h = embeds.to_dtype(self.dtype)?;
+        cache.begin_forward(h.dim(1)?)?;
+        let mut taps = Taps::new(layers, keep);
+        for (i, (&physical, slot)) in self.visits.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = self.layers[physical].forward(&h, &cos, &sin, slot, self.attn_formulation)?;
+            if let Some(feature) = deepstack.get(i) {
+                h = deepstack::add_visual_features(&h, visual_pos_mask, feature)?;
+            }
+            taps.take(i, &h)?;
+        }
+        Ok((self.project_last(&h)?, taps.finish(self.layers.len())?))
+    }
+
+    /// [`StepModel::forward_tree`] with **hidden-state taps** (SW-7198): every row's logits and
+    /// the outputs of decoder `layers` for every tree row, concatenated `[1, rows, layers ×
+    /// hidden]` as [`Self::forward_tapped`] returns them. Row `r`'s taps see only the cached
+    /// prefix and `r`'s ancestors, so the accepted branch's rows are the taps a linear forward of
+    /// that branch returns — the rows a block draft's context reads.
+    pub fn forward_tree_tapped(
+        &self,
+        cache: &mut Qwen35Cache,
+        tree: &TreeVerify<'_>,
+        layers: &[usize],
+    ) -> Result<TreeOutput> {
+        self.tree_forward(cache, tree, Some(layers))
+    }
+
+    /// The tree forward ([`StepModel::forward_tree`]); with `layers`, the hidden rows are those
+    /// layers' taps for every row, else (when asked) the final-normalized rows.
+    fn tree_forward(
+        &self,
+        cache: &mut Qwen35Cache,
+        tree: &TreeVerify<'_>,
+        layers: Option<&[usize]>,
+    ) -> Result<TreeOutput> {
+        self.validate_cache(cache)?;
+        let base = cache.offset();
+        let rows = tree.tree.rows();
+        cache.begin_forward(rows)?;
+        let plan = TreePlan::new(tree.tree);
+        let mask = tree.mask(base as usize, self.dtype, &self.device)?;
+        let mask_bytes = tensor_bytes(&mask);
+        let positions = tree.positions(base + cache.rope_delta());
+        let (cos, sin) = self.rope.cos_sin_at(&positions, self.dtype, &self.device)?;
+        let mut h = self
+            .embed_tokens
+            .forward(&tree.ids(&self.device)?)?
+            .to_dtype(self.dtype)?;
+        let mut taps = layers.map(|layers| Taps::new(layers, None));
+        for (i, (&physical, slot)) in self.visits.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = self.layers[physical].forward_tree(&h, &cos, &sin, slot, &plan, &mask)?;
+            if let Some(taps) = taps.as_mut() {
+                taps.take(i, &h)?;
+            }
+        }
+        let normalized = self.normalize(&h)?;
+        let logits = self.project_normalized(&normalized)?;
+        let hidden = match taps {
+            Some(taps) => Some(taps.finish(self.layers.len())?),
+            None => tree.want_hidden.then_some(normalized),
+        };
+        Ok(TreeOutput {
+            step: StepOutput { logits, hidden },
+            mask_bytes,
+        })
+    }
+
+    /// The decoder layer count.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Whether this model was loaded from a Prism checkpoint — whatever its LM head is (a Prism
+    /// snapshot may keep a dense or tied head). MLX's `is_prism`.
+    pub fn is_prism(&self) -> bool {
+        self.prism
+    }
+
+    /// The LM head over already-normalized rows `[.., hidden]` → `[.., vocab]` (a block draft
+    /// scores its rows with the target's head).
+    pub fn lm_head(&self, normalized: &Tensor) -> Result<Tensor> {
+        self.project_normalized(normalized)
+    }
+
+    /// The LM head's row access (SW-7197): how [`Self::lm_head_scores`] reads only the rows it is
+    /// asked for — built once, on first use (a CUDA head uploads its row-address table then).
+    pub fn head_rows(&self) -> Result<&crate::primitives::head_rows::HeadRows> {
+        if let Some(rows) = self.head_rows.get() {
+            return Ok(rows);
+        }
+        let head = self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })?;
+        let built = crate::primitives::head_rows::HeadRows::new(head)?;
+        Ok(self.head_rows.get_or_init(|| built))
+    }
+
+    /// The LM head's logits of only `ids` `[groups, k]` (`U32`) for normalized `rows`
+    /// `[groups, senders, hidden]`: `[groups, senders, k]` f32 — the head's columns of those ids,
+    /// read without the rest of the vocabulary where the head's format allows
+    /// ([`Self::head_rows`]).
+    pub fn lm_head_scores(&self, rows: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let head = self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })?;
+        self.head_rows()?.scores(head, rows, ids)
+    }
+
+    /// [`StepModel::forward_step`] whose hidden rows, when asked for, are the outputs of `taps`'
+    /// layers (at most its last `keep` rows) instead of the final-normalized rows — the block
+    /// draft's target step (SW-F360). `None` is the ordinary step.
+    pub fn forward_step_tapped(
+        &self,
+        cache: &mut Qwen35Cache,
+        request: StepRequest<'_>,
+        taps: Option<(&[usize], Option<usize>)>,
+    ) -> Result<StepOutput> {
+        if request.is_empty()? {
+            return Err(Error::Msg(
+                "Qwen35Model::forward_step: empty token slice".into(),
+            ));
+        }
+        // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
+        self.validate_cache(cache)?;
+        let offset = cache.offset() + cache.rope_delta();
+        let ids = request.tokens.ids(&self.device)?;
+        if let Some(b) = request.snapshot_at {
+            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
+            // its first `b` tokens; the attention KV is narrowed there afterwards.
+            let n = request.len()?;
+            if !request.prefill || b == 0 || b >= n {
+                return Err(Error::Msg(format!(
+                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
+                     prefill step that continues past it"
+                )));
+            }
+            cache.capture_boundary(cache.offset() + b as i32);
+        }
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
+        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
+            Ok(match (request.scope, request.want_hidden, taps) {
+                (scope, true, Some((layers, keep))) => {
+                    let (logits, taps) =
+                        self.forward_tapped(&ids, cache, offset, layers, keep, scope)?;
+                    (logits, Some(taps))
+                }
+                (LogitsScope::Last, false, _) => (self.decode_logits(&ids, cache, offset)?, None),
+                (LogitsScope::Last, true, None) => {
+                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+                (LogitsScope::All, false, _) => (self.forward(&ids, cache, offset)?, None),
+                (LogitsScope::All, true, None) => {
+                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
+                    (logits, Some(hidden))
+                }
+            })
+        })();
+        let (logits, hidden) = match run {
+            Ok(out) => out,
+            Err(e) => {
+                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
+                // in the linear layers it never reached: drop it, so no later prefill on this
+                // cache captures a stale boundary.
+                cache.clear_boundary_capture();
+                return Err(e);
+            }
+        };
+        Ok(StepOutput { logits, hidden })
     }
 
     /// Embed token ids `[B, S]` → `[B, S, hidden]` in the compute dtype — the splice point where the
@@ -3481,21 +3965,60 @@ impl Qwen35Model {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
                 None => {
                     debug_assert_priced(&key, format);
-                    keyed_projection(w, &key, dtype, format, modelopt, &device)
+                    let format = cfg.tensor_format(&key, format);
+                    keyed_projection(w, &key, dtype, format.as_ref(), modelopt, &device)
                 }
             }
+        };
+        // A matrix the plain tiers keep dense (`in_proj_a` / `in_proj_b`, the LM head, the
+        // embedding) is read as stored GGML blocks when a fully quantized tier (SW-7201) stores it
+        // so, in its per-tensor format.
+        let stored = |key: &str| -> Option<&Tensor> {
+            w.get(key)
+                .filter(|t| prism.is_none() && is_ggml_block_tensor(t))
+        };
+        let load_stored = |key: &str, t: &Tensor| -> Result<Projection> {
+            let stem = key.strip_suffix(".weight").unwrap_or(key);
+            let format = cfg.tensor_format(key, format);
+            Projection::load_stored_blocks(stem, t, None, format.as_ref(), &device)
         };
         let proj_dense = |key: String| -> Result<Projection> {
             match prism.and_then(|registry| registry.get(&key)) {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
-                None => Projection::load(req(key)?, None),
+                None => match stored(&key) {
+                    Some(t) => load_stored(&key, t),
+                    None => Projection::load(req(key)?, None),
+                },
             }
         };
 
         let embed_key = join("embed_tokens.weight");
         let embed_tokens = match prism.and_then(|registry| registry.get(&embed_key)) {
             Some(weight) => QwenEmbedding::Prism(weight.clone()),
-            None => QwenEmbedding::Dense(req(embed_key)?),
+            None => match stored(&embed_key) {
+                Some(t) => {
+                    // The table's stored blocks must be what the config says they are.
+                    let stem = embed_key.strip_suffix(".weight").unwrap_or(&embed_key);
+                    match cfg.tensor_format(&embed_key, format) {
+                        Some(ProjectionFormat::Ggml(q)) if q.bits() == 8 => {}
+                        other => {
+                            return Err(Error::Config(format!(
+                                "embedding `{stem}` is stored as GGML blocks, which a table \
+                                 is read from only as Q8; the config reads it as {}",
+                                match other {
+                                    Some(ProjectionFormat::Ggml(q)) => format!("Q{}", q.bits()),
+                                    Some(ProjectionFormat::Nvfp4(_)) => "NVFP4".into(),
+                                    None => "dense (no quantization block)".into(),
+                                }
+                            )))
+                        }
+                    }
+                    QwenEmbedding::Q8(std::sync::Arc::new(
+                        crate::primitives::quant::Q8RowEmbedding::from_stored(stem, t, &device)?,
+                    ))
+                }
+                None => QwenEmbedding::Dense(req(embed_key.clone())?),
+            },
         };
         let norm = norm_w(join("norm.weight"))?;
         let head_key = if prism.is_some() {
@@ -3506,31 +4029,41 @@ impl Qwen35Model {
         } else {
             "lm_head.weight".to_string()
         };
-        let lm_head = if !with_lm_head {
-            None
-        } else {
-            Some(std::sync::Arc::new(
-                if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
-                    Projection::load_prism(weight.clone())
-                } else if cfg.tie_word_embeddings {
-                    let QwenEmbedding::Dense(weight) = &embed_tokens else {
-                        return Err(Error::Config(
-                            "Prism tied embeddings require an explicit lm_head packed tensor"
-                                .into(),
-                        ));
-                    };
-                    Projection::load_as(weight.clone(), None, dense_format)?
-                } else if cfg.sensenova_loop.is_some() {
-                    keyed_projection(w, &head_key, dtype, format, false, &device)?
-                } else if let Some(head) =
-                    crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
-                {
-                    head
-                } else {
-                    Projection::load_as(req(head_key)?, None, dense_format)?
-                },
-            ))
-        };
+        let lm_head =
+            if !with_lm_head {
+                None
+            } else {
+                Some(std::sync::Arc::new(
+                    if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+                        Projection::load_prism(weight.clone())
+                    } else if cfg.tie_word_embeddings {
+                        match &embed_tokens {
+                            QwenEmbedding::Dense(weight) => {
+                                Projection::load_as(weight.clone(), None, dense_format)?
+                            }
+                            // A tied stored table is the head's own blocks, as stored.
+                            QwenEmbedding::Q8(_) => load_stored(
+                                &embed_key,
+                                stored(&embed_key).expect("a Q8 table is stored"),
+                            )?,
+                            QwenEmbedding::Prism(_) => return Err(Error::Config(
+                                "Prism tied embeddings require an explicit lm_head packed tensor"
+                                    .into(),
+                            )),
+                        }
+                    } else if cfg.sensenova_loop.is_some() {
+                        keyed_projection(w, &head_key, dtype, format, false, &device)?
+                    } else if let Some(t) = stored(&head_key) {
+                        load_stored(&head_key, t)?
+                    } else if let Some(head) =
+                        crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
+                    {
+                        head
+                    } else {
+                        Projection::load_as(req(head_key)?, None, dense_format)?
+                    },
+                ))
+            };
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;
@@ -3645,6 +4178,8 @@ impl Qwen35Model {
             quantized: format.is_some() || prism.is_some(),
             step_kv_cache: KvCacheKind::Static,
             attn_formulation: AttnFormulation::Gqa,
+            prism: prism.is_some(),
+            head_rows: std::sync::OnceLock::new(),
         })
     }
 }
@@ -3782,53 +4317,86 @@ impl StepModel for Qwen35Model {
         cache: &mut Qwen35Cache,
         request: StepRequest<'_>,
     ) -> Result<StepOutput> {
-        if request.is_empty()? {
-            return Err(Error::Msg(
-                "Qwen35Model::forward_step: empty token slice".into(),
-            ));
+        self.forward_step_tapped(cache, request, None)
+    }
+
+    /// Every cache this model builds keeps a tree branch (feature SW-F328); a SenseNova-Loop
+    /// decoder has no tree forward ([`Qwen35Config::tree_unsupported`]).
+    fn tree_unsupported(&self, cache: &Qwen35Cache) -> Option<&'static str> {
+        self.cfg
+            .tree_unsupported()
+            .or_else(|| DecodeCache::tree_unsupported(cache))
+    }
+
+    /// The tree rows on the host path at the cache's position: each row at the RoPE position of
+    /// its depth (plus the cache's RoPE delta), every DeltaNet layer recurring along the row's
+    /// branch from the live state, every attention layer attending through the ancestor-only
+    /// mask. The attention KV holds every row afterwards and the DeltaNet layers the per-row
+    /// states, until the cache commits a branch or aborts.
+    fn forward_tree(&self, cache: &mut Qwen35Cache, tree: &TreeVerify<'_>) -> Result<TreeOutput> {
+        self.tree_forward(cache, tree, None)
+    }
+}
+
+/// A block draft's target taps over one forward (SW-F360): each tapped layer's last `keep` rows
+/// copied straight into their column band of one `[B, n, layers × hidden]` buffer, so the taps are
+/// held once (as the request pricing counts them), never as per-layer copies plus their
+/// concatenation. The buffer is allocated once per forward and filled by device copies, so a
+/// captured verify step stages its taps in its own fixed buffer.
+struct Taps<'a> {
+    layers: &'a [usize],
+    keep: Option<usize>,
+    buffer: Option<Tensor>,
+    filled: Vec<bool>,
+}
+
+impl<'a> Taps<'a> {
+    fn new(layers: &'a [usize], keep: Option<usize>) -> Self {
+        Self {
+            layers,
+            keep,
+            buffer: None,
+            filled: vec![false; layers.len()],
         }
-        // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
-        self.validate_cache(cache)?;
-        let offset = cache.offset() + cache.rope_delta();
-        let ids = request.tokens.ids(&self.device)?;
-        if let Some(b) = request.snapshot_at {
-            // The boundary snapshot (sc-24446): a prefill keeps every linear layer's state after
-            // its first `b` tokens; the attention KV is narrowed there afterwards.
-            let n = request.len()?;
-            if !request.prefill || b == 0 || b >= n {
-                return Err(Error::Msg(format!(
-                    "Qwen35Model::forward_step: a snapshot after {b} of {n} tokens needs a \
-                     prefill step that continues past it"
-                )));
-            }
-            cache.capture_boundary(cache.offset() + b as i32);
+    }
+
+    /// Take decoder layer `i`'s output `h` `[B, S, hidden]` if `i` is tapped.
+    fn take(&mut self, i: usize, h: &Tensor) -> Result<()> {
+        let (b, s, hidden) = h.dims3()?;
+        let n = self.keep.map_or(s, |k| k.min(s));
+        let width = self.layers.len() * hidden;
+        for (j, _) in self.layers.iter().enumerate().filter(|(_, &l)| l == i) {
+            let buffer = match &self.buffer {
+                Some(buffer) => buffer,
+                // SAFETY: every column band is written before the buffer is read (a band left
+                // unwritten is refused by `finish`).
+                None => self
+                    .buffer
+                    .insert(unsafe { Tensor::empty((b, n, width), h.dtype(), h.device())? }),
+            };
+            // `[B, n, hidden]` into columns `j·hidden..` of `[B, n, layers·hidden]`: one strided
+            // device copy per layer (the reshapes are views of the same storage).
+            let rows = h.narrow(1, s - n, n)?.contiguous()?;
+            buffer.reshape((b * n, width))?.slice_set(
+                &rows.reshape((b * n, hidden))?,
+                1,
+                j * hidden,
+            )?;
+            self.filled[j] = true;
         }
-        let _prefill = crate::primitives::prefill_scope(request.prefill);
-        let run = (|| -> Result<(Tensor, Option<Tensor>)> {
-            Ok(match (request.scope, request.want_hidden) {
-                (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
-                (LogitsScope::Last, true) => {
-                    let (logits, hidden) = self.prefill_with_hidden(&ids, cache, offset)?;
-                    (logits, Some(hidden))
-                }
-                (LogitsScope::All, false) => (self.forward(&ids, cache, offset)?, None),
-                (LogitsScope::All, true) => {
-                    let (logits, hidden) = self.forward_with_hidden(&ids, cache, offset)?;
-                    (logits, Some(hidden))
-                }
-            })
-        })();
-        let (logits, hidden) = match run {
-            Ok(out) => out,
-            Err(e) => {
-                // A forward that failed part-way leaves the boundary capture (sc-24446) pending
-                // in the linear layers it never reached: drop it, so no later prefill on this
-                // cache captures a stale boundary.
-                cache.clear_boundary_capture();
-                return Err(e);
-            }
-        };
-        Ok(StepOutput { logits, hidden })
+        Ok(())
+    }
+
+    /// The filled buffer, or a refusal naming a tapped layer outside this `num_layers`-layer
+    /// target.
+    fn finish(self, num_layers: usize) -> Result<Tensor> {
+        match self.buffer {
+            Some(taps) if self.filled.iter().all(|&f| f) => Ok(taps),
+            _ => Err(Error::Config(format!(
+                "tapped layers {:?} outside this {num_layers}-layer target",
+                self.layers
+            ))),
+        }
     }
 }
 
@@ -4160,7 +4728,7 @@ pub(crate) mod tests {
         assert!((dense[0] - source[0]).abs() < 1e-6);
     }
 
-    fn cfg_json() -> Value {
+    pub(crate) fn cfg_json() -> Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.
         json!({
             "text_config": {
@@ -4402,7 +4970,7 @@ pub(crate) mod tests {
         Weights::from_map(m, Device::Cpu)
     }
 
-    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+    pub(crate) fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
         synthetic_weights_with_prefix(cfg, "model.language_model")
     }
 

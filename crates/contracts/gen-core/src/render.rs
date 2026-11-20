@@ -9,11 +9,12 @@ use crate::{
     default_seed, CancelFlag, Conditioning, ControlKind, Error, GenerationRequest, Image, LoadSpec,
     MemoryPhase, MemoryRequestScope, ModelDescriptor, Progress, Result,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
+#[derive(Clone, Copy)]
 pub struct RenderPlanRegistration {
     pub provider_id: &'static str,
     pub compile: fn(&LoadSpec, &GenerationRequest) -> Result<Option<RenderPlan>>,
@@ -21,8 +22,8 @@ pub struct RenderPlanRegistration {
 
 /// A serialized plan exposes the actual execution order, including once-per-request encoding
 /// and the subset repeated for each sequential image. This noise-start pass has no reference stage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-enum Stage {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RenderStage {
     PromptPrep,
     Encode,
     Schedule,
@@ -34,6 +35,8 @@ enum Stage {
     Decode,
     Output,
 }
+
+type Stage = RenderStage;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct PackedImageStream {
@@ -58,9 +61,27 @@ struct ImagePass {
     stages: [Stage; 10],
     sigmas: Vec<f32>,
     phase: ImagePhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    low_res_start: Option<crate::ResolvedLowResStartPlan>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     inert_splits: Vec<usize>,
     capture_sigma: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct LowResStartInput {
+    version: u32,
+    k: usize,
+    scale_bits: Option<u32>,
+    estimate_source: crate::EstimateSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct SourceImageInput {
+    width: u32,
+    height: u32,
+    pixels_sha256: [u8; 32],
+    strength_bits: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -74,6 +95,10 @@ struct ImageInputs {
     frames: u32,
     references: u32,
     conditioning: PackedImageConditioning,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_image: Option<SourceImageInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    low_res_start: Option<LowResStartInput>,
     steps: Option<u32>,
     sampler: Option<String>,
     scheduler: Option<String>,
@@ -131,6 +156,11 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
     type Error = Error;
 
     fn try_from(req: &GenerationRequest) -> Result<Self> {
+        if req.phases.is_some() {
+            return Err(Error::Unsupported(
+                "packed image plan does not support multi-phase denoise (phases)".into(),
+            ));
+        }
         let conditioning = match req.conditioning.as_slice() {
             [] => PackedImageConditioning::None,
             [Conditioning::Reference { image, strength }] => PackedImageConditioning::Reference {
@@ -157,6 +187,30 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                 ))
             }
         };
+        let source_image = match &req.source_image {
+            None => None,
+            Some(image) => {
+                if let Some(s) = req.strength {
+                    if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                        return Err(Error::Unsupported(format!(
+                            "img2img strength {s} must be finite and lie in 0.0..=1.0"
+                        )));
+                    }
+                }
+                Some(SourceImageInput {
+                    width: image.width,
+                    height: image.height,
+                    pixels_sha256: image_digest(image)?,
+                    strength_bits: req.strength.map(f32::to_bits),
+                })
+            }
+        };
+        let low_res_start = req.low_res_start.map(|spec| LowResStartInput {
+            version: spec.version,
+            k: spec.k,
+            scale_bits: spec.scale.map(f32::to_bits),
+            estimate_source: spec.estimate_source,
+        });
         Ok(Self {
             prompt_sha256: Sha256::digest(req.prompt.as_bytes()).into(),
             negative_prompt: req.negative_prompt.clone(),
@@ -167,6 +221,8 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             frames: req.frames.unwrap_or(1),
             references: req.memory_reference_count(),
             conditioning,
+            source_image,
+            low_res_start,
             steps: req.steps,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
@@ -303,6 +359,12 @@ impl RenderPlan {
         req: &GenerationRequest,
         pass: PackedImagePass<'_>,
     ) -> Result<Self> {
+        if req.phases.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{}: multi-phase denoise (phases) is not supported on this route",
+                descriptor.id
+            )));
+        }
         let PackedImagePass {
             pixel_stride,
             token_width,
@@ -339,6 +401,12 @@ impl RenderPlan {
         let tokens = (req.width / pixel_stride)
             .checked_mul(req.height / pixel_stride)
             .ok_or_else(|| Error::Unsupported("packed image token count overflow".into()))?;
+        let low_res_start = match &req.low_res_start {
+            Some(spec) => {
+                Some(spec.resolve_for_descriptor(descriptor, req, executed_steps, pixel_stride)?)
+            }
+            None => None,
+        };
         Ok(Self {
             backend: descriptor.backend.to_owned(),
             provider: descriptor.id.to_owned(),
@@ -376,6 +444,7 @@ impl RenderPlan {
                         token_width,
                     },
                 },
+                low_res_start,
                 inert_splits: Vec::new(),
             },
             pass_index: 0,
@@ -390,6 +459,9 @@ impl RenderPlan {
         req: &GenerationRequest,
     ) -> Result<()> {
         let mut live = ImageInputs::try_from(req)?;
+        if self.pass_index > 0 {
+            live.low_res_start = None;
+        }
         if let PackedImageConditioning::ProducedReference {
             from_pass,
             width,
@@ -397,6 +469,7 @@ impl RenderPlan {
             strength_bits,
         } = &self.inputs.conditioning
         {
+            live.source_image = None;
             // The produced image is bound by shape and strength: its bytes come from the earlier
             // pass and cannot be digested before load.
             match &live.conditioning {
@@ -467,6 +540,26 @@ impl RenderPlan {
         (self.pass.phase.stream.width, self.pass.phase.stream.height)
     }
 
+    /// Packed image spatial pixel stride (e.g., 16 for 2x2-packed /8 VAE latents).
+    pub fn pixel_stride(&self) -> u32 {
+        self.pass.phase.stream.patch_stride
+    }
+
+    /// Packed token channel width (e.g., 64 for FLUX.1).
+    pub fn token_width(&self) -> u32 {
+        self.pass.phase.stream.token_width
+    }
+
+    /// Declared stage execution order for this pass.
+    pub fn stages(&self) -> &[RenderStage; 10] {
+        &self.pass.stages
+    }
+
+    /// Whether this pass carries reference or control conditioning.
+    pub fn has_conditioning(&self) -> bool {
+        !matches!(self.inputs.conditioning, PackedImageConditioning::None)
+    }
+
     /// Replace a compiled single-reference input with a declaration that pass `from_pass`
     /// produces it, keeping the compiled geometry and strength.
     fn into_produced_reference(mut self, from_pass: usize) -> Result<Self> {
@@ -531,6 +624,70 @@ impl RenderPlan {
         self.pass.phase.stream.tokens as usize
     }
 
+    /// Resolved two-phase low-resolution start plan when active on this pass (`pass_index == 0`).
+    pub fn low_res_start(&self) -> Option<&crate::ResolvedLowResStartPlan> {
+        self.pass.low_res_start.as_ref()
+    }
+
+    /// Build the persisted [`crate::LowResStartExecutionReport`] receipt when `low_res_start` is active
+    /// on this pass (`SW-6940`: `FEAT-1`, `PIPE-3`, `PIPE-4`, `PERF-3`, `E3`).
+    pub fn low_res_start_execution_report(
+        &self,
+        dtype: &str,
+        dtype_bytes: u64,
+        slot_configuration: &str,
+    ) -> Result<Option<crate::LowResStartExecutionReport>> {
+        let Some(low_res) = &self.pass.low_res_start else {
+            return Ok(None);
+        };
+        let solver = low_res.estimate_source.validate_sampler_name(
+            &self.provider,
+            Some(self.sampler()),
+            self.inputs.guidance_method.as_deref(),
+        )?;
+        let guidance_mode = if let Some(method) = &self.inputs.guidance_method {
+            method.as_str()
+        } else if self.inputs.true_cfg_bits.is_some() {
+            "true_cfg"
+        } else if self.guidance() > 0.0 {
+            "embedded_guidance"
+        } else {
+            "distilled_unconditional"
+        };
+        let report = low_res.execution_report(
+            self.pass_index,
+            self.denoise_sigmas(),
+            solver,
+            guidance_mode,
+            self.guidance(),
+            slot_configuration,
+            dtype,
+            dtype_bytes,
+            1,
+            self.pixel_stride(),
+            self.token_width(),
+        )?;
+        Ok(Some(report))
+    }
+
+    /// Spatial `(width, height)` for denoise `phase` (`0..denoise_spans().len()`).
+    pub fn phase_output_size(&self, phase: usize) -> (u32, u32) {
+        if let Some(low_res) = &self.pass.low_res_start {
+            let spans = self.denoise_spans();
+            if spans.get(phase).is_some_and(|span| span.end <= low_res.k) {
+                return (low_res.low_width, low_res.low_height);
+            }
+        }
+        (self.pass.phase.stream.width, self.pass.phase.stream.height)
+    }
+
+    /// Packed token count for denoise `phase` (`0..denoise_spans().len()`).
+    pub fn phase_packed_tokens(&self, phase: usize) -> usize {
+        let (w, h) = self.phase_output_size(phase);
+        let stride = self.pixel_stride().max(1);
+        ((w / stride) * (h / stride)) as usize
+    }
+
     pub fn denoise_sigmas(&self) -> &[f32] {
         &self.pass.sigmas[self.pass.phase.first_step..=self.pass.phase.end_step]
     }
@@ -552,11 +709,19 @@ impl RenderPlan {
     }
 
     /// Half-open absolute steps in the executed pass-local schedule. Keeping a single full
-    /// schedule and one request-owned solver state makes inert boundaries numerically invisible.
+    /// schedule and one request-owned solver state makes inert boundaries numerically invisible;
+    /// when `low_res_start` is active, the phase-0 -> phase-1 boundary at `K` is included.
     pub fn denoise_spans(&self) -> Vec<Range<usize>> {
+        let mut splits = self.pass.inert_splits.clone();
+        if let Some(low_res) = &self.pass.low_res_start {
+            if splits.binary_search(&low_res.k).is_err() {
+                splits.push(low_res.k);
+                splits.sort_unstable();
+            }
+        }
         let mut first = self.pass.phase.first_step;
-        let mut spans = Vec::with_capacity(self.pass.inert_splits.len() + 1);
-        for &split in &self.pass.inert_splits {
+        let mut spans = Vec::with_capacity(splits.len() + 1);
+        for split in splits {
             spans.push(first..split);
             first = split;
         }
@@ -612,14 +777,29 @@ impl<'p, 's> RenderRun<'p, 's> {
         }
     }
 
-    fn phase_identity(&self, phase: usize) -> RenderPhaseIdentity {
+    fn target_phase_identity(&self) -> RenderPhaseIdentity {
         let stream = &self.plan.pass.phase.stream;
+        RenderPhaseIdentity {
+            pass: self.plan.pass_index,
+            phase: 0,
+            geometry: crate::MemoryGeometry {
+                width: stream.width,
+                height: stream.height,
+                batch: 1,
+                frames: self.plan.inputs.frames,
+                reference_count: self.plan.inputs.references,
+            },
+        }
+    }
+
+    fn denoise_phase_identity(&self, phase: usize) -> RenderPhaseIdentity {
+        let (width, height) = self.plan.phase_output_size(phase);
         RenderPhaseIdentity {
             pass: self.plan.pass_index,
             phase,
             geometry: crate::MemoryGeometry {
-                width: stream.width,
-                height: stream.height,
+                width,
+                height,
                 batch: 1,
                 frames: self.plan.inputs.frames,
                 reference_count: self.plan.inputs.references,
@@ -636,7 +816,7 @@ impl<'p, 's> RenderRun<'p, 's> {
             return Err(Error::Canceled.into());
         }
         if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
-            let identity = self.phase_identity(0);
+            let identity = self.target_phase_identity();
             scope.enter_render_phase(phase, &identity)?;
         }
         // A failed stage leaves teardown to the scope's owner, preserving the original error.
@@ -662,13 +842,25 @@ impl<'p, 's> RenderRun<'p, 's> {
         self.plan
     }
 
+    /// Invoke a closure with the active [`MemoryRequestScope`] when present (`MEM-5`).
+    pub fn with_active_scope<T>(
+        &self,
+        body: impl FnOnce(&mut dyn MemoryRequestScope) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let mut guard = self.scope.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(scope) => Ok(Some(body(scope)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Enter the next declared denoise span on the owner thread. A failed body leaves scope
     /// teardown to the owner, as in `phase`; the next image cannot start with an active span.
     pub fn begin_denoise_phase(&self, phase: usize) -> Result<()> {
         if self.state.get() != RunState::Rendering
             || self.active_denoise_phase.get().is_some()
             || phase != self.next_denoise_phase.get()
-            || phase > self.plan.pass.inert_splits.len()
+            || phase >= self.plan.denoise_spans().len()
         {
             return Err(Error::Unsupported(
                 "denoise phase is out of order or outside the compiled plan".into(),
@@ -678,7 +870,7 @@ impl<'p, 's> RenderRun<'p, 's> {
             return Err(Error::Canceled);
         }
         if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
-            scope.enter_render_phase(MemoryPhase::Denoise, &self.phase_identity(phase))?;
+            scope.enter_render_phase(MemoryPhase::Denoise, &self.denoise_phase_identity(phase))?;
         }
         self.active_denoise_phase.set(Some(phase));
         Ok(())
@@ -725,7 +917,7 @@ impl<'p, 's> RenderRun<'p, 's> {
             return Err(Error::Canceled);
         }
         if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
-            scope.enter_render_phase(MemoryPhase::Conditioning, &self.phase_identity(0))?;
+            scope.enter_render_phase(MemoryPhase::Conditioning, &self.target_phase_identity())?;
         }
         Ok(())
     }
@@ -784,7 +976,7 @@ impl<'p, 's> RenderRun<'p, 's> {
         mut decode: impl FnMut(u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
     ) -> std::result::Result<Vec<O>, E> {
         self.begin(RunState::Encoded, RunState::Rendering)?;
-        let expected_phases = self.plan.pass.inert_splits.len() + 1;
+        let expected_phases = self.plan.denoise_spans().len();
         let images = self
             .plan
             .count

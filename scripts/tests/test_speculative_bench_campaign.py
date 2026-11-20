@@ -253,11 +253,64 @@ class PlanTests(unittest.TestCase):
         self.assertIn(f'option_env!("{campaign.BUILD_SHA_ENV}")', source)
         self.assertIn(f'pub const BENCH_SCHEMA: &str = "{campaign.SCHEMA}";', source)
 
+    def test_the_optional_matrix_runner_is_accepted_for_both_macs_and_not_planned(self) -> None:
+        good = {"id": "r", "snapshot": "qwen38"}
+        base = campaign.plan_matrix(json.dumps({"rows": [good]}), SNAPSHOTS)
+        for runner in ("rw-starvector", "rw-llm"):
+            with self.subTest(runner):
+                plan = campaign.plan_matrix(json.dumps({"rows": [good], "runner": runner}), SNAPSHOTS)
+                self.assertEqual(plan, base)
+        with self.assertRaisesRegex(campaign.MatrixError, "rw-starvector.*rw-llm"):
+            campaign.plan_matrix(json.dumps({"rows": [good], "runner": "rw-mage"}), SNAPSHOTS)
+
+    def test_the_plan_command_refuses_missing_runner_local_paths_but_not_hub_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "snap").mkdir()
+            (root / "head.safetensors").write_text("x", encoding="utf-8")
+            snap, head = str(root / "snap"), str(root / "head.safetensors")
+            missing = str(root / "absent")
+
+            def check(row, environ=None):
+                return campaign.plan_matrix(
+                    json.dumps({"rows": [{"id": "r", **row}]}),
+                    {**SNAPSHOTS, "DECODE_BENCH_SNAPSHOT_QWEN38": missing, **(environ or {})},
+                    "mlx",
+                    require_local=True,
+                )
+
+            check({"snapshot": snap, "runs": ["epic"], "draft": snap, "mtp_head": head})
+            for row, field in (
+                ({"snapshot": missing}, "snapshot"),
+                ({"snapshot": snap, "runs": ["epic"], "draft": missing}, "draft"),
+                ({"snapshot": snap, "runs": ["epic"], "mtp_head": missing}, "mtp_head"),
+                ({"snapshot": snap, "runs": ["epic"], "draft": head}, "draft"),
+                ({"snapshot": "qwen38"}, "snapshot"),  # the alias resolves to the absent $QWEN path
+            ):
+                with self.subTest(field=field, row=row):
+                    with self.assertRaisesRegex(campaign.MatrixError, rf"row r: {field} .*not an existing"):
+                        check(row)
+            hub = {"snapshot": "hub:org/name@" + "a" * 40}
+            planned = check(hub, {"MODEL_PROOF_HUB_ROOT": str(root / "hub")})
+            self.assertEqual(len(planned["hub_snapshots"]), 1)
+            # Without the check (the other tests, `local`) a missing path still plans.
+            plan({"rows": [{"id": "r", "snapshot": missing}]})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "plan.json"
+            matrix = '{"rows": [{"id": "r", "snapshot": "qwen38"}]}'
+            environ = {**SNAPSHOTS, "DECODE_BENCH_MATRIX": matrix}
+            with mock.patch.dict(os.environ, environ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(campaign.main(["plan", "--output", str(output)]), 1)
+            self.assertFalse(output.exists())
+
     def test_every_malformed_matrix_is_refused_before_anything_runs(self) -> None:
         good = {"id": "r", "snapshot": "qwen38"}
         cases = {
             "not json": "{",
             "extra top key": {"rows": [good], "more": 1},
+            "unknown runner": {"rows": [good], "runner": "rw-mage"},
+            "non-string runner": {"rows": [good], "runner": None},
+            "runner without rows": {"runner": "rw-llm"},
             "no rows": {"rows": []},
             "rows not a list": {"rows": good},
             "too many rows": {"rows": [{**good, "id": f"r{i}"} for i in range(65)]},
@@ -309,6 +362,7 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(campaign.main(["plan", "--output", str(output)]), 1)
             self.assertFalse(output.exists())
             environ["DECODE_BENCH_MATRIX"] = '{"rows": [{"id": "r", "snapshot": "qwen38"}]}'
+            environ["DECODE_BENCH_SNAPSHOT_QWEN38"] = directory
             with mock.patch.dict(os.environ, environ), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     campaign.main(["plan", "--lane", "cuda", "--output", str(output)]), 0
@@ -1883,3 +1937,507 @@ class WithoutMtpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------------------------- SW-7200 paths
+
+REV = "8e450d7faf38238b64580163a7d3dd7e44af759d"
+TARGET_PIN = f"hub:SceneWorks/qwen3.8-27b-abliterated-mlx@{'7' * 40}/q4"
+DSPINE_PIN = f"hub:SceneWorks/qwen3.8-27b-dspine-b16@{REV}"
+TREE = {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": "max"}}}
+LINEAR = {"proposer": "block_draft", "depth": "max", "verify": "linear"}
+REC_MTP = {"proposer": "mtp", "depth": "recommended", "verify": "linear"}
+REC_BLOCK = {"proposer": "block_draft", "depth": "recommended", "verify": "linear"}
+
+
+class HubPinPlanTests(unittest.TestCase):
+    """SW-7200: a row names its target and draft as pinned Hub snapshots; the plan binds them
+    where the stage script puts them and lists each once for it."""
+
+    def setUp(self) -> None:
+        self.hub = Path(self.enterContext(tempfile.TemporaryDirectory())) / "hub"
+
+    def plan(self, rows, **environ):
+        return plan({"rows": rows}, {campaign.HUB_ROOT_ENV: str(self.hub), **environ}, "mlx")
+
+    def test_pins_bind_under_the_hub_root_and_are_listed_once_for_the_stage_script(self) -> None:
+        rows = [
+            {"id": "q4-dspine", "snapshot": TARGET_PIN, "draft": DSPINE_PIN, "runs": ["epic"],
+             "options": ["off", LINEAR, TREE]},
+            {"id": "q4-plain", "snapshot": TARGET_PIN, "runs": ["epic"]},
+        ]
+        planned = self.plan(rows)
+        root = Path(os.path.realpath(self.hub))
+        target = root / "models--SceneWorks--qwen3.8-27b-abliterated-mlx" / "snapshots" / ("7" * 40) / "q4"
+        draft = root / "models--SceneWorks--qwen3.8-27b-dspine-b16" / "snapshots" / REV
+        env = planned["rows"][0]["env"]
+        self.assertEqual(env["SPECULATIVE_BENCH_SNAPSHOT"], str(target))
+        self.assertEqual(env["SPECULATIVE_BENCH_DRAFT"], str(draft))
+        self.assertEqual(json.loads(env["SPECULATIVE_BENCH_OPTIONS"]), ["off", LINEAR, TREE])
+        self.assertEqual(planned["asset_setup"], "hub-snapshots")
+        self.assertEqual(
+            planned["hub_snapshots"],
+            {
+                "DECODE_BENCH_HUB_1": {"repository": "SceneWorks/qwen3.8-27b-abliterated-mlx",
+                                       "revision": "7" * 40, "subfolder": "q4"},
+                "DECODE_BENCH_HUB_2": {"repository": "SceneWorks/qwen3.8-27b-dspine-b16",
+                                       "revision": REV, "subfolder": ""},
+            },
+        )
+        # The stage script binds each pin to exactly the path the plan gave the row.
+        sys.path.insert(0, str(REPOSITORY))
+        try:
+            from scripts.ci import stage_pinned_hub_snapshots as stage
+        finally:
+            sys.path.remove(str(REPOSITORY))
+        with contextlib.redirect_stdout(io.StringIO()):
+            receipt = stage.stage(
+                planned["hub_snapshots"],
+                root,
+                manifest=lambda repository, revision: (
+                    None, None, {"config.json": {"size": 1}, "q4/config.json": {"size": 1}}
+                ),
+                fetch=lambda url, path: (None, None, None, False),
+                verify=lambda repository, revision, base, files: {
+                    "status": "ok", "manifest_sha256": "0", "files": []
+                },
+                free_bytes=lambda path: 1 << 50,
+            )
+        self.assertEqual(receipt["DECODE_BENCH_HUB_1"]["path"], str(target))
+        self.assertEqual(receipt["DECODE_BENCH_HUB_2"]["path"], str(draft))
+        # No pin, no staging keys.
+        self.assertNotIn("hub_snapshots", plan({"rows": [{"id": "r", "snapshot": "qwen38"}]}))
+
+    def test_a_malformed_pin_or_a_missing_hub_root_is_refused(self) -> None:
+        for bad in (
+            "hub:SceneWorks/qwen@main/q4",
+            f"hub:SceneWorks@{REV}",
+            f"hub:SceneWorks/qwen@{REV}/../q4",
+            f"hub:SceneWorks/qwen@{REV}/q4/",
+            f"hub:../qwen@{REV}",
+        ):
+            with self.subTest(pin=bad), self.assertRaises(campaign.MatrixError):
+                self.plan([{"id": "r", "snapshot": bad, "runs": ["epic"]}])
+        with self.assertRaisesRegex(campaign.MatrixError, campaign.HUB_ROOT_ENV):
+            plan({"rows": [{"id": "r", "snapshot": TARGET_PIN}]}, {}, "mlx")
+        with self.assertRaisesRegex(campaign.MatrixError, "draft"):
+            self.plan([{"id": "r", "snapshot": TARGET_PIN, "draft": "hub:x", "runs": ["epic"]}])
+
+    def test_path_options_are_checked_before_anything_builds(self) -> None:
+        good = [
+            "off", "auto", {"proposer": "mtp", "depth": 3}, {"mode": "auto"}, LINEAR, TREE,
+            {"proposer": "prompt_lookup", "depth": 4, "verify": {"tree": {"max_rows": 8}}},
+            REC_MTP, REC_BLOCK,
+        ]
+        self.plan([{"id": "r", "snapshot": TARGET_PIN, "runs": ["epic"], "options": good}])
+        for bad in (
+            "sometimes",
+            7,
+            {"proposer": "medusa", "depth": 3},
+            {"proposer": "block_draft", "depth": 0},
+            {"proposer": "block_draft", "depth": "most"},
+            {"proposer": "block_draft", "depth": True},
+            {"proposer": "block_draft", "depth": "max", "format": "dspine"},
+            {"proposer": "block_draft", "depth": "max", "verify": "tree"},
+            {"proposer": "block_draft", "depth": "max", "verify": {"tree": {}}},
+            {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 0}}},
+            {"proposer": "block_draft", "depth": "max",
+             "verify": {"tree": {"max_rows": "recommended"}}},
+            {"proposer": "block_draft", "depth": "max", "verify": {"tree": {"max_rows": 4}, "x": 1}},
+        ):
+            with self.subTest(option=bad), self.assertRaises(campaign.MatrixError):
+                self.plan([{"id": "r", "snapshot": TARGET_PIN, "runs": ["epic"], "options": [bad]}])
+
+
+class EpicOnlyRunTests(unittest.TestCase):
+    """SW-7200: a plan whose rows run only the epic needs no pre-epic checkout."""
+
+    setUp = RunTests.setUp
+
+    def run_epic_only(self, rows, *, pre_epic: bool):
+        output = self.directory / "out"
+        write_snapshot(self.snapshot)
+        plan_path = self.directory / "plan.json"
+        plan_path.write_text(
+            json.dumps(plan({"rows": rows}, {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})),
+            encoding="utf-8",
+        )
+        args = ["run", "--plan", str(plan_path), "--epic-root", str(self.directory / "epic"),
+                "--epic-sha", EPIC_SHA, "--output", str(output), "--cargo", sys.executable]
+        if pre_epic:
+            args += ["--pre-epic-root", str(self.directory / "pre-epic")]
+        environ = {"FAKE_RECORD": str(self.record)}
+        with mock.patch.dict(os.environ, environ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(io.StringIO()):
+            return campaign.main(args)
+
+    def test_an_epic_only_plan_runs_without_the_pre_epic_checkout(self) -> None:
+        code = self.run_epic_only(
+            [{"id": "q", "snapshot": "qwen38", "runs": ["epic"], "process_repeats": 1}],
+            pre_epic=False,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.checked, [("epic", EPIC_SHA)])
+        code = self.run_epic_only(
+            [{"id": "q", "snapshot": "qwen38", "process_repeats": 1}], pre_epic=False
+        )
+        self.assertEqual(code, 1)
+
+
+def path_row(prompt, prompt_class, requested, *, tok_s, wall, proposer="none", draft=None,
+             verify="linear", hits=(0, 0), accepted=None, draft_ms=None, sync=True, tree=None,
+             fallbacks=()):
+    samples = [
+        {"ttft_ms": 100.0, "decode_tok_s": tok_s, "decode_ms": 256 / tok_s * 1e3,
+         "wall_ms": wall, "prefix_hit_tokens": hit, "draft_ms": draft_ms,
+         "memory_before_bytes": 20 << 30, "peak_memory_bytes": (21 << 30) + (1 << 20)}
+        for hit in hits
+    ]
+    return {
+        "prompt_id": prompt, "class": prompt_class, "requested": requested,
+        "speculative": requested, "verify": verify, "proposer": proposer,
+        "prompt_tokens": 100, "generated_tokens": 256,
+        "verify_steps": 256 if accepted is None else round(256 / (1 + accepted)),
+        "mean_accepted_length": accepted, "samples": samples, "draft": draft,
+        "draft_time": None if draft_ms is None else {
+            "calls": 50, "host_synchronized_calls": 50 if sync else 0,
+            "total_ms": draft_ms, "per_call_ms": draft_ms / 50},
+        "tree_verify": tree, "fallbacks": list(fallbacks),
+    }
+
+
+def paths_document(rows, *, draft_source="/hub/draft", refusal=None, model="qwen3.8-27b"):
+    return {
+        "schema": campaign.SCHEMA, "model": model, "backend": "mlx", "max_new_tokens": 256,
+        "sampling": {"temperature": 0.0}, "thinking": {"setting": "off"}, "warmup": True,
+        "repeats": 2, "options": [r["requested"] for r in rows],
+        "load": {"prefix_cache_bytes": 0,
+                 "draft": {"source": draft_source, "refusal": refusal}},
+        "provenance": {"git": {"sha": EPIC_SHA}}, "rows": rows,
+        "memory": {"source": "mlx_allocator", "peak": "backend_high_water"},
+    }
+
+
+class PathsReportTests(unittest.TestCase):
+    """SW-7200: the paired paths report reads every path against its own process's `off` row."""
+
+    def setUp(self) -> None:
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def campaign(self):
+        dspine = {"source": "/hub/dspine", "format": "dspine", "precision": "bf16"}
+        dflash = {"source": "/hub/dflash2", "format": "dflash2", "precision": "bf16"}
+        tree = {"accepted_per_tree_pass": 3.5, "rows_per_pass": 9.0}
+
+        def a(run, k):
+            return paths_document([
+                row
+                for prompt, cls, fast in (("code_edit", "predictable", 3.0), ("chat", "open_ended", 1.5))
+                for row in (
+                    path_row(prompt, cls, "off", tok_s=10.0, wall=26000.0),
+                    path_row(prompt, cls, REC_MTP,
+                             tok_s=15.0, wall=18000.0, proposer="mtp", accepted=1.0, draft_ms=500.0,
+                             sync=False),
+                    # The max-depth MTP row is reported, never used for `auto`'s inputs.
+                    path_row(prompt, cls, {"proposer": "mtp", "depth": "max", "verify": "linear"},
+                             tok_s=40.0, wall=7000.0, proposer="mtp", accepted=2.0),
+                    path_row(prompt, cls, LINEAR, tok_s=10.0 * fast, wall=26000.0 / fast,
+                             proposer="block_draft", draft=dspine, accepted=fast - 1, draft_ms=900.0),
+                    path_row(prompt, cls, REC_BLOCK, tok_s=10.0 * fast, wall=26000.0 / fast,
+                             proposer="block_draft", draft=dspine, accepted=fast - 1, draft_ms=900.0),
+                    path_row(prompt, cls, TREE, tok_s=10.0 * fast * 1.1, wall=26000.0 / fast / 1.1,
+                             proposer="block_draft", draft=dspine, verify={"tree": {"max_rows": 16}},
+                             accepted=fast - 0.9, draft_ms=950.0, tree=tree),
+                )
+            ])
+
+        def b(run, k):
+            # A slower process: its own `off` is 8 tok/s, so its ratios stay paired.
+            return paths_document([
+                row
+                for prompt, cls in (("code_edit", "predictable"), ("chat", "open_ended"))
+                for row in (
+                    path_row(prompt, cls, "off", tok_s=8.0, wall=32000.0),
+                    path_row(prompt, cls, LINEAR, tok_s=8.0 * 1.2, wall=32000.0 / 1.2,
+                             proposer="block_draft", draft=dflash, accepted=0.4, draft_ms=600.0),
+                    path_row(prompt, cls, REC_BLOCK, tok_s=8.0 * 1.2, wall=32000.0 / 1.2,
+                             proposer="block_draft", draft=dflash, accepted=0.4, draft_ms=600.0),
+                )
+            ], draft_source="/hub/dflash2")
+
+        def probe(run, k):
+            return paths_document(
+                [path_row("code_edit", "predictable",
+                          {"proposer": "draft_model", "depth": 4}, tok_s=10.0, wall=2000.0,
+                          fallbacks=["speculative: `draft_model` is not available"])],
+                refusal="draft model: its tokenizer vocabulary is not the target's",
+            )
+
+        def reused(run, k):
+            return paths_document([
+                path_row("chat", "open_ended", "off", tok_s=10.0, wall=6000.0, hits=(0, 90)),
+                path_row("chat", "open_ended", LINEAR, tok_s=20.0, wall=3000.0, hits=(90, 90),
+                         proposer="block_draft", draft=dspine, accepted=1.0, draft_ms=100.0),
+            ])
+
+        rows = [
+            {"id": "q4-dspine", "runs": ["epic"], "process_repeats": 1, "document": a,
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+            {"id": "q4-dflash2", "runs": ["epic"], "process_repeats": 1, "document": b,
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+            {"id": "q4-draft-model", "runs": ["epic"], "process_repeats": 1, "document": probe,
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+            {"id": "q4-reused", "runs": ["epic"], "process_repeats": 1, "document": reused,
+             "env": {"SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "default"},
+             "snapshot": "/hub/models--SceneWorks--qwen3.8-27b-abliterated-mlx/snapshots/r/q4"},
+        ]
+        return write_campaign(self.directory / "mlx", rows, lane="mlx")
+
+    def summary(self, report, path, context="cold", cache="0"):
+        (match,) = [
+            s for s in report["summary"]
+            if s["path"] == path and s["context"] == context
+            and s["group"]["prefix_cache_bytes"] == cache
+        ]
+        return match
+
+    def test_every_path_is_measured_against_its_own_processs_off_row(self) -> None:
+        report = campaign.paths_report([self.campaign()])
+        self.assertEqual(report["refusals"], [])
+        self.assertEqual(report["schema"], campaign.PATHS_SCHEMA)
+        dspine = self.summary(report, "block_draft:dspine:linear")
+        self.assertEqual(dspine["group"]["tier"], "q4")
+        self.assertAlmostEqual(dspine["speedup_vs_off"]["decode_tok_s"]["predictable"], 3.0)
+        self.assertAlmostEqual(dspine["speedup_vs_off"]["decode_tok_s"]["open_ended"], 1.5)
+        self.assertAlmostEqual(dspine["speedup_vs_off"]["wall_ms"]["all"], math_sqrt(4.5))
+        self.assertAlmostEqual(dspine["draft_ms_per_pass"], 18.0)
+        self.assertTrue(dspine["draft_time_host_synchronized"])
+        self.assertEqual(dspine["memory_added_bytes"], (1 << 30) + (1 << 20))
+        tree = self.summary(report, "block_draft:dspine:tree")
+        self.assertEqual(tree["accepted_per_tree_pass"], 3.5)
+        # DFlash2's process ran its own `off` at 8 tok/s: its ratio is 1.2, not 9.6 / 10.
+        dflash = self.summary(report, "block_draft:dflash2:linear")
+        self.assertAlmostEqual(dflash["speedup_vs_off"]["decode_tok_s"]["all"], 1.2)
+        # The MTP draft time was enqueue-only (drafts left on the device).
+        self.assertFalse(self.summary(report, "mtp@recommended")["draft_time_host_synchronized"])
+        self.assertAlmostEqual(self.summary(report, "mtp")["speedup_vs_off"]["decode_tok_s"]["all"], 4.0)
+        # The draft-model path ran nothing, and says why.
+        probe = self.summary(report, "draft_model")
+        self.assertEqual(probe["ran"], ["none"])
+        self.assertIn("tokenizer vocabulary", probe["draft_refusal"])
+        # Reused-context samples are their own context.
+        reused = self.summary(report, "block_draft:dspine:linear", "reused", "default")
+        self.assertEqual(reused["prompts"], 1)
+        self.assertAlmostEqual(reused["speedup_vs_off"]["decode_tok_s"]["all"], 2.0)
+
+    def test_auto_inputs_compare_each_block_draft_with_mtp_through_off(self) -> None:
+        report = campaign.paths_report([self.campaign()])
+        inputs = {(i["path"], i["context"]): i for i in report["auto_inputs"]}
+        # Only what `auto` would run: each block draft at its recommended depth, linear.
+        self.assertEqual(
+            sorted(inputs),
+            [("block_draft:dflash2:linear@recommended", "cold"),
+             ("block_draft:dspine:linear@recommended", "cold")],
+        )
+        dspine = inputs[("block_draft:dspine:linear@recommended", "cold")]["decode_tok_s"]
+        # MTP at its recommended depth is 1.5x off in process A (the 4x max-depth row is not the
+        # comparison); DSpine 3.0x / 1.5x: 2.0x / 1.0x over it.
+        self.assertAlmostEqual(dspine["vs_mtp"], math_sqrt(2.0))
+        self.assertAlmostEqual(dspine["vs_mtp_min"], 1.0)
+        self.assertFalse(dspine["beats_mtp_on_every_prompt"])
+        # DFlash2's process has no MTP row; its ratio meets MTP's through each process's `off`.
+        dflash = inputs[("block_draft:dflash2:linear@recommended", "cold")]["decode_tok_s"]
+        self.assertAlmostEqual(dflash["vs_mtp"], 0.8)
+        self.assertFalse(dflash["beats_mtp_on_every_prompt"])
+
+    def test_the_paths_command_writes_both_reports_and_fails_on_a_refusal(self) -> None:
+        directory = self.campaign()
+        out = self.directory / "report"
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.main(["paths", "--campaign", str(directory), "--json",
+                                  str(out.with_suffix(".json")), "--markdown",
+                                  str(out.with_suffix(".md"))])
+        self.assertEqual(code, 0)
+        markdown = out.with_suffix(".md").read_text(encoding="utf-8")
+        self.assertIn("| block_draft:dspine:tree | block_draft |", markdown)
+        self.assertIn("## Block-draft inputs for `auto`", markdown)
+        self.assertIn("enqueue-only", markdown)
+        summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        summary["rows"][0]["processes"][0]["status"] = "failed"
+        (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.main(["paths", "--campaign", str(directory), "--json",
+                                  str(self.directory / "again.json"), "--markdown",
+                                  str(self.directory / "again.md")])
+        self.assertEqual(code, 1)
+
+
+def math_sqrt(value: float) -> float:
+    import math
+
+    return math.sqrt(value)
+
+
+class TimeBudgetTests(unittest.TestCase):
+    """SW-7200: on a loaned host the runner starts no process once its budget has passed, and
+    never interrupts the one running."""
+
+    setUp = RunTests.setUp
+
+    def test_no_process_starts_after_the_budget_and_the_row_stays_incomplete(self) -> None:
+        output = self.directory / "out"
+        output.mkdir()
+        rows = [{"id": f"q{i}", "snapshot": "qwen38", "runs": ["epic"], "process_repeats": 2}
+                for i in (1, 2)]
+        planned = plan({"rows": rows}, {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})
+        ticks = iter([0.0, 10.0, 20.0, 400.0, 500.0])
+        with mock.patch.dict(os.environ, {"FAKE_RECORD": str(self.record)}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.run_plan(
+                planned, roots={"epic": self.directory / "epic"}, target_dirs={},
+                epic_sha=EPIC_SHA, output=output, cargo=sys.executable, guard=[],
+                sha_override=False, stop_starting_after=300.0, clock=lambda: next(ticks),
+            )
+        self.assertEqual(code, 1)
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertIn("time budget", summary["stopped"])
+        self.assertFalse(summary["complete"])
+        first, second = summary["rows"]
+        self.assertTrue(first["complete"])
+        self.assertEqual(len(first["processes"]), 2)
+        self.assertFalse(second["complete"])
+        self.assertEqual(second["processes"], [])
+        runs = [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(sum(not r["build"] for r in runs), 2)
+
+
+class GuardTests(unittest.TestCase):
+    """SW-7200: every benchmark process runs under the external memory guard at its row's cap,
+    and the guard's closing summary is kept beside the process."""
+
+    setUp = RunTests.setUp
+
+    def test_the_rows_cap_reaches_the_guard_and_its_summary_is_recorded(self) -> None:
+        guard = self.directory / "summary_guard.py"
+        guard.write_text(textwrap.dedent("""
+            import subprocess, sys
+            cap = sys.argv[1]
+            code = subprocess.call(sys.argv[4:])
+            print(f"GUARD_SUMMARY exit={code} root_lifetime_max_bytes=123"
+                  f" max_process_lifetime_max_bytes=456 cap_gib={cap}", flush=True)
+            sys.exit(code)
+        """), encoding="utf-8")
+        output = self.directory / "out"
+        output.mkdir()
+        rows = [{"id": "q4", "snapshot": "qwen38", "runs": ["epic"], "process_repeats": 1,
+                 "memory_cap_gib": 40}]
+        planned = plan({"rows": rows}, {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})
+        self.assertEqual(planned["rows"][0]["memory_cap_gib"], 40)
+        with mock.patch.dict(os.environ, {"FAKE_RECORD": str(self.record)}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.run_plan(
+                planned, roots={"epic": self.directory / "epic"}, target_dirs={},
+                epic_sha=EPIC_SHA, output=output, cargo=sys.executable,
+                guard=[sys.executable, str(guard), "{cap_gib}", "60", "--"], sha_override=False,
+            )
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(
+            summary["rows"][0]["processes"][0]["guard"],
+            {"exit": 0, "root_lifetime_max_bytes": 123, "max_process_lifetime_max_bytes": 456,
+             "cap_gib": 40},
+        )
+        # A guard that names a cap refuses a row without one.
+        del planned["rows"][0]["memory_cap_gib"]
+        out2 = self.directory / "out2"
+        out2.mkdir()
+        with mock.patch.dict(os.environ, {"FAKE_RECORD": str(self.record)}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = campaign.run_plan(
+                planned, roots={"epic": self.directory / "epic"}, target_dirs={},
+                epic_sha=EPIC_SHA, output=out2, cargo=sys.executable,
+                guard=[sys.executable, str(guard), "{cap_gib}", "60", "--"], sha_override=False,
+            )
+        self.assertEqual(code, 1)
+        process = json.loads((out2 / "summary.json").read_text(encoding="utf-8"))["rows"][0]["processes"][0]
+        self.assertIn("memory_cap_gib", process["error"])
+        for bad in (0, -1, True, "40", 2048):
+            with self.subTest(cap=bad), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [{**rows[0], "memory_cap_gib": bad}]},
+                     {"DECODE_BENCH_SNAPSHOT_QWEN38": str(self.snapshot)})
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the guard reads macOS process ledgers")
+class MlxTreeGuardTests(unittest.TestCase):
+    """SW-7200: the MLX campaign's external guard refuses without headroom and otherwise runs the
+    command, passing its output through and closing with a parseable summary."""
+
+    GUARD = REPOSITORY / "scripts" / "ci" / "mlx_tree_guard.py"
+
+    def run_guard(self, *args):
+        return subprocess.run([sys.executable, str(self.GUARD), *args], capture_output=True,
+                              text=True, encoding="utf-8", check=False)
+
+    def test_no_headroom_refuses_before_starting(self) -> None:
+        result = self.run_guard("100000", "60", "--", sys.executable, "-c", "print('ran')")
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("ran", result.stdout)
+        self.assertIn("not started", result.stdout)
+
+    def test_a_command_runs_and_the_summary_parses(self) -> None:
+        result = self.run_guard("1", "60", "--", sys.executable, "-c", "print('ran')")
+        if result.returncode == 3:
+            self.skipTest("this host has under 11 GiB free")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ran", result.stdout)
+        log = Path(self.enterContext(tempfile.TemporaryDirectory())) / "p.log"
+        log.write_text(result.stdout, encoding="utf-8")
+        summary = campaign.guard_summary(log)
+        self.assertEqual((summary["exit"], summary["cap_gib"]), (0, 1))
+        self.assertGreater(summary["max_process_lifetime_max_bytes"], 0)
+
+
+class CudaCardSelectionTests(unittest.TestCase):
+    """SW-7200: the CUDA half binds its card by UUID and refuses when it is absent or ambiguous."""
+
+    def setUp(self) -> None:
+        path = REPOSITORY / "scripts" / "ci" / "decode_bench_select_cuda_card.py"
+        spec = importlib.util.spec_from_file_location("decode_bench_select_cuda_card", path)
+        self.select = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.select)
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    UUID = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+    INVENTORY = (
+        "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX PRO 6000, 97887, 1, 97886\n"
+        f"1, {UUID}, 00000000:41:00.0, RTX PRO 6000, 97887, 3, 97884\n"
+    )
+
+    def test_the_card_is_bound_by_uuid_and_recorded(self) -> None:
+        env_file = self.directory / "github_env"
+        with mock.patch.object(self.select, "query", return_value=self.INVENTORY), \
+                mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.select.main([self.UUID, str(self.directory)]), 0)
+        self.assertEqual(env_file.read_text(encoding="utf-8"), f"CUDA_VISIBLE_DEVICES={self.UUID}\n")
+        card = json.loads((self.directory / "cuda-selected-device.json").read_text(encoding="utf-8"))
+        self.assertEqual((card["index"], card["pci.bus_id"]), ("1", "00000000:41:00.0"))
+        inventory = (self.directory / "cuda-device-inventory.csv").read_text(encoding="utf-8")
+        self.assertTrue(inventory.startswith("index, uuid, pci.bus_id"))
+
+    def test_an_absent_duplicated_or_empty_inventory_is_refused(self) -> None:
+        other = "GPU-00000000-0000-0000-0000-000000000000"
+        for inventory in ("", self.INVENTORY.replace(self.UUID, other),
+                          self.INVENTORY + self.INVENTORY.splitlines()[1] + "\n", "1, broken\n"):
+            env_file = self.directory / "github_env"
+            env_file.unlink(missing_ok=True)
+            with self.subTest(inventory=inventory), \
+                    mock.patch.object(self.select, "query", return_value=inventory), \
+                    mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.select.main([self.UUID, str(self.directory)]), 1)
+                self.assertFalse(env_file.exists())
+        with mock.patch.dict(os.environ, {"GITHUB_ENV": str(self.directory / "e")}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.select.main(["GPU-1", str(self.directory)]), 1)

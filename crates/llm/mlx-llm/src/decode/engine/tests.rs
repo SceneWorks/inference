@@ -37,6 +37,23 @@ pub(crate) fn causal_model(vocab: i32, layers: usize) -> CausalLm {
 /// and `layers` layers over a `vocab`-entry vocabulary, drawn from one fixed seed in
 /// [`causal_model`]'s order.
 fn synthetic_llama(hidden: i32, layers: usize, vocab: i32) -> CausalLm {
+    synthetic_llama_with(hidden, layers, vocab, None)
+}
+
+/// A Qwen3-VL-style llama-family decoder over `vocab` ids (SW-7209): width 32 (head dim 8),
+/// three layers, interleaved M-RoPE sections `[2, 1, 1]` — the Causal multimodal decoder's
+/// position geometry at toy size.
+pub(crate) fn tiny_mrope_llama(vocab: i32) -> CausalLm {
+    synthetic_llama_with(32, 3, vocab, Some([2, 1, 1]))
+}
+
+/// [`synthetic_llama`] with interleaved M-RoPE sections `mrope_section` (`None`: 1-D RoPE).
+fn synthetic_llama_with(
+    hidden: i32,
+    layers: usize,
+    vocab: i32,
+    mrope_section: Option<[i32; 3]>,
+) -> CausalLm {
     let cfg = ModelConfig {
         hidden_size: hidden,
         intermediate_size: 2 * hidden,
@@ -59,7 +76,7 @@ fn synthetic_llama(hidden: i32, layers: usize, vocab: i32) -> CausalLm {
         partial_rotary_factor: 1.0,
         mla: None,
         yarn: None,
-        mrope_section: None,
+        mrope_section,
         gemma4: None,
         activation_role: Default::default(),
     };
@@ -1252,6 +1269,8 @@ fn a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded() {
         previous_hidden: None,
         position: PROMPT.len() as i32,
         max_drafts: 4,
+        budget_drafts: 4,
+        max_rows: 4,
     };
     let proposal = proposer.propose(&target, &ctx, &mut draft_sampler).unwrap();
     assert_eq!(proposal.drafts.len(), 4);
@@ -3849,6 +3868,8 @@ fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
             previous_hidden: Some(&previous),
             position,
             max_drafts: 1,
+            budget_drafts: 1,
+            max_rows: 1,
         };
         let mut sampler = DraftSampler {
             config: &config,
@@ -3887,6 +3908,8 @@ fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
             previous_hidden: Some(&previous),
             position: start + tokens.len() as i32,
             max_drafts: 3,
+            budget_drafts: 3,
+            max_rows: 3,
         };
         let mut draw = MlxSampler::from_config(&config);
         let mut sampler = DraftSampler {

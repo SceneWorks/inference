@@ -10,7 +10,7 @@ use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use core_llm::speculative::ngram_propose;
-use core_llm::ProposerKind;
+use core_llm::{ngram_propose_tree, DraftTree, ProposerKind};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::engine::{
@@ -59,6 +59,22 @@ impl<T: SpeculativeTarget + ?Sized> Proposer<T> for NgramProposer {
             drafts: ngram_propose(ctx.history, self.max_ngram, ctx.max_drafts),
             dists: Vec::new(),
         })
+    }
+
+    /// Every earlier occurrence of the trailing n-gram as one candidate tree (feature SW-F328,
+    /// [`ngram_propose_tree`]); the first branch is [`propose`](Proposer::propose)'s.
+    fn propose_tree(
+        &mut self,
+        _: &T,
+        ctx: &ProposeContext<'_>,
+        _: &mut DraftSampler<'_, '_>,
+    ) -> Result<DraftTree> {
+        Ok(ngram_propose_tree(
+            ctx.history,
+            self.max_ngram,
+            ctx.max_drafts,
+            ctx.max_rows,
+        ))
     }
 
     fn commit(&mut self, _: &T, _: i32, _: &[i32], _: Option<&Array>, _: i32) -> Result<()> {

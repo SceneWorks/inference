@@ -26,6 +26,11 @@
 //! looks like an attention/FFN projection but is not recognized is a **loud [`Error::Unsupported`]**,
 //! never a silent dense fallback. Qwen3.5/3.6's hybrid `linear_attn.*` projections and stacked MoE
 //! experts are covered explicitly so prepared and load-time quantization have the same surface.
+//!
+//! A **fully quantized** Qwen3.5 tier ([`write_snapshot_tier`] / [`write_hf_snapshot_tier`],
+//! SW-7201) additionally stores the LM head, the embedding and every `in_proj_a` / `in_proj_b` at
+//! 8 bits ([`REMAINING_MATRIX_SPEC`]); under a 4-bit body the `quantization` block carries one
+//! mlx-lm-keyed per-module entry for each, which the Qwen3.5 loader reads per tensor.
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
@@ -195,6 +200,7 @@ fn write_streaming_snapshot_with_sidecars(
             num_tensors: staged.len(),
             quantized: quantize,
             quantized_projections,
+            quantized_remaining: 0,
             out_dir: out_dir.to_path_buf(),
         })
     })();
@@ -366,6 +372,10 @@ pub struct SnapshotReport {
     /// Number of projection matrices quantized (`0` for a dense write). A packed tensor split into
     /// its standard projections counts each split part.
     pub quantized_projections: usize,
+    /// Number of the matrices plain tiers keep dense — `lm_head`, `embed_tokens`, every Gated
+    /// DeltaNet `in_proj_a` / `in_proj_b` — that a fully quantized tier stored at 8 bits
+    /// ([`write_hf_snapshot_tier`]); `0` otherwise.
+    pub quantized_remaining: usize,
     /// Directory the snapshot was written to.
     pub out_dir: PathBuf,
 }
@@ -390,11 +400,67 @@ pub struct SnapshotReport {
 pub fn write_snapshot(
     out_dir: &Path,
     tensors: impl IntoIterator<Item = (String, Array)>,
-    mut config: Value,
+    config: Value,
     tokenizer: &SnapshotTokenizer,
     quantize: Option<QuantSpec>,
 ) -> Result<SnapshotReport> {
+    write_snapshot_tier(out_dir, tensors, config, tokenizer, quantize, false)
+}
+
+/// The fixed format a fully quantized tier stores the matrices plain tiers keep dense in
+/// (SW-7201): 8-bit affine, group size 64 — the q8 body's own format. `lm_head` and
+/// `embed_tokens` are the most error-sensitive matrices and 4 bits would save only ~1.3 GB on
+/// Qwen3.8-27B; `in_proj_a` / `in_proj_b` feed the recurrent decay and delta strength, whose
+/// error compounds through the Gated DeltaNet state, and are ~0.5 MB each, so 4 bits would save
+/// ~12 MB in all.
+pub const REMAINING_MATRIX_SPEC: QuantSpec = QuantSpec {
+    group_size: 64,
+    bits: 8,
+    grid: crate::primitives::projection::QuantGrid::Computed,
+};
+
+/// Whether `key` is a language-model matrix plain tiers keep dense that a fully quantized tier
+/// stores at [`REMAINING_MATRIX_SPEC`]: the untied `lm_head`, the decoder's `embed_tokens` (not an
+/// MTP head's own), and every Gated DeltaNet `in_proj_a` / `in_proj_b` (decoder and MTP layers).
+/// Vision towers stay dense.
+pub fn is_remaining_matrix(key: &str) -> bool {
+    !under_vision_root(key)
+        && (key == "lm_head.weight"
+            || (key.ends_with("embed_tokens.weight") && !key.starts_with("mtp."))
+            || key.ends_with("linear_attn.in_proj_a.weight")
+            || key.ends_with("linear_attn.in_proj_b.weight"))
+}
+
+/// [`write_snapshot`], and with `quantize_remaining` a **fully quantized** tier (SW-7201): every
+/// [`is_remaining_matrix`] tensor is stored too, at [`REMAINING_MATRIX_SPEC`], so no
+/// language-model matrix stays bf16. Where that format differs from `quantize` (a 4-bit body),
+/// the `quantization` block names each such tensor's own `{group_size, bits}` under its mlx-lm
+/// module path ([`crate::models::qwen35::mlx_lm_module_path`]) — the per-module entries mlx-lm
+/// and the Qwen3.5 loader both read. Only a Qwen3.5 snapshot carries such a tier (other loaders
+/// read one quantization format per snapshot); anything else is refused.
+pub fn write_snapshot_tier(
+    out_dir: &Path,
+    tensors: impl IntoIterator<Item = (String, Array)>,
+    mut config: Value,
+    tokenizer: &SnapshotTokenizer,
+    quantize: Option<QuantSpec>,
+    quantize_remaining: bool,
+) -> Result<SnapshotReport> {
     let tensors: Vec<(String, Array)> = tensors.into_iter().collect();
+    if quantize_remaining {
+        if quantize.is_none() {
+            return Err(Error::Unsupported(
+                "a fully quantized tier needs a body format (q4 or q8)".into(),
+            ));
+        }
+        if Architecture::from_config(&config).ok() != Some(Architecture::Qwen35) {
+            return Err(Error::Unsupported(
+                "a fully quantized tier (quantized lm_head / embed_tokens) is a qwen3_5 snapshot \
+                 format; this architecture's loader reads one quantization format per snapshot"
+                    .into(),
+            ));
+        }
+    }
 
     let mut split_dims: Option<(i32, i32, i32)> = None; // (q_dim, kv_dim, intermediate)
     let mut qwen35_moe: Option<(i32, i32, i32)> = None; // (experts, expert_inter, hidden)
@@ -438,6 +504,7 @@ pub fn write_snapshot(
     // request leaves dense are collected and refused after the pass.
     let mut out: Vec<(String, Array)> = Vec::new();
     let mut quantized_projections = 0usize;
+    let mut remaining: Vec<String> = Vec::new();
     let mut uncovered: Vec<String> = Vec::new();
     for (key, arr) in tensors {
         match quantize {
@@ -543,6 +610,19 @@ pub fn write_snapshot(
                 push_quantized(&mut out, base, &w, spec)?;
                 quantized_projections += 1;
             }
+            Some(_) if quantize_remaining && is_remaining_matrix(&key) => {
+                if arr.ndim() != 2 {
+                    return Err(Error::Unsupported(format!(
+                        "cannot quantize `{key}` with shape {:?}: expected a rank-2 matrix",
+                        arr.shape()
+                    )));
+                }
+                let w = read_then_cast(&arr)?;
+                drop(arr);
+                let base = key.strip_suffix(".weight").unwrap_or(&key);
+                push_quantized(&mut out, base, &w, REMAINING_MATRIX_SPEC)?;
+                remaining.push(base.to_string());
+            }
             Some(_) if is_unrecognized_projection(&key, &arr) => {
                 uncovered.push(key.clone());
                 out.push((key, arr));
@@ -575,7 +655,20 @@ pub fn write_snapshot(
     // A `quantization` block marks the snapshot pre-quantized so the loader reads the stored
     // projections as-is (its `stored_quant` branch) rather than re-quantizing on load.
     if let Some(spec) = quantize {
-        let block = json!({ "group_size": spec.group_size, "bits": spec.bits });
+        let mut block = json!({ "group_size": spec.group_size, "bits": spec.bits });
+        if REMAINING_MATRIX_SPEC != spec {
+            let vlm = config.get("text_config").is_some();
+            let entries = block.as_object_mut().expect("a JSON object literal");
+            for base in &remaining {
+                entries.insert(
+                    crate::models::qwen35::mlx_lm_module_path(base, vlm),
+                    json!({
+                        "group_size": REMAINING_MATRIX_SPEC.group_size,
+                        "bits": REMAINING_MATRIX_SPEC.bits,
+                    }),
+                );
+            }
+        }
         if let Value::Object(map) = &mut config {
             map.insert("quantization".into(), block.clone());
             if let Some(Value::Object(text)) = map.get_mut("text_config") {
@@ -611,6 +704,7 @@ pub fn write_snapshot(
         num_tensors,
         quantized: quantize,
         quantized_projections,
+        quantized_remaining: remaining.len(),
         out_dir: out_dir.to_path_buf(),
     })
 }
@@ -693,7 +787,34 @@ pub fn write_hf_snapshot(
     out_dir: impl AsRef<Path>,
     quantize: Option<QuantSpec>,
 ) -> Result<SnapshotReport> {
-    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, false)
+    write_hf_snapshot_inner(
+        source_dir.as_ref(),
+        out_dir.as_ref(),
+        quantize,
+        false,
+        false,
+    )
+}
+
+/// [`write_hf_snapshot`] for a **fully quantized** Qwen3.5 tier (SW-7201, [`write_snapshot_tier`]):
+/// the `quantize` body plus `lm_head`, `embed_tokens` and every `in_proj_a` / `in_proj_b` at
+/// 8 bits. `quantize` Q8 is the int8 tier (every language-model matrix int8); Q4 is the 4-bit
+/// tier (4-bit body, 8-bit head, embedding and decay / delta-strength inputs). Vision towers stay
+/// dense and the native MTP head is quantized exactly as in the plain tier (dropped with
+/// `drop_native_mtp`, as [`write_hf_snapshot_without_native_mtp`] does).
+pub fn write_hf_snapshot_tier(
+    source_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: QuantSpec,
+    drop_native_mtp: bool,
+) -> Result<SnapshotReport> {
+    write_hf_snapshot_inner(
+        source_dir.as_ref(),
+        out_dir.as_ref(),
+        Some(quantize),
+        drop_native_mtp,
+        true,
+    )
 }
 
 /// [`write_hf_snapshot`] without the checkpoint's native MTP head: every `mtp.*` tensor is dropped
@@ -706,7 +827,7 @@ pub fn write_hf_snapshot_without_native_mtp(
     out_dir: impl AsRef<Path>,
     quantize: Option<QuantSpec>,
 ) -> Result<SnapshotReport> {
-    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, true)
+    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, true, false)
 }
 
 fn write_hf_snapshot_inner(
@@ -714,6 +835,7 @@ fn write_hf_snapshot_inner(
     out_dir: &Path,
     quantize: Option<QuantSpec>,
     drop_native_mtp: bool,
+    quantize_remaining: bool,
 ) -> Result<SnapshotReport> {
     // config.json is required — it carries the architecture + shapes the loader dispatches on. Read
     // it as a Value so the writer can add the quantization block; all other keys pass through.
@@ -764,6 +886,12 @@ ArtifactInput,
                 "SenseNova-Loop-9B preparation requires the original BF16 target".into(),
             ));
         }
+        if quantize_remaining {
+            return Err(Error::Unsupported(
+                "SenseNova-Loop-9B has no fully quantized tier; prepare the native affine Q4 or Q8"
+                    .into(),
+            ));
+        }
         if let Some(spec) = quantize {
             if ![QuantSpec::q4(), QuantSpec::q8()].contains(&spec) {
                 return Err(Error::Unsupported(
@@ -796,7 +924,14 @@ ArtifactInput,
     if drop_native_mtp {
         tensors.retain(|key, _| !key.starts_with("mtp."));
     }
-    let report = write_snapshot(out_dir, tensors, config, &tokenizer()?, quantize)?;
+    let report = write_snapshot_tier(
+        out_dir,
+        tensors,
+        config,
+        &tokenizer()?,
+        quantize,
+        quantize_remaining,
+    )?;
     copy_snapshot_sidecars(source, out_dir)?;
     Ok(report)
 }
@@ -834,6 +969,7 @@ fn copy_sensenova_bf16(source: &Path, out_dir: &Path, config_text: &str) -> Resu
             num_tensors: target_tensors().count(),
             quantized: None,
             quantized_projections: 0,
+            quantized_remaining: 0,
         })
     })();
     if result.is_err() {
@@ -2436,5 +2572,291 @@ pub(crate) mod tests {
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect()
+    }
+
+    /// SW-7201: [`tiny_qwen35_mtp`] plus a vision-tower matrix, written as a fully quantized tier.
+    fn write_full_tier(label: &str, spec: QuantSpec) -> (Fixture, SnapshotReport) {
+        let dir = unique_dir(label);
+        let (mut tensors, config) = tiny_qwen35_mtp(false);
+        let mut rng = SplitMix64::new(0x7201);
+        tensors.push((
+            "model.visual.blocks.0.attn.qkv.weight".into(),
+            randn(&[192, 64], &mut rng),
+        ));
+        let report = write_snapshot_tier(
+            &dir,
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(spec),
+            true,
+        )
+        .unwrap();
+        (dir, report)
+    }
+
+    /// SW-7201: a fully quantized tier stores `lm_head`, `embed_tokens` and every `in_proj_a` /
+    /// `in_proj_b` at 8 bits beside the body; the vision tower stays dense and the MTP head is
+    /// stored as in the plain tier. Under a 4-bit body each of those tensors gets its own
+    /// mlx-lm-keyed `quantization` entry (top level and `text_config`); under an 8-bit body the
+    /// block stays the plain one. The tier loads (constructor only, no forward).
+    #[test]
+    fn full_tier_stores_every_language_matrix_and_names_mixed_formats() {
+        let remaining = [
+            "lm_head",
+            "model.language_model.embed_tokens",
+            "model.language_model.layers.0.linear_attn.in_proj_a",
+            "model.language_model.layers.0.linear_attn.in_proj_b",
+            "model.language_model.layers.1.linear_attn.in_proj_a",
+            "model.language_model.layers.1.linear_attn.in_proj_b",
+            "model.language_model.layers.2.linear_attn.in_proj_a",
+            "model.language_model.layers.2.linear_attn.in_proj_b",
+        ];
+        for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+            let (dir, report) = write_full_tier(&format!("full-q{}", spec.bits), spec);
+            assert_eq!(report.quantized_remaining, remaining.len());
+            assert_eq!(
+                report.quantized_projections,
+                25 + 8,
+                "body + MTP fc, attention, MLP"
+            );
+            let stored = Weights::from_dir(&dir).unwrap();
+            let words = |stem: &str| stored.get(&format!("{stem}.weight")).unwrap().shape()[1];
+            for stem in remaining {
+                for part in ["scales", "biases"] {
+                    assert!(stored.contains(&format!("{stem}.{part}")), "{stem}.{part}");
+                }
+                assert_eq!(words(stem), 64 * 8 / 32, "{stem} is 8-bit");
+            }
+            assert_eq!(
+                words("model.language_model.layers.0.linear_attn.in_proj_qkv"),
+                64 * spec.bits / 32,
+                "the body keeps its own bits"
+            );
+            assert!(stored.contains("mtp.fc.scales"));
+            assert!(!stored.contains("model.visual.blocks.0.attn.qkv.scales"));
+
+            let json: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            for block in [&json["quantization"], &json["text_config"]["quantization"]] {
+                let entries = block.as_object().unwrap();
+                assert_eq!(entries["bits"], spec.bits);
+                if spec.bits == 8 {
+                    assert_eq!(entries.len(), 2, "an int8 tier needs no per-module entry");
+                    continue;
+                }
+                assert_eq!(entries.len(), 2 + remaining.len());
+                for path in [
+                    "language_model.lm_head",
+                    "language_model.model.embed_tokens",
+                    "language_model.model.layers.2.linear_attn.in_proj_b",
+                ] {
+                    assert_eq!(block[path], json!({"group_size": 64, "bits": 8}), "{path}");
+                }
+            }
+            let cfg = Qwen35Config::from_json(&json).unwrap();
+            assert_eq!(cfg.quantization, Some(spec));
+            for stem in remaining {
+                assert_eq!(cfg.stored_spec(stem), Some(QuantSpec::q8()), "{stem}");
+            }
+            assert_eq!(
+                cfg.stored_spec("model.language_model.layers.3.self_attn.q_proj"),
+                Some(spec)
+            );
+            let model = Qwen35Model::from_weights_with(&stored, "model.language_model", cfg, None)
+                .unwrap_or_else(|e| panic!("q{}: the full tier must load: {e}", spec.bits));
+            assert!(model.is_quantized());
+            assert!(model.has_mtp());
+        }
+    }
+
+    /// SW-7201: a fully quantized tier is a Qwen3.5 format and needs a body format.
+    #[test]
+    fn full_tier_refuses_other_architectures_and_a_dense_body() {
+        let (tensors, config) = tiny_model();
+        let err = write_snapshot_tier(
+            &unique_dir("full-llama"),
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            Some(QuantSpec::q8()),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("qwen3_5"), "{err}");
+        let (tensors, config) = tiny_qwen35(false);
+        let err = write_snapshot_tier(
+            &unique_dir("full-dense"),
+            tensors,
+            config,
+            &SnapshotTokenizer::default(),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("body format"), "{err}");
+    }
+
+    /// SW-7201: a 4-bit tier whose config lost its per-module entries reads its 8-bit embedding
+    /// at the wrong width; the loader names the disagreement instead of failing in a norm.
+    #[test]
+    fn a_mixed_tier_without_its_entries_is_refused_by_width() {
+        let (dir, _) = write_full_tier("full-q4-bare", QuantSpec::q4());
+        let mut json: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let bare = json!({"group_size": 64, "bits": 4});
+        json["quantization"] = bare.clone();
+        json["text_config"]["quantization"] = bare;
+        let cfg = Qwen35Config::from_json(&json).unwrap();
+        let err = Qwen35Model::from_weights_with(
+            &Weights::from_dir(&dir).unwrap(),
+            "model.language_model",
+            cfg,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("stored quantized `model.language_model.embed_tokens`"),
+            "{err}"
+        );
+    }
+
+    /// SW-7201: per-module `quantization` entries are keyed as mlx-lm keys modules — a VLM's
+    /// `language_model.model.*` / `language_model.lm_head`, a text-only config's own stems — and
+    /// read back to checkpoint stems; nested and top-level entries must agree; a malformed entry
+    /// or entries without a default format are refused.
+    #[test]
+    fn qwen35_config_reads_per_module_quantization_entries() {
+        use crate::models::qwen35::mlx_lm_module_path;
+        for (stem, vlm, path) in [
+            ("lm_head", true, "language_model.lm_head"),
+            (
+                "model.language_model.embed_tokens",
+                true,
+                "language_model.model.embed_tokens",
+            ),
+            ("model.embed_tokens", false, "model.embed_tokens"),
+        ] {
+            assert_eq!(mlx_lm_module_path(stem, vlm), path);
+        }
+        let (_, base) = tiny_qwen35(false);
+        let with = |top: Value, nested: Value| {
+            let mut config = base.clone();
+            config["quantization"] = top;
+            config["text_config"]["quantization"] = nested;
+            Qwen35Config::from_json(&config)
+        };
+        let block = json!({
+            "group_size": 64, "bits": 4, "mode": "affine",
+            "language_model.lm_head": {"group_size": 64, "bits": 8},
+            "language_model.model.layers.0.linear_attn.in_proj_a": false,
+        });
+        let cfg = with(block.clone(), block.clone()).unwrap();
+        assert_eq!(cfg.stored_spec("lm_head"), Some(QuantSpec::q8()));
+        assert_eq!(
+            cfg.stored_spec("model.language_model.layers.0.linear_attn.in_proj_a"),
+            Some(QuantSpec::q4())
+        );
+        assert_eq!(cfg.quantization_overrides.len(), 1);
+        let other = json!({
+            "group_size": 64, "bits": 4,
+            "language_model.model.embed_tokens": {"group_size": 64, "bits": 8},
+        });
+        assert!(with(block.clone(), other).is_err(), "conflicting entries");
+        let bad = json!({"group_size": 64, "bits": 4, "language_model.lm_head": 8});
+        assert!(with(bad.clone(), bad).is_err(), "malformed entry");
+
+        let mut text_only = base["text_config"].clone();
+        text_only["quantization"] = json!({
+            "group_size": 64, "bits": 4,
+            "lm_head": {"group_size": 64, "bits": 8},
+        });
+        let cfg = Qwen35Config::from_json(&text_only).unwrap();
+        assert_eq!(cfg.stored_spec("lm_head"), Some(QuantSpec::q8()));
+        text_only["quantization"] = json!({"lm_head": {"group_size": 64, "bits": 8}});
+        assert!(Qwen35Config::from_json(&text_only).is_err(), "no default");
+    }
+
+    /// SW-7201 (AC2 on the tiny fixture): each fully quantized tier decodes like the plain tier of
+    /// the same body bits — its logits stay within a small fraction of the plain tier's range, and
+    /// at every prompt position the greedy token agrees unless the plain tier's top two are
+    /// nearer than the logit difference between the tiers (a near-tie).
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn qwen35_full_tiers_decode_like_the_plain_tier() {
+        for spec in [QuantSpec::q4(), QuantSpec::q8()] {
+            let (full_dir, _) = write_full_tier(&format!("decode-full-q{}", spec.bits), spec);
+            let plain_dir = unique_dir(&format!("decode-plain-q{}", spec.bits));
+            let (tensors, config) = tiny_qwen35_mtp(false);
+            write_snapshot(
+                &plain_dir,
+                tensors,
+                config,
+                &SnapshotTokenizer::default(),
+                Some(spec),
+            )
+            .unwrap();
+            let load = |dir: &Path| {
+                let json: Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                Qwen35Model::from_weights_with(
+                    &Weights::from_dir(dir).unwrap(),
+                    "model.language_model",
+                    Qwen35Config::from_json(&json).unwrap(),
+                    None,
+                )
+                .unwrap()
+            };
+            let (full, plain) = (load(&full_dir), load(&plain_dir));
+            let ids = Array::from_slice(&[1i32, 5, 2, 7, 3, 0, 6, 4], &[1, 8]);
+            let logits = |model: &Qwen35Model| {
+                let out = model.forward(&ids, &mut model.new_cache(), 0).unwrap();
+                out.as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec()
+            };
+            let (full_logits, plain_logits) = (logits(&full), logits(&plain));
+            assert!(full_logits.iter().all(|v| v.is_finite()));
+            let diff = full_logits
+                .iter()
+                .zip(&plain_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let range = plain_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                diff <= 0.1 * range,
+                "q{}: full/plain logit difference {diff} vs range {range}",
+                spec.bits
+            );
+            let vocab = 8;
+            for (pos, (f, p)) in full_logits
+                .chunks(vocab)
+                .zip(plain_logits.chunks(vocab))
+                .enumerate()
+            {
+                let argmax = |row: &[f32]| {
+                    (0..row.len())
+                        .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+                        .unwrap()
+                };
+                if argmax(f) != argmax(p) {
+                    let mut sorted = p.to_vec();
+                    sorted.sort_by(|a, b| b.total_cmp(a));
+                    assert!(
+                        sorted[0] - sorted[1] <= 2.0 * diff,
+                        "q{} position {pos}: greedy tokens differ outside a near-tie",
+                        spec.bits
+                    );
+                }
+            }
+        }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED snapshot::tests::qwen35_full_tiers_decode_like_the_plain_tier");
     }
 }

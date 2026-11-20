@@ -242,7 +242,7 @@ fn validate_ip_spec(
     Ok(())
 }
 
-fn ip_descriptor(variant: Variant) -> ModelDescriptor {
+pub(crate) fn ip_descriptor(variant: Variant) -> ModelDescriptor {
     let mut descriptor = match variant {
         Variant::Dev => crate::descriptor_dev(),
         Variant::Schnell => crate::descriptor_schnell(),
@@ -263,7 +263,30 @@ fn ip_descriptor(variant: Variant) -> ModelDescriptor {
     };
     descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
     descriptor.capabilities.max_count = 1;
+    descriptor.capabilities.supports_low_res_start = false;
     descriptor
+}
+
+pub(crate) fn compile_ip_feature_route(
+    variant: Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> candle_gen::gen_core::Result<Option<RenderPlan>> {
+    let descriptor = ip_descriptor(variant);
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if !matches!(
+        req.conditioning.as_slice(),
+        [Conditioning::Reference { .. }]
+    ) || spec.ip_adapter.is_none()
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "FLUX.1 IP-Adapter requires a Reference conditioning input and ip_adapter weights"
+                .into(),
+        ));
+    }
+    crate::compile_conditioned_plan(variant, &descriptor, spec, req).map(Some)
 }
 
 fn typed_ip_request(

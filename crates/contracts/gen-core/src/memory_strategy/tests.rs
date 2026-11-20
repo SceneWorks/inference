@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LoadSpec, WeightsSource};
+use crate::{FeatureClass, LoadSpec, RenderPlan, WeightsSource};
 
 #[test]
 fn bounded_decode_params_require_a_published_edge_and_the_exact_overlap() {
@@ -330,6 +330,7 @@ pub(super) fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunCo
     let calibration = contract.calibration.as_ref().expect("calibration");
     MemoryRunContext {
         reference_resources: None,
+        low_res_start: None,
         selection: MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: MemoryStrategyParameters::default(),
@@ -3078,4 +3079,704 @@ fn checked_byte_total_sums_and_refuses_overflow() {
         Err(Error::Msg(message)) => assert_eq!(message, "p: vae byte total overflows u64"),
         other => panic!("expected a typed overflow, got {other:?}"),
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// SW-6941 (MEM-3, MEM-4, MEM-5, ADM-3, B4, E4) Conformance Tests
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn mem3_concurrent_streams_and_joint_workspace_are_summed_aliases_deduped_and_domains_separated() {
+    let mut video_geom = StreamPhaseGeometry::image("video", 1024, 576, 1);
+    video_geom.latent_frames = 21;
+    video_geom.reference_count = 2;
+    video_geom.reference_canvases = vec![(512, 512), (1024, 512)];
+    video_geom.output_mode = StreamOutputMode::Streamed {
+        chunk_bytes: 16 * 1024 * 1024,
+    };
+    assert_eq!(video_geom.pixel_area(), 1024 * 576);
+    assert_eq!(video_geom.packed_tokens(16).unwrap(), (64 * 36) * 21);
+    assert_eq!(
+        video_geom.total_reference_pixel_area().unwrap(),
+        512 * 512 + 1024 * 512
+    );
+
+    let mut audio_geom = StreamPhaseGeometry::image("audio", 16, 16, 1);
+    audio_geom.audio_tokens = 1280;
+    audio_geom.audio_duration_millis = 5167;
+
+    // Shared trunk weights aliased by both video and audio streams in DeviceVram must count ONCE,
+    // while concurrent video stream activations, audio stream activations, and joint workspace are
+    // SUMMED (never maxed), and HostRam / UnifiedMemory remain separate.
+    let shared_trunk_a = PricedAllocation::new(
+        "trunk_view_video",
+        MemoryBudgetDomain::DeviceVram,
+        1_000_000,
+    )
+    .with_alias_group("shared_joint_trunk");
+    let shared_trunk_b = PricedAllocation::new(
+        "trunk_view_audio",
+        MemoryBudgetDomain::DeviceVram,
+        1_000_000,
+    )
+    .with_alias_group("shared_joint_trunk");
+    let host_staging =
+        PricedAllocation::new("host_pinned_stage", MemoryBudgetDomain::HostRam, 500_000);
+    let unified_pool = PricedAllocation::new(
+        "unified_metal_heap",
+        MemoryBudgetDomain::UnifiedMemory,
+        750_000,
+    );
+
+    let op0 = PhaseOperationLiveSet {
+        operation_id: "denoise_phase_0".into(),
+        phase: MemoryPhase::Denoise,
+        pass_index: 0,
+        phase_index: 0,
+        stream_geometries: vec![video_geom, audio_geom],
+        resident_weights: vec![shared_trunk_a, shared_trunk_b, host_staging, unified_pool],
+        resident_overlays: vec![PricedAllocation::new(
+            "lora_overlay",
+            MemoryBudgetDomain::DeviceVram,
+            100_000,
+        )],
+        concurrent_stream_activations: vec![
+            PricedAllocation::new("video_stream_act", MemoryBudgetDomain::DeviceVram, 300_000),
+            PricedAllocation::new("audio_stream_act", MemoryBudgetDomain::DeviceVram, 200_000),
+        ],
+        joint_workspaces: vec![PricedAllocation::new(
+            "av_joint_cross_attn",
+            MemoryBudgetDomain::DeviceVram,
+            400_000,
+        )],
+        retained_state: vec![PricedAllocation::new(
+            "solver_history",
+            MemoryBudgetDomain::DeviceVram,
+            50_000,
+        )],
+        evidence_peak: None,
+    };
+
+    // DeviceVram peak = 1_000_000 (shared trunk counted once) + 100_000 (overlay)
+    //                 + 300_000 (video) + 200_000 (audio) + 400_000 (joint) + 50_000 (retained)
+    //                 = 2_050_000 B (strictly greater than max(300_000, 200_000, 400_000)).
+    assert_eq!(
+        op0.operation_peak_bytes(MemoryBudgetDomain::DeviceVram)
+            .unwrap(),
+        2_050_000
+    );
+    assert_eq!(
+        op0.operation_peak_bytes(MemoryBudgetDomain::HostRam)
+            .unwrap(),
+        500_000
+    );
+    assert_eq!(
+        op0.operation_peak_bytes(MemoryBudgetDomain::UnifiedMemory)
+            .unwrap(),
+        750_000
+    );
+
+    let op1 = PhaseOperationLiveSet {
+        operation_id: "denoise_phase_1".into(),
+        phase: MemoryPhase::Denoise,
+        pass_index: 0,
+        phase_index: 1,
+        stream_geometries: Vec::new(),
+        resident_weights: vec![PricedAllocation::new(
+            "trunk_full",
+            MemoryBudgetDomain::DeviceVram,
+            1_000_000,
+        )],
+        resident_overlays: Vec::new(),
+        concurrent_stream_activations: vec![PricedAllocation::new(
+            "full_grid_act",
+            MemoryBudgetDomain::DeviceVram,
+            900_000,
+        )],
+        joint_workspaces: Vec::new(),
+        retained_state: Vec::new(),
+        evidence_peak: None,
+    };
+
+    // A learned-component transition (such as a learned latent upsampler or endpoint evaluation)
+    // must price the learned component workspace above latent-only handoff deltas.
+    let bad_learned_transition = TransitionOperationLiveSet {
+        transition_id: "boundary_k_bad".into(),
+        from_operation_id: "denoise_phase_0".into(),
+        to_operation_id: "denoise_phase_1".into(),
+        mechanism: TransitionMechanismKind::LearnedComponentTransition {
+            learned_component_workspace_bytes: 250_000,
+        },
+        resident_weights: vec![PricedAllocation::new(
+            "trunk_full",
+            MemoryBudgetDomain::DeviceVram,
+            1_000_000,
+        )],
+        resident_overlays: Vec::new(),
+        transition_workspaces: Vec::new(), // Missing learned workspace!
+        live_handoff_buffers: vec![PricedAllocation::new(
+            "latent_handoff",
+            MemoryBudgetDomain::DeviceVram,
+            64_000,
+        )],
+    };
+    assert!(bad_learned_transition
+        .transition_peak_bytes(MemoryBudgetDomain::DeviceVram)
+        .is_err());
+
+    let good_learned_transition = TransitionOperationLiveSet {
+        transition_id: "boundary_k".into(),
+        from_operation_id: "denoise_phase_0".into(),
+        to_operation_id: "denoise_phase_1".into(),
+        mechanism: TransitionMechanismKind::LearnedComponentTransition {
+            learned_component_workspace_bytes: 250_000,
+        },
+        resident_weights: vec![PricedAllocation::new(
+            "trunk_full",
+            MemoryBudgetDomain::DeviceVram,
+            1_000_000,
+        )],
+        resident_overlays: vec![PricedAllocation::new(
+            "lora_overlay",
+            MemoryBudgetDomain::DeviceVram,
+            100_000,
+        )],
+        transition_workspaces: vec![PricedAllocation::new(
+            "endpoint_forward_workspace",
+            MemoryBudgetDomain::DeviceVram,
+            850_000,
+        )],
+        live_handoff_buffers: vec![PricedAllocation::new(
+            "six_buffer_handoff",
+            MemoryBudgetDomain::DeviceVram,
+            200_000,
+        )],
+    };
+    // transition_peak = 1_000_000 + 100_000 + 850_000 + 200_000 = 2_150_000 B > 2_050_000 B.
+    let plan = RequestLiveSetPlan {
+        operations: vec![op0, op1],
+        transitions: vec![good_learned_transition],
+    };
+    let domains = plan.price_all_domains().unwrap();
+    let vram = &domains[&MemoryBudgetDomain::DeviceVram];
+    assert_eq!(vram.max_operation_peak_bytes, 2_050_000);
+    assert_eq!(vram.max_transition_peak_bytes, 2_150_000);
+    assert_eq!(vram.request_peak_bytes, 2_150_000);
+    assert_eq!(vram.dominant_stage_id, "boundary_k");
+    assert_eq!(
+        domains[&MemoryBudgetDomain::HostRam].request_peak_bytes,
+        500_000
+    );
+    assert_eq!(
+        domains[&MemoryBudgetDomain::UnifiedMemory].request_peak_bytes,
+        750_000
+    );
+}
+
+#[test]
+fn mem3_evidence_peak_basis_prevents_double_counting_whole_request_high_water_and_rejects_ambiguous(
+) {
+    let basis = EvidencePeakBasis::classify_phase_peaks(
+        Some(CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES),
+        Some(CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES),
+        Some(CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES),
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+    );
+    assert_eq!(
+        basis,
+        EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES
+    );
+    assert!(basis.is_whole_request_total());
+    assert_eq!(basis.includes_resident_weights(), Some(true));
+    assert_eq!(basis.includes_concurrent_streams(), Some(true));
+    assert_eq!(basis.includes_joint_workspace(), Some(true));
+
+    // When an operation carries a `TotalPeak` basis that already includes weights, concurrent
+    // streams, and joint workspace, `operation_peak_bytes` must NOT add them a second time.
+    let op = PhaseOperationLiveSet {
+        operation_id: "flux1_dev_q4_denoise".into(),
+        phase: MemoryPhase::Denoise,
+        pass_index: 0,
+        phase_index: 0,
+        stream_geometries: vec![StreamPhaseGeometry::image("image", 1024, 1024, 1)],
+        resident_weights: vec![PricedAllocation::new(
+            "dit_q4",
+            MemoryBudgetDomain::DeviceVram,
+            6_800_000_000,
+        )],
+        resident_overlays: Vec::new(),
+        concurrent_stream_activations: vec![PricedAllocation::new(
+            "stream_act",
+            MemoryBudgetDomain::DeviceVram,
+            2_000_000_000,
+        )],
+        joint_workspaces: vec![PricedAllocation::new(
+            "joint_attn",
+            MemoryBudgetDomain::DeviceVram,
+            1_500_000_000,
+        )],
+        retained_state: Vec::new(),
+        evidence_peak: Some((
+            MemoryBudgetDomain::DeviceVram,
+            CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+            basis,
+        )),
+    };
+    assert_eq!(
+        op.operation_peak_bytes(MemoryBudgetDomain::DeviceVram)
+            .unwrap(),
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES
+    );
+
+    // An ambiguous evidence basis fails closed instead of being silently reinterpreted.
+    let mut ambiguous_op = op;
+    ambiguous_op.evidence_peak = Some((
+        MemoryBudgetDomain::DeviceVram,
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        EvidencePeakBasis::Ambiguous,
+    ));
+    assert!(ambiguous_op
+        .operation_peak_bytes(MemoryBudgetDomain::DeviceVram)
+        .is_err());
+}
+
+#[test]
+fn mem4_admission_selects_only_equivalent_features_and_never_recipe_diagnostic_or_tier_change() {
+    let budget = MemoryBudget {
+        total_bytes: 16_000_000_000,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+
+    // Even if `low_res_start` (Recipe), `trajectory_observer` (Diagnostic), or a Q8->Q4 tier
+    // downgrade would reduce peak below 16 GB, `select_equivalent_only_admission` must refuse them
+    // and select only a legal `FeatureClass::Equivalent` candidate (such as `tiled_vae_decode`).
+    let candidates = vec![
+        AdmissionAdjustmentCandidate {
+            id: "enable_low_res_start_recipe".into(),
+            feature_class: FeatureClass::Recipe,
+            strategy: MemoryStrategy::Resident,
+            changes_quantization_tier: false,
+            alters_recipe_trajectory: true,
+            incremental_peak_bytes: 12_000_000_000,
+        },
+        AdmissionAdjustmentCandidate {
+            id: "downgrade_tier_q8_to_q4".into(),
+            feature_class: FeatureClass::Equivalent,
+            strategy: MemoryStrategy::Resident,
+            changes_quantization_tier: true,
+            alters_recipe_trajectory: false,
+            incremental_peak_bytes: 11_000_000_000,
+        },
+        AdmissionAdjustmentCandidate {
+            id: "activate_diagnostic_observer".into(),
+            feature_class: FeatureClass::Diagnostic,
+            strategy: MemoryStrategy::Resident,
+            changes_quantization_tier: false,
+            alters_recipe_trajectory: false,
+            incremental_peak_bytes: 10_000_000_000,
+        },
+        AdmissionAdjustmentCandidate {
+            id: "bounded_vae_tiled_decode".into(),
+            feature_class: FeatureClass::Equivalent,
+            strategy: MemoryStrategy::BoundedDecode,
+            changes_quantization_tier: false,
+            alters_recipe_trajectory: false,
+            incremental_peak_bytes: 15_500_000_000,
+        },
+    ];
+
+    let selected = select_equivalent_only_admission(budget, &candidates).unwrap();
+    assert_eq!(selected.id, "bounded_vae_tiled_decode");
+    assert_eq!(selected.feature_class, FeatureClass::Equivalent);
+    assert!(!selected.changes_quantization_tier);
+    assert!(!selected.alters_recipe_trajectory);
+
+    // When the only Equivalent candidate exceeds budget (e.g. 14 GB budget vs 15.5 GB equivalent),
+    // admission refuses with a typed `InsufficientEquivalentAdjustments` listing the skipped
+    // non-equivalent candidates rather than enabling `low_res_start` or changing tier.
+    let tight_budget = MemoryBudget {
+        total_bytes: 14_000_000_000,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let refusal = select_equivalent_only_admission(tight_budget, &candidates).unwrap_err();
+    assert_eq!(
+        refusal,
+        EquivalentAdmissionRefusal::InsufficientEquivalentAdjustments {
+            effective_budget_bytes: 14_000_000_000,
+            lowest_equivalent_peak_bytes: Some(15_500_000_000),
+            forbidden_candidates_skipped: vec![
+                "enable_low_res_start_recipe".into(),
+                "downgrade_tier_q8_to_q4".into(),
+                "activate_diagnostic_observer".into(),
+            ],
+        }
+    );
+}
+
+#[test]
+fn b4_six_buffer_ceiling_exact_fit_one_byte_under_and_fail_closed_real_evidence_posture() {
+    let plan = crate::LowResStartSpec::new(4, Some(0.5))
+        .resolve_geometry("flux1_dev", 1024, 1024, 8, 8, 2, 16, 256)
+        .unwrap();
+    assert_eq!((plan.low_width, plan.low_height), (512, 512));
+    assert_eq!((plan.full_width, plan.full_height), (1024, 1024));
+
+    let ceiling = LowResTransitionSixBufferCeiling::compute(&plan, 1, 16, 8).unwrap();
+    assert_eq!(
+        ceiling.reduced_latent_fp32_bytes,
+        FLUX1_LOW_RES_512_FP32_LATENT_BYTES
+    );
+    assert_eq!(ceiling.reduced_latent_fp32_bytes, 262_144);
+    assert_eq!(
+        ceiling.full_latent_fp32_bytes,
+        FLUX1_FULL_RES_1024_FP32_LATENT_BYTES
+    );
+    assert_eq!(ceiling.full_latent_fp32_bytes, 1_048_576);
+    assert_eq!(
+        ceiling.total_six_buffer_ceiling_bytes,
+        FLUX1_LOW_RES_1024_SIX_BUFFER_CEILING_BYTES
+    );
+    assert_eq!(ceiling.total_six_buffer_ceiling_bytes, 4_718_592);
+    assert_eq!(
+        CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES,
+        17_655_793_562
+    );
+
+    let basis = EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES;
+
+    // 1. Conditional / bounded-increment fixture:
+    // Admits at exact equality `17,651,074,970 + 4,718,592 = 17,655,793,562 B`.
+    let exact_fit_budget = MemoryBudget {
+        total_bytes: 17_655_793_562,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let receipt = evaluate_low_res_transition_admission(
+        "flux1_dev",
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        exact_fit_budget,
+        Some(&plan),
+        1,
+        16,
+        8,
+        &LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+    )
+    .expect("exact equality 17,655,793,562 B must admit in conditional mode");
+    assert!(receipt.low_res_active);
+    assert_eq!(receipt.ordinary_t2i_peak_bytes, 17_651_074_970);
+    assert_eq!(receipt.transition_delta_bytes, 4_718_592);
+    assert_eq!(receipt.required_peak_bytes, 17_655_793_562);
+
+    // Refuses 1 byte below at `17,655,793,561 B`.
+    let one_byte_under_budget = MemoryBudget {
+        total_bytes: 17_655_793_561,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let under_err = evaluate_low_res_transition_admission(
+        "flux1_dev",
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        one_byte_under_budget,
+        Some(&plan),
+        1,
+        16,
+        8,
+        &LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+    )
+    .expect_err("1 byte under at 17,655,793,561 B must refuse");
+    assert_eq!(
+        under_err,
+        LowResTransitionAdmissionRefusal::ExceedsEffectiveBudget {
+            route_id: "flux1_dev".into(),
+            required_peak_bytes: 17_655_793_562,
+            effective_budget_bytes: 17_655_793_561,
+            deficit_bytes: 1,
+        }
+    );
+
+    // 2. Real-evidence fail-closed mode (§6.12):
+    // When the cell only has an unqualified whole-request high-water mark (`17,651,074,970 B`
+    // repeated across phases), `low_res_start` refuses with a typed reason before loading even
+    // when budget is 24 GiB, while ordinary T2I (`None`) on the exact same cell and posture admits
+    // unchanged at `17,651,074,970 B`!
+    let generous_budget = MemoryBudget {
+        total_bytes: 24 * 1024 * 1024 * 1024,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let unqualified_err = evaluate_low_res_transition_admission(
+        "flux1_dev",
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        generous_budget,
+        Some(&plan),
+        1,
+        16,
+        8,
+        &LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+    )
+    .expect_err("unqualified whole-request evidence must refuse low_res_start fail-closed");
+    assert_eq!(
+        unqualified_err,
+        LowResTransitionAdmissionRefusal::UnpricedTransitionIncrementsOnWholeRequestEvidence {
+            route_id: "flux1_dev".into(),
+            ordinary_t2i_peak_bytes: 17_651_074_970,
+            six_buffer_ceiling_bytes: 4_718_592,
+            evidence_basis: basis,
+        }
+    );
+
+    let ordinary_t2i_exact_budget = MemoryBudget {
+        total_bytes: CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let ordinary_receipt = evaluate_low_res_transition_admission(
+        "flux1_dev",
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        ordinary_t2i_exact_budget,
+        None,
+        1,
+        16,
+        8,
+        &LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+    )
+    .expect(
+        "ordinary T2I admission must remain completely unchanged under UnqualifiedRealEvidence",
+    );
+    assert!(!ordinary_receipt.low_res_active);
+    assert_eq!(
+        ordinary_receipt.required_peak_bytes,
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES
+    );
+
+    // 3. Qualified conservative bound mode:
+    let qualified_trace = qualify_flux1_low_res_transition_bound(
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        &plan,
+        1,
+        16,
+        8,
+        2,
+        512,
+        128,
+    )
+    .unwrap();
+    let qualified_peak = qualified_trace.total_bounded_peak_bytes().unwrap();
+    assert!(qualified_peak > CANDLE_FLUX1_DEV_Q4_1024_CONDITIONAL_LOW_RES_PEAK_BYTES);
+    let qualified_posture =
+        LowResTransitionPricingPosture::QualifiedConservativeBound(qualified_trace);
+    let qualified_exact = MemoryBudget {
+        total_bytes: qualified_peak,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let qualified_receipt = evaluate_low_res_transition_admission(
+        "flux1_dev",
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        qualified_exact,
+        Some(&plan),
+        1,
+        16,
+        8,
+        &qualified_posture,
+    )
+    .unwrap();
+    assert_eq!(qualified_receipt.required_peak_bytes, qualified_peak);
+
+    let qualified_one_under = MemoryBudget {
+        total_bytes: qualified_peak - 1,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    assert!(evaluate_low_res_transition_admission(
+        "flux1_dev",
+        CANDLE_FLUX1_DEV_Q4_1024_ORDINARY_PEAK_BYTES,
+        basis,
+        qualified_one_under,
+        Some(&plan),
+        1,
+        16,
+        8,
+        &qualified_posture,
+    )
+    .is_err());
+}
+
+#[test]
+fn mem5_scope_lifecycle_records_phase_transitions_and_keeps_rungs_across_phases() {
+    struct MockRungScope {
+        admitted_geometry: MemoryGeometry,
+        attention_chunk: u32,
+        window_size: u32,
+        total_blocks: u32,
+        tile_edge: u32,
+        overlap: u32,
+    }
+
+    impl MemoryRequestScope for MockRungScope {
+        fn configure_request(&mut self, _: &mut crate::GenerationRequest) -> Result<()> {
+            Ok(())
+        }
+        fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
+            Ok(())
+        }
+        fn enter_render_phase(
+            &mut self,
+            phase: MemoryPhase,
+            identity: &crate::render::RenderPhaseIdentity,
+        ) -> Result<()> {
+            if phase == MemoryPhase::Denoise {
+                assert!(identity.geometry.width <= self.admitted_geometry.width);
+                assert!(identity.geometry.height <= self.admitted_geometry.height);
+            } else {
+                assert_eq!(identity.geometry.width, self.admitted_geometry.width);
+                assert_eq!(identity.geometry.height, self.admitted_geometry.height);
+            }
+            Ok(())
+        }
+        fn leave_phase(&mut self, _: MemoryPhase) -> Result<()> {
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            tile_edge: u32,
+            overlap: u32,
+            geometry: MemoryGeometry,
+        ) -> Result<()> {
+            assert_eq!((tile_edge, overlap), (self.tile_edge, self.overlap));
+            assert_eq!(geometry, self.admitted_geometry);
+            Ok(())
+        }
+        fn configure_attention(&mut self, chunk_size: u32) -> Result<()> {
+            assert_eq!(chunk_size, self.attention_chunk);
+            Ok(())
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            first_block: u32,
+            block_count: u32,
+        ) -> Result<()> {
+            assert!(first_block < self.total_blocks);
+            assert_eq!(block_count, self.window_size);
+            Ok(())
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let desc = crate::ModelDescriptor {
+        id: "flux1_dev",
+        backend: "candle",
+        family: "flux",
+        modality: crate::Modality::Image,
+        capabilities: crate::Capabilities {
+            min_size: 256,
+            max_size: 2048,
+            ..Default::default()
+        },
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&crate::FLUX1_LATENT_SPACE),
+        control_kinds: None,
+        required_components: &[],
+    };
+    let req = crate::GenerationRequest {
+        prompt: "two-phase scope trace".into(),
+        width: 1024,
+        height: 1024,
+        count: 1,
+        steps: Some(8),
+        low_res_start: Some(crate::LowResStartSpec::new(4, Some(0.5))),
+        ..Default::default()
+    };
+    let sigmas = vec![1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0];
+    let plan = RenderPlan::base_image(
+        &desc,
+        &req,
+        crate::render::PackedImagePass {
+            pixel_stride: 16,
+            token_width: 64,
+            sampler: "euler",
+            guidance: 3.5,
+            sigmas,
+            executed_steps: 8,
+            capture_sigma: 0.0,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.denoise_spans(), vec![0..4, 4..8]);
+    assert_eq!(plan.phase_output_size(0), (512, 512));
+    assert_eq!(plan.phase_output_size(1), (1024, 1024));
+
+    let mut mock_scope = MockRungScope {
+        admitted_geometry: MemoryGeometry {
+            width: 1024,
+            height: 1024,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        },
+        attention_chunk: 256,
+        window_size: 1,
+        total_blocks: 57,
+        tile_edge: 512,
+        overlap: 128,
+    };
+
+    let events = trace_planned_low_res_scope_lifecycle(
+        &plan,
+        &req.cancel,
+        &mut mock_scope,
+        Some(256),
+        Some((0, 1)),
+        Some((512, 128)),
+    )
+    .unwrap();
+
+    // Verify phase 0 and phase 1 have distinct RenderPhaseIdentity values and phase 0 never reuses
+    // the final-phase (1024x1024, phase 1) identity.
+    assert!(
+        events.contains(&RecordedScopeLifecycleEvent::EnterRenderPhase {
+            phase: MemoryPhase::Denoise,
+            pass_index: 0,
+            phase_index: 0,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+        })
+    );
+    assert!(
+        events.contains(&RecordedScopeLifecycleEvent::EnterRenderPhase {
+            phase: MemoryPhase::Denoise,
+            pass_index: 0,
+            phase_index: 1,
+            geometry: MemoryGeometry {
+                width: 1024,
+                height: 1024,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+        })
+    );
 }

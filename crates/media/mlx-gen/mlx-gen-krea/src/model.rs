@@ -409,6 +409,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
+    d.capabilities.supports_phases = true;
     d.capabilities.pag = Some(raw_pag_capability());
     // img2img reference latent-init (epic 8588 slice A, sc-10224): Raw advertises `Reference` just like
     // Turbo, but routes to the CFG entrypoint `generate_base_img2img_with_progress` (honoring guidance +
@@ -427,6 +428,7 @@ pub fn raw_descriptor() -> ModelDescriptor {
 pub fn edit_descriptor() -> ModelDescriptor {
     let mut d = raw_descriptor();
     d.id = KREA_2_EDIT_ID;
+    d.capabilities.supports_phases = false;
     // Edit accepts a single source (`Reference`) OR a scene+person pair (`MultiReference`, epic 10871
     // P1.3 — scene = image 1, person = image 2, fixed order). The img2img Raw/Turbo descriptors stay
     // single-`Reference`; only the edit surface advertises `MultiReference`, so `validate_request`

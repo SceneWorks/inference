@@ -30,14 +30,11 @@ def _digest(path: Path, algorithm: str, size: int) -> str:
     return digest.hexdigest()
 
 
-def verify_pinned_hub_files(repository: str, revision: str, snapshot: Path,
-                            relative_files: tuple[str, ...]) -> dict:
-    """Return upstream-manifest and byte receipts; download no model payload."""
+def pinned_manifest(repository: str, revision: str) -> tuple[str, bytes, dict[str, dict]]:
+    """The Hub's expanded file inventory of one public, ungated repository revision."""
     if (not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repository)
             or not re.fullmatch(r"[0-9a-f]{40}", revision)):
         raise ValueError("source must name one repository at an immutable revision")
-    if not relative_files or len(set(relative_files)) != len(relative_files):
-        raise ValueError("source verification needs unique required files")
     url = f"https://huggingface.co/api/models/{repository}/revision/{revision}?blobs=true"
     request = urllib.request.Request(url, headers={"User-Agent": "SceneWorks-model-proof/1"})
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -59,6 +56,15 @@ def verify_pinned_hub_files(repository: str, revision: str, snapshot: Path,
                 or name in inventory):
             raise ValueError("Hub readback has an unsafe or repeated sibling path")
         inventory[name] = sibling
+    return url, raw, inventory
+
+
+def verify_pinned_hub_files(repository: str, revision: str, snapshot: Path,
+                            relative_files: tuple[str, ...]) -> dict:
+    """Return upstream-manifest and byte receipts; download no model payload."""
+    if not relative_files or len(set(relative_files)) != len(relative_files):
+        raise ValueError("source verification needs unique required files")
+    url, raw, inventory = pinned_manifest(repository, revision)
     verified = []
     for relative in relative_files:
         if (not isinstance(relative, str) or not relative or relative.startswith("/")

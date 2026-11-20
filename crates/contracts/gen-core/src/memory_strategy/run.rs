@@ -47,6 +47,10 @@ pub struct MemoryRunContext {
     pub cache_state: MemoryCacheState,
     /// Caller-facing identity of the exact evidence record selected for this request.
     pub evidence_revision: String,
+    /// Optional `low_res_start` transition pricing attachment (`SW-7216`). Stored in its own typed
+    /// `Copy` field so iOS admission (`ios_admission.rs`) can rewrite `evidence_revision` without
+    /// discarding the caller's transition posture or admitted low-res plan.
+    pub low_res_start: Option<MemoryLowResStartContext>,
 }
 
 impl MemoryRunContext {
@@ -59,7 +63,101 @@ impl MemoryRunContext {
         // subtracted from this scalar a second time.
         MemoryPeakBreakdown::from_unattributed(self.predicted_peak_bytes)
     }
+
+    /// Attach a resolved `low_res_start` plan and transition pricing posture directly to this
+    /// [`MemoryRunContext`] so engine-side request admission (`registered_safety_check`,
+    /// `safety_check`, `validate_context`, `begin_request`, and `configure_request`) enforces
+    /// incremental transition workspace pricing (`SW-7216`).
+    pub fn with_low_res_start(
+        mut self,
+        plan: crate::ResolvedLowResStartPlan,
+        evidence_basis: EvidencePeakBasis,
+        posture: LowResTransitionPricingPosture,
+    ) -> Self {
+        self.set_low_res_start(Some(MemoryLowResStartContext {
+            plan: Some(plan),
+            evidence_basis,
+            posture,
+        }));
+        self
+    }
+
+    /// Attach a resolved `low_res_start` plan using the default conditional 6-buffer increment
+    /// pricing posture (`LowResTransitionPricingPosture::ConditionalSixBufferIncrement`) (`SW-7216`).
+    pub fn with_low_res_start_plan(self, plan: crate::ResolvedLowResStartPlan) -> Self {
+        self.with_low_res_start(
+            plan,
+            EvidencePeakBasis::WHOLE_REQUEST_HIGH_WATER_COPIED_TO_PHASES,
+            LowResTransitionPricingPosture::ConditionalSixBufferIncrement,
+        )
+    }
+
+    /// Attach a `low_res_start` transition pricing posture (`UnqualifiedRealEvidence`,
+    /// `ConditionalSixBufferIncrement`, or `QualifiedConservativeBound`) to this context so
+    /// subsequent `configure_request` calls enforce that posture when `request.low_res_start` is
+    /// present (`SW-7216`).
+    pub fn with_low_res_start_posture(
+        mut self,
+        evidence_basis: EvidencePeakBasis,
+        posture: LowResTransitionPricingPosture,
+    ) -> Self {
+        self.set_low_res_start(Some(MemoryLowResStartContext {
+            plan: None,
+            evidence_basis,
+            posture,
+        }));
+        self
+    }
+
+    /// Set or clear the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
+    pub fn set_low_res_start(&mut self, low_res: Option<MemoryLowResStartContext>) {
+        self.low_res_start = low_res;
+    }
+
+    /// Retrieve the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
+    pub fn low_res_start(&self) -> Option<MemoryLowResStartContext> {
+        self.low_res_start
+    }
+
+    /// Retrieve the resolved [`crate::ResolvedLowResStartPlan`] attached to this context, if any (`SW-7216`).
+    pub fn low_res_start_plan(&self) -> Option<crate::ResolvedLowResStartPlan> {
+        self.low_res_start.and_then(|ctx| ctx.plan)
+    }
 }
+
+/// Optional `low_res_start` transition pricing attachment for [`MemoryRunContext`] (`SW-7216`).
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryLowResStartContext {
+    pub plan: Option<crate::ResolvedLowResStartPlan>,
+    pub evidence_basis: EvidencePeakBasis,
+    pub posture: LowResTransitionPricingPosture,
+}
+
+impl PartialEq for MemoryLowResStartContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.evidence_basis == other.evidence_basis
+            && self.posture == other.posture
+            && match (&self.plan, &other.plan) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.version == b.version
+                        && a.k == b.k
+                        && a.executed_steps == b.executed_steps
+                        && a.scale.to_bits() == b.scale.to_bits()
+                        && a.legal_quantum == b.legal_quantum
+                        && a.min_dim == b.min_dim
+                        && a.low_width == b.low_width
+                        && a.low_height == b.low_height
+                        && a.full_width == b.full_width
+                        && a.full_height == b.full_height
+                        && a.estimate_source == b.estimate_source
+                }
+                _ => false,
+            }
+    }
+}
+
+impl Eq for MemoryLowResStartContext {}
 
 /// Build a deterministic, finite, weights-free context from provider-owned route facts.
 pub struct MemoryBehaviorRoute {
@@ -111,6 +209,7 @@ pub fn standard_memory_behavior_context(
         predicted_peak_bytes: 1024 * 1024 * 1024,
         cache_state: MemoryCacheState::Cold,
         evidence_revision: "weights-free-provider-behavior".to_owned(),
+        low_res_start: None,
     })
 }
 
@@ -149,6 +248,14 @@ macro_rules! delegate_memory_request_scope {
     ($field:ident) => {
         fn enter_phase(&mut self, phase: $crate::MemoryPhase) -> $crate::Result<()> {
             self.$field.enter_phase(phase)
+        }
+
+        fn enter_render_phase(
+            &mut self,
+            phase: $crate::MemoryPhase,
+            identity: &$crate::render::RenderPhaseIdentity,
+        ) -> $crate::Result<()> {
+            self.$field.enter_render_phase(phase, identity)
         }
 
         fn leave_phase(&mut self, phase: $crate::MemoryPhase) -> $crate::Result<()> {

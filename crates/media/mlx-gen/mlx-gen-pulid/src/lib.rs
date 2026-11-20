@@ -25,6 +25,15 @@ pub fn register_providers(
             provider_id: pulid_flux::MODEL_ID,
             compile: pulid_flux::compile_plan,
         })
+        .register_feature_route(mlx_gen::gen_core::FeatureRouteRegistration {
+            route_id: "flux1_dev_pulid",
+            parent_provider_id: Some("flux1_dev"),
+            descriptor: pulid_flux::descriptor,
+            render_plan: Some(mlx_gen::gen_core::RenderPlanRegistration {
+                provider_id: "flux1_dev_pulid",
+                compile: pulid_flux::compile_plan,
+            }),
+        })
         .register_generator(pulid_flux::REGISTRATION)
         .register_memory_strategy(pulid_flux::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -51,6 +60,57 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["pulid_flux"]);
+    }
+
+    #[test]
+    fn pulid_routes_export_inapplicability_and_refuse_phases() {
+        use mlx_gen::gen_core::{
+            Conditioning, Error, FeatureInapplicabilityCode, GenerationPhase, GenerationRequest,
+            IdentityWeights, Image, LoadSpec, OffloadPolicy, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all = registry.all_route_feature_applicability();
+        for route_id in ["pulid_flux", "flux1_dev_pulid"] {
+            let app = &all[route_id]["low_res_start"];
+            assert!(!app.applicable, "{route_id} requires pass-0 reference");
+            assert!(app
+                .reasons
+                .iter()
+                .any(|r| r.code
+                    == FeatureInapplicabilityCode::ConflictsWithPass0ReferenceConditioning));
+        }
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        spec.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File("/nonexistent/pulid.safetensors".into())),
+            eva: Some(WeightsSource::File("/nonexistent/eva.safetensors".into())),
+            face_dir: Some(WeightsSource::Dir("/nonexistent/face".into())),
+        });
+        let phased_req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3],
+                },
+                strength: Some(1.0),
+            }],
+            phases: Some(vec![GenerationPhase {
+                steps: 4,
+                guidance: Some(4.0),
+                adapters: vec![],
+            }]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            registry.compile_render_plan("pulid_flux", &spec, &phased_req),
+            Err(Error::Unsupported(_))
+        ));
     }
 }
 

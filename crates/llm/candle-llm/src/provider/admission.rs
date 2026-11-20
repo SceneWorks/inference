@@ -637,6 +637,39 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
                     }
                 }
             }
+            // A fully quantized tier (SW-7201) also stores the embedding, the head and every
+            // `in_proj_a` / `in_proj_b` as GGML blocks, read from the host onto the device: the
+            // head and the decay / delta-strength inputs as `QTensor`s, the embedding as one code
+            // byte per weight plus an f16 scale per block (and, tied, as the head's `QTensor`).
+            // Their dims are not rank 2, so the head pricing below never counts them again.
+            let embed_key = format!("{prefix}.embed_tokens.weight");
+            for (key, tensor) in tensors {
+                let Some((dtype, rows, cols)) = crate::primitives::quant::ggml_block_storage(
+                    tensor.dtype == "U8",
+                    &tensor.shape,
+                ) else {
+                    continue;
+                };
+                let blocks = ggml_device_bytes((rows as u64).checked_mul(cols as u64)?, dtype)?;
+                let in_proj = split_layer_key(key).is_some_and(|(root, layer, suffix)| {
+                    root == prefix
+                        && layer < cfg.num_layers
+                        && matches!(
+                            suffix,
+                            "linear_attn.in_proj_a.weight" | "linear_attn.in_proj_b.weight"
+                        )
+                });
+                if *key == embed_key {
+                    add(crate::primitives::quant::Q8RowEmbedding::device_bytes(
+                        rows, cols,
+                    )?)?;
+                    if cfg.tie_word_embeddings {
+                        add(blocks)?;
+                    }
+                } else if in_proj || (key == "lm_head.weight" && !cfg.tie_word_embeddings) {
+                    add(blocks)?;
+                }
+            }
             // The qwen3_5 head is quantized under every format; a tied one from the embedding.
             let head = if cfg.tie_word_embeddings {
                 format!("{prefix}.embed_tokens.weight")
