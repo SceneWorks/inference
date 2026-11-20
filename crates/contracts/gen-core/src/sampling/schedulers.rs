@@ -368,7 +368,7 @@ fn reg_inc_beta(a: f64, b: f64, x: f64) -> f64 {
 
 /// Inverse Beta CDF: the `x ∈ [0, 1]` with `I_x(a, b) = p` (scipy `beta.ppf`), by bisection on the
 /// monotone `reg_inc_beta`.
-fn beta_ppf(p: f64, a: f64, b: f64) -> f64 {
+pub(crate) fn beta_ppf(p: f64, a: f64, b: f64) -> f64 {
     if p <= 0.0 {
         return 0.0;
     }

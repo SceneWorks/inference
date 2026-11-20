@@ -782,6 +782,26 @@ impl DitProjections {
         }
     }
 
+    /// The PDD head mix `Σ wₖ · headₖ(rows)` (SW-7224): ComfyUI's `_pdd_head`, the `dt`-weighted
+    /// mean of the heads a step spans, as a mix of the heads' outputs (the projection is linear, so
+    /// mixing outputs is mixing weights). One head at weight `1` is exactly that head's forward.
+    pub fn mix_output_heads(heads: &[(&LinearBias, f32)], rows: &Tensor) -> Result<Tensor> {
+        if let [(head, w)] = heads {
+            if *w == 1.0 {
+                return head.forward(rows);
+            }
+        }
+        let mut mixed: Option<Tensor> = None;
+        for (head, w) in heads {
+            let term = head.forward(rows)?.affine(f64::from(*w), 0.0)?;
+            mixed = Some(match mixed {
+                None => term,
+                Some(acc) => (acc + term)?,
+            });
+        }
+        mixed.ok_or_else(|| CandleError::Msg("minimax-h3-image dit: no output head".into()))
+    }
+
     /// Every tensor name these projections consume — the 17.
     pub fn names() -> Vec<String> {
         let mut v = LinearBias::names("proj_in").to_vec();
@@ -1038,6 +1058,19 @@ mod tests {
             p.output_head(None).is_err(),
             "the image transformer has no proj_out"
         );
+        // SW-7224: a mix is the weighted sum of the heads' outputs; one head at weight 1 is the
+        // head itself, bit for bit.
+        let rows = Tensor::from_vec(vec![1.0f32, 2.0], (1, 1, 2), &dev).unwrap();
+        let h = |k: usize| p.output_head(Some(k)).unwrap();
+        let mixed =
+            flat(&DitProjections::mix_output_heads(&[(h(1), 0.25), (h(2), 0.75)], &rows).unwrap());
+        // 0.1·(1 + 2) + (0.25·1 + 0.75·2) on every output lane.
+        assert!(mixed.iter().all(|&v| (v - 2.05).abs() < 1e-5), "{mixed:?}");
+        assert_eq!(
+            flat(&DitProjections::mix_output_heads(&[(h(2), 1.0)], &rows).unwrap()),
+            flat(&h(2).forward(&rows).unwrap())
+        );
+        assert!(DitProjections::mix_output_heads(&[], &rows).is_err());
         // The audio+video loader cannot read this map: it requires the audio stream.
         let video = MiniMaxH3DitConfig {
             variant: DitVariant::AudioVideo,

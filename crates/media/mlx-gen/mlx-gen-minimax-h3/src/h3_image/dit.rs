@@ -13,18 +13,21 @@
 //! * **No audio stream.** The checkpoint carries no `audio_proj_in` / `audio_proj_out`, so the
 //!   input/output set is [`ImageDitProjections`] (644 published tensors, not 638). H3's
 //!   [`crate::dit::DitProjections`], which requires the audio pair at load, is unchanged.
-//! * **One output head per step.** Step `i` projects with `pdd_proj_out.{i}`
-//!   ([`crate::dit::heads::PddHeads::select`]); the step index is an argument of [`ImageDenoiser::velocity`]
-//!   rather than a property of the model, so it reaches the head application on every call.
+//! * **One output head per step.** Step `i` projects with `pdd_proj_out.{i}` on the published grid;
+//!   a ComfyUI scheduler step that crosses grid points takes the `dt`-weighted mix of the heads it
+//!   spans ([`crate::dit::heads::PddHeads::forward_mix`], SW-7224). The step index is an argument
+//!   of [`ImageDenoiser::velocity`] rather than a property of the model, so it reaches the head
+//!   application on every call.
 //! * **At most two row classes.** Every text and generated row sits at the step's timestep
 //!   (upstream `row_timestep_plan`); an edit's reference rows sit at `0.999` for every step. The
 //!   gather index is `global_timestep · 3 + tag`. The six timesteps are enumerated up front,
 //!   which lets the whole run's modulation be projected once and `adaln_proj` evicted — H3's own
 //!   [`AdaLnCache::precompute_and_evict`].
 //!
-//! The sampler is the H3-Image checkpoint's: the [`SigmaSchedule::h3_image_distilled`] grid, and
-//! the `velocity` Euler form its scheduler config selects ([`ImageDenoiser::step`]), or ComfyUI's
-//! stochastic LCM on the same grid ([`ImageDenoiser::step_with`], SW-7106).
+//! The sampler is the H3-Image checkpoint's: the [`SigmaSchedule::h3_image_distilled`] grid (or a
+//! ComfyUI scheduler's grid, [`SigmaSchedule::h3_image`], SW-7224), and the `velocity` Euler form
+//! its scheduler config selects ([`ImageDenoiser::step`]), or ComfyUI's stochastic LCM or ancestral
+//! Euler on the same grid ([`ImageDenoiser::step_with`], SW-7106 / SW-7224).
 //!
 //! **Rung 4 (SW-7094).** [`MiniMaxH3ImageDit::load_dir_deferred`] keeps only the non-block tensors
 //! (the I/O projections, the six heads, the refiner) and hands the 50 blocks to H3's
@@ -833,7 +836,8 @@ impl ImageDenoiser {
         )
     }
 
-    /// The DiT velocity of every image row at sampling step `step`, through head `step`.
+    /// The DiT velocity of every image row at sampling step `step`, through the step's PDD head mix
+    /// (head `step` on the published grid; [`mlx_gen::gen_core::h3_image::pdd_head_mix`]).
     ///
     /// `image_rows` is `[1, num_packed_image_rows, in_channels · prod(patch)]` — an edit's
     /// reference rows first, then the generated rows; the result has the same shape, float32 (the
@@ -882,7 +886,11 @@ impl ImageDenoiser {
                 "minimax-h3-image dit: PAG layer {bad} is outside 0..{num_layers}"
             )));
         }
-        let head = self.dit.projections.pdd_heads.select(step)?;
+        // The step's output heads: head `step` on the published grid, ComfyUI's dt-weighted mix of
+        // the spanned heads when a scheduler's step crosses grid points (SW-7224). Checked before
+        // the 50 blocks run.
+        let heads = mlx_gen::gen_core::h3_image::pdd_head_mix(self.schedule.sigmas(), step)?;
+        self.dit.projections.pdd_heads.check_mix(&heads)?;
         let adaln = self.adaln_indices.get(step).ok_or_else(|| {
             Error::Msg(format!(
                 "minimax-h3-image dit: step {step} is outside the {}-step schedule",
@@ -985,7 +993,7 @@ impl ImageDenoiser {
         }
         let text = self.layout.num_text_tokens();
         let image = slice_axis(&x, 1, text, text + rows)?;
-        head.forward(&image)
+        self.dit.projections.pdd_heads.forward_mix(&heads, &image)
     }
 
     /// One sampler step: the velocity at step `step` through head `step`, then the checkpoint's

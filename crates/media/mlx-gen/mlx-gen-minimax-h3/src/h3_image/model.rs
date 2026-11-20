@@ -47,8 +47,8 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::h3_image::{
     edit_reference_images, latent_grid, reference_vae_size, reference_vision_size, request_sampler,
-    t2i_prompt_ids, validate_request as validate_h3_image, FIXED_GUIDANCE, FIXED_STEPS,
-    REFERENCE_NOISE_AUG, VAE_SPATIAL_RATIO,
+    request_scheduler, t2i_prompt_ids, validate_request as validate_h3_image, FIXED_GUIDANCE,
+    FIXED_STEPS, REFERENCE_NOISE_AUG, VAE_SPATIAL_RATIO,
 };
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
@@ -143,6 +143,9 @@ pub fn descriptor() -> ModelDescriptor {
             // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
             samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
             supports_h3_image_sampler: true,
+            // SW-7224: ComfyUI's schedulers over H3-Image's model sampling; no scheduler is the
+            // published grid.
+            schedulers: mlx_gen::gen_core::h3_image::SCHEDULER_NAMES.to_vec(),
             pag: Some(mlx_gen::gen_core::h3_image::minimax_h3_image_pag_capability()),
             ..Default::default()
         },
@@ -246,6 +249,7 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
     )
     .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     request_sampler(req).map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+    request_scheduler(req).map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     // Guidance 1.0 is the family's documented no-op, admitted above; the shared floor refuses any
     // guidance on a model without CFG, so it sees the request without it.
     if req.guidance == Some(FIXED_GUIDANCE) {
@@ -682,6 +686,12 @@ impl MiniMaxH3Image {
         let count = req.count.max(1);
         let sampler =
             request_sampler(req).map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+        let scheduler =
+            request_scheduler(req).map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+        mlx_gen::image_execution::policy(
+            "h3_image_scheduler",
+            serde_json::json!({ "scheduler": scheduler.name() }),
+        );
 
         let references = edit_reference_images(&req.conditioning)
             .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
@@ -781,13 +791,13 @@ impl MiniMaxH3Image {
                 dit,
                 layout.clone(),
                 &context,
-                SigmaSchedule::h3_image_distilled()?,
+                SigmaSchedule::h3_image(scheduler)?,
             )?,
             Some(window) => ImageDenoiser::new_windowed(
                 dit,
                 layout.clone(),
                 &context,
-                SigmaSchedule::h3_image_distilled()?,
+                SigmaSchedule::h3_image(scheduler)?,
                 window as usize,
                 req.cancel.clone(),
             )?,
@@ -843,6 +853,9 @@ impl MiniMaxH3Image {
                 mlx_gen::gen_core::h3_image::H3ImageSampler::Lcm { .. } => {
                     "mlx-keyed-normal-v1;initial=image_seed;ref_posterior=seed*phi+(0<<32)+(i+1);ref_aug=image_seed*phi+(1<<32)+(i+1);step=lcm_noise_seed(image_seed,step)"
                 }
+                mlx_gen::gen_core::h3_image::H3ImageSampler::EulerAncestral => {
+                    "mlx-keyed-normal-v1;initial=image_seed;ref_posterior=seed*phi+(0<<32)+(i+1);ref_aug=image_seed*phi+(1<<32)+(i+1);step=ancestral_noise_seed(image_seed,step)"
+                }
             };
             let sampler_fact = match sampler {
                 mlx_gen::gen_core::h3_image::H3ImageSampler::Euler => serde_json::json!({
@@ -864,10 +877,18 @@ impl MiniMaxH3Image {
                     "latent_dtype": "Float32",
                     "rng_scheme": rng_scheme,
                 }),
+                mlx_gen::gen_core::h3_image::H3ImageSampler::EulerAncestral => serde_json::json!({
+                    "solver": "euler_ancestral",
+                    "eta_bits": mlx_gen::gen_core::h3_image::ANCESTRAL_ETA.to_bits(),
+                    "s_noise_bits": mlx_gen::gen_core::h3_image::ANCESTRAL_S_NOISE.to_bits(),
+                    "timestep_convention": "velocity",
+                    "latent_dtype": "Float32",
+                    "rng_scheme": rng_scheme,
+                }),
             };
             mlx_gen::image_execution::sampled(
                 sampler_fact,
-                &mlx_gen::gen_core::h3_image::sampler_sigmas(),
+                denoiser.schedule().sigmas(),
                 image_seed,
             );
             let rows = denoiser.generated_rows(&rows)?;
@@ -1117,7 +1138,32 @@ mod tests {
         ] {
             validate_request(&caps, &good).unwrap();
         }
-        assert_eq!(caps.samplers, vec!["euler", "lcm"]);
+        assert_eq!(caps.samplers, vec!["euler", "lcm", "euler_ancestral"]);
+        // SW-7224: euler_ancestral by name and every advertised scheduler are admitted; an
+        // unadvertised scheduler is refused.
+        assert_eq!(
+            caps.schedulers,
+            vec!["simple", "sgm_uniform", "beta", "normal", "beta_1_1"]
+        );
+        for scheduler in ["simple", "sgm_uniform", "beta", "normal", "beta_1_1"] {
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    sampler: Some("euler_ancestral".into()),
+                    scheduler: Some(scheduler.into()),
+                    ..req(2048, 2048)
+                },
+            )
+            .unwrap();
+        }
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                scheduler: Some("karras".into()),
+                ..req(2048, 2048)
+            },
+        )
+        .is_err());
         // Above H3 video's 1.03 MP canvas and 2016 px edge: admitted for this family.
         validate_request(&caps, &req(4736, 3552)).unwrap();
     }
