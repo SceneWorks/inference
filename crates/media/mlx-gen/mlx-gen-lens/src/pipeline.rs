@@ -873,6 +873,133 @@ impl LensHeavy {
         )
     }
 
+    /// Planned phase-aware denoise trajectory driven by [`mlx_gen::gen_core::RenderRun`] (`SW-6945`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_planned_with_preview_memory(
+        &self,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+        preview: &PreviewSink,
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+    ) -> Result<Array> {
+        let dtype = self.dtype;
+        let transformer = &self.transformer;
+        let guidance_scale = run.plan().guidance();
+        let denoise_sigmas = run.plan().denoise_sigmas();
+        let spans = run.plan().denoise_spans();
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let (full_w, full_h) = run.plan().output_size();
+        let phase0_tokens = run.plan().phase_packed_tokens(0) as i32;
+        if let Some(low_res_report) = run.plan().low_res_start_execution_report(
+            if dtype == Dtype::Float32 { "f32" } else { "bf16" },
+            if dtype == Dtype::Float32 { 4 } else { 2 },
+            "base_dit",
+        )? {
+            mlx_gen::image_execution::policy(
+                "lens.low_res_start",
+                serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        let joint = needs_joint_cfg(guidance_scale);
+        check_conditioning_batch(encoder_features, encoder_mask, joint, guidance_scale)?;
+        let text_valid = (!text_mask_is_all_valid(encoder_mask)?).then_some(encoder_mask);
+        let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+            let (pw, ph) = if latents.shape().get(1).copied() == Some(phase0_tokens) {
+                (phase0_w, phase0_h)
+            } else {
+                (full_w, full_h)
+            };
+            let (lat_h, lat_w) = (
+                (ph / VAE_SCALE_FACTOR) as usize,
+                (pw / VAE_SCALE_FACTOR) as usize,
+            );
+            if joint {
+                let hidden = concatenate_axis(&[latents, latents], 0)?;
+                let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
+                let noise = transformer.forward_with_memory(
+                    &hidden,
+                    encoder_features,
+                    text_valid,
+                    &timestep,
+                    1,
+                    lat_h,
+                    lat_w,
+                    attention,
+                    transformer_window,
+                    cancel,
+                )?;
+                let parts = split(&noise, 2, 0)?;
+                cfg_rescale(&parts[0], &parts[1], guidance_scale)
+            } else {
+                let timestep = Array::from_slice(&[sigma], &[1]).as_dtype(dtype)?;
+                let cond = transformer.forward_with_memory(
+                    latents,
+                    encoder_features,
+                    text_valid,
+                    &timestep,
+                    1,
+                    lat_h,
+                    lat_w,
+                    attention,
+                    transformer_window,
+                    cancel,
+                )?;
+                cfg_rescale(&cond, &cond, guidance_scale)
+            }
+        };
+
+        let mut on_progress = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                on_step(current as usize, total as usize);
+            }
+        };
+
+        let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+        mlx_gen::run_flow_sampler_with_phase_transition_spans(
+            SamplerRun {
+                sampler_name: Some(run.plan().sampler()),
+                sigmas: denoise_sigmas,
+                seed,
+                cancel,
+                on_progress: &mut on_progress,
+            },
+            TimestepConvention::Sigma,
+            init_latents.as_dtype(dtype)?,
+            &spans,
+            Some(run),
+            |latents, sigma| {
+                let (pw, ph) = if latents.shape().get(1).copied() == Some(phase0_tokens) {
+                    (phase0_w, phase0_h)
+                } else {
+                    (full_w, full_h)
+                };
+                mlx_gen_flux2::preview::emit_flux_preview(
+                    preview,
+                    &previews,
+                    denoise_sigmas,
+                    sigma,
+                    latents,
+                    (ph / VAE_SCALE_FACTOR) as i32,
+                    (pw / VAE_SCALE_FACTOR) as i32,
+                    &self.vae,
+                );
+            },
+            predict,
+            None,
+        )
+    }
+
+    pub(crate) fn vae_ref(&self) -> &Flux2Vae {
+        &self.vae
+    }
+
     /// Render one image from pre-encoded conditioning (sc-11030): seed → init latents → denoise →
     /// decode → [`Image`]. The **single render body** shared by
     /// [`LensPipeline::generate_with_progress`] and the registry generator's `Resident` / `Sequential`

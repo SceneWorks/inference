@@ -1332,13 +1332,7 @@ fn encode_mean_latent(encoder: &Encoder, pixels: &Tensor) -> Result<Tensor> {
 /// (candle) Boogu lanes. `floor` because Python `int(steps · strength)` truncates toward zero. Pure
 /// function so the cross-backend-parity law is unit-testable without a GPU.
 pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    candle_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// The single img2img reference for the Base/Turbo t2i path (sc-11786): at most one
@@ -1519,66 +1513,31 @@ fn base_shift_mu() -> f32 {
     lin_mu(SEQ_LEN) as f32
 }
 
-/// The Base/Edit native sigma schedule (noise-fraction, descending to a trailing `0.0`) — the
-/// `OneMinusSigma` view of the v1 shifted clean-fraction timesteps (`σ_i = 1 − ts_i`).
 fn base_native_sigmas(steps: usize) -> Vec<f32> {
-    build_timesteps_v1(steps)
-        .iter()
-        .map(|&t| 1.0 - t as f32)
-        .collect()
+    candle_gen::gen_core::sampling::boogu_base_sigmas(steps)
 }
 
-/// Build the static-v1 shifted timestep schedule plus the trailing `1.0` (length `steps + 1`).
+#[cfg(test)]
 fn build_timesteps_v1(steps: usize) -> Vec<f64> {
-    let mu = lin_mu(SEQ_LEN);
-    let mut ts: Vec<f64> = (0..steps)
-        .map(|i| time_shift_v1(i as f64 / steps as f64, mu))
-        .collect();
-    ts.push(1.0);
-    ts
+    candle_gen::gen_core::sampling::boogu_timesteps_v1(steps)
 }
 
-/// Reference `_get_lin_function(x1=256,y1=base_shift,x2=4096,y2=max_shift)(seq_len)` → `mu`.
 fn lin_mu(seq_len: f64) -> f64 {
-    let (x1, y1, x2, y2) = (256.0, BASE_SHIFT, 4096.0, MAX_SHIFT);
-    let m = (y2 - y1) / (x2 - x1);
-    let b = y1 - m * x1;
-    m * seq_len + b
+    let _ = (BASE_SHIFT, MAX_SHIFT);
+    candle_gen::gen_core::sampling::boogu_lin_mu(seq_len)
 }
 
-/// Reference `_time_shift_v1(t, mu, sigma=1.0)`: `t1 = 1 − t` (clipped); `y = e^mu / (e^mu + (1/t1 − 1))`;
-/// return `1 − y`.
+#[cfg(test)]
 fn time_shift_v1(t: f64, mu: f64) -> f64 {
-    let eps = 1e-8;
-    let t1 = (1.0 - t).clamp(eps, 1.0 - eps);
-    let num = mu.exp();
-    let denom = num + (1.0 / t1 - 1.0);
-    1.0 - num / denom
+    candle_gen::gen_core::sampling::time_shift_v1(t, mu)
 }
 
-/// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending
-/// **clean-fraction** sigmas from `conditioning_sigma` toward (but excluding) `1.0`.
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let span = 1.0 - conditioning_sigma;
-    (0..steps)
-        .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
-        .collect()
+    candle_gen::gen_core::sampling::boogu_dmd_sigmas(conditioning_sigma, steps)
 }
 
-/// The Turbo DMD grid as the curated framework's **noise-fraction** schedule: `σ_i = 1 − c_i` for each
-/// clean-fraction [`dmd_sigmas`] entry (descending), plus the trailing `0.0` the curated solvers
-/// integrate toward. `run_flow_sampler` feeds `1 − σ = c_i` (the clean-fraction) back to the DiT
-/// (OneMinusSigma), so each curated step's x0 estimate matches the native DMD loop's; the curated
-/// solver then supplies the renoise. The final node `σ = 0` is the last native x0 estimate (the DMD
-/// loop's last step never renoises), so a consistency solver lands on the same terminal prediction.
-/// Verbatim mirror of `mlx-gen-boogu`'s `turbo_native_sigmas`.
 fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let mut s: Vec<f32> = dmd_sigmas(conditioning_sigma, steps)
-        .iter()
-        .map(|&c| 1.0 - c)
-        .collect();
-    s.push(0.0);
-    s
+    candle_gen::gen_core::sampling::boogu_turbo_sigmas(conditioning_sigma, steps)
 }
 
 /// Whether a Turbo request selects the curated unified-sampler framework. An unset sampler and

@@ -12,8 +12,8 @@ use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result, SamplerRun,
-    StagedHeavy, TimestepConvention, WeightsSource,
+    resolve_flow_schedule, run_flow_sampler, run_flow_sampler_with_phase_transition_spans, Error,
+    PreviewSink, Progress, Result, SamplerRun, StagedHeavy, TimestepConvention, WeightsSource,
 };
 
 use crate::block_stream::BlockWindow;
@@ -36,22 +36,7 @@ pub(crate) const DIT_DTYPE: Dtype = Dtype::Bfloat16;
 /// the static `shift=3.0` (`3σ / (1 + 2σ)`), with the trailing terminal `0.0` the flow sampler
 /// integrates to. Length `N + 1`, descending.
 pub fn anima_sigmas(steps: usize) -> Vec<f32> {
-    let n = steps.max(1);
-    let shift = SIGMA_SHIFT as f64;
-    let mut sigmas: Vec<f32> = (0..n)
-        .map(|i| {
-            // linspace(1.0, 1/n, n)
-            let s = if n == 1 {
-                1.0
-            } else {
-                1.0 + (i as f64) * (1.0 / n as f64 - 1.0) / ((n - 1) as f64)
-            };
-            // static time-shift: shift·s / (1 + (shift−1)·s)
-            (shift * s / (1.0 + (shift - 1.0) * s)) as f32
-        })
-        .collect();
-    sigmas.push(0.0);
-    sigmas
+    mlx_gen::gen_core::sampling::anima_sigmas(steps)
 }
 
 /// Resolve the Anima σ schedule, honoring a per-generation curated `scheduler` name (epic 7114
@@ -445,6 +430,42 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_anima_sampler_with_phases<F>(
+    sampler: Option<&str>,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    preview: &AnimaPreview<'_>,
+    on_progress: &mut dyn FnMut(Progress),
+    predict: F,
+) -> Result<Array>
+where
+    F: FnMut(&Array, f32) -> Result<Array>,
+{
+    run_flow_sampler_with_phase_transition_spans(
+        SamplerRun {
+            sampler_name: sampler,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
+        TimestepConvention::Sigma,
+        latents,
+        spans,
+        phase_scope,
+        |x, timestep| {
+            preview.emit(timestep, x);
+        },
+        predict,
+        None,
+    )
+}
+
 /// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling; hoisted to a
 /// free fn over the DiT in sc-10840 so the resident struct API AND the staged-residency generator share
 /// one integrator): run `sampler` over [`anima_schedule`] from `init`, evaluating `dit` in `dit_dtype`,
@@ -599,6 +620,97 @@ pub(crate) fn denoise_loop_bounded(
     run_anima_sampler(
         Some(sampling.solver().name()),
         sigmas,
+        init.clone(),
+        seed,
+        cancel,
+        &previews,
+        on_progress,
+        predict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_loop_planned(
+    run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+    dit: &CosmosDiT,
+    init: &Array,
+    cond: &Array,
+    uncond: Option<&Array>,
+    seed: u64,
+    dit_dtype: Dtype,
+    preview: &PreviewSink,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    attention: AttentionPlan<'_>,
+    window: Option<BlockWindow<'_>>,
+) -> Result<Array> {
+    let sigmas = run.plan().denoise_sigmas();
+    let spans = run.plan().denoise_spans();
+    let guidance_scale = run.plan().guidance();
+    let previews = AnimaPreview::new(preview, sigmas);
+    let guidance = Array::from_slice(&[guidance_scale], &[1]);
+    let mut forwards = 0u64;
+    let predict = |x: &Array, sigma: f32| -> Result<Array> {
+        let s = Array::from_slice(&[sigma], &[1]);
+        forwards += 1;
+        let rows = x.shape().first().copied().unwrap_or(0) as u64;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "anima",
+            "forward_argument",
+            forwards,
+            rows,
+            x,
+        );
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "anima",
+            "forward",
+            &[
+                ("evaluation", forwards),
+                ("rows", rows),
+                ("conditioned", 1),
+                (
+                    "compute_dtype_parameter",
+                    mlx_gen::sampler::sampling_dtype_code(dit_dtype),
+                ),
+            ],
+        );
+        let v_cond = dit.forward_bounded(x, &s, cond, dit_dtype, attention, window)?;
+        let v = match uncond {
+            Some(u) => {
+                forwards += 1;
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    "anima",
+                    "forward",
+                    &[
+                        ("evaluation", forwards),
+                        ("rows", rows),
+                        ("conditioned", 0),
+                        (
+                            "compute_dtype_parameter",
+                            mlx_gen::sampler::sampling_dtype_code(dit_dtype),
+                        ),
+                    ],
+                );
+                let v_u = dit.forward_bounded(x, &s, u, dit_dtype, attention, window)?;
+                add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+            }
+            None => v_cond,
+        };
+        let result = v.as_dtype(Dtype::Float32)?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "anima",
+            "forward_return",
+            forwards,
+            rows,
+            &result,
+        );
+        Ok(result)
+    };
+    run_anima_sampler_with_phases(
+        Some(run.plan().sampler()),
+        sigmas,
+        &spans,
+        Some(run),
         init.clone(),
         seed,
         cancel,
@@ -904,6 +1016,37 @@ impl AnimaHeavy {
             sampler,
             scheduler,
             scheduler_shift,
+            seed,
+            DIT_DTYPE,
+            preview,
+            cancel,
+            on_progress,
+            attention,
+            window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one_planned(
+        &self,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
+        cond: &Array,
+        uncond: Option<&Array>,
+        seed: u64,
+        preview: &PreviewSink,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        attention: AttentionPlan<'_>,
+        window: Option<BlockWindow<'_>>,
+    ) -> Result<Array> {
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let noise = create_noise(seed, phase0_w, phase0_h)?;
+        denoise_loop_planned(
+            run,
+            &self.dit,
+            &noise,
+            cond,
+            uncond,
             seed,
             DIT_DTYPE,
             preview,

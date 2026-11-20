@@ -114,6 +114,14 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: registry::MODEL_ID_TURBO,
+            compile: |spec, req| registry::compile_base(registry::MODEL_ID_TURBO, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: registry::MODEL_ID_BASE,
+            compile: |spec, req| registry::compile_base(registry::MODEL_ID_BASE, spec, req),
+        })
         .register_generator(registry::TURBO_REGISTRATION)
         .register_generator(registry::BASE_REGISTRATION)
         .register_memory_strategy(registry::TURBO_MEMORY_REGISTRATION)
@@ -189,6 +197,34 @@ mod explicit_registry_tests {
                 .memory_strategy_contract(id, &spec)
                 .unwrap()
                 .is_some());
+        }
+    }
+
+    #[test]
+    fn sw6945_lens_render_plan_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{GenerationRequest, LoadSpec, LowResStartSpec, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["lens_turbo", "lens"] {
+            assert!(all_features[id]["low_res_start"].applicable);
+            let req = GenerationRequest {
+                prompt: "a mountain lake".into(),
+                width: 1024,
+                height: 1024,
+                steps: Some(4),
+                seed: Some(91),
+                low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("lens render plan");
+            assert_eq!(plan.denoise_spans(), vec![0..2, 2..4]);
+            assert_eq!(plan.phase_output_size(0), (512, 512));
+            assert_eq!(plan.phase_output_size(1), (1024, 1024));
         }
     }
 }

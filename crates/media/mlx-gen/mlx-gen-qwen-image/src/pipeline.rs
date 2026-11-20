@@ -315,13 +315,6 @@ pub const SPATIAL_SCALE: u32 = 8;
 /// 2×2 patchify of the latent into the transformer's `in_channels = 16·4 = 64` token features.
 pub const PATCH: u32 = 2;
 
-// fork qwen-image scheduler shift params (`ModelConfig.qwen_image`).
-const SIGMA_BASE_SHIFT: f32 = 0.5;
-const SIGMA_MAX_SHIFT: f32 = 0.9;
-const SIGMA_BASE_SEQ_LEN: f32 = 256.0;
-const SIGMA_MAX_SEQ_LEN: f32 = 8192.0;
-const SIGMA_SHIFT_TERMINAL: f32 = 0.02;
-
 // The decoded-tensor → Image step is identical across families and now lives in core (F-006);
 // re-exported so `crate::pipeline::decoded_to_image` and the crate's public surface are unchanged.
 pub use mlx_gen::image::decoded_to_image;
@@ -427,9 +420,7 @@ pub fn fun_control_context_from_latents(
 /// scheduler axis builds a curated schedule over Qwen's OWN mu; kept identical to [`qwen_sigmas`] so the
 /// native production schedule stays byte-exact.
 fn qwen_mu(width: u32, height: u32) -> f32 {
-    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
-    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
-    m * (width as f32 * height as f32 / 256.0) + b
+    mlx_gen::gen_core::sampling::qwen_mu(width, height)
 }
 
 pub fn qwen_scheduler(num_steps: usize, width: u32, height: u32) -> FlowMatchEuler {
@@ -439,34 +430,7 @@ pub fn qwen_scheduler(num_steps: usize, width: u32, height: u32) -> FlowMatchEul
 }
 
 fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
-    // The terminal-sigma rescale below divides by `1 - shifted.last()`, which is `0` at `n == 1`
-    // (`shifted == [1.0]`) → a `[NaN, 0.0]` schedule. The production Generator already rejects
-    // `steps < 2` with a clear error (F-113); clamp here so this helper never emits a NaN schedule
-    // even when called directly (F-004), yielding a valid 2-step schedule instead.
-    let n = num_steps.max(2);
-    // linspace(1.0, 1.0/n, n). `n >= 2` (clamped above), so `n - 1 != 0` — no single-node special case.
-    let (start, end) = (1.0_f32, 1.0_f32 / n as f32);
-    let linspace: Vec<f32> = (0..n)
-        .map(|i| start + (end - start) * (i as f32) / ((n - 1) as f32))
-        .collect();
-
-    let mu = qwen_mu(width, height);
-    let e = mu.exp();
-    // exp(mu) / (exp(mu) + (1/sigma - 1))
-    let mut shifted: Vec<f32> = linspace
-        .iter()
-        .map(|&s| e / (e + (1.0 / s - 1.0)))
-        .collect();
-
-    // terminal-sigma rescale so the last shifted sigma hits `1 - terminal`.
-    let one_minus: Vec<f32> = shifted.iter().map(|&s| 1.0 - s).collect();
-    let scale = one_minus[one_minus.len() - 1] / (1.0 - SIGMA_SHIFT_TERMINAL);
-    for (s, om) in shifted.iter_mut().zip(&one_minus) {
-        *s = 1.0 - om / scale;
-    }
-
-    shifted.push(0.0);
-    shifted
+    mlx_gen::gen_core::sampling::qwen_sigmas(num_steps, width, height)
 }
 
 /// True classifier-free guidance with norm correction. Port of `QwenImage.compute_guided_noise`:

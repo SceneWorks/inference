@@ -888,12 +888,12 @@ mod tests {
 
     // --- Route inventory --------------------------------------------------------------------------
 
-    /// [`candle_gen::run_flow_sampler`]'s argument count before the predict closure. Pinned so a
+    /// [`candle_gen::run_flow_sampler_spans`]'s argument count before the predict closure. Pinned so a
     /// signature change — or a scanner mis-split — fails this inventory loudly instead of quietly
     /// shifting which argument "the one before the closure" names.
-    const SAMPLER_ARGUMENTS_BEFORE_PREDICT: usize = 8;
+    const SAMPLER_ARGUMENTS_BEFORE_PREDICT: usize = 11;
 
-    /// The arguments of every `run_flow_sampler` call in `source`, one entry per call site, covering
+    /// The arguments of every `run_flow_sampler_spans` call in `source`, one entry per call site, covering
     /// the arguments **before** the predict closure — the window the `preview` argument sits in.
     ///
     /// Ported from sc-16950's Krea inventory. The window is bounded by the call's own bracket balance
@@ -905,7 +905,7 @@ mod tests {
     /// The match is textual, so writing the driver's name followed by an open paren in prose is read
     /// as a call site: name it without the paren in comments.
     fn sampler_call_sites(file: &str, source: &str) -> Vec<Vec<String>> {
-        const CALL: &str = "run_flow_sampler(";
+        const CALL: &str = "run_flow_sampler_spans(";
         let mut sites = Vec::new();
         let mut cursor = 0usize;
         while let Some(at) = source[cursor..].find(CALL) {

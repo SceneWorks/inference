@@ -1269,28 +1269,12 @@ pub(crate) fn resolve_reference<'a>(
         .map(|(image, strength)| (image, resolve_strength(strength, None))))
 }
 
-/// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values
-/// from `conditioning_sigma` toward (but excluding) `1.0`. These are **clean-fraction** sigmas.
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let span = 1.0 - conditioning_sigma;
-    (0..steps)
-        .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
-        .collect()
+    mlx_gen::gen_core::sampling::boogu_dmd_sigmas(conditioning_sigma, steps)
 }
 
-/// The Turbo DMD grid as the curated framework's **noise-fraction** schedule: `σ_i = 1 − c_i` for each
-/// clean-fraction [`dmd_sigmas`] entry (descending), plus the trailing `0.0` the curated solvers
-/// integrate toward. `run_flow_sampler` feeds `1 − σ = c_i` (the clean-fraction) back to the DiT
-/// (OneMinusSigma), so each curated step's x0 estimate matches the native DMD loop's; the curated
-/// solver then supplies the renoise. The final node `σ = 0` is the last native x0 estimate (the DMD
-/// loop's last step never renoises), so a consistency solver lands on the same terminal prediction.
 fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
-    let mut s: Vec<f32> = dmd_sigmas(conditioning_sigma, steps)
-        .iter()
-        .map(|&c| 1.0 - c)
-        .collect();
-    s.push(0.0);
-    s
+    mlx_gen::gen_core::sampling::boogu_turbo_sigmas(conditioning_sigma, steps)
 }
 
 /// Whether a Turbo request selects the curated unified-sampler framework (epic 7114): true when a
@@ -1351,21 +1335,11 @@ pub fn base_flow_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
     resolve_flow_schedule(scheduler, base_shift_mu(), steps, &native)
 }
 
-/// The Base/Edit native sigma schedule (noise-fraction, descending to a trailing `0.0`) — the
-/// `OneMinusSigma` view of [`build_timesteps_v1`]'s shifted clean-fraction timesteps: `σ_i = 1 − ts_i`.
-/// `run_flow_sampler` feeds `1 − σ = ts_i` back to the DiT, so the unified Euler default is byte-exact
-/// with the legacy `x += (ts_{i+1} − ts_i)·v` loop (the trailing `ts = 1.0` becomes the terminal `σ = 0`).
 fn base_native_sigmas(steps: usize) -> Vec<f32> {
-    build_timesteps_v1(steps)
-        .iter()
-        .map(|&t| 1.0 - t as f32)
-        .collect()
+    mlx_gen::gen_core::sampling::boogu_base_sigmas(steps)
 }
 
-/// Build the static-v1 shifted timestep schedule plus the trailing `1.0`.
-///
-/// Returns a `Vec<f64>` of length `steps + 1`: the `steps` shifted samples of
-/// `linspace(0,1,steps+1)[:-1]` followed by `1.0` (so `ts[i+1]` is always valid in the Euler step).
+#[cfg(test)]
 fn build_timesteps_v1(steps: usize) -> Vec<f64> {
     let mu = lin_mu(SEQ_LEN);
     let mut ts: Vec<f64> = (0..steps)
@@ -1375,22 +1349,14 @@ fn build_timesteps_v1(steps: usize) -> Vec<f64> {
     ts
 }
 
-/// Reference `_get_lin_function(x1=256,y1=base_shift,x2=4096,y2=max_shift)(seq_len)` → `mu`.
 fn lin_mu(seq_len: f64) -> f64 {
-    let (x1, y1, x2, y2) = (256.0, BASE_SHIFT, 4096.0, MAX_SHIFT);
-    let m = (y2 - y1) / (x2 - x1);
-    let b = y1 - m * x1;
-    m * seq_len + b
+    let _ = (BASE_SHIFT, MAX_SHIFT);
+    mlx_gen::gen_core::sampling::boogu_lin_mu(seq_len)
 }
 
-/// Reference `_time_shift_v1(t, mu, sigma=1.0)`: `t1=1−t` (clipped); `y = e^mu / (e^mu + (1/t1 − 1))`;
-/// return `1 − y`.
+#[cfg(test)]
 fn time_shift_v1(t: f64, mu: f64) -> f64 {
-    let eps = 1e-8;
-    let t1 = (1.0 - t).clamp(eps, 1.0 - eps);
-    let num = mu.exp();
-    let denom = num + (1.0 / t1 - 1.0);
-    1.0 - num / denom
+    mlx_gen::gen_core::sampling::time_shift_v1(t, mu)
 }
 
 #[cfg(test)]

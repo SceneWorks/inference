@@ -23,9 +23,9 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::residency::StagedHeavy;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
+    GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision,
+    Progress, Quant, Residency, Result, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -123,7 +123,7 @@ ArtifactInput,
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
-        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::LENS_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,
@@ -168,6 +168,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -202,6 +203,7 @@ pub struct LensGenerator {
     text_stream_residency: Residency<LensText, LensHeavyOwned>,
     dit_stream_residency: Residency<LensText, LensHeavyOwned>,
     both_stream_residency: Residency<LensText, LensHeavyOwned>,
+    loaded_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (the DiT + VAE via [`LensHeavy`], plus the optional PiD decoder) —
@@ -363,6 +365,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
         text_stream_residency: build_request_residency(spec, defaults.id, StreamScope::TextEncoder),
         dit_stream_residency: build_request_residency(spec, defaults.id, StreamScope::Dit),
         both_stream_residency: build_request_residency(spec, defaults.id, StreamScope::Both),
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -555,6 +558,76 @@ fn load_heavy_phase_scoped(
     Ok(LensHeavyOwned { heavy, pid })
 }
 
+fn defaults_for(id: &'static str) -> Defaults {
+    if id == MODEL_ID_TURBO {
+        TURBO_DEFAULTS
+    } else {
+        BASE_DEFAULTS
+    }
+}
+
+fn build_schedule_for(
+    defaults: Defaults,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Vec<f32>> {
+    let steps = req.steps.unwrap_or(defaults.steps) as usize;
+    let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
+    let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+    let native = crate::schedule::lens_schedule(steps, latent_h, latent_w).sigmas;
+    let mu = mlx_gen::gen_core::sampling::lens_mu(steps, latent_h, latent_w);
+    let scheduled = mlx_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+    mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &scheduled,
+    )
+}
+
+/// Compile the weights-free Lens trajectory for `id` (`"lens_turbo"` or `"lens"`).
+pub fn compile_trajectory_for(
+    id: &'static str,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
+    let defaults = defaults_for(id);
+    let descriptor = descriptor_for(defaults.id);
+    validate_request(defaults.id, &descriptor.capabilities, req)?;
+    let sigmas = build_schedule_for(defaults, req)?;
+    let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+    let executed_steps = keep.saturating_sub(1);
+    let guidance = req.guidance.unwrap_or(defaults.guidance);
+    mlx_gen::gen_core::RenderPlan::base_image(
+        &descriptor,
+        req,
+        mlx_gen::gen_core::render::PackedImagePass {
+            pixel_stride: VAE_SCALE_FACTOR,
+            token_width: 128,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+pub(crate) fn compile_base(
+    id: &'static str,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    resolve_root(spec)?;
+    if req.use_pid && spec.pid.is_none() {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
+        )));
+    }
+    compile_trajectory_for(id, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
 impl Generator for LensGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -599,12 +672,59 @@ impl Generator for LensGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            let plan = compile_trajectory_for(self.defaults.id, req)?.bind_load(&self.loaded_spec);
+            self.generate_planned(req, &plan, None, on_progress)
+        })
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let output = self.generate_planned_impl(req, plan, scope, on_progress)?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        let (dt_label, dt_bytes) = match self.precision {
+            Precision::Fp32 => ("f32", 4),
+            Precision::Bf16 => ("bf16", 2),
+        };
+        report.low_res_start =
+            plan.low_res_start_execution_report(dt_label, dt_bytes, "base_dit")?;
+        Ok(report)
     }
 
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let plan = compile_trajectory_for(self.defaults.id, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::image_execution::complete_image_report_attempt(
@@ -624,21 +744,22 @@ impl Generator for LensGenerator {
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 mlx_gen::image_execution::with_primary_rng_scheme(
-                "mlx-global-normal-f32-v1;initial=output-seed;curated-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64",
-                || self.generate_observed(req, &mut progress).map(mlx_gen::gen_core::GenerationReport::from_output),
-            )
+                    "mlx-global-normal-f32-v1;initial=output-seed;curated-step=seed+0x9e3779b97f4a7c15*(step+1),wrapping-u64",
+                    || {
+                        let output =
+                            self.generate_planned_impl(req, plan, scope, &mut progress)?;
+                        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+                        let (dt_label, dt_bytes) = match self.precision {
+                            Precision::Fp32 => ("f32", 4),
+                            Precision::Bf16 => ("bf16", 2),
+                        };
+                        report.low_res_start = plan
+                            .low_res_start_execution_report(dt_label, dt_bytes, "base_dit")?;
+                        Ok(report)
+                    },
+                )
             },
         )
-    }
-}
-
-impl LensGenerator {
-    fn generate_observed(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -649,38 +770,34 @@ impl LensGenerator {
         Ok(())
     }
 
-    /// The rich-`Result` body behind [`Generator::generate`]: map the request onto the residency,
-    /// looping `count` with per-image seeds and streaming step/decode progress. The staged residency
-    /// lifecycle (encode → drop the gpt-oss encoder under `Sequential` → load the DiT/VAE/PiD →
-    /// denoise/decode → free the heavy bundle) is driven by the shared request-scoped [`Residency`]
-    /// seam (sc-11125), which owns the eval/drop/clear discipline, stage-boundary cancellation, and
-    /// the error-safe cache flush.
-    fn generate_impl(
+    fn generate_planned_impl(
         &self,
         req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
         self.validate_impl(req)?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
 
         if req.memory.is_some() {
-            return self.generate_memory_impl(req, on_progress);
+            return self.generate_memory_planned_impl(req, &run, on_progress);
         }
 
         let steps = req.steps.unwrap_or(self.defaults.steps) as usize;
-        let guidance = req.guidance.unwrap_or(self.defaults.guidance);
+        let guidance = plan.guidance();
         mlx_gen::image_execution::scalar("lens.guidance", guidance);
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed = plan.base_seed();
         let total = steps as u32;
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
         let encoder_window = resolve_encoder_window(req, self.streamable_text_encoder)?;
 
-        // Phase A: prompt → embeds (sc-11030; sc-11125). Under `Sequential` the shared seam loads the
-        // gpt-oss encoder, encodes, materializes, then DROPS it + `clear_cache()` so its ~13 GB frees
-        // before the DiT/VAE load below — the peak-bounding win. Encoding once (deterministic, no RNG
-        // draw) is byte-identical to the pre-sc-11030 per-image re-encode (the init noise reseeds per
-        // image inside `render`). Under the Resident default it remains live through this request.
         self.residency.run_request_scoped(
             self.default_stage_residency,
             false,
@@ -688,17 +805,29 @@ impl LensGenerator {
             req.use_pid,
             on_progress,
             |text: &LensText| {
-                text.encode_prompt_windowed(
-                    &req.prompt,
-                    negative,
-                    DEFAULT_DATE,
-                    guidance,
-                    Some(&req.cancel),
-                    encoder_window,
-                )
+                if req.use_pid {
+                    run.begin_conditioning()?;
+                    text.encode_prompt_windowed(
+                        &req.prompt,
+                        negative,
+                        DEFAULT_DATE,
+                        guidance,
+                        Some(&req.cancel),
+                        encoder_window,
+                    )
+                } else {
+                    run.encode(|| {
+                        text.encode_prompt_windowed(
+                            &req.prompt,
+                            negative,
+                            DEFAULT_DATE,
+                            guidance,
+                            Some(&req.cancel),
+                            encoder_window,
+                        )
+                    })
+                }
             },
-            // Materialize the features + mask while the encoder is still alive (Sequential only) — MLX
-            // is lazy, so un-evaluated outputs keep the encoder referenced and the drop frees nothing.
             |encoded: Option<&(Vec<Array>, Array)>| {
                 let Some((features, mask)) = encoded else {
                     return Ok(());
@@ -708,100 +837,86 @@ impl LensGenerator {
                 mlx_rs::transforms::eval(to_eval)?;
                 Ok(())
             },
-            // ── Establish the heavy render components (DiT + VAE + PiD) and run the render body once
-            // against the `heavy` borrow — identical for both residencies.
             |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (encoder_features, encoder_mask) = enc;
 
-                // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): one decoder serves
-                // the whole count loop (same prompt). Errors if `req.use_pid` but the model wasn't loaded with
-                // `LoadSpec::pid`; `None` (the default) → the byte-exact native Flux.2 VAE path. Lens is
-                // `vp_frame=false` (schedule σ *is* the degrade σ) and pure T2I (`start_step = 0`); resolve the
-                // plan against the SAME descending schedule `render` runs. `None` capture → full schedule.
-                let sigmas =
-                    heavy
-                        .heavy
-                        .resolve_sigmas(latent_h, latent_w, steps, req.scheduler.as_deref());
-                let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-                    req.scheduler.as_deref(),
-                    req.scheduler_shift,
-                    mlx_gen::gen_core::sampling::compute_mu(latent_h * latent_w, steps),
-                    steps,
-                    &sigmas,
-                )?;
-                let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
-                let keep = (keep < sigmas.len()).then_some(keep);
-                // F-030 (sc-11133): the PiD `from_ldm` early-stop truncates the descending schedule to
-                // `keep` σ nodes, so `render` (→ `run_curated_sampler`) runs and reports exactly
-                // `sigmas[..keep].len() - 1 == keep - 1` steps — NOT the requested `steps`. Deriving the
-                // emitted `total` from `keep` keeps the bar monotone AND lets it reach its total, so the
-                // `cur >= total` Decoding trigger below fires on the shortened schedule (without this the
-                // job froze at `(keep-1)/steps` and the 4×-SR decode was invisible).
+                let sigmas = plan.sigmas();
+                let keep_len = plan.denoise_sigmas().len();
+                let keep = (keep_len < sigmas.len()).then_some(keep_len);
                 let effective_total = effective_step_total(keep, total);
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy.pid,
                     req,
                     base_seed,
                     self.defaults.id,
-                    capture_sigma,
+                    plan.capture_sigma(),
                 )?;
+                if req.use_pid {
+                    run.end_conditioning()?;
+                }
                 let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
-                let mut images = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    let seed = base_seed.wrapping_add(i as u64);
-                    // The one render body (sc-11030): the same `LensHeavy::render` for both residencies, so a
-                    // Sequential job (encoder already dropped) is byte-identical to Resident. The reasoner
-                    // (sc-3176) is a standalone struct-API opt-in; the registry path leaves it off.
-                    let image = heavy.heavy.render_with_preview(
-                        &encoder_features,
-                        &encoder_mask,
-                        latent_h,
-                        latent_w,
-                        steps,
-                        guidance,
-                        // epic 7114 sc-7305: per-generation curated sampler/scheduler (N3 fallback inside the
-                        // unified framework; the worker also pre-normalizes unadvertised names).
-                        req.sampler.as_deref(),
-                        req.scheduler.as_deref(),
-                        req.scheduler_shift,
-                        seed,
-                        keep,
-                        pid_ref,
-                        &req.cancel,
-                        &mut |cur| {
-                            on_progress(Progress::Step {
-                                current: cur as u32,
-                                total: effective_total,
-                            });
-                            // F-106: `render` decodes immediately after the final step (it exposes only a step
-                            // callback, not a Progress sink), so emit `Decoding` when the last step lands —
-                            // BEFORE the VAE/PiD decode. F-030: gate on `effective_total` so the truncated
-                            // early-stop schedule still trips it exactly once.
-                            if cur as u32 >= effective_total {
-                                on_progress(Progress::Decoding);
-                            }
-                        },
-                        &req.preview,
-                    )?;
-                    images.push(image);
-                    // F-030 residual (sc-11133): a `keep == 1` early-stop runs 0 real steps, so the
-                    // per-step callback above never fires — the bar stalls at 0/1 and `Decoding` never
-                    // trips. Synthesize the terminal `Step` + one `Decoding` in that case (no-op for a
-                    // schedule that ran ≥ 1 real step and drove its own terminal above).
-                    emit_terminal_if_no_steps(keep, total, on_progress);
-                }
+                let images = run.images_with_denoise_phases(
+                    on_progress,
+                    |seed| {
+                        let (init_w, init_h) = run.plan().phase_output_size(0);
+                        let init_lat_h = (init_h / VAE_SCALE_FACTOR) as usize;
+                        let init_lat_w = (init_w / VAE_SCALE_FACTOR) as usize;
+                        let seq_len = (init_lat_h * init_lat_w) as i32;
+                        mlx_rs::random::seed(seed)?;
+                        Ok(mlx_rs::random::normal::<f32>(
+                            &[1, seq_len, 128],
+                            None,
+                            None,
+                            None,
+                        )?)
+                    },
+                    |seed, init, on_progress| {
+                        let latents = heavy.heavy.denoise_planned_with_preview_memory(
+                            &run,
+                            &encoder_features,
+                            &encoder_mask,
+                            &init,
+                            seed,
+                            &req.cancel,
+                            &mut |cur, _tot| {
+                                on_progress(Progress::Step {
+                                    current: cur as u32,
+                                    total: effective_total,
+                                });
+                                if cur as u32 >= effective_total {
+                                    on_progress(Progress::Decoding);
+                                }
+                            },
+                            &req.preview,
+                            mlx_gen::attention::AttentionPlan::UNBOUNDED,
+                            None,
+                        )?;
+                        emit_terminal_if_no_steps(keep, total, on_progress);
+                        Ok(latents)
+                    },
+                    |_seed, latents, _on_progress| {
+                        let decoded = crate::vae::decode(
+                            heavy.heavy.vae_ref(),
+                            &latents,
+                            latent_h,
+                            latent_w,
+                            pid_ref,
+                        )?;
+                        crate::pipeline::decoded_to_image(&decoded)
+                    },
+                )?;
                 Ok(GenerationOutput::Images(images))
             },
         )
     }
 
-    /// Shared-ladder execution. The legacy no-memory path above is intentionally unchanged; an
-    /// admitted request selects all lifecycle and scratch levers explicitly here.
-    fn generate_memory_impl(
+    /// Shared-ladder execution driven by [`mlx_gen::gen_core::RenderRun`].
+    fn generate_memory_planned_impl(
         &self,
         req: &GenerationRequest,
+        run: &mlx_gen::gen_core::RenderRun<'_, '_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let memory = req.memory.unwrap_or_default();
@@ -818,8 +933,6 @@ impl LensGenerator {
             &self.residency
         };
 
-        // A cached generator has one physical warm shape at a time. Evict non-selected owners before
-        // loading the chosen component scope so switching requests cannot retain duplicate trunks.
         for other in [
             &self.residency,
             &self.text_stream_residency,
@@ -856,11 +969,10 @@ impl LensGenerator {
             )
         });
 
-        let steps = req.steps.unwrap_or(self.defaults.steps) as usize;
-        let guidance = req.guidance.unwrap_or(self.defaults.guidance);
+        let guidance = run.plan().guidance();
         mlx_gen::image_execution::scalar("lens.guidance", guidance);
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed = run.plan().base_seed();
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
 
@@ -875,6 +987,7 @@ impl LensGenerator {
             req.use_pid,
             on_progress,
             |text| {
+                run.begin_conditioning()?;
                 calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
                 text.encode_prompt_windowed(
                     &req.prompt,
@@ -886,39 +999,37 @@ impl LensGenerator {
                 )
             },
             |encoded| {
-                let Some((features, mask)) = encoded else {
-                    return Ok(());
-                };
-                let mut arrays: Vec<&Array> = features.iter().collect();
-                arrays.push(mask);
-                mlx_rs::transforms::eval(arrays)?;
+                if let Some((features, mask)) = encoded {
+                    let mut arrays: Vec<&Array> = features.iter().collect();
+                    arrays.push(mask);
+                    mlx_rs::transforms::eval(arrays)?;
+                }
+                run.end_conditioning()?;
                 Ok(())
             },
             |heavy, (features, mask), progress| {
+                run.begin_rendering()?;
                 calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Denoise)?;
                 let mut out = Vec::with_capacity(req.count as usize);
+                let (init_w, init_h) = run.plan().phase_output_size(0);
+                let init_lat_h = (init_h / VAE_SCALE_FACTOR) as usize;
+                let init_lat_w = (init_w / VAE_SCALE_FACTOR) as usize;
                 for index in 0..req.count {
                     let seed = base_seed.wrapping_add(index as u64);
+                    run.reset_image_denoise_phases();
                     mlx_rs::random::seed(seed)?;
                     let init = mlx_rs::random::normal::<f32>(
-                        &[1, (latent_h * latent_w) as i32, 128],
+                        &[1, (init_lat_h * init_lat_w) as i32, 128],
                         None,
                         None,
                         None,
                     )?;
-                    let latents = heavy.heavy.denoise_with_sampler_keep_with_preview_memory(
+                    let latents = heavy.heavy.denoise_planned_with_preview_memory(
+                        run,
                         &features,
                         &mask,
                         &init,
-                        latent_h,
-                        latent_w,
-                        steps,
-                        guidance,
-                        req.sampler.as_deref(),
-                        req.scheduler.as_deref(),
-                        req.scheduler_shift,
                         seed,
-                        None,
                         &req.cancel,
                         &mut |current, total| {
                             progress(Progress::Step {
@@ -930,6 +1041,7 @@ impl LensGenerator {
                         attention,
                         dit_window,
                     )?;
+                    run.finish_image_denoise_phases()?;
                     out.push(Denoised { latents });
                 }
                 Ok(out)
@@ -949,18 +1061,22 @@ impl LensGenerator {
                 }
                 let mut images = Vec::with_capacity(denoised.len());
                 for item in denoised {
-                    progress(Progress::Decoding);
-                    let decoded = crate::vae::decode_with_tiling(
-                        decode.vae,
-                        &item.latents,
-                        latent_h,
-                        latent_w,
-                        None,
-                        tiling.as_ref(),
-                        Some(&req.cancel),
-                    )?;
-                    images.push(crate::pipeline::decoded_to_image(&decoded)?);
+                    let image = run.decode_phase(|| {
+                        progress(Progress::Decoding);
+                        let decoded = crate::vae::decode_with_tiling(
+                            decode.vae,
+                            &item.latents,
+                            latent_h,
+                            latent_w,
+                            None,
+                            tiling.as_ref(),
+                            Some(&req.cancel),
+                        )?;
+                        crate::pipeline::decoded_to_image(&decoded)
+                    })?;
+                    images.push(image);
                 }
+                run.finish_rendering();
                 Ok(GenerationOutput::Images(images))
             },
         )
@@ -1033,6 +1149,11 @@ pub(crate) fn validate_request(
     // Shared capability contract: count/size range, negative_prompt/guidance/true_cfg, sampler,
     // scheduler, conditioning kinds.
     caps.validate_request(id, req)?;
+    if req.source_image.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{id}: source_image is not supported on this route"
+        )));
+    }
 
     if req.prompt.is_empty() {
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
@@ -1046,6 +1167,22 @@ pub(crate) fn validate_request(
             "{id}: width/height must be multiples of {VAE_SCALE_FACTOR} (got {}x{})",
             req.width, req.height
         )));
+    }
+    if let Some(low_res) = &req.low_res_start {
+        let defaults = if id == MODEL_ID_TURBO {
+            TURBO_DEFAULTS
+        } else {
+            BASE_DEFAULTS
+        };
+        let descriptor = descriptor_for(defaults.id);
+        let sigmas = build_schedule_for(defaults, req)?;
+        let (_capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        low_res.resolve_for_descriptor(
+            &descriptor,
+            req,
+            keep.saturating_sub(1),
+            VAE_SCALE_FACTOR,
+        )?;
     }
     Ok(())
 }
@@ -1208,6 +1345,7 @@ mod tests {
         Ok(LensGenerator {
             descriptor: descriptor_turbo(),
             defaults: TURBO_DEFAULTS,
+            loaded_spec: spec.clone(),
             precision: spec.precision,
             quant: spec.quantize,
             streamable_text_encoder: true,
@@ -1280,7 +1418,10 @@ mod tests {
             };
             clear_cache();
             reset_peak_memory();
-            let output = generator.generate_impl(&request, &mut |_| {}).unwrap();
+            let plan = compile_trajectory_for(generator.defaults.id, &request).unwrap();
+            let output = generator
+                .generate_planned_impl(&request, &plan, None, &mut |_| {})
+                .unwrap();
             let peak = get_peak_memory() as u64;
             let image = match output {
                 GenerationOutput::Images(mut images) => images.pop().unwrap(),

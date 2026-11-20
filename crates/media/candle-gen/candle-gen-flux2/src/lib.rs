@@ -983,8 +983,8 @@ impl Pipeline {
         &self,
         phase: &TextPhase,
         req: &GenerationRequest,
+        guidance: f32,
     ) -> CResult<(Tensor, Option<Tensor>, f32)> {
-        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
         let encode = |te: &Flux2PromptEncoder,
                       tok: &TextTokenizer,
                       upsampler: Option<&CaptionUpsampler>|
@@ -1096,14 +1096,11 @@ impl Pipeline {
         &self,
         phase: &HeavyPhase,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         encoded: (Tensor, Option<Tensor>, f32),
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.expect("request seed was resolved before phases");
+        let base_seed = run.plan().base_seed();
         let (prompt_embeds, negative, guidance) = encoded;
         let (transformer, vae, pid) = match phase {
             HeavyPhase::Resident(comps) => (
@@ -1115,16 +1112,36 @@ impl Pipeline {
         };
         let pid_decoder =
             candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, self.variant.id())?;
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let clean_init = match &req.source_image {
+            Some(source_image) => {
+                let nchw = edit_provider::preprocess_ref(
+                    source_image,
+                    phase0_w,
+                    phase0_h,
+                    &self.device,
+                    self.dtype,
+                )?;
+                let enc_vae = Flux2Vae::new_with_encoder(self.component_vb("vae")?)?;
+                let packed = enc_vae.encode_packed(&nchw)?;
+                Some(pipeline::pack_nchw(&packed)?)
+            }
+            None => None,
+        };
+        if req.use_pid || clean_init.is_some() {
+            self.device.synchronize()?;
+            run.end_conditioning().map_err(CandleError::from)?;
+        }
         self.sample(
             req,
+            run,
             transformer,
             vae,
             &prompt_embeds,
             negative.as_ref(),
             pid_decoder.as_ref(),
+            clean_init.as_ref(),
             guidance,
-            steps,
-            base_seed,
             on_progress,
         )
     }
@@ -1137,19 +1154,27 @@ impl Pipeline {
     fn sample(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         transformer: &Flux2Transformer,
         vae: &Flux2Vae,
         prompt_embeds: &Tensor,
         negative: Option<&Tensor>,
         pid_decoder: Option<&PidDecoder>,
+        clean_init: Option<&Tensor>,
         guidance: f32,
-        steps: usize,
-        base_seed: u64,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Vec<Image>> {
         let embedded_guidance = self.variant.uses_embedded_guidance();
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let (phase0_lat_h, phase0_lat_w) = pipeline::latent_dims(phase0_w, phase0_h);
+        let phase0_tokens = run.plan().phase_packed_tokens(0);
         let img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
+        let phase0_img_ids = if (phase0_w, phase0_h) != (req.width, req.height) {
+            Some(pipeline::prepare_grid_ids(phase0_lat_h, phase0_lat_w))
+        } else {
+            None
+        };
         let txt_ids = pipeline::prepare_text_ids(self.cfg.max_sequence_length);
         let chunk_attention = req.memory.is_some_and(|memory| memory.chunk_attention);
         let attention_budget = if chunk_attention {
@@ -1174,20 +1199,9 @@ impl Pipeline {
             .map(|window| window as usize)
             .unwrap_or(memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
 
-        // Curated sampler/scheduler routing (epic 7114 P4, sc-7123). The NATIVE schedule is the legacy
-        // empirical-mu flow-match sigmas (descending, trailing 0.0); the same `mu` feeds the curated
-        // scheduler axis so `normal`/`karras`/etc. honor the resolution-dependent shift. The default path
-        // (sampler/scheduler unset) is the N1 no-op — euler over the native schedule reproduces the legacy
-        // `euler_step` flow-match loop within tolerance.
-        let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), steps);
-        let native = pipeline::schedule(steps, req.width, req.height);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            mu,
-            steps,
-            &native,
-        )?;
+        let sigmas = run.plan().denoise_sigmas();
+        let spans = run.plan().denoise_spans();
+        let sigma_0 = sigmas[0] as f64;
         let pag = descriptor(self.variant)
             .capabilities
             .resolve_pag(self.variant.id(), req)?;
@@ -1195,164 +1209,177 @@ impl Pipeline {
             "flux2.pag",
             serde_json::to_value(&pag).unwrap_or(serde_json::Value::Null),
         );
+        if let Some(low_res_report) = run
+            .plan()
+            .low_res_start_execution_report("f32", 4, "base_dit")
+            .map_err(CandleError::from)?
+        {
+            candle_gen::execution::policy(
+                "flux2.low_res_start",
+                serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+            );
+        }
         let canonical_solver =
-            candle_gen::gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+            candle_gen::gen_core::sampling::canonical_solver_or_euler(Some(run.plan().sampler()));
         let total_steps = sigmas.len().saturating_sub(1);
-        let target_seq = lat_h * lat_w;
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let mut eval_idx = 0usize;
-            let latents =
-                pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
-
-            // Per-step latent preview (epic 16948, sc-16955). The sampler's running latent is the packed
-            // 128-ch BN-normalized token sequence, so the hook unpacks it onto `(lat_h, lat_w)` — the same
-            // grid the decode tail below resolves — and runs the VAE's own de-normalize + unpatchify before
-            // projecting the raw 32-channel latent. Built per image so each seed's trajectory starts at
-            // frame 1. An inert sink is byte-identical to no hook at all.
-            let preview = preview::hook(&req.preview, vae, lat_h, lat_w);
-
-            // The driver does cancel + progress + the euler/curated integrator step. The forward (and the
-            // guidance>1 CFG blend) lives inside `predict` so a multi-eval solver re-runs it. FLUX.2 uses
-            // the Sigma convention but the model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
-            let latents = candle_gen::run_flow_sampler(
-                req.sampler.as_deref(),
-                TimestepConvention::Sigma,
-                &sigmas,
-                latents,
-                seed,
-                &req.cancel,
-                on_progress,
-                Some(&preview),
-                |latents, sigma| -> CResult<Tensor> {
-                    let ts = sigma * 1000.0;
-                    let current_eval = eval_idx;
-                    eval_idx += 1;
-                    let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
-                        canonical_solver,
-                        current_eval,
-                        total_steps,
-                    );
-                    let step_pag = pag
-                        .as_ref()
-                        .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
-                    let pag_layers = pag
-                        .as_ref()
-                        .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
-                    let out = if embedded_guidance {
-                        // dev: single forward feeding the embedded guidance scalar to the DiT.
-                        let pos = transformer.forward_with_memory_pag(
-                            latents,
-                            prompt_embeds,
-                            &img_ids,
-                            &txt_ids,
-                            ts,
-                            Some(guidance),
-                            attention_plan,
-                            transformer_window,
-                            &req.cancel,
-                            None,
-                        )?;
-                        if step_pag > 0.0 {
-                            let pert = transformer.forward_with_memory_pag(
+        run.images_with_denoise_phases(
+            on_progress,
+            |seed| {
+                let noise =
+                    pipeline::create_noise(&self.cfg, seed, phase0_w, phase0_h, &self.device)?;
+                match clean_init {
+                    Some(clean) => Ok(((clean * (1.0 - sigma_0))? + (&noise * sigma_0)?)?),
+                    None => Ok(noise),
+                }
+            },
+            |seed, latents, on_progress| {
+                let mut eval_idx = 0usize;
+                let preview = preview::hook(&req.preview, vae, lat_h, lat_w);
+                candle_gen::run_flow_sampler_spans(
+                    Some(run.plan().sampler()),
+                    TimestepConvention::Sigma,
+                    sigmas,
+                    &spans,
+                    Some(run),
+                    false,
+                    latents,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview),
+                    |latents, sigma| -> CResult<Tensor> {
+                        let ts = sigma * 1000.0;
+                        let current_eval = eval_idx;
+                        eval_idx += 1;
+                        let step_idx = candle_gen::gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        );
+                        let step_pag = pag
+                            .as_ref()
+                            .map_or(0.0, |p| p.step_scale(step_idx, total_steps));
+                        let pag_layers = pag
+                            .as_ref()
+                            .map_or(&[][..], |p| p.step_layers(step_idx, total_steps));
+                        let step_img_ids = match &phase0_img_ids {
+                            Some(ids) if latents.dim(1)? == phase0_tokens => ids.as_slice(),
+                            _ => img_ids.as_slice(),
+                        };
+                        let step_target_seq = step_img_ids.len();
+                        let out = if embedded_guidance {
+                            let pos = transformer.forward_with_memory_pag(
                                 latents,
                                 prompt_embeds,
-                                &img_ids,
+                                step_img_ids,
                                 &txt_ids,
                                 ts,
                                 Some(guidance),
                                 attention_plan,
                                 transformer_window,
                                 &req.cancel,
-                                Some((pag_layers, target_seq)),
+                                None,
                             )?;
-                            (&pos + ((&pos - &pert)? * step_pag as f64)?)?
-                        } else {
-                            pos
-                        }
-                    } else {
-                        let v = transformer.forward_with_memory_pag(
-                            latents,
-                            prompt_embeds,
-                            &img_ids,
-                            &txt_ids,
-                            ts,
-                            None,
-                            attention_plan,
-                            transformer_window,
-                            &req.cancel,
-                            None,
-                        )?;
-                        let base = match negative {
-                            Some(neg) => {
-                                let vn = transformer.forward_with_memory_pag(
+                            if step_pag > 0.0 {
+                                let pert = transformer.forward_with_memory_pag(
                                     latents,
-                                    neg,
-                                    &img_ids,
+                                    prompt_embeds,
+                                    step_img_ids,
                                     &txt_ids,
                                     ts,
-                                    None,
+                                    Some(guidance),
                                     attention_plan,
                                     transformer_window,
                                     &req.cancel,
-                                    None,
+                                    Some((pag_layers, step_target_seq)),
                                 )?;
-                                // vn + guidance·(v − vn)
-                                (&vn + ((&v - &vn)? * guidance as f64)?)?
+                                (&pos + ((&pos - &pert)? * step_pag as f64)?)?
+                            } else {
+                                pos
                             }
-                            None => v.clone(),
-                        };
-                        if step_pag > 0.0 {
-                            let v_pert = transformer.forward_with_memory_pag(
+                        } else {
+                            let v = transformer.forward_with_memory_pag(
                                 latents,
                                 prompt_embeds,
-                                &img_ids,
+                                step_img_ids,
                                 &txt_ids,
                                 ts,
                                 None,
                                 attention_plan,
                                 transformer_window,
                                 &req.cancel,
-                                Some((pag_layers, target_seq)),
+                                None,
                             )?;
-                            (&base + ((&v - &v_pert)? * step_pag as f64)?)?
-                        } else {
-                            base
-                        }
-                    };
-                    observe_consumed_guidance(guidance, embedded_guidance, negative.is_some());
-                    Ok(out)
-                },
-            )?;
-
-            on_progress(Progress::Decoding);
-            let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
-            let decoded = match pid_decoder {
-                // PiD consumes the packed BN-normalized [1,128,H/16,W/16] latent directly (the same
-                // tensor decode_packed BN-de-normalizes); returns [1,3,4H,4W].
-                Some(pid) => {
-                    candle_gen::ensure_decoder_layout(
-                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-                        pid,
-                    )?;
-                    pid.decode(&packed)?
-                }
-                None if req.memory.is_some_and(|memory| memory.tile_vae_decode) => {
-                    let memory = req.memory.expect("guarded above");
-                    vae.decode_packed_tiled(
-                        &packed,
-                        memory
-                            .decode_tile_edge
-                            .unwrap_or(memory_strategy::DECODE_TILE_EDGE),
-                        memory
-                            .decode_overlap
-                            .unwrap_or(memory_strategy::DECODE_OVERLAP),
-                    )?
-                }
-                None => vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
-            };
-            to_image(&decoded)
-        })
+                            let base = match negative {
+                                Some(neg) => {
+                                    let vn = transformer.forward_with_memory_pag(
+                                        latents,
+                                        neg,
+                                        step_img_ids,
+                                        &txt_ids,
+                                        ts,
+                                        None,
+                                        attention_plan,
+                                        transformer_window,
+                                        &req.cancel,
+                                        None,
+                                    )?;
+                                    (&vn + ((&v - &vn)? * guidance as f64)?)?
+                                }
+                                None => v.clone(),
+                            };
+                            if step_pag > 0.0 {
+                                let v_pert = transformer.forward_with_memory_pag(
+                                    latents,
+                                    prompt_embeds,
+                                    step_img_ids,
+                                    &txt_ids,
+                                    ts,
+                                    None,
+                                    attention_plan,
+                                    transformer_window,
+                                    &req.cancel,
+                                    Some((pag_layers, step_target_seq)),
+                                )?;
+                                (&base + ((&v - &v_pert)? * step_pag as f64)?)?
+                            } else {
+                                base
+                            }
+                        };
+                        observe_consumed_guidance(guidance, embedded_guidance, negative.is_some());
+                        Ok(out)
+                    },
+                )
+            },
+            |_seed, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
+                let decoded = match pid_decoder {
+                    Some(pid) => {
+                        candle_gen::ensure_decoder_layout(
+                            Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                            pid,
+                        )?;
+                        pid.decode(&packed)?
+                    }
+                    None if req.memory.is_some_and(|memory| memory.tile_vae_decode) => {
+                        let memory = req.memory.expect("guarded above");
+                        vae.decode_packed_tiled(
+                            &packed,
+                            memory
+                                .decode_tile_edge
+                                .unwrap_or(memory_strategy::DECODE_TILE_EDGE),
+                            memory
+                                .decode_overlap
+                                .unwrap_or(memory_strategy::DECODE_OVERLAP),
+                        )?
+                    }
+                    None => vae.decode_packed(&packed)?,
+                };
+                to_image(&decoded)
+            },
+        )
     }
 }
 
@@ -1572,7 +1599,201 @@ pub struct Flux2Generator {
     loaded_quant: Option<Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_admission: memory_strategy::Flux2AdmissionRegistry,
+    load_binding: Option<gen_core::RenderLoadBinding>,
 }
+
+impl Flux2Generator {
+    fn observe_loaded(&self) {
+        candle_gen::execution::unobserved_adapters(
+            self.pipe.adapters.len(),
+            "candle-gen-flux2/src/lib.rs",
+        );
+        candle_gen::execution::policy(
+            "loaded/loaded_quant",
+            format!("{:?}", self.loaded_quant).into(),
+        );
+        if self.pipe.comfyui_dit.is_some() {
+            candle_gen::execution::unavailable(
+                "candle-gen-flux2/src/lib.rs: imported ComfyUI DiT remapping and in-memory dequantization have no complete execution receipt",
+            );
+        }
+    }
+}
+
+pub(crate) fn base_schedule_for_request(
+    variant: Flux2Variant,
+    req: &GenerationRequest,
+) -> gen_core::Result<Vec<f32>> {
+    let steps = req
+        .steps
+        .map(|s| s as usize)
+        .unwrap_or(variant.default_steps() as usize);
+    let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), steps);
+    let native = pipeline::schedule(steps, req.width, req.height);
+    let mut sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )
+    .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    if req.source_image.is_some() {
+        let (_, truncated) = gen_core::resolve_img2img_truncated_schedule(&sigmas, req.strength)?;
+        sigmas = truncated;
+    }
+    Ok(sigmas)
+}
+
+pub(crate) fn validate_base_request(
+    variant: Flux2Variant,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    let id = variant.id();
+    let desc = descriptor(variant);
+    desc.capabilities.validate_request(id, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: prompt must not be empty"
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if req.low_res_start.is_some() || req.source_image.is_some() {
+        let sigmas = base_schedule_for_request(variant, req)?;
+        let executed_steps = sigmas.len().saturating_sub(1);
+        if let Some(spec) = &req.low_res_start {
+            spec.resolve_for_descriptor(&desc, req, executed_steps, SIZE_MULTIPLE)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn compile_base_plan(
+    variant: Flux2Variant,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    validate_base_request(variant, req)?;
+    let sigmas = base_schedule_for_request(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = req.guidance.unwrap_or(variant.default_guidance());
+    gen_core::RenderPlan::base_image(
+        &descriptor(variant),
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 128,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+pub fn compile_conditioned_plan(
+    variant: Flux2Variant,
+    descriptor: &ModelDescriptor,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: prompt must not be empty",
+            descriptor.id
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: steps must be >= 1",
+            descriptor.id
+        )));
+    }
+    let sigmas = base_schedule_for_request(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    if let Some(low_res) = &req.low_res_start {
+        low_res.resolve_for_descriptor(descriptor, req, executed_steps, SIZE_MULTIPLE)?;
+    }
+    let guidance = req.guidance.unwrap_or(variant.default_guidance());
+    gen_core::RenderPlan::packed_image_trajectory(
+        descriptor,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 128,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+    .map(|plan| plan.bind_load(spec))
+}
+
+fn validate_preload_pid(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    variant: Flux2Variant,
+) -> gen_core::Result<()> {
+    if !req.use_pid {
+        return Ok(());
+    }
+    if spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
+            variant.id()
+        )));
+    }
+    if req.pid_capture_sigma.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
+            variant.id()
+        )));
+    }
+    Ok(())
+}
+
+fn compile_klein_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_load_spec(Flux2Variant::Klein9b, spec)?;
+    validate_preload_pid(spec, req, Flux2Variant::Klein9b)?;
+    compile_base_plan(Flux2Variant::Klein9b, req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+fn compile_dev_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_load_spec(Flux2Variant::Dev, spec)?;
+    validate_preload_pid(spec, req, Flux2Variant::Dev)?;
+    compile_base_plan(Flux2Variant::Dev, req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+const KLEIN_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: config::FLUX2_KLEIN_9B_ID,
+    compile: compile_klein_plan,
+};
+
+const DEV_RENDER_PLAN: gen_core::RenderPlanRegistration = gen_core::RenderPlanRegistration {
+    provider_id: config::FLUX2_DEV_ID,
+    compile: compile_dev_plan,
+};
 
 impl Generator for Flux2Generator {
     fn generate_with_execution_report(
@@ -1581,19 +1802,19 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
-            candle_gen::execution::unobserved_adapters(
-                self.pipe.adapters.len(),
-                "candle-gen-flux2/src/lib.rs",
-            );
-            candle_gen::execution::policy(
-                "loaded/loaded_quant",
-                format!("{:?}", self.loaded_quant).into(),
-            );
-            if self.pipe.comfyui_dit.is_some() {
-                candle_gen::execution::unavailable(
-                    "candle-gen-flux2/src/lib.rs: imported ComfyUI DiT remapping and in-memory dequantization have no complete execution receipt",
-                );
-            }
+            self.observe_loaded();
+        })
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+            self.observe_loaded();
         })
     }
 
@@ -1668,25 +1889,7 @@ impl Generator for Flux2Generator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        let id = self.descriptor.id;
-        self.descriptor.capabilities.validate_request(id, req)?;
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
-            )));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        Ok(())
+        validate_base_request(self.pipe.variant, req)
     }
 
     fn generate(
@@ -1694,7 +1897,32 @@ impl Generator for Flux2Generator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("FLUX.2 base render produced no images".into()))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_base_plan(self.pipe.variant, req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        if let Some(loaded) = &self.load_binding {
+            plan.check_load(loaded)?;
+        }
         // Admission binds the caller's request, including its address. Consume it before
         // resolving defaults into an internal clone; that clone is not a second request.
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
@@ -1702,7 +1930,7 @@ impl Generator for Flux2Generator {
         // Resolve an omitted seed once for the whole request. The same value must drive both the
         // autoregressive caption sampler and diffusion so the persisted recipe is reproducible.
         let mut resolved_req = req.clone();
-        resolved_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
+        resolved_req.seed = Some(plan.base_seed());
         let req = &resolved_req;
         let stage_residency = req
             .memory
@@ -1740,40 +1968,42 @@ impl Generator for Flux2Generator {
         *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
         *candle_gen::lock_recover(&self.bounded_host_decode) =
             req.memory.is_some_and(|memory| memory.tile_vae_decode);
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let images = self.residency.run_request_scoped(
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text| self.pipe.encode_phase(text, req),
+            |text| {
+                if req.use_pid || req.source_image.is_some() {
+                    run.begin_conditioning()?;
+                    self.pipe.encode_phase(text, req, plan.guidance())
+                } else {
+                    run.encode(|| {
+                        let encoded = self.pipe.encode_phase(text, req, plan.guidance())?;
+                        self.pipe.device.synchronize()?;
+                        Ok::<_, candle_gen::CandleError>(encoded)
+                    })
+                }
+            },
             |_| Ok(self.pipe.device.synchronize()?),
             |heavy, encoded, on_progress| {
-                let result = self.pipe.render_phase(heavy, req, encoded, on_progress);
+                let result = self.pipe.render_phase(heavy, req, &run, encoded, on_progress);
                 candle_gen::synchronize_result(&self.pipe.device, result)
             },
         );
         *candle_gen::lock_recover(&self.bounded_host_decode) = false;
         *candle_gen::lock_recover(&self.stream_cancel) = gen_core::CancelFlag::default();
         let images = images?;
-        Ok(GenerationOutput::Images(images))
-    }
-
-    fn generate_with_report(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<gen_core::GenerationReport> {
-        let output = self.generate(req, on_progress)?;
-        let steps = req
-            .steps
-            .unwrap_or_else(|| self.pipe.variant.default_steps());
-        let mut report = gen_core::GenerationReport::from_output(output);
+        let steps = plan.denoise_sigmas().len().saturating_sub(1) as u32;
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
         report.pag = self
             .descriptor
             .capabilities
             .resolve_pag(self.descriptor.id, req)?
             .map(|p| p.execution_report(steps));
+        report.low_res_start = plan.low_res_start_execution_report("f32", 4, "base_dit")?;
         Ok(report)
     }
 }
@@ -1827,6 +2057,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // control descriptors remain false and fail closed before loading weights.
             supports_prompt_enhancement: variant.is_dev(),
             pag: Some(variant.pag_capability()),
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -1924,6 +2155,7 @@ fn generator_from_pipeline(
         loaded_quant,
         memory_strategy,
         memory_admission: memory_strategy::Flux2AdmissionRegistry::new(variant.id()),
+        load_binding: memory_spec.map(gen_core::RenderLoadBinding::from_spec),
     })
 }
 
@@ -2110,6 +2342,39 @@ pub fn register_providers(
     let registry = registry
         .register_generator(KLEIN_REGISTRATION)
         .register_generator(DEV_REGISTRATION)
+        .register_render_plan(KLEIN_RENDER_PLAN)
+        .register_render_plan(DEV_RENDER_PLAN)
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: sc20686_observer::PRODUCT_ROUTE_ID,
+            parent_provider_id: Some(config::FLUX2_KLEIN_9B_ID),
+            descriptor: || edit_provider::edit_report_descriptor(Flux2Variant::Klein9b),
+            render_plan: Some(gen_core::RenderPlanRegistration {
+                provider_id: sc20686_observer::PRODUCT_ROUTE_ID,
+                compile: |spec, req| {
+                    edit_provider::compile_edit_feature_route(Flux2Variant::Klein9b, spec, req)
+                },
+            }),
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: config::FLUX2_DEV_EDIT_ID,
+            parent_provider_id: Some(config::FLUX2_DEV_ID),
+            descriptor: || edit_provider::edit_report_descriptor(Flux2Variant::Dev),
+            render_plan: Some(gen_core::RenderPlanRegistration {
+                provider_id: config::FLUX2_DEV_EDIT_ID,
+                compile: |spec, req| {
+                    edit_provider::compile_edit_feature_route(Flux2Variant::Dev, spec, req)
+                },
+            }),
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: config::FLUX2_DEV_CONTROL_ID,
+            parent_provider_id: Some(config::FLUX2_DEV_ID),
+            descriptor: control_provider::control_report_descriptor,
+            render_plan: Some(gen_core::RenderPlanRegistration {
+                provider_id: config::FLUX2_DEV_CONTROL_ID,
+                compile: control_provider::compile_control_feature_route,
+            }),
+        })
         .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
             route_id: config::FLUX2_DEV_CONTROL_ID,
             provider_id: config::FLUX2_DEV_ID,
@@ -2221,6 +2486,90 @@ mod explicit_registry_tests {
             registry.provider_encoder_contract("flux2_dev_control_typo"),
             None
         );
+    }
+
+    #[test]
+    fn sw6945_candle_flux2_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{
+            Conditioning, ControlKind, FeatureInapplicabilityCode, GenerationRequest, Image,
+            LoadSpec, LowResStartSpec, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        for t2i_id in [super::config::FLUX2_KLEIN_9B_ID, super::config::FLUX2_DEV_ID] {
+            let app = &all_features[t2i_id]["low_res_start"];
+            assert!(app.applicable, "candle {t2i_id} must support low_res_start");
+        }
+        for edit_id in [
+            super::sc20686_observer::PRODUCT_ROUTE_ID,
+            super::config::FLUX2_DEV_EDIT_ID,
+        ] {
+            let app = &all_features[edit_id]["low_res_start"];
+            assert!(
+                !app.applicable,
+                "candle {edit_id} must refuse low_res_start"
+            );
+            assert!(app.reasons.iter().any(|r| {
+                r.code == FeatureInapplicabilityCode::ConflictsWithPass0EditConditioning
+            }));
+        }
+        let ctrl_app = &all_features[super::config::FLUX2_DEV_CONTROL_ID]["low_res_start"];
+        assert!(!ctrl_app.applicable);
+        assert!(ctrl_app.reasons.iter().any(|r| {
+            r.code == FeatureInapplicabilityCode::ConflictsWithPass0ControlConditioning
+        }));
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let req = GenerationRequest {
+            prompt: "a lighthouse".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(42),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(super::config::FLUX2_KLEIN_9B_ID, &spec, &req)
+            .unwrap()
+            .expect("flux2_klein_9b render plan");
+        assert_eq!(plan.denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(plan.phase_output_size(0), (256, 256));
+        assert_eq!(plan.phase_output_size(1), (512, 512));
+
+        let src_img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128; 64 * 64 * 3],
+        };
+        let edit_req = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: src_img.clone(),
+                strength: None,
+            }],
+            ..req.clone()
+        };
+        assert!(super::edit_provider::compile_edit_feature_route(
+            super::Flux2Variant::Klein9b,
+            &spec,
+            &edit_req
+        )
+        .is_err());
+
+        let ctrl_spec = spec
+            .clone()
+            .with_control(WeightsSource::File("/nonexistent/ctrl.safetensors".into()));
+        let ctrl_req = GenerationRequest {
+            conditioning: vec![Conditioning::Control {
+                image: src_img,
+                kind: ControlKind::Pose,
+                scale: Some(0.75),
+            }],
+            ..req
+        };
+        assert!(super::control_provider::compile_control_feature_route(&ctrl_spec, &ctrl_req)
+            .is_err());
     }
 }
 

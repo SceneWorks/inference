@@ -389,44 +389,114 @@ pub fn run_curated_sampler_with_phase_transition_spans(
                         let (x0_low, source) = boundary_state
                             .into_clean_estimate()
                             .map_err(CandleError::from)?;
-                        let (b_sz, _low_tokens, packed_channels) = x0_low.dims3()?;
-                        let patch_size = 2usize;
-                        let vae_spatial_scale = 8usize;
-                        let channels = packed_channels / (patch_size * patch_size);
-                        let packed_f32: Vec<f32> = x0_low
-                            .to_dtype(candle_core::DType::F32)?
-                            .flatten_all()?
-                            .to_vec1()?;
                         let base_seed = run.plan().base_seed();
                         let output_index = seed.wrapping_sub(base_seed) as u32;
                         let pass_index = run.plan().pass_index();
-                        let repacked = gen_core::transition_packed_clean_estimate_f32(
-                            gen_core::BoundaryState::CleanEstimate {
-                                latent: &packed_f32,
-                                source,
-                            },
-                            b_sz,
-                            channels,
-                            patch_size as u32,
-                            vae_spatial_scale as u32,
-                            &low_res_plan,
-                            sigma_k,
-                            ms,
-                            base_seed,
-                            output_index,
-                            pass_index,
-                            0,
-                        )
-                        .map_err(CandleError::from)?;
-                        let full_tokens = ((low_res_plan.full_height as usize)
-                            / (vae_spatial_scale * patch_size))
-                            * ((low_res_plan.full_width as usize)
-                                / (vae_spatial_scale * patch_size));
-                        let transitioned = Tensor::from_vec(
-                            repacked,
-                            (b_sz, full_tokens, packed_channels),
-                            x0_low.device(),
-                        )?;
+                        let low_f32: Vec<f32> = x0_low
+                            .to_dtype(candle_core::DType::F32)?
+                            .flatten_all()?
+                            .to_vec1()?;
+                        let transitioned = match x0_low.dims() {
+                            &[b_sz, _low_tokens, packed_channels] => {
+                                let patch_size = 2usize;
+                                let vae_spatial_scale = 8usize;
+                                let channels = packed_channels / (patch_size * patch_size);
+                                let repacked = gen_core::transition_packed_clean_estimate_f32(
+                                    gen_core::BoundaryState::CleanEstimate {
+                                        latent: &low_f32,
+                                        source,
+                                    },
+                                    b_sz,
+                                    channels,
+                                    patch_size as u32,
+                                    vae_spatial_scale as u32,
+                                    &low_res_plan,
+                                    sigma_k,
+                                    ms,
+                                    base_seed,
+                                    output_index,
+                                    pass_index,
+                                    0,
+                                )
+                                .map_err(CandleError::from)?;
+                                let full_tokens = ((low_res_plan.full_height as usize)
+                                    / (vae_spatial_scale * patch_size))
+                                    * ((low_res_plan.full_width as usize)
+                                        / (vae_spatial_scale * patch_size));
+                                Tensor::from_vec(
+                                    repacked,
+                                    (b_sz, full_tokens, packed_channels),
+                                    x0_low.device(),
+                                )?
+                            }
+                            &[b_sz, channels, low_h, _low_w] => {
+                                let vae_spatial_scale =
+                                    ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
+                                let noised = gen_core::transition_clean_estimate_f32(
+                                    gen_core::BoundaryState::CleanEstimate {
+                                        latent: &low_f32,
+                                        source,
+                                    },
+                                    b_sz,
+                                    channels,
+                                    vae_spatial_scale as u32,
+                                    &low_res_plan,
+                                    sigma_k,
+                                    ms,
+                                    base_seed,
+                                    output_index,
+                                    pass_index,
+                                    0,
+                                )
+                                .map_err(CandleError::from)?;
+                                let full_h =
+                                    (low_res_plan.full_height as usize) / vae_spatial_scale;
+                                let full_w =
+                                    (low_res_plan.full_width as usize) / vae_spatial_scale;
+                                Tensor::from_vec(
+                                    noised,
+                                    (b_sz, channels, full_h, full_w),
+                                    x0_low.device(),
+                                )?
+                            }
+                            &[b_sz, channels, 1, low_h, _low_w] => {
+                                let vae_spatial_scale =
+                                    ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
+                                let noised = gen_core::transition_clean_estimate_f32(
+                                    gen_core::BoundaryState::CleanEstimate {
+                                        latent: &low_f32,
+                                        source,
+                                    },
+                                    b_sz,
+                                    channels,
+                                    vae_spatial_scale as u32,
+                                    &low_res_plan,
+                                    sigma_k,
+                                    ms,
+                                    base_seed,
+                                    output_index,
+                                    pass_index,
+                                    0,
+                                )
+                                .map_err(CandleError::from)?;
+                                let full_h =
+                                    (low_res_plan.full_height as usize) / vae_spatial_scale;
+                                let full_w =
+                                    (low_res_plan.full_width as usize) / vae_spatial_scale;
+                                Tensor::from_vec(
+                                    noised,
+                                    (b_sz, channels, 1, full_h, full_w),
+                                    x0_low.device(),
+                                )?
+                            }
+                            other => {
+                                return Err(CandleError::from(gen_core::Error::Unsupported(
+                                    format!(
+                                        "low_res_start transition does not support latent shape {other:?}"
+                                    ),
+                                )))
+                            }
+                        };
                         out = if x0_low.dtype() == candle_core::DType::F32 {
                             transitioned
                         } else {

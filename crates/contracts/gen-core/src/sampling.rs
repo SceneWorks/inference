@@ -333,7 +333,8 @@ pub fn image_seq_len(width: u32, height: u32) -> usize {
 }
 
 /// Port of the fork's `_compute_empirical_mu`: a piecewise-linear fit of the time-shift `mu`
-/// from the latent sequence length and step count.
+/// from the latent sequence length and step count (`f32` intermediate precision, matching MLX
+/// FLUX.2 and Lens).
 //  Constants mirror the fork's Python float64 literals verbatim (8.73809524e-05 / 1.89833333 /
 //  0.00016927 / 0.45666666) for parity auditing; f32 rounds the extra digits harmlessly.
 #[allow(clippy::excessive_precision)]
@@ -349,6 +350,36 @@ pub fn compute_mu(image_seq_len: usize, num_steps: usize) -> f32 {
     let a = (m_200 - m_10) / 190.0;
     let b = m_200 - 200.0 * a;
     a * num_steps as f32 + b
+}
+
+/// Port of the fork's `_compute_empirical_mu` evaluated in `f64` and rounded once to `f32`
+/// (sc-27383, preserving Candle FLUX.2 schedule bit-exactness).
+#[allow(clippy::excessive_precision)]
+pub fn compute_mu_f64(image_seq_len: usize, num_steps: usize) -> f32 {
+    let (a1, b1) = (8.738_095_24e-05_f64, 1.898_333_33_f64);
+    let (a2, b2) = (0.000_169_27_f64, 0.456_666_66_f64);
+    let seq = image_seq_len as f64;
+    if image_seq_len > 4300 {
+        return (a2 * seq + b2) as f32;
+    }
+    let m_200 = a2 * seq + b2;
+    let m_10 = a1 * seq + b1;
+    let a = (m_200 - m_10) / 190.0;
+    let b = m_200 - 200.0 * a;
+    (a * num_steps as f64 + b) as f32
+}
+
+/// Starting step index for img2img noise-blend / truncated schedules:
+/// `max(usize(num_steps * clamp(strength, 0.0, 1.0)), 1)` when `strength > 0.0`, else `0`.
+///
+/// Mirrors the mflux fork's `Config.init_time_step`: `strength` is the fraction of initial steps
+/// skipped (so `0.3` skips the first 30% of the schedule and runs the remaining 70%). Any positive
+/// `strength` skips at least 1 step.
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => ((num_steps as f32 * s.clamp(0.0, 1.0)) as usize).max(1),
+        _ => 0,
+    }
 }
 
 /// `exp(mu) / (exp(mu) + (1/t - 1))` — the fork's `_time_shift_exponential_array` at
@@ -379,6 +410,347 @@ pub fn build_flow_sigmas(num_steps: usize, mu: f32) -> Vec<f32> {
         .collect();
     sigmas.push(0.0);
     sigmas
+}
+
+/// Build the FLUX.2 native flow-match sigma schedule with `f32` empirical-mu and linspace math
+/// (matching the MLX FLUX.2 schedule).
+pub fn flux2_sigmas_f32(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
+    let mu = compute_mu(image_seq_len(width, height), num_steps);
+    build_flow_sigmas(num_steps, mu)
+}
+
+/// Build the FLUX.2 native flow-match sigma schedule with `f64` empirical-mu and linspace math
+/// rounded to `f32` per entry (sc-27383, matching the Candle FLUX.2 schedule bit-for-bit).
+pub fn flux2_sigmas_f64(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
+    let n = num_steps.max(1);
+    let mu = compute_mu_f64(image_seq_len(width, height), n);
+    let e = (mu as f64).exp();
+    let (start, end) = (1.0_f64, 1.0 / n as f64);
+    let mut sigmas: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = if n == 1 {
+                start
+            } else {
+                start + (end - start) * (i as f64) / ((n - 1) as f64)
+            };
+            (e / (e + (1.0 / t - 1.0))) as f32
+        })
+        .collect();
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// Lens empirical `mu` shift for a `(latent_h, latent_w)` token grid and `num_steps`.
+pub fn lens_mu(num_steps: usize, latent_h: usize, latent_w: usize) -> f32 {
+    compute_mu(latent_h * latent_w, num_steps.max(1))
+}
+
+/// Lens native flow-match sigma schedule (`num_steps + 1` entries, descending, trailing `0.0`).
+pub fn lens_sigmas(num_steps: usize, latent_h: usize, latent_w: usize) -> Vec<f32> {
+    let n = num_steps.max(1);
+    build_flow_sigmas(n, lens_mu(n, latent_h, latent_w))
+}
+
+/// Lens per-step model timesteps (the shifted sigmas without the terminal `0.0`).
+pub fn lens_timesteps(sigmas: &[f32]) -> Vec<f32> {
+    sigmas[..sigmas.len().saturating_sub(1)].to_vec()
+}
+
+/// Anima static flow-match time-shift (`FlowMatchEulerDiscreteScheduler(shift=3.0)`).
+pub const ANIMA_SIGMA_SHIFT: f32 = 3.0;
+
+/// Anima native flow-match sigma schedule: `linspace(1.0, 1/N, N)` time-shifted by static
+/// `shift = 3.0` (`3σ / (1 + 2σ)`), with a trailing terminal `0.0` (length `N + 1`, descending).
+pub fn anima_sigmas(steps: usize) -> Vec<f32> {
+    let n = steps.max(1);
+    let shift = ANIMA_SIGMA_SHIFT as f64;
+    let mut sigmas: Vec<f32> = (0..n)
+        .map(|i| {
+            let s = if n == 1 {
+                1.0
+            } else {
+                1.0 + (i as f64) * (1.0 / n as f64 - 1.0) / ((n - 1) as f64)
+            };
+            (shift * s / (1.0 + (shift - 1.0) * s)) as f32
+        })
+        .collect();
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// Chroma1-Base's `use_beta_sigmas=true` schedule (`FlowMatchEulerDiscreteScheduler`,
+/// `beta_alpha = 0.6`, `beta_beta = 0.6`, `shift = 1.0`).
+///
+/// Mirrors diffusers' `_convert_to_beta`:
+/// `sigma_i = sigma_min + betappf(1 - i/(N-1), 0.6, 0.6) * (sigma_max - sigma_min)`
+/// with `sigma_max = 1.0`, `sigma_min = 1.0 / N`, plus a trailing `0.0`.
+pub fn chroma_base_sigmas(steps: usize) -> Vec<f32> {
+    let n = steps.max(1);
+    let smin = 1.0 / n as f64;
+    let smax = 1.0;
+    let mut out = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        let lin = if n == 1 {
+            0.0
+        } else {
+            i as f64 / (n - 1) as f64
+        };
+        let ppf = chroma_beta_ppf(1.0 - lin);
+        out.push((smin + ppf * (smax - smin)) as f32);
+    }
+    out.push(0.0);
+    out
+}
+
+/// `lgamma(α+β) − lgamma(α) − lgamma(β)` for α=β=0.6 (the `I_x` prefactor exponent constant).
+const CHROMA_LGAMMA_AB: f64 = -0.8818418061417858;
+const CHROMA_BETA_A: f64 = 0.6;
+
+fn chroma_betacf(x: f64) -> f64 {
+    let (a, b) = (CHROMA_BETA_A, CHROMA_BETA_A);
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let tiny = 1e-30;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < tiny {
+        d = tiny;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..300 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        let mut aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-13 {
+            break;
+        }
+    }
+    h
+}
+
+fn chroma_beta_cdf(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let bt = (CHROMA_LGAMMA_AB + CHROMA_BETA_A * x.ln() + CHROMA_BETA_A * (1.0 - x).ln()).exp();
+    if x < (CHROMA_BETA_A + 1.0) / (2.0 * CHROMA_BETA_A + 2.0) {
+        bt * chroma_betacf(x) / CHROMA_BETA_A
+    } else {
+        1.0 - bt * chroma_betacf(1.0 - x) / CHROMA_BETA_A
+    }
+}
+
+/// Inverse regularized incomplete beta `I_p⁻¹(0.6, 0.6)` via bisection (monotone CDF).
+pub fn chroma_beta_ppf(p: f64) -> f64 {
+    if p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if chroma_beta_cdf(mid) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// FLUX.1 resolution-dependent shift `mu(seq_len)` = linear interpolation between
+/// `(256, base_shift)` and `(4096, max_shift)` (`calculate_shift` in diffusers `FluxPipeline`).
+pub fn flux1_flow_mu(seq_len: usize, base_shift: f64, max_shift: f64) -> f32 {
+    let m = (max_shift - base_shift) / (4096.0 - 256.0);
+    let b = base_shift - m * 256.0;
+    (seq_len as f64 * m + b) as f32
+}
+
+/// Qwen-Image dynamic time-shift `mu` for a given pixel `(width, height)`.
+///
+/// Linearly interpolates `[base_shift = 0.5, max_shift = 0.9]` over `(width * height) / 256.0`
+/// in `[base_seq_len = 256.0, max_seq_len = 8192.0]` (matching the fork's `ModelConfig.qwen_image`).
+pub fn qwen_mu(width: u32, height: u32) -> f32 {
+    const SIGMA_BASE_SEQ_LEN: f32 = 256.0;
+    const SIGMA_MAX_SEQ_LEN: f32 = 8192.0;
+    const SIGMA_BASE_SHIFT: f32 = 0.5;
+    const SIGMA_MAX_SHIFT: f32 = 0.9;
+    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
+    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
+    m * (width as f32 * height as f32 / 256.0) + b
+}
+
+/// Qwen-Image native flow-match sigma schedule (`linspace(1.0, 1/N, N)` shifted by `qwen_mu`
+/// with terminal-sigma rescale to `0.02`, plus a trailing `0.0`).
+pub fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
+    const SIGMA_SHIFT_TERMINAL: f32 = 0.02;
+    let n = num_steps.max(2);
+    let (start, end) = (1.0_f32, 1.0_f32 / n as f32);
+    let linspace: Vec<f32> = (0..n)
+        .map(|i| start + (end - start) * (i as f32) / ((n - 1) as f32))
+        .collect();
+    let mu = qwen_mu(width, height);
+    let e = mu.exp();
+    let mut shifted: Vec<f32> = linspace
+        .iter()
+        .map(|&s| e / (e + (1.0 / s - 1.0)))
+        .collect();
+    let one_minus: Vec<f32> = shifted.iter().map(|&s| 1.0 - s).collect();
+    let scale = one_minus[one_minus.len() - 1] / (1.0 - SIGMA_SHIFT_TERMINAL);
+    for (s, om) in shifted.iter_mut().zip(&one_minus) {
+        *s = 1.0 - om / scale;
+    }
+    shifted.push(0.0);
+    shifted
+}
+
+/// Qwen-Image-Lightning schedule (`shift_terminal = None`, static `exp(mu) = 3.0` over
+/// `linspace(1.0, 1/1000, n)`, trailing `0.0`).
+pub fn qwen_lightning_sigmas(num_steps: usize) -> Vec<f32> {
+    const LIGHTNING_SHIFT: f32 = 3.0;
+    const LIGHTNING_NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
+    let n = num_steps.max(1);
+    let e = LIGHTNING_SHIFT;
+    let sigma_min = 1.0 / LIGHTNING_NUM_TRAIN_TIMESTEPS;
+    let mut sigmas: Vec<f32> = (0..n)
+        .map(|i| {
+            let s = if n == 1 {
+                1.0
+            } else {
+                1.0 + (sigma_min - 1.0) * (i as f32) / ((n - 1) as f32)
+            };
+            e / (e + (1.0 / s - 1.0))
+        })
+        .collect();
+    sigmas.push(0.0);
+    sigmas
+}
+
+/// SD3 flow-match sigma schedule: `linspace(1, 1/steps, steps)` passed through
+/// `shift * sigma / (1 + (shift - 1) * sigma)` with a trailing `0.0`.
+pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
+    let steps = steps.max(1);
+    let min_sigma = 1.0 / steps as f32;
+    let mut out: Vec<f32> = (0..steps)
+        .map(|i| {
+            let frac = if steps == 1 {
+                0.0
+            } else {
+                i as f32 / (steps - 1) as f32
+            };
+            let sigma = 1.0 - frac * (1.0 - min_sigma);
+            if sigma == 1.0 {
+                1.0
+            } else {
+                shift * sigma / (1.0 + (shift - 1.0) * sigma)
+            }
+        })
+        .collect();
+    out.push(0.0);
+    out
+}
+
+/// SANA flow-match sigma schedule (`build_flow_sigmas(steps, ln(3))`), optionally reshaped by a
+/// curated scheduler over `mu = ln(3)`.
+pub fn sana_sigmas(scheduler_name: Option<&str>, steps: usize) -> Vec<f32> {
+    const SCHEDULE_SHIFT: f32 = 3.0;
+    let mu = SCHEDULE_SHIFT.ln();
+    let native = build_flow_sigmas(steps, mu);
+    let Some(sched) = scheduler_name.and_then(crate::sampling::schedulers::Scheduler::from_name)
+    else {
+        return native;
+    };
+    let ms = crate::sampling::model_sampling::FlowModelSampling::with_shift(
+        TimestepConvention::Sigma,
+        mu,
+    );
+    schedule_sigmas(sched, &ms, steps)
+}
+
+/// Boogu v1 `_time_shift_v1(t, mu, sigma=1.0)`: `t1 = clamp(1 - t, 1e-8, 1 - 1e-8)`;
+/// `y = e^mu / (e^mu + (1/t1 - 1))`; returns `1 - y`.
+pub fn time_shift_v1(t: f64, mu: f64) -> f64 {
+    let eps = 1e-8;
+    let t1 = (1.0 - t).clamp(eps, 1.0 - eps);
+    let num = mu.exp();
+    let denom = num + (1.0 / t1 - 1.0);
+    1.0 - num / denom
+}
+
+/// Boogu v1 linear `mu` from latent sequence length (`256 -> 0.5, 4096 -> 1.15`).
+pub fn boogu_lin_mu(seq_len: f64) -> f64 {
+    let (x1, y1, x2, y2) = (256.0, 0.5, 4096.0, 1.15);
+    let m = (y2 - y1) / (x2 - x1);
+    let b = y1 - m * x1;
+    m * seq_len + b
+}
+
+/// Boogu v1 static-shifted clean-fraction timestep schedule plus trailing `1.0` (`steps + 1` points).
+pub fn boogu_timesteps_v1(steps: usize) -> Vec<f64> {
+    let mu = boogu_lin_mu(4096.0);
+    let mut ts: Vec<f64> = (0..steps)
+        .map(|i| time_shift_v1(i as f64 / steps as f64, mu))
+        .collect();
+    ts.push(1.0);
+    ts
+}
+
+/// Boogu Base/Edit native sigma schedule (noise-fraction, descending to trailing `0.0`):
+/// `sigma_i = 1 - ts_i` over [`boogu_timesteps_v1`].
+pub fn boogu_base_sigmas(steps: usize) -> Vec<f32> {
+    boogu_timesteps_v1(steps)
+        .iter()
+        .map(|&t| 1.0 - t as f32)
+        .collect()
+}
+
+/// Boogu Turbo DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps + 1)[:-1]` —
+/// `steps` ascending clean-fraction sigmas from `conditioning_sigma` toward (excluding) `1.0`.
+pub fn boogu_dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
+    let span = 1.0 - conditioning_sigma;
+    (0..steps)
+        .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
+        .collect()
+}
+
+/// Boogu Turbo DMD grid as a noise-fraction schedule: `1 - c_i` for each [`boogu_dmd_sigmas`]
+/// entry (descending), plus trailing `0.0`.
+pub fn boogu_turbo_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
+    let mut s: Vec<f32> = boogu_dmd_sigmas(conditioning_sigma, steps)
+        .iter()
+        .map(|&c| 1.0 - c)
+        .collect();
+    s.push(0.0);
+    s
 }
 
 /// A PiD **`from_ldm` early-stop** capture plan (epic 7840, sc-7993): how far to denoise before
@@ -1390,5 +1762,79 @@ mod tests {
             canonical_solver_or_euler(Some("dpmpp_sde")),
             Solver::DpmppSde
         );
+    }
+
+    #[test]
+    fn shared_image_schedules_and_init_time_step_preserve_family_goldens() {
+        // init_time_step
+        assert_eq!(init_time_step(4, None), 0);
+        assert_eq!(init_time_step(4, Some(0.0)), 0);
+        assert_eq!(init_time_step(4, Some(-0.5)), 0);
+        assert_eq!(init_time_step(4, Some(0.1)), 1);
+        assert_eq!(init_time_step(4, Some(0.5)), 2);
+        assert_eq!(init_time_step(4, Some(0.8)), 3);
+        assert_eq!(init_time_step(4, Some(2.0)), 4);
+
+        // FLUX.2 compute_mu / compute_mu_f64 / flux2_sigmas_f32 / flux2_sigmas_f64
+        let mu_f32 = compute_mu(4096, 4);
+        let mu_f64 = compute_mu_f64(4096, 4);
+        assert!((mu_f32 - 2.291_179_9).abs() < 1e-5);
+        assert!((mu_f64 - 2.291_179_9).abs() < 1e-5);
+        let f2_32 = flux2_sigmas_f32(4, 1024, 1024);
+        let f2_64 = flux2_sigmas_f64(4, 1024, 1024);
+        assert_eq!(f2_32.len(), 5);
+        assert_eq!(f2_64.len(), 5);
+        assert_eq!(f2_32[0], 1.0);
+        assert_eq!(f2_32[4], 0.0);
+        assert_eq!(f2_64[0], 1.0);
+        assert_eq!(f2_64[4], 0.0);
+
+        // Lens schedule
+        let lens = lens_sigmas(8, 64, 64);
+        assert_eq!(lens.len(), 9);
+        assert_eq!(lens[0], 1.0);
+        assert_eq!(lens[8], 0.0);
+        assert_eq!(lens_timesteps(&lens).len(), 8);
+
+        // Anima schedule (shift=3.0)
+        let anima = anima_sigmas(4);
+        assert_eq!(anima.len(), 5);
+        assert_eq!(anima[0], 1.0);
+        assert_eq!(anima[4], 0.0);
+        assert!((anima[3] - 0.5).abs() < 1e-6);
+
+        // Chroma Base beta schedule
+        let chroma = chroma_base_sigmas(8);
+        let want8 = [
+            1.0, 0.937751, 0.810255, 0.648749, 0.476251, 0.314745, 0.187249, 0.125, 0.0,
+        ];
+        assert_eq!(chroma.len(), 9);
+        for (g, w) in chroma.iter().zip(want8) {
+            assert!((g - w).abs() < 1e-4, "chroma N=8: {g} vs {w}");
+        }
+
+        // Qwen production & lightning schedules
+        let q_prod = qwen_sigmas(8, 1024, 1024);
+        assert_eq!(q_prod.len(), 9);
+        assert_eq!(q_prod[0], 1.0);
+        assert!((q_prod[7] - 0.02).abs() < 1e-5);
+        assert_eq!(q_prod[8], 0.0);
+        let q_light = qwen_lightning_sigmas(4);
+        assert_eq!(q_light.len(), 5);
+        assert!((q_light[1] - 0.857_326_5).abs() < 1e-5);
+        assert!((q_light[3] - 0.002_994_012).abs() < 1e-5);
+
+        // Boogu v1 & DMD/Turbo schedules
+        let b_base = boogu_base_sigmas(10);
+        assert_eq!(b_base.len(), 11);
+        assert_eq!(b_base[0], 1.0);
+        assert_eq!(b_base[10], 0.0);
+        let b_dmd = boogu_dmd_sigmas(0.001, 4);
+        assert_eq!(b_dmd.len(), 4);
+        assert!((b_dmd[0] - 0.001).abs() < 1e-6);
+        let b_turbo = boogu_turbo_sigmas(0.001, 4);
+        assert_eq!(b_turbo.len(), 5);
+        assert!((b_turbo[0] - 0.999).abs() < 1e-6);
+        assert_eq!(b_turbo[4], 0.0);
     }
 }

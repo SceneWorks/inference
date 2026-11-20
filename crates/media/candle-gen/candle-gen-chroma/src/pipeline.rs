@@ -284,128 +284,142 @@ impl Pipeline {
         candle_gen::load_sorted_mmap(dir, dtype, &self.device, "chroma")
     }
 
-    /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
-    /// `req.cancel`. One image per `req.count` (each at seed `base_seed + index`).
-    pub(crate) fn render(
+    pub(crate) fn render_planned(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         components: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let guidance = req
-            .true_cfg
-            .unwrap_or_else(|| self.variant.default_true_cfg());
+        let guidance = run.plan().guidance();
         candle_gen::execution::policy("chroma/pipeline/guidance", format!("{guidance:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.plan().base_seed();
 
-        let sigmas = self.sigmas(steps);
-
-        // Encode the prompt(s) once for the whole batch (seed- and image-independent). The negative
-        // branch is skipped entirely when guidance ≤ 1 (Flash single-forward) — bit-exact `pred = pos`.
-        let (pos_embeds, neg) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let pos_embeds = self.encode(components, &req.prompt)?;
-                let neg = if guidance > 1.0 {
-                    Some(self.encode(components, negative)?)
-                } else {
-                    None
-                };
-                Ok((pos_embeds, neg))
-            },
-        )?;
-        let h2 = (req.height as usize).div_ceil(16);
-        let w2 = (req.width as usize).div_ceil(16);
-        let rope_pos = rope::build_for(&components.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
-        let rope_neg = match &neg {
-            Some(n) => Some(rope::build_for(
-                &components.cfg,
-                n.dim(1)?,
-                h2,
-                w2,
-                &self.device,
-            )?),
-            None => None,
+        let (pos_embeds, neg, pid_decoder) = if req.use_pid {
+            run.begin_conditioning().map_err(CandleError::from)?;
+            let (pos_embeds, neg) = candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let pos_embeds = self.encode(components, &req.prompt)?;
+                    let neg = if guidance > 1.0 {
+                        Some(self.encode(components, negative)?)
+                    } else {
+                        None
+                    };
+                    Ok((pos_embeds, neg))
+                },
+            )?;
+            let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+                components.pid.as_deref(),
+                req,
+                base_seed,
+                self.variant.id(),
+            )?;
+            self.device.synchronize()?;
+            run.end_conditioning().map_err(CandleError::from)?;
+            (pos_embeds, neg, pid_decoder)
+        } else {
+            let (pos_embeds, neg) = run.encode(|| {
+                let encoded = candle_gen::gen_core::with_prompt_encoding(
+                    on_progress,
+                    || -> std::result::Result<_, candle_gen::CandleError> {
+                        let pos_embeds = self.encode(components, &req.prompt)?;
+                        let neg = if guidance > 1.0 {
+                            Some(self.encode(components, negative)?)
+                        } else {
+                            None
+                        };
+                        Ok((pos_embeds, neg))
+                    },
+                )?;
+                self.device.synchronize()?;
+                Ok::<_, candle_gen::CandleError>(encoded)
+            })?;
+            (pos_embeds, neg, None)
         };
 
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native FLUX-lineage VAE decode. Shared across `count` images (same prompt).
-        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
-            components.pid.as_deref(),
-            req,
-            base_seed,
-            self.variant.id(),
-        )?;
+        let build_ropes =
+            |w: u32, h: u32| -> Result<(rope::RopeTable, Option<rope::RopeTable>)> {
+                let h2 = (h as usize).div_ceil(16);
+                let w2 = (w as usize).div_ceil(16);
+                let rope_pos =
+                    rope::build_for(&components.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
+                let rope_neg = match &neg {
+                    Some(n) => Some(rope::build_for(
+                        &components.cfg,
+                        n.dim(1)?,
+                        h2,
+                        w2,
+                        &self.device,
+                    )?),
+                    None => None,
+                };
+                Ok((rope_pos, rope_neg))
+            };
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let (full_w, full_h) = run.plan().output_size();
+        let phase0_ropes = build_ropes(phase0_w, phase0_h)?;
+        let phase1_ropes = if (phase0_w, phase0_h) != (full_w, full_h) {
+            Some(build_ropes(full_w, full_h)?)
+        } else {
+            None
+        };
 
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let latents = self.initial_packed_noise(seed, req.height, req.width)?;
-            // Per-step latent preview (epic 16948, sc-16956), built per image from the SAME
-            // `(width, height)` the decode below is given — one source for the hook's geometry and the
-            // render's. Per image, not per batch: each seed is its own driver call and therefore its own
-            // trajectory, numbered from frame 1.
-            let preview = crate::preview::hook(&req.preview, req.width, req.height);
-            let latents = self.denoise(
-                &components.transformer,
-                latents,
-                &pos_embeds,
-                &rope_pos,
-                neg.as_ref(),
-                rope_neg.as_ref(),
-                &sigmas,
-                steps,
-                guidance,
-                req.sampler.as_deref(),
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                seed,
-                &preview,
-                &req.cancel,
-                on_progress,
-            )?;
-            on_progress(Progress::Decoding);
-            self.decode(
-                &components.vae,
-                pid_decoder.as_ref(),
-                &latents,
-                req.height,
-                req.width,
-            )
-        })
+        run.images_with_denoise_phases(
+            on_progress,
+            |seed| {
+                let output_index = seed.wrapping_sub(base_seed) as usize;
+                candle_gen::execution::draw("image_initial_noise", seed, output_index);
+                self.initial_packed_noise(seed, phase0_h, phase0_w)
+            },
+            |seed, latents, on_progress| {
+                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                self.denoise_planned(
+                    run,
+                    &components.transformer,
+                    latents,
+                    &pos_embeds,
+                    neg.as_ref(),
+                    &phase0_ropes,
+                    phase1_ropes.as_ref(),
+                    seed,
+                    &preview,
+                    &req.cancel,
+                    on_progress,
+                )
+            },
+            |seed, latents, on_progress| {
+                let output_index = seed.wrapping_sub(base_seed) as usize;
+                candle_gen::execution::output_index(output_index);
+                on_progress(Progress::Decoding);
+                self.decode(
+                    &components.vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height,
+                    req.width,
+                )
+            },
+        )
     }
 
-    /// Request-authoritative staged execution: T5 is released before the DiT is opened, the DiT is
-    /// released before the selected decoder is opened, and only the native VAE *or* PiD is loaded.
-    /// The denoise schedule, seeds, CFG branches and decode helpers are the same ones used above.
-    pub(crate) fn render_staged(
+    pub(crate) fn render_staged_planned(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let _cleanup = StagedCleanup {
             device: self.device.clone(),
         };
         candle_gen::check_cancel(&req.cancel)?;
-        let steps = req
-            .steps
-            .map(|steps| steps as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let guidance = req
-            .true_cfg
-            .unwrap_or_else(|| self.variant.default_true_cfg());
+        let guidance = run.plan().guidance();
         candle_gen::execution::policy("chroma/pipeline/guidance", format!("{guidance:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let sigmas = self.sigmas(steps);
+        let base_seed = run.plan().base_seed();
 
+        run.begin_conditioning().map_err(CandleError::from)?;
         check_calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
         let text = SynchronizedPhase::new(
             self.load_text_components()?,
@@ -424,94 +438,123 @@ impl Pipeline {
                 Ok((pos_embeds, neg))
             },
         )?;
-        let h2 = (req.height as usize).div_ceil(16);
-        let w2 = (req.width as usize).div_ceil(16);
-        let rope_pos = rope::build_for(&text.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
-        let rope_neg = neg
-            .as_ref()
-            .map(|value| rope::build_for(&text.cfg, value.dim(1)?, h2, w2, &self.device))
-            .transpose()?;
+        let build_ropes =
+            |w: u32, h: u32| -> Result<(rope::RopeTable, Option<rope::RopeTable>)> {
+                let h2 = (h as usize).div_ceil(16);
+                let w2 = (w as usize).div_ceil(16);
+                let rope_pos =
+                    rope::build_for(&text.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
+                let rope_neg = neg
+                    .as_ref()
+                    .map(|value| rope::build_for(&text.cfg, value.dim(1)?, h2, w2, &self.device))
+                    .transpose()?;
+                Ok((rope_pos, rope_neg))
+            };
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let (full_w, full_h) = run.plan().output_size();
+        let phase0_ropes = build_ropes(phase0_w, phase0_h)?;
+        let phase1_ropes = if (phase0_w, phase0_h) != (full_w, full_h) {
+            Some(build_ropes(full_w, full_h)?)
+        } else {
+            None
+        };
         text.release()?;
+        run.end_conditioning().map_err(CandleError::from)?;
 
         candle_gen::check_cancel(&req.cancel)?;
         check_calibration_fault(req, gen_core::MemoryPhase::Denoise)?;
-        let denoise = SynchronizedPhase::new(
+        let denoise = std::cell::RefCell::new(Some(SynchronizedPhase::new(
             self.load_denoise_components()?,
             self.device.clone(),
             "denoise components",
-        );
-        let mut latents = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            candle_gen::check_cancel(&req.cancel)?;
-            let seed = base_seed.wrapping_add(u64::from(index));
-            candle_gen::execution::draw("image_initial_noise", seed, index as usize);
-            let noise = self.initial_packed_noise(seed, req.height, req.width)?;
-            let preview = crate::preview::hook(&req.preview, req.width, req.height);
-            latents.push(self.denoise(
-                &denoise.transformer,
-                noise,
-                &pos_embeds,
-                &rope_pos,
-                neg.as_ref(),
-                rope_neg.as_ref(),
-                &sigmas,
-                steps,
-                guidance,
-                req.sampler.as_deref(),
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                seed,
-                &preview,
-                &req.cancel,
-                on_progress,
-            )?);
-        }
-        denoise.release()?;
+        )));
 
-        candle_gen::check_cancel(&req.cancel)?;
-        check_calibration_fault(req, gen_core::MemoryPhase::Decode)?;
-        let decoder = SynchronizedPhase::new(
-            if req.use_pid {
-                DecoderComponents::Pid(Box::new(self.load_pid_decoder()?.ok_or_else(|| {
-                    CandleError::Msg(format!(
-                        "{}: PiD was requested but no exact PiD load receipt is present",
-                        self.variant.id()
-                    ))
-                })?))
-            } else {
-                DecoderComponents::Native(Box::new(self.load_native_decoder()?))
+        let images = run.denoise_then_decode_with_phases(
+            on_progress,
+            |seed| {
+                let output_index = seed.wrapping_sub(base_seed) as usize;
+                candle_gen::execution::draw("image_initial_noise", seed, output_index);
+                self.initial_packed_noise(seed, phase0_h, phase0_w)
             },
-            self.device.clone(),
-            "decode components",
-        );
-        let pid_decoder = match &*decoder {
-            DecoderComponents::Pid(pid) => Some(
-                candle_gen_pid::resolve_pid_decoder(Some(pid), req, base_seed, self.variant.id())?
-                    .ok_or_else(|| {
-                        CandleError::Msg(format!(
-                            "{}: PiD decoder resolution returned none",
-                            self.variant.id()
-                        ))
-                    })?,
-            ),
-            DecoderComponents::Native(_) => None,
-        };
-        let mut images = Vec::with_capacity(latents.len());
-        for (output_index, latent) in latents.iter().enumerate() {
-            candle_gen::execution::output_index(output_index);
-            candle_gen::check_cancel(&req.cancel)?;
-            on_progress(Progress::Decoding);
-            images.push(match &*decoder {
-                DecoderComponents::Native(vae) => {
-                    self.decode(vae, None, latent, req.height, req.width)?
+            |seed, noise, on_progress| {
+                let denoise_guard = denoise.borrow();
+                let denoise_ref = denoise_guard
+                    .as_ref()
+                    .expect("denoise components remain loaded during denoise");
+                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                self.denoise_planned(
+                    run,
+                    &denoise_ref.transformer,
+                    noise,
+                    &pos_embeds,
+                    neg.as_ref(),
+                    &phase0_ropes,
+                    phase1_ropes.as_ref(),
+                    seed,
+                    &preview,
+                    &req.cancel,
+                    on_progress,
+                )
+            },
+            || {
+                if let Some(d) = denoise.borrow_mut().take() {
+                    d.release()?;
                 }
-                DecoderComponents::Pid(_) => {
-                    self.decode_tensor(None, pid_decoder.as_ref(), latent, req.height, req.width)?
+                candle_gen::check_cancel(&req.cancel)?;
+                check_calibration_fault(req, gen_core::MemoryPhase::Decode)?;
+                let decoder = SynchronizedPhase::new(
+                    if req.use_pid {
+                        DecoderComponents::Pid(Box::new(self.load_pid_decoder()?.ok_or_else(
+                            || {
+                                CandleError::Msg(format!(
+                                    "{}: PiD was requested but no exact PiD load receipt is present",
+                                    self.variant.id()
+                                ))
+                            },
+                        )?))
+                    } else {
+                        DecoderComponents::Native(Box::new(self.load_native_decoder()?))
+                    },
+                    self.device.clone(),
+                    "decode components",
+                );
+                Ok(decoder)
+            },
+            |decoder, seed, latent, on_progress| {
+                let output_index = seed.wrapping_sub(base_seed) as usize;
+                candle_gen::execution::output_index(output_index);
+                on_progress(Progress::Decoding);
+                let pid_decoder = match &**decoder {
+                    DecoderComponents::Pid(pid) => Some(
+                        candle_gen_pid::resolve_pid_decoder(
+                            Some(pid),
+                            req,
+                            base_seed,
+                            self.variant.id(),
+                        )?
+                        .ok_or_else(|| {
+                            CandleError::Msg(format!(
+                                "{}: PiD decoder resolution returned none",
+                                self.variant.id()
+                            ))
+                        })?,
+                    ),
+                    DecoderComponents::Native(_) => None,
+                };
+                match &**decoder {
+                    DecoderComponents::Native(vae) => {
+                        self.decode(vae, None, &latent, req.height, req.width)
+                    }
+                    DecoderComponents::Pid(_) => self.decode_tensor(
+                        None,
+                        pid_decoder.as_ref(),
+                        &latent,
+                        req.height,
+                        req.width,
+                    ),
                 }
-            });
-        }
-        drop(pid_decoder);
-        decoder.release()?;
+            },
+        )?;
         Ok(images)
     }
 
@@ -534,27 +577,9 @@ impl Pipeline {
 
     /// Chroma's flow-match sigma schedule (length `steps + 1`, descending to a trailing `0`). HD/Flash
     /// use the static-shift `linspace(1, 1/N, N)`; Base uses the beta-spaced schedule.
+    #[cfg(test)]
     pub(crate) fn sigmas(&self, steps: usize) -> Vec<f32> {
-        if self.variant.use_beta_sigmas() {
-            crate::beta::base_sigmas(steps)
-        } else {
-            let shift = self.variant.sigma_shift();
-            let n = steps.max(1);
-            let smax = 1.0f32;
-            let smin = 1.0 / n as f32;
-            let mut s = Vec::with_capacity(n + 1);
-            for i in 0..n {
-                let lin = if n == 1 {
-                    0.0
-                } else {
-                    i as f32 / (n - 1) as f32
-                };
-                let sigma = smax + (smin - smax) * lin; // linspace 1 → 1/N
-                s.push(shift * sigma / (1.0 + (shift - 1.0) * sigma));
-            }
-            s.push(0.0);
-            s
-        }
+        variant_sigmas(self.variant, steps)
     }
 
     /// sc-3673 deterministic, launch-portable initial noise in candle's get_noise shape, 2×2-packed to
@@ -570,61 +595,53 @@ impl Pipeline {
         pack(&noise)
     }
 
-    /// The true-CFG flow-match denoise, routed through the unified curated sampler/scheduler driver
-    /// (epic 7114 P4, sc-7123). The `scheduler` axis picks the σ schedule over the variant's static
-    /// shift in log space (`mu = shift.ln()`; `native` = the byte-exact per-variant [`Self::sigmas`]),
-    /// the `sampler` axis picks the integrator. The DEFAULT (`euler` over the native schedule) is the
-    /// N1 no-op — algebraically the legacy flow-match Euler loop `latents += pred·(σ_next − σ_cur)`
-    /// within the framework's `to_d` round-trip tolerance.
-    ///
-    /// Chroma feeds the raw sigma as the DiT timestep ([`TimestepConvention::Sigma`]; the Approximator
-    /// scales `·1000` internally) and does true CFG, so the whole CFG blend `pred = neg + g·(pos − neg)`
-    /// (or `pred = pos` when `guidance ≤ 1`) lives INSIDE the `predict` closure — a multi-eval solver
-    /// re-runs it per eval. Cancellation + progress are driven by the framework.
     #[allow(clippy::too_many_arguments)]
-    fn denoise(
+    fn denoise_planned(
         &self,
+        run: &gen_core::RenderRun<'_, '_>,
         transformer: &ChromaTransformer,
         latents: Tensor,
         pos_embeds: &Tensor,
-        rope_pos: &rope::RopeTable,
         neg_embeds: Option<&Tensor>,
-        rope_neg: Option<&rope::RopeTable>,
-        native: &[f32],
-        steps: usize,
-        guidance: f32,
-        sampler: Option<&str>,
-        scheduler: Option<&str>,
-        scheduler_shift: Option<f32>,
+        phase0_ropes: &(rope::RopeTable, Option<rope::RopeTable>),
+        phase1_ropes: Option<&(rope::RopeTable, Option<rope::RopeTable>)>,
         seed: u64,
         preview: &candle_gen::preview::PreviewHook<'_>,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        // The scheduler axis rides the variant's static shift in log space (HD shift=3 → ln(3);
-        // Flash/Base shift=1 → 0). Base's native beta schedule is returned verbatim on the default
-        // path, so `mu` only steers the alternative curated schedulers.
-        let mu = self.variant.sigma_shift().ln();
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            scheduler,
-            scheduler_shift,
-            mu,
-            steps,
-            native,
-        )
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
-        candle_gen::run_flow_sampler(
-            sampler,
+        let guidance = run.plan().guidance();
+        let phase0_tokens = run.plan().phase_packed_tokens(0);
+        if let Some(low_res_report) = run
+            .plan()
+            .low_res_start_execution_report("bf16", 2, "base_dit")
+            .map_err(CandleError::from)?
+        {
+            candle_gen::execution::policy(
+                "chroma.low_res_start",
+                serde_json::to_value(&low_res_report).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        candle_gen::run_flow_sampler_spans(
+            Some(run.plan().sampler()),
             TimestepConvention::Sigma,
-            &sigmas,
+            run.plan().denoise_sigmas(),
+            &run.plan().denoise_spans(),
+            Some(run),
+            false,
             latents,
             seed,
             cancel,
             on_progress,
             Some(preview),
             |latents, sigma| -> Result<Tensor> {
+                let (rope_pos, rope_neg) = match phase1_ropes {
+                    Some(ropes) if latents.dims().get(1).copied() != Some(phase0_tokens) => {
+                        (&ropes.0, ropes.1.as_ref())
+                    }
+                    _ => (&phase0_ropes.0, phase0_ropes.1.as_ref()),
+                };
                 let ts = Tensor::from_vec(vec![sigma], 1, &self.device)?;
-                // pooled_temb depends only on the timestep — compute once and share across both branches.
                 let pooled = transformer.pooled_temb(&ts)?;
                 let pos = transformer.forward_prepared(latents, pos_embeds, &pooled, rope_pos)?;
                 candle_gen::execution::component_runtime(
@@ -635,7 +652,6 @@ impl Pipeline {
                 match (neg_embeds, rope_neg) {
                     (Some(neg), Some(rope_n)) => {
                         let neg = transformer.forward_prepared(latents, neg, &pooled, rope_n)?;
-                        // neg + g·(pos − neg)
                         Ok((&neg + ((&pos - &neg)? * guidance as f64)?)?)
                     }
                     _ => Ok(pos),
@@ -721,6 +737,48 @@ fn check_calibration_fault(req: &GenerationRequest, phase: gen_core::MemoryPhase
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn variant_sigmas(variant: ChromaVariant, steps: usize) -> Vec<f32> {
+    if variant.use_beta_sigmas() {
+        crate::beta::base_sigmas(steps)
+    } else {
+        let shift = variant.sigma_shift();
+        let n = steps.max(1);
+        let smax = 1.0f32;
+        let smin = 1.0 / n as f32;
+        let mut s = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let lin = if n == 1 {
+                0.0
+            } else {
+                i as f32 / (n - 1) as f32
+            };
+            let sigma = smax + (smin - smax) * lin;
+            s.push(shift * sigma / (1.0 + (shift - 1.0) * sigma));
+        }
+        s.push(0.0);
+        s
+    }
+}
+
+pub(crate) fn resolved_sigmas(
+    variant: ChromaVariant,
+    req: &GenerationRequest,
+) -> gen_core::Result<Vec<f32>> {
+    let steps = req
+        .steps
+        .map(|steps| steps as usize)
+        .unwrap_or(variant.default_steps() as usize);
+    let native = variant_sigmas(variant, steps);
+    let mu = variant.sigma_shift().ln();
+    candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )
 }
 
 /// 2×2 pack `[1, 16, h, w] → [1, h/2·w/2, 64]` — candle FLUX's `State::new` image packing (so the

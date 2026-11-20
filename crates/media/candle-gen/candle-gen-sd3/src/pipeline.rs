@@ -121,31 +121,7 @@ pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 /// Returns `steps + 1` strictly-decreasing sigmas from 1.0 → 0.0 — the `native` schedule fed to
 /// [`candle_gen::resolve_flow_schedule`]. Pure; unit-tested without a GPU.
 pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
-    let steps = steps.max(1);
-    // `FlowMatchEulerDiscreteScheduler.set_timesteps` builds the inference schedule from
-    // `linspace(1.0, 1/steps, steps)`.  Using the training-grid endpoint (1/1000) here made Candle
-    // disagree with MLX and the frozen SD3.5 fixture at every interior point.
-    let min_sigma = 1.0 / steps as f32;
-    let mut out: Vec<f32> = (0..steps)
-        .map(|i| {
-            let frac = if steps == 1 {
-                0.0
-            } else {
-                i as f32 / (steps - 1) as f32
-            };
-            // linspace(1.0, 1/steps, steps)
-            let sigma = 1.0 - frac * (1.0 - min_sigma);
-            // The endpoint is invariant. For small positive shifts, f32 rounds `shift - 1`
-            // to -1, which would otherwise turn this first node into a division by zero.
-            if sigma == 1.0 {
-                1.0
-            } else {
-                shift * sigma / (1.0 + (shift - 1.0) * sigma)
-            }
-        })
-        .collect();
-    out.push(0.0);
-    out
+    candle_gen::gen_core::sampling::sd3_sigmas(steps, shift)
 }
 
 /// Resolve SD3.5's native or curated flow schedule over the model's static shift.  Curated
@@ -156,27 +132,8 @@ pub(crate) fn resolve_sd3_sigmas(scheduler: Option<&str>, steps: usize, shift: f
     candle_gen::resolve_flow_schedule(scheduler, shift.ln(), steps, &native)
 }
 
-/// The img2img **fork step** (sc-11784) — how many σ-schedule nodes to SKIP before the denoise starts,
-/// mirroring `mlx-gen`'s shared `img2img::init_time_step` (the same convention the Krea / Z-Image
-/// candle lanes use): for a reference with `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`;
-/// otherwise `0` (pure txt2img, no reference blend). **Higher strength → later start → fewer denoise
-/// steps → output stays CLOSER to the reference** — the INVERSE of the SDXL knob, matched here so the
-/// strength knob behaves identically on the Mac (MLX) and Windows (candle) SD3.5 lanes. `floor` because
-/// Python `int(steps · strength)` truncates toward zero for `s ≥ 0`. Pure function so the
-/// cross-backend-parity law is unit-testable without a GPU.
-///
-/// `pub` so the sc-16958 preview harness can derive an img2img run's **emitted frame count** —
-/// `steps − init_time_step(steps, strength)`, since the driver only ever sees the reduced
-/// `sigmas[start..]` tail — from the very function the fork uses, rather than restating that
-/// arithmetic beside it and drifting from it.
 pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    candle_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// Resolve a reference's optional strength at the SD3.5 img2img boundary.  Keeping this explicit

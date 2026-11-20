@@ -208,14 +208,7 @@ pub fn preprocess_ref_image(image: &Image, target_width: u32, target_height: u32
 /// for a positive strength clamped to `[0, 1]`, else `0` (pure txt2img). The denoise loop runs
 /// `start_step..num_steps`, and the init image is blended in at `sigmas[start_step]`.
 pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
-    match strength {
-        Some(s) if s > 0.0 => {
-            let s = s.clamp(0.0, 1.0);
-            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
-            ((num_steps as f32 * s) as usize).max(1)
-        }
-        _ => 0,
-    }
+    mlx_gen::gen_core::sampling::init_time_step(num_steps, strength)
 }
 
 /// img2img / edit noise blend: `(1 - sigma)·clean + sigma·noise` at the start sigma.

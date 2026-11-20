@@ -56,8 +56,8 @@ pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant, RES_MULTIPL
 pub use convert::{is_dit_quant_target, quantize_anima_dit};
 pub use loader::{load_conditioning_at_dtype, split_anima_keys, AnimaComponents};
 pub use model::{
-    descriptor_aesthetic, descriptor_base, descriptor_turbo, load_aesthetic, load_base, load_turbo,
-    Anima,
+    compile_trajectory_for, descriptor_aesthetic, descriptor_base, descriptor_turbo, load_aesthetic,
+    load_base, load_turbo, Anima,
 };
 pub use pipeline::{
     anima_sigmas, AnimaDecodeView, AnimaLight, AnimaPipeline, GenOptions, DEFAULT_SAMPLER,
@@ -105,6 +105,7 @@ pub fn register_base_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::BASE_REGISTRATION)
+        .register_render_plan(model::BASE_RENDER_PLAN)
         .register_activation_memory(BASE_ACTIVATION_MEMORY_REGISTRATION)
         .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -123,6 +124,7 @@ pub fn register_aesthetic_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::AESTHETIC_REGISTRATION)
+        .register_render_plan(model::AESTHETIC_RENDER_PLAN)
         .register_memory_strategy(model::AESTHETIC_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -142,6 +144,7 @@ pub fn register_turbo_generator(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::TURBO_REGISTRATION)
+        .register_render_plan(model::TURBO_RENDER_PLAN)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -201,6 +204,34 @@ mod explicit_registry_tests {
             gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(
                 &registry, &spec,
             );
+        }
+    }
+
+    #[test]
+    fn sw6945_anima_render_plan_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{GenerationRequest, LoadSpec, LowResStartSpec, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
+            assert!(all_features[id]["low_res_start"].applicable);
+            let req = GenerationRequest {
+                prompt: "an anime character".into(),
+                width: 1024,
+                height: 1024,
+                steps: Some(6),
+                seed: Some(19),
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("anima render plan");
+            assert_eq!(plan.denoise_spans(), vec![0..3, 3..6]);
+            assert_eq!(plan.phase_output_size(0), (512, 512));
+            assert_eq!(plan.phase_output_size(1), (1024, 1024));
         }
     }
 }

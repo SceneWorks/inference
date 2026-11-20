@@ -44,8 +44,9 @@ mod tests {
     /// signature change — or a scanner mis-split — fails this inventory loudly instead of quietly
     /// shifting which argument "the one before the closure" names.
     const SAMPLER_ARGUMENTS_BEFORE_PREDICT: usize = 8;
+    const SAMPLER_SPANS_ARGUMENTS_BEFORE_PREDICT: usize = 11;
 
-    /// The arguments of every `run_flow_sampler` call in `source`, one entry per call site, covering
+    /// The arguments of every `call` in `source`, one entry per call site, covering
     /// the arguments **before** the predict closure — the window the `preview` argument sits in.
     ///
     /// Ported from sc-16950's Krea inventory. The window is bounded by the call's own bracket balance
@@ -56,12 +57,11 @@ mod tests {
     ///
     /// The match is textual, so writing the driver's name followed by an open paren in prose is read
     /// as a call site: name it without the paren in comments.
-    fn sampler_call_sites(file: &str, source: &str) -> Vec<Vec<String>> {
-        const CALL: &str = "run_flow_sampler(";
+    fn sampler_call_sites_for(file: &str, source: &str, call: &str) -> Vec<Vec<String>> {
         let mut sites = Vec::new();
         let mut cursor = 0usize;
-        while let Some(at) = source[cursor..].find(CALL) {
-            let args_start = cursor + at + CALL.len();
+        while let Some(at) = source[cursor..].find(call) {
+            let args_start = cursor + at + call.len();
             sites.push(sampler_call_arguments(
                 file,
                 sites.len(),
@@ -172,7 +172,8 @@ mod tests {
     /// through one site says nothing about whether every caller supplies one.
     #[test]
     fn the_single_render_sampler_site_forwards_its_callers_hook() {
-        let sites = sampler_call_sites("lib.rs", include_str!("lib.rs"));
+        let sites =
+            sampler_call_sites_for("lib.rs", include_str!("lib.rs"), "run_flow_sampler_spans(");
         assert_eq!(
             sites.len(),
             1,
@@ -183,8 +184,8 @@ mod tests {
         let args = &sites[0];
         assert_eq!(
             args.len(),
-            SAMPLER_ARGUMENTS_BEFORE_PREDICT,
-            "lib.rs: expected {SAMPLER_ARGUMENTS_BEFORE_PREDICT} arguments before the predict \
+            SAMPLER_SPANS_ARGUMENTS_BEFORE_PREDICT,
+            "lib.rs: expected {SAMPLER_SPANS_ARGUMENTS_BEFORE_PREDICT} arguments before the predict \
              closure, parsed {args:?}"
         );
         // Positional, not `contains`: the preview is the argument immediately before the predict
@@ -241,11 +242,18 @@ mod tests {
     /// as an exact count so a *second* trainer site could not appear unnoticed.
     #[test]
     fn the_trainer_sample_render_is_the_only_deliberately_dark_site() {
-        let sites = sampler_call_sites("training.rs", include_str!("training.rs"));
+        let sites =
+            sampler_call_sites_for("training.rs", include_str!("training.rs"), "run_flow_sampler(");
         assert_eq!(
             sites.len(),
             1,
             "training.rs drives the sampler exactly once"
+        );
+        assert_eq!(
+            sites[0].len(),
+            SAMPLER_ARGUMENTS_BEFORE_PREDICT,
+            "training.rs: expected {SAMPLER_ARGUMENTS_BEFORE_PREDICT} arguments before the predict closure, parsed {:?}",
+            sites[0]
         );
         assert_eq!(
             sites[0].last().map(String::as_str),

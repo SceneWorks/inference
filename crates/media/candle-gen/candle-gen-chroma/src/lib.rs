@@ -89,6 +89,8 @@ pub struct ChromaGenerator {
     memory_contract: gen_core::MemoryProviderContract,
     load_receipt: Option<memory_strategy::ChromaLoadReceipt>,
     memory_admission: memory_strategy::AdmissionRegistry,
+    load_binding: gen_core::RenderLoadBinding,
+    loaded_spec: LoadSpec,
 }
 
 impl ChromaGenerator {
@@ -125,7 +127,18 @@ impl Generator for ChromaGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-chroma/src/lib.rs",
@@ -208,29 +221,7 @@ impl Generator for ChromaGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // The shared capability floor (size/count range; negative_prompt + true_cfg are advertised,
-        // so they pass; guidance / conditioning / unadvertised samplers are rejected here).
-        self.descriptor
-            .capabilities
-            .validate_request(self.variant.id(), req)?;
-        let id = self.variant.id();
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
-            )));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        Ok(())
+        validate_request_for_variant(self.variant, req)
     }
 
     fn generate(
@@ -238,9 +229,39 @@ impl Generator for ChromaGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.descriptor.id
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&self.load_binding)?;
         self.validate(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        self.memory_admission.consume_for_generate(req)?;
+        if scope.is_none() {
+            self.memory_admission.consume_for_generate(req)?;
+        }
         if let Some(receipt) = &self.load_receipt {
             receipt.ensure_unchanged()?;
         }
@@ -259,10 +280,8 @@ impl Generator for ChromaGenerator {
             self.pid_spec.clone(),
             self.adapters.clone(),
         );
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let images = if memory.stage_residency {
-            // A staged request is authoritative over the warm cache. Evict before opening T5 and
-            // never repopulate this slot from request-local phase components. The removed cache
-            // value remains owned until all queued work has synchronized.
             if let Some(warm) = evict_warm_for_staged(&self.components) {
                 release_warm_after_synchronize(&self.device, warm)?;
             } else {
@@ -270,31 +289,96 @@ impl Generator for ChromaGenerator {
                     .synchronize()
                     .map_err(gen_core::Error::backend)?;
             }
-            pipe.render_staged(req, on_progress)?
+            pipe.render_staged_planned(req, &run, on_progress)?
         } else {
             let components = self.components(&pipe)?;
-            pipe.render(req, &components, on_progress)?
+            pipe.render_planned(req, &run, &components, on_progress)?
         };
-        Ok(GenerationOutput::Images(images))
+        let mut report =
+            gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        Ok(report)
     }
 }
 
-/// Descriptors (registry introspection — no weights).
-pub fn descriptor_hd() -> ModelDescriptor {
-    ChromaVariant::Hd.descriptor()
-}
-pub fn descriptor_base() -> ModelDescriptor {
-    ChromaVariant::Base.descriptor()
-}
-pub fn descriptor_flash() -> ModelDescriptor {
-    ChromaVariant::Flash.descriptor()
+fn validate_request_for_variant(
+    variant: ChromaVariant,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    let descriptor = variant.descriptor();
+    descriptor
+        .capabilities
+        .validate_request(variant.id(), req)?;
+    let id = variant.id();
+    if req.source_image.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: source_image is not supported on this route"
+        )));
+    }
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: prompt must not be empty"
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    let memory = req.memory.unwrap_or_default();
+    if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: bounded decode, attention, and transformer residency are Missing"
+        )));
+    }
+    if let Some(low_res) = &req.low_res_start {
+        let sigmas = pipeline::resolved_sigmas(variant, req)?;
+        low_res.resolve_for_descriptor(
+            &descriptor,
+            req,
+            sigmas.len().saturating_sub(1),
+            SIZE_MULTIPLE,
+        )?;
+    }
+    Ok(())
 }
 
-/// Construct a lazy candle Chroma generator for `variant`. `spec.weights` must be a
-/// [`WeightsSource::Dir`] pointing at a Chroma diffusers snapshot (`tokenizer/`, `text_encoder/`,
-/// `transformer/`, `vae/`). Ordered LoRA/LoKr adapters and the optional PiD decoder are admitted and
-/// receipt-pinned; control/IP-adapter overlays and on-the-fly quantization remain unsupported.
-fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+/// Compile the weights-free Chroma trajectory for `variant` and `req`.
+pub fn compile_trajectory_for(
+    variant: ChromaVariant,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    validate_request_for_variant(variant, req)?;
+    let sigmas = pipeline::resolved_sigmas(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = req
+        .true_cfg
+        .unwrap_or_else(|| variant.default_true_cfg());
+    gen_core::RenderPlan::base_image(
+        &variant.descriptor(),
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+fn validate_load_spec(
+    variant: ChromaVariant,
+    spec: &LoadSpec,
+) -> gen_core::Result<PathBuf> {
     let id = variant.id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -315,6 +399,44 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
             "candle {id} does not support control / IP-adapter overlays yet (txt2img only)"
         )));
     }
+    Ok(root)
+}
+
+fn compile_variant_plan(
+    variant: ChromaVariant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_load_spec(variant, spec)?;
+    if req.use_pid && spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
+            variant.id()
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+/// Descriptors (registry introspection — no weights).
+pub fn descriptor_hd() -> ModelDescriptor {
+    ChromaVariant::Hd.descriptor()
+}
+pub fn descriptor_base() -> ModelDescriptor {
+    ChromaVariant::Base.descriptor()
+}
+pub fn descriptor_flash() -> ModelDescriptor {
+    ChromaVariant::Flash.descriptor()
+}
+
+/// Construct a lazy candle Chroma generator for `variant`. `spec.weights` must be a
+/// [`WeightsSource::Dir`] pointing at a Chroma diffusers snapshot (`tokenizer/`, `text_encoder/`,
+/// `transformer/`, `vae/`). Ordered LoRA/LoKr adapters and the optional PiD decoder are admitted and
+/// receipt-pinned; control/IP-adapter overlays and on-the-fly quantization remain unsupported.
+fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let id = variant.id();
+    let root = validate_load_spec(variant, spec)?;
     let device = candle_gen::default_device()?;
     let (load_receipt, memory_contract) =
         match memory_strategy::ChromaLoadReceipt::capture(id, spec) {
@@ -338,9 +460,6 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
         descriptor: variant.descriptor(),
         root,
         device,
-        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
-        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
-        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
@@ -348,6 +467,8 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
         memory_contract,
         load_receipt,
         memory_admission: memory_strategy::AdmissionRegistry::new(id),
+        load_binding: gen_core::RenderLoadBinding::from_spec(spec),
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -379,7 +500,19 @@ pub fn register_providers(
     let registry = registry
         .register_generator(HD_REGISTRATION)
         .register_generator(BASE_REGISTRATION)
-        .register_generator(FLASH_REGISTRATION);
+        .register_generator(FLASH_REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: CHROMA1_HD_ID,
+            compile: |spec, req| compile_variant_plan(ChromaVariant::Hd, spec, req),
+        })
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: CHROMA1_BASE_ID,
+            compile: |spec, req| compile_variant_plan(ChromaVariant::Base, spec, req),
+        })
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: CHROMA1_FLASH_ID,
+            compile: |spec, req| compile_variant_plan(ChromaVariant::Flash, spec, req),
+        });
     register_memory_contract_surfaces(registry)
         .register_memory_behavior(HD_MEMORY_BEHAVIOR)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
@@ -710,5 +843,33 @@ mod tests {
         assert_eq!(descriptor_hd().modality, Modality::Image);
         assert_eq!(descriptor_base().modality, Modality::Image);
         assert_eq!(descriptor_flash().modality, Modality::Image);
+    }
+
+    #[test]
+    fn sw6945_candle_chroma_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{GenerationRequest, LoadSpec, LowResStartSpec, WeightsSource};
+
+        let registry = provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["chroma1_hd", "chroma1_base", "chroma1_flash"] {
+            assert!(all_features[id]["low_res_start"].applicable);
+            let req = GenerationRequest {
+                prompt: "a blue lamp".into(),
+                width: 512,
+                height: 512,
+                steps: Some(6),
+                seed: Some(77),
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("chroma render plan");
+            assert_eq!(plan.denoise_spans(), vec![0..3, 3..6]);
+            assert_eq!(plan.phase_output_size(0), (256, 256));
+            assert_eq!(plan.phase_output_size(1), (512, 512));
+        }
     }
 }

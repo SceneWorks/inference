@@ -26,8 +26,8 @@ pub use config::{
     DEFAULT_SAMPLER, MAX_SEQUENCE_LENGTH,
 };
 pub use model::{
-    descriptor_base, descriptor_flash, descriptor_hd, load_base, load_chroma, load_flash, load_hd,
-    Chroma, SIZE_MULTIPLE,
+    compile_trajectory_for, descriptor_base, descriptor_flash, descriptor_hd, load_base,
+    load_chroma, load_flash, load_hd, Chroma, SIZE_MULTIPLE,
 };
 pub use text::{encode_prompt, t5_key_mask, transformer_text_mask};
 pub use transformer::ChromaTransformer;
@@ -37,6 +37,18 @@ pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: CHROMA1_HD_ID,
+            compile: |spec, req| model::compile_base(ChromaVariant::Hd, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: CHROMA1_BASE_ID,
+            compile: |spec, req| model::compile_base(ChromaVariant::Base, spec, req),
+        })
+        .register_render_plan(mlx_gen::gen_core::RenderPlanRegistration {
+            provider_id: CHROMA1_FLASH_ID,
+            compile: |spec, req| model::compile_base(ChromaVariant::Flash, spec, req),
+        })
         .register_generator(model::HD_REGISTRATION)
         .register_memory_strategy(model::HD_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -103,5 +115,33 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+    }
+
+    #[test]
+    fn sw6945_chroma_render_plan_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{GenerationRequest, LoadSpec, LowResStartSpec, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["chroma1_hd", "chroma1_base", "chroma1_flash"] {
+            assert!(all_features[id]["low_res_start"].applicable);
+            let req = GenerationRequest {
+                prompt: "a blue lamp".into(),
+                width: 512,
+                height: 512,
+                steps: Some(6),
+                seed: Some(77),
+                low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(id, &spec, &req)
+                .unwrap()
+                .expect("chroma render plan");
+            assert_eq!(plan.denoise_spans(), vec![0..3, 3..6]);
+            assert_eq!(plan.phase_output_size(0), (256, 256));
+            assert_eq!(plan.phase_output_size(1), (512, 512));
+        }
     }
 }
