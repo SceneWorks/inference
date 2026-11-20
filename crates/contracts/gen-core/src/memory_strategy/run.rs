@@ -119,9 +119,7 @@ impl MemoryRunContext {
 
     /// Retrieve the optional [`MemoryLowResStartContext`] bound to this context (`SW-7216`).
     pub fn low_res_start(&self) -> Option<MemoryLowResStartContext> {
-        let (_, tail) = self
-            .evidence_revision
-            .rsplit_once(LOW_RES_CONTEXT_MARKER)?;
+        let (_, tail) = self.evidence_revision.rsplit_once(LOW_RES_CONTEXT_MARKER)?;
         let id: usize = tail.parse().ok()?;
         lookup_low_res_start_context(id)
     }
@@ -150,8 +148,7 @@ pub struct MemoryLowResStartContext {
     pub posture: LowResTransitionPricingPosture,
 }
 
-fn low_res_context_table(
-) -> &'static std::sync::Mutex<Vec<MemoryLowResStartContext>> {
+fn low_res_context_table() -> &'static std::sync::Mutex<Vec<MemoryLowResStartContext>> {
     static TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<MemoryLowResStartContext>>> =
         std::sync::OnceLock::new();
     TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))

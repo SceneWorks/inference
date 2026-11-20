@@ -2068,13 +2068,10 @@ mod tests {
         );
 
         // 3. UnqualifiedRealEvidence posture: ordinary T2I is admitted, low_res_start is refused fail-closed:
-        let mut unqualified_posture_ctx = fixture
-            .context
-            .clone()
-            .with_low_res_start_posture(
-                basis,
-                gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
-            );
+        let mut unqualified_posture_ctx = fixture.context.clone().with_low_res_start_posture(
+            basis,
+            gen_core::LowResTransitionPricingPosture::UnqualifiedRealEvidence,
+        );
         unqualified_posture_ctx.budget = gen_core::MemoryBudget {
             total_bytes: 24 * 1024 * 1024 * 1024,
             committed_bytes: 0,
