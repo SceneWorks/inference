@@ -1487,8 +1487,13 @@ impl MemoryRequestScope for ScopeLifecycleRecorder<'_> {
         &mut self,
         tile_edge: u32,
         overlap: u32,
-        geometry: MemoryGeometry,
+        mut geometry: MemoryGeometry,
     ) -> Result<()> {
+        if geometry.reference_count == 0 {
+            if let Some((_, _, active_geom)) = self.active_phase {
+                geometry.reference_count = active_geom.reference_count;
+            }
+        }
         self.inner.configure_decode(tile_edge, overlap, geometry)?;
         self.events
             .push(RecordedScopeLifecycleEvent::ConfigureDecode {
@@ -1598,4 +1603,485 @@ pub fn trace_planned_low_res_scope_lifecycle(
     )?;
     recorder.finish(MemoryRunOutcome::Complete)?;
     Ok(recorder.into_events())
+}
+
+// -------------------------------------------------------------------------------------------------
+// SW-6946 (§6.13, M3): Reduced-Grid Plain Img2Img Initial Codec & Trajectory Live-Set Pricing
+// -------------------------------------------------------------------------------------------------
+
+/// Complete operation-level live-set breakdown for a reduced-grid plain single-source `img2img`
+/// trajectory with `low_res_start` (`§6.13`, `M3`, `SW-6946`).
+///
+/// Captures the exact byte accounting for:
+/// 1. Raw source RGB8 pixel buffer (`source_width * source_height * 3` bytes, e.g. `1200x700 -> 2,520,000 B`).
+/// 2. Fitted phase-0 normalized float32 input (`low_width * low_height * 3 * 4` bytes, e.g. `512x384 -> 2,359,296 B`).
+/// 3. VAE encode workspace at the reduced phase-0 grid (`(low_width, low_height)`).
+/// 4. Retained clean initial latent at the reduced phase-0 grid (`batch * C * (low_h / s) * (low_w / s) * 4`).
+/// 5. Seeded phase-0 noise + interpolated blend buffers at full-pass `sigmas[start_step]`.
+/// 6. Phase-0 first forward at `(low_width, low_height)`.
+/// 7. Node-`start_step + K` (`full_sigmas[start_step + K]`) 6-buffer fp32 transition ceiling to `(full_width, full_height)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LowResImg2ImgInitCodecPricing {
+    pub source_width: u32,
+    pub source_height: u32,
+    pub low_width: u32,
+    pub low_height: u32,
+    pub full_width: u32,
+    pub full_height: u32,
+    pub raw_source_rgb8_bytes: u64,
+    pub fitted_phase0_input_f32_bytes: u64,
+    pub vae_encode_workspace_bytes: u64,
+    pub retained_clean_init_latent_bytes: u64,
+    pub noise_and_blend_workspace_bytes: u64,
+    pub phase0_first_forward_workspace_bytes: u64,
+    pub transition_ceiling: LowResTransitionSixBufferCeiling,
+    pub start_step: usize,
+    pub executed_steps: usize,
+    pub transition_step_k: usize,
+    pub full_node_transition: usize,
+    pub init_sigma: f32,
+    pub transition_sigma: f32,
+    pub domain: MemoryBudgetDomain,
+    pub request_live_set_plan: RequestLiveSetPlan,
+    pub priced_domain_peak: PricedDomainPeak,
+}
+
+/// Price the complete [`RequestLiveSetPlan`] for a reduced-grid plain single-source `img2img`
+/// trajectory with `low_res_start` (`§6.13`, `M3`, `SW-6946`).
+#[allow(clippy::too_many_arguments)]
+pub fn price_low_res_img2img_request_live_set_plan(
+    domain: MemoryBudgetDomain,
+    low_res_plan: &ResolvedLowResStartPlan,
+    source_width: u32,
+    source_height: u32,
+    batch: u32,
+    latent_channels: u32,
+    vae_spatial_scale: u32,
+    resident_conditioning_weights_bytes: u64,
+    resident_vae_encoder_weights_bytes: u64,
+    vae_encode_workspace_bytes: u64,
+    resident_transformer_weights_bytes: u64,
+    phase0_first_forward_workspace_bytes: u64,
+    phase1_forward_workspace_bytes: u64,
+    resident_vae_decoder_weights_bytes: u64,
+    decode_workspace_bytes: u64,
+    full_sigmas: &[f32],
+    start_step: usize,
+) -> Result<LowResImg2ImgInitCodecPricing> {
+    if source_width == 0 || source_height == 0 {
+        return Err(Error::Unsupported(
+            "price_low_res_img2img_request_live_set_plan requires non-zero source dimensions"
+                .into(),
+        ));
+    }
+    if vae_encode_workspace_bytes == 0
+        || phase0_first_forward_workspace_bytes == 0
+        || phase1_forward_workspace_bytes == 0
+        || decode_workspace_bytes == 0
+    {
+        return Err(Error::Unsupported(
+            "price_low_res_img2img_request_live_set_plan requires non-zero encode, forward, and decode workspaces"
+                .into(),
+        ));
+    }
+    let full_node_transition = start_step
+        .checked_add(low_res_plan.k)
+        .ok_or_else(|| Error::Msg("full_node_transition overflow".into()))?;
+    let full_node_end = start_step
+        .checked_add(low_res_plan.executed_steps)
+        .ok_or_else(|| Error::Msg("full_node_end overflow".into()))?;
+    if start_step >= full_sigmas.len()
+        || full_node_transition >= full_sigmas.len()
+        || full_node_end >= full_sigmas.len()
+    {
+        return Err(Error::Unsupported(format!(
+            "price_low_res_img2img_request_live_set_plan: start_step={start_step}, k={}, executed_steps={} exceed full_sigmas len {}",
+            low_res_plan.k,
+            low_res_plan.executed_steps,
+            full_sigmas.len()
+        )));
+    }
+
+    let raw_source_rgb8_bytes = u64::from(source_width)
+        .checked_mul(u64::from(source_height))
+        .and_then(|px| px.checked_mul(3))
+        .ok_or_else(|| Error::Msg("raw_source_rgb8_bytes overflow".into()))?;
+    let fitted_phase0_input_f32_bytes = u64::from(low_res_plan.low_width)
+        .checked_mul(u64::from(low_res_plan.low_height))
+        .and_then(|px| px.checked_mul(3 * 4))
+        .ok_or_else(|| Error::Msg("fitted_phase0_input_f32_bytes overflow".into()))?;
+
+    let transition_ceiling = LowResTransitionSixBufferCeiling::compute(
+        low_res_plan,
+        batch,
+        latent_channels,
+        vae_spatial_scale,
+    )?;
+    let retained_clean_init_latent_bytes = transition_ceiling.reduced_latent_fp32_bytes;
+    let noise_and_blend_workspace_bytes = retained_clean_init_latent_bytes
+        .checked_mul(2)
+        .ok_or_else(|| Error::Msg("noise_and_blend_workspace_bytes overflow".into()))?;
+
+    let decoded_rgb_bytes = u64::from(low_res_plan.full_width)
+        .checked_mul(u64::from(low_res_plan.full_height))
+        .and_then(|px| px.checked_mul(3))
+        .ok_or_else(|| Error::Msg("decoded_rgb_bytes overflow".into()))?;
+
+    let mut phase0_geom = StreamPhaseGeometry::image(
+        "image",
+        low_res_plan.low_width,
+        low_res_plan.low_height,
+        batch,
+    );
+    phase0_geom.reference_count = 1;
+    phase0_geom.reference_canvases = vec![(source_width, source_height)];
+
+    let mut phase1_geom = StreamPhaseGeometry::image(
+        "image",
+        low_res_plan.full_width,
+        low_res_plan.full_height,
+        batch,
+    );
+    phase1_geom.reference_count = 1;
+    phase1_geom.reference_canvases = vec![(source_width, source_height)];
+
+    let request_live_set_plan = RequestLiveSetPlan {
+        operations: vec![
+            PhaseOperationLiveSet {
+                operation_id: "text_conditioning".into(),
+                phase: MemoryPhase::Conditioning,
+                pass_index: 0,
+                phase_index: 0,
+                stream_geometries: vec![phase1_geom.clone()],
+                resident_weights: vec![PricedAllocation::new(
+                    "text_encoders",
+                    domain,
+                    resident_conditioning_weights_bytes,
+                )],
+                resident_overlays: Vec::new(),
+                concurrent_stream_activations: vec![PricedAllocation::new(
+                    "prompt_encode_workspace",
+                    domain,
+                    1_048_576,
+                )],
+                joint_workspaces: Vec::new(),
+                retained_state: vec![PricedAllocation::new("prompt_embeddings", domain, 65_536)],
+                evidence_peak: None,
+            },
+            PhaseOperationLiveSet {
+                operation_id: "initial_codec_encode".into(),
+                phase: MemoryPhase::Conditioning,
+                pass_index: 0,
+                phase_index: 0,
+                stream_geometries: vec![phase0_geom.clone()],
+                resident_weights: vec![PricedAllocation::new(
+                    "vae_encoder",
+                    domain,
+                    resident_vae_encoder_weights_bytes,
+                )],
+                resident_overlays: Vec::new(),
+                concurrent_stream_activations: vec![
+                    PricedAllocation::new("raw_source_rgb8", domain, raw_source_rgb8_bytes),
+                    PricedAllocation::new(
+                        "fitted_phase0_input_f32",
+                        domain,
+                        fitted_phase0_input_f32_bytes,
+                    ),
+                    PricedAllocation::new(
+                        "vae_encode_workspace",
+                        domain,
+                        vae_encode_workspace_bytes,
+                    ),
+                ],
+                joint_workspaces: Vec::new(),
+                retained_state: vec![
+                    PricedAllocation::new("prompt_embeddings", domain, 65_536),
+                    PricedAllocation::new(
+                        "retained_clean_init_latent_phase0",
+                        domain,
+                        retained_clean_init_latent_bytes,
+                    ),
+                ],
+                evidence_peak: None,
+            },
+            PhaseOperationLiveSet {
+                operation_id: "denoise_phase0_init_and_forward".into(),
+                phase: MemoryPhase::Denoise,
+                pass_index: 0,
+                phase_index: 0,
+                stream_geometries: vec![phase0_geom],
+                resident_weights: vec![PricedAllocation::new(
+                    "transformer",
+                    domain,
+                    resident_transformer_weights_bytes,
+                )],
+                resident_overlays: Vec::new(),
+                concurrent_stream_activations: vec![PricedAllocation::new(
+                    "phase0_first_forward_workspace",
+                    domain,
+                    phase0_first_forward_workspace_bytes,
+                )],
+                joint_workspaces: Vec::new(),
+                retained_state: vec![
+                    PricedAllocation::new("prompt_embeddings", domain, 65_536),
+                    PricedAllocation::new(
+                        "retained_clean_init_latent_phase0",
+                        domain,
+                        retained_clean_init_latent_bytes,
+                    ),
+                    PricedAllocation::new(
+                        "seeded_phase0_noise_and_sigma_blend",
+                        domain,
+                        noise_and_blend_workspace_bytes,
+                    ),
+                ],
+                evidence_peak: None,
+            },
+            PhaseOperationLiveSet {
+                operation_id: "denoise_phase1_full_grid".into(),
+                phase: MemoryPhase::Denoise,
+                pass_index: 0,
+                phase_index: 1,
+                stream_geometries: vec![phase1_geom.clone()],
+                resident_weights: vec![PricedAllocation::new(
+                    "transformer",
+                    domain,
+                    resident_transformer_weights_bytes,
+                )],
+                resident_overlays: Vec::new(),
+                concurrent_stream_activations: vec![PricedAllocation::new(
+                    "phase1_forward_workspace",
+                    domain,
+                    phase1_forward_workspace_bytes,
+                )],
+                joint_workspaces: Vec::new(),
+                retained_state: vec![
+                    PricedAllocation::new("prompt_embeddings", domain, 65_536),
+                    PricedAllocation::new(
+                        "phase1_full_latent",
+                        domain,
+                        transition_ceiling.full_latent_fp32_bytes,
+                    ),
+                ],
+                evidence_peak: None,
+            },
+            PhaseOperationLiveSet {
+                operation_id: "decode_full_grid".into(),
+                phase: MemoryPhase::Decode,
+                pass_index: 0,
+                phase_index: 0,
+                stream_geometries: vec![phase1_geom],
+                resident_weights: vec![PricedAllocation::new(
+                    "vae_decoder",
+                    domain,
+                    resident_vae_decoder_weights_bytes,
+                )],
+                resident_overlays: Vec::new(),
+                concurrent_stream_activations: vec![PricedAllocation::new(
+                    "vae_decode_workspace",
+                    domain,
+                    decode_workspace_bytes,
+                )],
+                joint_workspaces: Vec::new(),
+                retained_state: vec![PricedAllocation::new(
+                    "decoded_rgb_output",
+                    domain,
+                    decoded_rgb_bytes,
+                )],
+                evidence_peak: None,
+            },
+        ],
+        transitions: vec![TransitionOperationLiveSet {
+            transition_id: "node_k_phase0_to_phase1_transition".into(),
+            from_operation_id: "denoise_phase0_init_and_forward".into(),
+            to_operation_id: "denoise_phase1_full_grid".into(),
+            mechanism: TransitionMechanismKind::LatentSpatialTransition,
+            resident_weights: vec![PricedAllocation::new(
+                "transformer",
+                domain,
+                resident_transformer_weights_bytes,
+            )],
+            resident_overlays: Vec::new(),
+            transition_workspaces: vec![PricedAllocation::new(
+                "six_buffer_fp32_transition_workspace",
+                domain,
+                transition_ceiling.total_six_buffer_ceiling_bytes,
+            )],
+            live_handoff_buffers: vec![
+                PricedAllocation::new("prompt_embeddings", domain, 65_536),
+                PricedAllocation::new(
+                    "solver_snapshot_handoff",
+                    domain,
+                    noise_and_blend_workspace_bytes,
+                ),
+            ],
+        }],
+    };
+    let priced_domain_peak = request_live_set_plan.price_domain(domain)?;
+
+    Ok(LowResImg2ImgInitCodecPricing {
+        source_width,
+        source_height,
+        low_width: low_res_plan.low_width,
+        low_height: low_res_plan.low_height,
+        full_width: low_res_plan.full_width,
+        full_height: low_res_plan.full_height,
+        raw_source_rgb8_bytes,
+        fitted_phase0_input_f32_bytes,
+        vae_encode_workspace_bytes,
+        retained_clean_init_latent_bytes,
+        noise_and_blend_workspace_bytes,
+        phase0_first_forward_workspace_bytes,
+        transition_ceiling,
+        start_step,
+        executed_steps: low_res_plan.executed_steps,
+        transition_step_k: low_res_plan.k,
+        full_node_transition,
+        init_sigma: full_sigmas[start_step],
+        transition_sigma: full_sigmas[full_node_transition],
+        domain,
+        request_live_set_plan,
+        priced_domain_peak,
+    })
+}
+
+#[cfg(test)]
+mod sw_6946_tests {
+    use super::*;
+    use crate::sampling::{init_time_step, sd3_sigmas};
+
+    #[test]
+    fn sw_6946_m3_non_square_strength_fixture_prices_initial_codec_for_sd3_5_and_flux2() {
+        // M3 non-square strength fixture (§6.13):
+        // 1200x700 source -> 1024x768 full target, scale=0.5, steps=10, strength=0.4
+        // => start_step=4, M=6, K=3, phase-0 512x384 (64x48 latent, 32x24 packed on FLUX.2).
+        let steps = 10;
+        let strength = 0.4_f32;
+        let start_step = init_time_step(steps, Some(strength));
+        assert_eq!(start_step, 4);
+        let executed_steps = steps - start_step;
+        assert_eq!(executed_steps, 6);
+
+        let low_res_plan = ResolvedLowResStartPlan {
+            version: 1,
+            k: 3,
+            scale: 0.5,
+            executed_steps,
+            low_width: 512,
+            low_height: 384,
+            full_width: 1024,
+            full_height: 768,
+            legal_quantum: 16,
+            min_dim: 256,
+            estimate_source: EstimateSource::PreviousEvaluation,
+        };
+        let full_sigmas = sd3_sigmas(steps, 3.0);
+        assert_eq!(full_sigmas.len(), 11);
+
+        // 1. SD3.5 (16-ch unpacked at /8: [1, 16, 48, 64] phase-0 -> [1, 16, 96, 128] phase-1)
+        let sd3_pricing = price_low_res_img2img_request_live_set_plan(
+            MemoryBudgetDomain::UnifiedMemory,
+            &low_res_plan,
+            1200,
+            700,
+            1,
+            16,
+            8,
+            512 * 1024 * 1024,
+            160 * 1024 * 1024,
+            48 * 1024 * 1024,
+            4096 * 1024 * 1024,
+            192 * 1024 * 1024,
+            512 * 1024 * 1024,
+            160 * 1024 * 1024,
+            96 * 1024 * 1024,
+            &full_sigmas,
+            start_step,
+        )
+        .expect("SD3.5 M3 initial codec pricing");
+
+        assert_eq!(sd3_pricing.raw_source_rgb8_bytes, 1200 * 700 * 3);
+        assert_eq!(sd3_pricing.fitted_phase0_input_f32_bytes, 512 * 384 * 3 * 4);
+        // [1, 16, 48, 64] fp32 = 196,608 B
+        assert_eq!(
+            sd3_pricing.retained_clean_init_latent_bytes,
+            16 * 48 * 64 * 4
+        );
+        assert_eq!(
+            sd3_pricing.transition_ceiling.full_latent_fp32_bytes,
+            16 * 96 * 128 * 4
+        );
+        // 6-buffer ceiling = 2 * 196,608 + 4 * 786,432 = 3,538,944 B
+        assert_eq!(
+            sd3_pricing
+                .transition_ceiling
+                .total_six_buffer_ceiling_bytes,
+            3_538_944
+        );
+        assert_eq!(sd3_pricing.start_step, 4);
+        assert_eq!(sd3_pricing.executed_steps, 6);
+        assert_eq!(sd3_pricing.transition_step_k, 3);
+        assert_eq!(sd3_pricing.full_node_transition, 7);
+        assert_eq!(sd3_pricing.init_sigma, full_sigmas[4]);
+        assert_eq!(sd3_pricing.transition_sigma, full_sigmas[7]);
+
+        let init_codec_op = sd3_pricing
+            .request_live_set_plan
+            .operations
+            .iter()
+            .find(|op| op.operation_id == "initial_codec_encode")
+            .expect("initial_codec_encode operation present");
+        assert_eq!(init_codec_op.phase, MemoryPhase::Conditioning);
+        assert_eq!(
+            init_codec_op
+                .operation_peak_bytes(MemoryBudgetDomain::UnifiedMemory)
+                .unwrap(),
+            (160 * 1024 * 1024)
+                + (1200 * 700 * 3)
+                + (512 * 384 * 3 * 4)
+                + (48 * 1024 * 1024)
+                + 65_536
+                + 196_608
+        );
+
+        // 2. FLUX.2 (32-ch /8 -> 128-ch /16 packed: 64x48 latent -> 32x24 packed = 768 tokens)
+        let flux2_pricing = price_low_res_img2img_request_live_set_plan(
+            MemoryBudgetDomain::UnifiedMemory,
+            &low_res_plan,
+            1200,
+            700,
+            1,
+            32,
+            8,
+            1024 * 1024 * 1024,
+            168 * 1024 * 1024,
+            64 * 1024 * 1024,
+            6144 * 1024 * 1024,
+            256 * 1024 * 1024,
+            768 * 1024 * 1024,
+            168 * 1024 * 1024,
+            128 * 1024 * 1024,
+            &full_sigmas,
+            start_step,
+        )
+        .expect("FLUX.2 M3 initial codec pricing");
+
+        // [1, 32, 48, 64] == [1, 768, 128] fp32 = 393,216 B
+        assert_eq!(
+            flux2_pricing.retained_clean_init_latent_bytes,
+            32 * 48 * 64 * 4
+        );
+        assert_eq!(
+            flux2_pricing.retained_clean_init_latent_bytes,
+            (32 * 24) * 128 * 4
+        );
+        // 6-buffer ceiling = 2 * 393,216 + 4 * 1,572,864 = 7,077,888 B
+        assert_eq!(
+            flux2_pricing
+                .transition_ceiling
+                .total_six_buffer_ceiling_bytes,
+            7_077_888
+        );
+        assert!(flux2_pricing.priced_domain_peak.request_peak_bytes > 0);
+    }
 }

@@ -151,7 +151,7 @@ pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Imag
     let mut reference = None;
     for c in &req.conditioning {
         if let Conditioning::Reference { image, strength } = c {
-            if reference.is_some() {
+            if reference.is_some() || req.source_image.is_some() {
                 return Err(CandleError::Msg(
                     "sd3: multiple reference images are not supported (single img2img init only)"
                         .into(),
@@ -159,6 +159,9 @@ pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Imag
             }
             reference = Some((image, strength.or(req.strength)));
         }
+    }
+    if let Some(image) = &req.source_image {
+        reference = Some((image, req.strength));
     }
     Ok(reference)
 }
@@ -525,51 +528,50 @@ impl Pipeline {
     /// — real CFG (Large/Medium) or the distilled single-eval (Turbo) applies to the img2img tail exactly
     /// as to txt2img. `start_step == 0` (`clean` is `None`) is pure txt2img: `x_t = noise`, full schedule
     /// — byte-identical to the pre-sc-11784 path.
-    pub(crate) fn render(
+    /// Planned resident execution over a compiled [`gen_core::RenderRun`] (`SW-6946`).
+    ///
+    /// Wraps prompt conditioning and initial reference VAE encoding (at phase-0 output dimensions
+    /// `run.plan().phase_output_size(0)`) inside `run.encode(|| ...)`, blends initial clean latents
+    /// with seeded phase-0 noise at `denoise_sigmas[0]` (`full_sigmas[start_step]`), and runs
+    /// [`render_core`] (`candle_gen::run_flow_sampler_spans`) across `run.plan().denoise_spans()`.
+    pub(crate) fn render_planned(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         components: &Components,
-        clean: Option<&Tensor>,
-        start_step: usize,
+        vae_encoder: Option<&VaeEncoder>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let steps = req
             .steps
             .map(|s| s as usize)
             .unwrap_or_else(|| self.variant.default_steps());
-        let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
+        let cfg_scale = run.plan().guidance();
         candle_gen::execution::policy("sd3/pipeline/cfg_scale", format!("{cfg_scale:?}").into());
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let lat_h = (req.height / VAE_SCALE) as usize;
-        let lat_w = (req.width / VAE_SCALE) as usize;
+        let base_seed = run.plan().base_seed();
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
+        let lat_h = (phase0_h / VAE_SCALE) as usize;
+        let lat_w = (phase0_w / VAE_SCALE) as usize;
 
-        // Conditioning is seed- and image-independent: encode once for the whole batch. `cfg_scale`
-        // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
-        let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
-                Ok((cond, uncond))
-            },
-        )?;
-        // Per-step latent preview (epic 16948, sc-16958). Opting in is the sc-16949 projector hook and
-        // nothing else: the driver owns frame numbering, the multi-eval dedup and the swallow-on-failure
-        // contract, so neither this loop nor `render_core` changes shape. The hook is built once and
-        // handed to each per-seed driver call, and the driver builds a fresh counter per call — so a
-        // batched request restarts each image's trajectory at frame 1 rather than continuing the
-        // previous one's numbering. Over an inert sink this costs one `is_active` check per evaluation
-        // and leaves the render seeded-byte-identical. See [`crate::preview`].
-        //
-        // `render_core` takes the hook **by reference, not as an `Option`** — deliberately. The
-        // catalog's route inventory classifies the argument one hop further in, at the
-        // `run_flow_sampler` call, so an `Option` here would let this lane be turned dark by changing
-        // one argument to `None` while `hooked: 1` and `supports_preview: true` kept advertising.
-        // Going dark now requires a type change; `crate::preview`'s
-        // `the_render_lane_builds_its_hook_from_the_requests_sink` covers the other half — that the
-        // sink the hook is built over is the request's.
-        let preview = request_preview(req);
-
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let ((cond, uncond), clean) =
+            run.encode(|| -> std::result::Result<_, candle_gen::CandleError> {
+                let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+                    on_progress,
+                    || -> std::result::Result<_, candle_gen::CandleError> {
+                        self.conditioning(&components.encoders, req, cfg_scale)
+                    },
+                )?;
+                let clean = match (resolve_reference(req)?, vae_encoder) {
+                    (Some((image, _)), Some(encoder)) => {
+                        Some(self.encode_reference(encoder, image, phase0_w, phase0_h)?)
+                    }
+                    _ => None,
+                };
+                Ok(((cond, uncond), clean))
+            })?;
+        let preview = request_preview(req, run.plan());
+        run.begin_rendering()?;
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             render_core(
                 &components.transformer,
                 &components.vae,
@@ -582,23 +584,26 @@ impl Pipeline {
                 seed,
                 self.device.clone(),
                 self.dtype,
-                req.sampler.as_deref(),
+                Some(run.plan().sampler()),
                 req.scheduler.as_deref(),
-                clean,
-                start_step,
+                clean.as_ref(),
+                0,
+                Some(run),
                 &req.cancel,
                 on_progress,
                 &preview,
             )
-        })
+        })?;
+        run.finish_rendering();
+        Ok(images)
     }
 
-    /// Request-authoritative staged execution. The triple text encoders are released before the
-    /// optional F32 I2I encoder is opened; both are released before the MMDiT (plus the exact
-    /// additive adapter stack), and the MMDiT is released before the decoder VAE is opened.
-    pub(crate) fn render_staged(
+    /// Planned request-authoritative staged execution over a compiled [`gen_core::RenderRun`] (`SW-6946`).
+    pub(crate) fn render_staged_planned(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
+        start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
         verify: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Image>> {
@@ -606,54 +611,51 @@ impl Pipeline {
             device: self.device.clone(),
         };
         candle_gen::check_cancel(&req.cancel)?;
-        let steps = req
-            .steps
-            .map(|value| value as usize)
-            .unwrap_or_else(|| self.variant.default_steps());
-        let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
+        let cfg_scale = run.plan().guidance();
         candle_gen::execution::policy("sd3/pipeline/cfg_scale", format!("{cfg_scale:?}").into());
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.plan().base_seed();
+        let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
         let latent_hw = (
-            (req.height / VAE_SCALE) as usize,
-            (req.width / VAE_SCALE) as usize,
+            (phase0_h / VAE_SCALE) as usize,
+            (phase0_w / VAE_SCALE) as usize,
         );
 
-        verify()?;
-        let text = SynchronizedPhase::new(
-            Mutex::new(self.load_text_encoders()?),
-            self.device.clone(),
-            "triple text encoders",
-        );
-        let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let (cond, uncond) = self.conditioning(&text, req, cfg_scale)?;
-                Ok((cond, uncond))
-            },
-        )?;
-        text.release()?;
+        let ((cond, uncond), clean) =
+            run.encode(|| -> std::result::Result<_, candle_gen::CandleError> {
+                verify()?;
+                let text = SynchronizedPhase::new(
+                    Mutex::new(self.load_text_encoders()?),
+                    self.device.clone(),
+                    "triple text encoders",
+                );
+                let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+                    on_progress,
+                    || -> std::result::Result<_, candle_gen::CandleError> {
+                        self.conditioning(&text, req, cfg_scale)
+                    },
+                )?;
+                text.release()?;
 
-        let reference = resolve_reference(req)?;
-        let start_step = match &reference {
-            Some((_, strength)) => init_time_step(steps, Some(resolve_img2img_strength(*strength))),
-            None => 0,
-        };
-        let clean = if start_step > 0 {
-            candle_gen::check_cancel(&req.cancel)?;
-            verify()?;
-            let encoder = SynchronizedPhase::new(
-                self.load_vae_encoder()?,
-                self.device.clone(),
-                "F32 I2I encoder",
-            );
-            let (image, _) = reference.expect("positive I2I fork has a reference");
-            let clean = self.encode_reference(&encoder, image, req.width, req.height)?;
-            encoder.release()?;
-            Some(clean)
-        } else {
-            None
-        };
+                let reference = resolve_reference(req)?;
+                let clean = if start_step > 0 {
+                    candle_gen::check_cancel(&req.cancel)?;
+                    verify()?;
+                    let encoder = SynchronizedPhase::new(
+                        self.load_vae_encoder()?,
+                        self.device.clone(),
+                        "F32 I2I encoder",
+                    );
+                    let (image, _) = reference.expect("positive I2I fork has a reference");
+                    let clean = self.encode_reference(&encoder, image, phase0_w, phase0_h)?;
+                    encoder.release()?;
+                    Some(clean)
+                } else {
+                    None
+                };
+                Ok(((cond, uncond), clean))
+            })?;
 
+        run.begin_rendering()?;
         candle_gen::check_cancel(&req.cancel)?;
         verify()?;
         let denoiser = SynchronizedPhase::new(
@@ -666,22 +668,18 @@ impl Pipeline {
             candle_gen::check_cancel(&req.cancel)?;
             let seed = base_seed.wrapping_add(u64::from(index));
             candle_gen::execution::draw("image_initial_noise", seed, index as usize);
-            let preview = request_preview(req);
+            let preview = request_preview(req, run.plan());
             latents.push(denoise_latents(
                 &denoiser,
                 &cond,
                 uncond.as_ref(),
                 cfg_scale,
-                steps,
-                req.scheduler_shift.unwrap_or(self.variant.shift()),
                 latent_hw,
                 seed,
                 self.device.clone(),
                 self.dtype,
-                req.sampler.as_deref(),
-                req.scheduler.as_deref(),
                 clean.as_ref(),
-                start_step,
+                run,
                 &req.cancel,
                 on_progress,
                 &preview,
@@ -698,34 +696,25 @@ impl Pipeline {
             candle_gen::execution::output_index(output_index);
             candle_gen::check_cancel(&req.cancel)?;
             on_progress(Progress::Decoding);
-            images.push(decode_image(&decoder, latent)?);
+            images.push(run.decode_phase(|| decode_image(&decoder, latent))?);
         }
         decoder.release()?;
+        run.finish_rendering();
         Ok(images)
     }
 }
 
-fn request_preview(req: &GenerationRequest) -> candle_gen::preview::PreviewHook<'_> {
-    crate::preview::hook(&req.preview)
+fn request_preview<'a>(
+    req: &'a GenerationRequest,
+    plan: &gen_core::RenderPlan,
+) -> candle_gen::preview::PreviewHook<'a> {
+    crate::preview::hook_for_plan(&req.preview, plan)
 }
 
-/// The render core shared by [`Pipeline::render`] and the structural/CUDA smoke tests: build the
-/// deterministic CPU-seeded noise, run the unified flow-match sampler (with CFG when `uncond` is
-/// `Some`, distilled-single-eval when `None`), and VAE-decode. Decoupled from snapshot I/O so a test
-/// can drive it with a random-weight transformer + VAE.
-///
-/// `preview` is the per-step latent preview hook (epic 16948, sc-16958) — the **single**
-/// shared-driver site every SD3.5 route and lane funnels through, so hooking it here wires all six
-/// user-reachable lanes at once. See [`crate::preview`] for the enumeration, the reused fit and why
-/// the latent needs no unpack.
-///
-/// It is **not** an `Option`, unlike the shared driver's own parameter. This crate has no
-/// deliberately dark lane to express — no trainer, no descriptor-less provider — so an `Option` here
-/// would buy nothing and cost the guarantee that matters: with `&PreviewHook` a caller cannot go
-/// preview-dark by editing one argument, which is invisible to the catalog's route inventory because
-/// that inventory classifies the driver argument one hop further in. A hook over an inert
-/// [`gen_core::PreviewSink`] is the way to run this without previews, and it is byte-identical to a
-/// run without one: the emitter returns before any tensor work when the sink is inert.
+/// The render core shared by [`Pipeline::render_planned`] and the structural/CUDA smoke tests:
+/// build the deterministic CPU-seeded noise, run the unified flow-match sampler (with CFG when
+/// `uncond` is `Some`, distilled-single-eval when `None`), and VAE-decode. Decoupled from snapshot
+/// I/O so a test can drive it with a random-weight transformer + VAE.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_core(
     transformer: &Sd3Transformer,
@@ -743,17 +732,29 @@ pub(crate) fn render_core(
     scheduler: Option<&str>,
     clean: Option<&Tensor>,
     start_step: usize,
+    run: Option<&gen_core::RenderRun<'_, '_>>,
     cancel: &gen_core::CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Image> {
     let (lat_h, lat_w) = latent_hw;
+    let fallback_sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
+    let start = start_step.min(fallback_sigmas.len().saturating_sub(1));
+    let (run_sigmas, spans) = match run {
+        Some(run) => (run.plan().denoise_sigmas(), run.plan().denoise_spans()),
+        None => {
+            let sliced = &fallback_sigmas[start..];
+            (
+                sliced,
+                std::iter::once(0..sliced.len().saturating_sub(1)).collect(),
+            )
+        }
+    };
 
-    // Native SD3 flow-match schedule (shifted), then the curated scheduler axis (default = native).
-    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
+    if let Some(run) = run {
+        run.reset_image_denoise_phases();
+    }
 
-    // sc-3673 parity — deterministic, launch-portable initial noise: N(0,1) from a CPU RNG seeded by
-    // `seed`, built on CPU then moved to the device.
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sd3/pipeline", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
@@ -761,55 +762,50 @@ pub(crate) fn render_core(
         .to_device(&device)?
         .to_dtype(dtype)?;
 
-    // img2img / `Reference` (sc-11784): blend the pre-encoded clean latent with the seeded noise at
-    // `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is clamped to
-    // the schedule because a curated scheduler may return a length ≠ `steps + 1`. For txt2img (`clean`
-    // is `None`, `start_step == 0`) this is `x_t = noise` over the full schedule — byte-identical to
-    // the pre-sc-11784 path. The flow-match interpolation matches diffusers' `scale_noise`
-    // (`x_t = (1 − σ)·clean + σ·noise`). Max strength (start == steps) ⇒ σ_start = 0 ⇒ x_t = clean and
-    // a single-node (0-step) tail: the source's VAE round-trip.
-    let start = start_step.min(sigmas.len().saturating_sub(1));
     let latents = match clean {
         Some(clean) => {
-            let sigma_start = sigmas[start] as f64;
+            let sigma_start = run_sigmas[0] as f64;
             (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
         }
         None => noise,
     };
-    let run_sigmas = &sigmas[start..];
 
-    let latents = candle_gen::run_flow_sampler(
+    let latents = candle_gen::run_flow_sampler_spans(
         sampler,
         TimestepConvention::Sigma,
         run_sigmas,
+        &spans,
+        run,
+        false,
         latents,
         seed,
         cancel,
         on_progress,
         Some(preview),
         |latents, sigma| -> Result<Tensor> {
-            // SD3 feeds the DiT `t = σ·1000` (the timestep convention; the embedder scales the
-            // sinusoid). f32 here is correct — the embedder upcasts internally.
             let t = Tensor::from_vec(vec![sigma * 1000.0], (1,), &device)?;
             let v_cond = transformer.forward(latents, &cond.context, &cond.pooled, &t)?;
             let v = match uncond {
-                // Large CFG: v = uncond + cfg·(cond − uncond).
                 Some(uncond) => {
                     let v_uncond =
                         transformer.forward(latents, &uncond.context, &uncond.pooled, &t)?;
                     (&v_uncond + ((&v_cond - &v_uncond)? * cfg_scale as f64)?)?
                 }
-                // Turbo (distilled): no negative branch — the velocity is used directly.
                 None => v_cond,
             };
-            // The DiT may run in a different (e.g. f32) dtype than the latent stream; bring the
-            // velocity back to the latent dtype so the flow-match step's add agrees (sc-7881).
             Ok(v.to_dtype(latents.dtype())?)
         },
     )?;
 
+    if let Some(run) = run {
+        run.finish_image_denoise_phases()?;
+    }
+
     on_progress(Progress::Decoding);
-    decode_image(vae, &latents)
+    match run {
+        Some(run) => run.decode_phase(|| decode_image(vae, &latents)),
+        None => decode_image(vae, &latents),
+    }
 }
 
 /// The denoise-only half of [`render_core`], used by staged execution so every final latent can be
@@ -820,40 +816,40 @@ fn denoise_latents(
     cond: &Sd3Conditioning,
     uncond: Option<&Sd3Conditioning>,
     cfg_scale: f32,
-    steps: usize,
-    shift: f32,
     latent_hw: (usize, usize),
     seed: u64,
     device: Device,
     dtype: DType,
-    sampler: Option<&str>,
-    scheduler: Option<&str>,
     clean: Option<&Tensor>,
-    start_step: usize,
+    run: &gen_core::RenderRun<'_, '_>,
     cancel: &gen_core::CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
     let (lat_h, lat_w) = latent_hw;
-    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
+    let run_sigmas = run.plan().denoise_sigmas();
+    let spans = run.plan().denoise_spans();
+    run.reset_image_denoise_phases();
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sd3/pipeline", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
         .to_device(&device)?
         .to_dtype(dtype)?;
-    let start = start_step.min(sigmas.len().saturating_sub(1));
     let latents = match clean {
         Some(clean) => {
-            let sigma_start = sigmas[start] as f64;
+            let sigma_start = run_sigmas[0] as f64;
             (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
         }
         None => noise,
     };
-    candle_gen::run_flow_sampler(
-        sampler,
+    let final_latent = candle_gen::run_flow_sampler_spans(
+        Some(run.plan().sampler()),
         TimestepConvention::Sigma,
-        &sigmas[start..],
+        run_sigmas,
+        &spans,
+        Some(run),
+        false,
         latents,
         seed,
         cancel,
@@ -872,7 +868,9 @@ fn denoise_latents(
             };
             Ok(v.to_dtype(latents.dtype())?)
         },
-    )
+    )?;
+    run.finish_image_denoise_phases()?;
+    Ok(final_latent)
 }
 
 /// VAE-decode the final latents `(1, 16, h, w)` to an RGB8 [`Image`]. The VAE applies its own
@@ -1379,6 +1377,7 @@ mod tests {
             None,
             None, // clean: txt2img (no reference)
             0,    // start_step: full schedule
+            None,
             &cancel,
             &mut progress,
             &preview,
@@ -1461,6 +1460,7 @@ mod tests {
                 None,
                 None, // clean: txt2img (no reference)
                 0,    // start_step: full schedule
+                None,
                 &cancel,
                 &mut |_p: Progress| {},
                 &preview,
@@ -1519,6 +1519,7 @@ mod tests {
                 None,
                 None, // clean: txt2img (no reference)
                 0,    // start_step: full schedule
+                None,
                 &cancel,
                 &mut |_p: Progress| {},
                 &preview,
@@ -1592,6 +1593,7 @@ mod tests {
                 None,
                 clean,
                 start,
+                None,
                 &cancel,
                 &mut |_p: Progress| {},
                 &preview,
@@ -1778,6 +1780,7 @@ mod tests {
                 None,
                 None, // clean: txt2img (no reference)
                 0,    // start_step: full schedule
+                None,
                 &cancel,
                 &mut |_p: Progress| {},
                 &preview,

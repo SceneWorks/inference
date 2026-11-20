@@ -115,6 +115,7 @@ pub struct Sd3Generator {
     vae_encoder: Mutex<Option<Arc<VaeEncoder>>>,
     /// Serializes cache transition + generation so a staged request cannot race a resident warm hit.
     lifecycle: Mutex<()>,
+    loaded_spec: LoadSpec,
     memory_contract: gen_core::MemoryProviderContract,
     load_receipt: Option<memory_strategy::Sd35LoadReceipt>,
     memory_admission: memory_strategy::AdmissionRegistry,
@@ -176,7 +177,18 @@ impl Generator for Sd3Generator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-sd3/src/lib.rs",
@@ -238,53 +250,7 @@ impl Generator for Sd3Generator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        let id = self.model_id();
-        // The shared capability floor (count/size/negative/guidance/conditioning/sampler).
-        self.descriptor.capabilities.validate_request(id, req)?;
-        let guidance = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
-        if req.negative_prompt.is_some() && guidance == 1.0 {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: a negative prompt requires guidance != 1.0; change guidance or drop the negative prompt"
-            )));
-        }
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if req.frames.is_some_and(|frames| frames != 1) || req.image_reference_count() > 1 {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id}: image generation requires one frame and either T2I/ref0 or I2I/ref1"
-            )));
-        }
-        let valid_strength = |strength: Option<f32>| {
-            strength.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
-        };
-        if !valid_strength(req.strength)
-            || req
-                .conditioning
-                .iter()
-                .any(|conditioning| match conditioning {
-                    gen_core::Conditioning::Reference { strength, .. } => {
-                        !valid_strength(*strength)
-                    }
-                    _ => false,
-                })
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id}: I2I strength must be finite and in [0, 1]"
-            )));
-        }
-        Ok(())
+        validate_request_for_variant(self.variant, req)
     }
 
     fn generate(
@@ -292,9 +258,37 @@ impl Generator for Sd3Generator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{}: generation completed without output",
+                    self.model_id()
+                ))
+            })
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_trajectory_for(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        self.memory_admission.consume(req)?;
+        self.memory_admission.consume_for_generate(req)?;
         if let Some(receipt) = &self.load_receipt {
             receipt.ensure_unchanged()?;
         }
@@ -305,9 +299,6 @@ impl Generator for Sd3Generator {
                 self.model_id()
             )));
         }
-        // The light `Pipeline` handle carries the snapshot/device/variant; the heavy components come
-        // from the cache. The rich-`CandleError` tail (including the typed `Canceled`) bridges into
-        // `gen_core::Error` via `?`.
         let pipe = Pipeline::load(
             &self.root,
             &self.device,
@@ -316,7 +307,9 @@ impl Generator for Sd3Generator {
             self.quant,
             &self.adapters,
         );
-        if memory.stage_residency {
+        let (_, start_step) = resolved_schedule_for_request(self.variant, req)?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let images = if memory.stage_residency {
             let warm = (
                 evict_warm_for_staged(&self.components),
                 evict_warm_for_staged(&self.vae_encoder),
@@ -329,40 +322,150 @@ impl Generator for Sd3Generator {
                     .ensure_unchanged()
                     .map_err(|error| candle_gen::CandleError::Msg(error.to_string()))
             };
-            let images = pipe.render_staged(req, on_progress, &verify)?;
-            return Ok(GenerationOutput::Images(images));
-        }
-
-        let components = self.components(&pipe)?;
-
-        // img2img / `Reference` (sc-11784): resolve the single reference + its effective strength, and —
-        // when the strength yields a non-empty structure-preserving denoise (`start_step > 0`) — VAE-encode
-        // it to the clean init latent. `resolve_reference` errors on >1 reference; the capability floor in
-        // `validate` already rejects any non-`Reference` conditioning. The fork `start_step` is computed
-        // against the SAME step count `render` uses (`req.steps` or the variant default), so the strength
-        // knob maps to the intended σ node. Mirrors the mlx-gen-sd3 `denoise_img2img_cfg` lane (sc-10189).
-        let reference = pipeline::resolve_reference(req)?;
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or_else(|| self.variant.default_steps());
-        let start_step = match &reference {
-            Some((_, strength)) => {
-                pipeline::init_time_step(steps, Some(pipeline::resolve_img2img_strength(*strength)))
-            }
-            None => 0,
-        };
-        let clean = if start_step > 0 {
-            let (image, _) = reference.expect("start_step > 0 implies a reference");
-            let encoder = self.vae_encoder(&pipe)?;
-            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+            pipe.render_staged_planned(req, &run, start_step, on_progress, &verify)?
         } else {
-            None
+            let components = self.components(&pipe)?;
+            let encoder = if start_step > 0 {
+                Some(self.vae_encoder(&pipe)?)
+            } else {
+                None
+            };
+            pipe.render_planned(req, &run, &components, encoder.as_deref(), on_progress)?
         };
-
-        let images = pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
-        Ok(GenerationOutput::Images(images))
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_mmdit")?;
+        Ok(report)
     }
+}
+
+fn validate_request_for_variant(variant: Variant, req: &GenerationRequest) -> gen_core::Result<()> {
+    let descriptor = descriptor_for(variant);
+    let id = descriptor.id;
+    // The shared capability floor (count/size/negative/guidance/conditioning/sampler).
+    descriptor.capabilities.validate_request(id, req)?;
+    let guidance = req.guidance.unwrap_or_else(|| variant.default_cfg());
+    if req.negative_prompt.is_some() && guidance == 1.0 {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: a negative prompt requires guidance != 1.0; change guidance or drop the negative prompt"
+        )));
+    }
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: prompt must not be empty"
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if req.frames.is_some_and(|frames| frames != 1) || req.image_reference_count() > 1 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: image generation requires one frame and either T2I/ref0 or I2I/ref1"
+        )));
+    }
+    let valid_strength = |strength: Option<f32>| {
+        strength.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+    };
+    if !valid_strength(req.strength)
+        || req
+            .conditioning
+            .iter()
+            .any(|conditioning| match conditioning {
+                gen_core::Conditioning::Reference { strength, .. } => !valid_strength(*strength),
+                _ => false,
+            })
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: I2I strength must be finite and in [0, 1]"
+        )));
+    }
+    pipeline::resolve_reference(req)?;
+    if let Some(low_res) = &req.low_res_start {
+        let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
+        let executed_steps = sigmas[start_step..].len().saturating_sub(1);
+        low_res.resolve_for_descriptor(&descriptor, req, executed_steps, SIZE_MULTIPLE)?;
+    }
+    Ok(())
+}
+
+fn resolved_schedule_for_request(
+    variant: Variant,
+    req: &GenerationRequest,
+) -> gen_core::Result<(Vec<f32>, usize)> {
+    let steps = req
+        .steps
+        .map(|s| s as usize)
+        .unwrap_or_else(|| variant.default_steps());
+    let shift = req.scheduler_shift.unwrap_or_else(|| variant.shift());
+    let sigmas = pipeline::resolve_sd3_sigmas(req.scheduler.as_deref(), steps, shift);
+    let reference = pipeline::resolve_reference(req)?;
+    let start_step = match &reference {
+        Some((_, strength)) => {
+            pipeline::init_time_step(steps, Some(pipeline::resolve_img2img_strength(*strength)))
+                .min(sigmas.len().saturating_sub(2))
+        }
+        None => 0,
+    };
+    Ok((sigmas, start_step))
+}
+
+/// Compile the weights-free Candle SD3.5 trajectory for `variant` and `req` (`SW-6946`).
+pub fn compile_trajectory_for(
+    variant: Variant,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    validate_request_for_variant(variant, req)?;
+    let descriptor = descriptor_for(variant);
+    let (sigmas, start_step) = resolved_schedule_for_request(variant, req)?;
+    let sliced = sigmas[start_step..].to_vec();
+    let executed_steps = sliced.len().saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
+    let guidance = req.guidance.unwrap_or_else(|| variant.default_cfg());
+    let sampler = req.sampler.as_deref().unwrap_or("euler");
+    gen_core::RenderPlan::packed_image_trajectory(
+        &descriptor,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler,
+            guidance,
+            sigmas: sliced,
+            executed_steps,
+            capture_sigma,
+        },
+    )
+}
+
+fn compile_variant_plan(
+    variant: Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let id = match variant {
+        Variant::Large => MODEL_ID,
+        Variant::LargeTurbo => MODEL_ID_TURBO,
+        Variant::Medium => MODEL_ID_MEDIUM,
+    };
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id} expects a snapshot directory (text_encoder/ text_encoder_2/ text_encoder_3/ \
+             transformer/ vae/), not a single .safetensors file"
+        )));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support control / IP-adapter overlays"
+        )));
+    }
+    compile_trajectory_for(variant, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
 }
 
 /// SD3.5 **Large**'s identity + the wired surface: txt2img with CFG + negative prompt (SD3.5 Large is
@@ -435,6 +538,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
             // for the lane enumeration and the reused epic-16624 16-channel fit.
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -518,6 +622,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
         lifecycle: Mutex::new(()),
+        loaded_spec: spec.clone(),
         memory_contract,
         load_receipt,
         memory_admission: memory_strategy::AdmissionRegistry::new(id),
@@ -541,8 +646,20 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(LARGE_REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: |spec, req| compile_variant_plan(Variant::Large, spec, req),
+        })
         .register_generator(TURBO_REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID_TURBO,
+            compile: |spec, req| compile_variant_plan(Variant::LargeTurbo, spec, req),
+        })
         .register_generator(MEDIUM_REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID_MEDIUM,
+            compile: |spec, req| compile_variant_plan(Variant::Medium, spec, req),
+        })
         .register_trainer(training::LARGE_TRAINER_REGISTRATION)
         .register_trainer(training::MEDIUM_TRAINER_REGISTRATION);
     register_memory_contract_surfaces(registry)
@@ -970,5 +1087,108 @@ mod tests {
             panic!("single-file source must be refused")
         };
         assert!(e.to_string().contains("snapshot directory"), "got: {e}");
+    }
+
+    #[test]
+    fn sw6946_candle_sd3_m3_non_square_plain_img2img_low_res_start_fixture() {
+        use candle_gen::gen_core::{
+            latent::SpatialCompression,
+            sampling::{init_time_step, sd3_sigmas, FlowModelSampling, TimestepConvention},
+            transition_clean_estimate_f32, BoundaryState, EstimateSource, LatentPatchLayout,
+            LowResStartSpec, SD3_LATENT_SPACE,
+        };
+
+        let registry = crate::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+
+        assert_eq!(SD3_LATENT_SPACE.channels, 16);
+        assert_eq!(
+            SD3_LATENT_SPACE.spatial_compression,
+            SpatialCompression {
+                height: 8,
+                width: 8
+            }
+        );
+        assert_eq!(SD3_LATENT_SPACE.patch_layout, LatentPatchLayout::Unpacked);
+
+        let source_1200x700 = Image {
+            width: 1200,
+            height: 700,
+            pixels: vec![112; 1200 * 700 * 3],
+        };
+        let steps = 10_usize;
+        let strength = 0.4_f32;
+        assert_eq!(init_time_step(steps, Some(strength)), 4);
+        let full_sigmas = sd3_sigmas(steps, 3.0);
+        assert_eq!(full_sigmas.len(), 11);
+
+        for provider_id in [MODEL_ID, MODEL_ID_TURBO, MODEL_ID_MEDIUM] {
+            let app = &all_features[provider_id]["low_res_start"];
+            assert!(
+                app.applicable,
+                "candle {provider_id} must support low_res_start"
+            );
+
+            for via_source_image in [false, true] {
+                let mut m3_req = GenerationRequest {
+                    prompt: "a vintage locomotive crossing a stone viaduct".into(),
+                    width: 1024,
+                    height: 768,
+                    steps: Some(steps as u32),
+                    seed: Some(1234),
+                    low_res_start: Some(LowResStartSpec::new(3, Some(0.5))),
+                    ..Default::default()
+                };
+                if via_source_image {
+                    m3_req.source_image = Some(source_1200x700.clone());
+                    m3_req.strength = Some(strength);
+                } else {
+                    m3_req.conditioning = vec![Conditioning::Reference {
+                        image: source_1200x700.clone(),
+                        strength: Some(strength),
+                    }];
+                }
+
+                let plan = registry
+                    .compile_render_plan(provider_id, &spec, &m3_req)
+                    .unwrap_or_else(|e| panic!("{provider_id} (source={via_source_image}): {e}"))
+                    .expect("compiled Candle SD3.5 RenderPlan");
+
+                assert_eq!(plan.executed_steps(), 6, "{provider_id}");
+                assert_eq!(plan.denoise_spans(), vec![0..3, 3..6], "{provider_id}");
+                assert_eq!(plan.phase_output_size(0), (512, 384), "{provider_id}");
+                assert_eq!(plan.phase_output_size(1), (1024, 768), "{provider_id}");
+                assert_eq!(plan.phase_packed_tokens(0), 32 * 24, "{provider_id}");
+                assert_eq!(plan.phase_packed_tokens(1), 64 * 48, "{provider_id}");
+
+                let denoise_sigmas = plan.denoise_sigmas();
+                assert_eq!(denoise_sigmas.len(), 7, "{provider_id}");
+                assert_eq!(denoise_sigmas, &full_sigmas[4..=10], "{provider_id}");
+                assert_eq!(denoise_sigmas[0], full_sigmas[4], "{provider_id}");
+                assert_eq!(denoise_sigmas[3], full_sigmas[7], "{provider_id}");
+
+                let low_res_plan = plan.low_res_start().expect("low_res_start active");
+                let phase0_clean = vec![0.5_f32; 16 * 48 * 64];
+                let transitioned = transition_clean_estimate_f32(
+                    BoundaryState::CleanEstimate {
+                        latent: &phase0_clean,
+                        source: EstimateSource::PreviousEvaluation,
+                    },
+                    1,
+                    16,
+                    8,
+                    low_res_plan,
+                    full_sigmas[7],
+                    &FlowModelSampling::new(TimestepConvention::Sigma),
+                    1234,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("Candle SD3.5 phase-0 -> phase-1 clean estimate transition at node 7");
+                assert_eq!(transitioned.len(), 16 * 96 * 128);
+            }
+        }
     }
 }
