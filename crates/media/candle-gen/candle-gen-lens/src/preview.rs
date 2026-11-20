@@ -242,8 +242,11 @@ mod tests {
     /// as an exact count so a *second* trainer site could not appear unnoticed.
     #[test]
     fn the_trainer_sample_render_is_the_only_deliberately_dark_site() {
-        let sites =
-            sampler_call_sites_for("training.rs", include_str!("training.rs"), "run_flow_sampler(");
+        let sites = sampler_call_sites_for(
+            "training.rs",
+            include_str!("training.rs"),
+            "run_flow_sampler(",
+        );
         assert_eq!(
             sites.len(),
             1,

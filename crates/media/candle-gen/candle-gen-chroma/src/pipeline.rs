@@ -339,24 +339,23 @@ impl Pipeline {
             (pos_embeds, neg, None)
         };
 
-        let build_ropes =
-            |w: u32, h: u32| -> Result<(rope::RopeTable, Option<rope::RopeTable>)> {
-                let h2 = (h as usize).div_ceil(16);
-                let w2 = (w as usize).div_ceil(16);
-                let rope_pos =
-                    rope::build_for(&components.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
-                let rope_neg = match &neg {
-                    Some(n) => Some(rope::build_for(
-                        &components.cfg,
-                        n.dim(1)?,
-                        h2,
-                        w2,
-                        &self.device,
-                    )?),
-                    None => None,
-                };
-                Ok((rope_pos, rope_neg))
+        let build_ropes = |w: u32, h: u32| -> Result<(rope::RopeTable, Option<rope::RopeTable>)> {
+            let h2 = (h as usize).div_ceil(16);
+            let w2 = (w as usize).div_ceil(16);
+            let rope_pos =
+                rope::build_for(&components.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
+            let rope_neg = match &neg {
+                Some(n) => Some(rope::build_for(
+                    &components.cfg,
+                    n.dim(1)?,
+                    h2,
+                    w2,
+                    &self.device,
+                )?),
+                None => None,
             };
+            Ok((rope_pos, rope_neg))
+        };
         let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
         let (full_w, full_h) = run.plan().output_size();
         let phase0_ropes = build_ropes(phase0_w, phase0_h)?;
@@ -438,18 +437,16 @@ impl Pipeline {
                 Ok((pos_embeds, neg))
             },
         )?;
-        let build_ropes =
-            |w: u32, h: u32| -> Result<(rope::RopeTable, Option<rope::RopeTable>)> {
-                let h2 = (h as usize).div_ceil(16);
-                let w2 = (w as usize).div_ceil(16);
-                let rope_pos =
-                    rope::build_for(&text.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
-                let rope_neg = neg
-                    .as_ref()
-                    .map(|value| rope::build_for(&text.cfg, value.dim(1)?, h2, w2, &self.device))
-                    .transpose()?;
-                Ok((rope_pos, rope_neg))
-            };
+        let build_ropes = |w: u32, h: u32| -> Result<(rope::RopeTable, Option<rope::RopeTable>)> {
+            let h2 = (h as usize).div_ceil(16);
+            let w2 = (w as usize).div_ceil(16);
+            let rope_pos = rope::build_for(&text.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
+            let rope_neg = neg
+                .as_ref()
+                .map(|value| rope::build_for(&text.cfg, value.dim(1)?, h2, w2, &self.device))
+                .transpose()?;
+            Ok((rope_pos, rope_neg))
+        };
         let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
         let (full_w, full_h) = run.plan().output_size();
         let phase0_ropes = build_ropes(phase0_w, phase0_h)?;
@@ -534,9 +531,13 @@ impl Pipeline {
                     DecoderComponents::Native(vae) => {
                         self.decode(vae, None, latent, req.height, req.width)
                     }
-                    DecoderComponents::Pid(_) => {
-                        self.decode_tensor(None, pid_decoder.as_ref(), latent, req.height, req.width)
-                    }
+                    DecoderComponents::Pid(_) => self.decode_tensor(
+                        None,
+                        pid_decoder.as_ref(),
+                        latent,
+                        req.height,
+                        req.width,
+                    ),
                 }
             })?;
             images.push(image);

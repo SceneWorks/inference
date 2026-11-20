@@ -1870,18 +1870,12 @@ impl LensGenerator {
             self.pipeline.adapters.len(),
             "candle-gen-lens/src/lib.rs",
         );
-        candle_gen::execution::policy(
-            "loaded/sequential",
-            format!("{:?}", self.sequential).into(),
-        );
+        candle_gen::execution::policy("loaded/sequential", format!("{:?}", self.sequential).into());
         candle_gen::execution::policy(
             "loaded/stream_text",
             format!("{:?}", self.stream_text).into(),
         );
-        candle_gen::execution::policy(
-            "loaded/stream_dit",
-            format!("{:?}", self.stream_dit).into(),
-        );
+        candle_gen::execution::policy("loaded/stream_dit", format!("{:?}", self.stream_dit).into());
         candle_gen::execution::policy(
             "loaded/loaded_precision",
             format!("{:?}", self.loaded_precision).into(),
@@ -1927,14 +1921,9 @@ impl LensGenerator {
         // no `PreviewSink` to emit into and a frame here would have no consumer.
         let mu = lens_mu(num_steps, latent_h, latent_w);
         let native = lens_sigmas(num_steps, latent_h, latent_w);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            None,
-            None,
-            mu,
-            num_steps,
-            &native,
-        )
-        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let sigmas =
+            candle_gen::resolve_flow_schedule_with_shift(None, None, mu, num_steps, &native)
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
         let span = 0..sigmas.len().saturating_sub(1);
         let latents = self.pipeline.denoise(
             None,
@@ -2103,8 +2092,13 @@ impl Generator for LensGenerator {
                     .synchronize()
                     .map_err(CandleError::from)?;
             }
-            self.pipeline
-                .render_sequential_planned(req, &run, self.defaults, stream_text, on_progress)?
+            self.pipeline.render_sequential_planned(
+                req,
+                &run,
+                self.defaults,
+                stream_text,
+                on_progress,
+            )?
         } else if !self.cache_components_for_request(stage_residency) {
             // A Sequential-loaded generator may be asked for a resident baseline, but that resident
             // stack is request-local. Caching it would leave the full encoder/heavy bundle alive and
@@ -2117,8 +2111,7 @@ impl Generator for LensGenerator {
             self.pipeline
                 .render_planned(req, &run, &comps, self.defaults, on_progress)?
         };
-        let mut report =
-            gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
         let (dt_label, dt_bytes) = match self.loaded_precision {
             Precision::Fp32 => ("f32", 4),
             Precision::Bf16 => ("bf16", 2),
@@ -2197,10 +2190,7 @@ fn defaults_for(id: &str) -> Defaults {
     }
 }
 
-fn build_schedule_for(
-    defaults: Defaults,
-    req: &GenerationRequest,
-) -> gen_core::Result<Vec<f32>> {
+fn build_schedule_for(defaults: Defaults, req: &GenerationRequest) -> gen_core::Result<Vec<f32>> {
     let steps = req.steps.unwrap_or(defaults.steps) as usize;
     let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
     let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;

@@ -1989,7 +1989,9 @@ impl Generator for Flux2Generator {
             },
             |_| Ok(self.pipe.device.synchronize()?),
             |heavy, encoded, on_progress| {
-                let result = self.pipe.render_phase(heavy, req, &run, encoded, on_progress);
+                let result = self
+                    .pipe
+                    .render_phase(heavy, req, &run, encoded, on_progress);
                 candle_gen::synchronize_result(&self.pipe.device, result)
             },
         );
@@ -2497,7 +2499,10 @@ mod explicit_registry_tests {
 
         let registry = super::provider_registry().unwrap();
         let all_features = registry.all_route_feature_applicability();
-        for t2i_id in [super::config::FLUX2_KLEIN_9B_ID, super::config::FLUX2_DEV_ID] {
+        for t2i_id in [
+            super::config::FLUX2_KLEIN_9B_ID,
+            super::config::FLUX2_DEV_ID,
+        ] {
             let app = &all_features[t2i_id]["low_res_start"];
             assert!(app.applicable, "candle {t2i_id} must support low_res_start");
         }
@@ -2568,8 +2573,9 @@ mod explicit_registry_tests {
             }],
             ..req
         };
-        assert!(super::control_provider::compile_control_feature_route(&ctrl_spec, &ctrl_req)
-            .is_err());
+        assert!(
+            super::control_provider::compile_control_feature_route(&ctrl_spec, &ctrl_req).is_err()
+        );
     }
 }
 

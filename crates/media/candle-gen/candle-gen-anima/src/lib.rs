@@ -603,8 +603,7 @@ impl Generator for Anima {
                 }
             },
         )?;
-        let mut report =
-            gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
         let (dt_label, dt_bytes) = match self.memory_tier.precision {
             gen_core::Precision::Fp32 => ("f32", 4),
             gen_core::Precision::Bf16 => ("bf16", 2),
@@ -662,12 +661,7 @@ pub(crate) fn validate_request(
     }
     if let Some(low_res) = &req.low_res_start {
         let sigmas = pipeline::resolved_sigmas(variant, req)?;
-        low_res.resolve_for_descriptor(
-            desc,
-            req,
-            sigmas.len().saturating_sub(1),
-            RES_MULTIPLE,
-        )?;
+        low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
     }
     Ok(())
 }

@@ -630,7 +630,9 @@ impl Flux2DevControl {
 }
 
 /// Compile the weights-free FLUX.2-dev control trajectory for `req`.
-pub fn compile_control_trajectory(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+pub fn compile_control_trajectory(
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
     let desc = descriptor_dev_control();
     validate_request(&desc, false, false, req)?;
     if !req

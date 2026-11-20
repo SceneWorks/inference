@@ -1453,9 +1453,11 @@ impl Flux2 {
                 let noise = create_noise(seed, phase0_w, phase0_h, self.config.in_channels)?;
                 // img2img: `(1-σ)·clean + σ·noise` at `σ = sigmas[start_step]`; txt2img: pure noise.
                 match &cond.clean_init {
-                    Some(clean) => {
-                        add_noise_by_interpolation(clean, &noise, cond.sched.sigmas[cond.start_step])
-                    }
+                    Some(clean) => add_noise_by_interpolation(
+                        clean,
+                        &noise,
+                        cond.sched.sigmas[cond.start_step],
+                    ),
                     None => Ok(noise),
                 }
             },
@@ -1554,9 +1556,8 @@ impl Flux2 {
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
         let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
-        let phase0_latent_ids = ((phase0_w, phase0_h) != (req.width, req.height)).then(|| {
-            prepare_grid_ids((phase0_h / 16) as usize, (phase0_w / 16) as usize, 0)
-        });
+        let phase0_latent_ids = ((phase0_w, phase0_h) != (req.width, req.height))
+            .then(|| prepare_grid_ids((phase0_h / 16) as usize, (phase0_w / 16) as usize, 0));
 
         // The img2img clean init latents are seed-independent — encode once at phase-0 output dims
         // (§6.13), blend with per-seed noise below. `None` for pure txt2img (or strength ≤ 0, where
@@ -2152,8 +2153,13 @@ pub fn compile_trajectory_for(
 ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
     let desc = variant.descriptor();
     validate_request(&desc, variant.is_edit(), variant.is_kv(), req)?;
-    let (sigmas, start_step, keep) =
-        resolved_schedule_for_request(&desc, variant.default_steps(), variant.is_edit(), true, req)?;
+    let (sigmas, start_step, keep) = resolved_schedule_for_request(
+        &desc,
+        variant.default_steps(),
+        variant.is_edit(),
+        true,
+        req,
+    )?;
     let sliced = sigmas[start_step..].to_vec();
     let executed_steps = keep.saturating_sub(start_step).saturating_sub(1);
     let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);

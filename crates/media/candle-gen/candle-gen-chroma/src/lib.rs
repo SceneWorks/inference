@@ -292,8 +292,7 @@ impl Generator for ChromaGenerator {
             let components = self.components(&pipe)?;
             pipe.render_planned(req, &run, &components, on_progress)?
         };
-        let mut report =
-            gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
+        let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
         report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
         Ok(report)
     }
@@ -355,9 +354,7 @@ pub fn compile_trajectory_for(
     validate_request_for_variant(variant, req)?;
     let sigmas = pipeline::resolved_sigmas(variant, req)?;
     let executed_steps = sigmas.len().saturating_sub(1);
-    let guidance = req
-        .true_cfg
-        .unwrap_or_else(|| variant.default_true_cfg());
+    let guidance = req.true_cfg.unwrap_or_else(|| variant.default_true_cfg());
     gen_core::RenderPlan::base_image(
         &variant.descriptor(),
         req,
@@ -373,10 +370,7 @@ pub fn compile_trajectory_for(
     )
 }
 
-fn validate_load_spec(
-    variant: ChromaVariant,
-    spec: &LoadSpec,
-) -> gen_core::Result<PathBuf> {
+fn validate_load_spec(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<PathBuf> {
     let id = variant.id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),

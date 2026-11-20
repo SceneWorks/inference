@@ -840,9 +840,9 @@ mod explicit_registry_tests {
                 low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
                 ..Default::default()
             };
-            let ctrl_spec =
-                spec.clone()
-                    .with_control(WeightsSource::File("/tmp/ctrl.safetensors".into()));
+            let ctrl_spec = spec
+                .clone()
+                .with_control(WeightsSource::File("/tmp/ctrl.safetensors".into()));
             let err = registry
                 .compile_render_plan(control_id, &ctrl_spec, &bad_req)
                 .unwrap_err();

@@ -586,7 +586,9 @@ impl Generator for ZImageTurbo {
         let plan = compile_turbo_trajectory(req)?;
         self.generate_planned(req, &plan, None, on_progress)?
             .output
-            .ok_or_else(|| gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output")))
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
+            })
     }
 
     fn generate_with_report(
@@ -1059,13 +1061,7 @@ pub(crate) fn compile_trajectory_for(
 
 pub fn compile_turbo_trajectory(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
     let guidance = 1.0 + req.guidance.unwrap_or(0.0);
-    compile_trajectory_for(
-        descriptor(),
-        SCHEDULE_SHIFT,
-        DEFAULT_STEPS,
-        guidance,
-        req,
-    )
+    compile_trajectory_for(descriptor(), SCHEDULE_SHIFT, DEFAULT_STEPS, guidance, req)
 }
 
 pub(crate) fn compile_turbo(
@@ -1079,9 +1075,7 @@ pub(crate) fn compile_turbo(
 }
 
 pub fn compile_base_trajectory(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
-    let guidance = req
-        .guidance
-        .unwrap_or(crate::model_base::DEFAULT_GUIDANCE);
+    let guidance = req.guidance.unwrap_or(crate::model_base::DEFAULT_GUIDANCE);
     compile_trajectory_for(
         crate::model_base::descriptor(),
         crate::model_base::SCHEDULE_SHIFT,
@@ -1172,15 +1166,9 @@ pub(crate) fn compile_turbo_control(
     validate_plan_load_spec(spec, crate::model_control::MODEL_ID)?;
     validate_control_load_spec(spec, crate::model_control::MODEL_ID)?;
     let guidance = 1.0 + req.guidance.unwrap_or(0.0);
-    compile_control_for(
-        desc,
-        SCHEDULE_SHIFT,
-        DEFAULT_STEPS,
-        guidance,
-        req,
-    )
-    .map(|plan| plan.bind_load(spec))
-    .map(Some)
+    compile_control_for(desc, SCHEDULE_SHIFT, DEFAULT_STEPS, guidance, req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
 }
 
 pub(crate) fn compile_base_control(
@@ -1191,9 +1179,7 @@ pub(crate) fn compile_base_control(
     validate_request(desc.id, &desc.capabilities, req)?;
     validate_plan_load_spec(spec, crate::model_base_control::MODEL_ID)?;
     validate_control_load_spec(spec, crate::model_base_control::MODEL_ID)?;
-    let guidance = req
-        .guidance
-        .unwrap_or(crate::model_base::DEFAULT_GUIDANCE);
+    let guidance = req.guidance.unwrap_or(crate::model_base::DEFAULT_GUIDANCE);
     compile_control_for(
         desc,
         crate::model_base::SCHEDULE_SHIFT,

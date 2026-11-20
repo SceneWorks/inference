@@ -16,7 +16,11 @@ pub(crate) fn defaults() -> FlowSamplingDefaults {
 }
 
 pub fn resolve_full(req: &GenerationRequest) -> Result<ResolvedFlowSampling> {
-    resolve_full_with_shift(req, crate::model::SCHEDULE_SHIFT, crate::model::DEFAULT_STEPS)
+    resolve_full_with_shift(
+        req,
+        crate::model::SCHEDULE_SHIFT,
+        crate::model::DEFAULT_STEPS,
+    )
 }
 
 pub(crate) fn resolve_full_with_shift(

@@ -540,7 +540,8 @@ impl SdxlGenerator {
                     },
                     |unet, state| {
                         if let Some(ref run) = state.3 {
-                            run.begin_rendering().map_err(candle_gen::CandleError::from)?;
+                            run.begin_rendering()
+                                .map_err(candle_gen::CandleError::from)?;
                         }
                         state.1 = pipe.denoise_images(
                             req,
@@ -606,7 +607,8 @@ impl SdxlGenerator {
                         })?
                     };
                     if let Some(ref run) = run {
-                        run.begin_rendering().map_err(candle_gen::CandleError::from)?;
+                        run.begin_rendering()
+                            .map_err(candle_gen::CandleError::from)?;
                     }
                     let images = pipe.render(
                         req,
@@ -872,15 +874,21 @@ impl Generator for SdxlGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-        let mut completed =
-            candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+        let mut completed = candle_gen::execution::capture_planned_with(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || {
                 candle_gen::execution::unobserved_adapters(
                     self.adapters.len(),
                     "candle-gen-sdxl/src/lib.rs",
                 );
                 candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
                 candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
-            })?;
+            },
+        )?;
         if self.adapters.is_empty()
             && self.pid_spec.is_none()
             && self.ldm.is_none()

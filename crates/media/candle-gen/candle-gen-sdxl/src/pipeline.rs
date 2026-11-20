@@ -1142,9 +1142,14 @@ impl Pipeline {
                 "sdxl: PiD requested but no PiD decoder loaded".into(),
             ));
         }
-        self.render_with(req, text_embeddings, unet, run, on_progress, |latents, _| {
-            Ok(latents)
-        })
+        self.render_with(
+            req,
+            text_embeddings,
+            unet,
+            run,
+            on_progress,
+            |latents, _| Ok(latents),
+        )
     }
 
     pub(crate) fn decode_images(
@@ -1558,7 +1563,10 @@ impl Pipeline {
                     };
                     (sigmas, spans)
                 } else {
-                    (run.plan().denoise_sigmas(), run.plan().denoise_spans().to_vec())
+                    (
+                        run.plan().denoise_sigmas(),
+                        run.plan().denoise_spans().to_vec(),
+                    )
                 };
                 candle_gen::sampler::run_curated_sampler_spans(
                     Some(sampler),
@@ -1689,29 +1697,20 @@ impl Pipeline {
             let cfgpp_sampler: Box<dyn CfgPpSampler<candle_gen::CandleLatentOps>> =
                 cfgpp_sampler_for::<candle_gen::CandleLatentOps>(base)
                     .expect("base_supports_cfgpp holds");
-            let mut denoise_fn =
-                |x: &Tensor, sigma: f32| -> gen_core::Result<(Tensor, Tensor)> {
-                    if req.cancel.is_cancelled() {
-                        return Err(gen_core::Error::Canceled);
-                    }
-                    candle_gen::preview::PreviewHook::emit(
-                        preview,
-                        &preview_counter,
-                        sigmas,
-                        sigma,
-                        x,
-                    );
-                    let current =
-                        (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
-                    on_progress(Progress::Step { current, total });
-                    cfgpp_denoise(&ops, ms, x, sigma, predict_pair)
-                };
+            let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<(Tensor, Tensor)> {
+                if req.cancel.is_cancelled() {
+                    return Err(gen_core::Error::Canceled);
+                }
+                candle_gen::preview::PreviewHook::emit(preview, &preview_counter, sigmas, sigma, x);
+                let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+                on_progress(Progress::Step { current, total });
+                cfgpp_denoise(&ops, ms, x, sigma, predict_pair)
+            };
             latents = cfgpp_sampler
                 .sample(&ops, &mut denoise_fn, latents, span_sigmas)
                 .map_err(CandleError::from)?;
             if let Some(run) = run {
-                run.end_denoise_phase(span_idx)
-                    .map_err(CandleError::from)?;
+                run.end_denoise_phase(span_idx).map_err(CandleError::from)?;
             }
             if span_idx + 1 < spans.len() {
                 if let Some(run) = run {
@@ -1720,14 +1719,11 @@ impl Pipeline {
                         let base_seed = run.plan().base_seed();
                         let output_index = seed.wrapping_sub(base_seed) as u32;
                         let pass_index = run.plan().pass_index();
-                        let x0_low = gen_core::sampling::denoise(
-                            &ops,
-                            ms,
-                            &latents,
-                            sigma_k,
-                            |xin, t| Ok(predict_pair(xin, t)?.0),
-                        )
-                        .map_err(CandleError::from)?;
+                        let x0_low =
+                            gen_core::sampling::denoise(&ops, ms, &latents, sigma_k, |xin, t| {
+                                Ok(predict_pair(xin, t)?.0)
+                            })
+                            .map_err(CandleError::from)?;
                         let low_f32 = x0_low
                             .to_dtype(DType::F32)?
                             .flatten_all()?
@@ -2573,7 +2569,15 @@ mod tests {
             ..Default::default()
         };
         let render = |guidance: f32, ehs: &Tensor| {
-            pipe.render(&req_at(guidance, 1), ehs, &unet, &vae, None, None, &mut |_| {})
+            pipe.render(
+                &req_at(guidance, 1),
+                ehs,
+                &unet,
+                &vae,
+                None,
+                None,
+                &mut |_| {},
+            )
         };
 
         // (1) CFG off (the sc-14195 repro): guidance 1.0 ⇒ one conditioned branch, batch-1 latent.

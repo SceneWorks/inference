@@ -56,8 +56,8 @@ pub use config::{ConditionerConfig, DitConfig, Qwen3Config, Variant, RES_MULTIPL
 pub use convert::{is_dit_quant_target, quantize_anima_dit};
 pub use loader::{load_conditioning_at_dtype, split_anima_keys, AnimaComponents};
 pub use model::{
-    compile_trajectory_for, descriptor_aesthetic, descriptor_base, descriptor_turbo, load_aesthetic,
-    load_base, load_turbo, Anima,
+    compile_trajectory_for, descriptor_aesthetic, descriptor_base, descriptor_turbo,
+    load_aesthetic, load_base, load_turbo, Anima,
 };
 pub use pipeline::{
     anima_sigmas, AnimaDecodeView, AnimaLight, AnimaPipeline, GenOptions, DEFAULT_SAMPLER,

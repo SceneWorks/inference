@@ -236,8 +236,7 @@ impl Generator for Anima {
         scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
-        let output =
-            self.generate_planned_impl(req, plan, scope, &req.preview, on_progress)?;
+        let output = self.generate_planned_impl(req, plan, scope, &req.preview, on_progress)?;
         let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
         report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
         Ok(report)
@@ -646,12 +645,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     }
     if let Some(low_res) = &req.low_res_start {
         let (_, sigmas) = resolved_sampling(variant, req)?;
-        low_res.resolve_for_descriptor(
-            desc,
-            req,
-            sigmas.len().saturating_sub(1),
-            RES_MULTIPLE,
-        )?;
+        low_res.resolve_for_descriptor(desc, req, sigmas.len().saturating_sub(1), RES_MULTIPLE)?;
     }
     Ok(())
 }

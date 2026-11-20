@@ -1186,13 +1186,7 @@ fn build_init_latents(
     heavy: &KolorsHeavy,
     mode: &KolorsBoundMode<'_, '_>,
 ) -> Result<KolorsInit> {
-    build_init_latents_with_size(
-        request,
-        heavy,
-        mode,
-        request.req.width,
-        request.req.height,
-    )
+    build_init_latents_with_size(request, heavy, mode, request.req.width, request.req.height)
 }
 
 fn build_init_latents_with_size(
@@ -1306,10 +1300,7 @@ impl mlx_gen_sdxl::stages::FamilyStages for KolorsRenderPlan<'_, '_, '_> {
             Some(run) => run.plan().phase_output_size(0),
             None => (req.width, req.height),
         };
-        let (lh, lw) = (
-            init_h as i32 / SPATIAL_SCALE,
-            init_w as i32 / SPATIAL_SCALE,
-        );
+        let (lh, lw) = (init_h as i32 / SPATIAL_SCALE, init_w as i32 / SPATIAL_SCALE);
         Ok((
             (),
             random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?,

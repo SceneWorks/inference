@@ -1538,17 +1538,18 @@ impl Scope {
 
 impl MemoryRequestScope for Scope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        let source_only_img2img =
-            request.source_image.is_some() && request.conditioning.is_empty();
+        let source_only_img2img = request.source_image.is_some() && request.conditioning.is_empty();
         if source_only_img2img {
-            request.conditioning.push(gen_core::Conditioning::Reference {
-                image: gen_core::Image {
-                    width: 0,
-                    height: 0,
-                    pixels: Vec::new(),
-                },
-                strength: request.strength,
-            });
+            request
+                .conditioning
+                .push(gen_core::Conditioning::Reference {
+                    image: gen_core::Image {
+                        width: 0,
+                        height: 0,
+                        pixels: Vec::new(),
+                    },
+                    strength: request.strength,
+                });
         }
         let core_result = self.core.configure_request(request);
         if source_only_img2img {

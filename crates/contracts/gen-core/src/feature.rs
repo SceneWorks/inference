@@ -1395,9 +1395,7 @@ pub fn transition_clean_estimate_f32(
         .checked_mul(channels)
         .and_then(|v| v.checked_mul(h_full))
         .and_then(|v| v.checked_mul(w_full))
-        .ok_or_else(|| {
-            Error::Unsupported("transition_clean_estimate_f32: size overflow".into())
-        })?;
+        .ok_or_else(|| Error::Unsupported("transition_clean_estimate_f32: size overflow".into()))?;
     let eps_trans = low_res_start_transition_noise_f32(
         request_seed,
         output_index,
@@ -2688,12 +2686,12 @@ impl FeatureRouteStructure {
                             LatentPatchLayout::Unpacked => {
                                 let vae_scale = u32::from(space.spatial_compression.width).max(1);
                                 let ch = u32::from(space.channels);
-                                pixel_stride.is_some_and(|s| {
-                                    s >= vae_scale && s.is_multiple_of(vae_scale)
-                                }) && token_width.is_some_and(|w| {
-                                    let ratio = pixel_stride.unwrap_or(vae_scale) / vae_scale;
-                                    w == ch || w == ch * ratio * ratio
-                                })
+                                pixel_stride
+                                    .is_some_and(|s| s >= vae_scale && s.is_multiple_of(vae_scale))
+                                    && token_width.is_some_and(|w| {
+                                        let ratio = pixel_stride.unwrap_or(vae_scale) / vae_scale;
+                                        w == ch || w == ch * ratio * ratio
+                                    })
                             }
                         }
                 });
@@ -6795,7 +6793,8 @@ mod tests {
             (256, 256)
         );
         let low_latent = vec![0.25_f32; 16 * 32 * 32];
-        let ms = crate::sampling::FlowModelSampling::new(crate::sampling::TimestepConvention::Sigma);
+        let ms =
+            crate::sampling::FlowModelSampling::new(crate::sampling::TimestepConvention::Sigma);
         let noised = transition_clean_estimate_f32(
             BoundaryState::CleanEstimate {
                 latent: &low_latent,

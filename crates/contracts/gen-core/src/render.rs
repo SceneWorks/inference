@@ -213,28 +213,22 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
                 kind: control_kind_key(kind),
                 scale_bits: scale.map(f32::to_bits),
             },
-            [
-                Conditioning::Control {
-                    image: ctrl_img,
-                    kind,
-                    scale,
-                },
-                Conditioning::Reference {
-                    image: ref_img,
-                    strength,
-                },
-            ]
-            | [
-                Conditioning::Reference {
-                    image: ref_img,
-                    strength,
-                },
-                Conditioning::Control {
-                    image: ctrl_img,
-                    kind,
-                    scale,
-                },
-            ] => PackedImageConditioning::ControlWithReference {
+            [Conditioning::Control {
+                image: ctrl_img,
+                kind,
+                scale,
+            }, Conditioning::Reference {
+                image: ref_img,
+                strength,
+            }]
+            | [Conditioning::Reference {
+                image: ref_img,
+                strength,
+            }, Conditioning::Control {
+                image: ctrl_img,
+                kind,
+                scale,
+            }] => PackedImageConditioning::ControlWithReference {
                 width: ctrl_img.width,
                 height: ctrl_img.height,
                 pixels_sha256: image_digest(ctrl_img)?,

@@ -237,8 +237,7 @@ pub fn ve_hook_for_plan<'a>(
     PreviewHook::with_sigma(sink, move |latents, sigma| {
         let dims = latents.dims();
         if dims.len() == 4
-            && ((dims[2] == p0_lh && dims[3] == p0_lw)
-                || (dims[2] == p1_lh && dims[3] == p1_lw))
+            && ((dims[2] == p0_lh && dims[3] == p0_lw) || (dims[2] == p1_lh && dims[3] == p1_lw))
         {
             project_ve_latents(latents, sigma)
         } else {

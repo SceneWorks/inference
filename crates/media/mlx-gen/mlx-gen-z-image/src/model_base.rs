@@ -181,7 +181,9 @@ impl Generator for ZImage {
         let plan = crate::model::compile_base_trajectory(req)?;
         self.generate_planned(req, &plan, None, on_progress)?
             .output
-            .ok_or_else(|| gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output")))
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: generator returned no output"))
+            })
     }
 
     fn generate_with_report(

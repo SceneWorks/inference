@@ -674,27 +674,30 @@ impl Chroma {
         let (pos_embeds, pos_mask) = (&encoded.pos_embeds, &encoded.pos_mask);
         let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
         #[allow(clippy::type_complexity)]
-        let build_phase_ctx = |w: u32, h: u32| -> Result<(RopeTable, Option<Array>, Option<(RopeTable, Option<Array>)>)> {
-            let h2 = (h / 16) as usize;
-            let w2 = (w / 16) as usize;
-            let si = (h2 * w2) as i32;
-            let img_ids = latent_image_ids(h2, w2);
-            let mask_pos = Self::full_mask(pos_mask, si)?;
-            let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
-            let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;
-            let neg_ctx = match &encoded.neg {
-                Some((neg_embeds, neg_mask)) => {
-                    let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
-                    let mask_neg = Self::full_mask(neg_mask, si)?;
-                    Some((
-                        tr.build_rope_table(&txt_ids_neg, &img_ids)?,
-                        ChromaTransformer::attention_mask2d(Some(&mask_neg))?,
-                    ))
-                }
-                None => None,
+        let build_phase_ctx =
+            |w: u32,
+             h: u32|
+             -> Result<(RopeTable, Option<Array>, Option<(RopeTable, Option<Array>)>)> {
+                let h2 = (h / 16) as usize;
+                let w2 = (w / 16) as usize;
+                let si = (h2 * w2) as i32;
+                let img_ids = latent_image_ids(h2, w2);
+                let mask_pos = Self::full_mask(pos_mask, si)?;
+                let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
+                let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;
+                let neg_ctx = match &encoded.neg {
+                    Some((neg_embeds, neg_mask)) => {
+                        let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
+                        let mask_neg = Self::full_mask(neg_mask, si)?;
+                        Some((
+                            tr.build_rope_table(&txt_ids_neg, &img_ids)?,
+                            ChromaTransformer::attention_mask2d(Some(&mask_neg))?,
+                        ))
+                    }
+                    None => None,
+                };
+                Ok((rope_pos, mask_pos2d, neg_ctx))
             };
-            Ok((rope_pos, mask_pos2d, neg_ctx))
-        };
 
         let (phase0_w, phase0_h) = run.plan().phase_output_size(0);
         let phase0_tokens = run.plan().phase_packed_tokens(0) as i32;
@@ -1064,10 +1067,7 @@ fn validate_request_for_variant(variant: ChromaVariant, req: &GenerationRequest)
         )));
     }
     if req.steps == Some(0) {
-        return Err(Error::Msg(format!(
-            "{}: steps must be >= 1",
-            descriptor.id
-        )));
+        return Err(Error::Msg(format!("{}: steps must be >= 1", descriptor.id)));
     }
     if let Some(low_res) = &req.low_res_start {
         let steps = req.steps.unwrap_or_else(|| variant.default_steps());
@@ -1092,9 +1092,7 @@ pub fn compile_trajectory_for(
 ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
     validate_request_for_variant(variant, req)?;
     let steps = req.steps.unwrap_or_else(|| variant.default_steps());
-    let guidance = req
-        .true_cfg
-        .unwrap_or_else(|| variant.default_true_cfg());
+    let guidance = req.true_cfg.unwrap_or_else(|| variant.default_true_cfg());
     let sampler = resolve_sampler_name(variant, req.sampler.as_deref());
     let sigmas = build_schedule_for(
         variant,

@@ -3500,7 +3500,11 @@ mod tests {
         };
 
         for (variant, base_desc, ip_desc) in [
-            (FluxVariant::Dev, descriptor_dev(), descriptor_dev_ip_adapter()),
+            (
+                FluxVariant::Dev,
+                descriptor_dev(),
+                descriptor_dev_ip_adapter(),
+            ),
             (
                 FluxVariant::Schnell,
                 descriptor_schnell(),

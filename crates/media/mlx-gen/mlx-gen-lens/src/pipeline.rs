@@ -897,7 +897,11 @@ impl LensHeavy {
         let (full_w, full_h) = run.plan().output_size();
         let phase0_tokens = run.plan().phase_packed_tokens(0) as i32;
         if let Some(low_res_report) = run.plan().low_res_start_execution_report(
-            if dtype == Dtype::Float32 { "f32" } else { "bf16" },
+            if dtype == Dtype::Float32 {
+                "f32"
+            } else {
+                "bf16"
+            },
             if dtype == Dtype::Float32 { 4 } else { 2 },
             "base_dit",
         )? {

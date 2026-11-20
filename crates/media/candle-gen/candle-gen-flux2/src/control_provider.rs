@@ -137,8 +137,7 @@ pub struct Flux2Control {
 pub fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
     descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
-    descriptor.capabilities.conditioning =
-        vec![candle_gen::gen_core::ConditioningKind::Control];
+    descriptor.capabilities.conditioning = vec![candle_gen::gen_core::ConditioningKind::Control];
     descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Any);
     descriptor.capabilities.supports_low_res_start = false;
     descriptor

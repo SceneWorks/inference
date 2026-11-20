@@ -1973,7 +1973,11 @@ impl Pipeline {
         let cap = match run {
             Some(run) => run.encode(|| {
                 candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-                    self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)
+                    self.text_embeddings(
+                        &components.text_encoder,
+                        &components.tokenizer,
+                        &req.prompt,
+                    )
                 })
             })?,
             None => candle_gen::gen_core::with_prompt_encoding(on_progress, || {

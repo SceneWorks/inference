@@ -178,12 +178,11 @@ pub(crate) fn validate_low_res_start_kolors(
             "kolors: low_res_start conflicts with ControlNet or IP-Adapter load specs".into(),
         ));
     }
-    if req.conditioning.iter().any(|c| {
-        matches!(
-            c,
-            Conditioning::Control { .. } | Conditioning::Mask { .. }
-        )
-    }) {
+    if req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::Control { .. } | Conditioning::Mask { .. }))
+    {
         return Err(gen_core::Error::Unsupported(
             "kolors: low_res_start conflicts with pass-0 ControlNet or Mask conditioning".into(),
         ));
@@ -240,12 +239,10 @@ pub(crate) fn compile_kolors(
         || !spec.extra_controls.is_empty()
         || spec.ip_adapter.is_some()
         || spec.identity.is_some()
-        || req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Control { .. } | Conditioning::Mask { .. }
-            )
-        })
+        || req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Control { .. } | Conditioning::Mask { .. }))
         || req.scheduler.as_deref() == Some("discrete")
         || req.sampler.as_deref() == Some(config::DEFAULT_SAMPLER)
     {
@@ -402,13 +399,19 @@ impl Generator for KolorsGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-        let completed =
-            candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
+        let completed = candle_gen::execution::capture_planned_with(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || {
                 candle_gen::execution::unobserved_adapters(
                     self.adapters.len(),
                     "candle-gen-kolors/src/lib.rs",
                 );
-            })?;
+            },
+        )?;
         gen_core::generator::CompletedGeneration::new(
             completed.generation,
             completed.execution,

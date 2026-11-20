@@ -1221,7 +1221,9 @@ impl mlx_gen::gen_core::Generator for Sdxl {
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.generate_with_report(req, on_progress)?
             .output
-            .ok_or_else(|| mlx_gen::gen_core::Error::Msg("sdxl: generator returned no output".into()))
+            .ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg("sdxl: generator returned no output".into())
+            })
     }
 
     fn generate_with_report(
@@ -1973,13 +1975,7 @@ fn build_init_latents(
     vae: &Autoencoder,
     mode: SdxlMode<'_>,
 ) -> Result<SdxlInitLatents> {
-    build_init_latents_with_size(
-        request,
-        vae,
-        mode,
-        request.req.width,
-        request.req.height,
-    )
+    build_init_latents_with_size(request, vae, mode, request.req.width, request.req.height)
 }
 
 fn build_init_latents_with_size(
@@ -2707,11 +2703,9 @@ pub fn compile_sdxl(
     };
     let sigmas = run_sigmas[..keep].to_vec();
     let executed_steps = sigmas.len().saturating_sub(1);
-    let sampler = mlx_gen::sampler::canonical_solver(
-        Some(sampling.sampler_name()),
-        mlx_gen::Solver::Euler,
-    )
-    .name();
+    let sampler =
+        mlx_gen::sampler::canonical_solver(Some(sampling.sampler_name()), mlx_gen::Solver::Euler)
+            .name();
     mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
         &desc,
         req,

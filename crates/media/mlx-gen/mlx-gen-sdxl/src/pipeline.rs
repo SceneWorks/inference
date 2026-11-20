@@ -1273,8 +1273,15 @@ pub fn denoise_curated_planned(
             }
         };
         let (x0_low, source) = boundary_state.into_clean_estimate()?;
-        let transitioned =
-            transition_nhwc_clean_estimate(&x0_low, source, &low_res_plan, sigma_k, ms_dyn, run, seed)?;
+        let transitioned = transition_nhwc_clean_estimate(
+            &x0_low,
+            source,
+            &low_res_plan,
+            sigma_k,
+            ms_dyn,
+            run,
+            seed,
+        )?;
         state.note_geometry_change(
             (low_res_plan.low_width, low_res_plan.low_height),
             (low_res_plan.full_width, low_res_plan.full_height),
@@ -1467,7 +1474,13 @@ pub fn denoise_cfgpp_planned(
             plan,
         )?;
         let guided = gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?;
-        mlx_gen::sampler::diagnostic_sampling_tensor("sdxl", "curated-epsilon", current, 1, &guided);
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "curated-epsilon",
+            current,
+            1,
+            &guided,
+        );
         mlx_gen::sampler::diagnostic_sampling_tensor(
             "sdxl",
             "cfgpp-unconditional-epsilon",
