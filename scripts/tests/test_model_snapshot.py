@@ -1348,7 +1348,11 @@ class DownloadToRunnerCacheTests(unittest.TestCase):
                 return root
 
             modules["huggingface_hub"].snapshot_download = truncating
-            self.assertEqual(self.run_helper(temporary, cache, modules), snapshot)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(self.run_helper(temporary, cache, modules), snapshot)
+            # Shell callers capture stdout as the snapshot path, so a repair must not write there.
+            self.assertEqual(stdout.getvalue(), "")
             self.assertEqual([call["filename"] for call in self.refetched], [self.FILES[1]])
             self.assertTrue(self.refetched[0]["force_download"])
             self.assertEqual(Path(self.refetched[0]["cache_dir"]), cache)

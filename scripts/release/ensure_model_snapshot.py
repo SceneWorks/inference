@@ -656,7 +656,9 @@ def download_to_runner_cache(
                 if not (root / name).is_file() or (root / name).stat().st_size != sizes[name]]
 
     for name in damaged():
-        print(f"re-fetching {repo_id}@{revision}:{name} (missing or not {sizes[name]} bytes)", flush=True)
+        # stderr: shell callers capture this function's stdout as the snapshot path.
+        print(f"re-fetching {repo_id}@{revision}:{name} (missing or not {sizes[name]} bytes)",
+              file=sys.stderr, flush=True)
         hf_hub_download(repo_id=repo_id, revision=revision, filename=name, cache_dir=str(cache),
                         token=token, force_download=True)
     missing = damaged()
