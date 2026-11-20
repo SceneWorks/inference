@@ -649,6 +649,153 @@ pub fn union_masks(a: &Image, b: &Image) -> crate::Result<Image> {
     })
 }
 
+// =================================================================================================
+// Shared VLM / edit conditioning host geometry and alpha compositing (`COMP-6`).
+// =================================================================================================
+
+/// Aspect-preserving factor-aligned resize dimensions (`(h_bar, w_bar)`) bounded to
+/// `[min_pixels, max_pixels]` (`COMP-6`, Qwen2-VL / Qwen2.5-VL / Boogu `smart_resize`).
+///
+/// Rounds `height` and `width` to the nearest multiple of `factor` (at least `factor`), then clamps
+/// the resulting pixel area `h_bar * w_bar` into `[min_pixels, max_pixels]` using `floor` for the
+/// upper bound and `ceil` for the lower bound.
+pub fn smart_resize(
+    height: usize,
+    width: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    let factor = factor.max(1);
+    let height = height.max(1);
+    let width = width.max(1);
+    let mut h_bar = ((height as f64 / factor as f64).round() as usize).max(1) * factor;
+    let mut w_bar = ((width as f64 / factor as f64).round() as usize).max(1) * factor;
+
+    if h_bar * w_bar > max_pixels {
+        let beta = ((height * width) as f64 / max_pixels.max(1) as f64).sqrt();
+        h_bar = (((height as f64 / beta / factor as f64).floor() as usize) * factor).max(factor);
+        w_bar = (((width as f64 / beta / factor as f64).floor() as usize) * factor).max(factor);
+    } else if h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+        h_bar = (((height as f64 * beta / factor as f64).ceil() as usize) * factor).max(factor);
+        w_bar = (((width as f64 * beta / factor as f64).ceil() as usize) * factor).max(factor);
+    }
+
+    (h_bar, w_bar)
+}
+
+/// Factor-aligned aspect-preserving PIL bicubic resize of a uint8 RGB HWC image (`COMP-6`).
+/// Returns `(out_h, out_w, resized_f32_hwc)`.
+pub fn smart_resize_bicubic_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> crate::Result<(usize, usize, Vec<f32>)> {
+    if !(in_h > 0 && in_w > 0 && factor > 0) {
+        return Err(Error::Msg(format!(
+            "smart_resize_bicubic_u8: zero dimension or factor ({in_w}x{in_h}, factor={factor})"
+        )));
+    }
+    let (out_h, out_w) = smart_resize(in_h, in_w, factor, min_pixels, max_pixels);
+    let resized = resize_bicubic_u8(src, in_h, in_w, out_h, out_w)?;
+    Ok((out_h, out_w, resized))
+}
+
+/// Convert a uint8 HWC RGBA buffer (`[H, W, 4]`, `[0, 255]`) to a planar NCHW float buffer
+/// (`[1, 4, H, W]`) normalized to `[-1.0, 1.0]` via `byte / 127.5 - 1.0` (`COMP-6`).
+pub fn rgba8_to_nchw_f32(
+    rgba_hwc: &[u8],
+    width: usize,
+    height: usize,
+) -> crate::Result<Vec<f32>> {
+    let hw = width
+        .checked_mul(height)
+        .ok_or_else(|| Error::Msg("rgba8_to_nchw_f32: dimension overflow".into()))?;
+    let expected = hw
+        .checked_mul(4)
+        .ok_or_else(|| Error::Msg("rgba8_to_nchw_f32: byte length overflow".into()))?;
+    if rgba_hwc.len() != expected {
+        return Err(Error::Msg(format!(
+            "rgba8_to_nchw_f32: expected {expected} bytes for {width}x{height} RGBA8, got {}",
+            rgba_hwc.len()
+        )));
+    }
+    let mut nchw = vec![0.0f32; expected];
+    for i in 0..hw {
+        let base = i * 4;
+        nchw[i] = (rgba_hwc[base] as f32 / 127.5) - 1.0;
+        nchw[hw + i] = (rgba_hwc[base + 1] as f32 / 127.5) - 1.0;
+        nchw[2 * hw + i] = (rgba_hwc[base + 2] as f32 / 127.5) - 1.0;
+        nchw[3 * hw + i] = (rgba_hwc[base + 3] as f32 / 127.5) - 1.0;
+    }
+    Ok(nchw)
+}
+
+/// Composite a straight-alpha uint8 HWC RGBA buffer (`[H, W, 4]`) over solid white `(255, 255, 255)`,
+/// returning a uint8 HWC RGB buffer (`[H, W, 3]`) (`COMP-6`).
+pub fn rgba_to_rgb_over_white_u8(rgba: &[u8]) -> crate::Result<Vec<u8>> {
+    if !rgba.len().is_multiple_of(4) {
+        return Err(Error::Msg(format!(
+            "rgba_to_rgb_over_white_u8: buffer length {} is not a multiple of 4",
+            rgba.len()
+        )));
+    }
+    let mut rgb = Vec::with_capacity((rgba.len() / 4) * 3);
+    for px in rgba.chunks_exact(4) {
+        let a = u32::from(px[3]);
+        let inv_a = 255 - a;
+        for &c in &px[..3] {
+            let comp = (u32::from(c) * a + 255 * inv_a + 127) / 255;
+            rgb.push(comp as u8);
+        }
+    }
+    Ok(rgb)
+}
+
+/// Composite a planar NCHW RGBA float buffer (`[B, 4, H, W]` in `[-1.0, 1.0]`) over solid white
+/// (`+1.0` in normalized `[-1.0, 1.0]` space), returning a planar NCHW RGB float buffer
+/// (`[B, 3, H, W]` in `[-1.0, 1.0]`) (`COMP-6`):
+/// `alpha = (a + 1) * 0.5`, `rgb_out = rgb * alpha + 1.0 * (1.0 - alpha)`.
+pub fn rgba_to_rgb_over_white_nchw_f32(
+    rgba_nchw: &[f32],
+    batch: usize,
+    height: usize,
+    width: usize,
+) -> crate::Result<Vec<f32>> {
+    let hw = height
+        .checked_mul(width)
+        .ok_or_else(|| Error::Msg("rgba_to_rgb_over_white_nchw_f32: H*W overflow".into()))?;
+    let expected = batch
+        .checked_mul(4)
+        .and_then(|n| n.checked_mul(hw))
+        .ok_or_else(|| Error::Msg("rgba_to_rgb_over_white_nchw_f32: buffer overflow".into()))?;
+    if rgba_nchw.len() != expected {
+        return Err(Error::Msg(format!(
+            "rgba_to_rgb_over_white_nchw_f32: expected {expected} elements for [{batch}, 4, {height}, {width}], got {}",
+            rgba_nchw.len()
+        )));
+    }
+    let mut rgb_nchw = vec![0.0f32; batch * 3 * hw];
+    for b in 0..batch {
+        let in_b = b * 4 * hw;
+        let out_b = b * 3 * hw;
+        let a_plane = &rgba_nchw[in_b + 3 * hw..in_b + 4 * hw];
+        for c in 0..3 {
+            let in_c = &rgba_nchw[in_b + c * hw..in_b + (c + 1) * hw];
+            let out_c = &mut rgb_nchw[out_b + c * hw..out_b + (c + 1) * hw];
+            for i in 0..hw {
+                let alpha = (a_plane[i] + 1.0) * 0.5;
+                out_c[i] = in_c[i] * alpha + (1.0 - alpha);
+            }
+        }
+    }
+    Ok(rgb_nchw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::checked_image_buffer_len;
@@ -755,5 +902,39 @@ mod tests {
         };
         let u = union_masks(&a, &b).unwrap();
         assert_eq!(u.pixels, vec![255, 255, 255, 0, 0, 0]);
+    }
+
+    #[test]
+    fn comp6_smart_resize_and_rgba_over_white_helpers() {
+        let (h, w) = smart_resize(1024, 1024, 32, 32 * 32, 1024 * 1024);
+        assert_eq!((h, w), (1024, 1024));
+
+        // Large dimensions clamp down to <= max_pixels while staying multiples of 32
+        let (h_down, w_down) = smart_resize(2048, 2048, 32, 32 * 32, 384 * 384);
+        assert_eq!(h_down % 32, 0);
+        assert_eq!(w_down % 32, 0);
+        assert!(h_down * w_down <= 384 * 384);
+
+        // Small dimensions scale up to >= min_pixels while staying multiples of 32
+        let (h_up, w_up) = smart_resize(16, 16, 32, 256 * 256, 1024 * 1024);
+        assert_eq!(h_up % 32, 0);
+        assert_eq!(w_up % 32, 0);
+        assert!(h_up * w_up >= 256 * 256);
+
+        // RGBA8 over white u8
+        let rgba = vec![
+            0u8, 0, 0, 0, // transparent black -> white
+            0, 0, 0, 255, // opaque black -> black
+        ];
+        let rgb = rgba_to_rgb_over_white_u8(&rgba).unwrap();
+        assert_eq!(rgb, vec![255, 255, 255, 0, 0, 0]);
+
+        // RGBA8 to NCHW f32 and NCHW RGBA over white f32
+        let nchw = rgba8_to_nchw_f32(&rgba, 2, 1).unwrap();
+        let rgb_nchw = rgba_to_rgb_over_white_nchw_f32(&nchw, 1, 1, 2).unwrap();
+        // Pixel 0 (alpha=0 -> a=-1 -> alpha=0) composites to +1.0 (white)
+        // Pixel 1 (alpha=255 -> a=+1 -> alpha=1) composites to -1.0 (black)
+        assert!((rgb_nchw[0] - 1.0).abs() < 1e-5);
+        assert!((rgb_nchw[1] - (-1.0)).abs() < 1e-5);
     }
 }

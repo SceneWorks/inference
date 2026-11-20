@@ -76,6 +76,44 @@ impl GuidanceMethod {
     pub const ALL: [GuidanceMethod; 4] = [Self::Cfg, Self::CfgRescale, Self::Apg, Self::CfgPp];
 }
 
+/// Named model-specific and shared guidance combine operators (`PIPE-8`).
+///
+/// Captures the mathematical combine variant a model family uses so execution plans,
+/// diagnostics, and conformance tests can inspect the active operator without duplicating
+/// inline combine math across backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuidanceOperator {
+    /// Standard classifier-free guidance: `uncond + scale · (cond − uncond)`.
+    PlainCfg,
+    /// Axis-parameterized Lin et al. L2 norm-rescaled CFG (`cfg_rescale`).
+    CfgRescale,
+    /// Qwen-Image per-token channel-axis (`[-1]`) L2 norm-rescaled True CFG (`qwen_cfg_l2_rescale`).
+    QwenChannelL2NormRescale,
+    /// Boogu residual CFG combine (`cond + (scale − 1) · (cond − uncond)`) with negated velocity (`-pred`).
+    BooguResidualCfgNegated,
+    /// Adaptive Projected Guidance (`normalized_guidance`).
+    Apg,
+    /// CFG++ solver-coupled unconditional renoising (`cfg_pp`).
+    CfgPp,
+    /// Perturbed-Attention Guidance (`pag_apply`).
+    Pag,
+}
+
+impl GuidanceOperator {
+    /// Canonical lowercase identifier for this guidance operator.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PlainCfg => "plain_cfg",
+            Self::CfgRescale => "cfg_rescale",
+            Self::QwenChannelL2NormRescale => "qwen_channel_l2_norm_rescale",
+            Self::BooguResidualCfgNegated => "boogu_residual_cfg_negated",
+            Self::Apg => "apg",
+            Self::CfgPp => "cfg_pp",
+            Self::Pag => "pag",
+        }
+    }
+}
+
 // =================================================================================================
 // GuidanceOps — the axis-parameterized backend op extension (sc-7437).
 // =================================================================================================
@@ -202,6 +240,91 @@ pub fn cfg_rescale<G: GuidanceOps>(
     // scale = where(‖comb‖ > 0, ‖cond‖/max(‖comb‖, eps), 1).
     let rescale = g.select_positive(&comb_norm, &ratio, &ones)?;
     g.mul(&comb, &rescale)
+}
+
+// =================================================================================================
+// Named model-family guidance operators (`PIPE-8`): Qwen-Image L2 norm rescale & Boogu residual/negate.
+// =================================================================================================
+
+/// Qwen-Image per-token channel-axis (`[-1]`) L2 norm-rescaled True CFG (`PIPE-8`):
+/// `comb = uncond + scale · (cond − uncond)`, rescaled per token by
+/// `‖cond‖₂ / max(‖comb‖₂, 1e-12)` over axis `[-1]` (with the `where(‖comb‖₂ > 0, …, 1)` guard).
+pub fn qwen_cfg_l2_rescale<G: GuidanceOps>(
+    g: &G,
+    cond: &G::Latent,
+    uncond: &G::Latent,
+    scale: f32,
+    shape: &[usize],
+) -> Result<G::Latent> {
+    cfg_rescale(g, cond, uncond, scale, shape, &[-1])
+}
+
+/// Host FP32 slice reference for Qwen-Image per-token channel-axis (`[-1]`) L2 norm-rescaled True CFG (`PIPE-8`).
+pub fn qwen_cfg_l2_rescale_slice(
+    cond: &[f32],
+    uncond: &[f32],
+    scale: f32,
+    tokens: usize,
+    channels: usize,
+) -> Result<Vec<f32>> {
+    let expected = tokens.checked_mul(channels).ok_or_else(|| {
+        crate::Error::Msg("qwen_cfg_l2_rescale_slice: token * channel overflow".into())
+    })?;
+    if cond.len() != expected || uncond.len() != expected {
+        return Err(crate::Error::Msg(format!(
+            "qwen_cfg_l2_rescale_slice: buffer len mismatch (cond={}, uncond={}, expected={expected})",
+            cond.len(),
+            uncond.len()
+        )));
+    }
+    let cond_vec = cond.to_vec();
+    let uncond_vec = uncond.to_vec();
+    qwen_cfg_l2_rescale(
+        &CpuLatentOps,
+        &cond_vec,
+        &uncond_vec,
+        scale,
+        &[1, tokens, channels],
+    )
+}
+
+/// Boogu residual classifier-free guidance combine (`PIPE-8`):
+/// `cond + (scale − 1) · (cond − uncond)` when `uncond` is present, or `cond` unchanged when unguided.
+///
+/// Algebraically equivalent to `uncond + scale · (cond − uncond)` in exact real arithmetic,
+/// but written in residual form `cond + (scale − 1) · (cond − uncond)` to match Boogu's
+/// model-dtype BF16/FP16 evaluation order prior to FP32 velocity negation.
+pub fn boogu_cfg_combine<L: LatentOps>(
+    ops: &L,
+    cond: &L::Latent,
+    uncond: Option<&L::Latent>,
+    scale: f32,
+) -> Result<L::Latent> {
+    match uncond {
+        Some(u) => {
+            let diff = ops.sub(cond, u)?;
+            ops.axpy(1.0, cond, scale - 1.0, &diff)
+        }
+        None => Ok(cond.clone()),
+    }
+}
+
+/// Boogu velocity negation (`PIPE-8`): negates the transformer's raw prediction (`-pred`)
+/// so the standard flow-Euler update `x + dt · v` integrates along the reverse-time flow trajectory.
+pub fn boogu_negate_velocity<L: LatentOps>(ops: &L, pred: &L::Latent) -> Result<L::Latent> {
+    ops.scale(pred, -1.0)
+}
+
+/// Boogu combined residual CFG + velocity negation operator (`PIPE-8`):
+/// computes `-(cond + (scale − 1) · (cond − uncond))` (or `-cond` when unguided).
+pub fn boogu_guided_negated_velocity<L: LatentOps>(
+    ops: &L,
+    cond: &L::Latent,
+    uncond: Option<&L::Latent>,
+    scale: f32,
+) -> Result<L::Latent> {
+    let guided = boogu_cfg_combine(ops, cond, uncond, scale)?;
+    boogu_negate_velocity(ops, &guided)
 }
 
 // =================================================================================================
@@ -759,5 +882,48 @@ mod tests {
             assert!(pag_apply(&OPS, &eps_cfg, &cond, &perturbed, bad).is_err());
             assert!(pag_apply_slice(&eps_cfg, &cond, &perturbed, bad).is_err());
         }
+    }
+
+    #[test]
+    fn pipe8_named_boogu_and_qwen_guidance_operators() {
+        assert_eq!(GuidanceOperator::PlainCfg.name(), "plain_cfg");
+        assert_eq!(
+            GuidanceOperator::QwenChannelL2NormRescale.name(),
+            "qwen_channel_l2_norm_rescale"
+        );
+        assert_eq!(
+            GuidanceOperator::BooguResidualCfgNegated.name(),
+            "boogu_residual_cfg_negated"
+        );
+
+        let cond = vec![3.0_f32, 4.0, 1.0, 0.0];
+        let uncond = vec![1.0_f32, 2.0, -1.0, 0.5];
+        let scale = 4.0_f32;
+
+        // Boogu residual combine + velocity negate
+        let combined = boogu_cfg_combine(&OPS, &cond, Some(&uncond), scale).unwrap();
+        let expected_combined: Vec<f32> = cond
+            .iter()
+            .zip(&uncond)
+            .map(|(&c, &u)| c + (scale - 1.0) * (c - u))
+            .collect();
+        assert!(max_abs(&combined, &expected_combined) < 1e-6);
+
+        let negated = boogu_guided_negated_velocity(&OPS, &cond, Some(&uncond), scale).unwrap();
+        let expected_negated: Vec<f32> = expected_combined.iter().map(|&v| -v).collect();
+        assert!(max_abs(&negated, &expected_negated) < 1e-6);
+
+        let unguided_negated = boogu_guided_negated_velocity(&OPS, &cond, None, scale).unwrap();
+        let expected_unguided: Vec<f32> = cond.iter().map(|&v| -v).collect();
+        assert!(max_abs(&unguided_negated, &expected_ungated_check(&expected_unguided)) < 1e-6);
+
+        // Qwen per-token channel L2 norm rescale
+        let qwen_rescaled = qwen_cfg_l2_rescale_slice(&cond, &uncond, scale, 2, 2).unwrap();
+        let direct = cfg_rescale(&OPS, &cond, &uncond, scale, &[1, 2, 2], &[-1]).unwrap();
+        assert!(max_abs(&qwen_rescaled, &direct) < 1e-6);
+    }
+
+    fn expected_ungated_check(v: &[f32]) -> Vec<f32> {
+        v.to_vec()
     }
 }

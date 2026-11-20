@@ -34,10 +34,9 @@ use std::path::Path;
 
 use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
-use crate::model::{pag_capability, validate_request};
+use crate::model::{pag_capability, validate_request, SIZE_MULTIPLE};
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_edit_with_progress_windowed_pag, qwen_samplers,
-    qwen_schedulers, resolve_run_params, PID_BACKBONE,
+    create_noise, qwen_samplers, qwen_schedulers, resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
@@ -113,6 +112,7 @@ pub struct QwenImageEdit {
     precision: Precision,
     quant: Option<Quant>,
     adapters: Vec<mlx_gen::AdapterSpec>,
+    loaded_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (the edit MMDiT transformer, the VAE, and the optional PiD
@@ -189,6 +189,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         precision: spec.precision,
         quant: spec.quantize,
         adapters: spec.adapters.clone(),
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -417,9 +418,8 @@ impl Generator for QwenImageEdit {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_with_report_observed(req, on_progress)
-        })
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
     }
 
     fn generate_with_execution_report(
@@ -427,6 +427,39 @@ impl Generator for QwenImageEdit {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let mut report = mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed_with_run(req, Some(&run), on_progress)
+        })?;
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        Ok(report)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         mlx_gen::image_execution::complete_image_report_attempt(
             self.descriptor(),
             &req.cancel,
@@ -443,7 +476,11 @@ impl Generator for QwenImageEdit {
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-                self.generate_with_report_observed(req, &mut progress)
+                let mut report =
+                    self.generate_with_report_observed_with_run(req, Some(&run), &mut progress)?;
+                report.low_res_start =
+                    plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+                Ok(report)
             },
         )
     }
@@ -455,19 +492,22 @@ impl QwenImageEdit {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_with_report_observed(req, on_progress)?
+        let plan = compile_trajectory_for(req)?;
+        self.generate_planned(req, &plan, None, on_progress)?
             .output
             .ok_or_else(|| {
                 gen_core::Error::Msg(format!("{MODEL_ID}: the render produced no output"))
             })
     }
 
-    fn generate_with_report_observed(
+    fn generate_with_report_observed_with_run(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl_with_run(req, run, on_progress)
+            .map_err(Into::into)
     }
 }
 
@@ -475,9 +515,10 @@ impl QwenImageEdit {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
-    fn generate_impl(
+    fn generate_impl_with_run(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
@@ -507,15 +548,21 @@ impl QwenImageEdit {
             req.use_pid,
             on_progress,
             |vl: &QwenVisionLanguageEncoder| {
-                let encoded = self.encode_phase_a(vl, req, params.guidance == 1.0)?;
-                crate::pipeline::finish_conditioning(req, MODEL_ID, || {
-                    match &encoded.1 {
-                        Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
-                        None => mlx_rs::transforms::eval([&encoded.0])?,
-                    }
-                    Ok(())
-                })?;
-                Ok(encoded)
+                let encode_body = || -> Result<_> {
+                    let encoded = self.encode_phase_a(vl, req, params.guidance == 1.0)?;
+                    crate::pipeline::finish_conditioning(req, MODEL_ID, || {
+                        match &encoded.1 {
+                            Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,
+                            None => mlx_rs::transforms::eval([&encoded.0])?,
+                        }
+                        Ok(())
+                    })?;
+                    Ok(encoded)
+                };
+                match run {
+                    Some(run) => run.encode(encode_body),
+                    None => encode_body(),
+                }
             },
             // The shared boundary already forced the vision tower and LM while the VL encoder was
             // alive, including Resident requests; Sequential has nothing left before its text drop.
@@ -580,7 +627,10 @@ impl QwenImageEdit {
                             .alternate_decoder
                             .map(|decoder| decoder as &dyn LatentDecoder)
                     });
-                let images = decode_and_collect(
+                if let Some(run) = run {
+                    run.begin_rendering()?;
+                }
+                let images = crate::pipeline::decode_and_collect_with_run(
                     heavy.vae,
                     decoder,
                     decode_tiling.as_ref(),
@@ -590,29 +640,32 @@ impl QwenImageEdit {
                     params.base_seed,
                     out_w,
                     out_h,
+                    run,
                     on_progress,
                     |seed, progress| {
                         let noise = create_noise(seed, out_w, out_h)?;
-                        let latents = denoise_edit_with_progress_windowed_pag(
-                            heavy.transformer,
-                            params.sampler_name.as_deref(),
-                            denoise_sigmas,
-                            seed,
-                            noise,
-                            &static_latents,
-                            &cond_grids,
-                            &pos,
-                            neg.as_ref(),
-                            params.guidance,
-                            out_w,
-                            out_h,
-                            attention_budget,
-                            block_window,
-                            resolved_pag.as_ref(),
-                            &req.cancel,
-                            &req.preview,
-                            progress,
-                        )?;
+                        let latents =
+                            crate::pipeline::denoise_edit_with_progress_windowed_pag_and_run(
+                                heavy.transformer,
+                                params.sampler_name.as_deref(),
+                                denoise_sigmas,
+                                seed,
+                                noise,
+                                &static_latents,
+                                &cond_grids,
+                                &pos,
+                                neg.as_ref(),
+                                params.guidance,
+                                out_w,
+                                out_h,
+                                attention_budget,
+                                block_window,
+                                resolved_pag.as_ref(),
+                                run,
+                                &req.cancel,
+                                &req.preview,
+                                progress,
+                            )?;
                         crate::pipeline::calibration_fault(
                             req,
                             mlx_gen::gen_core::MemoryPhase::Denoise,
@@ -621,6 +674,9 @@ impl QwenImageEdit {
                         Ok(latents)
                     },
                 )?;
+                if let Some(run) = run {
+                    run.finish_rendering();
+                }
                 Ok(GenerationOutput::Images(images))
             },
         )?;
@@ -632,6 +688,41 @@ impl QwenImageEdit {
         })
     }
 }
+
+pub fn compile_trajectory_for(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+    let desc = descriptor();
+    validate_request(MODEL_ID, &desc.capabilities, req)?;
+    validate_reference_images(req)?;
+    let params = resolve_run_params(req, req.width, req.height)?;
+    let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, 0);
+    let executed = params.sigmas[..keep].to_vec();
+    let executed_steps = executed.len().saturating_sub(1);
+    let solver = gen_core::sampling::canonical_solver_or_euler(params.sampler_name.as_deref());
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance: params.guidance,
+        sigmas: executed,
+        executed_steps,
+        capture_sigma,
+    };
+    gen_core::RenderPlan::packed_image_trajectory(&desc, req, pass)
+}
+
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    crate::model::validate_plan_load_spec(spec, MODEL_ID)?;
+    compile_trajectory_for(req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+pub const RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: MODEL_ID,
+        compile: compile_render_plan,
+    };
 
 /// Borrow an [`Image`] as an [`ImageInput`] (RGB uint8 HWC) for the preprocess/VAE-encode paths.
 fn image_input(im: &Image) -> ImageInput<'_> {

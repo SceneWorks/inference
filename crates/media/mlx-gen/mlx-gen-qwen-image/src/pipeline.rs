@@ -222,6 +222,40 @@ pub fn decode_and_collect<F>(
     width: u32,
     height: u32,
     on_progress: &mut dyn FnMut(Progress),
+    denoise_one: F,
+) -> Result<Vec<Image>>
+where
+    F: FnMut(u64, &mut dyn FnMut(Progress)) -> Result<Array>,
+{
+    decode_and_collect_with_run(
+        vae,
+        pid_decoder,
+        tiling,
+        req,
+        model_id,
+        count,
+        base_seed,
+        width,
+        height,
+        None,
+        on_progress,
+        denoise_one,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_and_collect_with_run<F>(
+    vae: &dyn LatentDecoder,
+    pid_decoder: Option<&dyn LatentDecoder>,
+    tiling: Option<&TilingConfig>,
+    req: &GenerationRequest,
+    model_id: &str,
+    count: u32,
+    base_seed: u64,
+    width: u32,
+    height: u32,
+    run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    on_progress: &mut dyn FnMut(Progress),
     mut denoise_one: F,
 ) -> Result<Vec<Image>>
 where
@@ -235,22 +269,35 @@ where
     let mut images = Vec::with_capacity(count as usize);
     for i in 0..count {
         let seed = base_seed.wrapping_add(i as u64);
+        if let Some(run) = run {
+            run.reset_image_denoise_phases();
+        }
         let latents = denoise_one(seed, on_progress)?;
+        if let Some(run) = run {
+            run.finish_image_denoise_phases()?;
+        }
         mlx_gen::diagnostics::record_phase_boundary(
             mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
         );
         on_progress(Progress::Decoding);
-        let unpacked = unpack_latents(&latents, width, height)?;
-        let decoded = match tiling {
-            Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
-            None => decoder.decode(&unpacked)?,
-        }
-        .as_dtype(Dtype::Float32)?;
-        // Fire the conformance fault only after the selected decoder (including every native VAE
-        // tile) has executed. This makes the propagated error exercise the same residency cleanup
-        // path as a real decoder failure instead of failing before the rung begins.
-        calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, model_id)?;
-        images.push(decoded_to_image(&decoded)?);
+        let decode_body = || -> Result<Image> {
+            let unpacked = unpack_latents(&latents, width, height)?;
+            let decoded = match tiling {
+                Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
+                None => decoder.decode(&unpacked)?,
+            }
+            .as_dtype(Dtype::Float32)?;
+            // Fire the conformance fault only after the selected decoder (including every native VAE
+            // tile) has executed. This makes the propagated error exercise the same residency cleanup
+            // path as a real decoder failure instead of failing before the rung begins.
+            calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, model_id)?;
+            decoded_to_image(&decoded)
+        };
+        let image = match run {
+            Some(run) => run.decode_phase(decode_body)?,
+            None => decode_body()?,
+        };
+        images.push(image);
     }
     Ok(images)
 }
@@ -438,6 +485,7 @@ fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
 /// prediction (over the channel axis). Keeps the guided velocity's magnitude matched to the
 /// conditional one — prevents the over-saturation plain CFG would introduce at `g = 4`.
 pub fn compute_guided_noise(pos: &Array, neg: &Array, guidance: f32) -> Result<Array> {
+    let _ = mlx_gen::gen_core::guidance::GuidanceOperator::QwenChannelL2NormRescale;
     let combined = add(neg, &multiply(&subtract(pos, neg)?, scalar(guidance))?)?;
     let cond_norm = l2_over_channels(pos)?;
     let comb_norm = l2_over_channels(&combined)?;
@@ -565,6 +613,49 @@ pub(crate) fn denoise_with_progress_windowed_pag(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_with_progress_windowed_pag_and_run(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        start_step,
+        attention_budget,
+        window_size,
+        pag,
+        None,
+        cancel,
+        preview,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_with_progress_windowed_pag_and_run(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    start_step: usize,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    pag: Option<&PagResolved>,
+    run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
     // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
     // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
@@ -589,14 +680,26 @@ pub(crate) fn denoise_with_progress_windowed_pag(
     // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
     // raw schedule sigma as the transformer timestep (Sigma convention).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        crate::preview::emit_preview(preview, &previews, sliced, sigma, latents, width, height);
+        let (step_w, step_h, step_lh, step_lw) = match run {
+            Some(run) => {
+                let (p0_w, p0_h) = run.plan().phase_output_size(0);
+                let (p0_lh, p0_lw) = ((p0_h / 16) as usize, (p0_w / 16) as usize);
+                if latents.shape().get(1).copied() == Some((p0_lh * p0_lw) as i32) {
+                    (p0_w, p0_h, p0_lh, p0_lw)
+                } else {
+                    (width, height, lh, lw)
+                }
+            }
+            None => (width, height, lh, lw),
+        };
+        crate::preview::emit_preview(preview, &previews, sliced, sigma, latents, step_w, step_h);
         let pos = transformer.forward_windowed(
             latents,
             pos_embeds,
             None,
             sigma,
-            lh,
-            lw,
+            step_lh,
+            step_lw,
             &[],
             attention,
             block_window,
@@ -608,8 +711,8 @@ pub(crate) fn denoise_with_progress_windowed_pag(
                     neg,
                     None,
                     sigma,
-                    lh,
-                    lw,
+                    step_lh,
+                    step_lw,
                     &[],
                     attention,
                     block_window,
@@ -642,8 +745,8 @@ pub(crate) fn denoise_with_progress_windowed_pag(
                     pos_embeds,
                     None,
                     sigma,
-                    lh,
-                    lw,
+                    step_lh,
+                    step_lw,
                     &[],
                     attention,
                     block_window,
@@ -657,18 +760,36 @@ pub(crate) fn denoise_with_progress_windowed_pag(
     // img2img loops `range(start_step, steps)`: slice the schedule from the matching sigma so the
     // blended init latents are denoised from there (the fork's `init_time_step`). Cancellation, the
     // per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114 P3).
-    run_flow_sampler(
-        SamplerRun {
-            sampler_name,
-            sigmas: sliced,
-            seed,
-            cancel,
-            on_progress,
-        },
-        TimestepConvention::Sigma,
-        latents,
-        predict,
-    )
+    match run {
+        Some(run) => mlx_gen::run_flow_sampler_with_phase_transition_spans(
+            SamplerRun {
+                sampler_name,
+                sigmas: sliced,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            &run.plan().denoise_spans(),
+            Some(run),
+            |_, _| {},
+            predict,
+            None,
+        ),
+        None => run_flow_sampler(
+            SamplerRun {
+                sampler_name,
+                sigmas: sliced,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            predict,
+        ),
+    }
 }
 
 /// Qwen-Image **2512-Fun-Controlnet-Union** (pose) denoise loop (sc-8267 — replaces the InstantX
@@ -781,6 +902,51 @@ pub(crate) fn denoise_control_with_progress_windowed_pag(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_control_with_progress_windowed_pag_and_run(
+        transformer,
+        controlnet,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        control_cond,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        control_scale,
+        width,
+        height,
+        attention_budget,
+        window_size,
+        pag,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_control_with_progress_windowed_pag_and_run(
+    transformer: &QwenTransformer,
+    controlnet: &QwenFunControlBranch,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    control_cond: &Array,
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    control_scale: f32,
+    width: u32,
+    height: u32,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    pag: Option<&PagResolved>,
+    run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
     // by the RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
@@ -867,18 +1033,36 @@ pub(crate) fn denoise_control_with_progress_windowed_pag(
         Ok(guided)
     };
     // Cancellation, the per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114).
-    run_flow_sampler(
-        SamplerRun {
-            sampler_name,
-            sigmas,
-            seed,
-            cancel,
-            on_progress,
-        },
-        TimestepConvention::Sigma,
-        latents,
-        predict,
-    )
+    match run {
+        Some(run) => mlx_gen::run_flow_sampler_with_phase_transition_spans(
+            SamplerRun {
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            &run.plan().denoise_spans(),
+            Some(run),
+            |_, _| {},
+            predict,
+            None,
+        ),
+        None => run_flow_sampler(
+            SamplerRun {
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            predict,
+        ),
+    }
 }
 
 /// Qwen-Image-**Edit** dual-latent denoise loop, driven by a [`mlx_gen::DiffusionSampler`] (sc-2909). Each
@@ -992,6 +1176,51 @@ pub(crate) fn denoise_edit_with_progress_windowed_pag(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    denoise_edit_with_progress_windowed_pag_and_run(
+        transformer,
+        sampler_name,
+        sigmas,
+        seed,
+        latents,
+        static_image_latents,
+        cond_grids,
+        pos_embeds,
+        neg_embeds,
+        guidance,
+        width,
+        height,
+        attention_budget,
+        window_size,
+        pag,
+        None,
+        cancel,
+        preview,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_edit_with_progress_windowed_pag_and_run(
+    transformer: &QwenTransformer,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
+    latents: Array,
+    static_image_latents: &Array,
+    cond_grids: &[(usize, usize)],
+    pos_embeds: &Array,
+    neg_embeds: Option<&Array>,
+    guidance: f32,
+    width: u32,
+    height: u32,
+    attention_budget: AttentionBudget,
+    window_size: Option<usize>,
+    pag: Option<&PagResolved>,
+    run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
+    cancel: &CancelFlag,
+    preview: &PreviewSink,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
     // `denoise_with_progress`. Bit-exact; scoped + restored on drop by the RAII guard (F-006).
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
@@ -1086,18 +1315,36 @@ pub(crate) fn denoise_edit_with_progress_windowed_pag(
     };
     // Cancellation, the per-step `eval` (the command-buffer-watchdog boundary), and progress live in
     // `run_flow_sampler` (epic 7114 P3).
-    run_flow_sampler(
-        SamplerRun {
-            sampler_name,
-            sigmas,
-            seed,
-            cancel,
-            on_progress,
-        },
-        TimestepConvention::Sigma,
-        latents,
-        predict,
-    )
+    match run {
+        Some(run) => mlx_gen::run_flow_sampler_with_phase_transition_spans(
+            SamplerRun {
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            &run.plan().denoise_spans(),
+            Some(run),
+            |_, _| {},
+            predict,
+            None,
+        ),
+        None => run_flow_sampler(
+            SamplerRun {
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            predict,
+        ),
+    }
 }
 
 /// Build the per-block perturbation mask for `(step_index, total_steps)` when PAG is active on this

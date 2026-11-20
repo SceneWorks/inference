@@ -152,7 +152,17 @@ pub fn project_spatial_latents(latents: &Tensor) -> Result<Image> {
 /// Errors — a latent that is not this route's packed shape, or a `width`/`height` that does not
 /// describe it — are what the shared emitter swallows to lose exactly one decorative frame.
 pub fn project_packed_latents(packed: &Tensor, width: u32, height: u32) -> Result<Image> {
-    let spatial = crate::pipeline::unpack_latents(packed, width, height)?;
+    let (w, h) = match packed.dims() {
+        &[1, seq, _]
+            if width.is_multiple_of(32)
+                && height.is_multiple_of(32)
+                && seq == ((height / 32) as usize) * ((width / 32) as usize) =>
+        {
+            (width / 2, height / 2)
+        }
+        _ => (width, height),
+    };
+    let spatial = crate::pipeline::unpack_latents(packed, w, h)?;
     project_spatial_latents(&spatial)
 }
 

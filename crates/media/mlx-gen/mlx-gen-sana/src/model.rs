@@ -133,6 +133,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
             supports_sequential_offload: true,
             supports_preview: true,
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -539,6 +540,7 @@ fn base_sana_request<'a>(
         scheduler_shift: req.scheduler_shift,
         init_image,
         strength,
+        phase0_size: None,
     }
 }
 
@@ -609,7 +611,72 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
+    if let Some(low_res) = &req.low_res_start {
+        if id == SPRINT_MODEL_ID {
+            return Err(Error::Unsupported(format!(
+                "{id}: low_res_start is not supported on continuous-time consistency SCM Sprint"
+            )));
+        }
+        let has_init = resolve_reference(req, id)?.is_some();
+        let sampling = crate::sampling::resolve_base_actual_with_init(req, has_init)?;
+        let executed_steps = sampling.sigmas().len().saturating_sub(1);
+        low_res.resolve_for_descriptor(desc, req, executed_steps, RES_MULTIPLE)?;
+    }
     Ok(())
+}
+
+/// Compile a weights-free [`mlx_gen::gen_core::RenderPlan`] for SANA-1.6B (`sana_1600m`).
+pub fn compile_trajectory_for(
+    desc: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::RenderPlan> {
+    if desc.id == SPRINT_MODEL_ID {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{}: RenderPlan compilation is not supported on continuous-time consistency SCM Sprint (ENG-5)",
+            desc.id
+        )));
+    }
+    validate_request(desc, req)?;
+    let has_init = resolve_reference(req, desc.id)?.is_some();
+    let sampling = crate::sampling::resolve_base_actual_with_init(req, has_init)?;
+    let sigmas = sampling.sigmas().to_vec();
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = resolve_base_guidance(req).unwrap_or(DEFAULT_GUIDANCE);
+    let pass = mlx_gen::gen_core::render::PackedImagePass {
+        pixel_stride: RES_MULTIPLE,
+        token_width: 32,
+        sampler: sampling.solver().name(),
+        guidance,
+        sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    if req.conditioning.is_empty() {
+        mlx_gen::gen_core::RenderPlan::base_image(desc, req, pass)
+    } else {
+        mlx_gen::gen_core::RenderPlan::packed_image_trajectory(desc, req, pass)
+    }
+}
+
+/// Pre-load [`mlx_gen::gen_core::RenderPlanRegistration`] compiler for `sana_1600m`.
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::RenderPlan>> {
+    load_components(spec, MODEL_ID)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: external overlays and custom component overrides are not supported"
+        )));
+    }
+    compile_trajectory_for(&descriptor(), req).map(|plan| Some(plan.bind_load(spec)))
 }
 
 impl Generator for Sana {
@@ -626,9 +693,59 @@ impl Generator for Sana {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        mlx_gen::image_execution::without_capture(|| {
-            self.generate_impl(req, on_progress).map_err(Into::into)
-        })
+        if self.sprint {
+            return mlx_gen::image_execution::without_capture(|| {
+                self.generate_impl(req, None, on_progress)
+                    .map_err(Into::into)
+            });
+        }
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| mlx_gen::gen_core::Error::Msg("SANA render produced no images".into()))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        if self.sprint {
+            let output = mlx_gen::image_execution::without_capture(|| {
+                self.generate_impl(req, None, on_progress)
+                    .map_err(mlx_gen::gen_core::Error::from)
+            })?;
+            return Ok(mlx_gen::gen_core::GenerationReport::from_output(output));
+        }
+        let plan = compile_trajectory_for(&self.descriptor, req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        if self.sprint {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: planned execution is not supported on continuous-time consistency SCM Sprint (ENG-5)",
+                self.descriptor.id
+            )));
+        }
+        validate_request(&self.descriptor, req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let output = mlx_gen::image_execution::without_capture(|| {
+            self.generate_impl(req, Some(&run), on_progress)
+                .map_err(mlx_gen::gen_core::Error::from)
+        })?;
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("f32", 4, "base_dit")?;
+        Ok(report)
     }
 
     fn generate_with_execution_report(
@@ -636,11 +753,56 @@ impl Generator for Sana {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
-        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
-            let mut progress =
-                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-            self.generate_impl(req, &mut progress).map_err(Into::into)
-        })
+        if self.sprint {
+            return mlx_gen::image_execution::complete_image_attempt(
+                &self.descriptor,
+                &req.cancel,
+                || {
+                    let mut progress =
+                        |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                    self.generate_impl(req, None, &mut progress)
+                        .map_err(Into::into)
+                },
+            );
+        }
+        let plan = compile_trajectory_for(&self.descriptor, req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &mlx_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        if self.sprint {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "{}: planned execution is not supported on continuous-time consistency SCM Sprint (ENG-5)",
+                self.descriptor.id
+            )));
+        }
+        validate_request(&self.descriptor, req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
+        mlx_gen::image_execution::complete_image_report_attempt(
+            &self.descriptor,
+            &req.cancel,
+            || {
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                let output = self
+                    .generate_impl(req, Some(&run), &mut progress)
+                    .map_err(mlx_gen::gen_core::Error::from)?;
+                let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+                report.low_res_start =
+                    plan.low_res_start_execution_report("f32", 4, "base_dit")?;
+                Ok(report)
+            },
+        )
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -680,6 +842,7 @@ impl Sana {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        run: Option<&mlx_gen::gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         // Only THIS original invocation carrier can inherit the joined program.
@@ -744,7 +907,8 @@ impl Sana {
             None => (None, None),
         };
 
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed =
+            run.map_or_else(|| req.seed.unwrap_or_else(default_seed), |r| r.plan().base_seed());
         // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
         // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
         let sprint_sampling = if self.sprint {
@@ -772,13 +936,19 @@ impl Sana {
         // loads. Under `Resident` it borrows the warm encoder (byte-identical to the pre-seam
         // `encode_with_mask`).
         let encode = |text_encoder: &SanaTextEncoder| {
-            encode_conditioning(
-                text_encoder,
-                self.sprint,
-                &req.prompt,
-                req.negative_prompt.as_deref(),
-                guidance,
-            )
+            let encode_fn = || {
+                encode_conditioning(
+                    text_encoder,
+                    self.sprint,
+                    &req.prompt,
+                    req.negative_prompt.as_deref(),
+                    guidance,
+                )
+            };
+            match run {
+                Some(run) => run.encode(encode_fn),
+                None => encode_fn(),
+            }
         };
         // Materialize the CHI embedding + pad mask (and their uncond twins) while the encoder is
         // still alive (Sequential only) — MLX is lazy, so an un-evaluated output keeps the Gemma
@@ -804,8 +974,12 @@ impl Sana {
             // Rungs 3 and 4, resolved against the trunk that will actually run them.
             let plan = crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
             mlx_gen::image_execution::policy_debug("transformer_plan", &plan);
-            let prepare_req =
+            let mut prepare_req =
                 base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+            prepare_req.phase0_size = run.map(|r| r.plan().phase_output_size(0));
+            if let Some(run) = run {
+                run.begin_rendering()?;
+            }
             let latents = render_batch_with_prepared_reference(
                 base_seed,
                 req.count,
@@ -816,9 +990,13 @@ impl Sana {
                     }
                 },
                 |seed, prepared_reference| {
-                    let sana_req =
+                    if let Some(run) = run {
+                        run.reset_image_denoise_phases();
+                    }
+                    let mut sana_req =
                         base_sana_request(req, seed, init_image, strength, guidance_scale);
-                    heavy.denoise_one_with_prepared_reference(
+                    sana_req.phase0_size = run.map(|r| r.plan().phase_output_size(0));
+                    let latent = heavy.denoise_one_with_prepared_reference_and_run(
                         &cond,
                         &sana_req,
                         guidance,
@@ -827,7 +1005,12 @@ impl Sana {
                         on_progress,
                         &req.preview,
                         plan,
-                    )
+                        run,
+                    )?;
+                    if let Some(run) = run {
+                        run.finish_image_denoise_phases()?;
+                    }
+                    Ok(latent)
                 },
             )?;
             materialize_latent_batch(&latents)?;
@@ -840,7 +1023,15 @@ impl Sana {
             on_progress(Progress::Decoding);
             let mut images = Vec::with_capacity(latents.len());
             for latent in &latents {
-                images.push(view.decode_one(latent, &req.cancel, tiling.as_ref())?);
+                let image = match run {
+                    Some(run) => run
+                        .decode_phase(|| view.decode_one(latent, &req.cancel, tiling.as_ref()))?,
+                    None => view.decode_one(latent, &req.cancel, tiling.as_ref())?,
+                };
+                images.push(image);
+            }
+            if let Some(run) = run {
+                run.finish_rendering();
             }
             Ok(GenerationOutput::Images(images))
         };
@@ -852,8 +1043,9 @@ impl Sana {
             let id = self.descriptor.id;
             let spec = &self.loaded_spec;
             let streamable = crate::memory_strategy::is_streamable(spec);
-            let prepare_req =
+            let mut prepare_req =
                 base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+            prepare_req.phase0_size = run.map(|r| r.plan().phase_output_size(0));
             return self.residency.run_exclusive_staged(&req.cancel, || {
                 run_staged_img2img(
                     &req.cancel,
@@ -1046,6 +1238,12 @@ mlx_gen::register_generators! {
     footprint = component_footprint
 }
 
+pub const BASE_RENDER_PLAN_REGISTRATION: mlx_gen::gen_core::RenderPlanRegistration =
+    mlx_gen::gen_core::RenderPlanRegistration {
+        provider_id: MODEL_ID,
+        compile: compile_render_plan,
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1190,7 +1388,7 @@ mod tests {
     fn check_registered_reference_path(source: &str) -> Result<()> {
         let generate = braced_item(source, "    fn generate_impl(");
         let prepare = "heavy.prepare_reference_with_tiling(&prepare_req, &req.cancel, encode_tile)";
-        let prepared_tail = "heavy.denoise_one_with_prepared_reference(";
+        let prepared_tail = "heavy.denoise_one_with_prepared_reference_and_run(";
         if generate
             .matches("render_batch_with_prepared_reference(")
             .count()
@@ -1224,7 +1422,7 @@ mod tests {
         check_registered_reference_path(shipped).unwrap();
 
         let reverted = shipped.replacen(
-            "heavy.denoise_one_with_prepared_reference(",
+            "heavy.denoise_one_with_prepared_reference_and_run(",
             "heavy.denoise_one_with_preview(",
             1,
         );
@@ -1905,5 +2103,64 @@ mod tests {
         // Both SANA ids honor the shared Residency seam (the descriptor bit consumers read).
         assert!(descriptor().capabilities.supports_sequential_offload);
         assert!(sprint_descriptor().capabilities.supports_sequential_offload);
+    }
+
+    #[test]
+    fn tier0_render_plan_and_low_res_start_conformance() {
+        use mlx_gen::gen_core::{FeatureInapplicabilityCode, LowResStartSpec};
+
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/sana".into()));
+
+        // T2I with low_res_start on sana_1600m compiles a two-phase RenderPlan
+        let mut t2i = req(1024, 1024);
+        t2i.steps = Some(10);
+        t2i.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        let plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &t2i)
+            .unwrap()
+            .expect("sana_1600m compiles a RenderPlan");
+        assert_eq!(plan.denoise_spans(), vec![0..4, 4..10]);
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        let lrs = plan.low_res_start().expect("low_res_start plan resolved");
+        assert_eq!(lrs.k, 4);
+        assert_eq!(lrs.executed_steps, 10);
+        assert_eq!(lrs.low_width, 512);
+        assert_eq!(lrs.low_height, 512);
+        assert_eq!(lrs.full_width, 1024);
+        assert_eq!(lrs.full_height, 1024);
+
+        // Plain img2img with low_res_start on sana_1600m truncates schedule and compiles two phases
+        let mut i2i = t2i.clone();
+        i2i.conditioning = vec![Conditioning::Reference {
+            image: ref_image(),
+            strength: Some(0.6),
+        }];
+        // 10 steps @ strength 0.6 -> start_step = 6 -> 4 executed steps (5 sigmas); warmup 2 steps
+        i2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        let i2i_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &i2i)
+            .unwrap()
+            .expect("sana_1600m img2img compiles a RenderPlan");
+        assert_eq!(i2i_plan.denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(i2i_plan.phase_output_size(0), (512, 512));
+        assert_eq!(i2i_plan.phase_output_size(1), (1024, 1024));
+
+        // Feature applicability: sana_1600m supports low_res_start; sana_sprint_1600m (ENG-5) refuses
+        let base_app = registry
+            .route_feature_applicability(MODEL_ID)
+            .expect("base route applicability");
+        assert!(base_app["low_res_start"].applicable);
+
+        let sprint_app = registry
+            .route_feature_applicability(SPRINT_MODEL_ID)
+            .expect("sprint route applicability");
+        assert!(!sprint_app["low_res_start"].applicable);
+        assert!(sprint_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingRenderPlan));
+        assert!(validate_request(&sprint_descriptor(), &t2i).is_err());
     }
 }

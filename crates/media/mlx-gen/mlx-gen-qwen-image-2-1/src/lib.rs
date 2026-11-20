@@ -120,8 +120,9 @@ pub use loader::{
     load_tokenizer, load_transformer, load_vae, load_vision_config,
 };
 pub use model::{
-    descriptor, descriptor_turbo, load, load_turbo, load_variant, QwenImage21, Schedule, Variant,
-    MODEL_ID, TURBO_MODEL_ID,
+    compile_render_plan, compile_render_plan_turbo, compile_trajectory_for, descriptor,
+    descriptor_turbo, load, load_turbo, load_variant, QwenImage21, Schedule, Variant, MODEL_ID,
+    RENDER_PLAN_REGISTRATION, TURBO_MODEL_ID, TURBO_RENDER_PLAN_REGISTRATION,
 };
 pub use pipeline::{
     create_noise, decode_rgb, decode_rgba, denoise, denoise_reported, encode_prompt,
@@ -162,6 +163,7 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_render_plan(model::RENDER_PLAN_REGISTRATION)
         // The text-to-image LoRA/LoKr trainer (sc-24159), under the generator's own id.
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
@@ -176,6 +178,7 @@ pub fn register_providers(
         // The distilled Turbo checkpoint (sc-25900): the same generator and memory contract under
         // its own id. No trainer — training stays on the base checkpoint.
         .register_generator(model::TURBO_REGISTRATION)
+        .register_render_plan(model::TURBO_RENDER_PLAN_REGISTRATION)
         .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,

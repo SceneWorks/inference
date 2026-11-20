@@ -221,20 +221,23 @@ impl BooguGenerator {
         &self,
         req: &GenerationRequest,
         default_steps: usize,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
     ) -> gen_core::Result<(Option<Tensor>, usize)> {
         let reference = pipeline::resolve_reference(req, self.descriptor.id)?;
         let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
         let start_step = reference
             .map(|(_, strength)| pipeline::init_time_step(steps, Some(strength)))
             .unwrap_or(0);
+        let (encode_w, encode_h) =
+            run.map_or((req.width, req.height), |r| r.plan().phase_output_size(0));
         let clean = if start_step > 0 {
             let (image, _) = reference.expect("start_step > 0 implies a reference");
             let encoder = self.img2img_encoder()?;
             Some(pipeline::encode_reference(
                 &encoder,
                 image,
-                req.width,
-                req.height,
+                encode_w,
+                encode_h,
                 &self.device,
             )?)
         } else {
@@ -247,6 +250,7 @@ impl BooguGenerator {
         &self,
         req: &GenerationRequest,
         preflight: &RequestPreflight,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<Vec<Image>> {
         // Evict every reloadable warm cache before phase A. The request lock held by `generate`
@@ -306,6 +310,7 @@ impl BooguGenerator {
                             pipeline::DEFAULT_STEPS,
                             &self.device,
                             on_progress,
+                            run,
                         )?
                     } else {
                         let RequestPreflight::Turbo(preflight) = preflight else {
@@ -339,6 +344,7 @@ impl BooguGenerator {
                         preflight,
                         &self.device,
                         on_progress,
+                        run,
                     )?
                 }
             };
@@ -354,9 +360,14 @@ impl BooguGenerator {
             self.staged_boundary(req, gen_core::MemoryPhase::Denoise)?;
             let denoise = pipeline::load_staged_denoise(&self.root, &self.device)?;
             let latents = match self.variant {
-                Variant::Base => {
-                    pipeline::stage_denoise_base(&denoise, req, encoded, &self.device, on_progress)?
-                }
+                Variant::Base => pipeline::stage_denoise_base(
+                    &denoise,
+                    req,
+                    encoded,
+                    &self.device,
+                    on_progress,
+                    run,
+                )?,
                 Variant::Turbo => pipeline::stage_denoise_turbo(
                     &denoise,
                     req,
@@ -364,9 +375,14 @@ impl BooguGenerator {
                     &self.device,
                     on_progress,
                 )?,
-                Variant::Edit => {
-                    pipeline::stage_denoise_edit(&denoise, req, encoded, &self.device, on_progress)?
-                }
+                Variant::Edit => pipeline::stage_denoise_edit(
+                    &denoise,
+                    req,
+                    encoded,
+                    &self.device,
+                    on_progress,
+                    run,
+                )?,
             };
             self.device
                 .synchronize()
@@ -377,7 +393,7 @@ impl BooguGenerator {
             }
             self.staged_boundary(req, gen_core::MemoryPhase::Decode)?;
             let decode = pipeline::load_staged_decode(&self.root, &self.device, None)?;
-            pipeline::stage_decode(&decode, req, self.descriptor.id, latents, on_progress)
+            pipeline::stage_decode(&decode, req, self.descriptor.id, latents, on_progress, run)
                 .map_err(gen_core::Error::backend)
         })();
         let cleanup = self.device.synchronize().map_err(gen_core::Error::backend);
@@ -387,135 +403,11 @@ impl BooguGenerator {
             (Ok(images), Ok(())) => Ok(images),
         }
     }
-}
 
-impl Generator for BooguGenerator {
-    fn generate_with_execution_report(
-        &self,
-        req: &candle_gen::gen_core::GenerationRequest,
-        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
-    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
-    }
-
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        self.memory_strategy.as_ref().map(|memory| &memory.contract)
-    }
-
-    fn memory_strategy_safety_check(
-        &self,
-        context: &gen_core::MemoryRunContext,
-    ) -> gen_core::MemorySafetyDecision {
-        let Some(memory) = &self.memory_strategy else {
-            return gen_core::MemorySafetyDecision::Reject {
-                reason: format!("{} has no exact Boogu artifact receipt", self.descriptor.id),
-            };
-        };
-        if let Err(error) = memory.receipt.ensure_unchanged() {
-            self.memory_admission.clear_approval();
-            return gen_core::MemorySafetyDecision::rejected(error);
-        }
-        match memory_strategy::safety_check(
-            self.descriptor.id,
-            &memory.contract,
-            gen_core::MemoryNumericTier {
-                precision: gen_core::Precision::Bf16,
-                quant: memory.receipt.tier,
-                component_precision_floors: &[],
-            },
-            context,
-        ) {
-            gen_core::MemorySafetyDecision::Accept => {
-                gen_core::MemorySafetyDecision::from_validation(
-                    self.memory_admission.approve(context),
-                )
-            }
-            reject => {
-                self.memory_admission.clear_approval();
-                reject
-            }
-        }
-    }
-
-    fn begin_memory_strategy_request(
-        &self,
-        context: &gen_core::MemoryRunContext,
-    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        let memory = self.memory_strategy.as_ref().ok_or_else(|| {
-            gen_core::Error::Unsupported(format!(
-                "{} has no exact Boogu artifact receipt",
-                self.descriptor.id
-            ))
-        })?;
-        memory.receipt.ensure_unchanged()?;
-        memory_strategy::begin_request(
-            self.descriptor.id,
-            &memory.contract,
-            gen_core::MemoryNumericTier {
-                precision: gen_core::Precision::Bf16,
-                quant: memory.receipt.tier,
-                component_precision_floors: &[],
-            },
-            self.device.clone(),
-            context,
-            self.memory_admission.clone(),
-        )
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        let id = self.descriptor.id;
-        self.descriptor.capabilities.validate_request(id, req)?;
-        let (default, off) = if matches!(self.variant, Variant::Turbo) {
-            (0.0, 0.0)
-        } else {
-            (pipeline::DEFAULT_GUIDANCE, 1.0)
-        };
-        if req
-            .negative_prompt
-            .as_ref()
-            .is_some_and(|prompt| !prompt.trim().is_empty())
-            && req.guidance.unwrap_or(default) == off
-        {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: a negative prompt requires CFG"
-            )));
-        }
-
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        // The Edit variant needs 1..=5 source references; Base/Turbo take at most one (img2img
-        // latent-init, sc-11786) — `resolve_reference` fails fast on a second reference. The capability
-        // floor already rejects a `MultiReference` on Base/Turbo (only `Reference` is advertised there).
-        match self.variant {
-            Variant::Edit => {
-                resolve_edit_references(req)?;
-            }
-            Variant::Base | Variant::Turbo => {
-                pipeline::resolve_reference(req, self.descriptor.id)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn generate(
+    fn execute_generate(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         let _request = self.request_lock.lock().map_err(|_| {
@@ -589,6 +481,7 @@ impl Generator for BooguGenerator {
             return Ok(GenerationOutput::Images(self.generate_staged(
                 req,
                 &preflight,
+                run,
                 on_progress,
             )?));
         }
@@ -602,7 +495,8 @@ impl Generator for BooguGenerator {
                 };
                 // img2img latent-init (sc-11786): a single `Reference` seeds the few-step DMD denoise
                 // from the VAE-encoded reference; no reference (or strength→start 0) stays pure txt2img.
-                let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_TURBO_STEPS)?;
+                let (clean, start_step) =
+                    self.img2img_init(req, pipeline::DEFAULT_TURBO_STEPS, None)?;
                 pipeline::render_turbo(
                     &comps,
                     req,
@@ -621,7 +515,7 @@ impl Generator for BooguGenerator {
                 };
                 // img2img latent-init (sc-11786): a single `Reference` seeds the true-CFG denoise from
                 // the VAE-encoded reference; no reference (or strength→start 0) stays pure txt2img.
-                let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_STEPS)?;
+                let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_STEPS, run)?;
                 pipeline::render_base(
                     &comps,
                     req,
@@ -630,6 +524,7 @@ impl Generator for BooguGenerator {
                     start_step,
                     &self.device,
                     on_progress,
+                    run,
                 )?
             }
             Variant::Edit => {
@@ -648,10 +543,320 @@ impl Generator for BooguGenerator {
                     preflight,
                     &self.device,
                     on_progress,
+                    run,
                 )?
             }
         };
         Ok(GenerationOutput::Images(images))
+    }
+}
+
+pub(crate) fn validate_request(
+    desc: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    let id = desc.id;
+    desc.capabilities.validate_request(id, req)?;
+    let (default, off) = if id == BOOGU_IMAGE_TURBO_ID {
+        (0.0, 0.0)
+    } else {
+        (pipeline::DEFAULT_GUIDANCE, 1.0)
+    };
+    if req
+        .negative_prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+        && req.guidance.unwrap_or(default) == off
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: a negative prompt requires CFG"
+        )));
+    }
+
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: prompt must not be empty"
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if id == BOOGU_IMAGE_EDIT_ID {
+        resolve_edit_references(req)?;
+    } else {
+        pipeline::resolve_reference(req, id)?;
+    }
+    if let Some(low_res) = &req.low_res_start {
+        if id == BOOGU_IMAGE_TURBO_ID {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: low_res_start is not supported on the Boogu Turbo DMD student path (ENG-5)"
+            )));
+        }
+        if id == BOOGU_IMAGE_EDIT_ID {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: low_res_start conflicts with pass-0 edit conditioning"
+            )));
+        }
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(pipeline::DEFAULT_STEPS);
+        let native = pipeline::base_native_sigmas(steps);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            pipeline::base_shift_mu(),
+            steps,
+            &native,
+        )?;
+        let start_step = pipeline::resolve_reference(req, id)?
+            .map(|(_, strength)| pipeline::init_time_step(steps, Some(strength)))
+            .unwrap_or(0);
+        let start = start_step.min(sigmas.len().saturating_sub(1));
+        let executed_steps = sigmas[start..].len().saturating_sub(1);
+        low_res.resolve_for_descriptor(desc, req, executed_steps, SIZE_MULTIPLE)?;
+    }
+    Ok(())
+}
+
+/// Compile a weights-free [`gen_core::RenderPlan`] for Candle Boogu Base (`boogu_image`) or Edit (`boogu_image_edit`).
+pub fn compile_trajectory_for(
+    desc: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    if desc.id == BOOGU_IMAGE_TURBO_ID {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: RenderPlan compilation is not supported on the Boogu Turbo DMD student path (ENG-5)",
+            desc.id
+        )));
+    }
+    validate_request(desc, req)?;
+    let steps = req
+        .steps
+        .map(|s| s as usize)
+        .unwrap_or(pipeline::DEFAULT_STEPS);
+    let guidance = req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE);
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    let native = pipeline::base_native_sigmas(steps);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        pipeline::base_shift_mu(),
+        steps,
+        &native,
+    )?;
+    let start_step = if desc.id == BOOGU_IMAGE_EDIT_ID {
+        0
+    } else {
+        pipeline::resolve_reference(req, desc.id)?
+            .map(|(_, strength)| pipeline::init_time_step(steps, Some(strength)))
+            .unwrap_or(0)
+    };
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let denoise_sigmas = sigmas[start..].to_vec();
+    let executed_steps = denoise_sigmas.len().saturating_sub(1);
+    let pass = gen_core::render::PackedImagePass {
+        pixel_stride: SIZE_MULTIPLE,
+        token_width: 64,
+        sampler: solver.name(),
+        guidance,
+        sigmas: denoise_sigmas,
+        executed_steps,
+        capture_sigma: 0.0,
+    };
+    if desc.id == BOOGU_IMAGE_ID && req.conditioning.is_empty() {
+        gen_core::RenderPlan::base_image(desc, req, pass)
+    } else {
+        gen_core::RenderPlan::packed_image_trajectory(desc, req, pass)
+    }
+}
+
+fn validate_plan_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<()> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id} expects a snapshot directory (mllm/ transformer/ vae/), not a single .safetensors file"
+        )));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not accept user LoRA/LoKr adapters"
+        )));
+    }
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support ControlNet / IP-Adapter overlays"
+        )));
+    }
+    Ok(())
+}
+
+/// Pre-load [`gen_core::RenderPlanRegistration`] compiler for Candle `boogu_image`.
+pub fn compile_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(spec, BOOGU_IMAGE_ID)?;
+    compile_trajectory_for(&descriptor(), req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+/// Pre-load [`gen_core::RenderPlanRegistration`] compiler for Candle `boogu_image_edit`.
+pub fn compile_edit_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_plan_load_spec(spec, BOOGU_IMAGE_EDIT_ID)?;
+    compile_trajectory_for(&descriptor_edit(), req).map(|plan| Some(plan.bind_load(spec)))
+}
+
+impl Generator for BooguGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {})
+    }
+
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref().map(|memory| &memory.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(memory) = &self.memory_strategy else {
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{} has no exact Boogu artifact receipt", self.descriptor.id),
+            };
+        };
+        if let Err(error) = memory.receipt.ensure_unchanged() {
+            self.memory_admission.clear_approval();
+            return gen_core::MemorySafetyDecision::rejected(error);
+        }
+        match memory_strategy::safety_check(
+            self.descriptor.id,
+            &memory.contract,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: memory.receipt.tier,
+                component_precision_floors: &[],
+            },
+            context,
+        ) {
+            gen_core::MemorySafetyDecision::Accept => {
+                gen_core::MemorySafetyDecision::from_validation(
+                    self.memory_admission.approve(context),
+                )
+            }
+            reject => {
+                self.memory_admission.clear_approval();
+                reject
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let memory = self.memory_strategy.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{} has no exact Boogu artifact receipt",
+                self.descriptor.id
+            ))
+        })?;
+        memory.receipt.ensure_unchanged()?;
+        memory_strategy::begin_request(
+            self.descriptor.id,
+            &memory.contract,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: memory.receipt.tier,
+                component_precision_floors: &[],
+            },
+            self.device.clone(),
+            context,
+            self.memory_admission.clone(),
+        )
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        validate_request(&self.descriptor, req)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        if self.variant == Variant::Turbo {
+            return self.execute_generate(req, None, on_progress);
+        }
+        self.generate_with_report(req, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("Boogu render produced no images".into()))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        if self.variant == Variant::Turbo {
+            let output = self.execute_generate(req, None, on_progress)?;
+            return Ok(gen_core::GenerationReport::from_output(output));
+        }
+        let plan = compile_trajectory_for(&self.descriptor, req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        if self.variant == Variant::Turbo {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: planned execution is not supported on the Boogu Turbo DMD student path (ENG-5)",
+                self.descriptor.id
+            )));
+        }
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let output = self.execute_generate(req, Some(&run), on_progress)?;
+        let mut report = gen_core::GenerationReport::from_output(output);
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
+        Ok(report)
     }
 }
 
@@ -796,6 +1001,7 @@ pub fn descriptor() -> ModelDescriptor {
             // (`loader::linear_detect`, sc-9410, group-size-aware); `build` no-ops the requested quant.
             // Turbo + edit inherit this via `descriptor()`.
             supported_quants: &[Quant::Q4, Quant::Q8],
+            supports_low_res_start: true,
             ..Default::default()
         },
     }
@@ -809,6 +1015,7 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
     d.capabilities.supports_guidance = true;
+    d.capabilities.supports_low_res_start = false;
     d.capabilities.samplers = TURBO_SAMPLERS.to_vec();
     d
 }
@@ -820,6 +1027,7 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 pub fn descriptor_edit() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_EDIT_ID;
+    d.capabilities.supports_low_res_start = false;
     d.capabilities.conditioning = vec![
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
@@ -916,6 +1124,18 @@ candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = descriptor_edit => load_edit
 }
 
+pub const BASE_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: BOOGU_IMAGE_ID,
+        compile: compile_render_plan,
+    };
+
+pub const EDIT_RENDER_PLAN_REGISTRATION: gen_core::RenderPlanRegistration =
+    gen_core::RenderPlanRegistration {
+        provider_id: BOOGU_IMAGE_EDIT_ID,
+        compile: compile_edit_render_plan,
+    };
+
 /// Add all Candle Boogu providers to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
@@ -923,7 +1143,9 @@ pub fn register_providers(
     let registry = registry
         .register_generator(BASE_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION);
+        .register_generator(EDIT_REGISTRATION)
+        .register_render_plan(BASE_RENDER_PLAN_REGISTRATION)
+        .register_render_plan(EDIT_RENDER_PLAN_REGISTRATION);
     register_memory_contract_surfaces(registry)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
@@ -1888,5 +2110,97 @@ mod tests {
             load(&lora).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn tier0_render_plan_and_low_res_start_conformance() {
+        use candle_gen::gen_core::{FeatureInapplicabilityCode, LowResStartSpec};
+
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/boogu".into()));
+
+        // Base T2I with low_res_start compiles a two-phase RenderPlan
+        let mut t2i = GenerationRequest {
+            prompt: "a red apple on a wooden table".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(10),
+            low_res_start: Some(LowResStartSpec::new(4, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(BOOGU_IMAGE_ID, &spec, &t2i)
+            .unwrap()
+            .expect("boogu_image compiles a RenderPlan");
+        assert_eq!(plan.denoise_spans(), vec![0..4, 4..10]);
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+        assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        let lrs = plan.low_res_start().expect("low_res_start plan resolved");
+        assert_eq!(lrs.k, 4);
+        assert_eq!(lrs.executed_steps, 10);
+        assert_eq!(lrs.low_width, 512);
+        assert_eq!(lrs.low_height, 512);
+
+        // Base single-reference img2img with low_res_start truncates schedule and compiles two phases
+        t2i.conditioning = vec![Conditioning::Reference {
+            image: boundary_image(512, 512),
+            strength: Some(0.6),
+        }];
+        t2i.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+        let i2i_plan = registry
+            .compile_render_plan(BOOGU_IMAGE_ID, &spec, &t2i)
+            .unwrap()
+            .expect("boogu_image img2img compiles a RenderPlan");
+        assert_eq!(i2i_plan.denoise_spans(), vec![0..2, 2..4]);
+        assert_eq!(i2i_plan.phase_output_size(0), (512, 512));
+        assert_eq!(i2i_plan.phase_output_size(1), (1024, 1024));
+
+        // Edit compiles a single-phase RenderPlan without low_res_start, and refuses low_res_start with ConflictsWithPass0EditConditioning
+        let edit_req = GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::Reference {
+                image: boundary_image(512, 512),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let edit_plan = registry
+            .compile_render_plan(BOOGU_IMAGE_EDIT_ID, &spec, &edit_req)
+            .unwrap()
+            .expect("boogu_image_edit compiles a RenderPlan");
+        assert_eq!(edit_plan.phase_output_size(0), (1024, 1024));
+
+        let mut edit_lrs = edit_req.clone();
+        edit_lrs.low_res_start = Some(LowResStartSpec::new(4, Some(0.5)));
+        assert!(registry
+            .compile_render_plan(BOOGU_IMAGE_EDIT_ID, &spec, &edit_lrs)
+            .is_err());
+
+        let base_app = registry
+            .route_feature_applicability(BOOGU_IMAGE_ID)
+            .expect("boogu_image applicability");
+        assert!(base_app["low_res_start"].applicable);
+
+        let edit_app = registry
+            .route_feature_applicability(BOOGU_IMAGE_EDIT_ID)
+            .expect("boogu_image_edit applicability");
+        assert!(!edit_app["low_res_start"].applicable);
+        assert!(edit_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::ConflictsWithPass0EditConditioning));
+
+        // Turbo (ENG-5) refuses low_res_start with typed refusal
+        let turbo_app = registry
+            .route_feature_applicability(BOOGU_IMAGE_TURBO_ID)
+            .expect("boogu_image_turbo applicability");
+        assert!(!turbo_app["low_res_start"].applicable);
+        assert!(turbo_app["low_res_start"]
+            .reasons
+            .iter()
+            .any(|r| r.code == FeatureInapplicabilityCode::MissingRenderPlan));
+        assert!(validate_request(&descriptor_turbo(), &t2i).is_err());
     }
 }

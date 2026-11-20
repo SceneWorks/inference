@@ -200,13 +200,8 @@ pub fn prepare_references(
 /// `preprocess`), which is what makes the decode side's `x·0.5 + 0.5` its exact inverse. An opaque
 /// reference (`A = 255`) yields the constant `+1.0` plane the RGB route always produced.
 fn rgba8_to_nchw(pixels: &[u8], width: usize, height: usize) -> Array {
-    let plane = width * height;
-    let mut out = vec![0.0f32; 4 * plane];
-    for (c, chunk) in out.chunks_mut(plane).enumerate() {
-        for (i, v) in chunk.iter_mut().enumerate() {
-            *v = f32::from(pixels[i * 4 + c]) / 255.0 * 2.0 - 1.0;
-        }
-    }
+    let out = mlx_gen::gen_core::imageops::rgba8_to_nchw_f32(pixels, height, width)
+        .expect("validated RGBA8 buffer");
     Array::from_slice(&out, &[1, 4, height as i32, width as i32])
 }
 
