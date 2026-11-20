@@ -451,7 +451,57 @@ pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Imag
             reference = Some((image, strength.or(req.strength)));
         }
     }
-    Ok(reference)
+    if reference.is_some() {
+        if req.source_image.is_some() {
+            return Err(CandleError::Msg(
+                "z_image: specify img2img input via source_image or Conditioning::Reference, not both"
+                    .into(),
+            ));
+        }
+        return Ok(reference);
+    }
+    if let Some(image) = req.source_image.as_ref() {
+        return Ok(Some((image, req.strength)));
+    }
+    Ok(None)
+}
+
+/// Resolve the full-pass Z-Image-Turbo sigma schedule for `req` and `steps`.
+pub(crate) fn resolve_turbo_sigmas(req: &GenerationRequest, steps: usize) -> Result<Vec<f32>> {
+    let lat_h = (req.height / SPATIAL_SCALE) as usize;
+    let lat_w = (req.width / SPATIAL_SCALE) as usize;
+    let image_seq_len = ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
+    let mu = calculate_shift(
+        image_seq_len,
+        BASE_IMAGE_SEQ_LEN,
+        MAX_IMAGE_SEQ_LEN,
+        BASE_SHIFT,
+        MAX_SHIFT,
+    );
+    let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
+    scheduler.set_timesteps(steps, Some(mu));
+    let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+    Ok(candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        0.0,
+        steps,
+        &native,
+    )?)
+}
+
+/// Resolve the full-pass base Z-Image (`shift = 6.0`) sigma schedule for `req` and `steps`.
+pub(crate) fn resolve_base_sigmas(req: &GenerationRequest, steps: usize) -> Result<Vec<f32>> {
+    let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
+    scheduler.set_timesteps(steps, None);
+    let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+    Ok(candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        (BASE_SCHEDULE_SHIFT as f32).ln(),
+        steps,
+        &native,
+    )?)
 }
 
 /// The **base** (non-Turbo) Z-Image flow-match scheduler config: `shift = 6.0`,
@@ -1248,6 +1298,7 @@ impl Pipeline {
     pub(crate) fn render_sequential(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(Vec<Image>, u32)> {
@@ -1256,8 +1307,18 @@ impl Pipeline {
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
-            Some((_, strength)) => init_time_step(steps, *strength),
+            Some((_, strength)) => {
+                if req.low_res_start.is_some() {
+                    gen_core::resolve_img2img_init_time_step(steps, *strength)?
+                } else {
+                    init_time_step(steps, *strength)
+                }
+            }
             None => 0,
+        };
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
         };
 
         let clean = if start_step > 0 {
@@ -1265,7 +1326,7 @@ impl Pipeline {
             on_progress(Progress::Loading(LoadPhase::Renderer));
             let encoder = self.load_vae_encoder()?;
             let encoded = match reference {
-                Some((image, _)) => self.encode_reference(&encoder, image, req.width, req.height),
+                Some((image, _)) => self.encode_reference(&encoder, image, init_w, init_h),
                 None => unreachable!("start_step > 0 implies a reference"),
             };
             let sync = self.device.synchronize();
@@ -1282,7 +1343,12 @@ impl Pipeline {
             &self.device,
             on_progress,
             || self.load_text_phase(),
-            |text| self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
+            |text| match run {
+                Some(run) => run.encode(|| {
+                    self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt)
+                }),
+                None => self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt),
+            },
             // sc-9032: accelerated attention is not currently wired; match the resident path's
             // effective false value exactly.
             || {
@@ -1295,6 +1361,7 @@ impl Pipeline {
             |transformer, cap, on_progress| {
                 self.denoise_sequential(
                     req,
+                    run,
                     transformer,
                     &cap,
                     clean.as_ref(),
@@ -1311,30 +1378,40 @@ impl Pipeline {
                 }
             },
             |vae, (latents, actual_steps), on_progress| {
-                let images = latents
-                    .iter()
-                    .enumerate()
-                    .map(|(output_index, latent)| {
-                        candle_gen::execution::output_index(output_index);
-                        candle_gen::check_cancel(&req.cancel)?;
-                        on_progress(Progress::Decoding);
-                        if memory.tile_vae_decode {
-                            self.decode_cpu(
-                                vae,
-                                latent,
-                                &req.cancel,
-                                memory
-                                    .decode_tile_edge
-                                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
-                                memory
-                                    .decode_overlap
-                                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
-                            )
-                        } else {
-                            self.decode(vae, None, latent)
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut decode_all = || -> Result<Vec<Image>> {
+                    latents
+                        .iter()
+                        .enumerate()
+                        .map(|(output_index, latent)| {
+                            candle_gen::execution::output_index(output_index);
+                            candle_gen::check_cancel(&req.cancel)?;
+                            on_progress(Progress::Decoding);
+                            if memory.tile_vae_decode {
+                                self.decode_cpu(
+                                    vae,
+                                    latent,
+                                    &req.cancel,
+                                    memory
+                                        .decode_tile_edge
+                                        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                                    memory
+                                        .decode_overlap
+                                        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                                )
+                            } else {
+                                self.decode(vae, None, latent)
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()
+                };
+                let images = match run {
+                    Some(run) => {
+                        let imgs = run.decode_phase(decode_all)?;
+                        run.finish_rendering();
+                        imgs
+                    }
+                    None => decode_all()?,
+                };
                 Ok((images, actual_steps))
             },
         )
@@ -1346,6 +1423,7 @@ impl Pipeline {
     pub(crate) fn render_base_sequential(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(Vec<Image>, u32)> {
@@ -1354,8 +1432,18 @@ impl Pipeline {
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
-            Some((_, strength)) => init_time_step(steps, *strength),
+            Some((_, strength)) => {
+                if req.low_res_start.is_some() {
+                    gen_core::resolve_img2img_init_time_step(steps, *strength)?
+                } else {
+                    init_time_step(steps, *strength)
+                }
+            }
             None => 0,
+        };
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
         };
 
         let clean = if start_step > 0 {
@@ -1363,7 +1451,7 @@ impl Pipeline {
             on_progress(Progress::Loading(LoadPhase::Renderer));
             let encoder = self.load_vae_encoder()?;
             let encoded = match reference {
-                Some((image, _)) => self.encode_reference(&encoder, image, req.width, req.height),
+                Some((image, _)) => self.encode_reference(&encoder, image, init_w, init_h),
                 None => unreachable!("start_step > 0 implies a reference"),
             };
             let sync = self.device.synchronize();
@@ -1381,22 +1469,29 @@ impl Pipeline {
             on_progress,
             || self.load_text_phase(),
             |text| {
-                let cap = self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt)?;
-                let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
-                candle_gen::execution::policy(
-                    "z-image/pipeline/guidance",
-                    format!("{guidance:?}").into(),
-                );
-                let neg_cap = if guidance != 1.0 {
-                    Some(self.uncond_embeddings(
-                        &text.text_encoder,
-                        &text.tokenizer,
-                        req.negative_prompt.as_deref().unwrap_or(""),
-                    )?)
-                } else {
-                    None
+                let encode_both = || -> Result<(Tensor, Option<Tensor>)> {
+                    let cap =
+                        self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt)?;
+                    let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+                    candle_gen::execution::policy(
+                        "z-image/pipeline/guidance",
+                        format!("{guidance:?}").into(),
+                    );
+                    let neg_cap = if guidance != 1.0 {
+                        Some(self.uncond_embeddings(
+                            &text.text_encoder,
+                            &text.tokenizer,
+                            req.negative_prompt.as_deref().unwrap_or(""),
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((cap, neg_cap))
                 };
-                Ok((cap, neg_cap))
+                match run {
+                    Some(run) => run.encode(encode_both),
+                    None => encode_both(),
+                }
             },
             || {
                 self.load_transformer_cancelable(
@@ -1408,6 +1503,7 @@ impl Pipeline {
             |transformer, (cap, neg_cap), on_progress| {
                 self.denoise_base_sequential(
                     req,
+                    run,
                     transformer,
                     &cap,
                     neg_cap.as_ref(),
@@ -1425,30 +1521,40 @@ impl Pipeline {
                 }
             },
             |vae, (latents, actual_steps), on_progress| {
-                let images = latents
-                    .iter()
-                    .enumerate()
-                    .map(|(output_index, latent)| {
-                        candle_gen::execution::output_index(output_index);
-                        candle_gen::check_cancel(&req.cancel)?;
-                        on_progress(Progress::Decoding);
-                        if memory.tile_vae_decode {
-                            self.decode_cpu(
-                                vae,
-                                latent,
-                                &req.cancel,
-                                memory
-                                    .decode_tile_edge
-                                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
-                                memory
-                                    .decode_overlap
-                                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
-                            )
-                        } else {
-                            self.decode(vae, None, latent)
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut decode_all = || -> Result<Vec<Image>> {
+                    latents
+                        .iter()
+                        .enumerate()
+                        .map(|(output_index, latent)| {
+                            candle_gen::execution::output_index(output_index);
+                            candle_gen::check_cancel(&req.cancel)?;
+                            on_progress(Progress::Decoding);
+                            if memory.tile_vae_decode {
+                                self.decode_cpu(
+                                    vae,
+                                    latent,
+                                    &req.cancel,
+                                    memory
+                                        .decode_tile_edge
+                                        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                                    memory
+                                        .decode_overlap
+                                        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                                )
+                            } else {
+                                self.decode(vae, None, latent)
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()
+                };
+                let images = match run {
+                    Some(run) => {
+                        let imgs = run.decode_phase(decode_all)?;
+                        run.finish_rendering();
+                        imgs
+                    }
+                    None => decode_all()?,
+                };
                 Ok((images, actual_steps))
             },
         )
@@ -1460,6 +1566,7 @@ impl Pipeline {
     fn denoise_sequential(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         transformer: &DiT,
         cap: &Tensor,
         clean: Option<&Tensor>,
@@ -1467,6 +1574,9 @@ impl Pipeline {
         pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(Vec<Tensor>, u32)> {
+        if let Some(run) = run {
+            run.begin_rendering()?;
+        }
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
@@ -1488,40 +1598,45 @@ impl Pipeline {
         );
         common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let lat_h = (req.height / SPATIAL_SCALE) as usize;
-        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let base_seed = match run {
+            Some(run) => run.plan().base_seed(),
+            None => req.seed.unwrap_or_else(gen_core::default_seed),
+        };
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
+        let lat_h = (init_h / SPATIAL_SCALE) as usize;
+        let lat_w = (init_w / SPATIAL_SCALE) as usize;
         let mut actual_steps = 0u32;
 
-        let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count as usize {
+            let seed = base_seed.wrapping_add(index as u64);
+            if run.is_none() {
+                candle_gen::execution::output_index(index);
+                candle_gen::execution::draw("image_initial_noise", seed, index);
+            }
             candle_gen::check_cancel(&req.cancel)?;
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+                run.begin_denoise_phase(0)?;
+            }
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
-            let image_seq_len =
-                ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
-            let mu = calculate_shift(
-                image_seq_len,
-                BASE_IMAGE_SEQ_LEN,
-                MAX_IMAGE_SEQ_LEN,
-                BASE_SHIFT,
-                MAX_SHIFT,
-            );
-            let mut scheduler =
-                FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
-            scheduler.set_timesteps(steps, Some(mu));
-            let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
-            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                0.0,
-                steps,
-                &native,
-            )?;
-            let start = start_step.min(sigmas.len().saturating_sub(1));
-            let run_sigmas = &sigmas[start..];
+            let owned_sigmas;
+            let (run_sigmas, spans): (&[f32], Vec<std::ops::Range<usize>>) = match run {
+                Some(run) => (run.plan().denoise_sigmas(), run.plan().denoise_spans()),
+                None => {
+                    owned_sigmas = resolve_turbo_sigmas(req, steps)?;
+                    let start = start_step.min(owned_sigmas.len().saturating_sub(1));
+                    let s = &owned_sigmas[start..];
+                    (s, std::iter::once(0..s.len().saturating_sub(1)).collect())
+                }
+            };
             actual_steps = run_sigmas.len().saturating_sub(1) as u32;
             let x_t = match clean {
                 Some(clean) => {
-                    let sigma_start = sigmas[start] as f64;
+                    let sigma_start = run_sigmas[0] as f64;
                     (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
                 }
                 None => noise,
@@ -1529,36 +1644,63 @@ impl Pipeline {
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
-            let dit_prepared = transformer.prepare_conditioning(
+            let mut cached_dims = prepared.latents.dims().to_vec();
+            let mut dit_prepared = transformer.prepare_conditioning(
                 &prepared.latents,
                 &cap_feats,
                 &cap_mask,
                 request_attention_plan(req, attention_budget),
             )?;
-            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
-            // driver call and must start a fresh trajectory at frame 1. The driver owns the counter.
-            let preview = crate::preview::hook(&req.preview);
+            let preview = match run {
+                Some(run) => crate::preview::hook_for_plan(&req.preview, run.plan()),
+                None => crate::preview::hook(&req.preview),
+            };
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
+            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
             let mut eval_idx = 0usize;
-            candle_gen::run_flow_sampler(
+            let out = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
                 run_sigmas,
+                &spans,
+                run,
+                run.is_some(),
                 prepared.latents,
                 seed,
                 &req.cancel,
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    if latents.dims() != cached_dims.as_slice() {
+                        dit_prepared = transformer.prepare_conditioning(
+                            latents,
+                            &cap_feats,
+                            &cap_mask,
+                            request_attention_plan(req, attention_budget),
+                        )?;
+                        cached_dims = latents.dims().to_vec();
+                    }
                     let current_eval = eval_idx;
                     eval_idx += 1;
-                    let step_idx = gen_core::sampling::step_index_for_eval(
-                        canonical_solver,
-                        current_eval,
-                        total_steps,
-                    );
+                    let step_idx = if has_low_res_start && total_steps > 0 {
+                        let sigma = 1.0 - t;
+                        run_sigmas[..total_steps]
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)
+                    } else {
+                        gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        )
+                    };
                     predict_cfg_and_pag(
                         &self.device,
                         transformer,
@@ -1578,8 +1720,12 @@ impl Pipeline {
                         transformer_window,
                     )
                 },
-            )
-        })?;
+            )?;
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()?;
+            }
+            latents.push(out);
+        }
         Ok((latents, actual_steps))
     }
 
@@ -1587,6 +1733,7 @@ impl Pipeline {
     fn denoise_base_sequential(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         transformer: &DiT,
         cap: &Tensor,
         neg_cap: Option<&Tensor>,
@@ -1595,6 +1742,9 @@ impl Pipeline {
         pag: Option<&gen_core::PagResolved>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(Vec<Tensor>, u32)> {
+        if let Some(run) = run {
+            run.begin_rendering()?;
+        }
         let memory = req.memory.unwrap_or_default();
         candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
@@ -1616,32 +1766,47 @@ impl Pipeline {
         );
         common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = match run {
+            Some(run) => run.plan().base_seed(),
+            None => req.seed.unwrap_or_else(gen_core::default_seed),
+        };
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
         candle_gen::execution::policy("z-image/pipeline/guidance", format!("{guidance:?}").into());
-        let lat_h = (req.height / SPATIAL_SCALE) as usize;
-        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
+        let lat_h = (init_h / SPATIAL_SCALE) as usize;
+        let lat_w = (init_w / SPATIAL_SCALE) as usize;
         let mut actual_steps = 0u32;
 
-        let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count as usize {
+            let seed = base_seed.wrapping_add(index as u64);
+            if run.is_none() {
+                candle_gen::execution::output_index(index);
+                candle_gen::execution::draw("image_initial_noise", seed, index);
+            }
             candle_gen::check_cancel(&req.cancel)?;
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+                run.begin_denoise_phase(0)?;
+            }
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
-            let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
-            scheduler.set_timesteps(steps, None);
-            let native: Vec<f32> = scheduler.sigmas.iter().map(|&sigma| sigma as f32).collect();
-            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                (BASE_SCHEDULE_SHIFT as f32).ln(),
-                steps,
-                &native,
-            )?;
-            let start = start_step.min(sigmas.len().saturating_sub(1));
-            let run_sigmas = &sigmas[start..];
+            let owned_sigmas;
+            let (run_sigmas, spans): (&[f32], Vec<std::ops::Range<usize>>) = match run {
+                Some(run) => (run.plan().denoise_sigmas(), run.plan().denoise_spans()),
+                None => {
+                    owned_sigmas = resolve_base_sigmas(req, steps)?;
+                    let start = start_step.min(owned_sigmas.len().saturating_sub(1));
+                    let s = &owned_sigmas[start..];
+                    (s, std::iter::once(0..s.len().saturating_sub(1)).collect())
+                }
+            };
             actual_steps = run_sigmas.len().saturating_sub(1) as u32;
             let x_t = match clean {
                 Some(clean) => {
-                    let sigma_start = sigmas[start] as f64;
+                    let sigma_start = run_sigmas[0] as f64;
                     (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
                 }
                 None => noise,
@@ -1656,13 +1821,14 @@ impl Pipeline {
                 }
                 None => None,
             };
-            let dit_prepared = transformer.prepare_conditioning(
+            let mut cached_dims = prepared.latents.dims().to_vec();
+            let mut dit_prepared = transformer.prepare_conditioning(
                 &prepared.latents,
                 &cap_feats,
                 &cap_mask,
                 request_attention_plan(req, attention_budget),
             )?;
-            let uncond_prepared = match uncond.as_ref() {
+            let mut uncond_prepared = match uncond.as_ref() {
                 Some((neg_feats, neg_mask)) => Some(transformer.prepare_conditioning(
                     &prepared.latents,
                     neg_feats,
@@ -1672,31 +1838,64 @@ impl Pipeline {
                 None => None,
             };
 
-            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
-            // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
-            // the predict closure below, so the hook only ever sees the conditional trajectory.
-            let preview = crate::preview::hook(&req.preview);
+            let preview = match run {
+                Some(run) => crate::preview::hook_for_plan(&req.preview, run.plan()),
+                None => crate::preview::hook(&req.preview),
+            };
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
+            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
             let mut eval_idx = 0usize;
-            candle_gen::run_flow_sampler(
+            let out = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
                 run_sigmas,
+                &spans,
+                run,
+                run.is_some(),
                 prepared.latents,
                 seed,
                 &req.cancel,
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    if latents.dims() != cached_dims.as_slice() {
+                        dit_prepared = transformer.prepare_conditioning(
+                            latents,
+                            &cap_feats,
+                            &cap_mask,
+                            request_attention_plan(req, attention_budget),
+                        )?;
+                        if let Some((neg_feats, neg_mask)) = uncond.as_ref() {
+                            uncond_prepared = Some(transformer.prepare_conditioning(
+                                latents,
+                                neg_feats,
+                                neg_mask,
+                                request_attention_plan(req, attention_budget),
+                            )?);
+                        }
+                        cached_dims = latents.dims().to_vec();
+                    }
                     let current_eval = eval_idx;
                     eval_idx += 1;
-                    let step_idx = gen_core::sampling::step_index_for_eval(
-                        canonical_solver,
-                        current_eval,
-                        total_steps,
-                    );
+                    let step_idx = if has_low_res_start && total_steps > 0 {
+                        let sigma = 1.0 - t;
+                        run_sigmas[..total_steps]
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)
+                    } else {
+                        gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        )
+                    };
                     predict_cfg_and_pag(
                         &self.device,
                         transformer,
@@ -1716,23 +1915,22 @@ impl Pipeline {
                         transformer_window,
                     )
                 },
-            )
-        })?;
+            )?;
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()?;
+            }
+            latents.push(out);
+        }
         Ok((latents, actual_steps))
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
     /// `req.cancel`. Returns one `gen_core::Image` per `req.count` (each with seed `base_seed + index`).
-    ///
-    /// **img2img / `Reference` (sc-11783).** When `clean` is `Some` (the caller VAE-encoded a reference
-    /// image via [`encode_reference`](Self::encode_reference)) and `start_step > 0`, each image blends the
-    /// pre-encoded clean latent with the seeded noise at `σ_start` (`x_t = (1 − σ)·clean + σ·noise`) and
-    /// denoises the **reduced** `start_step..` tail of the σ schedule — the CFG-free Turbo sibling of
-    /// [`render_base`](Self::render_base)'s img2img (sc-8646). `start_step == 0` (`clean` is `None`) is
-    /// pure txt2img: `x_t = noise`, full schedule — byte-identical to the pre-sc-11783 path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         components: &Components,
         clean: Option<&Tensor>,
         start_step: usize,
@@ -1760,17 +1958,28 @@ impl Pipeline {
         );
         common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let lat_h = (req.height / SPATIAL_SCALE) as usize;
-        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let base_seed = match run {
+            Some(run) => run.plan().base_seed(),
+            None => req.seed.unwrap_or_else(gen_core::default_seed),
+        };
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
+        let lat_h = (init_h / SPATIAL_SCALE) as usize;
+        let lat_w = (init_w / SPATIAL_SCALE) as usize;
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch.
-        let cap = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-            self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)
-        })?;
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native VAE decode. Shared across `count` images (same prompt).
+        let cap = match run {
+            Some(run) => run.encode(|| {
+                candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                    self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)
+                })
+            })?,
+            None => candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)
+            })?,
+        };
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(
             components.pid.as_deref(),
             req,
@@ -1779,103 +1988,102 @@ impl Pipeline {
         )?;
         let mut actual_steps = 0u32;
 
-        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        if let Some(run) = run {
+            run.begin_rendering()?;
+        }
+        let mut images = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count as usize {
+            let seed = base_seed.wrapping_add(index as u64);
+            if run.is_none() {
+                candle_gen::execution::output_index(index);
+                candle_gen::execution::draw("image_initial_noise", seed, index);
+            }
             candle_gen::check_cancel(&req.cancel)?;
-            // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+                run.begin_denoise_phase(0)?;
+            }
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
-
-            // Flow-match Euler schedule. Match the candle `z_image` reference: pass `Some(mu)` (the
-            // resolution-dependent shift parameter from `calculate_shift`). Under
-            // `use_dynamic_shifting=false` (the `z_image_turbo` config) the `Some(mu)` arm applies NO
-            // sigma shift, so the sigmas stay LINEAR and consistent with `current_timestep_normalized`
-            // (which is derived from the un-shifted `timesteps`). This is correctness-critical, NOT a
-            // style knob: passing `None` takes the scheduler's static-shift branch, which shifts
-            // `sigmas` WITHOUT updating `timesteps` — desyncing the t fed to the DiT from the σ used in
-            // the Euler step, which leaves residual high-frequency noise (visible speckle) in the
-            // decode. The unit-normal noise is the flow-match txt2img prior as-is (max σ = 1.0).
-            let image_seq_len =
-                ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
-            let mu = calculate_shift(
-                image_seq_len,
-                BASE_IMAGE_SEQ_LEN,
-                MAX_IMAGE_SEQ_LEN,
-                BASE_SHIFT,
-                MAX_SHIFT,
-            );
-            let mut scheduler =
-                FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
-            scheduler.set_timesteps(steps, Some(mu));
-
-            // Unified curated sampler/scheduler routing (epic 7114 P4, sc-7123). The NATIVE schedule is
-            // the scheduler's σ table verbatim (linear / un-shifted for the turbo config — see the
-            // comment above), so `resolve_flow_schedule(None, …)` returns it byte-for-byte and the
-            // default `euler` is the N1 no-op = the legacy `scheduler.step` loop
-            // `x + v·(σ_{i+1} − σ_i)`. The schedule is unshifted (`mu = 0.0` for the curated axis).
-            // Z-Image feeds the DiT the 1−σ conditioning (`OneMinusSigma`) and the predicted velocity
-            // is NEGATED before the step — both Z-Image-specific quirks live inside the `predict`
-            // closure, so a multi-eval solver re-applies them each eval.
-            let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
-            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                0.0,
-                steps,
-                &native,
-            )?;
-
-            // img2img / `Reference` (sc-11783): blend the pre-encoded clean latent with the seeded noise
-            // at `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is
-            // clamped to the schedule because a curated scheduler may return a length ≠ `steps + 1`. For
-            // txt2img (`clean` is `None`, `start_step == 0`) this is `x_t = noise` over the full schedule —
-            // byte-identical to the pre-sc-11783 path. The CFG-free Turbo mirror of `render_base`'s img2img.
-            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let owned_sigmas;
+            let (run_sigmas, spans): (&[f32], Vec<std::ops::Range<usize>>) = match run {
+                Some(run) => (run.plan().denoise_sigmas(), run.plan().denoise_spans()),
+                None => {
+                    owned_sigmas = resolve_turbo_sigmas(req, steps)?;
+                    let start = start_step.min(owned_sigmas.len().saturating_sub(1));
+                    let s = &owned_sigmas[start..];
+                    (s, std::iter::once(0..s.len().saturating_sub(1)).collect())
+                }
+            };
+            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
             let x_t = match clean {
                 Some(clean) => {
-                    let sigma_start = sigmas[start] as f64;
+                    let sigma_start = run_sigmas[0] as f64;
                     (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
                 }
                 None => noise,
             };
-            let run_sigmas = &sigmas[start..];
-            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
 
-            // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) and adds the
-            // singleton frame axis to the latents → (1, 16, 1, lat_h, lat_w).
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
-            let dit_prepared = components.transformer.prepare_conditioning(
+            let mut cached_dims = prepared.latents.dims().to_vec();
+            let mut dit_prepared = components.transformer.prepare_conditioning(
                 &prepared.latents,
                 &cap_feats,
                 &cap_mask,
                 request_attention_plan(req, attention_budget),
             )?;
 
-            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
-            // driver call and must start a fresh trajectory at frame 1. The driver owns the counter,
-            // so this route's numbering can only ever key off the schedule it is integrating.
-            let preview = crate::preview::hook(&req.preview);
+            let preview = match run {
+                Some(run) => crate::preview::hook_for_plan(&req.preview, run.plan()),
+                None => crate::preview::hook(&req.preview),
+            };
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
+            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
             let mut eval_idx = 0usize;
-            let latents = candle_gen::run_flow_sampler(
+            let latents = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
                 run_sigmas,
+                &spans,
+                run,
+                run.is_some(),
                 prepared.latents,
                 seed,
                 &req.cancel,
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    if latents.dims() != cached_dims.as_slice() {
+                        dit_prepared = components.transformer.prepare_conditioning(
+                            latents,
+                            &cap_feats,
+                            &cap_mask,
+                            request_attention_plan(req, attention_budget),
+                        )?;
+                        cached_dims = latents.dims().to_vec();
+                    }
                     let current_eval = eval_idx;
                     eval_idx += 1;
-                    let step_idx = gen_core::sampling::step_index_for_eval(
-                        canonical_solver,
-                        current_eval,
-                        total_steps,
-                    );
+                    let step_idx = if has_low_res_start && total_steps > 0 {
+                        let sigma = 1.0 - t;
+                        run_sigmas[..total_steps]
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)
+                    } else {
+                        gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        )
+                    };
                     predict_cfg_and_pag(
                         &self.device,
                         &components.transformer,
@@ -1896,43 +2104,33 @@ impl Pipeline {
                     )
                 },
             )?;
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()?;
+            }
 
             on_progress(Progress::Decoding);
-            self.decode(&components.vae, pid_decoder.as_ref(), &latents)
-        })?;
+            let img = match run {
+                Some(run) => run.decode_phase(|| {
+                    self.decode(&components.vae, pid_decoder.as_ref(), &latents)
+                })?,
+                None => self.decode(&components.vae, pid_decoder.as_ref(), &latents)?,
+            };
+            images.push(img);
+        }
+        if let Some(run) = run {
+            run.finish_rendering();
+        }
         Ok((images, actual_steps))
     }
 
     /// Render `req` against pre-loaded `components` on the **base** (non-Turbo) path: real
     /// classifier-free guidance over the static **shift=6.0** flow-match schedule (sc-8414, the candle
     /// sibling of `mlx-gen-z-image::model_base`). Emits per-step progress and honors `req.cancel`.
-    ///
-    /// Differences from [`render`](Self::render) (the Turbo path), all from the base model card /
-    /// `scheduler/scheduler_config.json`:
-    ///
-    /// - **Static shift = 6.0** (Turbo's effective inference schedule is linear/un-shifted because its
-    ///   `set_timesteps(steps, Some(mu))` call no-ops under `use_dynamic_shifting=false`). The base
-    ///   builds its σ table with `set_timesteps(steps, None)` against a `shift=6.0` config, so the
-    ///   static-shift branch actually fires. We feed that σ table to [`run_flow_sampler`] with
-    ///   [`TimestepConvention::OneMinusSigma`], which derives the DiT timestep `t = 1−σ` from the σ
-    ///   schedule **itself** — so the Turbo `None`-path "timesteps desync" speckle bug is structurally
-    ///   absent here (we never read the scheduler's `timesteps`/`current_timestep_normalized`).
-    /// - **Real CFG**: each step runs the DiT twice (cond + uncond) and combines
-    ///   `v = v_uncond + guidance·(v_cond − v_uncond)`. `guidance == 1.0` collapses to a single cond
-    ///   forward (Turbo-equivalent cost). The uncond branch encodes the negative prompt (empty string
-    ///   when unset — the unconditional embedding).
-    /// - **Default 50 steps** when `req.steps` is unset ([`BASE_DEFAULT_STEPS`]).
-    ///
-    /// **img2img / `Reference` (sc-8646).** When `clean` is `Some` (the caller VAE-encoded a reference
-    /// image via [`encode_reference`](Self::encode_reference)) and `start_step > 0`, each image blends
-    /// the pre-encoded clean latent with the seeded noise at `σ_start` (the flow-match interpolation
-    /// `x_t = (1 − σ)·clean + σ·noise`) and denoises the **reduced** `start_step..` tail of the σ
-    /// schedule — real CFG applies to the img2img tail exactly as to txt2img. `start_step == 0` (`clean`
-    /// is `None`) is pure txt2img: `x_t = noise`, full schedule — byte-identical to the pre-sc-8646 path.
-    /// Mirrors `mlx-gen-z-image::model_base` + `pipeline::render_batch`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_base(
         &self,
         req: &GenerationRequest,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         components: &Components,
         clean: Option<&Tensor>,
         start_step: usize,
@@ -1960,42 +2158,48 @@ impl Pipeline {
         );
         common::observe_pag_policy(pag);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let lat_h = (req.height / SPATIAL_SCALE) as usize;
-        let lat_w = (req.width / SPATIAL_SCALE) as usize;
+        let base_seed = match run {
+            Some(run) => run.plan().base_seed(),
+            None => req.seed.unwrap_or_else(gen_core::default_seed),
+        };
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (req.width, req.height),
+        };
+        let lat_h = (init_h / SPATIAL_SCALE) as usize;
+        let lat_w = (init_w / SPATIAL_SCALE) as usize;
 
-        // Real CFG: `req.guidance` is the classifier-free guidance scale (default 4.0). A value of 1.0
-        // turns CFG off (single cond forward, Turbo-equivalent cost).
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
         candle_gen::execution::policy("z-image/pipeline/guidance", format!("{guidance:?}").into());
         let cfg_on = guidance != 1.0;
 
-        // Text embeddings are seed- and image-independent: encode once for the whole batch. The uncond
-        // branch (negative prompt, empty when unset) is only encoded when CFG is active.
-        let (cap, neg_cap) = candle_gen::gen_core::with_prompt_encoding(
-            on_progress,
-            || -> std::result::Result<_, candle_gen::CandleError> {
-                let cap = self.text_embeddings(
-                    &components.text_encoder,
-                    &components.tokenizer,
-                    &req.prompt,
-                )?;
-                let neg_cap = if cfg_on {
-                    let neg = req.negative_prompt.as_deref().unwrap_or("");
-                    Some(self.uncond_embeddings(
+        let mut encode_both = || -> Result<(Tensor, Option<Tensor>)> {
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let cap = self.text_embeddings(
                         &components.text_encoder,
                         &components.tokenizer,
-                        neg,
-                    )?)
-                } else {
-                    None
-                };
-                Ok((cap, neg_cap))
-            },
-        )?;
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native VAE decode. Shared across `count` images (same prompt).
+                        &req.prompt,
+                    )?;
+                    let neg_cap = if cfg_on {
+                        let neg = req.negative_prompt.as_deref().unwrap_or("");
+                        Some(self.uncond_embeddings(
+                            &components.text_encoder,
+                            &components.tokenizer,
+                            neg,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((cap, neg_cap))
+                },
+            )
+        };
+        let (cap, neg_cap) = match run {
+            Some(run) => run.encode(encode_both)?,
+            None => encode_both()?,
+        };
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(
             components.pid.as_deref(),
             req,
@@ -2004,51 +2208,41 @@ impl Pipeline {
         )?;
         let mut actual_steps = 0u32;
 
-        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        if let Some(run) = run {
+            run.begin_rendering()?;
+        }
+        let mut images = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count as usize {
+            let seed = base_seed.wrapping_add(index as u64);
+            if run.is_none() {
+                candle_gen::execution::output_index(index);
+                candle_gen::execution::draw("image_initial_noise", seed, index);
+            }
             candle_gen::check_cancel(&req.cancel)?;
-            // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+                run.begin_denoise_phase(0)?;
+            }
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
-
-            // Static shift=6.0 schedule (the base model's scheduler_config.json). Unlike the Turbo
-            // path's `Some(mu)` no-op, the base passes `None` so the static-shift branch actually
-            // shifts the σ table; `run_flow_sampler`'s `OneMinusSigma` derives the DiT timestep from
-            // these σ directly, so there is no timesteps desync to guard against.
-            let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
-            scheduler.set_timesteps(steps, None);
-            let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
-
-            // Curated scheduler axis (epic 7114): an unset `req.scheduler` returns `native` verbatim
-            // (the byte-exact shift=6.0 default); a curated name re-shapes σ over the same shift
-            // (`mu = ln(shift)`), exactly as `mlx-gen-z-image::model_base`.
-            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-                req.scheduler.as_deref(),
-                req.scheduler_shift,
-                (BASE_SCHEDULE_SHIFT as f32).ln(),
-                steps,
-                &native,
-            )?;
-
-            // img2img / `Reference` (sc-8646): blend the pre-encoded clean latent with the seeded noise
-            // at `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is
-            // clamped to the schedule because a curated scheduler may return a length ≠ `steps + 1`.
-            // For txt2img (`clean` is `None`, `start_step == 0`) this is `x_t = noise` over the full
-            // schedule — byte-identical to the pre-sc-8646 path. Mirrors `render_batch`'s
-            // `add_noise_by_interpolation` (`x_t = (1 − σ)·clean + σ·noise`).
-            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let owned_sigmas;
+            let (run_sigmas, spans): (&[f32], Vec<std::ops::Range<usize>>) = match run {
+                Some(run) => (run.plan().denoise_sigmas(), run.plan().denoise_spans()),
+                None => {
+                    owned_sigmas = resolve_base_sigmas(req, steps)?;
+                    let start = start_step.min(owned_sigmas.len().saturating_sub(1));
+                    let s = &owned_sigmas[start..];
+                    (s, std::iter::once(0..s.len().saturating_sub(1)).collect())
+                }
+            };
+            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
             let x_t = match clean {
                 Some(clean) => {
-                    let sigma_start = sigmas[start] as f64;
+                    let sigma_start = run_sigmas[0] as f64;
                     (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
                 }
                 None => noise,
             };
-            let run_sigmas = &sigmas[start..];
-            actual_steps = run_sigmas.len().saturating_sub(1) as u32;
 
-            // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) for both the cond and
-            // (when CFG is on) the uncond branch, and adds the singleton frame axis to the latents. The
-            // uncond branch only uses cap_feats/cap_mask (its `latents` are discarded), so passing `x_t`
-            // there is fine.
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
@@ -2059,13 +2253,14 @@ impl Pipeline {
                 }
                 None => None,
             };
-            let dit_prepared = components.transformer.prepare_conditioning(
+            let mut cached_dims = prepared.latents.dims().to_vec();
+            let mut dit_prepared = components.transformer.prepare_conditioning(
                 &prepared.latents,
                 &cap_feats,
                 &cap_mask,
                 request_attention_plan(req, attention_budget),
             )?;
-            let uncond_prepared = match uncond.as_ref() {
+            let mut uncond_prepared = match uncond.as_ref() {
                 Some((features, mask)) => Some(components.transformer.prepare_conditioning(
                     &prepared.latents,
                     features,
@@ -2075,31 +2270,64 @@ impl Pipeline {
                 None => None,
             };
 
-            // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
-            // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
-            // the predict closure below, so the hook only ever sees the conditional trajectory.
-            let preview = crate::preview::hook(&req.preview);
+            let preview = match run {
+                Some(run) => crate::preview::hook_for_plan(&req.preview, run.plan()),
+                None => crate::preview::hook(&req.preview),
+            };
             let canonical_solver =
                 gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
             let total_steps = run_sigmas.len().saturating_sub(1);
+            let has_low_res_start = run.is_some_and(|r| r.plan().low_res_start().is_some());
             let mut eval_idx = 0usize;
-            let latents = candle_gen::run_flow_sampler(
+            let latents = candle_gen::run_flow_sampler_spans(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
                 run_sigmas,
+                &spans,
+                run,
+                run.is_some(),
                 prepared.latents,
                 seed,
                 &req.cancel,
                 on_progress,
                 Some(&preview),
                 |latents, t| -> Result<Tensor> {
+                    if latents.dims() != cached_dims.as_slice() {
+                        dit_prepared = components.transformer.prepare_conditioning(
+                            latents,
+                            &cap_feats,
+                            &cap_mask,
+                            request_attention_plan(req, attention_budget),
+                        )?;
+                        if let Some((features, mask)) = uncond.as_ref() {
+                            uncond_prepared = Some(components.transformer.prepare_conditioning(
+                                latents,
+                                features,
+                                mask,
+                                request_attention_plan(req, attention_budget),
+                            )?);
+                        }
+                        cached_dims = latents.dims().to_vec();
+                    }
                     let current_eval = eval_idx;
                     eval_idx += 1;
-                    let step_idx = gen_core::sampling::step_index_for_eval(
-                        canonical_solver,
-                        current_eval,
-                        total_steps,
-                    );
+                    let step_idx = if has_low_res_start && total_steps > 0 {
+                        let sigma = 1.0 - t;
+                        run_sigmas[..total_steps]
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                ((*a - sigma).abs()).total_cmp(&((*b - sigma).abs()))
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)
+                    } else {
+                        gen_core::sampling::step_index_for_eval(
+                            canonical_solver,
+                            current_eval,
+                            total_steps,
+                        )
+                    };
                     predict_cfg_and_pag(
                         &self.device,
                         &components.transformer,
@@ -2120,10 +2348,22 @@ impl Pipeline {
                     )
                 },
             )?;
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()?;
+            }
 
             on_progress(Progress::Decoding);
-            self.decode(&components.vae, pid_decoder.as_ref(), &latents)
-        })?;
+            let img = match run {
+                Some(run) => run.decode_phase(|| {
+                    self.decode(&components.vae, pid_decoder.as_ref(), &latents)
+                })?,
+                None => self.decode(&components.vae, pid_decoder.as_ref(), &latents)?,
+            };
+            images.push(img);
+        }
+        if let Some(run) = run {
+            run.finish_rendering();
+        }
         Ok((images, actual_steps))
     }
 

@@ -106,7 +106,18 @@ impl Generator for ZImageBaseGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let plan = crate::compile_base_trajectory(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-z-image/src/base.rs",
@@ -179,6 +190,7 @@ impl Generator for ZImageBaseGenerator {
                 req.width, req.height
             )));
         }
+        crate::validate_low_res_start_for(&self.descriptor, req, true)?;
         Ok(())
     }
 
@@ -197,6 +209,18 @@ impl Generator for ZImageBaseGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = crate::compile_base_trajectory(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.validate(req)?;
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
@@ -235,12 +259,13 @@ impl Generator for ZImageBaseGenerator {
             drop(candle_gen::lock_recover(&self.components).take());
             drop(candle_gen::lock_recover(&self.vae_encoder).take());
             let (images, actual_steps) =
-                pipe.render_base_sequential(req, resolved_pag.as_ref(), on_progress)?;
+                pipe.render_base_sequential(req, Some(&run), resolved_pag.as_ref(), on_progress)?;
             let mut report =
                 gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
             report.pag = resolved_pag
                 .as_ref()
                 .map(|resolved| resolved.execution_report(actual_steps));
+            report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
             return Ok(report);
         }
         let components = self.components(&pipe)?;
@@ -253,19 +278,27 @@ impl Generator for ZImageBaseGenerator {
         let reference = pipeline::resolve_reference(req)?;
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let start_step = match &reference {
-            Some((_, strength)) => pipeline::init_time_step(steps, *strength),
+            Some((_, strength)) => {
+                if req.low_res_start.is_some() {
+                    gen_core::resolve_img2img_init_time_step(steps, *strength)?
+                } else {
+                    pipeline::init_time_step(steps, *strength)
+                }
+            }
             None => 0,
         };
+        let (init_w, init_h) = run.plan().phase_output_size(0);
         let clean = if start_step > 0 {
             let (image, _) = reference.expect("start_step > 0 implies a reference");
             let encoder = self.vae_encoder(&pipe)?;
-            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+            Some(pipe.encode_reference(&encoder, image, init_w, init_h)?)
         } else {
             None
         };
 
         let (images, actual_steps) = pipe.render_base(
             req,
+            Some(&run),
             &components,
             clean.as_ref(),
             start_step,
@@ -276,6 +309,7 @@ impl Generator for ZImageBaseGenerator {
         report.pag = resolved_pag
             .as_ref()
             .map(|resolved| resolved.execution_report(actual_steps));
+        report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
         Ok(report)
     }
 }
@@ -339,6 +373,7 @@ pub fn descriptor() -> ModelDescriptor {
             // CFG blend happens inside the predict closure, so the previewed latent is always the
             // single conditional trajectory. Reuses the epic-16624 Z-Image fit ([`crate::preview`]).
             supports_preview: true,
+            supports_low_res_start: true,
             pag: Some(base_pag_capability()),
             ..Default::default()
         },

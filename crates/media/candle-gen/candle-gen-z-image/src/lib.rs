@@ -118,6 +118,32 @@ pub fn register_providers(
     let registry = registry
         .register_generator(REGISTRATION)
         .register_generator(base::REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: MODEL_ID,
+            compile: compile_turbo,
+        })
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: base::MODEL_ID,
+            compile: compile_base,
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: "z_image_turbo_control",
+            parent_provider_id: Some(MODEL_ID),
+            descriptor: turbo_control_descriptor,
+            render_plan: Some(gen_core::RenderPlanRegistration {
+                provider_id: "z_image_turbo_control",
+                compile: compile_turbo_control,
+            }),
+        })
+        .register_feature_route(gen_core::FeatureRouteRegistration {
+            route_id: "z_image_control",
+            parent_provider_id: Some(base::MODEL_ID),
+            descriptor: base_control_descriptor,
+            render_plan: Some(gen_core::RenderPlanRegistration {
+                provider_id: "z_image_control",
+                compile: compile_base_control,
+            }),
+        })
         .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
             route_id: "z_image_turbo_control",
             provider_id: MODEL_ID,
@@ -431,7 +457,18 @@ impl Generator for ZImageGenerator {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture_with(self, req, on_progress, || {
+        let plan = compile_turbo_trajectory(req)?;
+        self.generate_planned_with_execution_report(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        plan: &candle_gen::gen_core::RenderPlan,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_planned_with(self, req, plan, scope, on_progress, || {
             candle_gen::execution::unobserved_adapters(
                 self.adapters.len(),
                 "candle-gen-z-image/src/lib.rs",
@@ -514,6 +551,7 @@ impl Generator for ZImageGenerator {
                 req.width, req.height
             )));
         }
+        validate_low_res_start_for(&self.descriptor, req, false)?;
         Ok(())
     }
 
@@ -534,6 +572,18 @@ impl Generator for ZImageGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
+        let plan = compile_turbo_trajectory(req)?;
+        self.generate_planned(req, &plan, None, on_progress)
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.validate(req)?;
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
@@ -596,12 +646,13 @@ impl Generator for ZImageGenerator {
                     drop(candle_gen::lock_recover(&self.components).take());
                     drop(candle_gen::lock_recover(&self.vae_encoder).take());
                     let (images, actual_steps) = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
-                        pipe.render_base_sequential(&experimental_cfg_request(req), resolved_pag.as_ref(), on_progress)?
+                        pipe.render_base_sequential(&experimental_cfg_request(req), Some(&run), resolved_pag.as_ref(), on_progress)?
                     } else {
-                        pipe.render_sequential(req, resolved_pag.as_ref(), on_progress)?
+                        pipe.render_sequential(req, Some(&run), resolved_pag.as_ref(), on_progress)?
                     };
                     let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
                     report.pag = resolved_pag.as_ref().map(|resolved| resolved.execution_report(actual_steps));
+                    report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
                     return Ok(report);
                 }
                 let components = self.components(&pipe)?;
@@ -613,33 +664,337 @@ impl Generator for ZImageGenerator {
                 // non-`Reference` conditioning. Mirrors the base generator + the shared
                 // `render_base` img2img (sc-8646).
                 let reference = pipeline::resolve_reference(req)?;
+                let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
                 let start_step = match &reference {
-                    Some((_, strength)) => pipeline::init_time_step(
-                        req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS),
-                        *strength,
-                    ),
+                    Some((_, strength)) => {
+                        if req.low_res_start.is_some() {
+                            gen_core::resolve_img2img_init_time_step(steps, *strength)?
+                        } else {
+                            pipeline::init_time_step(steps, *strength)
+                        }
+                    }
                     None => 0,
                 };
+                let (init_w, init_h) = run.plan().phase_output_size(0);
                 let clean = if start_step > 0 {
                     let (image, _) = reference.expect("start_step > 0 implies a reference");
                     let encoder = self.vae_encoder(&pipe)?;
-                    Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+                    Some(pipe.encode_reference(&encoder, image, init_w, init_h)?)
                 } else {
                     None
                 };
 
                 let (images, actual_steps) = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
                     let request = experimental_cfg_request(req);
-                    pipe.render_base(&request, &components, clean.as_ref(), start_step, resolved_pag.as_ref(), on_progress)?
+                    pipe.render_base(&request, Some(&run), &components, clean.as_ref(), start_step, resolved_pag.as_ref(), on_progress)?
                 } else {
-                    pipe.render(req, &components, clean.as_ref(), start_step, resolved_pag.as_ref(), on_progress)?
+                    pipe.render(req, Some(&run), &components, clean.as_ref(), start_step, resolved_pag.as_ref(), on_progress)?
                 };
                 let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
                 report.pag = resolved_pag.as_ref().map(|resolved| resolved.execution_report(actual_steps));
+                report.low_res_start = plan.low_res_start_execution_report("bf16", 2, "base_dit")?;
                 Ok(report)
             },
         )
     }
+}
+
+pub(crate) fn validate_low_res_start_for(
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+    is_base: bool,
+) -> gen_core::Result<()> {
+    let reference = pipeline::resolve_reference(req)?;
+    let default_steps = if is_base {
+        pipeline::BASE_DEFAULT_STEPS
+    } else {
+        DEFAULT_STEPS
+    };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
+    let start_step = match &reference {
+        Some((_, strength)) => {
+            if req.low_res_start.is_some() {
+                gen_core::resolve_img2img_init_time_step(steps, *strength)?
+            } else {
+                pipeline::init_time_step(steps, *strength)
+            }
+        }
+        None => 0,
+    };
+    let executed_steps = steps.saturating_sub(start_step).max(1);
+    if let Some(low_res) = req.low_res_start.as_ref() {
+        low_res.resolve_for_descriptor(descriptor, req, executed_steps, SIZE_MULTIPLE)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn compile_trajectory_for(
+    req: &GenerationRequest,
+    is_base: bool,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    let descriptor = if is_base {
+        base::descriptor()
+    } else {
+        descriptor()
+    };
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, req)?;
+    if !is_base
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|negative| !negative.is_empty())
+        && req.guidance.unwrap_or(0.0) == 0.0
+    {
+        return Err(gen_core::Error::Msg(
+            "z_image_turbo: a negative prompt requires CFG different from 0.0".into(),
+        ));
+    }
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: prompt must not be empty",
+            descriptor.id
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: steps must be >= 1 (an explicit 0 renders undenoised noise)",
+            descriptor.id
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            descriptor.id, req.width, req.height
+        )));
+    }
+    let reference = pipeline::resolve_reference(req)?;
+    let default_steps = if is_base {
+        pipeline::BASE_DEFAULT_STEPS
+    } else {
+        DEFAULT_STEPS
+    };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
+    let start_step = match &reference {
+        Some((_, strength)) => {
+            if req.low_res_start.is_some() {
+                gen_core::resolve_img2img_init_time_step(steps, *strength)?
+            } else {
+                pipeline::init_time_step(steps, *strength)
+            }
+        }
+        None => 0,
+    };
+    let (full_sigmas, guidance) = if is_base {
+        (
+            pipeline::resolve_base_sigmas(req, steps)?,
+            req.guidance.unwrap_or(4.0),
+        )
+    } else if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
+        let eff_req = experimental_cfg_request(req);
+        (
+            pipeline::resolve_base_sigmas(&eff_req, steps)?,
+            eff_req.guidance.unwrap_or(1.0),
+        )
+    } else {
+        (pipeline::resolve_turbo_sigmas(req, steps)?, 1.0)
+    };
+    let start = start_step.min(full_sigmas.len().saturating_sub(1));
+    let sigmas = full_sigmas[start..].to_vec();
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let sampler = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref()).name();
+    gen_core::RenderPlan::packed_image_trajectory(
+        &descriptor,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 16,
+            sampler,
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+pub(crate) fn compile_turbo_trajectory(
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    compile_trajectory_for(req, false)
+}
+
+pub fn compile_turbo(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image_turbo does not quantize a dense tier on the fly — point the weights dir at \
+             a pre-quantized packed tier (SceneWorks/z-image-turbo-mlx q4/q8), which loads directly"
+                .into(),
+        ));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image_turbo does not support control / IP-adapter overlays yet (txt2img only)"
+                .into(),
+        ));
+    }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image_turbo does not support identity weights".into(),
+        ));
+    }
+    compile_turbo_trajectory(req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+pub(crate) fn compile_base_trajectory(
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    compile_trajectory_for(req, true)
+}
+
+pub fn compile_base(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    gen_core::reject_unknown_components(spec, &[], base::MODEL_ID)?;
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image does not support on-the-fly Q4/Q8 quantization yet".into(),
+        ));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image does not support control / IP-adapter overlays yet (txt2img only)"
+                .into(),
+        ));
+    }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image does not support identity weights".into(),
+        ));
+    }
+    compile_base_trajectory(req)
+        .map(|plan| plan.bind_load(spec))
+        .map(Some)
+}
+
+const CONTROL_KINDS: &[gen_core::ControlKind] = &[
+    gen_core::ControlKind::Pose,
+    gen_core::ControlKind::Canny,
+    gen_core::ControlKind::Depth,
+];
+
+pub fn turbo_control_descriptor() -> ModelDescriptor {
+    let mut desc = descriptor();
+    desc.id = "z_image_turbo_control";
+    desc.control_kinds = Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
+    desc.capabilities.conditioning = vec![ConditioningKind::Control, ConditioningKind::Reference];
+    desc.capabilities.supports_low_res_start = false;
+    desc
+}
+
+pub fn base_control_descriptor() -> ModelDescriptor {
+    let mut desc = base::descriptor();
+    desc.id = "z_image_control";
+    desc.control_kinds = Some(gen_core::AcceptedControlKinds::Only(CONTROL_KINDS.to_vec()));
+    desc.capabilities.conditioning = vec![ConditioningKind::Control, ConditioningKind::Reference];
+    desc.capabilities.supports_low_res_start = false;
+    desc
+}
+
+fn compile_control_for(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    is_base: bool,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    let desc = if is_base {
+        base_control_descriptor()
+    } else {
+        turbo_control_descriptor()
+    };
+    if req.low_res_start.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: low_res_start conflicts with pass-0 control conditioning (VACE control latents are full-resolution bound)",
+            desc.id
+        )));
+    }
+    if spec.control.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: requires a VACE control weight source in LoadSpec::control",
+            desc.id
+        )));
+    }
+    desc.capabilities.validate_request(desc.id, req)?;
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: prompt must not be empty",
+            desc.id
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: steps must be >= 1",
+            desc.id
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            desc.id, req.width, req.height
+        )));
+    }
+    let default_steps = if is_base {
+        pipeline::BASE_DEFAULT_STEPS
+    } else {
+        DEFAULT_STEPS
+    };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
+    let sigmas = if is_base {
+        pipeline::resolve_base_sigmas(req, steps)?
+    } else {
+        pipeline::resolve_turbo_sigmas(req, steps)?
+    };
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let sampler = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref()).name();
+    let guidance = if is_base {
+        req.guidance.unwrap_or(4.0)
+    } else {
+        1.0
+    };
+    gen_core::RenderPlan::packed_image_trajectory(
+        &desc,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 16,
+            sampler,
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+    .map(|plan| plan.bind_load(spec))
+}
+
+pub fn compile_turbo_control(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_control_for(spec, req, false).map(Some)
+}
+
+pub fn compile_base_control(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    compile_control_for(spec, req, true).map(Some)
 }
 
 /// Perturbed-Attention Guidance (PAG) capability descriptor for Z-Image Turbo and Edit.
@@ -710,6 +1065,7 @@ pub fn descriptor() -> ModelDescriptor {
             // the name-driven control + edit providers' bespoke Euler loops emit directly. The
             // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
             supports_preview: true,
+            supports_low_res_start: true,
             pag: Some(turbo_pag_capability()),
             ..Default::default()
         },
@@ -1831,5 +2187,135 @@ mod explicit_registry_tests {
             registry.provider_encoder_contract("z_image_control_typo"),
             None
         );
+    }
+
+    #[test]
+    fn z_image_shared_driver_render_plans_and_low_res_start_conformance() {
+        use candle_gen::gen_core::sampling::{FlowModelSampling, TimestepConvention};
+        use candle_gen::gen_core::{
+            BoundaryState, Conditioning, ControlKind, EstimateSource, GenerationRequest, Image,
+            LoadSpec, LowResStartSpec, WeightsSource,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let all_features = registry.all_route_feature_applicability();
+        let plain_spec = LoadSpec::new(WeightsSource::Dir("/tmp/z-image".into()));
+        let req = GenerationRequest {
+            prompt: "a studio portrait".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            low_res_start: Some(LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        for id in ["z_image_turbo", "z_image"] {
+            assert!(
+                all_features[id]["low_res_start"].applicable,
+                "{id} must support low_res_start"
+            );
+            let plan = registry
+                .compile_render_plan(id, &plain_spec, &req)
+                .unwrap()
+                .expect("compiled plan");
+            assert_eq!(plan.denoise_spans(), vec![0..2, 2..8]);
+            assert_eq!(plan.phase_output_size(0), (512, 512));
+            assert_eq!(plan.phase_output_size(1), (1024, 1024));
+        }
+
+        let img2img_req = GenerationRequest {
+            prompt: "a studio portrait".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            low_res_start: Some(LowResStartSpec::new(1, Some(0.5))),
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan("z_image", &plain_spec, &img2img_req)
+            .unwrap()
+            .expect("compiled img2img plan");
+        assert_eq!(plan.executed_steps(), 4);
+        assert_eq!(plan.denoise_spans(), vec![0..1, 1..4]);
+        assert_eq!(plan.phase_output_size(0), (512, 512));
+
+        let low_res_plan = *plan.low_res_start().unwrap();
+        let sigma_k = plan.denoise_sigmas()[low_res_plan.k];
+        let ms = FlowModelSampling::new(TimestepConvention::OneMinusSigma);
+        let low_latent = vec![0.25f32; 16 * 64 * 64];
+        let transitioned = candle_gen::gen_core::transition_clean_estimate_f32(
+            BoundaryState::CleanEstimate {
+                latent: &low_latent,
+                source: EstimateSource::EndpointEvaluation,
+            },
+            1,
+            16,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            plan.base_seed(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(transitioned.len(), 16 * 128 * 128);
+        assert!(transitioned.iter().all(|v| v.is_finite()));
+
+        let control_spec = plain_spec
+            .clone()
+            .with_control(WeightsSource::Dir("/tmp/z-image-control".into()));
+        let control_req = GenerationRequest {
+            prompt: "a studio portrait".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            conditioning: vec![Conditioning::Control {
+                kind: ControlKind::Canny,
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![128; 64 * 64 * 3],
+                },
+                scale: Some(0.75),
+            }],
+            ..Default::default()
+        };
+        for control_id in ["z_image_turbo_control", "z_image_control"] {
+            let feature_route = registry
+                .feature_route_registrations()
+                .find(|r| r.route_id == control_id)
+                .expect("registered feature route");
+            let planner = feature_route
+                .render_plan
+                .as_ref()
+                .expect("control render plan");
+            let plan = (planner.compile)(&control_spec, &control_req)
+                .unwrap()
+                .expect("compiled control plan");
+            assert_eq!(plan.denoise_spans(), vec![0..8]);
+            let mut bad = control_req.clone();
+            bad.low_res_start = Some(LowResStartSpec::new(2, Some(0.5)));
+            let err = (planner.compile)(&control_spec, &bad).unwrap_err();
+            assert!(
+                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+                "expected typed refusal for {control_id}, got {err:?}"
+            );
+            let app = &all_features[control_id]["low_res_start"];
+            assert!(!app.applicable, "{control_id}");
+            assert!(
+                app.reasons.iter().any(|r| r.message.contains("control")),
+                "{control_id}: {:?}",
+                app.reasons
+            );
+        }
     }
 }

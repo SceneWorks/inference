@@ -16,13 +16,23 @@ pub(crate) fn defaults() -> FlowSamplingDefaults {
 }
 
 pub fn resolve_full(req: &GenerationRequest) -> Result<ResolvedFlowSampling> {
-    let steps = req.steps.unwrap_or(crate::model::DEFAULT_STEPS) as usize;
-    let native = FlowMatchEuler::for_static_shift(steps, crate::model::SCHEDULE_SHIFT);
+    resolve_full_with_shift(req, crate::model::SCHEDULE_SHIFT, crate::model::DEFAULT_STEPS)
+}
+
+pub(crate) fn resolve_full_with_shift(
+    req: &GenerationRequest,
+    shift: f32,
+    default_steps: u32,
+) -> Result<ResolvedFlowSampling> {
+    let steps = req.steps.unwrap_or(default_steps) as usize;
+    let native = FlowMatchEuler::for_static_shift(steps, shift);
+    let mut variant_defaults = defaults();
+    variant_defaults.steps = default_steps;
     ResolvedFlowSampling::resolve(
         req,
-        defaults(),
+        variant_defaults,
         &native.sigmas,
-        crate::model::SCHEDULE_SHIFT.ln(),
+        shift.ln(),
         TimestepConvention::OneMinusSigma,
     )
 }

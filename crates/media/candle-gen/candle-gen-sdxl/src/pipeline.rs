@@ -1087,6 +1087,7 @@ impl Pipeline {
     /// emitting per-step progress and honoring `req.cancel`. Returns one `gen_core::Image` per
     /// `req.count` (each with seed `base_seed + index`). The denoise+decode here is unchanged from
     /// sc-4987 — only the component *ownership* moved out to the generator so it can cache them.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &self,
         req: &GenerationRequest,
@@ -1094,6 +1095,7 @@ impl Pipeline {
         unet: &SdxlUnet,
         vae: &SdxlVaeDecoder,
         pid: Option<&PidEngine>,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
@@ -1103,18 +1105,26 @@ impl Pipeline {
             req,
             text_embeddings,
             unet,
+            run,
             on_progress,
             |latents, progress| {
-                progress(Progress::Decoding);
-                self.decode(
-                    vae,
-                    pid_decoder
-                        .as_ref()
-                        .map(|decoder| decoder as &dyn LatentDecoder),
-                    &latents,
-                    &req.cancel,
-                    crate::denoise::decode_tiling(req.memory),
-                )
+                let mut do_decode = || {
+                    progress(Progress::Decoding);
+                    self.decode(
+                        vae,
+                        pid_decoder
+                            .as_ref()
+                            .map(|decoder| decoder as &dyn LatentDecoder),
+                        &latents,
+                        &req.cancel,
+                        crate::denoise::decode_tiling(req.memory),
+                    )
+                };
+                if let Some(run) = run {
+                    run.decode_phase(&mut do_decode)
+                } else {
+                    do_decode()
+                }
             },
         )
     }
@@ -1124,6 +1134,7 @@ impl Pipeline {
         req: &GenerationRequest,
         text_embeddings: &Tensor,
         unet: &SdxlUnet,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
         if req.use_pid && self.pid_spec.is_none() {
@@ -1131,7 +1142,7 @@ impl Pipeline {
                 "sdxl: PiD requested but no PiD decoder loaded".into(),
             ));
         }
-        self.render_with(req, text_embeddings, unet, on_progress, |latents, _| {
+        self.render_with(req, text_embeddings, unet, run, on_progress, |latents, _| {
             Ok(latents)
         })
     }
@@ -1142,6 +1153,7 @@ impl Pipeline {
         latents: &[Tensor],
         vae: &SdxlVaeDecoder,
         pid: Option<&PidEngine>,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
@@ -1149,16 +1161,68 @@ impl Pipeline {
         latents
             .iter()
             .map(|latent| {
-                on_progress(Progress::Decoding);
-                self.decode(
-                    vae,
-                    decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-                    latent,
-                    &req.cancel,
-                    crate::denoise::decode_tiling(req.memory),
-                )
+                let mut do_decode = || {
+                    on_progress(Progress::Decoding);
+                    self.decode(
+                        vae,
+                        decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                        latent,
+                        &req.cancel,
+                        crate::denoise::decode_tiling(req.memory),
+                    )
+                };
+                if let Some(run) = run {
+                    run.decode_phase(&mut do_decode)
+                } else {
+                    do_decode()
+                }
             })
             .collect()
+    }
+
+    fn load_vae_encoder(&self) -> Result<crate::unet::VaeMomentsEncoder> {
+        if let Some(ldm) = &self.ldm {
+            let vs = VarBuilder::from_tensors(ldm.vae.clone(), DType::F32, &self.device);
+            Ok(crate::unet::VaeMomentsEncoder::new(vs, VAE_SCALE)?)
+        } else {
+            let source = self.vae_fix.as_ref().ok_or_else(|| {
+                CandleError::Msg("sdxl: snapshot load is missing the fp16-fix VAE component".into())
+            })?;
+            crate::loaders::load_sdxl_vae_encoder(source, &self.device, self.dtype)
+        }
+    }
+
+    fn encode_source_image(&self, source: &Image, width: u32, height: u32) -> Result<Tensor> {
+        let (iw, ih) = (source.width as usize, source.height as usize);
+        if source.pixels.len()
+            != candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3)
+                .unwrap_or(usize::MAX)
+        {
+            return Err(CandleError::Msg(format!(
+                "sdxl: source_image pixel buffer {} != {iw}x{ih}x3",
+                source.pixels.len()
+            )));
+        }
+        let (rw, rh) = (width as usize, height as usize);
+        let resized = if (iw, ih) == (rw, rh) {
+            source.pixels.iter().map(|&p| p as f32).collect()
+        } else {
+            candle_gen::gen_core::imageops::resize_lanczos_u8(&source.pixels, ih, iw, rh, rw)?
+        };
+        let data: Vec<f32> = resized.into_iter().map(|v| v / 127.5 - 1.0).collect();
+        let hwc = Tensor::from_vec(data, (rh, rw, 3), &self.device)?;
+        let enc_dtype = if self.ldm.is_some() {
+            DType::F32
+        } else {
+            self.dtype
+        };
+        let nchw = hwc
+            .permute((2, 0, 1))?
+            .unsqueeze(0)?
+            .contiguous()?
+            .to_dtype(enc_dtype)?;
+        let encoder = self.load_vae_encoder()?;
+        Ok(encoder.encode_mean(&nchw)?.to_dtype(DType::F32)?)
     }
 
     fn render_with<T>(
@@ -1166,6 +1230,7 @@ impl Pipeline {
         req: &GenerationRequest,
         text_embeddings: &Tensor,
         unet: &SdxlUnet,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
         mut consume: impl FnMut(Tensor, &mut dyn FnMut(Progress)) -> Result<T>,
     ) -> Result<Vec<T>> {
@@ -1204,7 +1269,15 @@ impl Pipeline {
         candle_gen::execution::policy("sdxl/pipeline/use_guide", format!("{use_guide:?}").into());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let total = steps as u32;
-        let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
+        let (init_w, init_h) = match run {
+            Some(run) => run.plan().phase_output_size(0),
+            None => (self.config.width as u32, self.config.height as u32),
+        };
+        let (lat_h, lat_w) = ((init_h / 8) as usize, (init_w / 8) as usize);
+        let init_clean = match &req.source_image {
+            Some(source) => Some(self.encode_source_image(source, init_w, init_h)?),
+            None => None,
+        };
 
         // Lightning precompute (seed-independent): the trailing-Euler policy + the cond-only text
         // embedding (row 1 of the `[uncond, cond]` dual-CLIP stack — Lightning runs one conditioned
@@ -1219,6 +1292,9 @@ impl Pipeline {
         };
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            if let Some(run) = run {
+                run.reset_image_denoise_phases();
+            }
             // sc-3673 — deterministic, launch-portable initial noise: draw N(0,1) from a
             // fixed-algorithm CPU RNG (`StdRng`, ChaCha-based) seeded by `seed`, build the latent on
             // CPU, then move it to the compute device. This replaces candle's CUDA `device.set_seed`
@@ -1251,12 +1327,14 @@ impl Pipeline {
                     req,
                     name,
                     &init,
+                    init_clean.as_ref(),
                     text_embeddings,
                     unet,
                     steps,
                     use_guide,
                     guidance,
                     seed,
+                    run,
                     on_progress,
                 )?
             } else {
@@ -1269,6 +1347,9 @@ impl Pipeline {
                         .into(),
                 ));
             };
+            if let Some(run) = run {
+                run.finish_image_denoise_phases()?;
+            }
 
             consume(latents, on_progress)
         })
@@ -1358,27 +1439,48 @@ impl Pipeline {
         req: &GenerationRequest,
         sampler: &str,
         init: &Tensor,
+        init_clean: Option<&Tensor>,
         text_embeddings: &Tensor,
         unet: &SdxlUnet,
         steps: usize,
         use_guide: bool,
         guidance: f64,
         seed: u64,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let sched = sdxl_alpha_schedule()?;
         let ms = DiscreteModelSampling::sdxl(&sched);
         // Native curated schedule = ComfyUI's SDXL default (`normal`); the scheduler axis overrides it.
         let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
-        let sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
-        // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler (cast to f16 per eval).
-        let latents = (init * sigmas[0] as f64)?;
+        let full_sigmas =
+            candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
+        let (sigmas, latents): (&[f32], Tensor) = if let Some(clean) = init_clean {
+            let raw_strength = req.strength.unwrap_or(crate::DEFAULT_EDIT_STRENGTH);
+            let start_step = gen_core::resolve_img2img_init_time_step(
+                full_sigmas.len().saturating_sub(1),
+                Some(raw_strength),
+            )
+            .map_err(CandleError::from)?;
+            let sliced = &full_sigmas[start_step..];
+            if sliced.len() <= 1 {
+                return Ok(clean.to_dtype(self.dtype)?);
+            }
+            let blended = (clean + (init * sliced[0] as f64)?)?;
+            (sliced, blended)
+        } else {
+            // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler (cast to f16 per eval).
+            (&full_sigmas, (init * full_sigmas[0] as f64)?)
+        };
         // Per-step latent preview (epic 16948, sc-16954). Opting in is the sc-16949 projector hook, so
         // the loop is not restructured and the driver owns frame numbering + the multi-eval dedup.
         // `ve_hook` because the running latent here is raw k-diffusion VE σ-space — see
         // `crate::preview` for why that needs the `1/√(σ²+1)` renormalization the fit was measured in.
         // Built per image: the driver starts a fresh counter per call.
-        let preview = crate::preview::ve_hook(&req.preview);
+        let preview = match run {
+            Some(run) => crate::preview::ve_hook_for_plan(&req.preview, run.plan()),
+            None => crate::preview::ve_hook(&req.preview),
+        };
         // sc-14195: the conditioning must be batched to match the UNet input. `text_embeddings` is
         // ALWAYS the `[uncond, cond]` stack (uncond-first — `text_embeddings()` encodes both rows
         // unconditionally, since the uncond row is what CFG needs and it is cheap to carry), but
@@ -1392,47 +1494,277 @@ impl Pipeline {
         } else {
             text_embeddings.narrow(0, 1, 1)?.contiguous()?
         };
-        let out = candle_gen::run_curated_sampler(
-            Some(sampler),
-            &ms,
-            &sigmas,
-            latents,
-            seed,
-            &req.cancel,
-            on_progress,
-            Some(&preview),
-            |x_in, t| -> Result<Tensor> {
-                // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
-                // index the UNet embeds. CFG batches/combines exactly like the native DDIM path.
-                let eps = if use_guide && crate::sequential_cfg_enabled() {
-                    let model_in = x_in.to_dtype(self.dtype)?;
-                    let uncond =
-                        unet.forward(&model_in, t as f64, &ehs.narrow(0, 0, 1)?.contiguous()?)?;
-                    candle_gen::residency::check_cancel(&req.cancel)?;
-                    let cond =
-                        unet.forward(&model_in, t as f64, &ehs.narrow(0, 1, 1)?.contiguous()?)?;
-                    (&uncond + ((cond - &uncond)? * guidance)?)?
+        if req.guidance_method.as_deref() == Some("cfg_pp")
+            && use_guide
+            && gen_core::sampling::Solver::from_name(sampler)
+                .is_some_and(gen_core::sampling::base_supports_cfgpp)
+        {
+            return self.denoise_cfgpp(
+                req,
+                sampler,
+                &ms,
+                sigmas,
+                latents,
+                &ehs,
+                unet,
+                guidance,
+                seed,
+                run,
+                &preview,
+                on_progress,
+            );
+        }
+        let mut predict = |x_in: &Tensor, t: f32| -> Result<Tensor> {
+            // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
+            // index the UNet embeds. CFG batches/combines exactly like the native DDIM path.
+            let eps = if use_guide && crate::sequential_cfg_enabled() {
+                let model_in = x_in.to_dtype(self.dtype)?;
+                let uncond =
+                    unet.forward(&model_in, t as f64, &ehs.narrow(0, 0, 1)?.contiguous()?)?;
+                candle_gen::residency::check_cancel(&req.cancel)?;
+                let cond =
+                    unet.forward(&model_in, t as f64, &ehs.narrow(0, 1, 1)?.contiguous()?)?;
+                (&uncond + ((cond - &uncond)? * guidance)?)?
+            } else {
+                let model_in = if use_guide {
+                    Tensor::cat(&[x_in, x_in], 0)?
                 } else {
-                    let model_in = if use_guide {
-                        Tensor::cat(&[x_in, x_in], 0)?
-                    } else {
-                        x_in.clone()
-                    };
-                    let noise_pred =
-                        unet.forward(&model_in.to_dtype(self.dtype)?, t as f64, &ehs)?;
-                    if use_guide {
-                        let chunks = noise_pred.chunk(2, 0)?;
-                        (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance)?)?
-                    } else {
-                        noise_pred
-                    }
+                    x_in.clone()
                 };
-                // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
-                Ok(eps.to_dtype(DType::F32)?)
-            },
-        )?;
+                let noise_pred = unet.forward(&model_in.to_dtype(self.dtype)?, t as f64, &ehs)?;
+                if use_guide {
+                    let chunks = noise_pred.chunk(2, 0)?;
+                    (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance)?)?
+                } else {
+                    noise_pred
+                }
+            };
+            // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
+            Ok(eps.to_dtype(DType::F32)?)
+        };
+        let out = match run {
+            Some(run) => {
+                let (run_sigmas, spans) = if init_clean.is_some() {
+                    let spans = match run.plan().low_res_start() {
+                        Some(low_res) if low_res.k > 0 => {
+                            let p0 = low_res.k.min(sigmas.len().saturating_sub(1));
+                            if p0 < sigmas.len().saturating_sub(1) {
+                                vec![0..p0, p0..sigmas.len().saturating_sub(1)]
+                            } else {
+                                std::iter::once(0..sigmas.len().saturating_sub(1)).collect()
+                            }
+                        }
+                        _ => std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
+                    };
+                    (sigmas, spans)
+                } else {
+                    (run.plan().denoise_sigmas(), run.plan().denoise_spans().to_vec())
+                };
+                candle_gen::sampler::run_curated_sampler_spans(
+                    Some(sampler),
+                    &ms,
+                    run_sigmas,
+                    &spans,
+                    Some(run),
+                    false,
+                    latents,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                    Some(&preview),
+                    &mut predict,
+                )?
+            }
+            None => candle_gen::run_curated_sampler(
+                Some(sampler),
+                &ms,
+                sigmas,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                &mut predict,
+            )?,
+        };
         // The shared `decode` expects the compute dtype (f16), like the DDIM/Lightning latents.
         Ok(out.to_dtype(self.dtype)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_cfgpp(
+        &self,
+        req: &GenerationRequest,
+        sampler: &str,
+        ms: &DiscreteModelSampling,
+        sigmas: &[f32],
+        mut latents: Tensor,
+        ehs: &Tensor,
+        unet: &SdxlUnet,
+        guidance: f64,
+        seed: u64,
+        run: Option<&gen_core::RenderRun<'_, '_>>,
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        use candle_gen::gen_core::sampling::{
+            base_supports_cfgpp, cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler, Solver,
+        };
+
+        let base = Solver::from_name(sampler)
+            .filter(|solver| base_supports_cfgpp(*solver))
+            .unwrap_or(Solver::Euler);
+        let ops = candle_gen::CandleLatentOps;
+        let total = sigmas.len().saturating_sub(1).max(1) as u32;
+        let preview_counter = candle_gen::preview::PreviewCounter::new(sigmas);
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
+        candle_gen::execution::schedule(sampler, sigmas, "Discrete/Eps/cfg_pp");
+
+        let spans = match run {
+            Some(run) if run.plan().denoise_sigmas().len() == sigmas.len() => {
+                run.plan().denoise_spans().to_vec()
+            }
+            Some(run) => match run.plan().low_res_start() {
+                Some(low_res) if low_res.k > 0 => {
+                    let p0 = low_res.k.min(sigmas.len().saturating_sub(1));
+                    if p0 < sigmas.len().saturating_sub(1) {
+                        vec![0..p0, p0..sigmas.len().saturating_sub(1)]
+                    } else {
+                        std::iter::once(0..sigmas.len().saturating_sub(1)).collect()
+                    }
+                }
+                _ => std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
+            },
+            None => std::iter::once(0..sigmas.len().saturating_sub(1)).collect(),
+        };
+
+        let predict_pair = |x_in: &Tensor, t: f32| -> gen_core::Result<(Tensor, Tensor)> {
+            let (eps_u, eps_c) = if crate::sequential_cfg_enabled() {
+                let model_in = x_in.to_dtype(self.dtype).map_err(CandleError::from)?;
+                let u = unet.forward(
+                    &model_in,
+                    t as f64,
+                    &ehs.narrow(0, 0, 1)
+                        .map_err(CandleError::from)?
+                        .contiguous()
+                        .map_err(CandleError::from)?,
+                )?;
+                candle_gen::residency::check_cancel(&req.cancel)?;
+                let c = unet.forward(
+                    &model_in,
+                    t as f64,
+                    &ehs.narrow(0, 1, 1)
+                        .map_err(CandleError::from)?
+                        .contiguous()
+                        .map_err(CandleError::from)?,
+                )?;
+                (
+                    u.to_dtype(DType::F32).map_err(CandleError::from)?,
+                    c.to_dtype(DType::F32).map_err(CandleError::from)?,
+                )
+            } else {
+                let model_in = Tensor::cat(&[x_in, x_in], 0)
+                    .and_then(|cat| cat.to_dtype(self.dtype))
+                    .map_err(CandleError::from)?;
+                let noise_pred = unet
+                    .forward(&model_in, t as f64, ehs)?
+                    .to_dtype(DType::F32)
+                    .map_err(CandleError::from)?;
+                let chunks = noise_pred.chunk(2, 0).map_err(CandleError::from)?;
+                (chunks[0].clone(), chunks[1].clone())
+            };
+            let guided = (&eps_u
+                + ((&eps_c - &eps_u).map_err(CandleError::from)? * guidance)
+                    .map_err(CandleError::from)?)
+            .map_err(CandleError::from)?;
+            Ok((guided, eps_u))
+        };
+
+        for (span_idx, span) in spans.iter().enumerate() {
+            if let Some(run) = run {
+                run.begin_denoise_phase(span_idx)
+                    .map_err(CandleError::from)?;
+            }
+            let span_sigmas = &sigmas[span.start..=span.end];
+            let cfgpp_sampler: Box<dyn CfgPpSampler<candle_gen::CandleLatentOps>> =
+                cfgpp_sampler_for::<candle_gen::CandleLatentOps>(base)
+                    .expect("base_supports_cfgpp holds");
+            let mut denoise_fn =
+                |x: &Tensor, sigma: f32| -> gen_core::Result<(Tensor, Tensor)> {
+                    if req.cancel.is_cancelled() {
+                        return Err(gen_core::Error::Canceled);
+                    }
+                    candle_gen::preview::PreviewHook::emit(
+                        preview,
+                        &preview_counter,
+                        sigmas,
+                        sigma,
+                        x,
+                    );
+                    let current =
+                        (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+                    on_progress(Progress::Step { current, total });
+                    cfgpp_denoise(&ops, ms, x, sigma, predict_pair)
+                };
+            latents = cfgpp_sampler
+                .sample(&ops, &mut denoise_fn, latents, span_sigmas)
+                .map_err(CandleError::from)?;
+            if let Some(run) = run {
+                run.end_denoise_phase(span_idx)
+                    .map_err(CandleError::from)?;
+            }
+            if span_idx + 1 < spans.len() {
+                if let Some(run) = run {
+                    if let Some(low_res_plan) = run.plan().low_res_start().cloned() {
+                        let sigma_k = sigmas[span.end];
+                        let base_seed = run.plan().base_seed();
+                        let output_index = seed.wrapping_sub(base_seed) as u32;
+                        let pass_index = run.plan().pass_index();
+                        let x0_low = gen_core::sampling::denoise(
+                            &ops,
+                            ms,
+                            &latents,
+                            sigma_k,
+                            |xin, t| Ok(predict_pair(xin, t)?.0),
+                        )
+                        .map_err(CandleError::from)?;
+                        let low_f32 = x0_low
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        let dims = x0_low.dims();
+                        let (b_sz, channels, low_h) = (dims[0], dims[1], dims[2]);
+                        let vae_spatial_scale =
+                            ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
+                        let noised = gen_core::transition_clean_estimate_f32(
+                            gen_core::BoundaryState::CleanEstimate {
+                                latent: &low_f32,
+                                source: gen_core::EstimateSource::EndpointEvaluation,
+                            },
+                            b_sz,
+                            channels,
+                            vae_spatial_scale as u32,
+                            &low_res_plan,
+                            sigma_k,
+                            ms,
+                            base_seed,
+                            output_index,
+                            pass_index,
+                            0,
+                        )
+                        .map_err(CandleError::from)?;
+                        let full_h = (low_res_plan.full_height as usize) / vae_spatial_scale;
+                        let full_w = (low_res_plan.full_width as usize) / vae_spatial_scale;
+                        latents = Tensor::from_vec(
+                            noised,
+                            (b_sz, channels, full_h, full_w),
+                            x0_low.device(),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(latents.to_dtype(self.dtype)?)
     }
 
     /// Decode latents to an RGB8 [`Image`], either through the native VAE or — when a PiD decoder
@@ -2241,7 +2573,7 @@ mod tests {
             ..Default::default()
         };
         let render = |guidance: f32, ehs: &Tensor| {
-            pipe.render(&req_at(guidance, 1), ehs, &unet, &vae, None, &mut |_| {})
+            pipe.render(&req_at(guidance, 1), ehs, &unet, &vae, None, None, &mut |_| {})
         };
 
         // (1) CFG off (the sc-14195 repro): guidance 1.0 ⇒ one conditioned branch, batch-1 latent.
@@ -2282,7 +2614,7 @@ mod tests {
         // `count > 1` at CFG-off: the narrow is rebuilt per image inside `denoise_curated`, so pin
         // that the batch loop stays consistent and each seed still yields its own image.
         let multi = pipe
-            .render(&req_at(1.0, 2), &ab, &unet, &vae, None, &mut |_| {})
+            .render(&req_at(1.0, 2), &ab, &unet, &vae, None, None, &mut |_| {})
             .expect("CFG-off must also serve count > 1");
         assert_eq!(multi.len(), 2);
         assert_eq!(

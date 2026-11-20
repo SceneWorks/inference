@@ -68,6 +68,13 @@ pub(crate) fn ve_hook(sink: &PreviewSink) -> PreviewHook<'_> {
     candle_gen_sdxl::preview::ve_hook(sink)
 }
 
+pub(crate) fn ve_hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    candle_gen_sdxl::preview::ve_hook_for_plan(sink, plan)
+}
+
 #[cfg(test)]
 mod tests {
     use candle_gen::candle_core::{DType, Device};

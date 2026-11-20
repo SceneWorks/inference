@@ -405,6 +405,11 @@ impl Generator for SdxlControlGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        if req.low_res_start.is_some() {
+            return Err(gen_core::Error::Unsupported(
+                "sdxl: low_res_start conflicts with pass-0 ControlNet conditioning".into(),
+            ));
+        }
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;

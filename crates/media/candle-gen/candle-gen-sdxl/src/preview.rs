@@ -219,6 +219,36 @@ pub fn ve_hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::with_sigma(sink, project_ve_latents)
 }
 
+/// Plan-aware preview hook for a **VE σ-space** lane driven by [`candle_gen::gen_core::RenderPlan`].
+///
+/// Validates that the running `[1, 4, h, w]` latent matches either the reduced phase-0 latent grid
+/// (`plan.phase_output_size(0) / 8`) or the full phase-1 latent grid (`plan.output_size() / 8`)
+/// before projecting via [`project_ve_latents`].
+pub fn ve_hook_for_plan<'a>(
+    sink: &'a PreviewSink,
+    plan: &candle_gen::gen_core::RenderPlan,
+) -> PreviewHook<'a> {
+    let (p0_w, p0_h) = plan.phase_output_size(0);
+    let (p1_w, p1_h) = plan.output_size();
+    let p0_lh = (p0_h / 8) as usize;
+    let p0_lw = (p0_w / 8) as usize;
+    let p1_lh = (p1_h / 8) as usize;
+    let p1_lw = (p1_w / 8) as usize;
+    PreviewHook::with_sigma(sink, move |latents, sigma| {
+        let dims = latents.dims();
+        if dims.len() == 4
+            && ((dims[2] == p0_lh && dims[3] == p0_lw)
+                || (dims[2] == p1_lh && dims[3] == p1_lw))
+        {
+            project_ve_latents(latents, sigma)
+        } else {
+            Err(CandleError::Msg(format!(
+                "sdxl preview latent dims {dims:?} do not match phase-0 [{p0_lh}, {p0_lw}] or phase-1 [{p1_lh}, {p1_lw}]"
+            )))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use candle_gen::candle_core::{DType, Device};
