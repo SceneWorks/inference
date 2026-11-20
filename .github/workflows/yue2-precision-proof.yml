@@ -70,6 +70,14 @@ concurrency:
 
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+  # rust-lang/rust#157750: a fresh macOS build strips host proc-macro dylibs into E0463
+  # ("can't find crate for `*_derive`"), so keep every profile and its build overrides unstripped.
+  CARGO_PROFILE_DEV_STRIP: none
+  CARGO_PROFILE_TEST_STRIP: none
+  CARGO_PROFILE_RELEASE_STRIP: none
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
 
 jobs:
   cuda_diagnostic:
