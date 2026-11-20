@@ -39,8 +39,9 @@ pub enum HeadRows {
         /// `QMatMul`.
         dequant: bool,
     },
-    /// GGML blocks on CUDA: every row addressed in place by the indexed GEMV.
-    Indexed(IndexedExperts),
+    /// GGML blocks on CUDA: every row addressed in place by the indexed GEMV. Boxed: the bank
+    /// (device table, kernels) dwarfs the other variants, and it is built once per load.
+    Indexed(Box<IndexedExperts>),
     /// No in-place row access: the whole head, then the columns. The reason is a stable label.
     Full(&'static str),
 }
@@ -70,7 +71,7 @@ impl HeadRows {
                     Device::Cuda(_) => match IndexedExperts::ggml_rows(&weight, dequant)
                         .and_then(|bank| bank.available().map(|()| bank))
                     {
-                        Ok(bank) => Self::Indexed(bank),
+                        Ok(bank) => Self::Indexed(Box::new(bank)),
                         Err(MoeGemvError::Candle(e)) => return Err(Error::Candle(e)),
                         Err(e) => Self::Full(e.label()),
                     },

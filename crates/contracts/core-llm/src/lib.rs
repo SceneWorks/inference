@@ -185,8 +185,9 @@ pub use resource::{
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::tree::{
-    ngram_propose_tree, resolve_tree_verify, resolve_tree_verify_with, tree_workspace_rows,
-    DraftTree, TreeResolution, TreeWalk, MAX_TREE_ROWS,
+    build_lattice_tree, ngram_propose_tree, resolve_tree_verify, resolve_tree_verify_with,
+    tree_workspace_rows, DraftLattice, DraftTree, LatticeSampler, LatticeTreeError, TreeResolution,
+    TreeWalk, MAX_TREE_ROWS,
 };
 pub use speculative::{
     accept_greedy_run, accept_token, auto_block_draft_decision, auto_block_draft_tier,

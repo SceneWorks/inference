@@ -344,7 +344,7 @@ impl BlockDraft {
         BlockDraftContext::new(start)
     }
 
-    /// Append target rows `taps` `[1, n, tap_width]` to the context ([`ContextWriter::append`]).
+    /// Append target rows `taps` `[1, n, tap_width]` to the context (`ContextWriter::append`).
     pub fn append_context(&self, ctx: &mut BlockDraftContext, taps: &Array) -> Result<()> {
         match self {
             Self::DSpine(d) => d.append_context(ctx, taps),

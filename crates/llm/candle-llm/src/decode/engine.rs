@@ -293,6 +293,58 @@ impl DraftSampler<'_, '_> {
     }
 }
 
+/// The engine's draft sampler as the shared block-draft tree builder's policy
+/// ([`core_llm::build_lattice_tree`]): each operation is the sampler's own.
+impl core_llm::LatticeSampler for DraftSampler<'_, '_> {
+    type Error = Error;
+
+    fn greedy(&self) -> bool {
+        DraftSampler::greedy(self)
+    }
+
+    fn is_stop(&self, token: i32) -> bool {
+        DraftSampler::is_stop(self, token)
+    }
+
+    fn constraint_checkpoint(&self) -> Option<usize> {
+        DraftSampler::constraint_checkpoint(self)
+    }
+
+    fn enter_branch(&mut self, checkpoint: Option<usize>, path: &[i32]) {
+        DraftSampler::enter_branch(self, checkpoint, path);
+    }
+
+    fn allowed_among(&mut self, candidates: &[i32]) -> Vec<i32> {
+        DraftSampler::allowed_among(self, candidates)
+    }
+
+    fn choose_among(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        history: &[i32],
+    ) -> Result<Option<i32>> {
+        Ok(self
+            .sample_among(candidates, scores, width, history)?
+            .map(|(token, _)| token))
+    }
+
+    fn among_distribution(
+        &mut self,
+        candidates: &[i32],
+        scores: &[f32],
+        width: usize,
+        history: &[i32],
+    ) -> Result<Option<Vec<(i32, f32)>>> {
+        DraftSampler::among_distribution(self, candidates, scores, width, history)
+    }
+
+    fn draw(&mut self, dist: &[(i32, f32)]) -> i32 {
+        DraftSampler::draw(self, dist)
+    }
+}
+
 #[cfg(test)]
 impl<'a, 'c> DraftSampler<'a, 'c> {
     /// A sampler over `config`, `rng` and `constraint` with host-sampled drafts — for unit tests

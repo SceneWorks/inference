@@ -28,14 +28,14 @@
 //!
 //! ## Tree verification (SW-7198)
 //! Under a tree request the proposer hands the verifier the candidate **tree** of the same draft
-//! forward ([`Proposer::propose_tree`], built by `tree::build_tree`), and the target verifies it
+//! forward ([`Proposer::propose_tree`], built by [`core_llm::build_lattice_tree`]), and the target verifies it
 //! in one eager tree forward (the [`TappedQwen35`] tree forward returns the tapped rows of every
 //! tree row). The engine keeps the accepted branch only, so a commit appends the accepted
 //! branch's taps — the context a draft that only ever saw the accepted path holds — and an aborted
 //! tree step never reaches the proposer.
 
 use candle_core::Tensor;
-use core_llm::{DraftTree, ProposerKind};
+use core_llm::{build_lattice_tree, DraftLattice, DraftTree, ProposerKind};
 
 use crate::decode::engine::{DraftSampler, Drafts, Proposal, ProposeContext, Proposer};
 use crate::decode::step::{StepModel, StepOutput, StepRequest, TreeOutput, TreeVerify};
@@ -44,7 +44,8 @@ use crate::models::{BlockDraft, BlockDraftContext, Qwen35Cache, Qwen35Model};
 use crate::primitives::attention::AttnFormulation;
 use crate::primitives::input_ids;
 
-mod tree;
+#[cfg(test)]
+mod tree_tests;
 
 /// The Qwen3.5/3.8 hybrid as a block draft's target: its hidden rows are the outputs of `layers`
 /// (0-based), concatenated, and a step returns at most the last `keep` of them (the draft's
@@ -313,19 +314,20 @@ impl Proposer for BlockDraftProposer<'_> {
         })
     }
 
-    /// The candidate tree of one draft forward (SW-7198): see `tree::build_tree`.
+    /// The candidate tree of one draft forward (SW-7198), grown by the shared builder
+    /// [`core_llm::build_lattice_tree`].
     fn propose_tree(
         &mut self,
         ctx: &ProposeContext<'_>,
         sampler: &mut DraftSampler<'_, '_>,
     ) -> Result<Option<DraftTree>> {
         let width = self.run_draft(ctx)?;
-        let lattice = tree::Lattice {
+        let lattice = DraftLattice {
             candidates: &self.candidates,
             table: &self.table,
             width,
         };
-        tree::build_tree(&lattice, ctx, sampler).map(Some)
+        build_lattice_tree(&lattice, ctx.history, ctx.max_rows, sampler).map(Some)
     }
 
     fn commit(

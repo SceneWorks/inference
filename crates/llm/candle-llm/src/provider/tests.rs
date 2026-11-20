@@ -2319,12 +2319,11 @@ fn a_mixed_qwen35_tier_without_its_entries_is_refused() {
 fn qwen35_fully_quantized_tiers_decode_like_the_plain_tier() {
     use crate::models::{Qwen35Config, Qwen35Model};
     use crate::primitives::projection::ProjectionFormat;
-    use candle_core::Device;
     #[cfg(feature = "cuda")]
     let device =
         crate::device::new_cuda_for_test().expect("a cuda build proves the tiers on a CUDA device");
     #[cfg(not(feature = "cuda"))]
-    let device = Device::Cpu;
+    let device = candle_core::Device::Cpu;
     let load = |dir: &std::path::Path| {
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())

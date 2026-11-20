@@ -320,12 +320,39 @@ class Staging(unittest.TestCase):
                          for name, pin in bound.items()}
             path.write_text(json.dumps({"snapshots": snapshots}), encoding="utf-8")
             env = {"MODEL_PROOF_HUB_SNAPSHOT_RECEIPT": str(path), "FULL": "/hub/FULL", "PLAIN": "/hub/PLAIN"}
-            self.assertEqual(set(proofs.staged_hub_snapshots(row(*SLOTS), value, env)), {"FULL", "PLAIN"})
+            self.assertEqual(set(proofs.staged_hub_snapshots(row(*SLOTS), bound, env)), {"FULL", "PLAIN"})
             for broken in ({**env, "PLAIN": "/elsewhere"}, {k: v for k, v in env.items() if k != "MODEL_PROOF_HUB_SNAPSHOT_RECEIPT"}):
                 with self.subTest(env=broken), self.assertRaises(ValueError):
-                    proofs.staged_hub_snapshots(row(*SLOTS), value, broken)
+                    proofs.staged_hub_snapshots(row(*SLOTS), bound, broken)
+            other = proofs.bind_hub_snapshots((row(*SLOTS),), {"hub_snapshots": {"FULL": FULL, "PLAIN": MLX + "/q4"}})
             with self.assertRaises(ValueError):
-                proofs.staged_hub_snapshots(row(*SLOTS), {"hub_snapshots": {"FULL": FULL, "PLAIN": MLX + "/q4"}}, env)
+                proofs.staged_hub_snapshots(row(*SLOTS), other, env)
+            with self.assertRaisesRegex(ValueError, "not bound by the selection"):
+                proofs.staged_hub_snapshots(row(*SLOTS), {"FULL": bound["FULL"]}, env)
+
+    def test_a_mixed_selection_checks_each_case_against_its_own_slots(self):
+        # A package-wide mlx-llm selection: the full-tier case's slots are request-bound, the
+        # block-draft case pins its own. The request binds the full-tier slots, which the block-draft
+        # case does not declare; the selection as a whole does.
+        rows = {proofs.identity(item): item for item in json.loads(proofs.REGISTRY_PATH.read_text(encoding="utf-8"))}
+        tier = rows["mlx-llm/integration/qwen38_quantized_tiers::qwen38_full_tier_replies_agree_with_the_plain_tier"]
+        draft = rows["mlx-llm/integration/block_draft::qwen38_27b_dspine_accepts_more_than_one_token_per_pass"]
+        plain = next(slot for slot in tier["hub_snapshots"] if slot["environment"] == "QWEN38_PLAIN_TIER_SNAPSHOT")
+        value = {"hub_snapshots": {"QWEN38_FULL_TIER_SNAPSHOT": FULL, "QWEN38_PLAIN_TIER_SNAPSHOT": plain["choices"][0]}}
+        with self.assertRaisesRegex(ValueError, "no selected case declares"):
+            proofs.bind_hub_snapshots((draft,), value)
+        bound = proofs.bind_hub_snapshots((tier, draft), value)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            snapshots = {name: {**pin, "path": f"/hub/{name}", "status": "hub_content_verified"}
+                         for name, pin in bound.items()}
+            path.write_text(json.dumps({"snapshots": snapshots}), encoding="utf-8")
+            env = {"MODEL_PROOF_HUB_SNAPSHOT_RECEIPT": str(path), **{name: f"/hub/{name}" for name in bound}}
+            for item in (tier, draft):
+                own = {slot["environment"] for slot in item["hub_snapshots"]}
+                with self.subTest(case=proofs.identity(item)):
+                    self.assertEqual(set(proofs.staged_hub_snapshots(item, bound, env)), own)
+            self.assertNotIn("QWEN38_FULL_TIER_SNAPSHOT", proofs.staged_hub_snapshots(draft, bound, env))
 
 
 class WorkflowStaging(unittest.TestCase):

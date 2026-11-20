@@ -1117,7 +1117,9 @@ pub const STEP_MAX_CHECKPOINTS: usize = 2;
 /// `Clone` that would have to panic.
 #[derive(Debug)]
 pub enum Qwen35LayerCache {
-    Delta(DeltaNetCache),
+    /// Boxed: the recurrent slot (state, conv tail and checkpoint ring) is several times the
+    /// attention slots' size, and every access already goes through a reference.
+    Delta(Box<DeltaNetCache>),
     Attn(AttnKv),
     StaticAttn(StaticKvCache),
 }
@@ -1126,7 +1128,7 @@ impl Qwen35LayerCache {
     /// A deep copy of the slot (see [`StaticKvCache::try_clone`] for the static case).
     pub fn try_clone(&self) -> Result<Self> {
         Ok(match self {
-            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(c.try_clone()?),
+            Qwen35LayerCache::Delta(c) => Qwen35LayerCache::Delta(Box::new(c.try_clone()?)),
             Qwen35LayerCache::Attn(a) => Qwen35LayerCache::Attn(a.clone()),
             Qwen35LayerCache::StaticAttn(s) => Qwen35LayerCache::StaticAttn(s.try_clone()?),
         })
@@ -1374,7 +1376,7 @@ impl Qwen35Cache {
             }
         }
         for (at, c) in replacements {
-            self.layers[at] = Qwen35LayerCache::Delta(c);
+            self.layers[at] = Qwen35LayerCache::Delta(Box::new(c));
         }
         self.max_checkpoints = max;
         Ok(())
@@ -2861,7 +2863,7 @@ impl Qwen35Model {
             .copied()
             .map(|i| {
                 if self.cfg.is_linear(i) {
-                    Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
+                    Qwen35LayerCache::Delta(Box::new(Self::delta_slot(&shape, max_checkpoints)))
                 } else {
                     Qwen35LayerCache::Attn(AttnKv::default())
                 }
@@ -2916,7 +2918,7 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(self.visits.len());
         for &i in self.visits.iter() {
             layers.push(if self.cfg.is_linear(i) {
-                Qwen35LayerCache::Delta(Self::delta_slot(&shape, max_checkpoints))
+                Qwen35LayerCache::Delta(Box::new(Self::delta_slot(&shape, max_checkpoints)))
             } else {
                 Qwen35LayerCache::StaticAttn(StaticKvCache::new(
                     1,

@@ -824,15 +824,21 @@ def repository_identity(expected: str) -> dict:
     return {'revision': expected, 'tree': git('rev-parse', 'HEAD^{tree}')}
 
 
-def staged_hub_snapshots(row: dict, value: dict, env: dict[str, str]) -> dict:
+def staged_hub_snapshots(row: dict, bound: dict[str, dict], env: dict[str, str]) -> dict:
     """The staging receipt must cover each of the row's slots at its exact pin, and each
-    environment name must point at the verified snapshot directory."""
+    environment name must point at the verified snapshot directory. `bound` is the whole
+    selection's binding (`bind_hub_snapshots` over every selected row, which validates the
+    request once): a request binding another selected case's slot is not this case's to refuse."""
     path = env.get('MODEL_PROOF_HUB_SNAPSHOT_RECEIPT')
     if not path:
         raise ValueError('missing pinned Hub snapshot staging receipt')
     staged = json.loads(Path(path).read_text(encoding='utf-8')).get('snapshots', {})
     receipt = {}
-    for name, pin in bind_hub_snapshots((row,), value).items():
+    for slot in row.get('hub_snapshots', []):
+        name = slot['environment']
+        pin = bound.get(name)
+        if pin is None:
+            raise ValueError(f'{name} is not bound by the selection')
         entry = staged.get(name)
         if (not isinstance(entry, dict) or entry.get('status') != 'hub_content_verified'
                 or any(entry.get(key) != pin[key] for key in pin) or env.get(name) != entry.get('path')):
@@ -1279,6 +1285,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     write_json(policy_path, value['policy'])
     policy = load_policy(policy_path)
     approved_uuids = multi_cuda.bind_rows(rows, value, backend)
+    # The request's Hub bindings are validated once against the complete selection; each case
+    # then checks only its own slots against the staging receipt.
+    selection_snapshots = bind_hub_snapshots(rows, value)
     additional_policies = []
     for role, raw in enumerate(value.get('additional_cuda_policies', []), 1):
         extra_path = work / f'cuda-policy-role-{role}.json'
@@ -1343,7 +1352,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 if missing:
                     raise ValueError('missing declared model/fixture prerequisites: ' + ','.join(missing))
                 if row.get('hub_snapshots'):
-                    result['hub_snapshots'] = staged_hub_snapshots(row, value, env)
+                    result['hub_snapshots'] = staged_hub_snapshots(row, selection_snapshots, env)
                 if identity(row) in IRIS_QUANT_PROOFS:
                     path = env.get('MODEL_PROOF_ASSET_RECEIPT')
                     if not path:

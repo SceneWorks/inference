@@ -27,6 +27,10 @@
 use std::collections::hash_map::{Entry, HashMap};
 use std::fmt;
 
+mod lattice;
+
+pub use lattice::{build_lattice_tree, DraftLattice, LatticeSampler, LatticeTreeError};
+
 /// The most candidate rows (beyond the anchor) one tree verify pass carries on either backend:
 /// the anchor plus sixteen rows, the bound the tree workspace and the hybrid recurrent per-row
 /// states are priced for.
