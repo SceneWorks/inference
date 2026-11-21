@@ -292,7 +292,7 @@ fn prepare_hf(spec: &PrepareSpec, quantize_remaining: bool) -> Result<PrepareRep
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| Error::Msg(format!("prepare: shard name {}", shard.display())))?;
-        let mut tensors = Weights::from_file_host_raw(shard)?.into_map();
+        let mut tensors = Weights::from_file_host_raw(shard)?.try_into_map()?;
         stored += quantize_selected(&mut tensors, q, &selection)?;
         for key in &remaining_keys {
             if tensors.contains_key(key) {
@@ -379,7 +379,7 @@ fn prepare_gguf(spec: &PrepareSpec) -> Result<PrepareReport> {
     let chat_template = ck.chat_template.clone();
     let bos_token = ck.bos_token.clone();
     let eos_token = ck.eos_token.clone();
-    let mut tensors = ck.weights.into_map();
+    let mut tensors = ck.weights.try_into_map()?;
 
     // Store dense tensors as f16 (GGUF dequantizes to f32).
     for t in tensors.values_mut() {

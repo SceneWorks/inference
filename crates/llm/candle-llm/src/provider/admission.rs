@@ -396,21 +396,7 @@ pub(super) type SnapshotTensors = std::collections::HashMap<String, TensorHeader
 /// JSON header only. An unreadable directory or header is [`CoreError::Load`] (the load would
 /// fail reading it too).
 pub(super) fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors> {
-    let io_error =
-        |error: std::io::Error| CoreError::Load(format!("checkpoint admission: {error}"));
-    let mut shards: Vec<_> = if read_json(dir, "config.json")
-        .as_ref()
-        .is_some_and(|v| v["model_type"] == "sensenova_loop")
-    {
-        crate::sensenova_loop::shards(dir)
-    } else {
-        std::fs::read_dir(dir)
-            .map_err(io_error)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("safetensors"))
-            .collect()
-    };
-    shards.sort();
+    let shards = snapshot_shards(dir)?;
     let mut tensors = SnapshotTensors::new();
     for shard in shards {
         let malformed = || {
@@ -445,6 +431,99 @@ pub(super) fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors>
         }
     }
     Ok(tensors)
+}
+
+fn snapshot_shards(dir: &Path) -> CoreResult<Vec<std::path::PathBuf>> {
+    let io_error =
+        |error: std::io::Error| CoreError::Load(format!("checkpoint admission: {error}"));
+    let mut shards: Vec<_> = if read_json(dir, "config.json")
+        .as_ref()
+        .is_some_and(|v| v["model_type"] == "sensenova_loop")
+    {
+        crate::sensenova_loop::shards(dir)
+    } else {
+        std::fs::read_dir(dir)
+            .map_err(io_error)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+            .collect()
+    };
+    shards.sort();
+    Ok(shards)
+}
+
+/// Replace the physical bytes of a checkpoint-authored projection with the chosen device's
+/// plan. Leave unrecognized coefficient roles conservatively priced at f32 and account for
+/// a tied output head separately from its input embedding.
+pub(super) fn price_checkpoint_rows(
+    dir: &Path,
+    device: &Device,
+    decoder: &PricedDecoder,
+    tensors: &mut SnapshotTensors,
+) -> CoreResult<Option<(u64, u64)>> {
+    if !tensors.iter().any(|(key, t)| {
+        key.ends_with(".comfy_quant")
+            || (t.dtype.starts_with("F8_") && !core_llm::modelopt::is_companion(key))
+    }) {
+        return Ok(None);
+    }
+    let files = snapshot_shards(dir)?;
+    let Ok(source) = Weights::checkpoint_source(&files, device).map_err(to_core)? else {
+        return Ok(None);
+    };
+    let plan = source.reader().plan();
+    let causal_root = match decoder {
+        PricedDecoder::Causal(cfg) => Some(crate::models::llama::decoder_root(cfg, "", |k| {
+            tensors.contains_key(k)
+        })),
+        _ => None,
+    };
+    let hybrid_root = qwen35_dense_prefix(|key| tensors.contains_key(key)).ok();
+    let mut resident = plan
+        .companions
+        .iter()
+        .map(|c| c.resident_bytes)
+        .sum::<u64>();
+    let overflow = || CoreError::Load("checkpoint admission: resident size overflow".into());
+    for row in &plan.tensors {
+        let key = &row.logical_key;
+        let head = key == "lm_head.weight" || key.ends_with(".lm_head.weight");
+        let embedding = key.ends_with("embed_tokens.weight");
+        let (projection, tied) = match decoder {
+            PricedDecoder::Causal(cfg) => (
+                causal_root
+                    .as_ref()
+                    .is_some_and(|root| crate::models::llama::loads_quantized(cfg, root, key)),
+                cfg.tie_word_embeddings,
+            ),
+            PricedDecoder::Qwen35(cfg, _) => (
+                hybrid_root
+                    .is_some_and(|root| crate::models::qwen35::loads_quantized(cfg, root, key)),
+                cfg.tie_word_embeddings,
+            ),
+            _ => (false, false),
+        };
+        let coeff_bytes = || {
+            row.shape
+                .iter()
+                .try_fold(4u64, |a, &b| a.checked_mul(b as u64))
+                .ok_or_else(overflow)
+        };
+        let bytes = if projection || head {
+            row.residency.resident_bytes
+        } else if embedding && tied {
+            coeff_bytes()?
+                .checked_add(row.residency.resident_bytes)
+                .ok_or_else(overflow)?
+        } else {
+            row.residency.resident_bytes.max(coeff_bytes()?)
+        };
+        resident = resident.checked_add(bytes).ok_or_else(overflow)?;
+    }
+    for key in plan.all_physical_keys() {
+        tensors.remove(key);
+    }
+    Ok(Some((plan.source_bytes, resident)))
 }
 
 /// The quantized projection copy a snapshot load builds on the device beside its resident source

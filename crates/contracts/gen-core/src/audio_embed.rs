@@ -42,6 +42,16 @@ use crate::Result;
 /// worker runs inside one blocking task), not the `Send + Sync`
 /// [`VoiceEmbedder`](crate::voice_embed::VoiceEmbedder).
 pub trait AudioEmbedder {
+    /// Checkpoint execution and measured resident bytes for the primary source, when available.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+
+    /// Measured checkpoints, including separately loaded encoder and decoder components.
+    fn checkpoint_weight_facts_by_source(&self) -> Vec<crate::CheckpointWeightFacts> {
+        self.checkpoint_weight_facts().into_iter().collect()
+    }
+
     /// Stable identity + advertised shape, constructible without loading weights.
     fn descriptor(&self) -> &AudioEmbedderDescriptor;
 

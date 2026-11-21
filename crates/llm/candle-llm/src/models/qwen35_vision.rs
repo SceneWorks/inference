@@ -345,7 +345,7 @@ impl Qwen35VisionModel {
             if let Some(qtensor) = packed.as_deref_mut().and_then(|p| p.remove(&weight_name)) {
                 Projection::load_qtensor(qtensor, bias)
             } else {
-                Projection::load_with_bias(req(weight_name)?, bias, None)
+                w.linear(&weight_name, dtype, bias)
             }
         };
 

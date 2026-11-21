@@ -211,11 +211,14 @@ mod cuda {
         assert!(lt.meets_fp8_floor().unwrap(), "the CUDA lane needs sm_89+");
         let (qw, sw) = quantize_e4m3(&w).unwrap();
         let weight = Fp8Weight {
-            w: lt.stage_fp8(&qw.to_device(&dev).unwrap()).unwrap(),
+            op: candle_quant_kernels::fp8_linear::Fp8Linear::from_dynamic_codes(
+                qw.to_device(&dev).unwrap(),
+                sw,
+                std::sync::Arc::clone(&lt),
+                quantize_e4m3,
+            )
+            .unwrap(),
             scale: sw,
-            shape: (n, k),
-            device: dev.clone(),
-            lt: std::sync::Arc::clone(&lt),
         };
         let got = weight
             .forward(&x.to_device(&dev).unwrap(), None)

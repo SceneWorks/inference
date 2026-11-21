@@ -183,6 +183,7 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 name = "candle-audio"
 version = "0.0.0"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-nn",
  "libc",
@@ -1265,6 +1266,7 @@ dependencies = [
 name = "candle-llm"
 version = "0.0.0"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-flash-attn",
  "candle-llm",

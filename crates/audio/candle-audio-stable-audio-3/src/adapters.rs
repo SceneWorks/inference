@@ -872,7 +872,91 @@ impl AdapterBackend {
     }
 }
 
+struct NativeLora {
+    base: std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>,
+    ops: Vec<AdapterOp>,
+}
+
+impl candle_nn::linear::NativeLinearWeight for NativeLora {
+    fn forward(
+        &self,
+        x: &Tensor,
+        bias: Option<&Tensor>,
+    ) -> candle_audio::candle_core::Result<Tensor> {
+        let base = self.base.forward(x, bias)?;
+        let x = x.to_dtype(DType::F32)?;
+        let mut delta = None;
+        for op in &self.ops {
+            let a = op.module.a.as_ref().expect("validated LoRA A");
+            let b = op.module.b.as_ref().expect("validated LoRA B");
+            let down = candle_nn::Linear::new(a.to_dtype(DType::F32)?, None);
+            let up = candle_nn::Linear::new(b.to_dtype(DType::F32)?, None);
+            use candle_audio::candle_core::Module;
+            let output = up
+                .forward(&down.forward(&x)?)?
+                .affine((op.effective_scale as f32) as f64, 0.)?;
+            delta = Some(match delta {
+                None => output,
+                Some(previous) => (previous + output)?,
+            });
+        }
+        let dtype = base.dtype();
+        base.broadcast_add(&delta.expect("nonempty adapter stack").to_dtype(dtype)?)
+    }
+    fn dense_weight(&self) -> candle_audio::candle_core::Result<Tensor> {
+        apply_adapter_ops(&self.base.dense_weight()?, &self.ops)
+            .map_err(|e| candle_audio::candle_core::Error::Msg(e.to_string()))
+    }
+    fn format_id(&self) -> &'static str {
+        self.base.format_id()
+    }
+    fn dims(&self) -> (usize, usize) {
+        self.base.dims()
+    }
+    fn device(&self) -> &Device {
+        self.base.device()
+    }
+    fn resident_bytes(&self) -> u64 {
+        self.base.resident_bytes()
+            + self
+                .ops
+                .iter()
+                .flat_map(|op| [op.module.a.as_ref(), op.module.b.as_ref()])
+                .flatten()
+                .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                .sum::<u64>()
+    }
+}
+
 impl candle_nn::var_builder::SimpleBackend for AdapterBackend {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_audio::candle_core::Result<
+        Option<std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>>,
+    > {
+        let Some(ops) = self.plan.ops_for(name) else {
+            return self.inner.native_linear_weight(name, shape, dtype, device);
+        };
+        // XS obtains singular vectors and DoRA/BoRA normalize the sequentially adapted
+        // coefficients. Only the pure additive LoRA stack commutes with a frozen base GEMM.
+        if ops.iter().any(|op| op.kind != AdapterType::Lora) {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .native_linear_weight(name, shape, dtype, device)?
+            .map(|base| {
+                std::sync::Arc::new(NativeLora {
+                    base,
+                    ops: ops.to_vec(),
+                }) as _
+            }))
+    }
+
     fn get(
         &self,
         shape: candle_audio::candle_core::Shape,

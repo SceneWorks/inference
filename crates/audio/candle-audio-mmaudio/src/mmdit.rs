@@ -1213,7 +1213,8 @@ pub fn load_config_from_pth(cfg: Config, weights: &Path, device: &Device) -> Res
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth(weights, DType::F32, device).map_err(AudioError::from)?;
+    let vb = candle_audio::weights::state_builder(weights, None, DType::F32, device)
+        .map_err(AudioError::from)?;
     MmAudioDit::load(cfg, vb, device.clone()).map_err(AudioError::from)
 }
 
@@ -1245,11 +1246,11 @@ pub fn load(source: &WeightsSource, device: &Device) -> Result<MmAudioDit> {
     let path: PathBuf = match source {
         WeightsSource::File(p) => p.clone(),
         WeightsSource::Dir(d) => {
-            let nested = d.join(WEIGHTS_PATH);
+            let nested = candle_audio::weights::checkpoint_file(d.join(WEIGHTS_PATH));
             if nested.exists() {
                 nested
             } else {
-                d.join("mmaudio_small_16k.pth")
+                candle_audio::weights::checkpoint_file(d.join("mmaudio_small_16k.pth"))
             }
         }
     };
@@ -1262,11 +1263,11 @@ pub fn load_large_44k_v2(source: &WeightsSource, device: &Device) -> Result<MmAu
     let path: PathBuf = match source {
         WeightsSource::File(p) => p.clone(),
         WeightsSource::Dir(d) => {
-            let nested = d.join(WEIGHTS_PATH_44K);
+            let nested = candle_audio::weights::checkpoint_file(d.join(WEIGHTS_PATH_44K));
             if nested.exists() {
                 nested
             } else {
-                d.join("mmaudio_large_44k_v2.pth")
+                candle_audio::weights::checkpoint_file(d.join("mmaudio_large_44k_v2.pth"))
             }
         }
     };

@@ -148,13 +148,13 @@ impl XcodecDecoder {
     /// the semantic branch and the encoders are never paged in. Widths come from the tensors and
     /// are cross-checked (codebook size, codebook width → `fc_post2` → decoder input).
     pub fn load(checkpoint: &Path, device: &Device) -> Result<Self, AudioError> {
-        let st = candle_audio::weights::mmap_safetensors(checkpoint)
-            .map_err(|e| AudioError::Msg(format!("xcodec: open {}: {e}", checkpoint.display())))?;
-        let load = |name: &str| -> Result<Tensor, AudioError> {
-            candle_audio::weights::load_f32(&st, name, device)
+        let source = candle_audio::weights::AudioCheckpoint::open(checkpoint, device)?;
+        let names = source.names();
+        let vb = source.builder(DType::F32, device);
+        let load = |name: &str| {
+            vb.get_unchecked(name)
                 .map_err(|e| AudioError::Msg(format!("xcodec: tensor {name:?}: {e}")))
         };
-
         let codebooks = (0..NUM_CODEBOOKS)
             .map(|q| load(&format!("quantizer.vq.layers.{q}._codebook.embed")))
             .collect::<Result<Vec<_>, _>>()?;
@@ -169,9 +169,8 @@ impl XcodecDecoder {
             )));
         }
 
-        let fc_w = load("fc_post2.weight")?;
-        let fc_b = load("fc_post2.bias")?;
-        let (latent, fc_in) = fc_w.dims2()?;
+        let fc_post2 = candle_audio::weights::checkpoint_linear(&vb.pp("fc_post2"), true)?;
+        let (latent, fc_in) = fc_post2.weight_dims()?;
         if fc_in != dim {
             return Err(AudioError::Msg(format!(
                 "xcodec: fc_post2 takes {fc_in} channels but the codebooks are {dim} wide"
@@ -179,7 +178,7 @@ impl XcodecDecoder {
         }
 
         let mut raw = HashMap::new();
-        for (name, _) in st.tensors() {
+        for name in names {
             if name.starts_with("decoder_2.") {
                 let t = load(&name)?;
                 raw.insert(name, t);
@@ -195,7 +194,7 @@ impl XcodecDecoder {
         }
         Ok(Self {
             codebooks,
-            fc_post2: Linear::new(fc_w, Some(fc_b)),
+            fc_post2,
             decoder,
             device: device.clone(),
             chunk_frames: DECODE_CHUNK_FRAMES,

@@ -132,7 +132,7 @@ fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 impl ClapEmbedder {
     fn build(&self) -> AudioResult<Loaded> {
         let device = candle_audio::default_device()?;
-        let weights = self.root.join(WEIGHTS_FILE);
+        let weights = candle_audio::weights::checkpoint_file(self.root.join(WEIGHTS_FILE));
         if !weights.exists() {
             return Err(AudioError::Msg(format!(
                 "{MODEL_ID}: missing {WEIGHTS_FILE} under {}",
@@ -149,7 +149,8 @@ impl ClapEmbedder {
         .map_err(|e| AudioError::Msg(format!("{MODEL_ID}: tokenizer load failed: {e}")))?;
 
         // Load the whole pickle checkpoint as f32.
-        let vb = VarBuilder::from_pth(&weights, DType::F32, &device).map_err(AudioError::from)?;
+        let vb = candle_audio::weights::state_builder(&weights, None, DType::F32, &device)
+            .map_err(AudioError::from)?;
 
         let audio_tower = AudioTower::load(vb.pp("audio_model").pp("audio_encoder"), &device)
             .map_err(AudioError::from)?;

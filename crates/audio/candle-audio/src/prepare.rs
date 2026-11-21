@@ -32,7 +32,7 @@ pub fn probe_json_config(
     config: &str,
     accept: impl FnOnce(&serde_json::Value) -> bool,
 ) -> bool {
-    if !dir.is_dir() || !dir.join(weights).is_file() {
+    if !dir.is_dir() || !crate::weights::checkpoint_file(dir.join(weights)).is_file() {
         return false;
     }
     std::fs::read_to_string(dir.join(config))

@@ -39,7 +39,7 @@ use crate::error::{to_core, Error, Result};
 use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
-use crate::primitives::nn::{gelu, gelu_erf, linear};
+use crate::primitives::nn::{gelu, gelu_erf};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, AttnFormulation, Weights};
@@ -125,10 +125,8 @@ impl LlavaConfig {
 
 /// The LLaVA multimodal projector: `linear_2(act(linear_1(x)))`, both layers with bias, run in f32.
 pub struct LlavaProjector {
-    linear1_w: Tensor,
-    linear1_b: Tensor,
-    linear2_w: Tensor,
-    linear2_b: Tensor,
+    linear1_w: crate::primitives::Projection,
+    linear2_w: crate::primitives::Projection,
     gelu_tanh: bool,
 }
 
@@ -140,23 +138,29 @@ impl LlavaProjector {
                 .to_dtype(candle_core::DType::F32)?)
         };
         Ok(Self {
-            linear1_w: f32w("linear_1.weight")?,
-            linear1_b: f32w("linear_1.bias")?,
-            linear2_w: f32w("linear_2.weight")?,
-            linear2_b: f32w("linear_2.bias")?,
+            linear1_w: w.linear(
+                &format!("{prefix}.linear_1.weight"),
+                candle_core::DType::F32,
+                Some(f32w("linear_1.bias")?),
+            )?,
+            linear2_w: w.linear(
+                &format!("{prefix}.linear_2.weight"),
+                candle_core::DType::F32,
+                Some(f32w("linear_2.bias")?),
+            )?,
             gelu_tanh,
         })
     }
 
     /// Project SigLIP features `[b, seq, vision_hidden]` to language features `[b, seq, hidden]`.
     pub fn forward(&self, features: &Tensor) -> Result<Tensor> {
-        let h = __model_proof_output!(linear(features, &self.linear1_w, Some(&self.linear1_b)))?;
+        let h = __model_proof_output!(self.linear1_w.forward(features))?;
         let h = if self.gelu_tanh {
             gelu(&h)?
         } else {
             gelu_erf(&h)?
         };
-        __model_proof_output!(linear(&h, &self.linear2_w, Some(&self.linear2_b)))
+        __model_proof_output!(self.linear2_w.forward(&h))
     }
 }
 
@@ -250,6 +254,7 @@ pub struct LlavaGeneration {
 
 /// A loaded LLaVA VLM: vision tower, projector, language decoder, and image preprocessor.
 pub struct LlavaModel {
+    native_census: crate::primitives::ProjectionCensus,
     vision: SiglipVisionTower,
     projector: LlavaProjector,
     language: CausalLm,
@@ -301,6 +306,7 @@ impl LlavaModel {
         Ok(Self {
             vision,
             projector,
+            native_census: w.native_census(),
             language,
             processor,
             cfg,
@@ -539,6 +545,9 @@ impl LlavaProvider {
 }
 
 impl TextLlm for LlavaProvider {
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        self.model.native_census.checkpoint_report()
+    }
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
     }

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core::WeightsSource;
 use candle_audio::{AudioError, Result};
-use candle_nn::VarBuilder;
 
 use crate::sync::SynchformerVisualEncoder;
 
@@ -57,7 +56,8 @@ pub fn load_from_pth(weights: &Path, device: &Device) -> Result<SynchformerVisua
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth(weights, DType::F32, device).map_err(AudioError::from)?;
+    let vb = candle_audio::weights::state_builder(weights, None, DType::F32, device)
+        .map_err(AudioError::from)?;
     SynchformerVisualEncoder::load(vb.pp("vfeat_extractor"), device.clone())
         .map_err(AudioError::from)
 }
@@ -68,11 +68,11 @@ pub fn load(source: &WeightsSource, device: &Device) -> Result<SynchformerVisual
     let path: PathBuf = match source {
         WeightsSource::File(p) => p.clone(),
         WeightsSource::Dir(d) => {
-            let nested = d.join(WEIGHTS_PATH);
+            let nested = candle_audio::weights::checkpoint_file(d.join(WEIGHTS_PATH));
             if nested.exists() {
                 nested
             } else {
-                d.join("synchformer_state_dict.pth")
+                candle_audio::weights::checkpoint_file(d.join("synchformer_state_dict.pth"))
             }
         }
     };

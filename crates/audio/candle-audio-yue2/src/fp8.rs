@@ -285,18 +285,15 @@ pub fn status(lm: &Yue2Lm) -> Fp8Status {
 /// scale, and the shared cuBLASLt handle.
 #[cfg(feature = "cuda")]
 pub struct Fp8Weight {
-    w: candle_quant_kernels::cublaslt::DevFp8,
+    op: candle_quant_kernels::fp8_linear::Fp8Linear,
     scale: f32,
-    shape: (usize, usize),
-    device: Device,
-    lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
 }
 
 #[cfg(feature = "cuda")]
 impl Fp8Weight {
     /// `(out, in)`.
     pub fn shape(&self) -> (usize, usize) {
-        self.shape
+        self.op.dims()
     }
 
     /// The weight's per-tensor scale.
@@ -306,12 +303,13 @@ impl Fp8Weight {
 
     /// The CUDA device.
     pub fn device(&self) -> &Device {
-        &self.device
+        self.op.device()
     }
 
     /// The FP8 bytes plus the F32 scale.
     pub fn resident_bytes(&self) -> u64 {
-        (self.shape.0 * self.shape.1) as u64 + 4
+        let (out, inp) = self.shape();
+        (out * inp) as u64 + 4
     }
 
     /// Upstream `FP8Linear.forward`: BF16 `x` `[…, in]` → pad rows to 16 → dynamic per-tensor
@@ -328,7 +326,7 @@ impl Fp8Weight {
         if x.dtype() != DType::BF16 {
             bail!("FP8 AR expects BF16 input, got {:?}", x.dtype());
         }
-        let (n, k) = self.shape;
+        let (n, k) = self.shape();
         let dims = x.dims().to_vec();
         if dims.last() != Some(&k) {
             bail!("FP8 AR: input {dims:?} does not end in {k}");
@@ -344,10 +342,7 @@ impl Fp8Weight {
                 0,
             )?
         };
-        let (q, x_scale) = quantize_e4m3(&padded)?;
-        let xq = self.lt.stage_fp8(&q)?;
-        let y =
-            __model_proof_output!(self.lt.matmul_fp8_staged(&self.w, self.scale, &xq, x_scale))?;
+        let y = __model_proof_output!(self.op.forward(&padded))?;
         let mut out_dims = dims;
         *out_dims.last_mut().expect("non-empty") = n;
         let y = y.narrow(0, 0, m)?.reshape(out_dims)?;
@@ -426,14 +421,14 @@ mod cuda {
                     .map_err(err("move original"))?;
                 let (q, scale) = quantize_e4m3(&host).map_err(err("quantize weight"))?;
                 let q = q.to_device(device).map_err(err("upload weight"))?;
-                let staged = lt.stage_fp8(&q).map_err(err("stage weight"))?;
-                let fp8 = Fp8Weight {
-                    w: staged,
+                let op = candle_quant_kernels::fp8_linear::Fp8Linear::from_dynamic_codes(
+                    q,
                     scale,
-                    shape: weight.dims2().map_err(err("weight shape"))?,
-                    device: device.clone(),
-                    lt: Arc::clone(lt),
-                };
+                    Arc::clone(lt),
+                    quantize_e4m3,
+                )
+                .map_err(err("stage weight"))?;
+                let fp8 = Fp8Weight { op, scale };
                 // The original is kept before the device copy is dropped.
                 lm.fp8.as_mut().expect("prepared above").originals[i].push(host);
                 *lm.layers_mut()[i].ar.projections_mut()[j] = Proj::Fp8(Box::new(fp8));

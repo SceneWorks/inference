@@ -10,7 +10,7 @@ use candle_nn::ops::softmax_last_dim;
 use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::error::{Error, Result};
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
-use crate::primitives::nn::{conv2d, gelu, layer_norm, linear};
+use crate::primitives::nn::{conv2d, gelu, layer_norm};
 use crate::primitives::step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 use crate::primitives::Weights;
 
@@ -33,39 +33,56 @@ fn clip_quick_gelu(value: &Tensor) -> Result<Tensor> {
 struct ClipBlock {
     ln1w: Tensor,
     ln1b: Tensor,
-    qkvw: Tensor,
-    qkvb: Tensor,
-    outw: Tensor,
-    outb: Tensor,
+    qkvw: crate::primitives::Projection,
+    outw: crate::primitives::Projection,
     ln2w: Tensor,
     ln2b: Tensor,
-    fcw: Tensor,
-    fcb: Tensor,
-    projw: Tensor,
-    projb: Tensor,
+    fcw: crate::primitives::Projection,
+    projw: crate::primitives::Projection,
 }
 
 impl ClipBlock {
     fn load(w: &Weights, p: &str) -> Result<Self> {
+        let qkv = if w.contains(&format!("{p}.attn.in_proj.weight")) {
+            "attn.in_proj.weight"
+        } else {
+            "attn.in_proj_weight"
+        };
+        let qkv_bias = if w.contains(&format!("{p}.attn.in_proj.bias")) {
+            "attn.in_proj.bias"
+        } else {
+            "attn.in_proj_bias"
+        };
         Ok(Self {
             ln1w: tensor(w, p, "ln_1.weight")?,
             ln1b: tensor(w, p, "ln_1.bias")?,
-            qkvw: tensor(w, p, "attn.in_proj_weight")?,
-            qkvb: tensor(w, p, "attn.in_proj_bias")?,
-            outw: tensor(w, p, "attn.out_proj.weight")?,
-            outb: tensor(w, p, "attn.out_proj.bias")?,
+            qkvw: decoder_projection(w, p, qkv, Some(tensor(w, p, qkv_bias)?))?,
+            outw: decoder_projection(
+                w,
+                p,
+                "attn.out_proj.weight",
+                Some(tensor(w, p, "attn.out_proj.bias")?),
+            )?,
             ln2w: tensor(w, p, "ln_2.weight")?,
             ln2b: tensor(w, p, "ln_2.bias")?,
-            fcw: tensor(w, p, "mlp.c_fc.weight")?,
-            fcb: tensor(w, p, "mlp.c_fc.bias")?,
-            projw: tensor(w, p, "mlp.c_proj.weight")?,
-            projb: tensor(w, p, "mlp.c_proj.bias")?,
+            fcw: decoder_projection(
+                w,
+                p,
+                "mlp.c_fc.weight",
+                Some(tensor(w, p, "mlp.c_fc.bias")?),
+            )?,
+            projw: decoder_projection(
+                w,
+                p,
+                "mlp.c_proj.weight",
+                Some(tensor(w, p, "mlp.c_proj.bias")?),
+            )?,
         })
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let h = __model_proof_output!(layer_norm(input, &self.ln1w, &self.ln1b, 1e-5))?;
-        let qkv = __model_proof_output!(linear(&h, &self.qkvw, Some(&self.qkvb)))?;
+        let qkv = __model_proof_output!(self.qkvw.forward(&h))?;
         let (batch, seq, _) = qkv.dims3()?;
         let head = CLIP_WIDTH / CLIP_HEADS;
         let split = |start| -> Result<Tensor> {
@@ -86,14 +103,11 @@ impl ClipBlock {
         .transpose(1, 2)?
         .contiguous()?
         .reshape((batch, seq, CLIP_WIDTH))?;
-        let residual =
-            (input + __model_proof_output!(linear(&attn, &self.outw, Some(&self.outb)))?)?;
-        let mlp = clip_quick_gelu(&__model_proof_output!(linear(
-            &__model_proof_output!(layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5))?,
-            &self.fcw,
-            Some(&self.fcb),
+        let residual = (input + __model_proof_output!(self.outw.forward(&attn))?)?;
+        let mlp = clip_quick_gelu(&__model_proof_output!(self.fcw.forward(
+            &__model_proof_output!(layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5))?
         ))?)?;
-        Ok((&residual + __model_proof_output!(linear(&mlp, &self.projw, Some(&self.projb)))?)?)
+        Ok((&residual + __model_proof_output!(self.projw.forward(&mlp))?)?)
     }
 }
 
@@ -159,10 +173,8 @@ impl StarVectorClip {
 
 /// Checkpoint adapter (`Linear → Swish → Linear → eval BatchNorm1d`).
 pub struct StarVectorAdapter {
-    fcw: Tensor,
-    fcb: Tensor,
-    projw: Tensor,
-    projb: Tensor,
+    fcw: crate::primitives::Projection,
+    projw: crate::primitives::Projection,
     normw: Tensor,
     normb: Tensor,
     mean: Tensor,
@@ -172,10 +184,8 @@ impl StarVectorAdapter {
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let p = "model.image_projection";
         Ok(Self {
-            fcw: tensor(w, p, "c_fc.weight")?,
-            fcb: tensor(w, p, "c_fc.bias")?,
-            projw: tensor(w, p, "c_proj.weight")?,
-            projb: tensor(w, p, "c_proj.bias")?,
+            fcw: decoder_projection(w, p, "c_fc.weight", Some(tensor(w, p, "c_fc.bias")?))?,
+            projw: decoder_projection(w, p, "c_proj.weight", Some(tensor(w, p, "c_proj.bias")?))?,
             normw: tensor(w, p, "norm.weight")?,
             normb: tensor(w, p, "norm.bias")?,
             mean: tensor(w, p, "norm.running_mean")?,
@@ -183,9 +193,9 @@ impl StarVectorAdapter {
         })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = __model_proof_output!(linear(x, &self.fcw, Some(&self.fcb)))?;
+        let h = __model_proof_output!(self.fcw.forward(x))?;
         let h = (&h * candle_nn::ops::sigmoid(&h)?)?;
-        let h = __model_proof_output!(linear(&h, &self.projw, Some(&self.projb)))?;
+        let h = __model_proof_output!(self.projw.forward(&h))?;
         let (_, tokens, hidden) = h.dims3()?;
         if tokens != STARVECTOR_IMAGE_TOKENS || hidden != STARVECTOR_HIDDEN {
             return Err(Error::Msg("starvector adapter shape mismatch".into()));
@@ -219,7 +229,7 @@ pub struct StarVectorDecoder {
     layers: Vec<BigCodeBlock>,
     lnw: Tensor,
     lnb: Tensor,
-    head: Tensor,
+    head: crate::primitives::Projection,
     geometry: StarVectorDecoderGeometry,
     /// Which KV cache [`StepModel::new_cache_for`] builds (static by default).
     step_kv_cache: KvCacheKind,
@@ -255,32 +265,44 @@ impl StarVectorDecoderGeometry {
 struct BigCodeBlock {
     ln1w: Tensor,
     ln1b: Tensor,
-    qkvw: Tensor,
-    qkvb: Tensor,
-    outw: Tensor,
-    outb: Tensor,
+    qkvw: crate::primitives::Projection,
+    outw: crate::primitives::Projection,
     ln2w: Tensor,
     ln2b: Tensor,
-    fcw: Tensor,
-    fcb: Tensor,
-    projw: Tensor,
-    projb: Tensor,
+    fcw: crate::primitives::Projection,
+    projw: crate::primitives::Projection,
 }
 impl BigCodeBlock {
     fn load(w: &Weights, p: &str) -> Result<Self> {
         Ok(Self {
             ln1w: tensor(w, p, "ln_1.weight")?,
             ln1b: tensor(w, p, "ln_1.bias")?,
-            qkvw: decoder_projection(w, p, "attn.c_attn.weight")?,
-            qkvb: tensor(w, p, "attn.c_attn.bias")?,
-            outw: decoder_projection(w, p, "attn.c_proj.weight")?,
-            outb: tensor(w, p, "attn.c_proj.bias")?,
+            qkvw: decoder_projection(
+                w,
+                p,
+                "attn.c_attn.weight",
+                Some(tensor(w, p, "attn.c_attn.bias")?),
+            )?,
+            outw: decoder_projection(
+                w,
+                p,
+                "attn.c_proj.weight",
+                Some(tensor(w, p, "attn.c_proj.bias")?),
+            )?,
             ln2w: tensor(w, p, "ln_2.weight")?,
             ln2b: tensor(w, p, "ln_2.bias")?,
-            fcw: decoder_projection(w, p, "mlp.c_fc.weight")?,
-            fcb: tensor(w, p, "mlp.c_fc.bias")?,
-            projw: decoder_projection(w, p, "mlp.c_proj.weight")?,
-            projb: tensor(w, p, "mlp.c_proj.bias")?,
+            fcw: decoder_projection(
+                w,
+                p,
+                "mlp.c_fc.weight",
+                Some(tensor(w, p, "mlp.c_fc.bias")?),
+            )?,
+            projw: decoder_projection(
+                w,
+                p,
+                "mlp.c_proj.weight",
+                Some(tensor(w, p, "mlp.c_proj.bias")?),
+            )?,
         })
     }
     /// One block over `input` `[b, s, hidden]` at position `past`, appending this step's shared
@@ -294,7 +316,7 @@ impl BigCodeBlock {
         layer: usize,
     ) -> Result<Tensor> {
         let h = __model_proof_output!(layer_norm(input, &self.ln1w, &self.ln1b, 1e-5))?;
-        let qkv = __model_proof_output!(linear(&h, &self.qkvw, Some(&self.qkvb)))?;
+        let qkv = __model_proof_output!(self.qkvw.forward(&h))?;
         let (b, s, _) = qkv.dims3()?;
         let q = qkv.narrow(2, 0, geometry.hidden)?.reshape((
             b,
@@ -307,14 +329,11 @@ impl BigCodeBlock {
         let v = qkv.narrow(2, geometry.hidden + head, head)?.contiguous()?;
         let (keys, values) = cache.update(layer, &k.unsqueeze(1)?, &v.unsqueeze(1)?)?;
         let attn = multi_query_attention_split(&q, &keys.squeeze(1)?, &values.squeeze(1)?, past)?;
-        let residual =
-            (input + __model_proof_output!(linear(&attn, &self.outw, Some(&self.outb)))?)?;
-        let mlp = gelu(&__model_proof_output!(linear(
-            &__model_proof_output!(layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5))?,
-            &self.fcw,
-            Some(&self.fcb),
+        let residual = (input + __model_proof_output!(self.outw.forward(&attn))?)?;
+        let mlp = gelu(&__model_proof_output!(self.fcw.forward(
+            &__model_proof_output!(layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5))?
         ))?)?;
-        Ok((&residual + __model_proof_output!(linear(&mlp, &self.projw, Some(&self.projb)))?)?)
+        Ok((&residual + __model_proof_output!(self.projw.forward(&mlp))?)?)
     }
 }
 
@@ -388,15 +407,32 @@ fn multi_query_attention_split(
 /// The published StarVector GPTBigCode tensors are already `[out, in]`, exactly as Candle's
 /// shared `linear` leaf expects. Keeping this boundary explicit prevents accidentally applying
 /// the older Transformers `Conv1D` `[in, out]` convention to these safetensors.
-fn decoder_projection(w: &Weights, prefix: &str, suffix: &str) -> Result<Tensor> {
-    tensor(w, prefix, suffix)
+fn decoder_projection(
+    w: &Weights,
+    prefix: &str,
+    suffix: &str,
+    bias: Option<Tensor>,
+) -> Result<crate::primitives::Projection> {
+    let key = format!("{prefix}.{suffix}");
+    w.linear(&key, w.linear_dtype(&key)?, bias)
 }
 
-fn tied_token_embedding(w: &Weights, prefix: &str) -> Result<(Tensor, Tensor)> {
+fn tied_token_embedding(
+    w: &Weights,
+    prefix: &str,
+) -> Result<(Tensor, crate::primitives::Projection)> {
     let wte = tensor(w, prefix, "wte.weight")?;
     // GPTBigCode ties the output projection to the token embedding. The published
     // StarVector-1B snapshot therefore intentionally has no separate `lm_head.weight`.
-    let head = wte.clone();
+    let head = match w.native_projection(
+        &format!("{prefix}.wte.weight"),
+        wte.dtype(),
+        wte.device(),
+        None,
+    )? {
+        Some(op) => op,
+        None => crate::primitives::Projection::load(wte.clone(), None)?,
+    };
     Ok((wte, head))
 }
 
@@ -438,7 +474,7 @@ impl StarVectorDecoder {
     pub fn forward_embeds(&self, input: &Tensor, cache: &mut dyn KvCache) -> Result<Tensor> {
         let out = self.normed_states(input, cache)?;
         let s = out.dim(1)?;
-        linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)
+        self.head.forward(&out.narrow(1, s - 1, 1)?.squeeze(1)?)
     }
     /// The block stack over `input` at `cache`'s length, final-LayerNormed: `[b, s, hidden]`.
     fn normed_states(&self, input: &Tensor, cache: &mut dyn KvCache) -> Result<Tensor> {
@@ -549,14 +585,16 @@ impl StepModel for StarVectorDecoder {
         let logits = match request.scope {
             LogitsScope::Last => {
                 let s = out.dim(1)?;
-                linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)?
+                self.head.forward(&out.narrow(1, s - 1, 1)?.squeeze(1)?)?
             }
             // Row-wise through the same 2-D product the last-position path runs, so a one-token
             // verify step is bit-identical to a plain decode step.
             LogitsScope::All => {
                 let (b, s, h) = out.dims3()?;
-                let vocab = self.head.dim(0)?;
-                linear(&out.reshape((b * s, h))?, &self.head, None)?.reshape((b, s, vocab))?
+                let vocab = self.head.dims().0;
+                self.head
+                    .forward(&out.reshape((b * s, h))?)?
+                    .reshape((b, s, vocab))?
             }
         };
         Ok(StepOutput {
@@ -732,11 +770,13 @@ mod tests {
         tensors.insert("fixture.attn.c_attn.weight".into(), projection);
         let weights = Weights::from_map(tensors, device.clone());
 
-        let projection = decoder_projection(&weights, "fixture", "attn.c_attn.weight").unwrap();
-        assert_eq!(projection.dims(), &[3, 2]);
+        let projection =
+            decoder_projection(&weights, "fixture", "attn.c_attn.weight", None).unwrap();
+        assert_eq!(projection.dims(), (3, 2));
         let input = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
         assert_eq!(
-            linear(&input, &projection, None)
+            projection
+                .forward(&input)
                 .unwrap()
                 .to_vec2::<f32>()
                 .unwrap(),
@@ -764,19 +804,30 @@ mod tests {
             tied_token_embedding(&weights, "model.svg_transformer.transformer.transformer")
                 .unwrap();
         assert_eq!(
-            head.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            head.forward(&Tensor::eye(2, DType::F32, &device).unwrap())
+                .unwrap()
+                .t()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
             values
         );
         assert_eq!(
             wte.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            head.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            head.forward(&Tensor::eye(2, DType::F32, &device).unwrap())
+                .unwrap()
+                .t()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         );
         let hidden = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
         assert_eq!(
-            linear(&hidden, &head, None)
-                .unwrap()
-                .to_vec2::<f32>()
-                .unwrap(),
+            head.forward(&hidden).unwrap().to_vec2::<f32>().unwrap(),
             vec![vec![1.0, 3.0, 5.0]]
         );
 

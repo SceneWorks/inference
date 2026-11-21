@@ -139,13 +139,7 @@ fn load_decode_tensors(ckpt: &Path) -> Result<HashMap<String, Tensor>> {
 // --------------------------------------------------------------------------------------------
 
 fn linear(vb: &VarBuilder, name: &str, out: usize, inp: usize, bias: bool) -> CandleResult<Linear> {
-    let w = vb.get((out, inp), &format!("{name}.weight"))?;
-    let b = if bias {
-        Some(vb.get(out, &format!("{name}.bias"))?)
-    } else {
-        None
-    };
-    Ok(Linear::new(w, b))
+    candle_nn::linear_b(inp, out, bias, vb.pp(name))
 }
 
 fn layer_norm(vb: &VarBuilder, name: &str, dim: usize, eps: f64) -> CandleResult<LayerNorm> {
@@ -505,6 +499,17 @@ impl XyTokenizerCodec {
     /// Load the decoder from a `xy_tokenizer.ckpt` raw-pickle checkpoint.
     pub fn load(ckpt: &Path) -> Result<Self> {
         let device = candle_audio::default_device()?;
+        let resolved = candle_audio::weights::checkpoint_file(ckpt.to_owned());
+        if candle_audio::weights::is_safetensors(&resolved) {
+            let vb =
+                candle_audio::weights::normalized_state_builder(&resolved, DType::F32, &device)?;
+            let vb = if vb.contains_tensor("generator.quantizer.quantizers.0.codebook") {
+                vb.pp("generator")
+            } else {
+                vb
+            };
+            return Self::from_var_builder(vb, device);
+        }
         let tensors = load_decode_tensors(ckpt)?
             .into_iter()
             .map(|(k, v)| Ok((k, v.to_device(&device)?)))

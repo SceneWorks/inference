@@ -284,6 +284,7 @@ fn indexed_part(
             }
             IndexedExperts::nvfp4(&weights)
         }
+        Some(Projection::Checkpoint(_, kind)) => return Ok(Err(kind.label())),
         Some(Projection::Prism(_)) => return Ok(Err("prism")),
         // A dense projection in a per-expert bank: a biased or mixed bank (an all-dense, bias-free
         // bank is stacked instead).
@@ -483,12 +484,13 @@ pub struct MoeRouting {
 /// modelled — the verification model (V2-Lite) uses plain greedy top-k.
 pub struct SparseMoe {
     /// Router weight `[experts, hidden]`, in the model's activation dtype.
-    router: Tensor,
+    router: Projection,
+    dtype: DType,
     bank: ExpertBank,
     num_experts: usize,
     shared: SwiGlu,
     /// Shared-expert sigmoid gate `[1, hidden]`; `None` ⇒ the shared expert is added ungated.
-    shared_gate: Option<Tensor>,
+    shared_gate: Option<Projection>,
     routing: MoeRouting,
     /// Whether a gathered dispatch on CUDA (the indexed kernels refused) was logged.
     gather_noted: AtomicBool,
@@ -506,15 +508,35 @@ impl SparseMoe {
         shared_gate: Option<Tensor>,
         routing: MoeRouting,
     ) -> Result<Self> {
+        let dtype = router.dtype();
+        Self::from_projections(
+            Projection::load(router, None)?,
+            dtype,
+            experts,
+            shared,
+            shared_gate.map(|t| Projection::load(t, None)).transpose()?,
+            routing,
+        )
+    }
+
+    pub(crate) fn from_projections(
+        router: Projection,
+        dtype: DType,
+        experts: Vec<SwiGlu>,
+        shared: SwiGlu,
+        shared_gate: Option<Projection>,
+        routing: MoeRouting,
+    ) -> Result<Self> {
         let num_experts = experts.len();
-        if num_experts == 0 || router.dim(0)? != num_experts {
+        if num_experts == 0 || router.dims().0 != num_experts {
             return Err(Error::Config(format!(
                 "an MoE router over {} experts needs as many experts, got {num_experts}",
-                router.dim(0)?
+                router.dims().0
             )));
         }
         Ok(Self {
             router,
+            dtype,
             bank: ExpertBank::new(experts)?,
             num_experts,
             shared,
@@ -541,7 +563,7 @@ impl SparseMoe {
         if t > DEVICE_DISPATCH_MAX_ROWS {
             return Dispatch::Grouped;
         }
-        if self.bank.indexed_refusal(self.router.dtype()).is_none() {
+        if self.bank.indexed_refusal(self.dtype).is_none() {
             return Dispatch::Indexed;
         }
         match self.bank.layout {
@@ -565,7 +587,7 @@ impl SparseMoe {
     /// dense bank they refuse still dispatches on the device (gathered); any other bank is
     /// dispatched grouped and refused for graph capture with this cause.
     pub fn indexed_refusal(&self) -> Option<&'static str> {
-        self.bank.indexed_refusal(self.router.dtype())
+        self.bank.indexed_refusal(self.dtype)
     }
 
     /// Device bytes of this block's indexed expert-address tables (the three projections'
@@ -581,8 +603,7 @@ impl SparseMoe {
     /// (the dispatch's workspace and temporaries, `experts_per_tok` slots) — what admission prices
     /// per token on top of the dense step working set.
     pub fn step_bytes_per_token(&self) -> u64 {
-        self.bank
-            .step_bytes_per_token(self.router.dtype(), self.top_k())
+        self.bank.step_bytes_per_token(self.dtype, self.top_k())
     }
 
     /// Route every token on the device: the top-k expert ids `[t, k]` (u32, most probable first)
@@ -595,7 +616,7 @@ impl SparseMoe {
     /// which is at least `1 / experts` — so no clamp is taken here.
     pub fn route(&self, xf: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = self.top_k();
-        let logits = __model_proof_output!(xf.matmul(&self.router.t()?))?; // [t, E]
+        let logits = __model_proof_output!(self.router.forward(&xf))?; // [t, E]
         let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
         let ids = probs
             .arg_sort_last_dim(false)?
@@ -653,7 +674,7 @@ impl SparseMoe {
         let shared = self.shared.forward(&xf)?;
         let shared = match &self.shared_gate {
             Some(g) => {
-                let sg = candle_nn::ops::sigmoid(&xf.matmul(&g.t()?)?)?; // [t, 1]
+                let sg = candle_nn::ops::sigmoid(&g.forward(&xf)?)?; // [t, 1]
                 shared.broadcast_mul(&sg)?
             }
             None => shared,
@@ -724,9 +745,11 @@ impl SparseMoe {
     /// Add the block's weights to a census. A stacked dense bank counts as its per-expert dense
     /// projections, exactly as the un-stacked bank did.
     pub fn record(&self, census: &mut WeightCensus) {
-        census.record_tensor(&self.router);
-        if let Some(gate) = &self.shared_gate {
-            census.record_tensor(gate);
+        for gate in std::iter::once(&self.router).chain(self.shared_gate.iter()) {
+            match gate {
+                Projection::Dense(linear) => census.record_tensor(linear.weight()),
+                packed => census.projections.record(packed),
+            }
         }
         match &self.bank.layout {
             Layout::Stacked { gate, up, down } => {
@@ -920,11 +943,10 @@ mod tests {
             let mut rng = SplitMix64::new(9);
             let x = randn(&[5, 32], &mut rng);
             let (ids, weights) = moe.route(&x).unwrap();
-            let probs =
-                candle_nn::ops::softmax_last_dim(&x.matmul(&moe.router.t().unwrap()).unwrap())
-                    .unwrap()
-                    .to_vec2::<f32>()
-                    .unwrap();
+            let probs = candle_nn::ops::softmax_last_dim(&moe.router.forward(&x).unwrap())
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
             let ids = ids.to_vec2::<u32>().unwrap();
             let weights = weights.to_vec2::<f32>().unwrap();
             for (ti, row) in probs.iter().enumerate() {
@@ -1251,7 +1273,9 @@ mod tests {
         ];
         // `bank.forward` is `IndexedExperts::forward` (candle-quant-kernels): kernel launches
         // over device tables, no host read — audited, and listed on purpose by its receiver.
-        const DEVICE_OPS: [&str; 36] = [
+        // Router weights are resident projections; this call preserves the device-only routing path.
+        const DEVICE_OPS: [&str; 37] = [
+            "router.forward",
             "Ok",
             "f64::from",
             "Tensor::zeros",

@@ -120,6 +120,9 @@ pub(crate) fn loads_quantized(cfg: &Qwen35Config, prefix: &str, key: &str) -> bo
 /// The dense tensor `key` in the compute `dtype`, refusing a stored GGML block tensor (sc-19375)
 /// in a slot the loader reads dense — its bytes are block codes, not weights.
 fn dense_weight(w: &Weights, key: &str, dtype: DType) -> Result<Tensor> {
+    if let Some(dense) = w.encoded_dense(key, dtype, None)? {
+        return Ok(dense);
+    }
     let t = w.require(key)?;
     if is_ggml_block_tensor(t) {
         return Err(Error::Config(format!(
@@ -160,6 +163,9 @@ fn keyed_projection(
     modelopt: bool,
     device: &Device,
 ) -> Result<Projection> {
+    if let Some(p) = w.checkpoint_projection(key, dtype, device, None)? {
+        return Ok(p);
+    }
     if let Some(p) = crate::modelopt::modelopt_projection(w, key, format, device)? {
         return Ok(p);
     }
@@ -2038,15 +2044,16 @@ fn build_ffn(
             });
         }
     }
-    Ok(Ffn::Moe(SparseMoe::new(
-        req(lp("mlp.gate.weight"))?,
+    Ok(Ffn::Moe(SparseMoe::from_projections(
+        w.linear(&lp("mlp.gate.weight"), dtype, None)?,
+        dtype,
         experts,
         SwiGlu {
             gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
             up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
             down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
         },
-        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        Some(w.linear(&lp("mlp.shared_expert_gate.weight"), dtype, None)?),
         MoeRouting {
             experts_per_tok: moe.experts_per_tok,
             norm_topk_prob: true,
@@ -2376,7 +2383,9 @@ impl Qwen35Mtp {
             .map_err(|e| Error::Config(e.to_string()))?;
 
         let logical = |key: &str| -> Option<[usize; 2]> {
-            let (rows, cols) = raw.get(key)?.dims2().ok()?;
+            let &[rows, cols] = raw.shape(key)? else {
+                return None;
+            };
             match quant {
                 Some((_, group)) => {
                     let stem = key.strip_suffix(".weight").unwrap_or(key);
@@ -2388,9 +2397,7 @@ impl Qwen35Mtp {
         };
         // The shared stored-tensor check (E8: MLX refuses exactly the same heads).
         geometry
-            .check_tensors(prefix, logical, |key| {
-                raw.get(key).map(|t| t.dims().to_vec())
-            })
+            .check_tensors(prefix, logical, |key| raw.shape(key).map(<[usize]>::to_vec))
             .map_err(Error::Config)?;
         let mut expected_keys = std::collections::BTreeSet::new();
         for (name, _) in geometry.matrices() {
@@ -2412,17 +2419,10 @@ impl Qwen35Mtp {
         .map_err(Error::Config)?;
 
         // The predictor reads the native `mtp.` layout.
-        let device = raw.device().clone();
-        let w = Weights::from_map(
-            raw.into_map()
-                .into_iter()
-                .map(|(key, t)| match key.strip_prefix(prefix) {
-                    Some(bare) if prefix.is_empty() => (format!("mtp.{bare}"), t),
-                    _ => (key, t),
-                })
-                .collect(),
-            device,
-        );
+        let mut w = raw;
+        if prefix.is_empty() {
+            w.add_key_prefix("mtp.");
+        }
         let proj_q = |key: &str| -> Result<Projection> {
             match quant {
                 Some((bits, group)) => {
@@ -3974,7 +3974,7 @@ impl Qwen35Model {
         // embedding) is read as stored GGML blocks when a fully quantized tier (SW-7201) stores it
         // so, in its per-tensor format.
         let stored = |key: &str| -> Option<&Tensor> {
-            w.get(key)
+            w.plain(key)
                 .filter(|t| prism.is_none() && is_ggml_block_tensor(t))
         };
         let load_stored = |key: &str, t: &Tensor| -> Result<Projection> {
@@ -3987,7 +3987,7 @@ impl Qwen35Model {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
                 None => match stored(&key) {
                     Some(t) => load_stored(&key, t),
-                    None => Projection::load(req(key)?, None),
+                    None => w.linear(&key, dtype, None),
                 },
             }
         };
@@ -4029,41 +4029,49 @@ impl Qwen35Model {
         } else {
             "lm_head.weight".to_string()
         };
-        let lm_head =
-            if !with_lm_head {
-                None
-            } else {
-                Some(std::sync::Arc::new(
-                    if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
-                        Projection::load_prism(weight.clone())
-                    } else if cfg.tie_word_embeddings {
-                        match &embed_tokens {
-                            QwenEmbedding::Dense(weight) => {
-                                Projection::load_as(weight.clone(), None, dense_format)?
+        let lm_head = if !with_lm_head {
+            None
+        } else {
+            Some(std::sync::Arc::new(
+                if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+                    Projection::load_prism(weight.clone())
+                } else if cfg.tie_word_embeddings {
+                    match &embed_tokens {
+                        QwenEmbedding::Dense(weight) => {
+                            match w.native_projection(&embed_key, dtype, &device, None)? {
+                                Some(head) => head,
+                                None => Projection::load_as(weight.clone(), None, dense_format)?,
                             }
-                            // A tied stored table is the head's own blocks, as stored.
-                            QwenEmbedding::Q8(_) => load_stored(
-                                &embed_key,
-                                stored(&embed_key).expect("a Q8 table is stored"),
-                            )?,
-                            QwenEmbedding::Prism(_) => return Err(Error::Config(
+                        }
+                        // A tied stored table is the head's own blocks, as stored.
+                        QwenEmbedding::Q8(_) => load_stored(
+                            &embed_key,
+                            stored(&embed_key).expect("a Q8 table is stored"),
+                        )?,
+                        QwenEmbedding::Prism(_) => {
+                            return Err(Error::Config(
                                 "Prism tied embeddings require an explicit lm_head packed tensor"
                                     .into(),
-                            )),
+                            ))
                         }
-                    } else if cfg.sensenova_loop.is_some() {
-                        keyed_projection(w, &head_key, dtype, format, false, &device)?
-                    } else if let Some(t) = stored(&head_key) {
-                        load_stored(&head_key, t)?
-                    } else if let Some(head) =
-                        crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
-                    {
-                        head
-                    } else {
-                        Projection::load_as(req(head_key)?, None, dense_format)?
-                    },
-                ))
-            };
+                    }
+                } else if cfg.sensenova_loop.is_some() {
+                    keyed_projection(w, &head_key, dtype, format, false, &device)?
+                } else if let Some(t) = stored(&head_key) {
+                    load_stored(&head_key, t)?
+                } else if let Some(head) =
+                    w.checkpoint_projection(&head_key, dtype, &device, None)?
+                {
+                    head
+                } else if let Some(head) =
+                    crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
+                {
+                    head
+                } else {
+                    Projection::load_as(req(head_key)?, None, dense_format)?
+                },
+            ))
+        };
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;

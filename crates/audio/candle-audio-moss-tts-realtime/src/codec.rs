@@ -573,7 +573,7 @@ impl CodecLayer {
             Ok(LayerNorm::new(w, b, 1e-5))
         };
         let lin = |vbp: VarBuilder, out: usize, inp: usize| -> CandleResult<Linear> {
-            Ok(Linear::new(vbp.get((out, inp), "weight")?, None))
+            candle_nn::linear_no_bias(inp, out, vbp)
         };
         Ok(Self {
             norm1: ln("norm1")?,
@@ -727,20 +727,20 @@ impl CodecStage {
     fn load(spec: &StageSpec, context: usize, module: &str, vb: &VarBuilder) -> CandleResult<Self> {
         let vb_s = vb.pp(format!("{module}.{}", spec.index));
         let input_proj = if spec.d_model != spec.input_dim {
-            Some(Linear::new(
-                vb_s.pp("input_proj")
-                    .get((spec.d_model, spec.input_dim), "weight")?,
-                None,
-            ))
+            Some(candle_nn::linear_no_bias(
+                spec.input_dim,
+                spec.d_model,
+                vb_s.pp("input_proj"),
+            )?)
         } else {
             None
         };
         let output_proj = if spec.d_model != spec.output_dim {
-            Some(Linear::new(
-                vb_s.pp("output_proj")
-                    .get((spec.output_dim, spec.d_model), "weight")?,
-                None,
-            ))
+            Some(candle_nn::linear_no_bias(
+                spec.d_model,
+                spec.output_dim,
+                vb_s.pp("output_proj"),
+            )?)
         } else {
             None
         };

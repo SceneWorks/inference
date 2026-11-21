@@ -35,6 +35,7 @@ pub use memory_surface::*;
 mod builder;
 pub use builder::*;
 
+mod audio_receipts;
 mod providers;
 pub use providers::*;
 

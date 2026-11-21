@@ -78,6 +78,7 @@ impl HeadRows {
                     Device::Metal(_) => Self::Full("metal"),
                 }
             }
+            Projection::Checkpoint(_, kind) => Self::Full(kind.label()),
             Projection::Prism(_) => Self::Full("prism"),
             Projection::Nvfp4(_) => Self::Full("nvfp4"),
         })

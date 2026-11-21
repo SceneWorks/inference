@@ -53,42 +53,51 @@ impl KokoroPipeline {
     /// `kokoro-v1_0.pth`.
     pub fn from_snapshot(root: &Path, device: &Device) -> Result<Self> {
         let config = KokoroConfig::from_file(&root.join("config.json"))?;
-        let pth = root.join(CHECKPOINT_FILE);
+        let pth = candle_audio::weights::checkpoint_file(root.join(CHECKPOINT_FILE));
         if !pth.is_file() {
             return Err(AudioError::Msg(format!(
                 "kokoro snapshot {} has no {CHECKPOINT_FILE}",
                 root.display()
             )));
         }
-        let bert = Plbert::new(
-            config.n_token,
-            &config.plbert,
-            section_var_builder(&pth, "bert", device)?,
-        )?;
+        let source = candle_audio::weights::is_safetensors(&pth)
+            .then(|| {
+                candle_audio::weights::normalized_state_builder(
+                    &pth,
+                    candle_audio::candle_core::DType::F32,
+                    device,
+                )
+            })
+            .transpose()?;
+        let section = |name: &str| match &source {
+            Some(vb) => Ok(vb.pp(name)),
+            None => section_var_builder(&pth, name, device),
+        };
+        let bert = Plbert::new(config.n_token, &config.plbert, section("bert")?)?;
         let bert_encoder = linear(
             config.plbert.hidden_size,
             config.hidden_dim,
-            section_var_builder(&pth, "bert_encoder", device)?,
+            section("bert_encoder")?,
         )?;
         let predictor = ProsodyPredictor::new(
             config.style_dim,
             config.hidden_dim,
             config.n_layer,
             config.max_dur,
-            section_var_builder(&pth, "predictor", device)?,
+            section("predictor")?,
         )?;
         let text_encoder = TextEncoder::new(
             config.hidden_dim,
             config.text_encoder_kernel_size,
             config.n_layer,
             config.n_token,
-            section_var_builder(&pth, "text_encoder", device)?,
+            section("text_encoder")?,
         )?;
         let decoder = Decoder::new(
             config.hidden_dim,
             config.style_dim,
             &config.istftnet,
-            section_var_builder(&pth, "decoder", device)?,
+            section("decoder")?,
         )?;
         Ok(Self {
             config,

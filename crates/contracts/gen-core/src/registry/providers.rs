@@ -792,7 +792,8 @@ impl ProviderRegistry {
         audio_transforms,
         AudioTransformRegistration,
         "audio transform",
-        dyn AudioTransform
+        dyn AudioTransform,
+        super::audio_receipts::load_audio_transform
     );
     explicit_registry_kind!(
         trainers,
@@ -816,7 +817,8 @@ impl ProviderRegistry {
         transcribers,
         TranscriberRegistration,
         "transcriber",
-        dyn Transcriber
+        dyn Transcriber,
+        super::audio_receipts::load_transcriber
     );
     explicit_registry_kind!(
         image_embedders,
@@ -840,7 +842,8 @@ impl ProviderRegistry {
         voice_embedders,
         VoiceEmbedderRegistration,
         "voice embedder",
-        dyn VoiceEmbedder
+        dyn VoiceEmbedder,
+        super::audio_receipts::load_voice_embedder
     );
     explicit_registry_kind!(
         audio_embedders,
@@ -848,7 +851,8 @@ impl ProviderRegistry {
         audio_embedders,
         AudioEmbedderRegistration,
         "audio embedder",
-        dyn AudioEmbedder
+        dyn AudioEmbedder,
+        super::audio_receipts::load_audio_embedder
     );
 
     /// Return the provider-owned on-disk component footprint for generator `id`, when declared.
