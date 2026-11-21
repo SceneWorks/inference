@@ -18,7 +18,7 @@ ROUTES = {
     "face": ("common:mmap_var_builder(", "common:vb.native_linear_weight(", "iresnet:w.linear("),
     "flux": ("flux1_load:mmap_var_builder(", "control:candle_nn::linear(", "ip_adapter:w.linear("),
     "flux2": ("lib:load_path_mmap(", "single_file:LogicalWeightReader", "single_file:.native_projection("),
-    "flux3": ("dit:mmap_var_builder(", "nn:vb.native_linear_weight(", "nn:publisher.linear("),
+    "flux3": ("dit:mmap_var_builder(", "nn:vb.native_linear_weight_with_shape(", "nn:publisher.linear(", "dit:validate_source_checkpoint("),
     "ideogram": ("pipeline:Weights::from_dir(", "loader:st.linear("),
     "instantid": ("model:Weights::from_file(", "model:Resampler::from_weights(", "model:load_sdxl_controlnet("),
     "iris": ("nn:mmap_var_builder(", "nn:src.native_linear("),
