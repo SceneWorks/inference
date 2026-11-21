@@ -43,12 +43,14 @@ class SharedHeadroom(unittest.TestCase):
                      'free_mib': 92891, 'utilization_percent': utilization}, **changes)
 
     def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None,
-              original_deadline_monotonic=None, require_owned_completion=True):
+              original_deadline_monotonic=None, require_owned_completion=True, lock_trace=None):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': UUID}
             fake_os = SimpleNamespace(name='nt', fstat=os.fstat)
             def lock(_fd, operation, _count):
+                if lock_trace is not None:
+                    lock_trace.append(operation)
                 if operation == 2 and unlock_failure:
                     raise OSError('MOCK explicit UUID unlock failure')
             fake_lock = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lock)
@@ -101,6 +103,61 @@ class SharedHeadroom(unittest.TestCase):
         self.assertEqual(receipt['admission_wait']['stable_sample_restarts'], 1)
         self.assertEqual(receipt['admission_background_activity']['sample_count'], 5)
         self.assertEqual(receipt['claim_deadline_monotonic'], 20.)
+
+    def test_timed_out_window_releases_lock_then_admits_only_five_new_samples(self):
+        # CI_IMPACT: scripted selected-card reads, an in-memory clock and a fake Windows UUID lock.
+        partial = self.card(25, used_mib=7500, free_mib=90387)
+        fresh = self.card(1)
+        for failure, completed in ((TimeoutError('GPU inventory sampling deadline exhausted'), 2),
+                                   (subprocess.TimeoutExpired(['nvidia-smi', '--id=' + UUID], .1), 0)):
+            locks, attempts, persisted = [], [], []
+            def read(output, label, deadline, **_kwargs):
+                attempts.append(label)
+                if label == 'model-proof-admission-sample-' + str(completed + 1) and len(attempts) == completed + 2:
+                    raise failure
+                if label == 'model-proof-claimed-device' and len(attempts) > 1:
+                    persisted.extend(json.loads((output / 'model-proof-admission-samples.json').read_text()))
+                return ([partial if len(attempts) <= completed + 1 else fresh], [])
+            with self.subTest(completed=completed):
+                receipt, _ = self.claim(read, clock=FakeClock(), original_deadline_monotonic=20, lock_trace=locks)
+                self.assertEqual(locks, [1, 2, 1, 2])
+                self.assertEqual([row['selected_used_mib'] for row in persisted], [7500] * completed)
+                self.assertEqual(attempts[completed + 2:completed + 8],
+                                 ['model-proof-claimed-device', *[f'model-proof-admission-sample-{n}' for n in range(1, 6)]])
+                self.assertEqual(receipt['claim_deadline_monotonic'], 20)
+                self.assertEqual(receipt['admission_baseline']['reserved_baseline_mib'], fresh['used_mib'])
+                self.assertEqual(receipt['admission_utilization_percent'], [1] * 5)
+                self.assertEqual(receipt['admission_wait']['inventory_window_timeouts'], 1)
+                self.assertEqual(receipt['admission_wait']['last_inventory_window_timeout'],
+                                 {'error': str(failure), 'discarded_samples': completed})
+
+    def test_window_timeout_cannot_extend_claim_deadline_or_suppress_identity_and_query_errors(self):
+        ready, locks, clock = ([self.card()], []), [], FakeClock()
+        def expire(output, label, _deadline, **_kwargs):
+            if label == 'model-proof-admission-sample-3':
+                clock.now = 3
+                raise TimeoutError('GPU inventory sampling deadline exhausted')
+            return ready
+        with self.assertRaisesRegex(resources.CudaClaimRejected, 'original CUDA claim deadline expired') as caught:
+            self.claim(expire, clock=clock, original_deadline_monotonic=3, lock_trace=locks,
+                       body=lambda _: self.fail('exhausted admission entered the body'))
+        self.assertEqual(locks, [1, 2])
+        self.assertEqual(caught.exception.diagnostic['admission_samples']['sample_count'], 2)
+        for bad in ([([self.card(index=0)], [])], [([self.card(uuid=OTHER)], [])],
+                    [([self.card(total_mib=98000)], [])], [TimeoutError('unrelated I/O')],
+                    [RuntimeError(resources.release_window_overrun('model-proof-admission'))]):
+            locks = []
+            with self.subTest(bad=bad), self.assertRaises(resources.CudaClaimRejected) as caught:
+                self.claim([ready, *bad], clock=FakeClock(), lock_trace=locks,
+                           body=lambda _: self.fail('invalid sample reached the body'))
+            self.assertEqual(locks, [1, 2])
+            self.assertNotIn('inventory_window_timeouts', caught.exception.diagnostic['admission_wait'])
+        locks = []
+        with self.assertRaises(resources.CudaClaimRejected) as caught:
+            self.claim([ready, TimeoutError('GPU inventory sampling deadline exhausted'), ([self.card(index=0)], [])],
+                       clock=FakeClock(), lock_trace=locks, body=lambda _: self.fail('reacquired wrong card'))
+        self.assertEqual(locks, [1, 2, 1, 2])
+        self.assertEqual(caught.exception.diagnostic['admission_error'], 'invalid selected primary identity/metadata')
 
     def test_shared_wait_timeout_invalid_metadata_and_query_failures_never_enter_body(self):
         busy = self.card(100, used_mib=87648, free_mib=10239)
@@ -176,9 +233,9 @@ class SharedHeadroom(unittest.TestCase):
                       subprocess.TimeoutExpired('nvidia-smi', 5)):
             valid = ([self.card()], [])
             with self.subTest(error=error), self.assertRaises(resources.CudaClaimRejected) as caught:
-                self.claim([valid, valid, error], body=lambda _: self.fail('primary timeout reached body'))
+                self.claim([error], body=lambda _: self.fail('primary timeout reached body'))
             self.assertIn(str(error), caught.exception.diagnostic['admission_error'])
-            self.assertEqual(caught.exception.diagnostic['admission_samples']['sample_count'], 1)
+            self.assertEqual(caught.exception.diagnostic['admission_wait']['primary_polls'], 0)
             # Post-run: a slow driver query is retried, then recorded as inconclusive; the
             # owned-Job exit still seals the passing proof (run 44431476698).
             receipt, _ = self.claim([valid] * 7 + [error] * resources.RELEASE_QUERY_ATTEMPTS)
