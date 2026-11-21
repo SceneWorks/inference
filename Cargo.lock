@@ -943,7 +943,6 @@ name = "candle-gen-mochi"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
- "candle-gen-flux",
  "image",
  "rand",
  "serde_json",

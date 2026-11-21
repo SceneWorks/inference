@@ -4,7 +4,7 @@
 //! [`candle-gen`](candle_gen) — the candle (Windows/CUDA) sibling of `mlx-gen-mochi`. Mochi is a
 //! T5-XXL-conditioned dual-stream MMDiT (the **AsymmDiT**) with an asymmetric 3-D causal-conv VAE
 //! (6× temporal, 8× spatial). It has **no** `candle-transformers` reference: the masked T5 encode
-//! ([`text_encoder`], run through the reused `candle_gen_flux::packed_te::PackedT5Encoder` + the
+//! ([`text_encoder`], run through the reused `candle_gen::text_encoder::T5Encoder` + the
 //! tokenizer key-padding mask Mochi's `_get_t5_prompt_embeds` applies), the learned 3-D RoPE ([`rope`]),
 //! the linear-quadratic flow-match scheduler ([`scheduler`]), the dual-stream AsymmDiT denoiser
 //! ([`transformer`]), and the AsymmVAE decoder ([`vae`], on a from-scratch conv2d-tap [`conv3d`]) are

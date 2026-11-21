@@ -56,17 +56,16 @@ mod vae;
 // built, the mean-encoder mirror) stays with each caller.
 mod flux1_load;
 
-// Packed-tier (MLX diffusers-layout q4/q8) load path (sc-9407, sc-9089 umbrella). `quant` is the thin
-// per-crate dense-or-packed enum delegating to the shared `candle_gen::quant` packed-load module
-// (sc-9086); `packed_dit`/`packed_te` are minimal vendored diffusers-layout FLUX.1 DiT + CLIP-L/T5-XXL
-// encoders that build every projection through it, so q4/q8 load straight from the packed parts (no
-// dense bf16 staging). The dense BFL snapshot path (stock `candle-transformers`) is unchanged.
 mod packed_dit;
-// `packed_te` is `pub` so the Mochi provider (`candle-gen-mochi`) can reuse the vendored T5-XXL encoder
-// stack (`PackedT5Encoder` / `T5Config::xxl`) — the same google/t5-v1.1-xxl geometry Mochi conditions
-// on — through its masked-forward path (`forward_masked`, added for Mochi's padded/masked encode).
-pub mod packed_te;
+/// Compatibility imports for the shared Candle text encoders.
+pub mod packed_te {
+    pub use candle_gen::text_encoder::{
+        ClipConfig, ClipTextEncoder as PackedClipText, T5Config, T5Encoder as PackedT5Encoder,
+    };
+}
 mod quant;
+#[cfg(test)]
+mod text_encoder_tests;
 
 // XLabs FLUX IP-Adapter (sc-5872, epic 5480) — reference-image (identity) conditioning. `ip_dit` is the
 // forked FLUX DiT carrying the per-double-block decoupled-cross-attn seam (the stock candle-transformers
