@@ -745,16 +745,18 @@ fn read_f32le(
     >,
     path: &str,
 ) -> Vec<f32> {
-    let bytes = candle_audio::gen_core::__model_input_reader!(
-std::fs::read(path),
-"crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_f32le::std::fs::read@34736",
-Reference,
-path,
-|__model_input_path| std::fs::read(__model_input_path)
-,
-origin = input_origin.get()
-)
-    .unwrap_or_else(|e| panic!("read f32-LE clip {path}: {e}"));
+    #[cfg(feature = "model-inference-proof")]
+    let result = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read(path),
+        "crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_f32le::std::fs::read@34736",
+        Reference,
+        path,
+        |input_path| std::fs::read(input_path),
+        origin = input_origin.get()
+    );
+    #[cfg(not(feature = "model-inference-proof"))]
+    let result = std::fs::read(path);
+    let bytes = result.unwrap_or_else(|e| panic!("read f32-LE clip {path}: {e}"));
     // A trailing partial sample means the file is truncated, not that the last sample is optional;
     // `chunks_exact` would drop it and hand back a quietly shorter waveform.
     assert!(
@@ -775,15 +777,18 @@ fn read_codes_csv(
     >,
     path: &str,
 ) -> Vec<Vec<u32>> {
-    candle_audio::gen_core::__model_input_reader!(
-std::fs::read_to_string(path),
-"crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_codes_csv::std::fs::read_to_string@35431",
-TensorInput,
-path,
-|__model_input_path| std::fs::read_to_string(__model_input_path)
-,
-origin = input_origin.get()
-)
+    #[cfg(feature = "model-inference-proof")]
+    let result = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read_to_string(path),
+        "crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_codes_csv::std::fs::read_to_string@35431",
+        TensorInput,
+        path,
+        |input_path| std::fs::read_to_string(input_path),
+        origin = input_origin.get()
+    );
+    #[cfg(not(feature = "model-inference-proof"))]
+    let result = std::fs::read_to_string(path);
+    result
         .expect("read codes csv")
         .lines()
         .filter(|l| !l.trim().is_empty())
