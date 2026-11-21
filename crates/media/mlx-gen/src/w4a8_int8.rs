@@ -502,12 +502,15 @@ impl W4A8Linear {
     }
 
     /// Retained native arrays only; no dense weight set can be materialized through this API.
+    pub fn base_arrays(&self) -> Vec<&Array> {
+        [&self.packed, &self.s_rel, &self.s_channel, &self.codebook]
+            .into_iter()
+            .chain(self.bias.iter())
+            .collect()
+    }
+
     pub fn materialize(&self) -> Result<()> {
-        eval(
-            [&self.packed, &self.s_rel, &self.s_channel, &self.codebook]
-                .into_iter()
-                .chain(self.bias.iter()),
-        )?;
+        eval(self.base_arrays())?;
         Ok(())
     }
 

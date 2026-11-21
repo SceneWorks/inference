@@ -202,7 +202,7 @@ pub fn load_dit(weights: &Path, config: &Flux3Config, compute: Dtype) -> Result<
 /// [`load_dit`] for an explicit native storage. The exact physical inventory is checked from
 /// the headers before any tensor is read. Packed codes are NEVER cast (a numeric cast of `u32`
 /// codes would silently destroy them); their scales/biases follow the compute dtype. Every
-/// storage but dense and MLX affine is a typed refusal on this backend.
+/// source layout is validated against the package declaration.
 pub fn load_dit_with_storage(
     weights: &Path,
     config: &Flux3Config,
@@ -211,6 +211,16 @@ pub fn load_dit_with_storage(
 ) -> Result<Flux3Dit> {
     let affine = match storage {
         NativeDitStorage::Publisher(DitFormat::Dense) => None,
+        NativeDitStorage::Publisher(DitFormat::Fp8Rowwise)
+            if mlx_gen::metal_available() && compute == Dtype::Bfloat16 =>
+        {
+            None
+        }
+        NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) => {
+            return Err(Error::Unsupported(
+                "FLUX3 FP8R requires Metal and BF16 compute".into(),
+            ))
+        }
         NativeDitStorage::MlxAffine { bits, group_size } => Some(crate::nn::AffineTargets {
             targets: storage.packed_targets(&config.dit)?,
             bits: bits as i32,
@@ -234,6 +244,7 @@ pub fn load_dit_with_storage(
     // The release ships bf16. Cast every tensor to the compute dtype ONE TENSOR AT A TIME and
     // drop its source handle, so the load peak is the compute-dtype model plus a single source
     // tensor rather than both full copies (the f32 path doubles the DiT; bf16 is a no-op cast).
+    let packed_targets = storage.packed_targets(&config.dit)?;
     let mut keys: Vec<String> = weights.keys().map(str::to_owned).collect();
     keys.sort();
     for key in keys {
@@ -243,7 +254,7 @@ pub fn load_dit_with_storage(
         // Read the file bytes on MLX's CPU stream first: a GPU cast over an unread `Load` makes
         // the Metal command buffer wait on the disk (sc-24245).
         mlx_rs::transforms::eval_pending_loads([&array])?;
-        let packed_codes = affine.as_ref().is_some_and(|a| a.targets.contains(&key));
+        let packed_codes = packed_targets.contains(&key);
         let array = if array.ndim() >= 2 && !packed_codes {
             array.as_dtype(compute)?
         } else {
@@ -316,10 +327,9 @@ fn verify_native_package(
 
 fn refuse_unsupported_spec(route_id: &str, spec: &LoadSpec) -> Result<()> {
     crate::memory_strategy::refuse_deferred_load_shape(route_id, spec)?;
-    if let Some(q @ (gen_core::Quant::Nvfp4 | gen_core::Quant::Fp8Rowwise)) = spec.quantize {
+    if let Some(q @ gen_core::Quant::Nvfp4) = spec.quantize {
         return Err(Error::Unsupported(format!(
-            "{route_id}: LoadSpec::quantize {} has no MLX FLUX3 kernel; the native MLX tiers \
-             are affine q4/q8",
+            "{route_id}: LoadSpec::quantize {} has no MLX FLUX3 kernel",
             q.key()
         )));
     }
@@ -378,7 +388,17 @@ pub(crate) fn resolve_package(
     let config = gen_core_flux3::resolve_checkpoint(package_dir)?;
     config.validate_route(route_id)?;
     let storage = NativeDitStorage::from_package(package_dir)?;
-    storage.validate_selection(quantize, precision)?;
+    let selection = quantize.or_else(|| {
+        (storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise))
+            .then_some(gen_core::Quant::Fp8Rowwise)
+    });
+    storage.validate_selection(selection, precision)?;
+    if storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) && !mlx_gen::metal_available()
+    {
+        return Err(gen_core::Error::Unsupported(
+            "FLUX3 FP8R requires Metal".into(),
+        ));
+    }
     storage.check_backend(ArtifactBackend::Mlx)?;
     if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
         config.validate_supported()?;

@@ -332,6 +332,7 @@ pub(crate) fn clip_header_linear(
         base: LinearFacts {
             base_shape: shape,
             is_quantized: bits.is_some(),
+            source_packed: false,
             has_live_adapters: false,
             adapter_count: 0,
             bias_shape: bias.as_ref().map(|b| b.shape.clone()),

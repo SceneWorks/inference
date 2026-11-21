@@ -20,7 +20,7 @@ if (MX) {
     exponent = clamp(exponent - int(mantissa == 0.5f), -127, 127);
     rounded = ldexp(sc_round_fp8(ldexp(xval, -exponent), false), exponent);
 } else {
-    rounded = sc_round_fp8(xval / float(sx[0]), E5);
+    rounded = sc_round_fp8(xval / float(sx[ROW ? row : 0]), E5);
 }
 if (col < uint(K)) q[row * uint(K) + col] = rounded;
 "#;
@@ -65,7 +65,7 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint i=tid; i < 256u; i+=128u) {
     uint row=row0+i/16u, col=col0+i%16u;
     if (row < uint(M) && col < uint(N))
-        y[row*uint(N)+col] = MX ? tile[i] : (tile[i]*float(sx[0]))*float(sw[0]);
+        y[row*uint(N)+col] = MX ? tile[i] : (tile[i]*float(sx[ROW ? row : 0]))*float(sw[ROW ? col : 0]);
 }
 "#;
 
@@ -113,6 +113,19 @@ impl Fp8Linear {
                 if scale.dtype() != Dtype::Uint8 || input_scale.is_some() {
                     return Err(
                         "MXFP8 requires E8M0 scales and dynamic block activation scaling".into(),
+                    );
+                }
+                scale
+            }
+            ComfyQuantFormat::Fp8Rowwise => {
+                let scale = scale.ok_or("rowwise FP8 requires one F32 scale per output row")?;
+                if logical != stored
+                    || scale.dtype() != Dtype::Float32
+                    || scale.shape() != [codes.shape()[0]]
+                    || input_scale.is_some()
+                {
+                    return Err(
+                        "invalid rowwise FP8 geometry, scale dtype or static input scale".into(),
                     );
                 }
                 scale
@@ -199,6 +212,9 @@ impl Fp8Linear {
         }
         let mut sliced = self.clone();
         sliced.codes = self.codes.index((lo..hi, ..));
+        if self.format == ComfyQuantFormat::Fp8Rowwise {
+            sliced.scales = self.scales.index(lo..hi);
+        }
         sliced.bias = self.bias.as_ref().map(|b| b.index(lo..hi));
         sliced.shape[0] = hi - lo;
         sliced.scale_row += lo;
@@ -228,6 +244,19 @@ impl Fp8Linear {
         }
         let mx = i32::from(self.format == ComfyQuantFormat::Mxfp8);
         let e5 = i32::from(self.format == ComfyQuantFormat::Float8E5M2);
+        let rowwise = self.format == ComfyQuantFormat::Fp8Rowwise;
+        let (input, sx) = if rowwise {
+            // The BFL operator rounds activations to BF16 before computing each token scale.
+            let input = x.as_dtype(Dtype::Bfloat16)?.reshape(&[m, k])?;
+            let peak = input.as_dtype(Dtype::Float32)?.abs()?.max_axis(-1, false)?;
+            let sx = mlx_rs::ops::maximum(
+                mlx_rs::ops::divide(peak, Array::from_f32(448.0))?,
+                Array::from_f32(1e-12),
+            )?;
+            (input, sx)
+        } else {
+            (x.clone(), self.input_scale.clone())
+        };
         let xb = (k - 1) / 32 + 1;
         let ng = ((n - 1) / 16 + 1)
             .checked_mul(128)
@@ -261,9 +290,17 @@ impl Fp8Linear {
             let (quant, project) = cache.as_ref().expect("initialized above");
             let q = quant
                 .apply()
-                .inputs([x, &self.input_scale])
-                .output_shape([m, k], Dtype::Float32)
+                .inputs([&input, &sx])
+                .output_shape(
+                    [m, k],
+                    if mx != 0 {
+                        Dtype::Float32
+                    } else {
+                        Dtype::Float16
+                    },
+                )
                 .template_arg("K", k)
+                .template_arg("ROW", i32::from(rowwise))
                 .template_arg("MX", mx)
                 .template_arg("E5", e5)
                 .grid(
@@ -281,14 +318,15 @@ impl Fp8Linear {
             };
             Ok(project
                 .apply()
-                .inputs([&q, &self.codes, &self.scales, &self.input_scale])
-                .output_shape([m, n], x.dtype())
+                .inputs([&q, &self.codes, &self.scales, &sx])
+                .output_shape([m, n], input.dtype())
                 .template_arg("M", m)
                 .template_arg("N", n)
                 .template_arg("K", k)
                 .template_arg("STRIDE", self.codes.shape()[1])
                 .template_arg("SCALE_TILES", tiles)
                 .template_arg("SCALE_ROW", self.scale_row)
+                .template_arg("ROW", i32::from(rowwise))
                 .template_arg("MX", mx)
                 .template_arg("E5", e5)
                 .grid(ng, mg, 1)
@@ -344,7 +382,15 @@ pub fn decoded_codes(codes: &Array, format: ComfyQuantFormat) -> Result<Array> {
         .view_dtype(Dtype::Float16)?
         .as_dtype(Dtype::Float32)?)
     } else {
-        Ok(codes.from_fp8(Dtype::Float32)?)
+        let nan = mlx_rs::ops::logical_or(
+            mlx_rs::ops::eq(codes, Array::from_slice(&[0x7fu8], &[]))?,
+            mlx_rs::ops::eq(codes, Array::from_slice(&[0xffu8], &[]))?,
+        )?;
+        Ok(mlx_rs::ops::r#where(
+            nan,
+            Array::from_f32(f32::NAN),
+            codes.from_fp8(Dtype::Float32)?,
+        )?)
     }
 }
 
@@ -397,6 +443,12 @@ impl Fp8Linear {
                 scale.reshape(&[rows, blocks, 1])?,
             )?
             .reshape(&[rows, columns])?
+        } else if self.format == ComfyQuantFormat::Fp8Rowwise {
+            let scales = match indices {
+                Some(ids) => self.scales.take_axis(ids, 0)?,
+                None => self.scales.clone(),
+            };
+            mlx_rs::ops::multiply(decoded, scales.reshape(&[rows, 1])?)?
         } else {
             mlx_rs::ops::multiply(decoded, &self.scales)?
         };
@@ -471,9 +523,10 @@ mod tests {
             mlx_rs::Device::try_default().unwrap().get_type().unwrap(),
             mlx_rs::DeviceType::Gpu
         );
-        for format in [Float8E4M3Fn, Float8E5M2, Mxfp8] {
+        for format in [Float8E4M3Fn, Float8E5M2, Mxfp8, Fp8Rowwise] {
             for (m, n, k) in [(1usize, 1usize, 32usize), (3, 17, 35)] {
                 let mx = format == Mxfp8;
+                let rowwise = format == Fp8Rowwise;
                 let stored = if mx {
                     mxfp8_padded_shape([n, k])
                 } else {
@@ -517,7 +570,11 @@ mod tests {
                         ((i * 29 + 7) % 113) as f32 / 32.0 - 1.0
                     };
                 }
-                let scale = if mx {
+                let row_scales: Vec<_> =
+                    (0..n).map(|row| scalar_scale + row as f32 / 16.).collect();
+                let scale = if rowwise {
+                    Array::from_slice(&row_scales, &[n as i32])
+                } else if mx {
                     Array::from_slice(&scales, &[swshape[0] as i32, swshape[1] as i32])
                 } else {
                     Array::from_f32(scalar_scale)
@@ -541,6 +598,14 @@ mod tests {
                                 .fold(0., f32::max);
                             let act_scale = if mx && max > 0. {
                                 2f32.powi((max / 448.).log2().ceil() as i32)
+                            } else if rowwise {
+                                let peak = input[r * k..(r + 1) * k]
+                                    .iter()
+                                    .copied()
+                                    .map(round_bf16)
+                                    .map(f32::abs)
+                                    .fold(0., f32::max);
+                                (peak / 448.).max(1e-12)
                             } else {
                                 1.
                             };
@@ -550,7 +615,7 @@ mod tests {
                                         - 127,
                                 )
                             } else {
-                                f64::from(scalar_scale)
+                                f64::from(if rowwise { row_scales[c] } else { scalar_scale })
                             };
                             for (j, &a) in block.iter().enumerate() {
                                 let q = nearest(round_bf16(a) / act_scale, format) * act_scale;

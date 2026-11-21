@@ -34,6 +34,7 @@ impl CodecResidencyPolicy for MlxCodecResidency {
             && matches!(
                 spec,
                 TensorCodecSpec::ConvRotInt8 { .. }
+                    | TensorCodecSpec::RowwiseFp8 { .. }
                     | TensorCodecSpec::ScalarFp8 {
                         full_precision_matrix_mult: false,
                         ..
@@ -59,6 +60,7 @@ pub fn capability() -> NativeExecutionCapability {
         FP8_E4M3_SCALAR_CODEC.codec_id,
         FP8_E5M2_SCALAR_CODEC.codec_id,
         MXFP8_CODEC.codec_id,
+        FP8_E4M3_ROWWISE_CODEC.codec_id,
     ])
 }
 
@@ -171,9 +173,9 @@ impl SourceReads {
                         matches!(scale, ScalarScaleSource::Companion { .. }),
                         input_scale.is_some(),
                     ),
-                    TensorCodecSpec::ConvRotInt8 { .. } | TensorCodecSpec::Mxfp8 { .. } => {
-                        (true, false)
-                    }
+                    TensorCodecSpec::ConvRotInt8 { .. }
+                    | TensorCodecSpec::Mxfp8 { .. }
+                    | TensorCodecSpec::RowwiseFp8 { .. } => (true, false),
                     _ => (false, false),
                 };
                 (
@@ -253,6 +255,9 @@ pub fn prepare_sources(
                         crate::convrot_int8::descriptor_array(geometry.rotation_group)
                     });
                 continue;
+            }
+            TensorCodecSpec::RowwiseFp8 { scale } => {
+                (ComfyQuantFormat::Fp8Rowwise, Some(scale), None)
             }
             TensorCodecSpec::Mxfp8 { scale, .. } => (ComfyQuantFormat::Mxfp8, Some(scale), None),
             TensorCodecSpec::ScalarFp8 {
