@@ -19,12 +19,18 @@ from scripts.ci import flux1_comparison as paired
 from scripts.ci import ltx_adapter_tier1_fixture as ltx
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci import wan_adapter_tier1_fixture as wan
+from scripts.ci import z_image_tier1_fixture as z_image
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.media_campaign_supervisor import load_policy
 
 BASE = "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294"
-PROFILES = {("mlx", wan.PROFILE): wan, ("mlx", ltx.PROFILE): ltx, ("candle-cuda", ltx.PROFILE): ltx}
+PROFILES = {
+    ("mlx", wan.PROFILE): wan,
+    ("mlx", ltx.PROFILE): ltx,
+    ("candle-cuda", ltx.PROFILE): ltx,
+    ("candle-cuda", z_image.PROFILE): z_image,
+}
 ARMS = ("base", "head")
 GIB = 2**30
 MIB = 2**20
