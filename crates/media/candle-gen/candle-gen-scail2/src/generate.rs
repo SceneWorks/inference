@@ -498,12 +498,14 @@ pub(crate) fn generate_scoped<C: Deref<Target = Components>>(
         let seg_video = video.reshape((vc, vt, vh, vw))?; // [3,T_out,H,W]
         let t_out = seg_video.dim(1)?;
 
-        let keep_from = if seg_idx == 0 { 0 } else { job.segment_overlap };
+        let keep_from = segment.history_frames;
         let piece = seg_video.narrow(1, keep_from, t_out - keep_from)?;
         out_pieces.push(piece);
 
-        if seg_idx + 1 < segments.len() {
-            let ov = job.segment_overlap;
+        let ov = segments
+            .get(seg_idx + 1)
+            .map_or(0, |next| next.history_frames);
+        if ov > 0 {
             prev_history_pixel = Some(seg_video.narrow(1, t_out - ov, ov)?.contiguous()?);
         }
     }

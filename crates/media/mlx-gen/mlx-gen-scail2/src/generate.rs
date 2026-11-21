@@ -324,6 +324,38 @@ pub(crate) fn generate_scoped(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
+    // Split the inference LoRAs BY ROLE, not by file (sc-18198). A lightx2v "lightning" file is a
+    // hybrid, and its two halves want opposite treatment:
+    //   * full-rank `.diff`/`.diff_b` deltas land on the qk-norms, `norm3`, `head.head`,
+    //     `img_emb.proj.{0,4}` and the Linear biases — none of which the residual host exposes as
+    //     adapter targets, so they are folded into the raw weight map below (sc-5684). Every one of
+    //     those tensors stays DENSE bf16 in the pre-quantized q4/q8 tiers (only the 2-D block
+    //     projections are packed), so the fold is tier-independent.
+    //   * low-rank `lora_down`/`lora_up` factors target exactly the projections that DO get packed.
+    //     Those install as forward-time residuals after the build+quantize, which is the one form
+    //     that works over a packed base — and is already how the Bias-Aware DPO LoRA loads (sc-5451).
+    // So EVERY spec goes to the residual pass, and diff-patch files additionally go to the fold. The
+    // two passes are disjoint by key suffix — the low-rank loader groups only `.lora_A`/`.lora_down`/
+    // `.lora_B`/`.lora_up`/`.alpha` and ignores every other key, so a hybrid file is never applied
+    // twice. This replaces the blanket "needs the DENSE (bf16) snapshot" rejection, which failed the
+    // whole file whenever the tier was pre-quantized even though nothing in it actually requires a
+    // dense base; a full-rank delta that genuinely CANNOT be carried is now refused per-target by
+    // `report_outcome` instead.
+    let mut diff_patch: Vec<&AdapterSpec> = Vec::new();
+    let mut residual: Vec<AdapterSpec> = Vec::new();
+    for spec in adapters {
+        // Propagate a header read failure rather than defaulting to "not a diff-patch": treating an
+        // unreadable adapter as low-rank-only would drop its `.diff` half without a word.
+        if crate::lora::has_diff_patch_keys(&spec.path)? {
+            diff_patch.push(spec);
+        }
+        // A file joins the residual pass unless the diff-patch fold consumed ALL of it. Tested by
+        // exclusion rather than by listing LoRA suffixes: the installer also handles LoKr/LoHa (the
+        // descriptor advertises `supports_lokr`), and an allow-list would silently drop those.
+        if crate::lora::has_residual_installable_keys(&spec.path)? {
+            residual.push(spec.clone());
+        }
+    }
     let cfg_disabled = job.guidance <= 1.0;
     // Experimental bf16 compute opt-in (sc-5681; see the DiT block below). Read once here so the
     // per-segment NaN guard (F-096) keys off the same flag.
@@ -405,38 +437,6 @@ pub(crate) fn generate_scoped(
 
     // --- DiT (bf16 production compute; optional Q4/Q8 load-time quant, sc-5445) ---
     let load_dit = || -> Result<Scail2Dit> {
-        // Split the inference LoRAs BY ROLE, not by file (sc-18198). A lightx2v "lightning" file is a
-        // hybrid, and its two halves want opposite treatment:
-        //   * full-rank `.diff`/`.diff_b` deltas land on the qk-norms, `norm3`, `head.head`,
-        //     `img_emb.proj.{0,4}` and the Linear biases — none of which the residual host exposes as
-        //     adapter targets, so they are folded into the raw weight map below (sc-5684). Every one of
-        //     those tensors stays DENSE bf16 in the pre-quantized q4/q8 tiers (only the 2-D block
-        //     projections are packed), so the fold is tier-independent.
-        //   * low-rank `lora_down`/`lora_up` factors target exactly the projections that DO get packed.
-        //     Those install as forward-time residuals after the build+quantize, which is the one form
-        //     that works over a packed base — and is already how the Bias-Aware DPO LoRA loads (sc-5451).
-        // So EVERY spec goes to the residual pass, and diff-patch files additionally go to the fold. The
-        // two passes are disjoint by key suffix — the low-rank loader groups only `.lora_A`/`.lora_down`/
-        // `.lora_B`/`.lora_up`/`.alpha` and ignores every other key, so a hybrid file is never applied
-        // twice. This replaces the blanket "needs the DENSE (bf16) snapshot" rejection, which failed the
-        // whole file whenever the tier was pre-quantized even though nothing in it actually requires a
-        // dense base; a full-rank delta that genuinely CANNOT be carried is now refused per-target by
-        // `report_outcome` instead.
-        let mut diff_patch: Vec<&AdapterSpec> = Vec::new();
-        let mut residual: Vec<AdapterSpec> = Vec::new();
-        for spec in adapters {
-            // Propagate a header read failure rather than defaulting to "not a diff-patch": treating an
-            // unreadable adapter as low-rank-only would drop its `.diff` half without a word.
-            if crate::lora::has_diff_patch_keys(&spec.path)? {
-                diff_patch.push(spec);
-            }
-            // A file joins the residual pass unless the diff-patch fold consumed ALL of it. Tested by
-            // exclusion rather than by listing LoRA suffixes: the installer also handles LoKr/LoHa (the
-            // descriptor advertises `supports_lokr`), and an allow-list would silently drop those.
-            if crate::lora::has_residual_installable_keys(&spec.path)? {
-                residual.push(spec.clone());
-            }
-        }
         let mut w = Weights::from_file(root.join("dit.safetensors"))?;
         // sc-5684: merge any lightx2v diff-patch ("lightning") LoRA(s) into the dense weights *before*
         // building + quantizing — `.diff`/`.diff_b`/low-rank factors fold uniformly into the raw
@@ -703,35 +703,37 @@ pub(crate) fn generate_scoped(
         // free-aware (`free × 0.85`, `free = MLX limit − resident`), so the old "bound the peak as the
         // resolution grows" intent is preserved and now measured against real availability rather than
         // a hard-coded pixel budget. The write-cap safety (sc-12438 Req 3) is inside the selector.
-        on_progress(Progress::Decoding);
-        let zs = latent.shape();
-        let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
-        let z_shape = z.shape();
-        let out_frames = z_shape[2] * VAE_TILING.temporal_scale;
-        let out_height = z_shape[3] * VAE_TILING.spatial_scale;
-        let out_width = z_shape[4] * VAE_TILING.spatial_scale;
-        let video = {
-            // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
-            let cfg = decode_tiling(out_height, out_width, out_frames)?;
-            mlx_gen::video_execution::policy(
-                "scail2_decode",
-                serde_json::json!({"tiling":format!("{cfg:?}"),"segment":seg_idx,"latent_shape":z_shape}),
-            );
-            match cfg.as_ref() {
-                // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
-                Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel))?,
-                None => vae.decode(&z)?,
-            }
-        };
+        let video = decode_segment(
+            cancel,
+            on_progress,
+            || {
+                let zs = latent.shape();
+                let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
+                let z_shape = z.shape();
+                let out_frames = z_shape[2] * VAE_TILING.temporal_scale;
+                let out_height = z_shape[3] * VAE_TILING.spatial_scale;
+                let out_width = z_shape[4] * VAE_TILING.spatial_scale;
+                // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
+                let cfg = decode_tiling(out_height, out_width, out_frames)?;
+                mlx_gen::video_execution::policy(
+                    "scail2_decode",
+                    serde_json::json!({"tiling":format!("{cfg:?}"),"segment":seg_idx,"latent_shape":z_shape}),
+                );
+                Ok((z, cfg))
+            },
+            |(z, cfg)| {
+                match cfg.as_ref() {
+                    // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
+                    Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel)),
+                    None => vae.decode(&z),
+                }
+            },
+        )?;
         let vs = video.shape();
         let seg_video = video.reshape(&[vs[1], vs[2], vs[3], vs[4]])?; // [3,T_out,H,W]
         let t_out = seg_video.shape()[1];
 
-        let keep_from = if seg_idx == 0 {
-            0
-        } else {
-            job.segment_overlap as i32
-        };
+        let keep_from = segment.history_frames as i32;
         let piece = seg_video.take_axis(
             Array::from_slice(
                 &(keep_from..t_out).collect::<Vec<i32>>(),
@@ -742,8 +744,10 @@ pub(crate) fn generate_scoped(
         mlx_rs::transforms::eval([&piece])?;
         out_pieces.push(piece);
 
-        if seg_idx + 1 < segments.len() {
-            let ov = job.segment_overlap as i32;
+        let ov = segments
+            .get(seg_idx + 1)
+            .map_or(0, |next| next.history_frames as i32);
+        if ov > 0 {
             prev_history_pixel = Some(seg_video.take_axis(
                 Array::from_slice(&(t_out - ov..t_out).collect::<Vec<i32>>(), &[ov]),
                 1,
@@ -760,6 +764,25 @@ pub(crate) fn generate_scoped(
         fps: job.fps,
         audio: None,
     })
+}
+
+/// Decode policy selection can take a memory snapshot. Check cancellation both after
+/// notifying the caller and before invoking the chosen tiled or untiled decoder.
+fn decode_segment<P, T>(
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    prepare: impl FnOnce() -> Result<P>,
+    decode: impl FnOnce(P) -> Result<T>,
+) -> Result<T> {
+    on_progress(Progress::Decoding);
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let policy = prepare()?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    decode(policy)
 }
 
 /// Pin decoded-and-reencoded history on both sides of the native scheduler update.
@@ -1088,6 +1111,37 @@ mod tests {
         );
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED generate::tests::public_generate_rejects_geometry_before_adapter_io");
+    }
+
+    #[test]
+    fn canceled_untiled_decode_never_enters_the_vae() {
+        for cancel_on_progress in [true, false] {
+            let cancel = CancelFlag::new();
+            let mut notified = false;
+            let outcome = decode_segment(
+                &cancel,
+                &mut |event| {
+                    assert!(matches!(event, Progress::Decoding));
+                    notified = true;
+                    if cancel_on_progress {
+                        cancel.cancel();
+                    }
+                },
+                || {
+                    assert!(
+                        !cancel_on_progress,
+                        "selected a decode policy after cancellation"
+                    );
+                    cancel.cancel();
+                    Ok(None::<usize>)
+                },
+                |policy| -> Result<()> {
+                    panic!("entered decoder with policy {policy:?} after cancellation")
+                },
+            );
+            assert!(notified);
+            assert!(matches!(outcome, Err(Error::Canceled)));
+        }
     }
 
     /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.

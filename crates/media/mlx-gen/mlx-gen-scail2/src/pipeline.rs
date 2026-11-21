@@ -1083,6 +1083,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_adapter_refuses_before_pixel_or_component_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut model = unloaded();
+        model.root = root.path().to_owned();
+        model.adapters.push(mlx_gen::AdapterSpec::new(
+            model.root.join("missing-adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        // The empty root cannot supply any component, and the sized input contains
+        // no RGB bytes. The first error must identify the unreadable adapter.
+        let error = model
+            .generate(&auto_sized(32, 32), &mut |_| {
+                panic!("prepared an invalid request")
+            })
+            .unwrap_err()
+            .to_string();
+        let header_error = crate::lora::has_diff_patch_keys(&model.adapters[0].path).unwrap_err();
+        assert_eq!(
+            error,
+            mlx_gen::gen_core::Error::from(header_error).to_string()
+        );
+        model.adapters.clear();
+        let pixel_error = model
+            .generate(&auto_sized(32, 32), &mut |_| {
+                panic!("encoded invalid pixels")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            pixel_error.contains(CLEARED_THE_GEOMETRY_GATE),
+            "{pixel_error}"
+        );
+        assert_ne!(error, pixel_error);
+    }
+
     /// The substring that identifies this gate's refusal, distinct from the shared floor's
     /// "outside supported range".
     const REFUSED: &str = "advertised size envelope";

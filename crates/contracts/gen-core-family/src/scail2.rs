@@ -24,6 +24,8 @@ pub struct Scail2Segment {
     /// Rendered output geometry; driving poses and their masks use half its width and height.
     pub identity: RenderPhaseIdentity,
     pub latent_frames: u32,
+    /// Decoded pixel frames retained from the preceding window and skipped when stitching.
+    pub history_frames: usize,
 }
 
 impl Scail2Segment {
@@ -96,6 +98,7 @@ pub fn resolve_segments(
     let mut push = |start: usize, frames: usize| {
         segments.push(Scail2Segment {
             source: start..start + frames,
+            history_frames: if segments.is_empty() { 0 } else { overlap },
             identity: RenderPhaseIdentity {
                 pass: segments.len(),
                 phase: 0,
@@ -120,12 +123,56 @@ pub fn resolve_segments(
             push(start, remaining);
         }
     }
+    // Candle's causal VAE accepts exactly 1+4k input frames. A single segment never
+    // encodes history, and independent (zero-overlap) segments have no history.
+    if tail == SegmentTail::AlignedRemainder
+        && segments.len() > 1
+        && overlap > 0
+        && !(overlap - 1).is_multiple_of(TEMPORAL_STRIDE)
+    {
+        return Err(Error::Unsupported(format!("scail2: Candle clean history requires segment_overlap ({overlap}) to be zero or 1 + {TEMPORAL_STRIDE}·k")));
+    }
     Ok(segments)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_history_is_present_only_for_reencodable_overlaps() {
+        let plan = |tail, frames, overlap| {
+            resolve_segments(
+                tail,
+                MemoryGeometry {
+                    width: 64,
+                    height: 32,
+                    frames,
+                    batch: 1,
+                    reference_count: 1,
+                },
+                9,
+                overlap,
+            )
+        };
+        let candle = SegmentTail::AlignedRemainder;
+        let mlx = SegmentTail::FullWindows;
+        assert!(plan(candle, 17, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("clean history"));
+        assert_eq!(plan(candle, 9, 4).unwrap()[0].history_frames, 0);
+        assert_eq!(plan(mlx, 17, 4).unwrap()[1].history_frames, 4);
+        for tail in [mlx, candle] {
+            let independent = plan(tail, 18, 0).unwrap();
+            assert_eq!(independent.len(), 2);
+            assert_eq!(independent[1].source, 9..18);
+            assert!(independent.iter().all(|s| s.history_frames == 0));
+            let joined = plan(tail, 17, 5).unwrap();
+            assert_eq!(joined[0].history_frames, 0);
+            assert_eq!(joined[1].history_frames, 5);
+        }
+    }
 
     #[test]
     fn vae_align_rounds_down_to_4k_plus_1() {
