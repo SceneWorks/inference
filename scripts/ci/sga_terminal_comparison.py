@@ -26,7 +26,8 @@ from scripts.ci.wan_adapter_tier1_fixture import unique_object
 from scripts.media_campaign_supervisor import load_policy
 
 SELECTION = "sga-terminal-tier2"
-PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture"}
+PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
+            ("candle-cuda", "z-image"): "z_image_tier2_fixture"}
 DEVICE_KEY = {"candle-cuda": "cuda_device_uuid", "mlx": "runner"}
 ARMS = source_pair.ARMS
 ORDER = (ARMS, tuple(reversed(ARMS)))
