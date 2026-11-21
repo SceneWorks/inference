@@ -16,6 +16,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.ci import flux1_comparison as paired
+from scripts.ci import krea_phase_tier1_fixture as krea
 from scripts.ci import ltx_adapter_tier1_fixture as ltx
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci import wan_adapter_tier1_fixture as wan
@@ -30,6 +31,7 @@ PROFILES = {
     ("mlx", ltx.PROFILE): ltx,
     ("candle-cuda", ltx.PROFILE): ltx,
     ("candle-cuda", z_image.PROFILE): z_image,
+    ("candle-cuda", krea.PROFILE): krea,
 }
 ARMS = ("base", "head")
 GIB = 2**30
