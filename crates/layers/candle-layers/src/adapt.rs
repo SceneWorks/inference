@@ -696,25 +696,6 @@ impl LokrFactors {
         w2_a: Option<&Tensor>,
         w2_b: Option<&Tensor>,
     ) -> Result<Option<Self>> {
-        Self::build_with_unscaled_right(scale, base_shape, w1, w1_a, w1_b, w2, w2_t2, w2_a, w2_b)
-            .map(|factors| factors.map(|(scaled, _)| scaled))
-    }
-
-    /// Build the installed factors and retain the unscaled, normalized F32 right matrix. A
-    /// phase that changes strength can re-bake this matrix before casting to activation dtype,
-    /// preserving the arithmetic of a fresh install rather than multiplying the residual afterward.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_with_unscaled_right(
-        scale: f64,
-        base_shape: (usize, usize),
-        w1: Option<&Tensor>,
-        w1_a: Option<&Tensor>,
-        w1_b: Option<&Tensor>,
-        w2: Option<&Tensor>,
-        w2_t2: Option<&Tensor>,
-        w2_a: Option<&Tensor>,
-        w2_b: Option<&Tensor>,
-    ) -> Result<Option<(Self, Tensor)>> {
         Self::build_inner(
             scale, base_shape, None, w1, w1_a, w1_b, w2, w2_t2, w2_a, w2_b,
         )
@@ -768,7 +749,6 @@ impl LokrFactors {
             w2_a,
             w2_b,
         )
-        .map(|factors| factors.map(|(scaled, _)| scaled))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -783,7 +763,7 @@ impl LokrFactors {
         w2_t2: Option<&Tensor>,
         w2_a: Option<&Tensor>,
         w2_b: Option<&Tensor>,
-    ) -> Result<Option<(Self, Tensor)>> {
+    ) -> Result<Option<Self>> {
         if !scale.is_finite() {
             return Err(CandleError::Msg(format!(
                 "lokr: derived scale must be finite, got {scale}"
@@ -839,20 +819,17 @@ impl LokrFactors {
         // Bake the full scale into `w2` (keeps `w1` a clean copy); hold f32, contiguous for the matmuls.
         let w2 = (&factor2 * scale)?.contiguous()?;
         let w1 = factor1.contiguous()?;
-        Ok(Some((
-            Self {
-                w1,
-                w2,
-                a,
-                b,
-                c,
-                d,
-                output_slice,
-                scale,
-                prepared: Arc::default(),
-            },
-            factor2,
-        )))
+        Ok(Some(Self {
+            w1,
+            w2,
+            a,
+            b,
+            c,
+            d,
+            output_slice,
+            scale,
+            prepared: Arc::default(),
+        }))
     }
 
     /// The `[out, in]` projection shape this residual adapts (`out` is the output slice's length

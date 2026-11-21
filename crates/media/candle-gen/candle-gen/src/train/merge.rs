@@ -124,13 +124,25 @@ pub const MAX_ADAPTER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// `Err` naming the path, cap, and actual size, never an unbounded `std::fs::read` that could OOM the
 /// process. Normal-sized adapters are unaffected — the byte-for-byte load path below is unchanged.
 pub fn read_adapter(path: &Path) -> Result<AdapterFile> {
+    read_adapter_capped(path, MAX_ADAPTER_BYTES).map(|(adapter, _, _)| adapter)
+}
+
+/// Return the already validated physical tensor layout with the decoded adapter, so lazy
+/// consumers can refer to the same winning input keys and offsets without reparsing the file.
+/// The offset is the start of the data region, relative to the beginning of the file.
+pub fn read_adapter_with_layout(
+    path: &Path,
+) -> Result<(AdapterFile, u64, safetensors::tensor::Metadata)> {
     read_adapter_capped(path, MAX_ADAPTER_BYTES)
 }
 
 /// [`read_adapter`] with an explicit byte cap — the shared body; `read_adapter` passes
 /// [`MAX_ADAPTER_BYTES`]. Factored out so the guard can be exercised with a tiny cap in tests without
 /// crafting a multi-GB file (the fully-in-memory buffer read is exactly why the cap exists).
-fn read_adapter_capped(path: &Path, max_bytes: u64) -> Result<AdapterFile> {
+fn read_adapter_capped(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(AdapterFile, u64, safetensors::tensor::Metadata)> {
     let size = std::fs::metadata(path)
         .map_err(|e| CandleError::Msg(format!("stat adapter {}: {e}", path.display())))?
         .len();
@@ -150,10 +162,10 @@ path,
 )
     .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
     let tensors = cst::load_buffer(&bytes, &Device::Cpu)?;
-    let (_, md) = safetensors::SafeTensors::read_metadata(&bytes)
+    let (header_bytes, md) = safetensors::SafeTensors::read_metadata(&bytes)
         .map_err(|e| CandleError::Msg(format!("read adapter metadata {}: {e}", path.display())))?;
     let meta = md.metadata().clone().unwrap_or_default();
-    Ok(AdapterFile { tensors, meta })
+    Ok((AdapterFile { tensors, meta }, 8 + header_bytes as u64, md))
 }
 
 /// Read a scalar tensor (`[]` or `[1]`) as `f32` — a per-target scalar read (a LoRA `.alpha`, or any
@@ -911,7 +923,7 @@ mod tests {
         // Real entry (8 GiB cap) and an explicit small-but-sufficient cap both load identically.
         let af = read_adapter(&path).unwrap();
         assert!(af.tensors.contains_key("m.lora_down.weight"));
-        let capped = read_adapter_capped(&path, MAX_ADAPTER_BYTES).unwrap();
+        let (capped, _, _) = read_adapter_capped(&path, MAX_ADAPTER_BYTES).unwrap();
         assert_eq!(capped.tensors.len(), af.tensors.len());
         std::fs::remove_file(&path).ok();
     }

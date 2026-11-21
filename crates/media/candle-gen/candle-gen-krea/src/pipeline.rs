@@ -2228,7 +2228,7 @@ fn render_multiphase_driver<T>(
     mut decode: impl FnMut(&Tensor) -> Result<T>,
 ) -> Result<Vec<T>> {
     let device = dit.device();
-    let topology = dit.phase_topology()?;
+    let mut topology = dit.phase_topology()?;
     let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
     let sigmas = run.plan().sigmas();
     let full_total_steps = sigmas.len().saturating_sub(1);
@@ -2242,7 +2242,7 @@ fn render_multiphase_driver<T>(
             let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, sigmas);
             run.denoise_adapter_phases(image_seed, initial, |phase, sub, seed, latent| {
                 let args = phase.arguments();
-                let selection = topology.phase(args.adapters());
+                let selection = topology.phase(args.adapters(), &req.cancel)?;
                 // The installed factors stay immutable. Prepare only the active phase's text
                 // fusion and hold it with that phase's alternate factors for its solver evaluations.
                 let positive = dit.prepare_phase_conditioning(context, req.width, req.height, &selection)?;
