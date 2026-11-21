@@ -175,6 +175,9 @@ impl ConvRotLinear {
     }
     /// Invert the orthonormal activation rotation on the requested coefficient rows.
     pub fn rows(&self, ids: &Array) -> Result<Array> {
+        if self.observation.as_ref().is_some_and(|o| o.pending()) {
+            self.materialize()?;
+        }
         let flat = ids.reshape(&[-1])?;
         let weight = self.codes.take_axis(&flat, 0)?.as_dtype(Dtype::Float32)?;
         let scales = self.scales.take_axis(&flat, 0)?;

@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 mlx-rs = { workspace = true }
+mlx-sys = { workspace = true }
 sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
 

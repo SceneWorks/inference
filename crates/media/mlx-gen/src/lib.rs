@@ -25,7 +25,7 @@ pub use gen_core::{
 };
 
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
-pub use mlx_layers::NativeProjection;
+pub use mlx_layers::{fp8::METAL_FP8_HEADER, NativeProjection};
 
 pub mod adapters;
 // Narrowing helpers for the provider-declared architecture axes (epic SC-22657): shared so a

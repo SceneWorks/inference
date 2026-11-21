@@ -46,6 +46,24 @@ impl Weights {
         }
     }
 
+    /// Keep the producer dtype and shard declarations when a provider owns an already verified
+    /// byte view and has copied the selected tensors into MLX arrays.
+    pub fn from_source_map(
+        mut tensors: HashMap<String, Array>,
+        paths: &[PathBuf],
+        declarations: &[String],
+    ) -> Result<Self> {
+        let source_reads = mlx_layers::source::prepare_sources(&mut tensors, paths, declarations)?;
+        Ok(Self {
+            source_reads,
+            ..Self::from_map(tensors)
+        })
+    }
+    /// Transfer the same measured source rows when a media pipeline delegates its encoder to MLX LLM.
+    pub fn into_language_weights(self) -> mlx_llm::primitives::Weights {
+        let reads = self.source_reads.clone();
+        mlx_llm::primitives::Weights::from_observed_map(self.into_tensors(), reads)
+    }
     /// An empty weights container — for building small in-memory fixtures (e.g. checkpoint-remap unit
     /// tests that assert `remap_*_keys` produces the aliased names without a real snapshot).
     pub fn empty() -> Self {

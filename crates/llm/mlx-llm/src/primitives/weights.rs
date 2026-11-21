@@ -114,6 +114,16 @@ impl Weights {
         }
     }
 
+    pub fn from_observed_map(
+        tensors: HashMap<String, Array>,
+        source_reads: mlx_layers::source::SourceReads,
+    ) -> Self {
+        Self {
+            source_reads,
+            ..Self::from_map(tensors)
+        }
+    }
+
     /// Load every tensor from a single `.safetensors` file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -295,6 +305,11 @@ impl Weights {
         }
         if !batch.is_empty() {
             Self::verify_batch(&batch)?;
+        }
+        for key in accessed.iter() {
+            if let Some(array) = self.tensors.get(key) {
+                self.source_reads.materialized(key, array)?;
+            }
         }
         Ok(())
     }

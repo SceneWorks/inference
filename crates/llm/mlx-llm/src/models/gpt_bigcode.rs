@@ -12,7 +12,7 @@ use crate::decode::Decode;
 use crate::error::{Error, Result};
 use crate::primitives::attention::sdpa_causal;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
-use crate::primitives::nn::{embed, gelu_tanh, layer_norm, linear};
+use crate::primitives::nn::{gelu_tanh, layer_norm, linear};
 use crate::primitives::Weights;
 
 /// Project a multi-row GPTBigCode prefill as a batch of independent matrix-vector products.
@@ -73,12 +73,11 @@ impl GptBigCodeConfig {
 
 /// Native GPTBigCode decoder with learned positions and a single MQA KV head.
 pub struct GptBigCode {
-    token_embedding: Array,
-    position_embedding: Array,
+    token_embedding: Projection,
+    position_embedding: Projection,
     layers: Vec<GptBigCodeLayer>,
     final_norm_weight: Array,
     final_norm_bias: Array,
-    lm_head: Array,
     cfg: GptBigCodeConfig,
 }
 
@@ -86,11 +85,12 @@ impl GptBigCode {
     /// Load the exact StarVector decoder from its namespaced safetensors map.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: GptBigCodeConfig) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
-        let token_embedding = w.require(&key("transformer.wte.weight"))?.clone();
+        let token_embedding =
+            Projection::from_named(w, &key("transformer.wte.weight"), None, None)?;
         // GPTBigCode ties the output projection to the token embedding. The published
         // StarVector-1B snapshot therefore intentionally has no separate `lm_head.weight`.
-        let lm_head = token_embedding.clone();
-        let position_embedding = w.require(&key("transformer.wpe.weight"))?.clone();
+        let position_embedding =
+            Projection::from_named(w, &key("transformer.wpe.weight"), None, None)?;
         let mut layers = Vec::with_capacity(cfg.layers);
         for index in 0..cfg.layers {
             layers.push(GptBigCodeLayer::from_weights(
@@ -105,7 +105,6 @@ impl GptBigCode {
             layers,
             final_norm_weight: w.require(&key("transformer.ln_f.weight"))?.clone(),
             final_norm_bias: w.require(&key("transformer.ln_f.bias"))?.clone(),
-            lm_head,
             cfg,
         };
         w.verify_accessed_gpu_view()?;
@@ -123,15 +122,15 @@ impl GptBigCode {
         let positions: Vec<i32> = (offset..offset + shape[1]).collect();
         let position_ids = Array::from_slice(&positions, &[1, shape[1]]);
         Ok(add(
-            &embed(&self.token_embedding, ids)?,
-            &embed(&self.position_embedding, &position_ids)?,
+            &self.token_embedding.rows(ids)?,
+            &self.position_embedding.rows(&position_ids)?,
         )?)
     }
 
     /// Token embeddings without position rows, used to concatenate the image prefix before one
     /// shared learned-position lookup over the complete multimodal prompt.
     pub fn raw_embed(&self, ids: &Array) -> Result<Array> {
-        embed(&self.token_embedding, ids)
+        self.token_embedding.rows(ids)
     }
 
     /// Prefill multimodal embeddings. Vision rows already occupy positions `0..offset`; `embeds`
@@ -149,7 +148,7 @@ impl GptBigCode {
         )?;
         let sequence = hidden.shape()[1];
         let last = hidden.take_axis(Array::from_slice(&[sequence - 1], &[1]), 1)?;
-        let logits = linear(&last, &self.lm_head, None)?;
+        let logits = self.token_embedding.forward(&last)?;
         Ok(logits.reshape(&[hidden.shape()[0], self.cfg.vocab_size])?)
     }
 
@@ -163,7 +162,7 @@ impl GptBigCode {
         }
         let positions: Vec<i32> = (offset..offset + sequence).collect();
         let ids = Array::from_slice(&positions, &[1, sequence]);
-        Ok(add(embeds, &embed(&self.position_embedding, &ids)?)?)
+        Ok(add(embeds, &self.position_embedding.rows(&ids)?)?)
     }
 
     /// A fresh MQA cache for this decoder.
@@ -494,11 +493,6 @@ mod tests {
     #[ignore = "model inference; explicit model-proof workflow"]
     fn tiny_decoder_loads_and_projects_with_tied_token_embeddings() {
         let model = tiny_decoder();
-        assert_eq!(
-            model.lm_head.as_slice::<f32>(),
-            model.token_embedding.as_slice::<f32>()
-        );
-
         let mut cache = model.cache();
         let logits = model
             .logits_from_embeds(&model.embed_at(&input_ids(&[1]), 0).unwrap(), &mut cache)

@@ -93,6 +93,14 @@ pub fn plan_projection_sources(
                 bases.insert(base.to_owned());
             }
         }
+        if selected(&h.name)
+            && matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)
+            && [".scale_weight", ".weight_scale"]
+                .iter()
+                .any(|suffix| source.contains_key(&format!("{}{suffix}", h.name)))
+        {
+            bases.insert(h.name.clone());
+        }
         if let Some(base) = h.name.strip_suffix(".weight") {
             if selected(&h.name)
                 && (matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2)

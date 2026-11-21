@@ -472,6 +472,17 @@ pub fn embedding(w: &Weights, base: &str, group_size: i32) -> Result<TokenEmbedd
     ))
 }
 
+/// Embedding-table coefficients in an architecture's chosen dense dtype. Encoded tables keep their
+/// source representation; only gathered rows cross the floating-point boundary.
+pub fn embedding_compute(w: &Weights, base: &str, dtype: Dtype) -> Result<TokenEmbedding> {
+    if let Some(p) = mlx_layers::NativeProjection::from_weights(w, base, false)? {
+        return Ok(TokenEmbedding::Native(p));
+    }
+    Ok(TokenEmbedding::Dense(
+        w.require(&format!("{base}.weight"))?.as_dtype(dtype)?,
+    ))
+}
+
 /// Read every tensor of `dir` (possibly sharded safetensors) into an owned key→`Array` map (MLX
 /// arrays are ref-counted, so the clone is a handle copy, not a buffer copy). The read side of the
 /// offline pre-quantization converters.
