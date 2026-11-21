@@ -207,7 +207,7 @@ impl Observation {
                 &shape
             };
             row.accounting
-                .declare_dense_layout(&row.key, &shape, width)
+                .declare_dense_layout(&row.key, shape, width)
                 .map_err(|e| Error::Msg(e.to_string()))?;
             row.accounting
                 .record(
