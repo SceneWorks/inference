@@ -116,6 +116,53 @@ class TargetedCudaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             diagnostic.continuation(diagnostic.GPU0_MEMORY, proof.cohorts.WAN, previous)
 
+    def test_gpu0_role_refuses_gpu1_admission_even_with_a_matching_policy_hash(self):
+        from scripts.tests.test_wan_tier1_comparison import request
+        with TemporaryDirectory() as directory:
+            raw_policy = request("candle-cuda", proof.BASE)["policy"]
+            raw_policy["cudaDeviceUuid"] = diagnostic.GPU0_HARDWARE["uuid"]
+            policy = proof.read_policy(Path(directory), "policy.json", raw_policy)
+        admitted = proof.runtime_guarded_admission(policy)
+        admitted.update(hostAvailableBytes=100 * proof.GIB, gpuAvailableBytes=50 * proof.GIB)
+        guard = {"returncode": 0, "elapsed_seconds": 1, "peak_host_bytes": 100, "admission": admitted}
+        observed = {"result": {}, "initial_le_f32_hex": "", "terminal_le_f32_hex": ""}
+        with patch.object(proof.evidence, "capture", return_value={"samples": [{"elapsed_ns": 100}]}), \
+             patch.object(proof.proof, "verify_execution", return_value={}):
+            for delta in ({"cudaDeviceUuid": followup.CUDA_UUID}, {"pollMillis": policy.poll_millis + 1},
+                          {"backend": "linux-cuda"}):
+                with self.assertRaisesRegex(ValueError, "GPU0 child admission"):
+                    proof.evaluate(observed, "cuda-ti2v5b-t2v-heun", "candle-cuda", policy,
+                                   dict(proof.SETTINGS, campaign=diagnostic.GPU0_TIMING), "",
+                                   dict(guard, admission=dict(admitted, **delta)), {})
+
+    def test_gpu0_release_replays_both_supported_producer_outcomes_on_the_claimed_card(self):
+        from scripts.ci.model_proof_resources import SHARED_CUDA_HEADROOM_ACTIVITY
+        card = {"index": 0, "total_mib": 97887, "used_mib": 97100, "free_mib": 787, "utilization_percent": 9}
+        rows = [{"sample_number": i, "selected_card": card, "predicates": {"unique_uuid": True},
+                 "selected_index_matches_admission": True, "post_owned_exit_primary_metadata_valid": True}
+                for i in range(1, 6)]
+        activity = {"status": "retained-existing-samples", "activity_profile": SHARED_CUDA_HEADROOM_ACTIVITY,
+                    "admission_headroom_is_diagnostic_only": True, "samples": rows, "sample_count": len(rows)}
+        claim = {"device_uuid": diagnostic.GPU0_HARDWARE["uuid"], "physical_index": 0,
+                 "activity_profile": SHARED_CUDA_HEADROOM_ACTIVITY, "admission_baseline": {"admitted_total_mib": 97887},
+                 "release_metadata_verification": {"status": "verified"}, "release_utilization_percent": [9] * 5,
+                 "release_background_activity": activity}
+        proof.verify_gpu0_release(claim)
+        partial = dict(activity, samples=rows[:2], sample_count=2)
+        with self.assertRaises(ValueError):
+            proof.verify_gpu0_release(dict(claim, release_background_activity=partial))
+        claim.pop("release_utilization_percent")
+        claim.update(release_background_activity=partial, release_metadata_verification={
+            "status": "inconclusive-driver-query-timing", "error": "driver timeout", "diagnostic": partial})
+        proof.verify_gpu0_release(claim)
+        for replacement in (dict(rows[0], selected_card=dict(card, index=1)),
+                            dict(rows[0], post_owned_exit_primary_metadata_valid=False)):
+            with self.assertRaises(ValueError):
+                proof.verify_gpu0_release(dict(claim, release_background_activity=dict(partial, samples=[replacement, rows[1]])))
+        with self.assertRaises(ValueError):
+            proof.verify_gpu0_release(dict(claim, release_metadata_verification={"status": "inconclusive-driver-query-timing",
+                "error": "driver timeout", "diagnostic": activity}))
+
     def test_native_conditioning_is_complete_disjoint_and_within_the_owned_child(self):
         for case, count in diagnostic.TIMING_CALLS.items():
             row = {"conditioning_ns": [20] * count, "conditioning_end_ns": 21 * count,

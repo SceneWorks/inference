@@ -24,7 +24,7 @@ from scripts.ci import video_tier1_followup as followup
 from scripts.ci import video_tier1_cuda_diagnostic as targeted
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
-from scripts.media_campaign_supervisor import load_policy, validate_admission
+from scripts.media_campaign_supervisor import load_policy, runtime_guarded_admission, validate_admission
 
 BASE = "38dab65f5d9640396cf2946cd4ee866ce46630c6"
 SELECTION = cohorts.WAN
@@ -417,6 +417,12 @@ def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool
             or guard["peak_host_bytes"] > policy.child_footprint_cap_bytes
             or guard["admission"]["policySha256"] != policy.sha256):
         raise ValueError("supervisor did not record an admitted bounded execution")
+    if settings.get("campaign") in targeted.GPU0_CONTINUATIONS:
+        # The supervisor emits this fixed admission, then measures available memory before spawn.
+        expected = runtime_guarded_admission(policy)
+        if any(k not in guard["admission"] or guard["admission"][k] != v for k, v in expected.items()
+               if k not in ("hostAvailableBytes", "gpuAvailableBytes")):
+            raise ValueError("GPU0 child admission differs from its selected physical device or guards")
     if settings.get("campaign") in targeted.TIMING_CONTINUATIONS:
         targeted.verify_conditioning(observed["conditioning"], facts["samples"], case, guard["elapsed_seconds"])
     if settings.get("campaign") in targeted.MEMORY_CONTINUATIONS:
@@ -668,6 +674,36 @@ def verify_cuda_claim(claim, hardware, policy):
         raise ValueError("CUDA utilization readings differ from the admission samples")
 
 
+def verify_gpu0_release(claim):
+    from scripts.ci.model_proof_resources import proof_cuda_shared_release
+    from scripts.release.veda_cuda_guard import BASELINE_SAMPLES
+
+    activity = claim["release_background_activity"]
+    metadata = claim["release_metadata_verification"]
+    rows = activity["samples"]
+    if (activity["status"] != "retained-existing-samples" or activity["activity_profile"] != claim["activity_profile"]
+            or activity["admission_headroom_is_diagnostic_only"] is not True
+            or type(activity["sample_count"]) is not int or not 1 <= len(rows) <= BASELINE_SAMPLES
+            or len(rows) != activity["sample_count"]):
+        raise ValueError("missing exact GPU0 release observations")
+    for index, row in enumerate(rows, 1):
+        card = row["selected_card"]
+        if (type(row["sample_number"]) is not int or row["sample_number"] != index or row["predicates"]["unique_uuid"] is not True
+                or row["selected_index_matches_admission"] is not True
+                or row["post_owned_exit_primary_metadata_valid"] is not True
+                or not proof_cuda_shared_release(dict(card, uuid=claim["device_uuid"]), claim["device_uuid"],
+                                                 claim["physical_index"], claim["admission_baseline"]["admitted_total_mib"])):
+            raise ValueError("GPU0 release sample differs from the claimed card")
+    if metadata == {"status": "verified"}:
+        if (len(rows) != BASELINE_SAMPLES or claim.get("release_utilization_percent") !=
+                [row["selected_card"]["utilization_percent"] for row in rows]):
+            raise ValueError("verified GPU0 release lacks its complete five-sample window")
+    elif (metadata.get("status") != "inconclusive-driver-query-timing" or not isinstance(metadata.get("error"), str)
+          or "release_utilization_percent" in claim
+          or any(metadata["diagnostic"].get(k) != v for k, v in activity.items())):
+        raise ValueError("inconclusive GPU0 release lacks its selected-card timing diagnostics")
+
+
 def check_followup_device(extension, hardware, adapter):
     if extension["name"] in targeted.GPU0_CONTINUATIONS:
         if hardware != targeted.GPU0_HARDWARE:
@@ -717,6 +753,8 @@ def check_complete_provenance(receipt, contract):
         if receipt.get("dedicated_adapter") != cuda_adapter(policy):
             raise ValueError("WDDM process counter source differs from the selected physical adapter")
         verify_cuda_claim(claim, hardware, policy)
+        if contract["request"].get("followup") in targeted.GPU0_CONTINUATIONS:
+            verify_gpu0_release(claim)
     # The verifier runs in the same job after scratch cleanup, with the pinned compiler.
     tc = proof.verified_toolchain(build_env(policy), root=ROOT)
     models = cohorts.models(contract["cases"])
