@@ -226,6 +226,29 @@ fn is_fp8_operand(h: &SafetensorsTensorHeader) -> bool {
         && gen_core::checkpoint_codec::projection_companion_base(&h.name).is_none()
 }
 
+/// When both parameters are encoded, H3 supplies the role's compute dtype. A surviving
+/// ordinary weight or bias otherwise retains the checkpoint's mixed precision.
+pub fn encoded_head_width(
+    key: &str,
+    headers: &BTreeMap<&str, &SafetensorsTensorHeader>,
+) -> Option<u64> {
+    let (base, field) = key.rsplit_once('.')?;
+    if !matches!(field, "weight" | "bias") {
+        return None;
+    }
+    let keeps_fp32 = crate::h3_projection_keeps_fp32(base);
+    if !keeps_fp32 && !matches!(base, "context_embedder" | "norm_out.linear") {
+        return None;
+    }
+    let other = if field == "weight" { "bias" } else { "weight" };
+    let partner = headers.get(format!("{base}.{other}").as_str());
+    Some(
+        partner
+            .filter(|h| h.is_float())
+            .map_or(if keeps_fp32 { 4 } else { 2 }, |h| h.dtype.size() as u64),
+    )
+}
+
 fn allocation_with_fp8(
     headers: &[SafetensorsTensorHeader],
     payloads: &BTreeMap<String, Vec<u8>>,
@@ -256,7 +279,9 @@ fn allocation_with_fp8(
                 let bytes = if t.residency.mode == ResidencyMode::Packed {
                     t.residency.resident_bytes
                 } else {
-                    let w = width(by_name[t.physical_key.as_str()]).unwrap_or(activation_width);
+                    let w = encoded_head_width(&t.physical_key, &by_name)
+                        .or_else(|| width(by_name[t.physical_key.as_str()]))
+                        .unwrap_or(activation_width);
                     t.shape
                         .iter()
                         .try_fold(w, |a, &n| a.checked_mul(n as u64))
@@ -1238,6 +1263,45 @@ mod tests {
             assert_eq!(operands["head.weight"], matrix_bytes);
             assert_eq!(operands[&scale], scales);
             assert_eq!(actual.projections.len(), 1);
+        }
+    }
+    #[test]
+    fn mixed_head_fallback_prices_original_bias_or_weight_then_the_model_role() {
+        use gen_core::checkpoint_codec::DenseResidencyPolicy;
+        let headers = vec![
+            header("proj_in.weight", Dtype::F8_E5M2, &[3, 5]),
+            header("proj_in.bias", Dtype::F32, &[3]),
+            header("time_embedder.linear_1.weight", Dtype::F8_E5M2, &[3, 5]),
+            header("time_embedder.linear_1.bias", Dtype::F8_E5M2, &[3]),
+            header("context_embedder.weight", Dtype::F8_E5M2, &[3, 5]),
+            header("context_embedder.bias", Dtype::F8_E5M2, &[3]),
+            header("proj_out.weight", Dtype::F16, &[3, 5]),
+            header("proj_out.bias", Dtype::F8_E5M2, &[3]),
+        ];
+        let allocation = allocation_with_fp8(
+            &headers,
+            &BTreeMap::new(),
+            CUDA,
+            2,
+            |_| None,
+            &DenseResidencyPolicy,
+            &[],
+        )
+        .unwrap();
+        let bytes: BTreeMap<_, _> = allocation.resident_by_name.into_iter().collect();
+        for base in [
+            "proj_in",
+            "time_embedder.linear_1",
+            "context_embedder",
+            "proj_out",
+        ] {
+            let width = if matches!(base, "proj_in" | "time_embedder.linear_1") {
+                4
+            } else {
+                2
+            };
+            assert_eq!(bytes[&format!("{base}.weight")], 15 * width);
+            assert_eq!(bytes[&format!("{base}.bias")], 3 * width);
         }
     }
     fn fixture(
