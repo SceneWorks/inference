@@ -402,14 +402,6 @@ impl ProjectionSource {
         }
         #[cfg(feature = "cuda")]
         {
-            if self
-                .reader()
-                .planned(name)
-                .is_some_and(|r| matches!(r.codec, gen_core::TensorCodecSpec::RowwiseFp8 { .. }))
-                && (dtype != DType::BF16 || transpose)
-            {
-                return Ok(None);
-            }
             let convrot = if transpose {
                 None
             } else {
