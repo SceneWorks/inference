@@ -1358,11 +1358,6 @@ impl FluxDit {
     ) -> candle_gen::Result<Tensor> {
         match prepared {
             Some(prepared) => {
-                if prepared.layout != Some(self.layout) {
-                    return Err(candle_gen::CandleError::Msg(
-                        "flux: prepared conditioning belongs to another DiT variant".into(),
-                    ));
-                }
                 prepared.validate(image, image_ids, text, text_ids)?;
                 Ok(prepared.pe.clone())
             }
@@ -1744,6 +1739,11 @@ impl FluxDit {
         prepared: Option<&PreparedConditioning>,
         pag_layers: Option<&[u32]>,
     ) -> candle_gen::Result<Tensor> {
+        if prepared.is_some_and(|prepared| prepared.layout != Some(self.layout)) {
+            return Err(candle_gen::CandleError::Msg(
+                "flux: prepared conditioning belongs to another DiT variant".into(),
+            ));
+        }
         if self.layout == Layout::Bfl {
             for (name, tensor) in [("txt", text), ("img", image)] {
                 if tensor.rank() != 3 {
