@@ -225,6 +225,16 @@ pub const FP8_E4M3_SCALAR_CODEC: CheckpointCodecRegistration = CheckpointCodecRe
     resident_encoding: WeightEncoding::DenseBf16,
 };
 
+/// Publisher rowwise E4M3 (FP8R). Each output row retains its own F32 calibration.
+pub const FP8_E4M3_ROWWISE_CODEC: CheckpointCodecRegistration = CheckpointCodecRegistration {
+    codec_id: "fp8-e4m3-rowwise-v1",
+    stored: &[StoredTensorFormat::described(
+        WeightEncoding::Fp8E4M3,
+        ComfyQuantFormat::Fp8Rowwise,
+    )],
+    resident_encoding: WeightEncoding::DenseBf16,
+};
+
 /// ComfyUI scalar-scaled FP8 **E5M2** (sc-20385). Same convention as
 /// [`FP8_E4M3_SCALAR_CODEC`] with E5M2 element decode; no backend has a native E5M2-weight matmul,
 /// so residency is always the dense fallback.
@@ -296,6 +306,7 @@ pub const NVFP4_CODEC: CheckpointCodecRegistration = CheckpointCodecRegistration
 pub const COMFY_QUANT_CODECS: &[CheckpointCodecRegistration] = &[
     FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC,
+    FP8_E4M3_ROWWISE_CODEC,
     MXFP8_CODEC,
     INT8_PER_ROW_CODEC,
     CONVROT_INT8_CODEC,
@@ -318,6 +329,7 @@ pub const BASELINE_CHECKPOINT_CODECS: &[CheckpointCodecRegistration] = &[
     DENSE_F32_CODEC,
     FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC,
+    FP8_E4M3_ROWWISE_CODEC,
     MXFP8_CODEC,
     INT8_PER_ROW_CODEC,
     CONVROT_INT8_CODEC,

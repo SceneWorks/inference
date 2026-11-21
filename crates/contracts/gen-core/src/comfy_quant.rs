@@ -86,6 +86,8 @@ pub enum ComfyQuantFormat {
     Float8E4M3Fn,
     /// `float8_e5m2` — fp8 E5M2 values + one per-tensor f32 scale.
     Float8E5M2,
+    /// Publisher E4M3 rows calibrated by one F32 scale per output.
+    Fp8Rowwise,
     /// `mxfp8` — fp8 E4M3FN values + E8M0 shared exponents per 32-element block along the last axis.
     Mxfp8,
     /// `nvfp4` — E2M1 nibbles (two per `U8` byte) + one FP8 E4M3 micro-scale per 16-element block
@@ -99,6 +101,7 @@ impl ComfyQuantFormat {
         match self {
             Self::Int8TensorwisePerRow | Self::ConvRotInt8 => "int8_tensorwise",
             Self::Float8E4M3Fn => "float8_e4m3fn",
+            Self::Fp8Rowwise => "fp8r",
             Self::Float8E5M2 => "float8_e5m2",
             Self::Mxfp8 => "mxfp8",
             Self::Nvfp4 => "nvfp4",
@@ -109,6 +112,7 @@ impl ComfyQuantFormat {
         Some(match name {
             "int8_tensorwise" => Self::Int8TensorwisePerRow,
             "float8_e4m3fn" => Self::Float8E4M3Fn,
+            "fp8r" => Self::Fp8Rowwise,
             "float8_e5m2" => Self::Float8E5M2,
             "mxfp8" => Self::Mxfp8,
             "nvfp4" => Self::Nvfp4,

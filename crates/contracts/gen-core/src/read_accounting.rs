@@ -158,7 +158,7 @@ impl CheckpointReadAccounting {
         if let Some((prev, n)) = state.rows.get(&i) {
             if *prev == repr && *n != bytes {
                 return Err(
-                    format!("{key}: changed {repr:?} residency from {n} to {bytes} bytes").into(),
+                    format!("{key}: {repr:?} residency {bytes} contradicts the first measurement of {n} bytes").into(),
                 );
             }
             if row.residency.mode == ResidencyMode::Packed

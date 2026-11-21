@@ -432,6 +432,7 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap(),
             LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedRowwiseFp8 { .. }
             | LogicalTensor::PackedMxFp8 { .. }
             | LogicalTensor::PackedScalarFp8 { .. }
             | LogicalTensor::PackedNvfp4 { .. } => {
@@ -557,6 +558,43 @@ mod tests {
         assert_eq!(dense_f32(&weights, "q.weight"), expected);
         assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
         assert_eq!(weights.receipt.resident_bytes(), 16);
+    }
+
+    #[test]
+    fn scalar_dense_f32_preserves_source_precision_and_prices_the_actual_operand() {
+        let dir = fixture_dir();
+        let path = dir.path().join("source-f32.safetensors");
+        let scale = 1.0_f32 + 1.0 / 512.;
+        let desc = br#"{"format":"float8_e4m3fn"}"#;
+        write_safetensors(
+            &path,
+            &[
+                ("model.q.weight", "F8_E4M3", &[4, 4], vec![0x38; 16]),
+                (
+                    "model.q.weight_scale",
+                    "F32",
+                    &[],
+                    scale.to_le_bytes().to_vec(),
+                ),
+                ("model.q.comfy_quant", "U8", &[desc.len()], desc.to_vec()),
+                (
+                    "model.direct.weight",
+                    "F32",
+                    &[1, 1],
+                    scale.to_le_bytes().to_vec(),
+                ),
+            ],
+        );
+        let reader = LogicalWeightReader::open(&path, plan_dense(&path), &Device::Cpu).unwrap();
+        for (name, count) in [("q.weight", 16), ("direct.weight", 1)] {
+            let weight = reader.read_dense(name, DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(
+                weight.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                vec![scale; count]
+            );
+        }
+        let facts = reader.checkpoint_weight_facts().unwrap();
+        assert_eq!(facts.receipt().resident_bytes(), 68);
     }
 
     /// Golden: `fp8-e5m2-scalar-v1` (scaled) plus the undescribed plain cast (unit scale).

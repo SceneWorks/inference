@@ -2556,7 +2556,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
- "safetensors 0.4.5",
+ "safetensors 0.7.0",
  "sceneworks-gen-core",
  "sceneworks-gen-core-checkpoint",
  "sceneworks-gen-core-iris",

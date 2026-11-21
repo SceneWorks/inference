@@ -438,6 +438,7 @@ impl Gemma2 {
     /// table's scales), which every layer then keeps.
     pub fn compute_dtype(&self) -> Dtype {
         match &self.embed {
+            TokenEmbedding::Native(_) => Dtype::Bfloat16,
             TokenEmbedding::Dense(w) => w.dtype(),
             TokenEmbedding::Quantized { scales, .. } => scales.dtype(),
         }

@@ -19,6 +19,7 @@ pub struct CheckpointReceiptScope {
     sources: Arc<Mutex<Sources>>,
     readers: Arc<Mutex<BTreeMap<Vec<PathBuf>, Vec<Arc<crate::CheckpointReadAccounting>>>>>,
 
+    prepared: Option<Arc<LoadSpec>>,
     primary: Option<PathBuf>,
     pin: Option<PinnedWeightsFile>,
     observed_pin: Arc<std::sync::OnceLock<std::result::Result<PinnedWeightsFile, String>>>,
@@ -26,9 +27,14 @@ pub struct CheckpointReceiptScope {
 
 impl CheckpointReceiptScope {
     pub fn for_load(spec: &LoadSpec) -> crate::Result<Self> {
+        let prepared = spec.has_source_guard().then(|| Arc::new(spec.clone()));
         match &spec.weights {
-            crate::WeightsSource::Dir(_) => Ok(Self::default()),
+            crate::WeightsSource::Dir(_) => Ok(Self {
+                prepared,
+                ..Self::default()
+            }),
             crate::WeightsSource::File(path) => Ok(Self {
+                prepared,
                 primary: Some(absolute(path)),
                 pin: spec.prepared_file_pin_for(path)?.cloned(),
                 ..Self::default()
@@ -48,6 +54,14 @@ impl CheckpointReceiptScope {
         f()
     }
 
+    /// Hold the authoritative preparation/inventory guard across deferred opens and execution.
+    /// This preserves the same before/after source checks as the initial registry constructor.
+    pub fn with_prepared<T>(&self, f: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
+        self.with(|| match &self.prepared {
+            Some(spec) => spec.read_prepared_files_unchanged(f),
+            None => f(),
+        })
+    }
     /// Explicit propagation for a provider that opens a new reader on a worker thread.
     pub fn current() -> Option<Self> {
         CURRENT.with(|s| s.borrow().clone())

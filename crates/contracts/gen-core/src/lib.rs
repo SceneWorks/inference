@@ -45,8 +45,8 @@ pub mod block_window;
 pub mod caption;
 pub mod checkpoint_codec;
 pub mod checkpoint_facts;
-mod receipt_scope;
 mod read_accounting;
+mod receipt_scope;
 pub use read_accounting::CheckpointReadAccounting;
 pub use receipt_scope::CheckpointReceiptScope;
 pub mod comfy_quant;
@@ -93,6 +93,7 @@ pub mod h3_image;
 pub mod h3_memory;
 pub mod h3_reference;
 pub mod hdr;
+mod headwise;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
@@ -106,6 +107,7 @@ pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
 pub mod moss_image_edit;
+pub use headwise::{HeadwiseProjection, HeadwiseWeights};
 pub mod numeric;
 pub mod registry;
 pub mod render;
@@ -160,8 +162,8 @@ pub use checkpoint_codec::{
     LogicalWeightPlan, LogicalWeightPlanError, LogicalWeightReceipt, PlannedResidency,
     ResidencyMode, ResidentTensorHeadersError, ScalarScaleSource, StoredTensorFormat,
     TensorCodecSpec, WeightEncoding, COMFY_QUANT_CODECS, DENSE_BF16_CODEC, DENSE_CODECS,
-    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
-    GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC,
+    FP8_E5M2_SCALAR_CODEC, GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 pub use checkpoint_facts::{
     CheckpointFactsSink, CheckpointWeightFacts, CheckpointWeightFactsError,

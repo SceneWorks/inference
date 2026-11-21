@@ -25,6 +25,7 @@ pub fn load_safetensors_on_cpu(
 pub struct Weights {
     tensors: HashMap<String, Array>,
     metadata: HashMap<String, String>,
+    pub(crate) source_reads: mlx_layers::source::SourceReads,
     accessed: RefCell<std::collections::HashSet<String>>,
     planned_convrot: HashMap<String, gen_core::convrot_int8::ConvRotInt8>,
     planned_fp8: HashMap<String, mlx_layers::fp8::Fp8Linear>,
@@ -37,6 +38,7 @@ impl Weights {
         Self {
             tensors,
             metadata: HashMap::new(),
+            source_reads: Default::default(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
@@ -50,6 +52,7 @@ impl Weights {
         Self {
             tensors: HashMap::new(),
             metadata: HashMap::new(),
+            source_reads: Default::default(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
@@ -78,8 +81,13 @@ path.as_ref(),
             .cloned()
             .into_iter()
             .collect();
-        mlx_layers::fp8::prepare_sources(&mut tensors, &[path.as_ref().to_owned()], &declarations)?;
+        let source_reads = mlx_layers::source::prepare_sources(
+            &mut tensors,
+            &[path.as_ref().to_owned()],
+            &declarations,
+        )?;
         Ok(Self {
+            source_reads,
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
@@ -108,7 +116,11 @@ path.as_ref(),
             .iter()
             .map(|(key, array)| (key.as_str(), array))
             .collect();
-        Self::materialize_and_verify(&mut named)
+        Self::materialize_and_verify(&mut named)?;
+        for (key, array) in named {
+            self.source_reads.materialized(key, array)?;
+        }
+        Ok(())
     }
 
     /// Upper bound on the bytes one [`Self::materialize`] / [`Self::materialize_accessed`] batch
@@ -168,7 +180,11 @@ path.as_ref(),
             .iter()
             .filter_map(|key| self.tensors.get(key).map(|array| (key.as_str(), array)))
             .collect();
-        Self::materialize_and_verify(&mut named)
+        Self::materialize_and_verify(&mut named)?;
+        for (key, array) in named {
+            self.source_reads.materialized(key, array)?;
+        }
+        Ok(())
     }
 
     /// [`Self::materialize`]'s evaluate-and-verify pass over arrays that have already **left** a
@@ -241,8 +257,16 @@ path.as_ref(),
             u64::from_le_bytes(bytes[..8].try_into().expect("validated length prefix"));
         progress.add_bytes(8 + header_len);
         let mut tensors = HashMap::new();
+        let selected: std::collections::HashSet<_> = safe
+            .names()
+            .into_iter()
+            .filter(|k| include(k))
+            .map(|k| k.to_string())
+            .collect();
         for (name, view) in safe.tensors() {
-            if !include(&name) {
+            let companion = gen_core::checkpoint_codec::projection_companion_base(&name)
+                .is_some_and(|base| selected.contains(&format!("{base}.weight")));
+            if !selected.contains(&name) && !companion {
                 continue;
             }
             let shape: Vec<i32> = view
@@ -282,7 +306,7 @@ path.as_ref(),
             } else {
                 let dtype = match view.dtype() {
                     safetensors_fp8::Dtype::BOOL => Dtype::Bool,
-                    safetensors_fp8::Dtype::U8 => Dtype::Uint8,
+                    safetensors_fp8::Dtype::U8 | safetensors_fp8::Dtype::F8_E8M0 => Dtype::Uint8,
                     safetensors_fp8::Dtype::U16 => Dtype::Uint16,
                     safetensors_fp8::Dtype::U32 => Dtype::Uint32,
                     safetensors_fp8::Dtype::U64 => Dtype::Uint64,
@@ -322,8 +346,13 @@ path.as_ref(),
         let declarations = gen_core::safetensors_path_quantization_metadata(path.as_ref())?
             .into_iter()
             .collect::<Vec<_>>();
-        mlx_layers::fp8::prepare_sources(&mut tensors, &[path.as_ref().to_owned()], &declarations)?;
+        let source_reads = mlx_layers::source::prepare_sources(
+            &mut tensors,
+            &[path.as_ref().to_owned()],
+            &declarations,
+        )?;
         Ok(Self {
+            source_reads,
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
@@ -396,8 +425,9 @@ f,
             "mlx-gen::Weights::from_paths",
             files,
         );
-        mlx_layers::fp8::prepare_sources(&mut tensors, files, &declarations)?;
+        let source_reads = mlx_layers::source::prepare_sources(&mut tensors, files, &declarations)?;
         Ok(Self {
+            source_reads,
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
@@ -501,9 +531,15 @@ f,
     /// for the identity-but-renamed entries in a checkpoint→internal mapping.
     pub fn alias(&mut self, from: &str, to: &str) {
         if let Some(t) = self.tensors.get(from).cloned() {
+            self.source_reads.alias(from, to);
             if let (Some(source), Some(dest)) =
                 (from.strip_suffix(".weight"), to.strip_suffix(".weight"))
             {
+                for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
+                    if let Some(array) = self.tensors.get(&format!("{source}{suffix}")).cloned() {
+                        self.tensors.insert(format!("{dest}{suffix}"), array);
+                    }
+                }
                 if let Some(fp8) = self.planned_fp8(source).cloned() {
                     let scaled = self.tensors.contains_key(&format!("{source}.weight_scale"));
                     let input = self.tensors.contains_key(&format!("{source}.input_scale"));
@@ -1129,14 +1165,21 @@ mod tests {
 }
 
 impl mlx_layers::MlxWeightSource for Weights {
+    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
+        self.source_reads.get(key)
+    }
     fn planned_fp8(&self, base: &str) -> Option<&mlx_layers::fp8::Fp8Linear> {
         self.planned_fp8(base)
     }
     fn get(&self, key: &str) -> Option<&Array> {
         self.get(key)
     }
-    fn rotation_cache(&self) -> &RefCell<HashMap<usize, Array>> {
-        &self.convrot_rotations
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.convrot_rotations
+            .borrow_mut()
+            .entry(group)
+            .or_insert_with(build)
+            .clone()
     }
     fn planned_geometry(&self, base: &str) -> Option<gen_core::convrot_int8::ConvRotInt8> {
         self.planned_convrot(base)

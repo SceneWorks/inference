@@ -49,7 +49,8 @@ use gen_core::checkpoint_codec::{
     CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyPolicy, LogicalKeyMapping,
     LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, ResidencyMode, ScalarScaleSource,
     TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC,
-    FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
+    FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC,
+    MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::checkpoint_facts::{
     CheckpointWeightFacts, ExecutionRepresentation, NativeExecutionCapability,
@@ -76,6 +77,7 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     DENSE_F32_CODEC.codec_id,
     FP8_E4M3_SCALAR_CODEC.codec_id,
     FP8_E5M2_SCALAR_CODEC.codec_id,
+    FP8_E4M3_ROWWISE_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
     gen_core::convrot_int8::CODEC_ID,
     INT8_PER_ROW_CODEC.codec_id,
@@ -137,6 +139,7 @@ impl CandleCodecResidency {
             ids.extend([
                 FP8_E4M3_SCALAR_CODEC.codec_id,
                 FP8_E5M2_SCALAR_CODEC.codec_id,
+                FP8_E4M3_ROWWISE_CODEC.codec_id,
             ]);
             ids.push(gen_core::convrot_int8::CODEC_ID);
         }
@@ -231,6 +234,7 @@ impl CodecResidencyPolicy for CandleCodecResidency {
             && [
                 FP8_E4M3_SCALAR_CODEC.codec_id,
                 FP8_E5M2_SCALAR_CODEC.codec_id,
+                FP8_E4M3_ROWWISE_CODEC.codec_id,
             ]
             .contains(&codec.codec_id)
             && candle_quant_kernels::cublaslt::eight_bit_layout_supported(stored_shape)
@@ -278,6 +282,7 @@ pub fn plan_logical_weights(
 /// One decoded logical tensor.
 pub enum LogicalTensor {
     /// Original, padded E4M3 matrix and contiguous swizzled E8M0 block-scale surface.
+    PackedRowwiseFp8 { codes: Tensor, scales: Tensor },
     PackedMxFp8 {
         codes: Tensor,
         scales: Tensor,
@@ -342,7 +347,8 @@ impl LogicalTensor {
             Self::PackedMxFp8 { codes, scales, .. } => {
                 (codes.elem_count() + scales.elem_count()) as u64
             }
-            Self::PackedConvRot { codes, scales, .. } => {
+            Self::PackedRowwiseFp8 { codes, scales }
+            | Self::PackedConvRot { codes, scales, .. } => {
                 (codes.elem_count() + scales.elem_count() * scales.dtype().size_in_bytes()) as u64
             }
             Self::Dense(tensor) => (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64,
@@ -625,6 +631,7 @@ impl LogicalWeightReader {
             [
                 FP8_E4M3_SCALAR_CODEC.codec_id,
                 FP8_E5M2_SCALAR_CODEC.codec_id,
+                FP8_E4M3_ROWWISE_CODEC.codec_id,
                 MXFP8_CODEC.codec_id,
             ]
             .contains(&row.codec_id)
@@ -696,6 +703,17 @@ impl LogicalWeightReader {
                 } else {
                     Fp8Linear::from_parts(codes, weight_scale, input_scale, bias, lt)?
                 }
+            }
+            LogicalTensor::PackedRowwiseFp8 { codes, scales } => {
+                if transpose || shape.is_some_and(|(n, k)| codes.dims() != [n, k]) {
+                    candle_core::bail!("{key}: FP8R source shape/orientation mismatch");
+                }
+                Fp8Linear::from_rowwise_parts(
+                    codes,
+                    &scales.to_device(&Device::Cpu)?.to_vec1::<f32>()?,
+                    bias,
+                    lt,
+                )?
             }
             LogicalTensor::PackedMxFp8 {
                 codes,
@@ -876,7 +894,7 @@ impl LogicalWeightReader {
             ))
         })?;
         let tensor = Self::shaped_row(tensor, shape)?;
-        let decoded = decode(&self.st, &tensor, &self.device)?;
+        let decoded = decode(&self.st, &tensor, &self.device, DType::BF16)?;
         let repr = if tensor.residency.mode == ResidencyMode::Packed {
             ExecutionRepresentation::NativePacked
         } else {
@@ -937,33 +955,8 @@ impl LogicalWeightReader {
             .planned(key)
             .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
         let mut dense = Self::shaped_row(row, shape)?.into_owned();
-        if let TensorCodecSpec::ScalarFp8 { scale, .. } = &dense.codec {
-            let view = self.st.get(&dense.physical_key)?;
-            let element = match dense.encoding {
-                WeightEncoding::Fp8E4M3 => gen_core::fp8_e4m3fn_to_f32 as fn(u8) -> f32,
-                WeightEncoding::Fp8E5M2 => gen_core::fp8_e5m2_to_f32 as fn(u8) -> f32,
-                _ => candle_core::bail!("{key}: invalid scalar FP8 encoding"),
-            };
-            let sw = match scale {
-                ScalarScaleSource::Unit => 1.,
-                ScalarScaleSource::Companion { physical_key } => scalar_at(&self.st, physical_key)?,
-            };
-            if view.shape() != dense.source_shape() {
-                candle_core::bail!("{key}: FP8 source geometry changed");
-            }
-            let values =
-                cst::read_tensor_bytes(&view, |bytes| decode_scaled_fp8(bytes, element, sw));
-            let t = Tensor::from_vec(values, view.shape(), &Device::Cpu)?
-                .to_dtype(dtype)?
-                .to_device(device)?;
-            let logical = apply_transform(&dense, LogicalTensor::Dense(t))?;
-            if let LogicalTensor::Dense(t) = logical {
-                return Ok(t);
-            }
-            unreachable!()
-        }
         dense.residency.mode = ResidencyMode::Dense;
-        let LogicalTensor::Dense(t) = decode(&self.st, &dense, device)? else {
+        let LogicalTensor::Dense(t) = decode(&self.st, &dense, device, dtype)? else {
             candle_core::bail!("{key}: checkpoint operand has no dense coefficient representation")
         };
         t.to_dtype(dtype)
@@ -1053,9 +1046,14 @@ fn guard_stored(
     Ok(())
 }
 
-fn upload_bf16(values: Vec<f32>, shape: &[usize], device: &Device) -> Result<Tensor> {
+fn upload_values(
+    values: Vec<f32>,
+    shape: &[usize],
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
     Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
-        .to_dtype(DType::BF16)?
+        .to_dtype(dtype)?
         .to_device(device)?)
 }
 
@@ -1064,6 +1062,7 @@ fn decode(
     st: &MmapedSafetensors,
     tensor: &LogicalTensorPlan,
     device: &Device,
+    dtype: DType,
 ) -> Result<LogicalTensor> {
     use ::safetensors::Dtype as StDtype;
 
@@ -1145,7 +1144,7 @@ fn decode(
                     let values: Vec<f32> = cst::read_tensor_bytes(&view, |bytes| {
                         decode_scaled_fp8(bytes, element, weight_scale)
                     });
-                    LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+                    LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
                 }
                 ResidencyMode::Packed => {
                     #[cfg(feature = "cuda")]
@@ -1177,6 +1176,44 @@ fn decode(
                         )));
                     }
                 }
+            }
+        }
+        TensorCodecSpec::RowwiseFp8 { scale } => {
+            let n = source_shape[0];
+            let k = source_shape[1];
+            guard_stored(
+                tensor,
+                view.dtype(),
+                view.shape(),
+                StDtype::F8_E4M3,
+                source_shape,
+            )?;
+            let sv = st.get(scale)?;
+            if sv.dtype() != StDtype::F32 || sv.shape() != [n] {
+                candle_core::bail!("{scale}: FP8R source scale geometry changed");
+            }
+            let scales = cst::read_tensor_bytes(&sv, |b| {
+                b.chunks_exact(4)
+                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            });
+            if tensor.residency.mode == ResidencyMode::Packed {
+                LogicalTensor::PackedRowwiseFp8 {
+                    codes: cst::read_tensor_bytes(&view, |b| {
+                        Tensor::from_raw_buffer(b, DType::F8E4M3, source_shape, device)
+                    })?,
+                    scales: Tensor::from_vec(scales, n, &Device::Cpu)?,
+                }
+            } else {
+                let values = cst::read_tensor_bytes(&view, |b| {
+                    b.chunks_exact(k)
+                        .zip(&scales)
+                        .flat_map(|(codes, &scale)| {
+                            decode_scaled_fp8(codes, gen_core::fp8_e4m3fn_to_f32, scale)
+                        })
+                        .collect()
+                });
+                LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
             }
         }
         TensorCodecSpec::Mxfp8 {
@@ -1223,7 +1260,7 @@ fn decode(
                     tensor.codec_id, tensor.physical_key
                 ))
             })?;
-            LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+            LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
         }
         TensorCodecSpec::Nvfp4 {
             block_scale,
@@ -1262,7 +1299,7 @@ fn decode(
                             tensor.codec_id, tensor.physical_key
                         ))
                     })?;
-                    LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+                    LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
                 }
                 ResidencyMode::Packed => {
                     // The repack into the container `Nvfp4Linear` consumes: nibble-order swap plus
@@ -1445,7 +1482,7 @@ fn decode(
                 cols,
                 &mut values,
             );
-            LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+            LogicalTensor::Dense(upload_values(values, source_shape, device, dtype)?)
         }
     };
     apply_transform(tensor, decoded)
@@ -1506,6 +1543,24 @@ pub fn apply_transform(
                 sliced.contiguous()?
             };
             Ok(LogicalTensor::Dense(out))
+        }
+        LogicalTensor::PackedRowwiseFp8 { codes, scales } => {
+            let apply = |t: Tensor| -> Result<Tensor> {
+                let sliced = t.narrow(0, start, len)?;
+                if transform.half_swap {
+                    let half = len / 2;
+                    Tensor::cat(
+                        &[sliced.narrow(0, half, half)?, sliced.narrow(0, 0, half)?],
+                        0,
+                    )
+                } else {
+                    sliced.force_contiguous()
+                }
+            };
+            Ok(LogicalTensor::PackedRowwiseFp8 {
+                codes: apply(codes)?,
+                scales: apply(scales)?,
+            })
         }
         LogicalTensor::PackedScalarFp8 {
             codes,

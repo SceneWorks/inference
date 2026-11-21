@@ -307,6 +307,7 @@ impl PlannedDitWeights {
             LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype)?.to_device(&self.device),
             LogicalTensor::PackedConvRot { .. }
             | LogicalTensor::PackedNvfp4 { .. }
+            | LogicalTensor::PackedRowwiseFp8 { .. }
             | LogicalTensor::PackedMxFp8 { .. }
             | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
@@ -401,7 +402,7 @@ impl PlannedDitWeights {
                 }
                 Ok(QLinear::from_nvfp4(lin))
             }
-            LogicalTensor::PackedConvRot { .. } | LogicalTensor::PackedMxFp8 { .. } | LogicalTensor::PackedScalarFp8 { .. } => {
+            LogicalTensor::PackedConvRot { .. } | LogicalTensor::PackedRowwiseFp8{..} | LogicalTensor::PackedMxFp8 { .. } | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "flux2 single-file: `{weight_key}` packed FP8 row bypassed the native projection constructor"
                 )))

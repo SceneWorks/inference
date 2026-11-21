@@ -453,6 +453,9 @@ pub fn lin_with_bias(
 /// Load `{base}` as a [`TokenEmbedding`] — packed when `{base}.scales` is present, else dense (the
 /// embedding analogue of [`lin`]).
 pub fn embedding(w: &Weights, base: &str, group_size: i32) -> Result<TokenEmbedding> {
+    if let Some(native) = mlx_layers::NativeProjection::from_weights(w, base, false)? {
+        return Ok(TokenEmbedding::Native(native));
+    }
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
         let bits = packed_bits(wq, scales, group_size)?;

@@ -128,7 +128,8 @@ impl LogicalTensorPlan {
     pub fn matrix_rank_refusal(&self) -> Option<String> {
         const MATRIX_RANK: usize = 2;
         match &self.codec {
-            TensorCodecSpec::Mxfp8 { .. }
+            TensorCodecSpec::RowwiseFp8 { .. }
+            | TensorCodecSpec::Mxfp8 { .. }
             | TensorCodecSpec::Nvfp4 { .. }
             | TensorCodecSpec::ConvRotInt8 { .. }
             | TensorCodecSpec::Int8PerRow { .. } => {}

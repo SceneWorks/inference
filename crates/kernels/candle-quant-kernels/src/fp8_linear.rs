@@ -14,6 +14,7 @@ pub struct Fp8Linear {
     dims: (usize, usize),
     input_scale: Option<f32>,
     block_scales: Option<Tensor>,
+    row_scales: Option<candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>>,
     scale_w: f32,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
@@ -91,6 +92,7 @@ impl Fp8Linear {
             dynamic_quantizer: None,
             dims: codes.dims2()?,
             block_scales: None,
+            row_scales: None,
             w_fp8: lt.stage_fp8(&codes)?,
             device,
             scale_w,
@@ -100,6 +102,24 @@ impl Fp8Linear {
         })
     }
 
+    pub fn from_rowwise_parts(
+        codes: Tensor,
+        scales: &[f32],
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        let (n, _) = codes.dims2()?;
+        if codes.dtype() != candle_core::DType::F8E4M3
+            || scales.len() != n
+            || scales.iter().any(|s| !s.is_finite() || *s < 0.)
+        {
+            candle_core::bail!("invalid FP8R scale plane or weight codes");
+        }
+        let row_scales = lt.stage_f32(scales)?;
+        let mut layer = Self::from_codes(codes, 1., None, bias, lt)?;
+        layer.row_scales = Some(row_scales);
+        Ok(layer)
+    }
     pub fn from_mxfp8_parts(
         codes: Tensor,
         block_scales: Tensor,
@@ -132,6 +152,9 @@ impl Fp8Linear {
         use gen_core::checkpoint_codec::{
             FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, MXFP8_CODEC,
         };
+        if self.row_scales.is_some() {
+            return gen_core::FP8_E4M3_ROWWISE_CODEC.codec_id;
+        }
         if self.block_scales.is_some() {
             MXFP8_CODEC.codec_id
         } else if self.w_fp8.is_e5m2() {
@@ -173,7 +196,10 @@ impl Fp8Linear {
         if flat.dim(1)? != self.dims.1 || !flat.device().same_device(self.device()) {
             candle_core::bail!("FP8 input width or device differs from weight");
         }
-        let y = if let Some(scales) = &self.block_scales {
+        let y = if let Some(scales) = &self.row_scales {
+            self.lt
+                .flux3_fp8_rowwise_linear(&flat, &self.w_fp8, scales)?
+        } else if let Some(scales) = &self.block_scales {
             if f32_accumulator {
                 self.lt
                     .mxfp8_linear_f32(&self.w_fp8, scales, &flat, self.dims.0)?

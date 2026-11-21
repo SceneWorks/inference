@@ -1427,6 +1427,7 @@ pub struct Qwen35Model {
 #[derive(Debug)]
 enum TokenEmbedding {
     Dense(Array),
+    Native(mlx_layers::NativeProjection),
     /// A fully quantized tier's stored affine table (SW-7201), gathered then dequantized per row.
     Quantized(QuantizedEmbedding),
     Prism(PrismEmbedding),
@@ -1436,6 +1437,7 @@ impl TokenEmbedding {
     fn push_arrays(&self, out: &mut Vec<Array>) {
         match self {
             Self::Dense(weight) => out.push(weight.clone()),
+            Self::Native(p) => p.push_arrays(out),
             Self::Quantized(q) => {
                 out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()])
             }
@@ -1446,6 +1448,7 @@ impl TokenEmbedding {
     fn forward(&self, input_ids: &Array) -> Result<Array> {
         match self {
             Self::Dense(weight) => embed(weight, input_ids),
+            Self::Native(p) => Ok(p.rows(input_ids)?),
             Self::Quantized(embedding) => embedding.forward(input_ids),
             Self::Prism(embedding) => embedding.forward(input_ids),
         }
@@ -1455,6 +1458,7 @@ impl TokenEmbedding {
     /// (never materialized twice). Prism refuses a tied head before reaching here.
     fn tied_projection(&self) -> Projection {
         match self {
+            Self::Native(p) => Projection::Native(p.clone()),
             Self::Dense(weight) => Projection::Dense {
                 weight: weight.clone(),
                 bias: None,
@@ -2465,6 +2469,8 @@ impl Qwen35Model {
         let embed_key = dp("embed_tokens.weight");
         let embed_tokens = if let Some(pack) = prism {
             TokenEmbedding::Prism(pack.embedding(w, &embed_key)?)
+        } else if let Some(Projection::Native(p)) = Projection::native(w, &embed_key, false)? {
+            TokenEmbedding::Native(p)
         } else if let Some(stem) = stored_part(&embed_key) {
             let spec = stored_spec(&stem).ok_or_else(|| {
                 Error::Config(format!(

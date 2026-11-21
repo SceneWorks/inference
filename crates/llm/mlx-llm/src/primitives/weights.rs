@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default)]
 pub struct Weights {
     tensors: HashMap<String, Array>,
+    source_reads: mlx_layers::source::SourceReads,
     rotations: RefCell<HashMap<usize, Array>>,
     /// Keys read through [`Weights::require`] / [`Weights::get`] since the last
     /// [`Weights::remove_accessed`]. See the module docs.
@@ -106,6 +107,7 @@ impl Weights {
     pub fn from_map(tensors: HashMap<String, Array>) -> Self {
         Self {
             tensors,
+            source_reads: Default::default(),
             rotations: Default::default(),
             accessed: RefCell::new(HashSet::new()),
             released: HashSet::new(),
@@ -128,8 +130,12 @@ impl Weights {
             .cloned()
             .into_iter()
             .collect();
-        mlx_layers::fp8::prepare_sources(&mut tensors, &[path.to_owned()], &declarations)?;
-        Ok(Self::from_map(tensors))
+        let source_reads =
+            mlx_layers::source::prepare_sources(&mut tensors, &[path.to_owned()], &declarations)?;
+        Ok(Self {
+            source_reads,
+            ..Self::from_map(tensors)
+        })
     }
 
     /// Load and merge every `*.safetensors` shard in a snapshot directory.
@@ -174,8 +180,12 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &__input_paths,
         );
-        mlx_layers::fp8::prepare_sources(&mut tensors, &shards, &declarations)?;
-        Ok(Self::from_map(tensors))
+        let source_reads =
+            mlx_layers::source::prepare_sources(&mut tensors, &shards, &declarations)?;
+        Ok(Self {
+            source_reads,
+            ..Self::from_map(tensors)
+        })
     }
 
     /// Inspect its header without marking a tensor for materialization.
@@ -245,6 +255,11 @@ impl Weights {
     pub fn materialize_accessed(&self) -> Result<()> {
         let accessed = self.accessed.borrow();
         mlx_rs::transforms::eval(accessed.iter().filter_map(|key| self.tensors.get(key)))?;
+        for key in accessed.iter() {
+            if let Some(array) = self.tensors.get(key) {
+                self.source_reads.materialized(key, array)?;
+            }
+        }
         Ok(())
     }
 
@@ -388,6 +403,7 @@ impl Weights {
                 .map(|a| a.nbytes() as u64)
                 .sum();
             for key in read {
+                self.source_reads.materialized(&key, &self.tensors[&key])?;
                 self.tensors.remove(&key);
                 self.released.insert(key);
                 report.released += 1;
@@ -725,10 +741,17 @@ mod tests {
 }
 
 impl mlx_layers::MlxWeightSource for Weights {
+    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
+        self.source_reads.get(key)
+    }
     fn get(&self, key: &str) -> Option<&Array> {
         self.get(key)
     }
-    fn rotation_cache(&self) -> &RefCell<HashMap<usize, Array>> {
-        &self.rotations
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.rotations
+            .borrow_mut()
+            .entry(group)
+            .or_insert_with(build)
+            .clone()
     }
 }

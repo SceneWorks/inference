@@ -107,8 +107,7 @@ pub struct ArcFace {
     stem_prelu: Tensor, // [1,C,1,1]
     layers: Vec<Vec<Block>>,
     bn2: Affine,
-    fc_w: Tensor, // `[512, 25088]` Linear weight
-    fc_b: Tensor, // `[512]`
+    fc: candle_gen::candle_nn::Linear,
     features: Affine,
 }
 
@@ -150,8 +149,7 @@ impl ArcFace {
             stem_prelu: w.require_channel4d("stem.prelu.weight")?,
             layers,
             bn2: Affine::load(w, "bn2")?,
-            fc_w: w.require("fc.weight")?, // [512, 25088], used as a Linear (no OHWI transpose)
-            fc_b: w.require("fc.bias")?,
+            fc: w.linear("fc")?,
             features: Affine::load(w, "features")?,
         })
     }
@@ -174,10 +172,7 @@ impl ArcFace {
         let flat = h.elem_count() / n;
         h = h.contiguous()?.reshape((n, flat))?;
         // fc Linear: [N,25088] @ [25088,512] + [512].
-        let fc_b = self.fc_b.reshape((1, self.fc_b.elem_count()))?;
-        h = __model_proof_output!(
-            __model_proof_output!(h.matmul(&self.fc_w.t()?))?.broadcast_add(&fc_b)
-        )?;
+        h = __model_proof_output!(candle_gen::candle_nn::Module::forward(&self.fc, &h))?;
         self.features.forward_vec(&h)
     }
 }

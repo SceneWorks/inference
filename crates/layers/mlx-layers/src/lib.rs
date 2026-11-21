@@ -3,6 +3,7 @@
 pub mod convrot_int8;
 pub mod fp8;
 pub mod int8_gemm;
+pub mod source;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -43,6 +44,21 @@ impl NativeProjection {
         Self::from_key(w, base, &format!("{base}.weight"), bias)
     }
     pub fn from_key(
+        w: &(impl MlxWeightSource + ?Sized),
+        base: &str,
+        key: &str,
+        bias: bool,
+    ) -> Result<Option<Self>> {
+        let mut native = Self::bind_key(w, base, key, bias)?;
+        if let (Some(bound), Some(observation)) = (native.as_mut(), w.observation(key)) {
+            match bound {
+                Self::Fp8(p) => p.observe(observation)?,
+                Self::ConvRot(p) => p.observe(observation)?,
+            }
+        }
+        Ok(native)
+    }
+    fn bind_key(
         w: &(impl MlxWeightSource + ?Sized),
         base: &str,
         key: &str,
@@ -101,6 +117,32 @@ impl NativeProjection {
                 p.descriptor().in_features as i32,
             ],
             Self::Fp8(p) => p.shape(),
+        }
+    }
+    pub fn rows(&self, ids: &mlx_rs::Array) -> Result<mlx_rs::Array> {
+        match self {
+            Self::ConvRot(p) => p.rows(ids),
+            Self::Fp8(p) => p.rows(ids),
+        }
+    }
+    pub fn materialize(&self) -> Result<()> {
+        match self {
+            Self::ConvRot(p) => p.materialize(),
+            Self::Fp8(p) => p.materialize(),
+        }
+    }
+    pub fn operands(&self) -> Vec<(&'static str, &mlx_rs::Array)> {
+        match self {
+            Self::ConvRot(p) => vec![
+                ("weight", p.codes()),
+                ("weight_scale", p.scales()),
+                ("rotation", p.rotation()),
+            ],
+            Self::Fp8(p) => vec![
+                ("weight", p.codes()),
+                ("weight_scale", p.scales()),
+                ("input_scale", p.input_scale()),
+            ],
         }
     }
     pub fn set_bias(&mut self, b: mlx_rs::Array) -> Result<()> {
