@@ -334,7 +334,7 @@ impl Fp8Linear {
             Ok(project
                 .apply()
                 .inputs([&q, &self.codes, &self.scales, &sx])
-                .output_shape([m, n], input.dtype())
+                .output_shape([m, n], x.dtype())
                 .template_arg("M", m)
                 .template_arg("N", n)
                 .template_arg("K", k)

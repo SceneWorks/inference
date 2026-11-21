@@ -70,6 +70,11 @@ fn malformed_metadata_is_not_dense_or_affine_q8() {
 #[test]
 #[ignore = "requires coordinator-reserved exclusive local Metal token; never skip-as-pass"]
 fn native_projections_match_pinned_kitchen() {
+    assert!(mlx_gen::metal_available());
+    assert_eq!(
+        mlx_rs::Device::try_default().unwrap().get_type().unwrap(),
+        mlx_rs::DeviceType::Gpu
+    );
     let fixture = fixture();
     assert_eq!(
         fixture["kitchen_revision"],
@@ -129,9 +134,40 @@ fn native_projections_match_pinned_kitchen() {
                 "group{g} {dtype:?} output{i}: {got} != {want}"
             );
         }
-        assert!(linear
-            .merge_dense_delta(&Array::from_slice(&vec![0f32; (n * k) as usize], &[n, k]))
-            .is_err());
+        let retained = |p: &mlx_gen::convrot_int8::ConvRotLinear| {
+            [
+                p.codes().as_ptr().ctx,
+                p.scales().as_ptr().ctx,
+                p.rotation().as_ptr().ctx,
+            ]
+        };
+        let original = retained(linear.convrot_base().unwrap());
+        let mut delta = vec![0f32; (n * k) as usize];
+        delta[0] = 1.;
+        linear
+            .merge_dense_delta(&Array::from_slice(&delta, &[n, k]))
+            .unwrap();
+        assert_eq!(retained(linear.convrot_base().unwrap()), original);
+        let adapted = linear.forward(&x).unwrap();
+        assert_eq!(adapted.dtype(), dtype);
+        let rounded_x = x.as_dtype(Dtype::Float32).unwrap();
+        let mut with_delta = out.as_slice::<f32>().to_vec();
+        for row in 0..m as usize {
+            with_delta[row * n as usize] += rounded_x.as_slice::<f32>()[row * k as usize];
+        }
+        let with_delta = Array::from_slice(&with_delta, &[m, n])
+            .as_dtype(dtype)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let adapted = adapted.as_dtype(Dtype::Float32).unwrap();
+        eval([&adapted, &with_delta]).unwrap();
+        assert_eq!(adapted.as_slice::<f32>(), with_delta.as_slice::<f32>());
+        assert_ne!(adapted.as_slice::<f32>(), out.as_slice::<f32>());
         println!("native Metal group{g} {dtype:?} {m}x{k} -> {m}x{n}, oracle matched");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED convrot_int8::native_projections_match_pinned_kitchen"
+    );
 }

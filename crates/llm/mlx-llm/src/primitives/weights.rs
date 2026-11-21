@@ -31,7 +31,6 @@ use crate::error::{Error, Result};
 pub struct Weights {
     tensors: HashMap<String, Array>,
     source_reads: mlx_layers::source::SourceReads,
-    rotations: RefCell<HashMap<usize, Array>>,
     /// Keys read through [`Weights::require`] / [`Weights::get`] since the last
     /// [`Weights::remove_accessed`]. See the module docs.
     accessed: RefCell<HashSet<String>>,
@@ -108,7 +107,6 @@ impl Weights {
         Self {
             tensors,
             source_reads: Default::default(),
-            rotations: Default::default(),
             accessed: RefCell::new(HashSet::new()),
             released: HashSet::new(),
         }
@@ -771,10 +769,6 @@ impl mlx_layers::MlxWeightSource for Weights {
         self.get(key)
     }
     fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
-        self.rotations
-            .borrow_mut()
-            .entry(group)
-            .or_insert_with(build)
-            .clone()
+        self.source_reads.rotation(group, build)
     }
 }

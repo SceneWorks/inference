@@ -98,19 +98,8 @@ fn split_ldm_source(mut source: Weights) -> Result<LdmComponents> {
                     dest.insert_source_projection(&target, p)?;
                 }
                 TensorRemap::SplitQkv(c, targets) => {
-                    let rows = p.shape()[0];
-                    if rows % 3 != 0 {
-                        return Err(Error::Msg(format!(
-                            "{source_key}: QKV row count {rows} is not divisible by three"
-                        )));
-                    }
-                    let dest = component_map(c, &mut unet, &mut clip_l, &mut clip_bigg, &mut vae);
-                    // All three views retain this source matrix. Charge it once at the split.
-                    p.materialize()?;
-                    for (index, target) in targets.into_iter().enumerate() {
-                        let lo = index as i32 * (rows / 3);
-                        dest.insert_source_projection(&target, p.slice_rows(lo, lo + rows / 3)?)?;
-                    }
+                    component_map(c, &mut unet, &mut clip_l, &mut clip_bigg, &mut vae)
+                        .insert_split_projection(&source_key, p, &targets)?;
                 }
                 TensorRemap::Transpose(c, target) => {
                     let dest = component_map(c, &mut unet, &mut clip_l, &mut clip_bigg, &mut vae);

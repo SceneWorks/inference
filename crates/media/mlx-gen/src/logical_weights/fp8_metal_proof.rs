@@ -189,6 +189,30 @@ fn metal_projection_matches_fixed_codebook_reference_and_dtype_rounding() {
             [expected]
         );
     }
+    let rowwise = Fp8Linear::new(
+        Fp8Rowwise,
+        Array::from_slice(&[0x38u8], &[1, 1]),
+        Some(Array::from_slice(&[1.0f32 + 1.0 / 512.0], &[1])),
+        None,
+        &[1, 1],
+        Some(Array::from_slice(&[-1.0f32], &[1])),
+    )
+    .unwrap();
+    for (dtype, expected) in [
+        (Dtype::Bfloat16, 0.),
+        (Dtype::Float16, 1. / 512.),
+        (Dtype::Float32, 1. / 512.),
+    ] {
+        let x = Array::from_slice(&[1.0f32], &[1, 1])
+            .as_dtype(dtype)
+            .unwrap();
+        let y = rowwise.forward(&x).unwrap();
+        assert_eq!(y.dtype(), dtype);
+        assert_eq!(
+            y.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>(),
+            [expected]
+        );
+    }
     crate::model_inference_device::record_model_inference_device();
     println!("\nMODEL_INFERENCE_BODY_COMPLETED logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding");
 }
