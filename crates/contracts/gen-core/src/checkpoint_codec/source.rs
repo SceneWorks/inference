@@ -287,19 +287,21 @@ impl ProjectionSourceHeaders {
         tables: &[String],
         read_descriptors: impl FnOnce(&BTreeSet<&str>) -> crate::Result<BTreeMap<String, Vec<u8>>>,
     ) -> crate::Result<Option<Self>> {
-        let by_name: BTreeMap<_, _> = source.keys().map(|s| (s.as_str(), ())).collect();
+        let by_name: BTreeMap<_, _> = source.values().map(|h| (h.name.as_str(), h)).collect();
         let mut declarations = serde_json::Map::new();
         let mut bases = BTreeSet::new();
         for table in tables {
             let entries = crate::comfy_quant::parse_quantization_metadata(table)
                 .map_err(|e| crate::Error::Msg(e.to_string()))?;
-            let prefix = resolve_metadata_prefix(&by_name, &entries)
+            let prefix = super::compile::resolve_projection_metadata_prefix(&by_name, &entries)
                 .map_err(|e| crate::Error::Msg(e.to_string()))?;
             let json: serde_json::Value =
                 serde_json::from_str(table).map_err(|e| crate::Error::Msg(e.to_string()))?;
             for name in entries.keys() {
                 let base = format!("{prefix}{name}");
-                if selected(&format!("{base}.weight")) {
+                if selected(&format!("{base}.weight"))
+                    || (by_name.contains_key(base.as_str()) && selected(&base))
+                {
                     bases.insert(base.clone());
                     let descriptor = &json["layers"][name];
                     if declarations
@@ -412,6 +414,79 @@ mod tests {
         output.extend(bytes);
         std::fs::write(path, output).unwrap();
     }
+    #[test]
+    fn bare_fp8_expert_declarations_bind_the_actual_owner_for_blob_and_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("experts.safetensors");
+        let key = "model.experts.gate";
+        let scale = 1.25f32.to_le_bytes();
+        let desc = br#"{"format":"float8_e4m3fn","full_precision_matrix_mult":true}"#;
+        let encoded = (key, "F8_E4M3", &[2, 3, 2][..], &[0x38; 12][..]);
+        let scales = (
+            "model.experts.gate.weight_scale",
+            "F32",
+            &[][..],
+            &scale[..],
+        );
+        let declared = (
+            "model.experts.gate.comfy_quant",
+            "U8",
+            &[desc.len()][..],
+            &desc[..],
+        );
+        let tables = vec![r#"{"layers":{"experts.gate":{"format":"float8_e4m3fn","full_precision_matrix_mult":true}}}"#.into()];
+        let paths = [path.clone()];
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        for with_blob in [false, true] {
+            let mut rows = vec![encoded, scales];
+            if with_blob {
+                rows.push(declared);
+            }
+            write(&path, &rows);
+            let plan = plan_projection_sources(
+                &paths,
+                |k| k == key,
+                &tables,
+                &registry,
+                &SourceCodecResidency,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.tensors[0].shape, [2, 3, 2]);
+            assert!(matches!(
+                plan.tensors[0].codec,
+                TensorCodecSpec::ScalarFp8 {
+                    full_precision_matrix_mult: true,
+                    ..
+                }
+            ));
+            assert!(plan.companions.iter().all(|c| c.owner_physical_key == key));
+        }
+        write(
+            &path,
+            &[
+                encoded,
+                scales,
+                declared,
+                (
+                    "model.experts.gate.weight",
+                    "F8_E4M3",
+                    &[2, 3, 2],
+                    &[0x38; 12],
+                ),
+            ],
+        );
+        assert!(plan_projection_sources(
+            &paths,
+            |_| true,
+            &tables,
+            &registry,
+            &SourceCodecResidency
+        )
+        .is_err());
+    }
+
     #[test]
     fn source_classification_keeps_mixed_dtypes_and_refuses_unmapped_sidecars() {
         let dir = tempfile::tempdir().unwrap();

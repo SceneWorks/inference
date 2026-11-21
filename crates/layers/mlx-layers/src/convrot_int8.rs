@@ -175,6 +175,9 @@ impl ConvRotLinear {
     }
     /// Invert the orthonormal activation rotation on the requested coefficient rows.
     pub fn rows(&self, ids: &Array) -> Result<Array> {
+        self.rows_as(ids, Dtype::Bfloat16)
+    }
+    pub fn rows_as(&self, ids: &Array, dtype: Dtype) -> Result<Array> {
         if self.observation.as_ref().is_some_and(|o| o.pending()) {
             self.materialize()?;
         }
@@ -184,7 +187,7 @@ impl ConvRotLinear {
         let g = self.descriptor.rotation_group as i32;
         let k = self.descriptor.in_features as i32;
         let rotated = matmul(&weight.reshape(&[-1, g])?, &self.rotation)?.reshape(&[-1, k])?;
-        let values = mlx_rs::ops::multiply(rotated, &scales)?.as_dtype(Dtype::Bfloat16)?;
+        let values = mlx_rs::ops::multiply(rotated, &scales)?.as_dtype(dtype)?;
         let mut shape = ids.shape().to_vec();
         shape.push(k);
         Ok(values.reshape(&shape)?)

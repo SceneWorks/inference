@@ -63,7 +63,7 @@ fn record_exact_epilogue_fallback(operation: &'static str) {
 /// returns native bf16, so it keeps its own variant rather than using this.
 pub enum TokenEmbedding {
     Dense(Array),
-    Native(mlx_layers::NativeProjection),
+    Native(mlx_layers::NativeProjection, Dtype),
     Quantized {
         wq: Array,
         scales: Array,
@@ -81,7 +81,7 @@ impl TokenEmbedding {
     pub fn rows(&self, ids: &Array) -> Result<Array> {
         let out = match self {
             Self::Dense(w) => w.take_axis(ids, 0)?,
-            Self::Native(p) => p.rows(ids)?,
+            Self::Native(p, dtype) => p.rows_as(ids, *dtype)?,
             Self::Quantized {
                 wq,
                 scales,
@@ -153,7 +153,7 @@ impl TokenEmbedding {
     pub fn materialize_weights(&self) -> Result<()> {
         match self {
             Self::Dense(weight) => mlx_rs::transforms::eval([weight])?,
-            Self::Native(p) => p.materialize()?,
+            Self::Native(p, _) => p.materialize()?,
             Self::Quantized {
                 wq, scales, biases, ..
             } => mlx_rs::transforms::eval([wq, scales, biases])?,

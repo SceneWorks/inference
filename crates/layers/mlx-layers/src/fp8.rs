@@ -412,12 +412,15 @@ pub fn decoded_codes(codes: &Array, format: ComfyQuantFormat) -> Result<Array> {
 impl Fp8Linear {
     /// Decode the requested row coefficients, without evaluating the full vocab/expert table.
     pub fn rows(&self, ids: &Array) -> Result<Array> {
+        self.rows_as(ids, Dtype::Bfloat16)
+    }
+    pub fn rows_as(&self, ids: &Array, dtype: Dtype) -> Result<Array> {
         if self.observation.as_ref().is_some_and(|o| o.pending()) {
             self.materialize()?;
         }
         let flat = ids.reshape(&[-1])?;
         let codes = self.codes.take_axis(&flat, 0)?;
-        let values = self.decode_rows(&codes, Some(&flat), Dtype::Bfloat16)?;
+        let values = self.decode_rows(&codes, Some(&flat), dtype)?;
         let mut shape = ids.shape().to_vec();
         shape.push(self.shape[1]);
         Ok(values.reshape(&shape)?)

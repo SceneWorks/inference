@@ -123,7 +123,11 @@ pub fn compile_logical_weight_plan_with_metadata(
     if let Some(payload) = quantization_metadata {
         let table = crate::comfy_quant::parse_quantization_metadata(payload)
             .map_err(|error| LogicalWeightPlanError::QuantizationMetadata { error })?;
-        let prefix = resolve_metadata_prefix(&by_name, &table)?;
+        let prefix = if mapping.inline_fp8_scales() {
+            resolve_projection_metadata_prefix(&by_name, &table)?
+        } else {
+            resolve_metadata_prefix(&by_name, &table)?
+        };
         for (layer, descriptor) in table {
             metadata_descriptors.insert(format!("{prefix}{layer}"), (layer, descriptor));
         }
@@ -151,11 +155,25 @@ pub fn compile_logical_weight_plan_with_metadata(
             });
         }
         let weight_key = format!("{base}.weight");
-        if !by_name.contains_key(weight_key.as_str()) {
-            return Err(LogicalWeightPlanError::OrphanDescriptor {
-                physical_key: header.name.clone(),
-            });
-        }
+        let bare = mapping.inline_fp8_scales()
+            && by_name
+                .get(base)
+                .is_some_and(|h| matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2));
+        let weight_key = match (by_name.contains_key(weight_key.as_str()), bare) {
+            (true, false) => weight_key,
+            (false, true) => base.to_owned(),
+            (true, true) => {
+                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                    physical_key: header.name.clone(),
+                    reason: "the descriptor has both a bare FP8 owner and a .weight owner",
+                })
+            }
+            (false, false) => {
+                return Err(LogicalWeightPlanError::OrphanDescriptor {
+                    physical_key: header.name.clone(),
+                })
+            }
+        };
         let payload = descriptor_payloads
             .get(header.name.as_str())
             .ok_or_else(|| LogicalWeightPlanError::DescriptorPayloadUnavailable {
@@ -969,6 +987,37 @@ pub fn compile_logical_weight_plan_with_metadata(
         companions: consumed_companions.into_values().collect(),
         source_bytes,
     })
+}
+
+/// Normalize the bare FP8 parameter spelling for the opted-in constructor mapping. Reuse
+/// the metadata resolver's unique-prefix and whole-inventory checks for both spellings.
+pub(super) fn resolve_projection_metadata_prefix(
+    by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
+    table: &BTreeMap<String, PartialComfyQuantDescriptor>,
+) -> Result<String, LogicalWeightPlanError> {
+    let mut names = BTreeSet::new();
+    for (key, header) in by_name {
+        if key.ends_with(".weight") {
+            names.insert((*key).to_owned());
+        } else if matches!(header.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2) {
+            let weight = format!("{key}.weight");
+            if by_name.contains_key(weight.as_str())
+                && table.keys().any(|layer| {
+                    *key == layer
+                        || key
+                            .strip_suffix(layer.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+            {
+                return Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+                    layer: (*key).to_owned(),
+                    reason: "both bare and .weight FP8 source owners exist".into(),
+                });
+            }
+            names.insert(weight);
+        }
+    }
+    resolve_metadata_prefix(&names.iter().map(|key| (key.as_str(), ())).collect(), table)
 }
 
 /// Resolve the single state-dict prefix under which every `_quantization_metadata` layer name has a

@@ -4,7 +4,7 @@
 
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::host_i32;
@@ -190,7 +190,7 @@ impl Qwen3TextEncoder {
                 group_size,
                 bits,
             } => Some((wq, scales, biases, *group_size, *bits)),
-            TokenEmbedding::Dense(_) | TokenEmbedding::Native(_) => None,
+            TokenEmbedding::Dense(_) | TokenEmbedding::Native(..) => None,
         }
     }
 
@@ -566,7 +566,7 @@ fn gen_head_missing() -> Error {
 /// embedding's prefix (`….embed_tokens`).
 fn load_embed(w: &Weights, base: &str, quant: Option<Flux2Quant>) -> Result<TokenEmbedding> {
     if let Some(p) = mlx_gen::NativeProjection::from_weights(w, base, false)? {
-        return Ok(TokenEmbedding::Native(p));
+        return Ok(TokenEmbedding::Native(p, Dtype::Bfloat16));
     }
     if let Some(q) = quant {
         if let Some(scales) = w.get(&format!("{base}.scales")) {
