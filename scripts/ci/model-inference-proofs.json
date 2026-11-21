@@ -24574,8 +24574,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "ip_dit::tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs",
+    "fqn": "transformer::bfl_tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -24593,8 +24593,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -24602,7 +24602,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -24620,7 +24620,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards",
       "requirements": []
     }
   },
@@ -24628,8 +24628,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "ip_dit::tests::streamed_window_one_preserves_injector_indices_and_control_order",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs",
+    "fqn": "transformer::bfl_tests::streamed_window_one_preserves_injector_indices_and_control_order",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -24647,8 +24647,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::streamed_window_one_preserves_injector_indices_and_control_order",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::streamed_window_one_preserves_injector_indices_and_control_order",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::streamed_window_one_preserves_injector_indices_and_control_order",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::streamed_window_one_preserves_injector_indices_and_control_order",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -24656,7 +24656,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::streamed_window_one_preserves_injector_indices_and_control_order/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::streamed_window_one_preserves_injector_indices_and_control_order/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -24674,7 +24674,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::streamed_window_one_preserves_injector_indices_and_control_order",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::streamed_window_one_preserves_injector_indices_and_control_order",
       "requirements": []
     }
   },
@@ -24682,8 +24682,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "ip_dit::tests::wrappers_agree_when_all_injectors_none",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs",
+    "fqn": "transformer::bfl_tests::wrappers_agree_when_all_injectors_none",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -24701,8 +24701,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::wrappers_agree_when_all_injectors_none",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::wrappers_agree_when_all_injectors_none",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::wrappers_agree_when_all_injectors_none",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::wrappers_agree_when_all_injectors_none",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -24710,7 +24710,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::wrappers_agree_when_all_injectors_none/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::wrappers_agree_when_all_injectors_none/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -24728,7 +24728,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/ip_dit.rs::ip_dit::tests::wrappers_agree_when_all_injectors_none",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::bfl_tests::wrappers_agree_when_all_injectors_none",
       "requirements": []
     }
   },
@@ -24904,8 +24904,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::dense_streamed_blocks_match_resident_window_one",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::dense_streamed_blocks_match_resident_window_one",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -24923,8 +24923,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::dense_streamed_blocks_match_resident_window_one",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::dense_streamed_blocks_match_resident_window_one",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::dense_streamed_blocks_match_resident_window_one",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::dense_streamed_blocks_match_resident_window_one",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -24932,7 +24932,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::dense_streamed_blocks_match_resident_window_one/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::dense_streamed_blocks_match_resident_window_one/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -24950,7 +24950,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::dense_streamed_blocks_match_resident_window_one",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::dense_streamed_blocks_match_resident_window_one",
       "requirements": []
     }
   },
@@ -24958,8 +24958,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::forward_injected_none_matches_forward",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::forward_injected_none_matches_forward",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -24977,8 +24977,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_none_matches_forward",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_none_matches_forward",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_none_matches_forward",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_none_matches_forward",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -24986,7 +24986,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_none_matches_forward/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_none_matches_forward/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25004,7 +25004,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_none_matches_forward",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_none_matches_forward",
       "requirements": []
     }
   },
@@ -25012,8 +25012,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::forward_injected_residual_changes_output",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::forward_injected_residual_changes_output",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25031,8 +25031,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_residual_changes_output",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_residual_changes_output",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_residual_changes_output",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_residual_changes_output",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25040,7 +25040,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_residual_changes_output/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_residual_changes_output/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25058,7 +25058,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::forward_injected_residual_changes_output",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::forward_injected_residual_changes_output",
       "requirements": []
     }
   },
@@ -25066,8 +25066,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::packed_dit_dense_forward_shape_and_finite",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::packed_dit_dense_forward_shape_and_finite",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25085,8 +25085,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::packed_dit_dense_forward_shape_and_finite",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::packed_dit_dense_forward_shape_and_finite",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::packed_dit_dense_forward_shape_and_finite",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::packed_dit_dense_forward_shape_and_finite",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25094,7 +25094,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::packed_dit_dense_forward_shape_and_finite/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::packed_dit_dense_forward_shape_and_finite/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25112,7 +25112,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::packed_dit_dense_forward_shape_and_finite",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::packed_dit_dense_forward_shape_and_finite",
       "requirements": []
     }
   },
@@ -25120,8 +25120,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25139,8 +25139,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25148,7 +25148,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25166,7 +25166,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards",
       "requirements": []
     }
   },
@@ -25174,8 +25174,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25193,8 +25193,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25202,7 +25202,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25220,7 +25220,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices",
       "requirements": []
     }
   },
@@ -25228,8 +25228,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25247,8 +25247,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25256,7 +25256,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_injected_window_one_matches_resident_across_both_namespaces/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_injected_window_one_matches_resident_across_both_namespaces/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25274,7 +25274,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_injected_window_one_matches_resident_across_both_namespaces",
       "requirements": []
     }
   },
@@ -25282,8 +25282,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::streamed_window_one_observes_cancel_before_next_block_materialization",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::streamed_window_one_observes_cancel_before_next_block_materialization",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25301,8 +25301,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_window_one_observes_cancel_before_next_block_materialization",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_window_one_observes_cancel_before_next_block_materialization",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_window_one_observes_cancel_before_next_block_materialization",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_window_one_observes_cancel_before_next_block_materialization",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25310,7 +25310,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_window_one_observes_cancel_before_next_block_materialization/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_window_one_observes_cancel_before_next_block_materialization/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25328,7 +25328,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_window_one_observes_cancel_before_next_block_materialization",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_window_one_observes_cancel_before_next_block_materialization",
       "requirements": []
     }
   },
@@ -25336,8 +25336,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25355,8 +25355,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25364,7 +25364,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25382,7 +25382,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache",
       "requirements": []
     }
   },
@@ -25390,8 +25390,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::vendored_dit_full_network_close_to_stock_bfl_dense",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::vendored_dit_full_network_close_to_stock_bfl_dense",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25409,8 +25409,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_full_network_close_to_stock_bfl_dense",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_full_network_close_to_stock_bfl_dense",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_full_network_close_to_stock_bfl_dense",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_full_network_close_to_stock_bfl_dense",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25418,7 +25418,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_full_network_close_to_stock_bfl_dense/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_full_network_close_to_stock_bfl_dense/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25436,7 +25436,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_full_network_close_to_stock_bfl_dense",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_full_network_close_to_stock_bfl_dense",
       "requirements": []
     }
   },
@@ -25444,8 +25444,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::vendored_dit_real_config_matches_stock_bfl_dense",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::vendored_dit_real_config_matches_stock_bfl_dense",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25463,8 +25463,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_real_config_matches_stock_bfl_dense",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_real_config_matches_stock_bfl_dense",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_real_config_matches_stock_bfl_dense",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_real_config_matches_stock_bfl_dense",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25472,7 +25472,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_real_config_matches_stock_bfl_dense/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_real_config_matches_stock_bfl_dense/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25490,7 +25490,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_real_config_matches_stock_bfl_dense",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_real_config_matches_stock_bfl_dense",
       "requirements": []
     }
   },
@@ -25498,8 +25498,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_dit::tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs",
+    "fqn": "transformer::diffusers_tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25517,8 +25517,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25526,7 +25526,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_single_and_io_matches_stock_bfl_dense/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_single_and_io_matches_stock_bfl_dense/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25544,7 +25544,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_dit.rs::packed_dit::tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/transformer.rs::transformer::diffusers_tests::vendored_dit_single_and_io_matches_stock_bfl_dense",
       "requirements": []
     }
   },
@@ -25552,8 +25552,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs",
+    "fqn": "text_encoder_tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25571,8 +25571,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25580,7 +25580,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::masked_forward_zero_mask_is_byte_identical_to_unmasked/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25598,7 +25598,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::masked_forward_zero_mask_is_byte_identical_to_unmasked",
       "requirements": []
     }
   },
@@ -25606,8 +25606,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_te::tests::vendored_clip_matches_stock_dense",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs",
+    "fqn": "text_encoder_tests::vendored_clip_matches_stock_dense",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25625,8 +25625,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_clip_matches_stock_dense",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_clip_matches_stock_dense",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_clip_matches_stock_dense",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_clip_matches_stock_dense",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25634,7 +25634,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_clip_matches_stock_dense/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_clip_matches_stock_dense/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25652,7 +25652,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_clip_matches_stock_dense",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_clip_matches_stock_dense",
       "requirements": []
     }
   },
@@ -25660,8 +25660,8 @@
     "package": "candle-gen-flux",
     "target": "candle_gen_flux",
     "target_kind": "lib",
-    "fqn": "packed_te::tests::vendored_t5_matches_stock_dense",
-    "source": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs",
+    "fqn": "text_encoder_tests::vendored_t5_matches_stock_dense",
+    "source": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux",
       "kind": [
@@ -25679,8 +25679,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_t5_matches_stock_dense",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_t5_matches_stock_dense",
+    "fixture_identity": "CPU tiny Flux/BFL/VAE/CLIP/T5/IP/control/linear fixtures and learned preview fit; crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_t5_matches_stock_dense",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_t5_matches_stock_dense",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -25688,7 +25688,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_t5_matches_stock_dense/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_t5_matches_stock_dense/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -25706,7 +25706,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/packed_te.rs::packed_te::tests::vendored_t5_matches_stock_dense",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/src/text_encoder_tests.rs::text_encoder_tests::vendored_t5_matches_stock_dense",
       "requirements": []
     }
   },
@@ -105640,8 +105640,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::attention_query_chunking_matches_the_unbounded_forward",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::attention_query_chunking_matches_the_unbounded_forward",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105659,8 +105659,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::attention_query_chunking_matches_the_unbounded_forward",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::attention_query_chunking_matches_the_unbounded_forward",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::attention_query_chunking_matches_the_unbounded_forward",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::attention_query_chunking_matches_the_unbounded_forward",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105668,7 +105668,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::attention_query_chunking_matches_the_unbounded_forward/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::attention_query_chunking_matches_the_unbounded_forward/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -105686,7 +105686,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::attention_query_chunking_matches_the_unbounded_forward",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::attention_query_chunking_matches_the_unbounded_forward",
       "requirements": []
     }
   },
@@ -105694,8 +105694,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105713,8 +105713,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105722,7 +105722,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -105740,7 +105740,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled",
       "requirements": []
     }
   },
@@ -105748,8 +105748,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105767,8 +105767,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105776,7 +105776,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::install_additive_lora_on_vendored_dit_applies_and_shifts/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::install_additive_lora_on_vendored_dit_applies_and_shifts/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -105794,7 +105794,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::install_additive_lora_on_vendored_dit_applies_and_shifts",
       "requirements": []
     }
   },
@@ -105802,8 +105802,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105821,8 +105821,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105830,7 +105830,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::plain_forward_drives_streamed_storage_through_bounded_windows/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::plain_forward_drives_streamed_storage_through_bounded_windows/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -105848,7 +105848,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::plain_forward_drives_streamed_storage_through_bounded_windows",
       "requirements": []
     }
   },
@@ -105856,8 +105856,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105875,8 +105875,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105884,7 +105884,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -105902,7 +105902,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry",
       "requirements": []
     }
   },
@@ -105910,8 +105910,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105929,8 +105929,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105938,7 +105938,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -105956,7 +105956,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar",
       "requirements": []
     }
   },
@@ -105964,8 +105964,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -105983,8 +105983,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -105992,7 +105992,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -106010,7 +106010,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar",
       "requirements": []
     }
   },
@@ -106018,8 +106018,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -106037,8 +106037,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -106046,7 +106046,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -106064,7 +106064,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation",
       "requirements": []
     }
   },
@@ -106072,8 +106072,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::streamed_windows_match_resident_forward_including_ragged_tail",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::streamed_windows_match_resident_forward_including_ragged_tail",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -106091,8 +106091,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_windows_match_resident_forward_including_ragged_tail",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_windows_match_resident_forward_including_ragged_tail",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_windows_match_resident_forward_including_ragged_tail",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_windows_match_resident_forward_including_ragged_tail",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -106100,7 +106100,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_windows_match_resident_forward_including_ragged_tail/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_windows_match_resident_forward_including_ragged_tail/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -106118,7 +106118,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::streamed_windows_match_resident_forward_including_ragged_tail",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::streamed_windows_match_resident_forward_including_ragged_tail",
       "requirements": []
     }
   },
@@ -106126,8 +106126,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_dit::parity_tests::vendored_dense_dit_matches_stock_forward",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs",
+    "fqn": "dit::inference_tests::vendored_dense_dit_matches_stock_forward",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -106145,8 +106145,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::vendored_dense_dit_matches_stock_forward",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::vendored_dense_dit_matches_stock_forward",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::vendored_dense_dit_matches_stock_forward",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::vendored_dense_dit_matches_stock_forward",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -106154,7 +106154,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::vendored_dense_dit_matches_stock_forward/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::vendored_dense_dit_matches_stock_forward/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -106172,7 +106172,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_dit.rs::packed_dit::parity_tests::vendored_dense_dit_matches_stock_forward",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/dit.rs::dit::inference_tests::vendored_dense_dit_matches_stock_forward",
       "requirements": []
     }
   },
@@ -106180,8 +106180,8 @@
     "package": "candle-gen-z-image",
     "target": "candle_gen_z_image",
     "target_kind": "lib",
-    "fqn": "packed_te::parity_tests::vendored_dense_te_matches_stock_forward",
-    "source": "crates/media/candle-gen/candle-gen-z-image/src/packed_te.rs",
+    "fqn": "text_encoder::parity_tests::vendored_dense_te_matches_stock_forward",
+    "source": "crates/media/candle-gen/candle-gen-z-image/src/text_encoder.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_z_image",
       "kind": [
@@ -106199,8 +106199,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/packed_te.rs::packed_te::parity_tests::vendored_dense_te_matches_stock_forward",
-    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/packed_te.rs::packed_te::parity_tests::vendored_dense_te_matches_stock_forward",
+    "fixture_identity": "CPU synthetic/committed Z-Image learned projection/DiT/TE/VAE/control/train/perceptual/native decoder fixtures; crates/media/candle-gen/candle-gen-z-image/src/text_encoder.rs::text_encoder::parity_tests::vendored_dense_te_matches_stock_forward",
+    "configuration_source": "crates/media/candle-gen/candle-gen-z-image/src/text_encoder.rs::text_encoder::parity_tests::vendored_dense_te_matches_stock_forward",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -106208,7 +106208,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_te.rs::packed_te::parity_tests::vendored_dense_te_matches_stock_forward/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/text_encoder.rs::text_encoder::parity_tests::vendored_dense_te_matches_stock_forward/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -106226,7 +106226,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/packed_te.rs::packed_te::parity_tests::vendored_dense_te_matches_stock_forward",
+      "source_identity": "crates/media/candle-gen/candle-gen-z-image/src/text_encoder.rs::text_encoder::parity_tests::vendored_dense_te_matches_stock_forward",
       "requirements": []
     }
   },
