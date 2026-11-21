@@ -1,5 +1,5 @@
 //! Weight loading for the Boogu DiT + Qwen3-VL condition encoder — a thin shape-inferring wrapper
-//! over candle's [`MmapedSafetensors`], mirroring `mlx-gen-boogu`'s `Weights`/`lin` interface (and
+//! over the shared [`MappedWeights`] reader, mirroring `mlx-gen-boogu`'s `Weights`/`lin` interface (and
 //! `candle-gen-ideogram`'s `loader::Weights`) so the port stays a near-1:1 translation. [`linear`]
 //! builds a [`Linear`] from the actual `{base}.weight` (+ optional `{base}.bias`) tensor shapes, so
 //! dims that aren't in the public config (the FFN inner width, the embedder MLP hidden) need no
