@@ -27,16 +27,34 @@ extern "C" __global__ void veda_pool(const float* x, const unsigned int* valid, 
     f[out+2*dim]=mn;
 }
 // f: [heads, video, 3*dim]; p: [heads, 3*dim, dim]. out[h,t,d] = (sum_i f[h,t,i]*p[h,i,d]) + f[h,t,d].
-extern "C" __global__ void veda_project(const float* f, const float* p, float* out,
-    int heads, int video, int dim) {
+// Source coefficients round E4M3 * per-head F32 scale to BF16 before the frozen FP32 dot.
+__device__ __forceinline__ float veda_coeff(const float* values,const float*,long long i,int) {
+    return values[i];
+}
+__device__ __forceinline__ float veda_coeff(const unsigned char* codes,const float* scales,long long i,int head) {
+    unsigned char b=codes[i];
+    int exp=(b>>3)&15, mant=b&7;
+    float value=exp?ldexpf(1.0f+mant*0.125f,exp-7):mant*0.001953125f;
+    float scaled=__fmul_rn((b&128)?-value:value,scales[head]);
+    unsigned int bits=__float_as_uint(scaled);
+    return __uint_as_float((bits+0x7fff+((bits>>16)&1))&0xffff0000);
+}
+template<typename T>
+__device__ __forceinline__ void veda_project_impl(const float* f,const T* p,const float* scales,float* out,int heads,int video,int dim) {
     long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=(long long)heads*video*dim) return;
     int d=(int)(i%dim), t=(int)((i/dim)%video), h=(int)(i/((long long)dim*video));
     const float* fr=f+((long long)h*video+t)*3*dim;
-    const float* pr=p+(long long)h*3*dim*dim+d;
+    long long offset=(long long)h*3*dim*dim+d;
     float v=0.0f;
-    for(int k=0;k<3*dim;k++) v=__fadd_rn(v,__fmul_rn(fr[k],pr[(long long)k*dim]));
+    for(int k=0;k<3*dim;k++) v=__fadd_rn(v,__fmul_rn(fr[k],veda_coeff(p,scales,offset+(long long)k*dim,h)));
     out[i]=__fadd_rn(v,fr[d]);
+}
+extern "C" __global__ void veda_project(const float* f,const float* p,float* out,int heads,int video,int dim) {
+    veda_project_impl(f,p,nullptr,out,heads,video,dim);
+}
+extern "C" __global__ void veda_project_fp8(const float* f,const unsigned char* codes,const float* scales,float* out,int heads,int video,int dim) {
+    veda_project_impl(f,codes,scales,out,heads,video,dim);
 }
 // q,k: [heads, video, dim]. s[h,r,c] = (sum_d q[h,r,d]*k[h,c,d]) / divisor.
 extern "C" __global__ void veda_logits(const float* q, const float* k, float* s,

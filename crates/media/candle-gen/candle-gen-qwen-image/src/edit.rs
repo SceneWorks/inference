@@ -19,7 +19,7 @@
 //! this by chunking over query rows once the scores exceed `ATTN_SCORES_BUDGET` (sc-6217), and the
 //! `edit_validate` high-res run confirms a coherent 1536² edit through that chunked path.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -212,26 +212,6 @@ fn component_vb(
 
 /// Load every `.safetensors` in `root/transformer` into one CPU tensor map (native dtype). The eager
 /// load (vs the mmap [`component_vb`] fast path) is what lets the adapter deltas fold into the dense
-/// weights before the MMDiT is built (sc-6220).
-fn load_transformer_tensors(root: &Path) -> Result<HashMap<String, Tensor>> {
-    let dir = root.join("transformer");
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "qwen edit: snapshot is missing the transformer/ dir (at {})",
-            root.display()
-        )));
-    }
-    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); this path loads into a CPU map for
-    // adapter merging (not the mmap fast path), so it keeps its own loop.
-    let files = candle_gen::sorted_safetensors(&dir, "qwen edit")?;
-    let mut map = HashMap::new();
-    for f in &files {
-        let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
-        map.extend(part);
-    }
-    Ok(map)
-}
-
 /// Build the MMDiT, applying LoRA/LoKr `adapters` by the route the base tier + adapter type allow
 /// (sc-6220, sc-11091, sc-11684):
 ///
@@ -329,9 +309,10 @@ pub(crate) fn load_transformer(
     // form, so fold the delta into the weight before the MMDiT is built (each merged tensor cast to
     // `dtype` + moved to `device` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path).
     // Bit-exact but not streamable; these adapter types are rare and dense-only.
-    let mut tensors = load_transformer_tensors(root)?;
-    crate::adapters::merge_adapters(&mut tensors, adapters)?;
-    let vb = VarBuilder::from_tensors(tensors, dtype, device);
+    let vb = crate::adapters::fold_checkpoint(
+        component_vb(root, "transformer", dtype, device)?,
+        adapters,
+    )?;
     Ok(QwenTransformer::new_gs(&cfg, vb, gs)?)
 }
 

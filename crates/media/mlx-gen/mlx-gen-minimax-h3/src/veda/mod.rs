@@ -1096,8 +1096,8 @@ fn scorer_self_test(l: &Layout, q: &Array, k: &Array, heads: usize, dim: usize) 
         heads,
         dim,
         plans: vec![],
-        q: vec![proj(3)],
-        k: vec![proj(11)],
+        q: vec![proj(3).into()],
+        k: vec![proj(11).into()],
     };
     let ids: Vec<i32> = (0..heads as i32).collect();
     let upload = |query: bool| -> Result<Array> {
