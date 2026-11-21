@@ -78,7 +78,7 @@ impl StepTokens<'_> {
 }
 
 /// One decode step's inputs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StepRequest<'a> {
     /// The tokens to feed, in order; they occupy positions `cache.len() .. cache.len() + n`.
     pub tokens: StepTokens<'a>,
@@ -100,6 +100,9 @@ pub struct StepRequest<'a> {
     /// (sc-24446). Only a recurrent model needs it (its state exists only where it was taken);
     /// a softmax KV cache can be copied at any prefix after the step and ignores it.
     pub snapshot_at: Option<usize>,
+    /// Additional strictly-inner boundaries (relative to segment start, `0 < b < n`) to capture
+    /// inside a prefill step (SW-F356).
+    pub snapshot_points: Vec<usize>,
 }
 
 impl<'a> StepRequest<'a> {
@@ -111,6 +114,7 @@ impl<'a> StepRequest<'a> {
             want_hidden: false,
             prefill: false,
             snapshot_at: None,
+            snapshot_points: Vec::new(),
         }
     }
 
@@ -122,6 +126,7 @@ impl<'a> StepRequest<'a> {
             want_hidden: false,
             prefill: false,
             snapshot_at: None,
+            snapshot_points: Vec::new(),
         }
     }
 
@@ -133,6 +138,7 @@ impl<'a> StepRequest<'a> {
             want_hidden: false,
             prefill: false,
             snapshot_at: None,
+            snapshot_points: Vec::new(),
         }
     }
 
@@ -145,6 +151,7 @@ impl<'a> StepRequest<'a> {
             want_hidden: false,
             prefill: false,
             snapshot_at: None,
+            snapshot_points: Vec::new(),
         }
     }
 
@@ -164,6 +171,13 @@ impl<'a> StepRequest<'a> {
     /// ([`StepRequest::snapshot_at`]).
     pub fn with_snapshot_at(mut self, b: usize) -> Self {
         self.snapshot_at = Some(b);
+        self
+    }
+
+    /// The same request keeping the cache's state at all relative boundary positions in `points`
+    /// ([`StepRequest::snapshot_points`], SW-F356).
+    pub fn with_snapshot_points(mut self, points: Vec<usize>) -> Self {
+        self.snapshot_points = points;
         self
     }
 

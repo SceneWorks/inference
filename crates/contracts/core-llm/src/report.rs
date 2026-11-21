@@ -206,6 +206,36 @@ impl TreeVerifyReport {
     }
 }
 
+/// Exact multi-boundary prefix-checkpoint accounting for one generation (feature SW-F356).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrefixCheckpointReport {
+    /// Effective policy label (`"off"`, `"auto"`, `"document"`, or `"bypassed"` / `"none"`).
+    pub policy: String,
+    /// Prompt tokens restored from a cached checkpoint (prefill skipped).
+    pub reused_tokens: u64,
+    /// Prompt tokens evaluated (prefilled / reread).
+    pub reread_tokens: u64,
+    /// Kind label of the matched checkpoint (`"conversation"`, `"message_boundary"`,
+    /// `"near_tail"`, `"shared_root"`, `"document"`), or `None` on miss/off/bypass.
+    pub matched_kind: Option<String>,
+    /// Checkpoints captured/stored during this request.
+    pub checkpoints_captured: u32,
+    /// Total bytes captured/stored for this request's checkpoints.
+    pub captured_bytes: u64,
+    /// Elapsed wall time restoring the matched checkpoint into the live cache.
+    pub restore_time: std::time::Duration,
+    /// Elapsed wall time capturing and inserting checkpoints after/during this request.
+    pub capture_time: std::time::Duration,
+    /// Resident store bytes after this request.
+    pub resident_bytes: u64,
+    /// Protected bytes in the store after this request.
+    pub protected_bytes: u64,
+    /// Store entries evicted to accommodate or make room during this request.
+    pub evicted_entries: u32,
+    /// Checkpoint-specific fallback or diagnostic reasons.
+    pub fallbacks: Vec<String>,
+}
+
 /// Which decode path served one generation, as the backend measured it (epic sc-24128 E2: the path
 /// that ran is visible and a fallback is named). Carried on
 /// [`TextLlmOutput::decode`](crate::TextLlmOutput::decode).
@@ -316,6 +346,8 @@ pub struct DecodeReport {
     /// The proposer's wall time (SW-7200): `None` when no proposer call ran or the backend does
     /// not time it.
     pub draft_time: Option<DraftTime>,
+    /// Exact multi-boundary prefix-checkpoint accounting (feature SW-F356).
+    pub prefix_checkpoints: Option<PrefixCheckpointReport>,
 }
 
 impl DecodeReport {

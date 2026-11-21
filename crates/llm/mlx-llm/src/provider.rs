@@ -11,20 +11,24 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(any(test, feature = "campaign"))]
 use core_llm::Role;
 #[cfg(feature = "campaign")]
 use core_llm::ThinkingMode;
 use core_llm::{
-    AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
-    Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
-    JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
-    ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort, RenderOptions,
-    Result as CoreResult, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef,
+    AudioRef, BoundaryCandidates, Channel, ChatTemplate, Constraint, ConstraintDecodeTable,
+    ConstraintKind, Content, Error as CoreError, FinishReason as CoreFinish, ImageRef,
+    IncrementalDetok, JinjaChatTemplate, JsonConstraint, Llama3Template, LlmMemoryGeometry,
+    LoadSpec, Message, ModelSamplingDefaults, NearTailConfig, PlannedBoundary,
+    PrefixCheckpointCapabilities, PrefixCheckpointMode, PrefixCheckpointPolicy,
+    PrefixCheckpointReport, PrefixDocumentSpan, PrefixKind, PrefixReuse, ProposerCapabilities,
+    ProposerKind, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling,
+    SpeculativePlan, SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef, MAX_CHECKPOINTS_PER_REQUEST,
+    PREFIX_DOCUMENT_UNALIGNED, PREFIX_PROPOSER_INCOMPATIBLE,
 };
 
 use core_llm::DraftReport;
@@ -35,11 +39,12 @@ use crate::decode::CancelFlag;
 #[cfg(feature = "campaign")]
 use crate::decode::{generate_batch, BatchRequest, GenerationOutput};
 use crate::decode::{
-    generate_speculative, generate_with_observer, prefill_restored, BlockDraftProposer, Boundary,
-    ConstraintMask, Decode, DraftModelProposer, DynCacheTarget, EngineOptions, FinishReason,
-    GenerationConfig, MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixPrefill,
-    PrefixStats, Proposer, Qwen35MtpMultimodalPrompt, RewindableConstraintMask, SpeculativePrompt,
-    SpeculativeRun, SpeculativeTarget, StreamEvent, TappedQwen35,
+    generate_speculative, generate_with_observer, prefill_restored_with_plan, BlockDraftProposer,
+    Boundary, ConstraintMask, Decode, DraftModelProposer, DynCacheTarget, EngineOptions,
+    FinishReason, GenerationConfig, MtpProposer, NgramProposer, NoProposer, PrefixCache,
+    PrefixPrefill, PrefixRestoreOutcome, PrefixStats, Proposer, Qwen35MtpMultimodalPrompt,
+    RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StreamEvent,
+    TappedQwen35,
 };
 use crate::error::to_core;
 use crate::image::{Qwen35ImageProcessor, Qwen35Preprocess};
@@ -1060,6 +1065,8 @@ pub struct LlamaProvider {
     /// optional accelerator — the companion MTP head (sc-24444) — requested but not attached,
     /// named in `fallbacks`. Read through [`TextLlm::load_report`].
     load_report: core_llm::LoadReport,
+    /// Defaults-table mode (`off` | `auto`) used when a request leaves `prefix_checkpoints` unset.
+    prefix_checkpoints_default: PrefixCheckpointMode,
     /// The speculative option a request that leaves it unset runs with (E5, sc-24446): the MLX
     /// defaults-table row ([`core_llm::defaults::MLX`]) unless
     /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
@@ -2269,6 +2276,7 @@ impl LlamaProvider {
             kv_model_name: spec.source.clone(),
             _prism_vision_weights: prism_vision_weights,
             prefix: RefCell::new(PrefixCache::with_budget(0)),
+            prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
             speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             block_draft: None,
@@ -2376,6 +2384,7 @@ impl LlamaProvider {
             prefix: RefCell::new(PrefixCache::with_budget(
                 core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
             speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             block_draft: None,
@@ -2424,6 +2433,16 @@ impl LlamaProvider {
         self.speculative_default = speculative;
     }
 
+    /// The prefix-checkpoint mode an unset request runs with on this provider.
+    pub fn prefix_checkpoints_default(&self) -> PrefixCheckpointMode {
+        self.prefix_checkpoints_default
+    }
+
+    /// Override the default prefix-checkpoint mode for requests that leave it unset.
+    pub fn set_prefix_checkpoints_default(&mut self, mode: PrefixCheckpointMode) {
+        self.prefix_checkpoints_default = mode;
+    }
+
     /// Whether a Prism VLM's dense vision tensors were retained for the multimodal adapter.
     pub fn has_deferred_prism_vision(&self) -> bool {
         self._prism_vision_weights.is_some()
@@ -2468,6 +2487,7 @@ impl LlamaProvider {
             prefix: RefCell::new(PrefixCache::with_budget(
                 core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
             speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             block_draft: None,
@@ -4249,34 +4269,94 @@ impl LlamaProvider {
             tree_rows_for_kv_plan(tree_rows, compressed_format.is_some());
         fallbacks.extend(tree_kv_fallback.map(str::to_string));
 
-        // The cross-turn prefix cache (sc-24437) keys on token ids, which cannot tell two images
-        // (or clips) behind the same placeholder ids apart — a multimodal prompt neither reads nor
-        // feeds it, and the report says so. The hybrid decoder snapshots at the end of the
-        // rendered conversation, the prefix the next chat turn extends.
+        // The cross-turn prefix cache (sc-24437 / SW-F356) keys on token ids, which cannot tell two
+        // images (or clips) behind the same placeholder ids apart — a multimodal prompt neither
+        // reads nor feeds it, and the report says so.
+        let checkpoint_policy = req.prefix_checkpoints_or(self.prefix_checkpoints_default);
+        let mut checkpoint_fallbacks: Vec<String> = Vec::new();
         let (mut prefix_path, mut prefix_reason) = prefix_path_for(
             self.prefix.borrow().budget_bytes() > 0,
             multimodal,
             gemma4_mm_request,
         );
+        if let Some(reason) = prefix_reason {
+            checkpoint_fallbacks.push(reason.to_string());
+        }
         // Only a request the cache serves reads (restores) or feeds (stores) it — `off` and
         // `bypassed` never touch it. A compressed request reads it — a dense hit is imported into
         // its compressed cache — but never feeds it: the store holds dense K/V, and a compressed
         // cache never re-enters it (sc-20681), so it takes no snapshot.
         let prefix_route = prefix_path == "miss";
-        let prefix_store = prefix_route && compressed_format.is_none();
-        let prefix_boundary = match &self.model {
-            Decoder::Qwen35(_) if prefix_store => {
-                self.conversation_boundary(messages, req, &prompt_ids)
+        let prefix_store = prefix_route && compressed_format.is_none() && !observed;
+        let boundary_candidates = if prefix_store {
+            let (cands, doc_unaligned) =
+                self.resolve_boundary_candidates(messages, req, &prompt_ids, checkpoint_policy);
+            if doc_unaligned {
+                checkpoint_fallbacks.push(PREFIX_DOCUMENT_UNALIGNED.to_string());
             }
-            _ => None,
+            cands
+        } else {
+            BoundaryCandidates::default()
         };
-        let snapshot_bytes = if prefix_store {
-            self.prefix_snapshot_bytes(prefix_boundary, route.is_mtp())
-                .ok_or_else(|| {
-                    CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
-                })?
+        let reuse_mode = match &self.model {
+            Decoder::Causal(_) => PrefixReuse::AnyPrefix,
+            Decoder::Qwen35(_) => PrefixReuse::WholeEntry,
+        };
+        let peeked_reused = if prefix_store {
+            let prefix = self.prefix.borrow();
+            match &self.model {
+                Decoder::Causal(_) => prefix.peek_reused::<ContiguousKvCache>(&prompt_ids, false),
+                Decoder::Qwen35(_) => {
+                    let check_mtp =
+                        route.is_mtp() && !matches!(route, SpeculativeRoute::BlockDraft { .. });
+                    prefix.peek_reused::<Qwen35Cache>(&prompt_ids, check_mtp)
+                }
+            }
         } else {
             0
+        };
+        let boundary_plan = if prefix_store {
+            core_llm::plan_prefix_boundaries(
+                prompt_ids.len(),
+                peeked_reused,
+                reuse_mode,
+                checkpoint_policy,
+                boundary_candidates,
+                NearTailConfig::default(),
+            )
+        } else {
+            core_llm::BoundaryPlan::default()
+        };
+        let planned_with_costs: Vec<(PlannedBoundary, u64)> = if prefix_store {
+            let mut items = Vec::with_capacity(boundary_plan.captures.len() + 1);
+            for &b in &boundary_plan.captures {
+                let bytes = self
+                    .boundary_snapshot_bytes(b, route.is_mtp())
+                    .ok_or_else(|| {
+                        CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
+                    })?;
+                items.push((b, bytes));
+            }
+            // Softmax caches store their live Conversation KV after completion with 0 extra
+            // request-time peak bytes; include it so `admit_planned` still authorizes storage.
+            if reuse_mode == PrefixReuse::AnyPrefix
+                && !items
+                    .iter()
+                    .any(|(b, _)| b.kind == PrefixKind::Conversation)
+                && !prompt_ids.is_empty()
+            {
+                items.push((
+                    PlannedBoundary {
+                        position: prompt_ids.len(),
+                        kind: PrefixKind::Conversation,
+                        protected: false,
+                    },
+                    0,
+                ));
+            }
+            items
+        } else {
+            Vec::new()
         };
         // The request's native-memory estimate: the K/V term at the compressed format's bytes
         // when the plan runs compressed (sc-20682), dense otherwise — plus what its speculative
@@ -4314,15 +4394,19 @@ impl LlamaProvider {
         // A compressed request looks its dense prefix up before admission, so the reclaim below
         // never evicts the entry it is about to import (the restored cache shares the entry's
         // buffers: it holds them, no copy).
-        let mut compressed_prefix = if prefix_route && compressed_format.is_some() {
-            self.prefix
-                .borrow_mut()
-                .restore::<ContiguousKvCache>(&prompt_ids, false)
-                .map_err(to_core)?
+        let mut compressed_outcome = if prefix_route && compressed_format.is_some() && !observed {
+            Some(
+                self.prefix
+                    .borrow_mut()
+                    .restore_with_diagnostic::<ContiguousKvCache>(&prompt_ids, false)
+                    .map_err(to_core)?,
+            )
         } else {
             None
         };
-        let keeps_hit = compressed_prefix.is_some();
+        let keeps_hit = compressed_outcome
+            .as_ref()
+            .is_some_and(|o| o.restored.is_some());
         let reclaim = |required: u64, available: u64| {
             let mut prefix = self.prefix.borrow_mut();
             if keeps_hit {
@@ -4336,43 +4420,59 @@ impl LlamaProvider {
             core_llm::operational_memory_override()?,
         )?;
         // Held prefix-cache entries are reclaimable memory (sc-24437, E7): a request that would
-        // not fit evicts them least-recently-used first, and the snapshot it would leave behind
-        // is admitted with it — or not taken, so caching never makes a request fail and never
-        // takes memory admission did not grant.
-        let prefix_admission = if prefix_store {
+        // not fit evicts them least-recently-used first, and the planned snapshots are admitted
+        // with it (trimmed lowest-priority first if tight, never forcing request refusal).
+        let planned_admission = if prefix_store {
             self.prefix
                 .borrow_mut()
-                .admit(required, snapshot_bytes, available)
+                .admit_planned(required, &planned_with_costs, available)
         } else {
-            core_llm::PrefixAdmission {
-                available: reclaim(required, available),
-                snapshot: false,
+            core_llm::PlannedAdmission {
+                admission: core_llm::PrefixAdmission {
+                    available: reclaim(required, available),
+                    snapshot: false,
+                },
+                kept: Vec::new(),
+                evicted_entries: 0,
+                fallback: None,
             }
         };
-        let keep_prefix = prefix_admission.snapshot;
-        if prefix_store && !keep_prefix {
-            prefix_reason = Some(core_llm::PREFIX_NOT_ADMITTED);
+        let keep_prefix = planned_admission.admission.snapshot;
+        let kept_boundaries = planned_admission.kept;
+        let checkpoint_evictions = planned_admission.evicted_entries;
+        if let Some(fb) = planned_admission.fallback {
+            if !planned_with_costs.is_empty() && !keep_prefix {
+                prefix_reason = Some(fb);
+            }
+            if !planned_with_costs.is_empty() {
+                checkpoint_fallbacks.push(fb.to_string());
+            }
         }
-        if prefix_route && compressed_format.is_some() {
+        if prefix_route && compressed_format.is_some() && !observed {
             prefix_reason = Some(core_llm::PREFIX_COMPRESSED_NOT_STORED);
+            checkpoint_fallbacks.push(core_llm::PREFIX_COMPRESSED_NOT_STORED.to_string());
         }
+        let snapshot_bytes: u64 = if keep_prefix {
+            planned_with_costs
+                .iter()
+                .filter(|(b, _)| kept_boundaries.contains(b))
+                .fold(0u64, |acc, &(_, bytes)| acc.saturating_add(bytes))
+        } else {
+            0
+        };
         if let Err(error) = core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
-            if keep_prefix {
-                required.saturating_add(snapshot_bytes)
-            } else {
-                required
-            },
-            prefix_admission.available,
+            required.saturating_add(snapshot_bytes),
+            planned_admission.admission.available,
         ) {
             // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
             // prompt lookup or plain — what `auto` admitted before the preference), by name.
             // Nothing has run: no K/V, no prefill, no preprocessing.
             if core_llm::withdraws_auto_block_draft(speculative_mode, route.proposer_kind(), &error)
             {
-                drop(compressed_prefix);
+                drop(compressed_outcome);
                 drop(_progress);
                 return self.generate_resolving(
                     req,
@@ -4385,7 +4485,6 @@ impl LlamaProvider {
             }
             return Err(error);
         }
-        let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         // A compressed selection the model refuses runs dense from the start: the request was
         // admitted at the compressed price, so it is admitted again at the dense price before any
         // K/V exists (sc-20682), held prefix entries reclaimable as above.
@@ -4454,6 +4553,11 @@ impl LlamaProvider {
         };
 
         let mut prefix_hit = 0usize;
+        let mut checkpoint_telemetry = CheckpointTelemetry {
+            evicted_entries: checkpoint_evictions,
+            fallbacks: checkpoint_fallbacks,
+            ..CheckpointTelemetry::default()
+        };
 
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
@@ -4849,19 +4953,32 @@ impl LlamaProvider {
                             // that declines it prefills the whole prompt instead, by name
                             // (sc-20681).
                             let mut reused = 0usize;
-                            if let Some(restored) = compressed_prefix.take() {
-                                let layers = restored.cache.share_live().map_err(to_core)?;
-                                let imported = match layers {
-                                    Some(layers) => {
-                                        cache.import_prefix(&layers).map_err(to_core)?
+                            if let Some(outcome) = compressed_outcome.take() {
+                                checkpoint_telemetry.restore_time = outcome.restore_time;
+                                if outcome.proposer_skipped_longer {
+                                    checkpoint_telemetry
+                                        .fallbacks
+                                        .push(PREFIX_PROPOSER_INCOMPATIBLE.to_string());
+                                }
+                                if let Some(restored) = outcome.restored {
+                                    let layers = restored.cache.share_live().map_err(to_core)?;
+                                    let imported = match layers {
+                                        Some(layers) => {
+                                            cache.import_prefix(&layers).map_err(to_core)?
+                                        }
+                                        None => false,
+                                    };
+                                    if imported {
+                                        reused = restored.reused;
+                                        checkpoint_telemetry.matched_kind =
+                                            Some(restored.kind.label().to_string());
+                                    } else {
+                                        prefix_reason =
+                                            Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED);
+                                        checkpoint_telemetry.fallbacks.push(
+                                            core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED.to_string(),
+                                        );
                                     }
-                                    None => false,
-                                };
-                                if imported {
-                                    reused = restored.reused;
-                                } else {
-                                    prefix_reason =
-                                        Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED);
                                 }
                             }
                             if req.cancel.is_cancelled() {
@@ -4910,28 +5027,48 @@ impl LlamaProvider {
                         }
                         Decoder::Causal(model) => {
                             let model: &CausalLm = model;
-                            let restored = if prefix_route {
+                            let restore_outcome = if prefix_route {
                                 self.prefix
                                     .borrow_mut()
-                                    .restore::<ContiguousKvCache>(&prompt_ids, false)
+                                    .restore_with_diagnostic::<ContiguousKvCache>(
+                                        &prompt_ids,
+                                        false,
+                                    )
                                     .map_err(to_core)?
                             } else {
-                                None
+                                PrefixRestoreOutcome {
+                                    restored: None,
+                                    proposer_skipped_longer: false,
+                                    restore_time: Duration::ZERO,
+                                }
                             };
                             let PrefixPrefill {
                                 mut cache,
                                 logits,
                                 fed_tokens,
+                                matched_kind,
+                                proposer_skipped_longer,
+                                restore_time,
+                                capture_time,
                                 ..
-                            } = prefill_restored(
+                            } = prefill_restored_with_plan(
                                 model,
-                                restored,
+                                restore_outcome,
                                 &prompt_ids,
-                                None,
+                                &kept_boundaries,
                                 false,
                                 &req.cancel,
                             )
                             .map_err(to_core)?;
+                            checkpoint_telemetry.restore_time = restore_time;
+                            checkpoint_telemetry.capture_time = capture_time;
+                            checkpoint_telemetry.matched_kind =
+                                matched_kind.map(|k| k.label().to_string());
+                            if proposer_skipped_longer {
+                                checkpoint_telemetry
+                                    .fallbacks
+                                    .push(PREFIX_PROPOSER_INCOMPATIBLE.to_string());
+                            }
                             // Measured, not looked up: the positions the prefill did not feed.
                             prefix_hit = prompt_ids.len() - fed_tokens;
                             if prefix_hit > 0 {
@@ -4954,10 +5091,32 @@ impl LlamaProvider {
                                 options,
                             );
                             if let (Ok(run), true) = (&run, keep_prefix) {
-                                self.prefix
+                                let store_out = self
+                                    .prefix
                                     .borrow_mut()
-                                    .store_run(&prompt_ids, run, cache, None, None)
+                                    .store_run_with_checkpoints(
+                                        &prompt_ids,
+                                        run,
+                                        cache,
+                                        &kept_boundaries,
+                                        Vec::new(),
+                                        &[],
+                                        boundary_plan.promote_reused,
+                                    )
                                     .map_err(to_core)?;
+                                checkpoint_telemetry.record_store(store_out);
+                            } else if let (Ok(run), Some(pb)) = (&run, boundary_plan.promote_reused)
+                            {
+                                if prefix_store
+                                    && run.output.finish_reason
+                                        != crate::decode::FinishReason::Cancelled
+                                    && pb.position <= prompt_ids.len()
+                                {
+                                    let _ = self
+                                        .prefix
+                                        .borrow_mut()
+                                        .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                                }
                             }
                             run
                         }
@@ -4971,7 +5130,8 @@ impl LlamaProvider {
                                     block,
                                     &prompt_ids,
                                     prefix_route,
-                                    prefix_boundary,
+                                    &kept_boundaries,
+                                    boundary_plan.promote_reused,
                                     keep_prefix,
                                     &config,
                                     width,
@@ -4980,16 +5140,21 @@ impl LlamaProvider {
                                     options,
                                     &mut prefix_hit,
                                     &mut prefix_path,
+                                    &mut checkpoint_telemetry,
                                 )
                             } else {
                                 let mtp = route.is_mtp();
-                                let restored = if prefix_route {
+                                let restore_outcome = if prefix_route {
                                     self.prefix
                                         .borrow_mut()
-                                        .restore::<Qwen35Cache>(&prompt_ids, mtp)
+                                        .restore_with_diagnostic::<Qwen35Cache>(&prompt_ids, mtp)
                                         .map_err(to_core)?
                                 } else {
-                                    None
+                                    PrefixRestoreOutcome {
+                                        restored: None,
+                                        proposer_skipped_longer: false,
+                                        restore_time: Duration::ZERO,
+                                    }
                                 };
                                 let PrefixPrefill {
                                     mut cache,
@@ -4997,26 +5162,41 @@ impl LlamaProvider {
                                     hidden,
                                     fed_tokens,
                                     mtp: resume,
-                                    boundary,
+                                    boundaries,
+                                    matched_kind,
+                                    proposer_skipped_longer,
+                                    restore_time,
+                                    capture_time,
                                     ..
-                                } = prefill_restored(
+                                } = prefill_restored_with_plan(
                                     model,
-                                    restored,
+                                    restore_outcome,
                                     &prompt_ids,
-                                    prefix_boundary,
+                                    &kept_boundaries,
                                     mtp,
                                     &req.cancel,
                                 )
                                 .map_err(to_core)?;
+                                checkpoint_telemetry.restore_time = restore_time;
+                                checkpoint_telemetry.capture_time = capture_time;
+                                checkpoint_telemetry.matched_kind =
+                                    matched_kind.map(|k| k.label().to_string());
+                                if proposer_skipped_longer {
+                                    checkpoint_telemetry
+                                        .fallbacks
+                                        .push(PREFIX_PROPOSER_INCOMPATIBLE.to_string());
+                                }
                                 // Measured, not looked up: the positions the prefill did not feed.
                                 prefix_hit = prompt_ids.len() - fed_tokens;
                                 if prefix_hit > 0 {
                                     prefix_path = "hit";
                                 }
+                                let capture_lens: Vec<usize> =
+                                    boundaries.iter().map(Boundary::len).collect();
                                 let mut head = mtp.then(|| {
                                     MtpProposer::new()
                                         .resume_from(resume)
-                                        .capture_at(boundary.as_ref().map(Boundary::len))
+                                        .capture_at_many(&capture_lens)
                                 });
                                 let mut plain = route.plain_proposer(self.draft.as_ref());
                                 let proposer: &mut dyn Proposer<Qwen35Model> = match head.as_mut() {
@@ -5040,12 +5220,36 @@ impl LlamaProvider {
                                     options,
                                 );
                                 if let (Ok(run), true) = (&run, keep_prefix) {
-                                    let captured =
-                                        head.as_mut().and_then(MtpProposer::take_captured);
-                                    self.prefix
+                                    let captured = head
+                                        .as_mut()
+                                        .map_or_else(Vec::new, MtpProposer::take_captured_all);
+                                    let store_out = self
+                                        .prefix
                                         .borrow_mut()
-                                        .store_run(&prompt_ids, run, cache, boundary, captured)
+                                        .store_run_with_checkpoints(
+                                            &prompt_ids,
+                                            run,
+                                            cache,
+                                            &kept_boundaries,
+                                            boundaries,
+                                            &captured,
+                                            boundary_plan.promote_reused,
+                                        )
                                         .map_err(to_core)?;
+                                    checkpoint_telemetry.record_store(store_out);
+                                } else if let (Ok(run), Some(pb)) =
+                                    (&run, boundary_plan.promote_reused)
+                                {
+                                    if prefix_store
+                                        && run.output.finish_reason
+                                            != crate::decode::FinishReason::Cancelled
+                                        && pb.position <= prompt_ids.len()
+                                    {
+                                        let _ = self
+                                            .prefix
+                                            .borrow_mut()
+                                            .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                                    }
                                 }
                                 run
                             }
@@ -5070,6 +5274,16 @@ impl LlamaProvider {
             path: prefix_path.into(),
             reason: prefix_reason.map(str::to_string),
         };
+        if !observed {
+            let prefix_store_ref = self.prefix.borrow();
+            report.prefix_checkpoints = Some(checkpoint_telemetry.into_report(
+                checkpoint_policy.label(),
+                prefix_hit as u64,
+                prompt_len.saturating_sub(prefix_hit) as u64,
+                prefix_store_ref.resident_bytes(),
+                prefix_store_ref.protected_bytes(),
+            ));
+        }
         report.fused_primitives = crate::primitives::fused::fused_tally()
             .since(&fused_start)
             .path_report();
@@ -5327,30 +5541,76 @@ impl SpeculativeRoute {
     }
 }
 
+#[derive(Default)]
+struct CheckpointTelemetry {
+    restore_time: Duration,
+    capture_time: Duration,
+    matched_kind: Option<String>,
+    checkpoints_captured: u32,
+    captured_bytes: u64,
+    evicted_entries: u32,
+    fallbacks: Vec<String>,
+}
+
+impl CheckpointTelemetry {
+    fn record_store(&mut self, outcome: crate::decode::PrefixStoreOutcome) {
+        self.checkpoints_captured = self
+            .checkpoints_captured
+            .saturating_add(outcome.checkpoints_captured);
+        self.captured_bytes = self.captured_bytes.saturating_add(outcome.captured_bytes);
+        self.evicted_entries = self.evicted_entries.saturating_add(outcome.evicted_entries);
+        self.capture_time = self.capture_time.saturating_add(outcome.capture_time);
+        for fb in outcome.fallbacks {
+            if !self.fallbacks.contains(&fb) {
+                self.fallbacks.push(fb);
+            }
+        }
+    }
+
+    fn into_report(
+        self,
+        policy: &str,
+        reused_tokens: u64,
+        reread_tokens: u64,
+        resident_bytes: u64,
+        protected_bytes: u64,
+    ) -> PrefixCheckpointReport {
+        PrefixCheckpointReport {
+            policy: policy.to_string(),
+            reused_tokens,
+            reread_tokens,
+            matched_kind: self.matched_kind,
+            checkpoints_captured: self.checkpoints_captured,
+            captured_bytes: self.captured_bytes,
+            restore_time: self.restore_time,
+            capture_time: self.capture_time,
+            resident_bytes,
+            protected_bytes,
+            evicted_entries: self.evicted_entries,
+            fallbacks: self.fallbacks,
+        }
+    }
+}
+
 impl LlamaProvider {
-    /// Where the rendered conversation ends and the generation prompt begins, when that is a
-    /// strict token prefix of `prompt_ids` (sc-24437): the point the hybrid decoder's prefix-cache
-    /// snapshot is taken at, because the next chat turn re-renders these messages and extends
-    /// them (whatever the template later does to this turn's reply). `None` when the template
-    /// renders the messages differently without a generation prompt.
-    fn conversation_boundary(
+    /// Render `prefix_messages` without a generation prompt and return its token length iff it is
+    /// a strict token prefix of `prompt_ids`.
+    fn render_prefix_boundary(
         &self,
-        messages: &[Message],
+        prefix_messages: &[Message],
         req: &TextLlmRequest,
         prompt_ids: &[i32],
     ) -> Option<usize> {
         let rendered = self
             .template
             .render_with(
-                messages,
+                prefix_messages,
                 &RenderOptions {
                     add_generation_prompt: false,
                     enable_thinking: req.enable_thinking_kwarg(),
                     reasoning_effort: req.reasoning_effort,
                     preserve_thinking: req.preserve_thinking,
                     tools: &req.tools,
-                    // The date the request's own render used (the campaign's pinned one, or the
-                    // template's default), so the conversation is a prefix of the prompt.
                     date_string: self.campaign_template_date,
                 },
             )
@@ -5363,10 +5623,149 @@ impl LlamaProvider {
         .then_some(len)
     }
 
+    /// Where the rendered conversation ends and the generation prompt begins, when that is a
+    /// strict token prefix of `prompt_ids` (sc-24437).
+    fn conversation_boundary(
+        &self,
+        messages: &[Message],
+        req: &TextLlmRequest,
+        prompt_ids: &[i32],
+    ) -> Option<usize> {
+        self.render_prefix_boundary(messages, req, prompt_ids)
+    }
+
+    /// Resolve an explicit [`PrefixDocumentSpan`] into a strict token prefix length `< prompt_ids.len()`.
+    /// Uses dual PUA sentinels (`\u{E000}` / `\u{E001}`) for [`PrefixDocumentSpan::MessageChars`]
+    /// so BPE merges across the character boundary back off cleanly to the last identical token.
+    fn resolve_document_boundary(
+        &self,
+        span: PrefixDocumentSpan,
+        messages: &[Message],
+        req: &TextLlmRequest,
+        prompt_ids: &[i32],
+    ) -> Option<usize> {
+        match span {
+            PrefixDocumentSpan::Messages { count } => (count > 0 && count <= messages.len())
+                .then(|| self.render_prefix_boundary(&messages[..count], req, prompt_ids))
+                .flatten(),
+            PrefixDocumentSpan::Tokens { count } => {
+                (count > 0 && count < prompt_ids.len()).then_some(count)
+            }
+            PrefixDocumentSpan::MessageChars { message, chars } => {
+                if chars == 0 {
+                    return None;
+                }
+                let target = messages.get(message)?;
+                let text = target.text_content();
+                let total_chars = text.chars().count();
+                if chars > total_chars {
+                    return None;
+                }
+                let byte_split = text
+                    .char_indices()
+                    .nth(chars)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(text.len());
+                let (prefix_str, suffix_str) = (&text[..byte_split], &text[byte_split..]);
+                let tokenize_with_sentinel = |sentinel: char| -> Option<Vec<u32>> {
+                    let mut modified = messages.to_vec();
+                    modified[message].content =
+                        vec![Content::Text(format!("{prefix_str}{sentinel}{suffix_str}"))];
+                    let rendered = self
+                        .template
+                        .render_with(
+                            &modified,
+                            &RenderOptions {
+                                add_generation_prompt: true,
+                                enable_thinking: req.enable_thinking_kwarg(),
+                                reasoning_effort: req.reasoning_effort,
+                                preserve_thinking: req.preserve_thinking,
+                                tools: &req.tools,
+                                date_string: self.campaign_template_date,
+                            },
+                        )
+                        .ok()?;
+                    self.tokenizer.encode(&rendered, false).ok()
+                };
+                let ids_a = tokenize_with_sentinel('\u{E000}')?;
+                let ids_b = tokenize_with_sentinel('\u{E001}')?;
+                let same_as_prompt = |ids: &[u32]| {
+                    ids.len() == prompt_ids.len()
+                        && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b)
+                };
+                if same_as_prompt(&ids_a) && same_as_prompt(&ids_b) {
+                    return None;
+                }
+                let aligned = ids_a
+                    .iter()
+                    .zip(&ids_b)
+                    .zip(prompt_ids)
+                    .take_while(|&((&a, &b), &p)| a as i32 == p && b as i32 == p)
+                    .count();
+                (aligned > 0 && aligned < prompt_ids.len()).then_some(aligned)
+            }
+        }
+    }
+
+    /// Resolve all candidate prefix boundaries (`document`, `shared_root`, `prev_message`,
+    /// `conversation_end`), plus whether an explicit document span failed to align.
+    fn resolve_boundary_candidates(
+        &self,
+        messages: &[Message],
+        req: &TextLlmRequest,
+        prompt_ids: &[i32],
+        policy: PrefixCheckpointPolicy,
+    ) -> (BoundaryCandidates, bool) {
+        let document = policy
+            .document
+            .and_then(|span| self.resolve_document_boundary(span, messages, req, prompt_ids));
+        let doc_unaligned = policy.document.is_some() && document.is_none();
+        let conversation_end = self.conversation_boundary(messages, req, prompt_ids);
+        let shared_root = if policy.is_active() && messages.len() >= 2 {
+            self.render_prefix_boundary(&messages[..1], req, prompt_ids)
+        } else {
+            None
+        };
+        let prev_message = if policy.is_active() && messages.len() >= 2 {
+            self.render_prefix_boundary(&messages[..messages.len() - 1], req, prompt_ids)
+        } else {
+            None
+        };
+        (
+            BoundaryCandidates {
+                document,
+                shared_root,
+                prev_message,
+                conversation_end,
+            },
+            doc_unaligned,
+        )
+    }
+
+    /// Peak request-time snapshot bytes needed to capture `boundary`.
+    fn boundary_snapshot_bytes(&self, boundary: PlannedBoundary, mtp: bool) -> Option<u64> {
+        match &self.model {
+            Decoder::Qwen35(m) => m.config().prefix_snapshot_bytes(boundary.position, mtp),
+            Decoder::Causal(_) => {
+                if !boundary.protected {
+                    Some(0)
+                } else {
+                    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+                    let aligned = (boundary.position as u64)
+                        .div_ceil(block)
+                        .max(1)
+                        .checked_mul(block)?;
+                    self.model.memory_geometry().kv_shape().dense_bytes(aligned)
+                }
+            }
+        }
+    }
+
     /// An upper bound on the bytes of the prefix-cache snapshot a text request takes during its
     /// run (sc-24437), which its admission adds: the hybrid's whole cache at the conversation
     /// `boundary` (and the MTP head's state there with `mtp`). A softmax decoder keeps the
     /// request's own cache after the run — memory the request already holds — so it takes none.
+    #[cfg(test)]
     fn prefix_snapshot_bytes(&self, boundary: Option<usize>, mtp: bool) -> Option<u64> {
         match (&self.model, boundary) {
             (Decoder::Qwen35(m), Some(b)) => m.config().prefix_snapshot_bytes(b, mtp),
@@ -5683,7 +6082,8 @@ impl LlamaProvider {
         block: &ResidentBlockDraft,
         prompt_ids: &[i32],
         prefix_route: bool,
-        prefix_boundary: Option<usize>,
+        kept_boundaries: &[PlannedBoundary],
+        promote_reused: Option<PlannedBoundary>,
         keep_prefix: bool,
         config: &GenerationConfig,
         width: usize,
@@ -5692,23 +6092,47 @@ impl LlamaProvider {
         options: EngineOptions<'_, '_>,
         prefix_hit: &mut usize,
         prefix_path: &mut &'static str,
+        checkpoint_telemetry: &mut CheckpointTelemetry,
     ) -> crate::error::Result<SpeculativeRun> {
         let target = TappedQwen35::for_draft(model, &block.model);
-        let restored = if prefix_route {
+        let restore_outcome = if prefix_route {
             self.prefix
                 .borrow_mut()
-                .restore::<Qwen35Cache>(prompt_ids, false)?
+                .restore_with_diagnostic::<Qwen35Cache>(prompt_ids, false)?
         } else {
-            None
+            PrefixRestoreOutcome {
+                restored: None,
+                proposer_skipped_longer: false,
+                restore_time: Duration::ZERO,
+            }
         };
         let PrefixPrefill {
             mut cache,
             logits,
             hidden,
             fed_tokens,
-            boundary,
+            boundaries,
+            matched_kind,
+            proposer_skipped_longer,
+            restore_time,
+            capture_time,
             ..
-        } = prefill_restored(&target, restored, prompt_ids, prefix_boundary, true, cancel)?;
+        } = prefill_restored_with_plan(
+            &target,
+            restore_outcome,
+            prompt_ids,
+            kept_boundaries,
+            true,
+            cancel,
+        )?;
+        checkpoint_telemetry.restore_time = restore_time;
+        checkpoint_telemetry.capture_time = capture_time;
+        checkpoint_telemetry.matched_kind = matched_kind.map(|k| k.label().to_string());
+        if proposer_skipped_longer {
+            checkpoint_telemetry
+                .fallbacks
+                .push(PREFIX_PROPOSER_INCOMPATIBLE.to_string());
+        }
         *prefix_hit = prompt_ids.len() - fed_tokens;
         if *prefix_hit > 0 {
             *prefix_path = "hit";
@@ -5731,9 +6155,25 @@ impl LlamaProvider {
             options,
         )?;
         if keep_prefix {
-            self.prefix
-                .borrow_mut()
-                .store_run(prompt_ids, &run, cache, boundary, None)?;
+            let store_out = self.prefix.borrow_mut().store_run_with_checkpoints(
+                prompt_ids,
+                &run,
+                cache,
+                kept_boundaries,
+                boundaries,
+                &[],
+                promote_reused,
+            )?;
+            checkpoint_telemetry.record_store(store_out);
+        } else if let Some(pb) = promote_reused {
+            if run.output.finish_reason != crate::decode::FinishReason::Cancelled
+                && pb.position <= prompt_ids.len()
+            {
+                let _ = self
+                    .prefix
+                    .borrow_mut()
+                    .promote_protected(&prompt_ids[..pb.position], pb.kind);
+            }
         }
         run.report.draft = Some(block.report.clone());
         Ok(run)
@@ -5843,6 +6283,11 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
             tree_verify: None,
+            prefix_checkpoints: Some(PrefixCheckpointCapabilities {
+                max_checkpoints_per_request: MAX_CHECKPOINTS_PER_REQUEST as u32,
+                supports_document_span: true,
+                supports_hybrid_boundaries: true,
+            }),
         },
     }
 }

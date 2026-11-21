@@ -2441,3 +2441,78 @@ class CudaCardSelectionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GITHUB_ENV": str(self.directory / "e")}), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.select.main(["GPU-1", str(self.directory)]), 1)
+
+
+class PrefixCheckpointsCampaignTests(unittest.TestCase):
+    """SW-F356: campaign planning, default parsing, and paired E5 decision support."""
+
+    def test_prompt_set_and_prefix_checkpoints_knobs_plan_and_refuse_baseline(self) -> None:
+        (row,) = plan(
+            {
+                "rows": [
+                    {
+                        "id": "ckpt-auto",
+                        "snapshot": "bonsai-mlx",
+                        "runs": ["epic"],
+                        "prefix_cache_bytes": "default",
+                        "prompt_set": "prefix_checkpoints",
+                        "prefix_checkpoints": "auto",
+                    }
+                ]
+            },
+            lane="mlx",
+        )["rows"]
+        self.assertEqual(row["env"]["SPECULATIVE_BENCH_PROMPT_SET"], "prefix_checkpoints")
+        self.assertEqual(row["env"]["SPECULATIVE_BENCH_PREFIX_CHECKPOINTS"], "auto")
+
+        for bad in (
+            {"id": "bad-ps", "snapshot": "bonsai-mlx", "runs": ["epic"], "prompt_set": "other"},
+            {"id": "bad-cp", "snapshot": "bonsai-mlx", "runs": ["epic"], "prefix_checkpoints": "all"},
+            {"id": "ps-base", "snapshot": "bonsai-mlx", "prompt_set": "prefix_checkpoints"},
+            {"id": "cp-base", "snapshot": "bonsai-mlx", "prefix_checkpoints": "off"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(campaign.MatrixError):
+                plan({"rows": [bad]}, lane="mlx")
+
+    def test_defaults_table_reports_prefix_checkpoints_off_as_provisional_and_pairs_twins(self) -> None:
+        entries = {e["entry"]: e for e in campaign.default_entries(LIVE_DEFAULTS)}
+        for key in (
+            "MLX.prefix_checkpoints",
+            "CANDLE_CUDA.prefix_checkpoints",
+            "CANDLE_METAL.prefix_checkpoints",
+            "CANDLE_CPU.prefix_checkpoints",
+        ):
+            self.assertIn(key, entries)
+            self.assertFalse(entries[key]["on"])
+            self.assertTrue(entries[key]["provisional"])
+            self.assertEqual(entries[key]["kind"], "prefix_checkpoints")
+            self.assertEqual(entries[key]["value"], "PrefixCheckpointMode::Off")
+
+        with tempfile.TemporaryDirectory() as td:
+            def ckpt_row(row_id, mode, ttft):
+                def make(run, k):
+                    return document(
+                        run,
+                        prefix_cache_bytes=1 << 20,
+                        value=lambda p, o, m: (50.0 if m == "decode_tok_s" else ttft) + jitter(k),
+                        row_extra=lambda p, o: {"prefix_checkpoints": {"policy": mode}},
+                    )
+
+                env = {
+                    "SPECULATIVE_BENCH_PREFIX_CACHE_BYTES": "1048576",
+                    "SPECULATIVE_BENCH_PROMPT_SET": "prefix_checkpoints",
+                    "SPECULATIVE_BENCH_PREFIX_CHECKPOINTS": mode,
+                }
+                return {"id": row_id, "runs": ["epic"], "env": env, "document": make}
+
+            directory = write_campaign(
+                Path(td) / "ckpt",
+                [ckpt_row("ckpt-auto", "auto", 40.0), ckpt_row("ckpt-off", "off", 100.0)],
+            )
+            decisions = {
+                d["entry"]: d
+                for d in campaign.compare_campaigns([directory], LIVE_DEFAULTS)["defaults"]
+            }
+            decision = decisions["CANDLE_CUDA.prefix_checkpoints"]
+            self.assertEqual((decision["pairs"], decision["outcome"]), (1, "on"))
+            self.assertTrue(decision["flip"])

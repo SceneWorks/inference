@@ -208,6 +208,7 @@ impl ChatRequest {
             cancel: Default::default(),
             progress: None,
             kv_compression,
+            prefix_checkpoints: None,
         })
     }
 }
@@ -327,6 +328,22 @@ pub fn x_decode(report: &DecodeReport) -> Value {
             "calls": draft.calls,
             "host_synchronized_calls": draft.host_synchronized_calls,
             "total_ms": draft.total.as_secs_f64() * 1e3,
+        });
+    }
+    if let Some(ref pc) = report.prefix_checkpoints {
+        v["prefix_checkpoints"] = json!({
+            "policy": pc.policy,
+            "reused_tokens": pc.reused_tokens,
+            "reread_tokens": pc.reread_tokens,
+            "matched_kind": pc.matched_kind,
+            "checkpoints_captured": pc.checkpoints_captured,
+            "captured_bytes": pc.captured_bytes,
+            "restore_time_ms": pc.restore_time.as_secs_f64() * 1e3,
+            "capture_time_ms": pc.capture_time.as_secs_f64() * 1e3,
+            "resident_bytes": pc.resident_bytes,
+            "protected_bytes": pc.protected_bytes,
+            "evicted_entries": pc.evicted_entries,
+            "fallbacks": pc.fallbacks,
         });
     }
     v

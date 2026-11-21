@@ -1066,6 +1066,7 @@ fn qwen35_provider(model: Qwen35Model) -> LlamaProvider {
         prefix: RefCell::new(PrefixCache::with_budget(
             core_llm::defaults::MLX.prefix_cache_bytes,
         )),
+        prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
         speculative_default: core_llm::defaults::MLX.speculative,
         draft: None,
         block_draft: None,
@@ -1101,6 +1102,7 @@ fn qwen35_moe_provider() -> LlamaProvider {
         prefix: RefCell::new(PrefixCache::with_budget(
             core_llm::defaults::MLX.prefix_cache_bytes,
         )),
+        prefix_checkpoints_default: core_llm::defaults::MLX.prefix_checkpoints,
         speculative_default: core_llm::defaults::MLX.speculative,
         draft: None,
         block_draft: None,
@@ -7472,4 +7474,134 @@ fn auto_block_draft_decision_is_keyed_on_the_resident_draft_and_target() {
     let without = qwen35_mtp_provider();
     assert_eq!(without.auto_block_draft_key(), None);
     assert!(!without.auto_prefers_block_draft());
+}
+
+#[test]
+fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
+    let desc = provider_descriptor();
+    assert_eq!(
+        desc.capabilities.prefix_checkpoints,
+        Some(core_llm::PrefixCheckpointCapabilities {
+            max_checkpoints_per_request: core_llm::MAX_CHECKPOINTS_PER_REQUEST as u32,
+            supports_document_span: true,
+            supports_hybrid_boundaries: true,
+        })
+    );
+
+    let mut provider = causal_provider();
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::PrefixCheckpointMode::Off
+    );
+    provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Auto);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::PrefixCheckpointMode::Auto
+    );
+
+    let req = TextLlmRequest {
+        messages: vec![
+            Message::system("t1 t2 t3"),
+            Message::user("t4 t5 t6 t7"),
+            Message::assistant("t8 t9"),
+            Message::user("t10 t11"),
+        ],
+        ..Default::default()
+    };
+    let rendered = provider
+        .template
+        .render_with(
+            &req.messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+                tools: &req.tools,
+                date_string: None,
+            },
+        )
+        .unwrap();
+    let prompt_ids: Vec<i32> = provider
+        .tokenizer
+        .encode(&rendered, false)
+        .unwrap()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
+
+    // `Messages { count: 2 }` aligns cleanly and populates shared_root, prev_message, conversation_end.
+    let policy_msg =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Messages {
+            count: 2,
+        });
+    let (cands, unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_msg);
+    assert!(!unaligned);
+    let root = cands.shared_root.expect("shared_root");
+    let doc = cands.document.expect("document");
+    let prev = cands.prev_message.expect("prev_message");
+    let conv = cands.conversation_end.expect("conversation_end");
+    assert!(root > 0 && root < doc && doc < prev && prev < conv && conv < prompt_ids.len());
+
+    // `MessageChars` splits at token boundary and backs off safely on mid-token splits via dual sentinels.
+    let doc_text = "t4 t5 t6 t7";
+    let exact_chars = "t4 t5 ".len();
+    let policy_exact = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: exact_chars,
+        },
+    );
+    let (exact_cands, exact_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_exact);
+    assert!(!exact_unaligned);
+    let exact_doc = exact_cands.document.expect("message_chars exact doc");
+
+    let mid_chars = "t4 t".len();
+    let policy_mid = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: mid_chars,
+        },
+    );
+    let (mid_cands, mid_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_mid);
+    assert!(!mid_unaligned);
+    let mid_doc = mid_cands.document.expect("message_chars mid-token doc");
+    assert!(
+        mid_doc > root && mid_doc < exact_doc && exact_doc < prev,
+        "mid-token split ({mid_doc}) must back off strictly before exact boundary ({exact_doc})"
+    );
+
+    // Out-of-range char offset flags unaligned instead of guessing or crashing.
+    let policy_oob = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: doc_text.chars().count() + 10,
+        },
+    );
+    let (oob_cands, oob_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_oob);
+    assert!(oob_cands.document.is_none());
+    assert!(oob_unaligned);
+
+    // `Tokens` accepts valid `< prompt_ids.len()` and rejects `>= prompt_ids.len()`.
+    let policy_tok =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+            count: root,
+        });
+    let (tok_cands, tok_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_tok);
+    assert!(!tok_unaligned);
+    assert_eq!(tok_cands.document, Some(root));
+
+    let policy_tok_bad =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+            count: prompt_ids.len(),
+        });
+    let (tok_bad_cands, tok_bad_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_tok_bad);
+    assert!(tok_bad_cands.document.is_none());
+    assert!(tok_bad_unaligned);
 }

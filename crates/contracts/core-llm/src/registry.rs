@@ -442,6 +442,7 @@ mod tests {
             speculative: Vec::new(),
             supported_constraints: constraints.iter().map(Constraint::kind).collect(),
             tree_verify: None,
+            prefix_checkpoints: None,
         }
     }
 

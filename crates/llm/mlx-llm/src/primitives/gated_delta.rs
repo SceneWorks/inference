@@ -1030,11 +1030,12 @@ pub struct DeltaNetCache {
     offset: i32,
     /// The open or last-closed checkpoint window.
     window: Option<CheckpointWindow>,
-    /// The position the next forward outside a checkpoint window captures its state at
-    /// ([`capture_at`](DeltaNetCache::capture_at)), if any.
-    capture: Option<i32>,
-    /// `(position, conv_state, ssm_state)` the last forward captured.
-    captured: Option<(i32, Array, Array)>,
+    /// Positions the next forward outside a checkpoint window captures its state at
+    /// ([`capture_at`](DeltaNetCache::capture_at) /
+    /// [`capture_at_many`](DeltaNetCache::capture_at_many)), if any.
+    captures: Vec<i32>,
+    /// `(position, conv_state, ssm_state)` entries the last forward captured.
+    captured: Vec<(i32, Array, Array)>,
     /// The per-row states of a tree verify forward not yet kept or dropped (feature SW-F328).
     tree: Option<TreeStates>,
     /// The tree the next forward verifies ([`arm_tree`](DeltaNetCache::arm_tree)).
@@ -1172,35 +1173,53 @@ impl DeltaNetCache {
         }
         let conv_state = conv.tail_after(t - 1)?;
         let offset = self.offset;
-        self.captured = None;
-        let capture = self
-            .capture
-            .take()
-            .filter(|&p| !recording && p > offset && p < offset + t);
-        let (y, ssm_state) = if let Some(p) = capture {
-            // A boundary inside a prefill (sc-24446): run the recurrence up to it, keep the state
-            // there, continue from it — the arithmetic of two forwards split at `p`.
-            let b = p - offset;
-            let head = |x: &Array| slice_axis(x, 1, 0, b);
-            let tail = |x: &Array| slice_axis(x, 1, b, t);
-            let (y_head, at) = gated_delta_recurrence(
-                &head(q)?,
-                &head(k)?,
-                &head(v)?,
-                &head(g)?,
-                &head(beta)?,
-                self.ssm_state.as_ref(),
-            )?;
+        self.captured.clear();
+        let pending = std::mem::take(&mut self.captures);
+        let mut cuts: Vec<i32> = if recording {
+            Vec::new()
+        } else {
+            pending
+                .into_iter()
+                .filter(|&p| p > offset && p < offset + t)
+                .collect()
+        };
+        cuts.sort_unstable();
+        cuts.dedup();
+        let (y, ssm_state) = if !cuts.is_empty() {
+            // Multiple boundaries inside one prefill (SW-F356 / sc-24446): split segment by
+            // segment along `cuts` carrying `ssm`, saving each `(p, conv_tail, ssm)` without
+            // disturbing the recurrence output or running extra forwards.
+            let mut ys = Vec::with_capacity(cuts.len() + 1);
+            let mut ssm = self.ssm_state.clone();
+            let mut prev_b = 0i32;
+            for p in cuts {
+                let b = p - offset;
+                let seg = |x: &Array| slice_axis(x, 1, prev_b, b);
+                let (y_seg, at) = gated_delta_recurrence(
+                    &seg(q)?,
+                    &seg(k)?,
+                    &seg(v)?,
+                    &seg(g)?,
+                    &seg(beta)?,
+                    ssm.as_ref(),
+                )?;
+                self.captured.push((p, conv.tail_after(b - 1)?, at.clone()));
+                ys.push(y_seg);
+                ssm = Some(at);
+                prev_b = b;
+            }
+            let seg = |x: &Array| slice_axis(x, 1, prev_b, t);
             let (y_tail, last) = gated_delta_recurrence(
-                &tail(q)?,
-                &tail(k)?,
-                &tail(v)?,
-                &tail(g)?,
-                &tail(beta)?,
-                Some(&at),
+                &seg(q)?,
+                &seg(k)?,
+                &seg(v)?,
+                &seg(g)?,
+                &seg(beta)?,
+                ssm.as_ref(),
             )?;
-            self.captured = Some((p, conv.tail_after(b - 1)?, at));
-            (concatenate_axis(&[&y_head, &y_tail], 1)?, last)
+            ys.push(y_tail);
+            let refs: Vec<&Array> = ys.iter().collect();
+            (concatenate_axis(&refs, 1)?, last)
         } else if recording && t > 1 {
             let (y, last, states) =
                 gated_delta_recurrence_checkpointed(q, k, v, g, beta, self.ssm_state.as_ref())?;
@@ -1355,21 +1374,27 @@ impl DeltaNetCache {
     /// that forward, which runs outside a checkpoint window (a prefill) — so the prefix cache can
     /// snapshot the layer there without splitting the prefill into two forwards (sc-24446).
     pub fn capture_at(&mut self, position: i32) {
-        self.capture = Some(position);
+        self.captures = vec![position];
     }
 
-    /// Drop a pending [`capture_at`](Self::capture_at) the last forward did not consume (it
-    /// failed before reaching this layer): a later forward must never capture a stale boundary.
+    /// Ask the next forward outside a checkpoint window to capture states at every boundary in
+    /// `positions` strictly inside that forward (SW-F356).
+    pub fn capture_at_many(&mut self, positions: &[i32]) {
+        self.captures = positions.to_vec();
+    }
+
+    /// Drop any pending [`capture_at`](Self::capture_at) /
+    /// [`capture_at_many`](Self::capture_at_many) the last forward did not consume: a later
+    /// forward must never capture a stale boundary.
     pub fn clear_capture(&mut self) {
-        self.capture = None;
+        self.captures.clear();
     }
 
-    /// This layer as it was after `position`, from the state the last forward captured there
-    /// ([`capture_at`](Self::capture_at)) — no checkpoint window, no pending capture — or `None`
-    /// when it captured none there.
+    /// This layer as it was after `position`, from the state the last forward captured there — no
+    /// checkpoint window, no pending capture — or `None` when it captured none there.
     pub fn at_captured(&self, position: i32) -> Option<DeltaNetCache> {
-        let (p, conv, ssm) = self.captured.as_ref()?;
-        (*p == position).then(|| DeltaNetCache {
+        let (_, conv, ssm) = self.captured.iter().find(|(p, _, _)| *p == position)?;
+        Some(DeltaNetCache {
             conv_state: Some(conv.clone()),
             ssm_state: Some(ssm.clone()),
             offset: position,
@@ -1482,8 +1507,8 @@ impl DeltaNetCache {
         self.ssm_state = None;
         self.offset = 0;
         self.window = None;
-        self.capture = None;
-        self.captured = None;
+        self.captures.clear();
+        self.captured.clear();
         self.tree = None;
         self.tree_plan = None;
     }
@@ -2426,6 +2451,87 @@ mod tests {
     /// [`KERNEL_MAX_STEPS`] tokens) must complete too and agree with it. Marked `ignore` only for
     /// runtime (the loop is long), not flakiness — it is the direct regression guard for the
     /// high-res-image vision crash.
+    /// Same multi-boundary recurrence proof on GPU (`Stream::gpu()`) from both offset 0 and a
+    /// resumed non-zero prefix offset, verifying outputs, captured states, standalone continuation,
+    /// deduplication, out-of-range filtering, and `clear_capture`.
+    #[test]
+    fn delta_cache_captures_multiple_boundaries_matching_standalone_prefixes() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let n = 14;
+            let s = FeedSeq::new(n);
+
+            // Reference full uncaptured run 0..14
+            let mut full_ref = DeltaNetCache::new();
+            let part = |x: &Array, a: i32, b: i32| slice_axis(x, 1, a, b).unwrap();
+            let run_seg = |cache: &mut DeltaNetCache, a: i32, b: i32| -> Array {
+                let seed = cache
+                    .conv_state
+                    .clone()
+                    .unwrap_or_else(|| Array::from_slice(&[0.0f32; 18], &[1, 3, 6]));
+                let (_, trace) =
+                    causal_depthwise_conv_traced(&part(&s.conv_in, a, b), &s.conv_w, &seed)
+                        .unwrap();
+                let y = cache
+                    .advance(
+                        trace,
+                        &part(&s.x.q, a, b),
+                        &part(&s.x.k, a, b),
+                        &part(&s.x.v, a, b),
+                        &part(&s.x.g, a, b),
+                        &part(&s.x.beta, a, b),
+                    )
+                    .unwrap();
+                y.eval().unwrap();
+                y
+            };
+            let y_ref = run_seg(&mut full_ref, 0, n);
+
+            // Cold run with multiple unsorted, duplicated, and out-of-range boundaries.
+            let mut captured = DeltaNetCache::new();
+            captured.capture_at_many(&[10, 0, 3, 7, 7, n, n + 4]);
+            let y_cap = run_seg(&mut captured, 0, n);
+            assert!(errors(&y_cap, &y_ref).0 < 1e-5);
+            assert_eq!(live(&captured), live(&full_ref));
+            assert!(captured.at_captured(0).is_none());
+            assert!(captured.at_captured(n).is_none());
+
+            for b in [3, 7, 10] {
+                let mut standalone = DeltaNetCache::new();
+                s.feed(&mut standalone, 0, b);
+                let mut at_b = captured
+                    .at_captured(b)
+                    .expect("valid boundary must be captured");
+                assert_eq!(at_b.offset(), b);
+                assert_eq!(live(&at_b), live(&standalone), "boundary {b}");
+
+                // Resuming from boundary `b` with suffix `b..n` and capturing an inner cut `12`
+                if b < 11 {
+                    at_b.capture_at_many(&[12, 2]); // `2 <= offset` is filtered
+                    let y_suffix = run_seg(&mut at_b, b, n);
+                    assert_eq!(at_b.offset(), n);
+                    assert_eq!(live(&at_b), live(&full_ref), "resumed from {b}");
+                    let _ = y_suffix;
+
+                    let mut ref_12 = DeltaNetCache::new();
+                    s.feed(&mut ref_12, 0, 12);
+                    let at_12 = at_b.at_captured(12).expect("inner suffix boundary 12");
+                    assert_eq!(live(&at_12), live(&ref_12));
+                    assert!(at_b.at_captured(b).is_none());
+                    assert!(at_b.at_captured(2).is_none());
+                }
+            }
+
+            // `clear_capture` cancels pending boundaries.
+            let mut cleared = DeltaNetCache::new();
+            cleared.capture_at_many(&[4, 8]);
+            cleared.clear_capture();
+            s.feed(&mut cleared, 0, n);
+            assert!(cleared.at_captured(4).is_none());
+            assert!(cleared.at_captured(8).is_none());
+            assert_eq!(live(&cleared), live(&full_ref));
+        });
+    }
+
     #[test]
     #[ignore = "slow: 130k-step recurrence; guards the long-prefill Metal buffer-limit regression"]
     fn long_prefill_does_not_exhaust_buffer_limit() {

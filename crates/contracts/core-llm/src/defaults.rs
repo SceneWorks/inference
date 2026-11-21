@@ -22,7 +22,7 @@
 //! field, a `LoadSpec` field, a process environment variable or a runtime override — always wins
 //! over the table.
 
-use crate::request::{Speculative, SpeculativeProposer};
+use crate::request::{PrefixCheckpointMode, Speculative, SpeculativeProposer};
 use crate::speculative::{
     DRAFT_MODEL_RECOMMENDED_DEPTH, MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_RECOMMENDED_DEPTH,
 };
@@ -122,6 +122,10 @@ pub struct DecodeDefaults {
     /// The cross-turn prefix-cache budget a load reserves when `LoadSpec::prefix_cache_bytes` is
     /// unset (`0` disables the cache).
     pub prefix_cache_bytes: u64,
+    /// Whether exact multi-boundary prefix checkpoints are captured by default when a request
+    /// leaves [`TextLlmRequest::prefix_checkpoints`](crate::TextLlmRequest::prefix_checkpoints)
+    /// unset (feature SW-F356).
+    pub prefix_checkpoints: PrefixCheckpointMode,
     /// Whether the decode step is captured and replayed as a CUDA graph.
     pub cuda_graphs: bool,
     /// Whether decoders stage positions on the device (and take the length-aware
@@ -164,6 +168,9 @@ pub const MLX: DecodeDefaults = DecodeDefaults {
     // on any family (200 judged, 0 regression); a hit cuts TTFT 19.5–87.7%. An exact cross-turn
     // reuse, admission-clamped (E7), so it can never refuse or overrun a load.
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
+    // justification: PROVISIONAL — off pending SW-F356 paired real-weight runs measuring
+    // full-request latency, TTFT, snapshot overhead, and peak memory.
+    prefix_checkpoints: PrefixCheckpointMode::Off,
     // justification: n/a — MLX has no CUDA graphs.
     cuda_graphs: false,
     // justification: fixed — MLX decoders always read positions from device RoPE tables
@@ -219,6 +226,9 @@ pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
     // rests on two cells barely past their band (a +2.3% miss TTFT vs ±2.1%, a -7.3% hit decode
     // vs ±3.9%), outweighed by the hit's TTFT cut. Admission-clamped in the device domain (E7).
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
+    // justification: PROVISIONAL — off pending SW-F356 paired real-weight runs measuring
+    // full-request latency, TTFT, snapshot overhead, and peak memory.
+    prefix_checkpoints: PrefixCheckpointMode::Off,
     // justification: on, MEASURED (cuda-b4-compare.md, cuda-campaign-b4): 40 of 40 on-vs-off cells
     // pass, decode +44–53% on Bonsai and +5% on Qwen3-8B (speculative `off`), TTFT unchanged.
     // Captured steps are token-identical to eager by construction (bit-exact self-check). A step
@@ -268,6 +278,8 @@ pub const CANDLE_METAL: DecodeDefaults = DecodeDefaults {
     // justification: on — follows CANDLE_CUDA's MEASURED value (Metal was not a campaign host);
     // admission-clamped (E7).
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
+    // justification: PROVISIONAL — follows CANDLE_CUDA pending SW-F356 paired real-weight runs.
+    prefix_checkpoints: PrefixCheckpointMode::Off,
     // justification: n/a — CUDA only.
     cuda_graphs: false,
     // justification: off, a correctness limit — Metal has no `write_rows_at` / `decode_attention`
@@ -306,6 +318,8 @@ pub const CANDLE_CPU: DecodeDefaults = DecodeDefaults {
     // justification: on — follows CANDLE_CUDA's MEASURED value (the CPU was not a campaign host);
     // admission-clamped in host memory.
     prefix_cache_bytes: PREFIX_CACHE_BYTES,
+    // justification: PROVISIONAL — follows CANDLE_CUDA pending SW-F356 paired real-weight runs.
+    prefix_checkpoints: PrefixCheckpointMode::Off,
     // justification: n/a — CUDA only.
     cuda_graphs: false,
     // justification: off — no graph runner on the CPU, and the

@@ -4274,6 +4274,7 @@ fn image_fixture_prompts() -> Vec<core_llm_testkit::BenchPrompt> {
             thinking: None,
             tool_calls: Vec::new(),
         }],
+        prefix_checkpoints: None,
     };
     vec![
         prompt(
@@ -5132,6 +5133,8 @@ fn the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model() {
         sampling: core_llm::Sampling::greedy(),
         repeats: 1,
         thinking: core_llm_testkit::BenchThinking::Default,
+        prompt_set: core_llm_testkit::BenchPromptSet::Default,
+        prefix_checkpoints: None,
     };
     let prompts = core_llm_testkit::speculative_prompt_set();
     let doc = core_llm_testkit::run_speculative_bench(&provider, &prompts, &config)
@@ -6323,3 +6326,113 @@ fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell
 
 /// The block draft through the provider (SW-F360, SW-7197).
 mod block_draft;
+
+#[test]
+fn prefix_checkpoint_descriptor_defaults_and_boundary_resolution() {
+    let desc = super::provider_descriptor();
+    assert_eq!(
+        desc.capabilities.prefix_checkpoints,
+        Some(core_llm::PrefixCheckpointCapabilities {
+            max_checkpoints_per_request: core_llm::MAX_CHECKPOINTS_PER_REQUEST as u32,
+            supports_document_span: true,
+            supports_hybrid_boundaries: true,
+        })
+    );
+
+    let (cfg, weights) = tiny_llama_parts();
+    let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
+    let tok = core_llm::Tokenizer::from_json(&synthetic_tokenizer_json(vocab)).unwrap();
+    let mut provider =
+        super::LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tok, vec![]);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::PrefixCheckpointMode::Off
+    );
+    provider.set_prefix_checkpoints_default(core_llm::PrefixCheckpointMode::Auto);
+    assert_eq!(
+        provider.prefix_checkpoints_default(),
+        core_llm::PrefixCheckpointMode::Auto
+    );
+
+    let req = core_llm::TextLlmRequest {
+        messages: vec![
+            core_llm::Message::system("t1 t2 t3"),
+            core_llm::Message::user("t4 t5 t6 t7"),
+            core_llm::Message::assistant("t8 t9"),
+            core_llm::Message::user("t10 t11"),
+        ],
+        ..Default::default()
+    };
+    let (_, prompt_ids) = provider.render_request(&req, &req.messages).unwrap();
+
+    let policy_msg =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Messages {
+            count: 2,
+        });
+    let (cands, unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_msg);
+    assert!(!unaligned);
+    let root = cands.shared_root.expect("shared_root");
+    let doc = cands.document.expect("document");
+    let prev = cands.prev_message.expect("prev_message");
+    let conv = cands.conversation_end.expect("conversation_end");
+    assert!(root > 0 && root < doc && doc < prev && prev < conv && conv < prompt_ids.len());
+
+    let doc_text = "t4 t5 t6 t7";
+    let exact_chars = "t4 t5 ".len();
+    let policy_exact = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: exact_chars,
+        },
+    );
+    let (exact_cands, exact_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_exact);
+    assert!(!exact_unaligned);
+    let exact_doc = exact_cands.document.expect("message_chars exact doc");
+
+    let mid_chars = "t4 t".len();
+    let policy_mid = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: mid_chars,
+        },
+    );
+    let (mid_cands, mid_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_mid);
+    assert!(!mid_unaligned);
+    let mid_doc = mid_cands.document.expect("message_chars mid-token doc");
+    assert!(
+        mid_doc > root && mid_doc < exact_doc && exact_doc < prev,
+        "mid-token split ({mid_doc}) must back off strictly before exact boundary ({exact_doc})"
+    );
+
+    let policy_oob = core_llm::PrefixCheckpointPolicy::with_document(
+        core_llm::PrefixDocumentSpan::MessageChars {
+            message: 1,
+            chars: doc_text.chars().count() + 10,
+        },
+    );
+    let (oob_cands, oob_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_oob);
+    assert!(oob_cands.document.is_none());
+    assert!(oob_unaligned);
+
+    let policy_tok =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+            count: root,
+        });
+    let (tok_cands, tok_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_tok);
+    assert!(!tok_unaligned);
+    assert_eq!(tok_cands.document, Some(root));
+
+    let policy_tok_bad =
+        core_llm::PrefixCheckpointPolicy::with_document(core_llm::PrefixDocumentSpan::Tokens {
+            count: prompt_ids.len(),
+        });
+    let (tok_bad_cands, tok_bad_unaligned) =
+        provider.resolve_boundary_candidates(&req.messages, &req, &prompt_ids, policy_tok_bad);
+    assert!(tok_bad_cands.document.is_none());
+    assert!(tok_bad_unaligned);
+}

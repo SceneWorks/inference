@@ -1184,6 +1184,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                     want_hidden: wants_hidden,
                     prefill: false,
                     snapshot_at: None,
+                    snapshot_points: Vec::new(),
                 },
             )?;
             stats.forwards += 1;

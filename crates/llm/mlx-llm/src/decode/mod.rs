@@ -36,9 +36,10 @@ pub use engine::{
     TruncateRollback,
 };
 pub use prefix::{
-    generate_cached, generate_cached_with, prefill_restored, prefill_with_prefix, Boundary,
-    PagedPrefixCache, PagedPrefixLookup, PagedPrefixStats, PrefixCache, PrefixEntry, PrefixPrefill,
-    PrefixSnapshot, PrefixStats, Restored,
+    generate_cached, generate_cached_with, prefill_restored, prefill_restored_with_plan,
+    prefill_with_prefix, Boundary, PagedPrefixCache, PagedPrefixLookup, PagedPrefixStats,
+    PrefixCache, PrefixEntry, PrefixPrefill, PrefixRestoreOutcome, PrefixSnapshot, PrefixStats,
+    PrefixStoreOutcome, Restored,
 };
 pub use proposers::{
     generate_qwen35_mtp, DraftModelProposer, MtpBoundary, MtpProposer, NgramProposer,

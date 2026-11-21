@@ -151,6 +151,8 @@ PATHS_SCHEMA = "sceneworks.decode-speedups.paths/1"
 RUNS = ("epic", "baseline")
 FORMATS = ("bf16", "q8", "q4", "nvfp4")
 THINKING = ("default", "off", "on", "xhigh", "medium", "low")
+PROMPT_SETS = ("default", "prefix_checkpoints")
+PREFIX_CHECKPOINTS = ("off", "auto")
 DEFAULT_PROCESS_REPEATS = 3
 CANDLE_SWITCHES = (
     "CANDLE_LLM_CUDA_GRAPHS",
@@ -193,6 +195,8 @@ ROW_KEYS = {
     "switches",
     "without_mtp",
     "memory_cap_gib",
+    "prompt_set",
+    "prefix_checkpoints",
 }
 ROW_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 MAX_ROWS = 64
@@ -502,10 +506,27 @@ def plan_row(
         knobs["SPECULATIVE_BENCH_PREFIX_CACHE_BYTES"] = str(budget)
         if budget != 0:
             epic_only.append("prefix_cache_bytes")
+    if "prompt_set" in row:
+        prompt_set = _text(row["prompt_set"], f"{tag}: prompt_set")
+        if prompt_set not in PROMPT_SETS:
+            raise MatrixError(
+                f"{tag}: prompt_set must be one of {list(PROMPT_SETS)}, got {prompt_set!r}"
+            )
+        knobs["SPECULATIVE_BENCH_PROMPT_SET"] = prompt_set
+        if prompt_set != "default":
+            epic_only.append("prompt_set")
+    if "prefix_checkpoints" in row:
+        checkpoints = _text(row["prefix_checkpoints"], f"{tag}: prefix_checkpoints")
+        if checkpoints not in PREFIX_CHECKPOINTS:
+            raise MatrixError(
+                f"{tag}: prefix_checkpoints must be one of {list(PREFIX_CHECKPOINTS)}, got {checkpoints!r}"
+            )
+        knobs["SPECULATIVE_BENCH_PREFIX_CHECKPOINTS"] = checkpoints
+        epic_only.append("prefix_checkpoints")
     if "baseline" in runs and epic_only:
         raise MatrixError(
             f"{tag}: {epic_only} cannot run on the pre-epic baseline (no draft models, companion "
-            "heads or prefix cache there); give the row runs [\"epic\"]"
+            "heads, prefix cache or prefix checkpoints there); give the row runs [\"epic\"]"
         )
 
     switches = row.get("switches", {})
@@ -1581,6 +1602,7 @@ def document_config(process: Process) -> dict[str, Any]:
             name: (value or {}).get("env")
             for name, value in (provenance.get("switches") or {}).items()
         },
+        "prefix_checkpoints": _prefix_checkpoints_mode(process),
         "prompts": sorted({(r.get("prompt_id"), r.get("class")) for r in doc.get("rows") or []}),
     }
 
@@ -1791,6 +1813,7 @@ FIELD_MEASUREMENT = {
     "fused_rotation": ("switch", "MLX_LLM_FUSED_ROTATION"),
     "gdn_kernel": ("switch", "MLX_LLM_GDN_KERNEL"),
     "prefix_cache_bytes": ("prefix_cache", None),
+    "prefix_checkpoints": ("prefix_checkpoints", None),
     "speculative": ("speculative", None),
 }
 DEFAULTS_BACKENDS = {
@@ -1836,7 +1859,7 @@ def default_entries(source: str) -> list[dict[str, Any]]:
                         "backend": backend,
                         "field": name,
                         "value": value,
-                        "on": value not in ("false", "Speculative::Off", "0"),
+                        "on": value not in ("false", "Speculative::Off", "0", "PrefixCheckpointMode::Off"),
                         "kind": kind,
                         "switch": switch,
                         "provisional": "PROVISIONAL" in justification,
@@ -1856,7 +1879,33 @@ def _prefix_cache_on(process: Process) -> bool:
     return bool((process.document.get("load") or {}).get("prefix_cache_bytes") or 0)
 
 
-def _context(process: Process, exclude_switch: str | None, include_cache: bool) -> str:
+def _prefix_checkpoints_mode(process: Process) -> str | None:
+    env = process.row_entry.get("env") or {}
+    mode = env.get("SPECULATIVE_BENCH_PREFIX_CHECKPOINTS")
+    if mode in PREFIX_CHECKPOINTS:
+        return mode
+    rows = process.document.get("rows") or []
+    policies = {
+        (row.get("prefix_checkpoints") or {}).get("policy")
+        for row in rows
+        if isinstance(row.get("prefix_checkpoints"), dict)
+    }
+    if not policies:
+        return None
+    if policies == {"off"}:
+        return "off"
+    if policies <= {"auto", "document"}:
+        return "auto"
+    return None
+
+
+def _context(
+    process: Process,
+    exclude_switch: str | None,
+    include_cache: bool,
+    *,
+    include_checkpoints: bool = True,
+) -> str:
     """Everything two epic rows of one campaign must share to be an on/off pair — twins: their
     whole configuration (options included) and process schedule (``runs``: a row alternating with
     pre-epic processes is a different measurement regime), but the setting under test."""
@@ -1876,6 +1925,8 @@ def _context(process: Process, exclude_switch: str | None, include_cache: bool) 
     }
     if include_cache:
         config["prefix_cache"] = _prefix_cache_on(process)
+    if not include_checkpoints:
+        config.pop("prefix_checkpoints", None)
     return json.dumps({"campaign": process.campaign, **config}, sort_keys=True, default=str)
 
 
@@ -1884,6 +1935,8 @@ def _deliberate(entry: dict[str, Any], processes: list[Process]) -> bool:
     non-zero prefix-cache budget): a row that did so and has no twin is a missing measurement."""
     if entry["kind"] == "switch":
         return entry["switch"] in (processes[0].row_entry.get("switches") or {})
+    if entry["kind"] == "prefix_checkpoints":
+        return _prefix_checkpoints_mode(processes[0]) == "auto"
     return entry["kind"] == "prefix_cache" and _prefix_cache_on(processes[0])
 
 
@@ -1911,6 +1964,12 @@ def _pairs(
         elif entry["kind"] == "prefix_cache":
             state = _prefix_cache_on(processes[0])
             context = _context(processes[0], None, include_cache=False)
+        elif entry["kind"] == "prefix_checkpoints":
+            mode = _prefix_checkpoints_mode(processes[0])
+            if mode not in PREFIX_CHECKPOINTS:
+                continue
+            state = mode == "auto"
+            context = _context(processes[0], None, include_cache=True, include_checkpoints=False)
         else:
             return [], []
         buckets.setdefault(context, {}).setdefault(state, []).append(processes)
@@ -2081,7 +2140,12 @@ def decide_defaults(
                         )
         outcome = _e5_outcome(entry, judged)
         if unpaired:
-            what = "the prefix cache" if entry["kind"] == "prefix_cache" else entry["switch"]
+            if entry["kind"] == "prefix_cache":
+                what = "the prefix cache"
+            elif entry["kind"] == "prefix_checkpoints":
+                what = "prefix checkpoints"
+            else:
+                what = entry["switch"]
             outcome["reason"] += (
                 f"; unpaired, no twin row identical but for {what}: "
                 + ", ".join(f"{p[0].campaign}/{p[0].row}" for p in unpaired)
@@ -2545,6 +2609,8 @@ def paths_report(directories: list[Path]) -> dict[str, Any]:
                 "thinking": (document.get("thinking") or {}).get("setting"),
                 "sampling": document.get("sampling"),
                 "prefix_cache_bytes": env.get("SPECULATIVE_BENCH_PREFIX_CACHE_BYTES", "0"),
+                "prompt_set": env.get("SPECULATIVE_BENCH_PROMPT_SET", "default"),
+                "prefix_checkpoints": _prefix_checkpoints_mode(process) or "default",
             }
             load = document.get("load") or {}
             offs = {

@@ -104,8 +104,8 @@ pub use block_draft::{
 };
 pub use cancel::CancelFlag;
 pub use capabilities::{
-    ModelSamplingDefaults, MtpCapabilities, ProposerCapabilities, TextLlmCapabilities,
-    TextLlmDescriptor, TreeVerifyCapabilities,
+    ModelSamplingDefaults, MtpCapabilities, PrefixCheckpointCapabilities, ProposerCapabilities,
+    TextLlmCapabilities, TextLlmDescriptor, TreeVerifyCapabilities,
 };
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
@@ -139,11 +139,15 @@ pub use output::{
 };
 pub use paging::BlockAllocator;
 pub use prefix::{
-    prefix_cache_budget, prefix_path_before_lookup, requested_prefix_cache_bytes, InsertOutcome,
-    PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse,
-    PrefixStats, PrefixStore, PREFIX_COMPRESSED_IMPORT_DECLINED, PREFIX_COMPRESSED_NOT_STORED,
-    PREFIX_COPY_FAILED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
-    PREFIX_PAGED_NOT_SNAPSHOTTED,
+    plan_prefix_boundaries, prefix_cache_budget, prefix_path_before_lookup,
+    requested_prefix_cache_bytes, BoundaryCandidates, BoundaryPlan, InsertOutcome, NearTailConfig,
+    PlannedAdmission, PlannedBoundary, PrefixAdmission, PrefixHit, PrefixId, PrefixIndex,
+    PrefixInsert, PrefixInsertOutcome, PrefixKind, PrefixLookup, PrefixMatch, PrefixReuse,
+    PrefixStats, PrefixStore, MAX_CHECKPOINTS_PER_REQUEST, PREFIX_CANCELLED_NOT_STORED,
+    PREFIX_COMPRESSED_IMPORT_DECLINED, PREFIX_COMPRESSED_NOT_STORED, PREFIX_COPY_FAILED,
+    PREFIX_DOCUMENT_UNALIGNED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
+    PREFIX_PAGED_NOT_SNAPSHOTTED, PREFIX_PARTIAL_ADMISSION_TRIMMED, PREFIX_PROPOSER_INCOMPATIBLE,
+    PREFIX_PROTECTED_CAP_DEMOTED, PREFIX_PROTECTED_PRESERVED,
 };
 pub use prepare::{
     check_prepare_output, detect_format, ModelFormat, PrepareReport, PrepareSpec,
@@ -167,12 +171,13 @@ pub use registry::{
 };
 pub use report::{
     prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeDraft, DecodeReport,
-    DraftReport, DraftTime, FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
-    TreeVerifyReport,
+    DraftReport, DraftTime, FeatureSupport, FusedTally, LoadReport, PathReport,
+    PrefixCheckpointReport, ProjectionReport, TreeVerifyReport,
 };
 pub use request::{
-    HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
-    Speculative, SpeculativeProposer, SpeculativeVerify, TextLlmRequest, ThinkingMode,
+    HostSampleReason, LoadSpec, MtpMode, PrefixCheckpointMode, PrefixCheckpointPolicy,
+    PrefixDocumentSpan, Quantize, ReasoningEffort, SamplerPath, Sampling, Speculative,
+    SpeculativeProposer, SpeculativeVerify, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_draft_load, admit_load_memory, admit_request_memory, admit_request_memory_with_geometry,

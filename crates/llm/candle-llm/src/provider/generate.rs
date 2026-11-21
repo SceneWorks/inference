@@ -381,11 +381,12 @@ impl LlamaProvider {
                 )?)
             })
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
-        // The cross-turn prefix cache (sc-24437) serves the engine's text routes. It keys on token
-        // ids, which cannot tell two images (or clips) behind the same placeholder ids apart — a
-        // multimodal prompt neither reads nor feeds it — and the reference loop is the parity
-        // oracle, which always prefills cold; the report names either. The hybrid decoder
-        // snapshots at the end of the rendered conversation, the prefix the next turn extends.
+        // The cross-turn prefix cache (sc-24437 / SW-F356) serves the engine's text routes. It
+        // keys on token ids, which cannot tell two images (or clips) behind the same placeholder
+        // ids apart — a multimodal prompt neither reads nor feeds it — and the reference loop is
+        // the parity oracle, which always prefills cold; the report names either.
+        let checkpoint_policy = req.prefix_checkpoints_or(self.prefix_checkpoints_default);
+        let mut checkpoint_fallbacks: Vec<String> = Vec::new();
         let prefix_on = self.prefix_cache().budget_bytes() > 0;
         let prefix_route = !multimodal && !gemma4_mm_request && route != DecodeRoute::Reference;
         let (mut prefix_path, mut prefix_reason) =
@@ -396,6 +397,9 @@ impl LlamaProvider {
                 ),
                 shared => shared,
             };
+        if let Some(reason) = prefix_reason {
+            checkpoint_fallbacks.push(reason.to_string());
+        }
         let prefix_mtp = matches!(
             route,
             DecodeRoute::Engine {
@@ -403,47 +407,112 @@ impl LlamaProvider {
                 ..
             }
         );
-        let prefix_boundary = match &self.model {
-            Decoder::Qwen35(_) if prefix_on && prefix_route => {
-                self.conversation_boundary(messages, req, &prompt_ids)
+        let prefix_store = prefix_on && prefix_route;
+        let boundary_candidates = if prefix_store {
+            let (cands, doc_unaligned) =
+                self.resolve_boundary_candidates(messages, req, &prompt_ids, checkpoint_policy);
+            if doc_unaligned {
+                checkpoint_fallbacks.push(PREFIX_DOCUMENT_UNALIGNED.to_string());
             }
-            _ => None,
+            cands
+        } else {
+            BoundaryCandidates::default()
         };
-        let snapshot_bytes = self
-            .prefix_snapshot_bytes(
-                prompt_ids.len().saturating_add(req.max_new_tokens as usize),
-                prefix_boundary,
-                prefix_mtp,
+        let reuse_mode = match &self.model {
+            Decoder::Causal(_) => PrefixReuse::AnyPrefix,
+            Decoder::Qwen35(_) => PrefixReuse::WholeEntry,
+        };
+        let peeked_reused = if prefix_store {
+            self.prefix_cache().peek_reused(&prompt_ids, prefix_mtp)
+        } else {
+            0
+        };
+        let boundary_plan = if prefix_store {
+            core_llm::plan_prefix_boundaries(
+                prompt_ids.len(),
+                peeked_reused,
+                reuse_mode,
+                checkpoint_policy,
+                boundary_candidates,
+                NearTailConfig::default(),
             )
-            .ok_or_else(|| CoreError::InvalidRequest("prefix snapshot estimate overflow".into()))?;
+        } else {
+            core_llm::BoundaryPlan::default()
+        };
+        let planned_with_costs: Vec<(PlannedBoundary, u64)> = if prefix_store {
+            let mut items = Vec::with_capacity(boundary_plan.captures.len() + 1);
+            for &b in &boundary_plan.captures {
+                let bytes = self.boundary_snapshot_bytes(b, prefix_mtp).ok_or_else(|| {
+                    CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
+                })?;
+                items.push((b, bytes));
+            }
+            if reuse_mode == PrefixReuse::AnyPrefix && !prompt_ids.is_empty() {
+                let conv_bytes = self
+                    .prefix_snapshot_bytes(
+                        prompt_ids.len().saturating_add(req.max_new_tokens as usize),
+                        None,
+                        false,
+                    )
+                    .ok_or_else(|| {
+                        CoreError::InvalidRequest("prefix snapshot estimate overflow".into())
+                    })?;
+                items.push((
+                    PlannedBoundary {
+                        position: prompt_ids.len(),
+                        kind: PrefixKind::Conversation,
+                        protected: false,
+                    },
+                    conv_bytes,
+                ));
+            }
+            items
+        } else {
+            Vec::new()
+        };
         let available = request_available_memory(self.model.device())?;
         // Held prefix-cache entries are reclaimable memory (E7): a request that would not fit
-        // evicts them least-recently-used first, and the snapshot it would leave behind is
-        // admitted with it — or not taken, so caching never makes a request fail and never takes
-        // memory admission did not grant.
-        let prefix_admission = if prefix_on && prefix_route {
+        // evicts them least-recently-used first, and the planned snapshots are admitted with it
+        // (trimmed lowest-priority first if tight, never forcing request refusal).
+        let planned_admission = if prefix_store {
             self.prefix_cache()
-                .admit(required, snapshot_bytes, available)
+                .admit_planned(required, &planned_with_costs, available)
         } else {
-            core_llm::PrefixAdmission {
-                available: self.prefix_cache().reclaim_for(required, available),
-                snapshot: false,
+            PlannedAdmission {
+                admission: core_llm::PrefixAdmission {
+                    available: self.prefix_cache().reclaim_for(required, available),
+                    snapshot: false,
+                },
+                kept: Vec::new(),
+                evicted_entries: 0,
+                fallback: None,
             }
         };
-        let keep_prefix = prefix_admission.snapshot;
-        if prefix_on && prefix_route && !keep_prefix {
-            prefix_reason = Some(PREFIX_NOT_ADMITTED);
+        let keep_prefix = planned_admission.admission.snapshot;
+        let kept_boundaries = planned_admission.kept;
+        let checkpoint_evictions = planned_admission.evicted_entries;
+        if let Some(fb) = planned_admission.fallback {
+            if !planned_with_costs.is_empty() && !keep_prefix {
+                prefix_reason = Some(fb);
+            }
+            if !planned_with_costs.is_empty() {
+                checkpoint_fallbacks.push(fb.to_string());
+            }
         }
+        let snapshot_bytes: u64 = if keep_prefix {
+            planned_with_costs
+                .iter()
+                .filter(|(b, _)| kept_boundaries.contains(b))
+                .fold(0u64, |acc, &(_, bytes)| acc.saturating_add(bytes))
+        } else {
+            0
+        };
         if let Err(error) = core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
-            if keep_prefix {
-                required.saturating_add(snapshot_bytes)
-            } else {
-                required
-            },
-            prefix_admission.available,
+            required.saturating_add(snapshot_bytes),
+            planned_admission.admission.available,
         ) {
             // `auto`'s preferred block draft that does not fit: resolve again without it (MTP,
             // prompt lookup or plain — what `auto` admitted before the preference), by name.
@@ -456,8 +525,12 @@ impl LlamaProvider {
             }
             return Err(error);
         }
-        let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
         let mut prefix_hit = 0usize;
+        let mut checkpoint_telemetry = CheckpointTelemetry {
+            evicted_entries: checkpoint_evictions,
+            fallbacks: checkpoint_fallbacks,
+            ..CheckpointTelemetry::default()
+        };
 
         self.model
             .device()
@@ -859,30 +932,46 @@ impl LlamaProvider {
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
-                        let restored = self
-                            .prefix_cache()
-                            .restore_into(&mut cache, &prompt_ids, speculative)
-                            .map_err(to_core)?;
-                        let prefilled = prefill_restored(
+                        let restore_outcome = if prefix_on && prefix_route {
+                            self.prefix_cache()
+                                .restore_with_diagnostic(&mut cache, &prompt_ids, speculative)
+                                .map_err(to_core)?
+                        } else {
+                            PrefixRestoreOutcome {
+                                restored: None,
+                                proposer_skipped_longer: false,
+                                restore_time: Duration::ZERO,
+                            }
+                        };
+                        let prefilled = prefill_restored_with_plan(
                             stepper,
                             &mut cache,
-                            restored,
+                            restore_outcome,
                             &prompt_ids,
-                            prefix_boundary,
+                            &kept_boundaries,
                             speculative || block.is_some(),
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        checkpoint_telemetry.restore_time = prefilled.restore_time;
+                        checkpoint_telemetry.capture_time = prefilled.capture_time;
+                        checkpoint_telemetry.matched_kind =
+                            prefilled.matched_kind.map(|k| k.label().to_string());
+                        if prefilled.proposer_skipped_longer {
+                            checkpoint_telemetry.push_fallback(PREFIX_PROPOSER_INCOMPATIBLE);
+                        }
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
-                        let snapshot = prefilled.boundary;
+                        let capture_lens: Vec<usize> =
+                            prefilled.boundaries.iter().map(Boundary::len).collect();
+                        let snapshots = prefilled.boundaries;
                         if let Some(head) = mtp_proposer.take() {
                             mtp_proposer = Some(
                                 head.resume_from(prefilled.mtp)
-                                    .capture_at(snapshot.as_ref().map(Boundary::len)),
+                                    .capture_at_many(&capture_lens),
                             );
                         }
                         let mut prefill = None;
@@ -935,12 +1024,36 @@ impl LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
-                        let captured = mtp_proposer.as_mut().and_then(MtpProposer::take_captured);
-                        if let Err(e) =
-                            self.prefix_cache()
-                                .store(&prompt_ids, &[], &cache, snapshot, captured)
-                        {
-                            prefix_reason = Some(prefix_store_reason(&e));
+                        let captured = mtp_proposer
+                            .as_mut()
+                            .map_or_else(Vec::new, MtpProposer::take_captured_all);
+                        if keep_prefix {
+                            match self.prefix_cache().store_checkpoints(
+                                &prompt_ids,
+                                &[],
+                                run.output.finish_reason,
+                                &cache,
+                                &kept_boundaries,
+                                snapshots,
+                                &captured,
+                                boundary_plan.promote_reused,
+                            ) {
+                                Ok(out) => checkpoint_telemetry.record_store(out),
+                                Err(e) => {
+                                    let reason = prefix_store_reason(&e);
+                                    prefix_reason = Some(reason);
+                                    checkpoint_telemetry.push_fallback(reason);
+                                }
+                            }
+                        } else if let Some(pb) = boundary_plan.promote_reused {
+                            if prefix_store
+                                && run.output.finish_reason != FinishReason::Cancelled
+                                && pb.position <= prompt_ids.len()
+                            {
+                                let _ = self
+                                    .prefix_cache()
+                                    .promote_protected(&prompt_ids[..pb.position], pb.kind);
+                            }
                         }
                         run
                     }
@@ -1154,20 +1267,34 @@ impl LlamaProvider {
                                 drafts,
                             )
                             .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
-                        let restored = self
-                            .prefix_cache()
-                            .restore_into(&mut cache, &prompt_ids, false)
-                            .map_err(to_core)?;
-                        let prefilled = prefill_restored(
+                        let restore_outcome = if prefix_on && prefix_route {
+                            self.prefix_cache()
+                                .restore_with_diagnostic(&mut cache, &prompt_ids, false)
+                                .map_err(to_core)?
+                        } else {
+                            PrefixRestoreOutcome {
+                                restored: None,
+                                proposer_skipped_longer: false,
+                                restore_time: Duration::ZERO,
+                            }
+                        };
+                        let prefilled = prefill_restored_with_plan(
                             stepper,
                             &mut cache,
-                            restored,
+                            restore_outcome,
                             &prompt_ids,
-                            None,
+                            &kept_boundaries,
                             false,
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        checkpoint_telemetry.restore_time = prefilled.restore_time;
+                        checkpoint_telemetry.capture_time = prefilled.capture_time;
+                        checkpoint_telemetry.matched_kind =
+                            prefilled.matched_kind.map(|k| k.label().to_string());
+                        if prefilled.proposer_skipped_longer {
+                            checkpoint_telemetry.push_fallback(PREFIX_PROPOSER_INCOMPATIBLE);
+                        }
                         // Measured, not looked up: the positions the prefill did not feed.
                         prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
                         if prefix_hit > 0 {
@@ -1211,14 +1338,31 @@ impl LlamaProvider {
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
                         if keep_prefix {
-                            if let Err(e) = self.prefix_cache().store(
+                            match self.prefix_cache().store_checkpoints(
                                 &prompt_ids,
                                 &run.output.tokens,
+                                run.output.finish_reason,
                                 &cache,
-                                None,
-                                None,
+                                &kept_boundaries,
+                                Vec::new(),
+                                &[],
+                                boundary_plan.promote_reused,
                             ) {
-                                prefix_reason = Some(prefix_store_reason(&e));
+                                Ok(out) => checkpoint_telemetry.record_store(out),
+                                Err(e) => {
+                                    let reason = prefix_store_reason(&e);
+                                    prefix_reason = Some(reason);
+                                    checkpoint_telemetry.push_fallback(reason);
+                                }
+                            }
+                        } else if let Some(pb) = boundary_plan.promote_reused {
+                            if prefix_store
+                                && run.output.finish_reason != FinishReason::Cancelled
+                                && pb.position <= prompt_ids.len()
+                            {
+                                let _ = self
+                                    .prefix_cache()
+                                    .promote_protected(&prompt_ids[..pb.position], pb.kind);
                             }
                         }
                         run
@@ -1423,10 +1567,20 @@ impl LlamaProvider {
         decode_record.prefix_hit_tokens = prefix_hit as u64;
         decode_record.prefix_cache = prefix_path;
         decode_record.prefix_cache_reason = prefix_reason;
+        {
+            let prefix_store_ref = self.prefix_cache();
+            decode_record.prefix_checkpoints = Some(checkpoint_telemetry.into_report(
+                checkpoint_policy.label(),
+                prefix_hit as u64,
+                prompt_len.saturating_sub(prefix_hit) as u64,
+                prefix_store_ref.resident_bytes(),
+                prefix_store_ref.protected_bytes(),
+            ));
+        }
         *self
             .last_decode
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decode_record.clone());
 
         // End-of-generation tails, in pipeline order. First the reasoning segmenter's held-back
         // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
@@ -1564,5 +1718,60 @@ impl LlamaProvider {
             draft.model.config().format,
             self.load_record.target_quantization(),
         ))
+    }
+}
+
+#[derive(Default)]
+struct CheckpointTelemetry {
+    restore_time: Duration,
+    capture_time: Duration,
+    matched_kind: Option<String>,
+    checkpoints_captured: u32,
+    captured_bytes: u64,
+    evicted_entries: u32,
+    fallbacks: Vec<String>,
+}
+
+impl CheckpointTelemetry {
+    fn push_fallback(&mut self, fb: &str) {
+        if !self.fallbacks.iter().any(|existing| existing == fb) {
+            self.fallbacks.push(fb.to_string());
+        }
+    }
+
+    fn record_store(&mut self, outcome: PrefixStoreOutcome) {
+        self.checkpoints_captured = self
+            .checkpoints_captured
+            .saturating_add(outcome.checkpoints_captured);
+        self.captured_bytes = self.captured_bytes.saturating_add(outcome.captured_bytes);
+        self.evicted_entries = self.evicted_entries.saturating_add(outcome.evicted_entries);
+        self.capture_time = self.capture_time.saturating_add(outcome.capture_time);
+        for fb in outcome.fallbacks {
+            self.push_fallback(&fb);
+        }
+    }
+
+    fn into_report(
+        self,
+        policy: &str,
+        reused_tokens: u64,
+        reread_tokens: u64,
+        resident_bytes: u64,
+        protected_bytes: u64,
+    ) -> PrefixCheckpointReport {
+        PrefixCheckpointReport {
+            policy: policy.to_string(),
+            reused_tokens,
+            reread_tokens,
+            matched_kind: self.matched_kind,
+            checkpoints_captured: self.checkpoints_captured,
+            captured_bytes: self.captured_bytes,
+            restore_time: self.restore_time,
+            capture_time: self.capture_time,
+            resident_bytes,
+            protected_bytes,
+            evicted_entries: self.evicted_entries,
+            fallbacks: self.fallbacks,
+        }
     }
 }

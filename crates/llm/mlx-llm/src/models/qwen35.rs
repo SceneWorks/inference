@@ -1153,6 +1153,16 @@ impl Qwen35Cache {
         }
     }
 
+    /// Ask the next forward outside any checkpoint window to capture every DeltaNet layer's state
+    /// at every boundary in `positions` strictly inside that forward (SW-F356).
+    pub fn capture_boundaries(&mut self, positions: &[i32]) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.capture_at_many(positions);
+            }
+        }
+    }
+
     /// Drop every DeltaNet layer's pending [`capture_boundary`](Self::capture_boundary) — after a
     /// forward that failed part-way, whose later layers never consumed it.
     pub fn clear_boundary_capture(&mut self) {

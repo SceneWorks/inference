@@ -99,6 +99,11 @@ pub(super) fn provider_descriptor_on(backend: core_llm::DecodeBackend) -> TextLl
             // JSON-constrained decoding.
             supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
             tree_verify: None,
+            prefix_checkpoints: Some(core_llm::PrefixCheckpointCapabilities {
+                max_checkpoints_per_request: core_llm::MAX_CHECKPOINTS_PER_REQUEST as u32,
+                supports_document_span: true,
+                supports_hybrid_boundaries: true,
+            }),
         },
     }
 }

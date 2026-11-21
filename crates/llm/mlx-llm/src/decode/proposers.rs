@@ -326,8 +326,8 @@ pub struct MtpProposer<'a> {
     cache: Option<MtpCache>,
     after_cur: Option<MtpCache>,
     resume: Option<MtpBoundary>,
-    capture_at: Option<usize>,
-    captured: Option<MtpBoundary>,
+    capture_at: Vec<usize>,
+    captured: Vec<MtpBoundary>,
 }
 
 /// The MTP head's state at a prompt boundary `len` (story sc-24437): its cache after warming on
@@ -384,13 +384,25 @@ impl<'a> MtpProposer<'a> {
     /// [`take_captured`](Self::take_captured)); ignored unless `len` falls strictly inside the
     /// warmed span.
     pub fn capture_at(mut self, len: Option<usize>) -> Self {
-        self.capture_at = len;
+        self.capture_at = len.into_iter().collect();
         self
     }
 
-    /// The state captured by [`capture_at`](Self::capture_at), once.
+    /// Record the head's state at every prompt boundary in `lens` strictly inside the warmed span
+    /// (SW-F356; see [`take_captured_all`](Self::take_captured_all)).
+    pub fn capture_at_many(mut self, lens: &[usize]) -> Self {
+        self.capture_at = lens.to_vec();
+        self
+    }
+
+    /// The first state captured by [`capture_at`](Self::capture_at), once (clearing any remainder).
     pub fn take_captured(&mut self) -> Option<MtpBoundary> {
-        self.captured.take()
+        std::mem::take(&mut self.captured).into_iter().next()
+    }
+
+    /// All states captured during the last warm-up, in boundary order.
+    pub fn take_captured_all(&mut self) -> Vec<MtpBoundary> {
+        std::mem::take(&mut self.captured)
     }
 
     fn cache(&mut self) -> Result<&mut MtpCache> {
@@ -445,19 +457,24 @@ impl MtpProposer<'_> {
             }
         };
         let first = offset.max(1);
-        let split = self
-            .capture_at
-            .take()
-            .filter(|&b| b > offset && b < prompt_len);
+        self.captured.clear();
+        let mut splits: Vec<usize> = std::mem::take(&mut self.capture_at)
+            .into_iter()
+            .filter(|&b| b > offset && b < prompt_len)
+            .collect();
+        splits.sort_unstable();
+        splits.dedup();
         let mut seed = None;
-        let mut segments = Vec::with_capacity(2);
+        let mut segments: Vec<(std::ops::Range<usize>, Option<usize>)> =
+            Vec::with_capacity(splits.len() + 1);
         let mut from = first;
-        if let Some(b) = split {
-            segments.push(from..b);
+        for b in splits {
+            let start = from.min(b);
+            segments.push((start..b, Some(b)));
             from = b;
         }
-        segments.push(from..prompt_len);
-        for segment in segments {
+        segments.push((from..prompt_len, None));
+        for (segment, cap) in segments {
             if !segment.is_empty() {
                 let shifted = model.embed_input_ids(&input_ids(&prompt[segment.clone()]))?;
                 let aligned = target_rows(segment.start - 1, segment.len())?;
@@ -469,15 +486,15 @@ impl MtpProposer<'_> {
                     [&positions, &positions, &positions],
                 )?);
             }
-            if split == Some(segment.end) {
-                let row = target_rows(segment.end - 1, 1)?;
+            if let Some(boundary_len) = cap {
+                let row = target_rows(boundary_len - 1, 1)?;
                 let mut pending: Vec<&Array> = seed.iter().collect();
                 pending.push(&row);
                 eval(pending)?;
-                self.captured = Some(MtpBoundary {
+                self.captured.push(MtpBoundary {
                     cache: cache.clone(),
                     hidden: row,
-                    len: segment.end,
+                    len: boundary_len,
                 });
             }
         }
@@ -508,7 +525,7 @@ impl Proposer<Qwen35Model> for MtpProposer<'_> {
         if self.multimodal.is_none() {
             return self.warm_text(model, prompt, hidden);
         }
-        if self.resume.is_some() || self.capture_at.is_some() {
+        if self.resume.is_some() || !self.capture_at.is_empty() {
             return Err(Error::Msg(
                 "MtpProposer: a multimodal prompt never resumes from or feeds the prefix cache"
                     .into(),
