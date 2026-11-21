@@ -26,6 +26,7 @@
 //! `from_mmaped_safetensors`. Do NOT change the sort key (e.g. to a numeric shard index): it would
 //! silently pick a different shard's copy of a duplicated key and corrupt weight loading.
 
+pub use candle_checkpoint::{MappedWeights, ProjectionSource};
 use std::path::{Path, PathBuf};
 
 use candle_core::safetensors::MmapedSafetensors;

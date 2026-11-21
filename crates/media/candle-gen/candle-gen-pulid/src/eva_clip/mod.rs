@@ -121,10 +121,7 @@ impl EvaVisionTransformer {
             .map(|i| Block::from_weights(w, &p(&format!("blocks.{i}")), nh, hd))
             .collect::<GenResult<Vec<_>>>()?;
         let rope = VisionRope::build(hd, cfg.grid(), cfg.pt_seq_len, cfg.rope_theta, &device)?;
-        let head = Linear::new(
-            w.require(&p("head.weight"))?,
-            Some(w.require(&p("head.bias"))?),
-        );
+        let head = w.linear(&p("head"), true)?;
         Ok(Self {
             patch_embed: PatchEmbed::from_weights(w, &p("patch_embed"), cfg.patch, cfg.embed_dim)?,
             cls_token,

@@ -73,6 +73,16 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    fn native_linear_weight_transposed(
+        &self,
+        _name: &str,
+        _shape: (usize, usize),
+        _dtype: DType,
+        _dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        Ok(None)
+    }
+
     fn contains_tensor(&self, name: &str) -> bool;
 }
 
@@ -94,6 +104,16 @@ pub trait SimpleBackend: Send + Sync {
         &self,
         _name: &str,
         _shape: Option<(usize, usize)>,
+        _dtype: DType,
+        _dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        Ok(None)
+    }
+
+    fn native_linear_weight_transposed(
+        &self,
+        _name: &str,
+        _shape: (usize, usize),
         _dtype: DType,
         _dev: &Device,
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
@@ -130,6 +150,16 @@ impl Backend for Box<dyn SimpleBackend + '_> {
         self.as_ref().native_linear_weight(name, shape, dtype, dev)
     }
 
+    fn native_linear_weight_transposed(
+        &self,
+        name: &str,
+        shape: (usize, usize),
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        self.as_ref()
+            .native_linear_weight_transposed(name, shape, dtype, dev)
+    }
     fn contains_tensor(&self, name: &str) -> bool {
         self.as_ref().contains_tensor(name)
     }
@@ -235,6 +265,19 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         self.data
             .backend
             .native_linear_weight(&self.path(name), shape, self.dtype, self.device())
+    }
+
+    pub fn native_linear_weight_transposed(
+        &self,
+        name: &str,
+        shape: (usize, usize),
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        self.data.backend.native_linear_weight_transposed(
+            &self.path(name),
+            shape,
+            self.dtype,
+            self.device(),
+        )
     }
 
     /// This returns true only if a tensor with the passed in name is available. E.g. when passed
@@ -947,6 +990,21 @@ impl<R: Renamer + Sync + Send> SimpleBackend for Rename<'_, R> {
             .native_linear_weight(&self.inner.path(&name), shape, dtype, dev)
     }
 
+    fn native_linear_weight_transposed(
+        &self,
+        name: &str,
+        shape: (usize, usize),
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
+        let name = self.renamer.rename(name);
+        self.inner.data.backend.native_linear_weight_transposed(
+            &self.inner.path(&name),
+            shape,
+            dtype,
+            dev,
+        )
+    }
     fn contains_tensor(&self, name: &str) -> bool {
         let name = self.renamer.rename(name);
         self.inner.contains_tensor(&name)

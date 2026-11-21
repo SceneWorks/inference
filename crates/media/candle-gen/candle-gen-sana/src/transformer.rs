@@ -111,10 +111,7 @@ fn validate_packed_tier(
 ) -> candle_gen::Result<Option<usize>> {
     let bases = packed_linear_bases(cfg);
     let is_packed = bases.iter().any(|(base, _)| {
-        w.contains(&format!("{base}.scales"))
-            || w.require(&format!("{base}.weight"))
-                .map(|weight| weight.dtype() == DType::U32)
-                .unwrap_or(false)
+        w.contains(&format!("{base}.scales")) || w.is_affine_codes(&format!("{base}.weight"))
     });
     if !is_packed {
         return Ok(None);

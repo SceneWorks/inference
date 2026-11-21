@@ -22,6 +22,9 @@ impl LogicalKeyMapping for SourceMapping {
     fn logical_key(&self, key: &str) -> Option<String> {
         Some(key.to_owned())
     }
+    fn accepts_descriptor_shape(&self) -> bool {
+        true
+    }
     fn inline_fp8_scales(&self) -> bool {
         true
     }
@@ -93,28 +96,63 @@ impl ProjectionSource {
             .map(|op| candle_nn::Linear::from_native(op, bias)))
     }
 
+    pub fn native_linear_transposed(
+        &self,
+        key: &str,
+        shape: (usize, usize),
+        dtype: DType,
+        dev: &Device,
+        bias: Option<Tensor>,
+    ) -> Result<Option<candle_nn::Linear>> {
+        Ok(self
+            .native_linear_weight_transposed(key, shape, dtype, dev)?
+            .map(|op| candle_nn::Linear::from_native(op, bias)))
+    }
+
     /// Return the original mmap for a plain checkpoint. Detection inspects tensor headers only.
     pub fn from_mapped(
         st: MmapedSafetensors,
         files: &[PathBuf],
         dev: &Device,
     ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
+        Self::from_mapped_selected(st, files, dev, |_| true)
+    }
+
+    /// Restrict the logical plan to a component's selected physical keys. Companion names
+    /// are captured by matrix base across shards, even if the projection caller selected just weight.
+    pub fn from_mapped_selected(
+        st: MmapedSafetensors,
+        files: &[PathBuf],
+        dev: &Device,
+        selected: impl Fn(&str) -> bool,
+    ) -> Result<std::result::Result<Self, MmapedSafetensors>> {
         let views: BTreeMap<_, _> = st.tensors().into_iter().collect();
         let mut bases = BTreeSet::new();
         for (name, view) in &views {
+            if !selected(name) {
+                continue;
+            }
             if let Some(base) = name.strip_suffix(".comfy_quant") {
                 bases.insert(base.to_owned());
             }
             if let Some(base) = name.strip_suffix(".weight") {
                 if matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2)
-                    || (view.dtype() == Dtype::I8
+                    || (matches!(view.dtype(), Dtype::I8 | Dtype::U8)
                         && views.contains_key(&format!("{base}.weight_scale")))
                 {
                     bases.insert(base.to_owned());
                 }
             }
         }
-        if bases.is_empty() {
+        let bare_fp8 = views.iter().any(|(key, view)| {
+            selected(key)
+                && matches!(view.dtype(), Dtype::F8_E4M3 | Dtype::F8_E5M2)
+                && !matches!(
+                    key.rsplit('.').next(),
+                    Some("weight_s_rel" | "weight_scale" | "weight_scale_2" | "scales")
+                )
+        });
+        if bases.is_empty() && !bare_fp8 {
             return Ok(Err(st));
         }
         let mut headers = Vec::new();
@@ -140,7 +178,7 @@ impl ProjectionSource {
                 )
             );
             if !(part && (companion || name.ends_with(".weight")))
-                && !(float8 && !companion)
+                && !(float8 && !companion && selected(name))
                 && name != "scaled_fp8"
             {
                 continue;
@@ -174,6 +212,14 @@ impl ProjectionSource {
                     .expect("validated layers")
                     .iter()
                 {
+                    if !bases.contains(name)
+                        && !bases.iter().any(|b| {
+                            b.strip_suffix(name.as_str())
+                                .is_some_and(|prefix| prefix.ends_with('.'))
+                        })
+                    {
+                        continue;
+                    }
                     if layers
                         .insert(name.clone(), entry.clone())
                         .is_some_and(|previous| previous != *entry)
@@ -209,6 +255,7 @@ struct SourceLinear {
     op: NativeOp,
     format_id: &'static str,
     resident_bytes: u64,
+    transpose: bool,
 }
 #[cfg(feature = "cuda")]
 impl NativeLinearWeight for SourceLinear {
@@ -227,6 +274,31 @@ impl NativeLinearWeight for SourceLinear {
             }
         }
     }
+    fn compute_dtype(&self) -> DType {
+        self.dtype
+    }
+    fn relocated(&self, dev: &Device) -> Result<candle_nn::Linear> {
+        let source = self.source.on_device(dev)?;
+        let shape = Some(self.dims());
+        let op = source.native_oriented(&self.key, shape, self.dtype, dev, self.transpose)?;
+        if let Some(op) = op {
+            return Ok(candle_nn::Linear::from_native(op, None));
+        }
+        let dense = source.reader().read_dense_with_shape(
+            &self.key,
+            if self.transpose { None } else { shape },
+            self.dtype,
+            dev,
+        )?;
+        Ok(candle_nn::Linear::new(
+            if self.transpose {
+                dense.t()?.contiguous()?
+            } else {
+                dense
+            },
+            None,
+        ))
+    }
     fn format_id(&self) -> &'static str {
         self.format_id
     }
@@ -234,9 +306,21 @@ impl NativeLinearWeight for SourceLinear {
         self.resident_bytes
     }
     fn dense_weight(&self) -> Result<Tensor> {
-        self.source
-            .0
-            .read_dense(&self.key, self.dtype, self.device())
+        let t = self.source.0.dense_coefficients(
+            &self.key,
+            if self.transpose {
+                None
+            } else {
+                Some(self.dims())
+            },
+            self.dtype,
+            self.device(),
+        )?;
+        if self.transpose {
+            t.t()?.contiguous()
+        } else {
+            Ok(t)
+        }
     }
     fn dims(&self) -> (usize, usize) {
         match &self.op {
@@ -252,24 +336,33 @@ impl NativeLinearWeight for SourceLinear {
     }
 }
 
-impl SimpleBackend for ProjectionSource {
-    fn native_linear_weight(
+impl ProjectionSource {
+    fn native_oriented(
         &self,
         name: &str,
         shape: Option<(usize, usize)>,
         dtype: DType,
         dev: &Device,
+        transpose: bool,
     ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
         if !self.reader().device().same_device(dev) {
             return self
                 .on_device(dev)?
-                .native_linear_weight(name, shape, dtype, dev);
+                .native_oriented(name, shape, dtype, dev, transpose);
         }
         #[cfg(feature = "cuda")]
         {
-            let op = if let Some(base) = self.0.convrot_projection(name, None)? {
+            let convrot = if transpose {
+                None
+            } else {
+                self.0.convrot_projection(name, None)?
+            };
+            let op = if let Some(base) = convrot {
                 NativeOp::ConvRot(base)
-            } else if let Some(base) = self.0.fp8_projection_with_shape(name, None, shape)? {
+            } else if let Some(base) = self
+                .0
+                .fp8_projection_oriented(name, None, shape, transpose)?
+            {
                 NativeOp::Fp8(base)
             } else {
                 return Ok(None);
@@ -279,6 +372,7 @@ impl SimpleBackend for ProjectionSource {
                 key: name.to_owned(),
                 dtype,
                 op,
+                transpose,
                 format_id: self
                     .0
                     .planned(name)
@@ -296,18 +390,49 @@ impl SimpleBackend for ProjectionSource {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (name, shape, dtype, dev);
+            let _ = (name, shape, dtype, dev, transpose);
             Ok(None)
         }
     }
+}
+
+impl SimpleBackend for ProjectionSource {
+    fn native_linear_weight(
+        &self,
+        key: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
+        self.native_oriented(key, shape, dtype, dev, false)
+    }
+    fn native_linear_weight_transposed(
+        &self,
+        key: &str,
+        shape: (usize, usize),
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
+        self.native_oriented(key, Some(shape), dtype, dev, true)
+    }
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         if self.0.planned(name).is_some() {
-            return self.0.read_dense(name, dtype, dev);
+            return self.on_device(dev)?.reader().read_dense(name, dtype, dev);
         }
         self.0.st.load(name, dev)?.to_dtype(dtype)
     }
     fn get(&self, shape: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
-        let t = self.get_unchecked(name, dtype, dev)?;
+        let t = if self.reader().planned(name).is_some() {
+            let dims = match shape.dims() {
+                [n, k] => Some((*n, *k)),
+                _ => None,
+            };
+            self.on_device(dev)?
+                .reader()
+                .read_dense_with_shape(name, dims, dtype, dev)?
+        } else {
+            self.get_unchecked(name, dtype, dev)?
+        };
         if t.shape() != &shape {
             return Err(Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -320,6 +445,51 @@ impl SimpleBackend for ProjectionSource {
     }
     fn contains_tensor(&self, name: &str) -> bool {
         self.0.st.get(name).is_ok()
+    }
+}
+
+/// Mapped weights for models that infer projection sizes from checkpoint keys.
+pub enum MappedWeights {
+    Checkpoint(ProjectionSource),
+    Plain(MmapedSafetensors),
+}
+
+impl MappedWeights {
+    pub fn new(st: MmapedSafetensors, paths: &[PathBuf], device: &Device) -> Result<Self> {
+        Ok(match ProjectionSource::from_mapped(st, paths, device)? {
+            Ok(source) => Self::Checkpoint(source),
+            Err(plain) => Self::Plain(plain),
+        })
+    }
+    pub fn mmap(&self) -> &MmapedSafetensors {
+        match self {
+            Self::Checkpoint(src) => src.mmap(),
+            Self::Plain(st) => st,
+        }
+    }
+    pub fn read(&self, key: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        match self {
+            Self::Checkpoint(src) => src.get_unchecked(key, dtype, dev),
+            Self::Plain(st) => st.load(key, dev)?.to_dtype(dtype),
+        }
+    }
+    pub fn linear(
+        &self,
+        base: &str,
+        bias: bool,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<candle_nn::Linear> {
+        let w = format!("{base}.weight");
+        let b = bias
+            .then(|| self.read(&format!("{base}.bias"), dtype, dev))
+            .transpose()?;
+        if let Self::Checkpoint(src) = self {
+            if let Some(layer) = src.native_linear(&w, dtype, dev, b.clone())? {
+                return Ok(layer);
+            }
+        }
+        Ok(candle_nn::Linear::new(self.read(&w, dtype, dev)?, b))
     }
 }
 

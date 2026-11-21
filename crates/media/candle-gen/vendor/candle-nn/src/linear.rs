@@ -26,6 +26,15 @@ use std::sync::{Arc, OnceLock};
 pub trait NativeLinearWeight: Send + Sync {
     fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>;
     fn dense_weight(&self) -> Result<Tensor>;
+    fn compute_dtype(&self) -> candle::DType {
+        candle::DType::BF16
+    }
+    fn relocated(&self, device: &candle::Device) -> Result<Linear> {
+        candle::bail!(
+            "{} does not support relocation to {device:?}",
+            self.format_id()
+        )
+    }
     fn format_id(&self) -> &'static str;
     fn resident_bytes(&self) -> u64;
     fn dims(&self) -> (usize, usize);
@@ -126,6 +135,32 @@ impl Linear {
     pub fn weight(&self) -> &Tensor {
         self.try_weight()
             .expect("failed to materialize the linear weight")
+    }
+
+    pub fn weight_dtype(&self) -> candle::DType {
+        match &self.weight {
+            Weight::Dense(t) => t.dtype(),
+            Weight::Native { projection, .. } => projection.compute_dtype(),
+        }
+    }
+    pub fn with_bias(mut self, bias: Option<Tensor>) -> Self {
+        self.bias = bias;
+        self
+    }
+    pub fn to_device(&self, device: &candle::Device) -> Result<Self> {
+        if self.device().same_device(device) {
+            return Ok(self.clone());
+        }
+        let base = match &self.weight {
+            Weight::Dense(t) => Self::new(t.to_device(device)?, None),
+            Weight::Native { projection, .. } => projection.relocated(device)?,
+        };
+        Ok(base.with_bias(
+            self.bias
+                .as_ref()
+                .map(|b| b.to_device(device))
+                .transpose()?,
+        ))
     }
 
     pub fn bias(&self) -> Option<&Tensor> {

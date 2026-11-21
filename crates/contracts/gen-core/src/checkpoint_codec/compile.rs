@@ -354,6 +354,13 @@ pub fn compile_logical_weight_plan_with_metadata(
         })?;
         let base = header.name.strip_suffix(".weight");
         let descriptor = base.and_then(|base| descriptors.get(base));
+        let declared_source_shape = declared_source_shape.or_else(|| {
+            if mapping.accepts_descriptor_shape() {
+                descriptor.and_then(|d| d.orig_shape.clone())
+            } else {
+                None
+            }
+        });
         // Descriptor ↔ stored-dtype agreement first: "declared e4m3 but stored bf16" is the exact
         // defect, not a missing codec row.
         if let Some(descriptor) = descriptor {

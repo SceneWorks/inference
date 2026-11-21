@@ -80,8 +80,8 @@ pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 /// published index reads.
 #[derive(Debug, Clone)]
 pub struct LinearBias {
-    weight: Tensor,
-    bias: Tensor,
+    projection: candle_gen::candle_nn::Linear,
+    weight_bytes: usize,
     /// Forward-time LoRA/LoKr residuals (SW-7096), in a residual-only slot. `None` unless an
     /// install routes here — only the image DiT does.
     adapters: Option<Box<crate::dit::layers::LinearNoBias>>,
@@ -90,8 +90,7 @@ pub struct LinearBias {
 impl LinearBias {
     pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
         let mut copy = self.clone();
-        copy.weight = copy.weight.to_device(device)?;
-        copy.bias = copy.bias.to_device(device)?;
+        copy.projection = self.projection.to_device(device)?;
         copy.adapters = self
             .adapters
             .as_ref()
@@ -104,12 +103,12 @@ impl LinearBias {
     /// and stored dtype.
     pub fn adaptable_mut(&mut self) -> Option<&mut crate::dit::layers::LinearNoBias> {
         if self.adapters.is_none() {
-            let (out, inp) = (self.weight.dims()[0], self.weight.dims()[1]);
+            let (out, inp) = self.projection.weight_dims().ok()?;
             let slot = crate::dit::layers::LinearNoBias::residual_slot(
                 inp,
                 out,
-                self.weight.dtype(),
-                self.weight.device(),
+                self.projection.weight_dtype(),
+                self.projection.device(),
             )
             .ok()?;
             self.adapters = Some(Box::new(slot));
@@ -148,24 +147,32 @@ impl LinearBias {
         in_features: usize,
         out_features: usize,
     ) -> Result<Self> {
-        crate::quant::guard_dense(w, crate::quant::DIT, prefix)?;
-        let weight = w.require(&format!("{prefix}.weight"))?;
-        let bias = w.require(&format!("{prefix}.bias"))?;
-        if weight.dims() != [out_features, in_features] {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3 dit {prefix}.weight: expected [{out_features}, {in_features}], got {:?}",
-                weight.dims()
-            )));
+        let projection = match w.native_linear(prefix, true)? {
+            Some(layer) => layer,
+            None => {
+                crate::quant::guard_dense(w, crate::quant::DIT, prefix)?;
+                w.linear(prefix, true)?
+            }
+        };
+        if projection.weight_dims()? != (out_features, in_features) {
+            return Err(CandleError::Msg(format!("minimax-h3 dit {prefix}.weight: expected [{out_features}, {in_features}], got {:?}",projection.weight_dims()?)));
         }
+        let bias = projection.bias().expect("biased projection");
         if bias.dims() != [out_features] {
             return Err(CandleError::Msg(format!(
                 "minimax-h3 dit {prefix}.bias: expected [{out_features}], got {:?}",
                 bias.dims()
             )));
         }
+        let weight_bytes = projection
+            .native_resident_bytes()
+            .map(|bytes| bytes as usize)
+            .unwrap_or_else(|| {
+                out_features * in_features * projection.weight_dtype().size_in_bytes()
+            });
         Ok(Self {
-            weight,
-            bias,
+            projection,
+            weight_bytes,
             adapters: None,
         })
     }
@@ -177,13 +184,12 @@ impl LinearBias {
 
     /// The dtype the stored bytes carry — f32 for the fp32-kept heads, bf16 otherwise.
     pub fn dtype(&self) -> DType {
-        self.weight.dtype()
+        self.projection.weight_dtype()
     }
 
     /// Device bytes this projection holds.
     pub fn nbytes(&self) -> usize {
-        self.weight.elem_count() * self.weight.dtype().size_in_bytes()
-            + self.bias.elem_count() * self.bias.dtype().size_in_bytes()
+        self.weight_bytes + self.bias().elem_count() * self.bias().dtype().size_in_bytes()
     }
 
     /// The loaded bias, as read off disk.
@@ -194,7 +200,7 @@ impl LinearBias {
     /// `proj_in.bias` is the probe — float32, `[out_features]` (`hidden_size` = 5376 for
     /// `proj_in`), and different between the two.
     pub fn bias(&self) -> &Tensor {
-        &self.bias
+        self.projection.bias().expect("biased projection")
     }
 
     /// `y = x · Wᵀ + b`, with `x` cast to the weight's own dtype first.
@@ -202,8 +208,12 @@ impl LinearBias {
     /// The cast mirrors the reference's explicit `x.to(get_parameter_dtype(module))` and is what
     /// keeps a float32 head from silently running its matmul at the block stack's bfloat16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.to_dtype(self.weight.dtype())?;
-        let y = __model_proof_output!(linear(&x, &self.weight, &self.bias))?;
+        let x = x.to_dtype(self.projection.weight_dtype())?;
+        let y = if self.projection.is_native() {
+            candle_gen::candle_nn::Module::forward(&self.projection, &x)?
+        } else {
+            __model_proof_output!(linear(&x, self.projection.try_weight()?, self.bias()))?
+        };
         // SW-7096: the residuals read the same cast input the base does.
         match &self.adapters {
             Some(slot) => slot.add_residuals(&x, y),

@@ -6,7 +6,9 @@ use candle_gen::train::projection::FrozenProjectionPack;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use gen_core_moss_image::moss_image::MossImageConfig;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Geometry {
@@ -74,22 +76,18 @@ impl Linear {
         consumed: &mut BTreeSet<String>,
     ) -> Result<Self> {
         let weight_name = format!("{name}.weight");
-        let weight = w.require(&weight_name)?;
-        if weight.dims() != [output, input] {
+        let base = w.linear(name, bias)?;
+        if base.weight_dims()? != (output, input) {
             return Err(CandleError::Msg(format!("MOSS shape {weight_name}")));
         }
         consumed.insert(weight_name);
-        let b = if bias {
+        if let Some(b) = base.bias() {
             let key = format!("{name}.bias");
-            let value = w.require(&key)?;
-            if value.dims() != [output] {
+            if b.dims() != [output] {
                 return Err(CandleError::Msg(format!("MOSS shape {key}")));
             }
             consumed.insert(key);
-            Some(value)
-        } else {
-            None
-        };
+        }
         let low_rank = if let Some(a) = adapter {
             let prefix = format!("diffusion_model.{name}");
             let down = a.require(&format!("{prefix}.lora_down.weight"))?;
@@ -120,7 +118,7 @@ impl Linear {
             None
         };
         Ok(Self {
-            base: candle_nn::Linear::new(weight, b),
+            base,
             low_rank,
             residuals: Vec::new(),
             residuals_frozen: false,
@@ -130,16 +128,17 @@ impl Linear {
     }
     fn prepare_frozen_group(layers: &mut [&mut Self]) -> Result<Option<FrozenProjectionPack>> {
         if layers.iter().any(|l| {
-            l.low_rank.is_some()
+            l.base.is_native()
+                || l.low_rank.is_some()
                 || l.edit_fused_bias
-                || (l.dtype() == DType::BF16 && l.base.weight().device().is_cpu())
+                || (l.dtype() == DType::BF16 && l.base.device().is_cpu())
         }) {
             return Ok(None);
         }
         let mut facades = layers
             .iter()
             .map(|l| {
-                let (out, input) = l.base.weight().dims2()?;
+                let (out, input) = l.base.weight_dims()?;
                 Ok(candle_gen::quant::AdaptLinear::from_dense(
                     l.base.clone(),
                     input,
@@ -165,7 +164,7 @@ impl Linear {
         let facades = layers
             .iter()
             .map(|l| {
-                let (out, input) = l.base.weight().dims2()?;
+                let (out, input) = l.base.weight_dims()?;
                 Ok(candle_gen::quant::AdaptLinear::from_dense(
                     l.base.clone(),
                     input,
@@ -181,18 +180,19 @@ impl Linear {
     }
 
     fn dtype(&self) -> DType {
-        self.base.weight().dtype()
+        self.base.weight_dtype()
     }
     fn base_forward(&self, x: &Tensor) -> Result<Tensor> {
         // Candle's CPU matmul has no BF16 kernel. This explicit FP32 accumulation over the
         // already-rounded BF16 operands, followed by BF16 rounding, is the CPU numerical oracle.
         // Editing also widens biased GPU projections until after bias addition: the frozen
         // source rounds its fused linear once, not once before and again after the bias.
-        if self.dtype() == DType::BF16
+        if !self.base.is_native()
+            && self.dtype() == DType::BF16
             && (x.device().is_cpu() || (self.edit_fused_bias && self.base.bias().is_some()))
         {
             let linear = candle_nn::Linear::new(
-                self.base.weight().to_dtype(DType::F32)?,
+                self.base.try_weight()?.to_dtype(DType::F32)?,
                 self.base
                     .bias()
                     .map(|b| b.to_dtype(DType::F32))
@@ -764,7 +764,7 @@ impl Transformer {
         self.g.channels
     }
     pub(crate) fn device(&self) -> &Device {
-        self.video.base.weight().device()
+        self.video.base.device()
     }
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident_bytes
@@ -853,8 +853,7 @@ impl Transformer {
             )?,
         };
         for key in &keys {
-            let t = w.require(key)?;
-            result.resident_bytes += (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+            result.resident_bytes += w.materialized_bytes(key)?;
         }
         if let Some(adapter) = adapter {
             for key in adapter.keys().filter(|k| !k.ends_with(".alpha")) {
@@ -864,7 +863,10 @@ impl Transformer {
         }
         // Derived RoPE bands are checkpoint-compatible but are reconstructed in source FP32.
         keys.insert("rope.bands".into());
-        let extra: Vec<_> = w.keys().filter(|k| !keys.contains(*k)).collect();
+        let extra: Vec<_> = w
+            .keys()
+            .filter(|k| !keys.contains(*k) && !w.is_checkpoint_companion(k))
+            .collect();
         if !extra.is_empty() {
             return Err(CandleError::Msg(format!(
                 "MOSS unconsumed transformer tensors {extra:?}"
@@ -908,7 +910,7 @@ impl Transformer {
             ] {
                 shapes.insert(
                     format!("layers.{i}.proj.{name}"),
-                    (l.base.weight().dims()[0], l.base.weight().dims()[1]),
+                    l.base.weight_dims().expect("validated projection geometry"),
                 );
             }
         }
@@ -1019,8 +1021,8 @@ impl Transformer {
                     format!("layers.{i}.proj.{name}"),
                     candle_gen::quant::AdaptLinear::from_dense(
                         l.base.clone(),
-                        l.base.weight().dims()[1],
-                        l.base.weight().dims()[0],
+                        l.base.weight_dims()?.1,
+                        l.base.weight_dims()?.0,
                     ),
                 ));
             }
@@ -1367,25 +1369,25 @@ impl Transformer {
 
 /// Promote only source-mandated FP32 islands, then replace all six published tensors.
 pub(crate) fn install_replacements(base: &Weights, replacements: &Weights) -> Result<Weights> {
-    let mut map = HashMap::new();
+    let mut out = base.clone();
     for key in base.keys() {
-        let mut t = base.require(key)?;
-        if [
+        if base.is_checkpoint_companion(key) {
+            continue;
+        }
+        if replacements.contains(key) {
+            out.replace_tensor(key.clone(), replacements.require(key)?);
+        } else if [
             "time_embedding.",
             "shared_block_modulation.",
             "video_head_modulation.",
         ]
         .iter()
-        .any(|p| key.starts_with(p))
+        .any(|prefix| key.starts_with(prefix))
         {
-            t = t.to_dtype(DType::F32)?;
+            out.replace_tensor(key.clone(), base.require(key)?.to_dtype(DType::F32)?);
         }
-        if replacements.contains(key) {
-            t = replacements.require(key)?;
-        }
-        map.insert(key.clone(), t);
     }
-    Ok(Weights::from_map(map))
+    Ok(out)
 }
 
 #[cfg(test)]

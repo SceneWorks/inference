@@ -309,3 +309,164 @@ fn int8_degrades_on_activation_outlier_no_rotation() {
          {err}); if this fails, per-tensor int8 is outlier-safe and ConvRot is unnecessary"
     );
 }
+
+/// Checkpoint input, stock Candle constructor, immutable packed projection, and additive adapter.
+/// These fixed reference products come from the independent host float8 implementation.
+#[test]
+#[ignore = "dedicated CUDA checkpoint-numerics proof"]
+fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Error>> {
+    use candle_gen::candle_nn::Module;
+    use candle_gen::quant::AdaptLinear;
+    use float8::{F8E4M3, F8E5M2};
+    use half::bf16;
+    use safetensors::{tensor::TensorView, Dtype};
+    let dev = Device::new_cuda(0)?;
+    let tmp = tempfile::tempdir()?;
+    let scalar = |e5: bool, v: f32| {
+        if e5 {
+            F8E5M2::from_f32(v).to_f32()
+        } else {
+            F8E4M3::from_f32(v).to_f32()
+        }
+    };
+    for e5 in [false, true] {
+        for sx in [None, Some(0.5f32)] {
+            let format = if e5 { "float8_e5m2" } else { "float8_e4m3fn" };
+            let dtype = if e5 { Dtype::F8_E5M2 } else { Dtype::F8_E4M3 };
+            let mut codes = vec![0u8; 16 * 16];
+            let mut w = Vec::new();
+            for row in 0..16 {
+                let v = if row % 2 == 0 { 1.5 } else { -0.75 };
+                codes[row * 16 + row] = if e5 {
+                    F8E5M2::from_f32(v).to_bits()
+                } else {
+                    F8E4M3::from_f32(v).to_bits()
+                };
+                w.push(v);
+            }
+            let desc = format!(r#"{{"format":"{format}"}}"#);
+            let sw = 2f32.to_le_bytes();
+            let input_scale = sx.unwrap_or(1.).to_le_bytes();
+            let mut tensors = vec![
+                (
+                    "linear.weight",
+                    TensorView::new(dtype, vec![16, 16], &codes)?,
+                ),
+                (
+                    "linear.comfy_quant",
+                    TensorView::new(Dtype::U8, vec![desc.len()], desc.as_bytes())?,
+                ),
+                (
+                    "linear.weight_scale",
+                    TensorView::new(Dtype::F32, vec![], &sw)?,
+                ),
+            ];
+            if sx.is_some() {
+                tensors.push((
+                    "linear.input_scale",
+                    TensorView::new(Dtype::F32, vec![], &input_scale)?,
+                ));
+            }
+            let path = tmp
+                .path()
+                .join(format!("scalar-{e5}-{}.safetensors", sx.is_some()));
+            safetensors::tensor::serialize_to_file(tensors, None, &path)?;
+            let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+            let lin = candle_gen::candle_nn::linear_no_bias(16, 16, vb.pp("linear"))?;
+            assert_eq!(
+                lin.native_format_id(),
+                Some(if e5 {
+                    "fp8-e5m2-scalar-v1"
+                } else {
+                    "fp8-e4m3-scalar-v1"
+                })
+            );
+            let input: Vec<bf16> = (0..18 * 16)
+                .map(|i| {
+                    bf16::from_f32(
+                        [0.5, -1.375, 0.001953125, 300.0, 0.375, -0.25, 0.125, 1.0][i % 8],
+                    )
+                })
+                .collect();
+            let x = Tensor::from_slice(&input, (18, 16), &dev)?.narrow(0, 1, 17)?;
+            let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+            let mut adapted = AdaptLinear::from_dense(lin, 16, 16);
+            let mut a = vec![bf16::ZERO; 16];
+            a[0] = bf16::ONE;
+            adapted.push_lora_checked(
+                Tensor::from_slice(&a, (16, 1), &dev)?,
+                Tensor::ones((1, 16), DType::BF16, &dev)?,
+                1.0,
+            )?;
+            let got_adapted = adapted.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+            for row in 0..17 {
+                for j in 0..16 {
+                    let xij = input[(row + 1) * 16 + j].to_f32();
+                    let s = sx.unwrap_or(1.);
+                    let sat = if e5 { 57344.0 } else { 448.0 };
+                    let expected =
+                        bf16::from_f32(scalar(e5, (xij / s).clamp(-sat, sat)) * s * w[j] * 2.);
+                    assert_eq!(
+                        got[row * 16 + j],
+                        expected,
+                        "{format} scale {sx:?} [{row},{j}]"
+                    );
+                    assert_eq!(
+                        got_adapted[row * 16 + j],
+                        bf16::from_f32(expected.to_f32() + input[(row + 1) * 16].to_f32())
+                    );
+                }
+            }
+        }
+    }
+    let (m, n, k) = (17usize, 23usize, 61usize);
+    let mut codes = vec![0u8; 32 * 64];
+    let mut scales = vec![127u8; 128 * 4];
+    let mut factors = Vec::new();
+    for row in 0..n {
+        let col = (row * 7) % k;
+        let code = F8E4M3::from_f32(if row % 2 == 0 { 1.5 } else { -0.75 });
+        let exponent = (row % 5) as i32 - 2;
+        codes[row * 64 + col] = code.to_bits();
+        scales[(row % 32) * 16 + (row / 32) * 4 + col / 32] = (exponent + 127) as u8;
+        factors.push((col, code.to_f32() * 2f32.powi(exponent)));
+    }
+    let desc = br#"{"format":"mxfp8"}"#;
+    let path = tmp.path().join("mx.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "linear.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![32, 64], &codes)?,
+            ),
+            (
+                "linear.weight_scale",
+                TensorView::new(Dtype::U8, vec![128, 4], &scales)?,
+            ),
+            (
+                "linear.comfy_quant",
+                TensorView::new(Dtype::U8, vec![desc.len()], desc)?,
+            ),
+        ],
+        None,
+        &path,
+    )?;
+    let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+    let lin = candle_gen::candle_nn::linear_no_bias(k, n, vb.pp("linear"))?;
+    assert_eq!(lin.native_format_id(), Some("mxfp8-v1"));
+    let input: Vec<bf16> = (0..(m + 1) * k)
+        .map(|i| bf16::from_f32([0.25, 0.5, -1., 2.][i % 4]))
+        .collect();
+    let x = Tensor::from_slice(&input, (m + 1, k), &dev)?.narrow(0, 1, m)?;
+    let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+    for row in 0..m {
+        for (j, &(col, w)) in factors.iter().enumerate() {
+            assert_eq!(
+                got[row * n + j],
+                bf16::from_f32(input[(row + 1) * k + col].to_f32() * w),
+                "MX [{row},{j}]"
+            );
+        }
+    }
+    Ok(())
+}

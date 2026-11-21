@@ -12,6 +12,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::quant::AdaptLinear as QLinear;
 use candle_gen_boogu::loader::Weights;
+#[cfg(test)]
 use candle_nn::Linear;
 
 /// Candle's binding declaration of the same two Mage q4 floors used by the MLX provider.
@@ -120,18 +121,9 @@ pub(crate) fn linear(weights: &Weights, base: &str, bias: bool) -> Result<QLinea
             out_dim,
         ));
     }
-    let weight = weights.get(&format!("{base}.weight"))?;
-    let bias = if bias {
-        Some(weights.get(&format!("{base}.bias"))?)
-    } else {
-        None
-    };
-    let (out_dim, in_dim) = weight.dims2()?;
-    Ok(QLinear::from_dense(
-        Linear::new(weight, bias),
-        in_dim,
-        out_dim,
-    ))
+    let layer = candle_gen_boogu::loader::linear(weights, base, bias)?;
+    let (out, input) = layer.weight_dims()?;
+    Ok(QLinear::from_dense(layer, input, out))
 }
 
 /// Fold one projection to the requested tier on `device`.

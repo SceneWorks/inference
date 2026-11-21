@@ -980,28 +980,32 @@ mod tests {
 
         // Packed fp8: the codes tensor's dtype is irrelevant to the transform arm.
         let fp8_plan = packed_plan(FP8_E4M3_SCALAR_CODEC.codec_id, "q.weight");
-        let codes = Tensor::zeros((256, 64), DType::U8, &Device::Cpu).expect("codes");
-        let error = apply_transform(
+        let bytes: Vec<u8> = (0..256)
+            .flat_map(|row| std::iter::repeat_n(row as u8, 64))
+            .collect();
+        let original = Tensor::from_vec(bytes, (256, 64), &Device::Cpu).unwrap();
+        let LogicalTensor::PackedScalarFp8 {
+            codes,
+            weight_scale,
+            ..
+        } = apply_transform(
             &fp8_plan,
             LogicalTensor::PackedScalarFp8 {
-                codes,
-                weight_scale: 1.0,
-                weight_scale_from_companion: false,
+                codes: original,
+                weight_scale: 2.0,
+                weight_scale_from_companion: true,
                 input_scale: None,
             },
         )
-        .err()
-        .expect("a half swap on a packed fp8 decode must refuse")
-        .to_string();
-        assert!(
-            error.contains(&format!("codec {}:", FP8_E4M3_SCALAR_CODEC.codec_id))
-                && error.contains("\"model.qkv.weight\"")
-                && error.contains("\"q.weight\"")
-                && error.contains("half swap")
-                && error.contains("packed-native residency"),
-            "the packed-fp8 refusal must name the codec, the physical key, the logical key and the \
-             half swap, got: {error}"
-        );
+        .unwrap()
+        else {
+            panic!("scalar code bytes must stay packed");
+        };
+        let result = codes.to_vec2::<u8>().unwrap();
+        for (row, col) in result.iter().enumerate() {
+            assert!(col.iter().all(|&c| c == ((row + 64) % 128) as u8));
+        }
+        assert_eq!(weight_scale, 2.0);
 
         // Packed NVFP4: the host container, so this leg runs on every lane.
         let nvfp4_plan = packed_plan(NVFP4_CODEC.codec_id, "k.weight");

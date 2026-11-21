@@ -705,6 +705,15 @@ impl Weights {
     }
 
     /// Whether this native checkpoint carries prepacked ComfyUI Kitchen NVFP4 projection triplets.
+    pub(crate) fn is_native_projection(&self, base: &str) -> bool {
+        let key = format!("{base}.weight");
+        !self.overlay_has(&key)
+            && self
+                .logical
+                .as_ref()
+                .is_some_and(|reader| reader.has_native_projection(&key))
+    }
+
     pub fn is_native_nvfp4(&self) -> bool {
         self.native_nvfp4
     }

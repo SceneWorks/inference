@@ -57,12 +57,7 @@ impl PerceiverAttentionCA {
         heads: usize,
         dim_head: usize,
     ) -> GenResult<Self> {
-        let lin = |leaf: &str| -> GenResult<Linear> {
-            Ok(Linear::new(
-                w.require(&join(prefix, &format!("{leaf}.weight")))?,
-                None,
-            ))
-        };
+        let lin = |leaf: &str| -> GenResult<Linear> { w.linear(&join(prefix, leaf), false) };
         Ok(Self {
             norm1: layer_norm(w, &join(prefix, "norm1"))?,
             norm2: layer_norm(w, &join(prefix, "norm2"))?,

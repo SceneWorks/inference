@@ -599,8 +599,18 @@ impl QLinear {
         Ok(copy)
     }
 
+    pub fn native_format_id(&self) -> Option<&'static str> {
+        match self {
+            Self::Dense(DenseLinear::Linear(l)) => l.native_format_id(),
+            Self::ConvRot(_) => Some(gen_core::convrot_int8::CODEC_ID),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(base) => Some(base.format_id()),
+            _ => None,
+        }
+    }
+
     /// The execution device of an immutable E4M3FN projection, if present.
-    pub fn fp8_device(&self) -> Option<&Device> {
+    pub fn native_device(&self) -> Option<&Device> {
         if let Self::Dense(DenseLinear::Linear(l)) = self {
             if l.is_native() {
                 return Some(l.device());
@@ -912,8 +922,8 @@ impl QLinear {
         skip_indivisible: bool,
     ) -> Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
-        if self.fp8_device().is_some() {
-            candle_core::bail!("source FP8 projection refuses re-quantization to {quant:?}");
+        if self.native_device().is_some() {
+            return Ok(()); // source precision is fixed; retain the existing operator.
         }
         if matches!(self, Self::ConvRot(_)) {
             candle_core::bail!("ConvRot refuses re-quantization to {quant:?}");
@@ -989,11 +999,15 @@ impl QLinear {
     /// for the leaves it must keep dense — e.g. FLUX.2's control branch `control_img_in` (260
     /// in-features is not a multiple of the block 32, so it can't quantize) (sc-7460).
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(DenseLinear::Linear(layer)) = self {
+            *layer = layer.to_device(device)?;
+            return Ok(());
+        }
         if self
-            .fp8_device()
+            .native_device()
             .is_some_and(|owner| !owner.same_device(device))
         {
-            candle_core::bail!("FP8 projection is bound to its execution device");
+            candle_core::bail!("checkpoint projection is bound to its execution device");
         }
         if let Self::ConvRot(q) = self {
             if !q.device().same_device(device) {
@@ -1007,7 +1021,7 @@ impl QLinear {
             }
             return Ok(());
         }
-        if self.fp8_device().is_some() {
+        if self.native_device().is_some() {
             return Ok(());
         }
         if let Self::Dense(dense) = self {
@@ -1038,7 +1052,7 @@ impl QLinear {
 
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
-        !matches!(self, Self::Dense(_)) || self.fp8_device().is_some()
+        !matches!(self, Self::Dense(_)) || self.native_device().is_some()
     }
 
     /// The GGUF block type of a quantized projection's resident weight (`None` when dense) — lets a

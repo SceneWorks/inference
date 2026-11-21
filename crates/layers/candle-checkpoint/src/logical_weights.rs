@@ -638,27 +638,53 @@ impl LogicalWeightReader {
         bias: Option<Tensor>,
         shape: Option<(usize, usize)>,
     ) -> Result<Option<candle_quant_kernels::fp8_linear::Fp8Linear>> {
+        self.fp8_projection_oriented(key, bias, shape, false)
+    }
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fp8_projection_oriented(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+        shape: Option<(usize, usize)>,
+        transpose: bool,
+    ) -> Result<Option<candle_quant_kernels::fp8_linear::Fp8Linear>> {
         if !self.has_native_projection(key) {
             return Ok(None);
         }
         use candle_quant_kernels::fp8_linear::Fp8Linear;
         let ctx = self.resources.int8_context(&self.device)?;
         let lt = ctx.handle_for(&self.device)?.clone();
+        if transpose
+            && !self
+                .planned(key)
+                .is_some_and(|r| matches!(r.codec, TensorCodecSpec::ScalarFp8 { .. }))
+        {
+            return Ok(None);
+        }
         let layer = match self.read_with_shape(key, shape)? {
             LogicalTensor::PackedScalarFp8 {
                 codes,
                 weight_scale,
                 input_scale,
                 ..
-            } if codes.dtype() == DType::U8 => {
-                Fp8Linear::from_e5m2_parts(codes, weight_scale, input_scale, bias, lt)?
+            } => {
+                let codes = if transpose {
+                    codes.t()?.contiguous()?
+                } else {
+                    codes
+                };
+                if shape.is_some_and(|(n, k)| codes.dims() != [n, k]) {
+                    candle_core::bail!(
+                        "{key}: oriented weight {:?} differs from model shape {shape:?}",
+                        codes.dims()
+                    );
+                }
+                if codes.dtype() == DType::U8 {
+                    Fp8Linear::from_e5m2_parts(codes, weight_scale, input_scale, bias, lt)?
+                } else {
+                    Fp8Linear::from_parts(codes, weight_scale, input_scale, bias, lt)?
+                }
             }
-            LogicalTensor::PackedScalarFp8 {
-                codes,
-                weight_scale,
-                input_scale,
-                ..
-            } => Fp8Linear::from_parts(codes, weight_scale, input_scale, bias, lt)?,
             LogicalTensor::PackedMxFp8 {
                 codes,
                 scales,
@@ -763,35 +789,8 @@ impl LogicalWeightReader {
                 self.plan.mapping_id
             ))
         })?;
-        let shaped;
-        let tensor = if let (
-            Some((n, k)),
-            TensorCodecSpec::Mxfp8 {
-                stored_shape,
-                logical_shape_declared: false,
-                ..
-            },
-        ) = (shape, &tensor.codec)
-        {
-            if gen_core::mxfp8_padded_shape([n, k]) != *stored_shape {
-                candle_core::bail!("{logical_key}: MXFP8 stored {stored_shape:?} does not pad model shape [{n},{k}]");
-            }
-            let mut row = tensor.clone();
-            let TensorCodecSpec::Mxfp8 {
-                logical_shape_declared,
-                ..
-            } = &mut row.codec
-            else {
-                unreachable!()
-            };
-            *logical_shape_declared = true;
-            row.shape = vec![n, k];
-            shaped = row;
-            &shaped
-        } else {
-            tensor
-        };
-        let decoded = decode(&self.st, tensor, &self.device)?;
+        let tensor = Self::shaped_row(tensor, shape)?;
+        let decoded = decode(&self.st, &tensor, &self.device)?;
         self.measured
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -799,17 +798,76 @@ impl LogicalWeightReader {
         Ok(decoded)
     }
 
-    /// Read a true dense operand for a caller that needs coefficients (embedding, convolution,
-    /// weight fusion), accounting for the actual storage when its plan priced a GEMM.
-    pub fn read_dense(&self, key: &str, dtype: DType, device: &Device) -> Result<Tensor> {
+    fn shaped_row(
+        tensor: &LogicalTensorPlan,
+        shape: Option<(usize, usize)>,
+    ) -> Result<std::borrow::Cow<'_, LogicalTensorPlan>> {
+        Ok(
+            if let (
+                Some((n, k)),
+                TensorCodecSpec::Mxfp8 {
+                    stored_shape,
+                    logical_shape_declared: false,
+                    ..
+                },
+            ) = (shape, &tensor.codec)
+            {
+                if gen_core::mxfp8_padded_shape([n, k]) != *stored_shape {
+                    candle_core::bail!(
+                        "{}: MXFP8 stored {stored_shape:?} does not pad model shape [{n},{k}]",
+                        tensor.logical_key
+                    );
+                }
+                let mut row = tensor.clone();
+                let TensorCodecSpec::Mxfp8 {
+                    logical_shape_declared,
+                    ..
+                } = &mut row.codec
+                else {
+                    unreachable!()
+                };
+                *logical_shape_declared = true;
+                row.shape = vec![n, k];
+                std::borrow::Cow::Owned(row)
+            } else {
+                std::borrow::Cow::Borrowed(tensor)
+            },
+        )
+    }
+
+    /// Decode the requested coefficient view without changing an existing projection's execution regime.
+    pub(crate) fn dense_coefficients(
+        &self,
+        key: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
         let row = self
             .planned(key)
             .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
-        let mut dense = row.clone();
+        let mut dense = Self::shaped_row(row, shape)?.into_owned();
         dense.residency.mode = ResidencyMode::Dense;
         let LogicalTensor::Dense(t) = decode(&self.st, &dense, device)? else {
             candle_core::bail!("{key}: checkpoint operand has no dense coefficient representation")
         };
+        t.to_dtype(dtype)
+    }
+
+    /// Read a true dense operand for a caller that needs coefficients (embedding, convolution,
+    /// weight fusion), accounting for the actual storage when its plan priced a GEMM.
+    pub fn read_dense(&self, key: &str, dtype: DType, device: &Device) -> Result<Tensor> {
+        self.read_dense_with_shape(key, None, dtype, device)
+    }
+    pub fn read_dense_with_shape(
+        &self,
+        key: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let t = self.dense_coefficients(key, shape, dtype, device)?;
+        let row = self.planned(key).expect("decoded planned row");
         let bytes = (t.elem_count() * t.dtype().size_in_bytes()) as u64;
         self.measured
             .lock()
@@ -818,7 +876,7 @@ impl LogicalWeightReader {
         if row.residency.mode == ResidencyMode::Packed {
             self.demote_to_dense_fallback(key, bytes)?;
         }
-        t.to_dtype(dtype)
+        Ok(t)
     }
 
     /// The receipt **measured** over everything materialized through [`Self::read`] so far.
@@ -1446,15 +1504,24 @@ pub fn apply_transform(
             weight_scale_from_companion,
             input_scale,
         } => {
-            // `half_swap` on a packed row is refused at plan time, but `transform` is a public
-            // field on a public struct: a plan that did not come from the compiler can carry one
-            // here. A `debug_assert!` would compile out and return UNSWAPPED rows under the
-            // swapped logical key in every shipping build — plausible-but-wrong weights. Refuse.
-            if transform.half_swap {
-                return Err(half_swap_on_packed(tensor));
-            }
+            let sliced = codes.narrow(0, start, len)?;
+            let codes = if transform.half_swap {
+                if !len.is_multiple_of(2) {
+                    candle_core::bail!(
+                        "{}: cannot half-swap odd row count {len}",
+                        tensor.logical_key
+                    );
+                }
+                let half = len / 2;
+                Tensor::cat(
+                    &[sliced.narrow(0, half, half)?, sliced.narrow(0, 0, half)?],
+                    0,
+                )?
+            } else {
+                sliced.contiguous()?
+            };
             Ok(LogicalTensor::PackedScalarFp8 {
-                codes: codes.narrow(0, start, len)?.contiguous()?,
+                codes,
                 weight_scale,
                 weight_scale_from_companion,
                 input_scale,

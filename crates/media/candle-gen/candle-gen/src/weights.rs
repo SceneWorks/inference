@@ -59,11 +59,12 @@ fn load_map_tensor(
 }
 
 /// A loaded checkpoint weight map (every tensor coerced to the requested compute dtype on load).
+#[derive(Clone)]
 pub struct Weights {
     map: HashMap<String, Tensor>,
     source: Option<(candle_checkpoint::ProjectionSource, Device, DType)>,
     encoded_keys: std::collections::BTreeSet<String>,
-    pub(crate) projection_resources: ProjectionResources,
+    pub(crate) projection_resources: std::sync::Arc<ProjectionResources>,
     /// The device the set is *destined for* when some tensors were deliberately left on the host
     /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
     target: Option<Device>,
@@ -232,7 +233,10 @@ impl Weights {
                 }
             }
         }
-        let source = candle_checkpoint::ProjectionSource::from_mapped(st, &paths, device)?;
+        let source =
+            candle_checkpoint::ProjectionSource::from_mapped_selected(st, &paths, device, |key| {
+                prefixes.iter().any(|prefix| key.starts_with(prefix))
+            })?;
         let mmap = match &source {
             Ok(src) => src.mmap(),
             Err(st) => st,
@@ -264,6 +268,64 @@ impl Weights {
         Ok(weights)
     }
 
+    /// Build a stock Linear through the same projection route used by VarBuilder.
+    pub fn linear(&self, base: &str, bias: bool) -> Result<candle_nn::Linear> {
+        if let Some(layer) = self.native_linear(base, bias)? {
+            return Ok(layer);
+        }
+        let weight = self.require(&format!("{base}.weight"))?;
+        let b = bias
+            .then(|| self.require(&format!("{base}.bias")))
+            .transpose()?;
+        Ok(candle_nn::Linear::new(weight, b))
+    }
+
+    /// Source-encoded weights have a non-affine checkpoint format.
+    pub fn is_affine_codes(&self, key: &str) -> bool {
+        self.map.get(key).is_some_and(|t| t.dtype() == DType::U32)
+    }
+
+    /// Replace one module operand without rebuilding other immutable native projections.
+    pub fn replace_tensor(&mut self, key: String, value: Tensor) {
+        self.encoded_keys.remove(&key);
+        self.map.insert(key, value);
+    }
+
+    pub fn source_format_id(&self, key: &str) -> Option<&'static str> {
+        if !self.encoded_keys.contains(key) {
+            return None;
+        }
+        self.source
+            .as_ref()?
+            .0
+            .reader()
+            .planned(key)
+            .map(|row| row.codec_id)
+    }
+    pub fn materialized_bytes(&self, key: &str) -> Result<u64> {
+        if self.encoded_keys.contains(key) {
+            if let Some((source, _, _)) = &self.source {
+                return source.reader().materialized_bytes(key).ok_or_else(|| {
+                    CandleError::Msg(format!(
+                        "{key}: checkpoint operand has not been materialized"
+                    ))
+                });
+            }
+        }
+        let tensor = self.require(key)?;
+        Ok((tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64)
+    }
+
+    /// Physical descriptors/scale planes are consumed by the logical source and excluded from module key counts.
+    pub fn is_checkpoint_companion(&self, key: &str) -> bool {
+        self.source.as_ref().is_some_and(|(src, _, _)| {
+            src.reader()
+                .plan()
+                .companions
+                .binary_search_by(|c| c.physical_key.as_str().cmp(key))
+                .is_ok()
+        })
+    }
     /// Construct a checkpoint projection with the same codec as VarBuilder consumers.
     pub fn native_linear(&self, base: &str, bias: bool) -> Result<Option<candle_nn::Linear>> {
         let key = format!("{base}.weight");
@@ -324,7 +386,7 @@ impl Weights {
             map,
             source: None,
             encoded_keys: Default::default(),
-            projection_resources: ProjectionResources::default(),
+            projection_resources: Default::default(),
             target: None,
         }
     }
@@ -360,7 +422,48 @@ impl Weights {
             }
             stores.push(st);
         }
+        // H3's immutable mixed-precision loader keeps F32 heads, F16 biases and the
+        // W4A8/INT8 value validators below. Route checkpoint FP8 matrices to the same
+        // logical source as stock VarBuilder instead of casting FP8 or consuming its scales twice.
+        let fp8_bases: std::collections::HashSet<_> = headers
+            .iter()
+            .filter_map(|(key, (_, dtype, _))| {
+                matches!(
+                    dtype,
+                    safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
+                )
+                .then(|| key.strip_suffix(".weight"))
+                .flatten()
+                .map(str::to_owned)
+            })
+            .collect();
+        let is_fp8 = |key: &str| {
+            key.rsplit_once('.')
+                .is_some_and(|(base, _)| fp8_bases.contains(base))
+        };
+        let mut weights = Self::from_map(HashMap::new());
+        if !fp8_bases.is_empty() {
+            let files: Vec<_> = files.iter().map(|p| p.as_ref().to_owned()).collect();
+            let st = crate::loader::mmap_safetensors_multi(&files)?;
+            let source = candle_checkpoint::ProjectionSource::from_mapped_selected(
+                st, &files, device, is_fp8,
+            )?
+            .ok()
+            .ok_or_else(|| CandleError::Msg("FP8 checkpoint has no logical rows".into()))?;
+            weights.encoded_keys.extend(
+                source
+                    .reader()
+                    .plan()
+                    .tensors
+                    .iter()
+                    .map(|row| row.logical_key.clone()),
+            );
+            weights.source = Some((source, device.clone(), DType::BF16));
+        }
         for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
+            if is_fp8(key) {
+                continue;
+            }
             let base = key.trim_end_matches(".comfy_quant");
             let payload = stores[*di].get(key)?;
             let declared: serde_json::Value =
@@ -453,6 +556,9 @@ impl Weights {
                 .map_err(CandleError::Msg)?;
         }
         for (key, (_, stored_dtype, _)) in &headers {
+            if is_fp8(key) {
+                continue;
+            }
             let native = (key.ends_with(".weight") && *stored_dtype == safetensors::Dtype::I8)
                 || key.ends_with(".weight_scale")
                 || key.ends_with(".weight_s_rel")
@@ -467,18 +573,23 @@ impl Weights {
                 }
             }
         }
-        let mut map = HashMap::with_capacity(headers.len());
+        weights
+            .map
+            .reserve(headers.len() - weights.encoded_keys.len());
         for st in &stores {
             for (key, view) in st.tensors() {
+                if weights.encoded_keys.contains(&key) {
+                    continue;
+                }
                 let tensor = if view.dtype() == safetensors::Dtype::I8 {
                     Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
                 } else {
                     st.load(&key, device)?
                 };
-                map.insert(key, tensor);
+                weights.map.insert(key, tensor);
             }
         }
-        Ok(Self::from_map(map))
+        Ok(weights)
     }
 
     pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {

@@ -19,22 +19,15 @@ use gen_core_checkpoint::supra2::{timestep_features, Supra2Config};
 
 const LN_EPS: f64 = 1e-6;
 
-fn lin(w: &HashMap<String, Tensor>, prefix: &str, shape: [usize; 2]) -> Result<Linear> {
-    let get = |name: &str| -> Result<Tensor> {
-        w.get(name)
-            .cloned()
-            .ok_or_else(|| Error::Msg(format!("supra2: missing denoiser tensor `{name}`")))
-    };
-    let weight = get(&format!("{prefix}.weight"))?;
-    let bias = get(&format!("{prefix}.bias"))?;
-    if weight.dims() != shape || bias.dims() != [shape[0]] {
+fn lin(w: &candle_gen::Weights, prefix: &str, shape: [usize; 2]) -> Result<Linear> {
+    let layer = w.linear(prefix, true)?;
+    let dims = layer.weight_dims()?;
+    if dims != (shape[0], shape[1]) || layer.bias().is_none_or(|b| b.dims() != [shape[0]]) {
         return Err(Error::Msg(format!(
-            "supra2: `{prefix}` has shape {:?}/{:?}, expected {shape:?}",
-            weight.dims(),
-            bias.dims()
+            "supra2: `{prefix}` has shape {dims:?}, expected {shape:?}"
         )));
     }
-    Ok(Linear::new(weight, Some(bias)))
+    Ok(layer)
 }
 
 /// `x * (1 + scale[:, None]) + shift[:, None]`.
@@ -89,7 +82,7 @@ struct Block {
 }
 
 impl Block {
-    fn from_weights(w: &HashMap<String, Tensor>, i: usize, c: &Supra2Config) -> Result<Self> {
+    fn from_weights(w: &candle_gen::Weights, i: usize, c: &Supra2Config) -> Result<Self> {
         let d = c.d_model;
         let p = |s: &str| format!("blocks.{i}.{s}");
         Ok(Self {
@@ -163,11 +156,20 @@ impl SupraDit {
     /// Build from upstream-keyed f32 tensors (already on the target device); every key and shape of
     /// [`Supra2Config::expected_tensors`] is required and no other key may be present.
     pub fn from_tensors(w: &HashMap<String, Tensor>, config: &Supra2Config) -> Result<Self> {
+        if let Some((name, t)) = w.iter().find(|(_, t)| t.dtype() != DType::F32) {
+            return Err(Error::Msg(format!(
+                "supra2: denoiser tensor `{name}` is {:?}, expected F32",
+                t.dtype()
+            )));
+        }
+        Self::from_weights(&candle_gen::Weights::from_map(w.clone()), config)
+    }
+    fn from_weights(w: &candle_gen::Weights, config: &Supra2Config) -> Result<Self> {
         let expected = config.expected_tensors();
         let mut unexpected: Vec<&str> = w
             .keys()
             .map(String::as_str)
-            .filter(|k| !expected.iter().any(|(n, _)| n == k))
+            .filter(|k| !w.is_checkpoint_companion(k) && !expected.iter().any(|(n, _)| n == k))
             .collect();
         if !unexpected.is_empty() {
             unexpected.sort_unstable();
@@ -175,17 +177,8 @@ impl SupraDit {
                 "supra2: unexpected denoiser tensors {unexpected:?}"
             )));
         }
-        if let Some((name, t)) = w.iter().find(|(_, t)| t.dtype() != DType::F32) {
-            return Err(Error::Msg(format!(
-                "supra2: denoiser tensor `{name}` is {:?}, expected F32",
-                t.dtype()
-            )));
-        }
         let d = config.d_model;
-        let pos_embed = w
-            .get("pos_embed")
-            .cloned()
-            .ok_or_else(|| Error::Msg("supra2: missing denoiser tensor `pos_embed`".into()))?;
+        let pos_embed = w.require("pos_embed")?;
         if pos_embed.dims() != [1, config.num_tokens(), d] {
             return Err(Error::Msg(format!(
                 "supra2: pos_embed shape {:?} does not match the geometry",
@@ -211,8 +204,21 @@ impl SupraDit {
 
     /// Load the converted bundle's `denoiser.safetensors` onto `device`, verifying the inventory.
     pub fn load(path: &std::path::Path, config: &Supra2Config, device: &Device) -> Result<Self> {
-        let w = candle_gen::candle_core::safetensors::load(path, device)?;
-        Self::from_tensors(&w, config)
+        let headers = candle_gen::gen_core::safetensors_path_tensor_headers(path)?;
+        let w = candle_gen::Weights::from_file(path, device, DType::F32)?;
+        for h in headers {
+            let is_encoded = w.source_format_id(&h.name).is_some();
+            if !w.is_checkpoint_companion(&h.name)
+                && !is_encoded
+                && h.dtype != candle_gen::gen_core::weightsmeta::Dtype::F32
+            {
+                return Err(Error::Msg(format!(
+                    "supra2: denoiser tensor `{}` is {:?}, expected F32",
+                    h.name, h.dtype
+                )));
+            }
+        }
+        Self::from_weights(&w, config)
     }
 
     pub fn config(&self) -> &Supra2Config {

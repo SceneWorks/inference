@@ -127,7 +127,7 @@ impl Base {
     fn device(&self) -> Option<Device> {
         match self {
             Base::Dense(l) => Some(l.device().clone()),
-            Base::Packed(q) => q.fp8_device().cloned(),
+            Base::Packed(q) => q.native_device().cloned(),
             Base::Nvfp4(q) => Some(q.device().clone()),
             Base::ConvRot(q) => Some(q.device().clone()),
             Base::W4A8(q) => Some(q.device().clone()),
@@ -880,6 +880,7 @@ impl AdaptLinear {
     /// Distinguish descriptor-driven integer execution from affine packed Q8.
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self.base, Base::ConvRot(_))
+            || matches!(&self.base,Base::Packed(q) if q.native_format_id()==Some(gen_core::convrot_int8::CODEC_ID))
     }
 
     /// Packed W4A8 base; residuals remain additive in the original, unrotated input basis.
@@ -1083,7 +1084,7 @@ impl AdaptLinear {
     /// which stays the MLX-packed (`Q4_1`/`Q8_0`) predicate its existing callers key off — an NVFP4
     /// base holds no GGUF block weight and has no [`super::MatmulStrategy`].
     pub fn is_fp8(&self) -> bool {
-        matches!(&self.base, Base::Packed(base) if base.fp8_device().is_some())
+        matches!(&self.base,Base::Packed(q) if q.native_format_id().is_some_and(|id|[gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id,gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id,gen_core::checkpoint_codec::MXFP8_CODEC.codec_id].contains(&id)))
     }
 
     pub fn is_nvfp4(&self) -> bool {
@@ -1249,7 +1250,10 @@ impl AdaptLinear {
     /// Dense/MLX-packed bases keep the historical unchecked behaviour (their installers carry
     /// their own shape screening) and always return `Ok`.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
-        if self.is_fp8() || matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
+        if self.is_fp8()
+            || self.is_convrot_int8()
+            || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
+        {
             return self.push_lora_checked(a, b, scale);
         }
         self.adapters.push(Adapter::Lora {
@@ -1327,7 +1331,7 @@ impl AdaptLinear {
     fn admission_subject(&self) -> &'static str {
         match &self.base {
             Base::Dense(_) => "dense base",
-            Base::Packed(q) if q.fp8_device().is_some() => "FP8 base",
+            Base::Packed(q) if q.native_device().is_some() => "FP8 base",
             Base::Packed(_) => "MLX-packed base",
             Base::Nvfp4(_) => "NVFP4 base",
             Base::ConvRot(_) => "ConvRot INT8 base",
@@ -1446,7 +1450,10 @@ impl AdaptLinear {
     /// **On an NVFP4 base this delegates to [`Self::push_lokr_structured_checked`]** — same
     /// structural closure as [`Self::push_lora`] (sc-11045 fix round, MAJOR 7).
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
-        if self.is_fp8() || matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
+        if self.is_fp8()
+            || self.is_convrot_int8()
+            || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
+        {
             return self.push_lokr_structured_checked(factors);
         }
         self.adapters.push(Adapter::LokrStructured { factors });
@@ -1482,7 +1489,7 @@ impl AdaptLinear {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
             // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
-            Base::Packed(q) if q.fp8_device().is_some() => q.quantize(quant),
+            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {
@@ -1511,7 +1518,7 @@ impl AdaptLinear {
     ) -> candle_core::Result<()> {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
-            Base::Packed(q) if q.fp8_device().is_some() => q.quantize(quant),
+            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {
@@ -1533,7 +1540,7 @@ impl AdaptLinear {
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
-            Base::Packed(q) if q.fp8_device().is_some() => q.quantize(quant),
+            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {

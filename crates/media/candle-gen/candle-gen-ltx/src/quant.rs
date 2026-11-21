@@ -156,6 +156,29 @@ impl QLinear {
 
     pub fn operator_kind(&self) -> AdvancedOperatorKind {
         match &self.base {
+            QLinearBase::Adapt(_)
+                if self.attestation == candle_gen::gen_core::convrot_int8::CODEC_ID =>
+            {
+                AdvancedOperatorKind::Int8ConvRotIgemm
+            }
+            QLinearBase::Adapt(_)
+                if self.attestation
+                    == candle_gen::gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id =>
+            {
+                AdvancedOperatorKind::Fp8E4M3
+            }
+            QLinearBase::Adapt(_)
+                if self.attestation
+                    == candle_gen::gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id =>
+            {
+                AdvancedOperatorKind::Fp8E5M2
+            }
+            QLinearBase::Adapt(_)
+                if self.attestation
+                    == candle_gen::gen_core::checkpoint_codec::MXFP8_CODEC.codec_id =>
+            {
+                AdvancedOperatorKind::MxFp8
+            }
             QLinearBase::Adapt(linear) if linear.is_packed() => AdvancedOperatorKind::MlxAffine,
             QLinearBase::Adapt(_) => AdvancedOperatorKind::Dense,
             QLinearBase::ConvRot(_) => AdvancedOperatorKind::Int8ConvRotIgemm,
@@ -368,6 +391,27 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
             });
         }
         source.refuse_undeclared_advanced_tensor(&path)?;
+    }
+    if let Some(native) = vb.native_linear_weight(&format!("{key}.weight"))? {
+        let (out_features, in_features) = native.dims();
+        let attestation = native.format_id().to_owned();
+        let b = bias
+            .then(|| vb.get_unchecked(&format!("{key}.bias")))
+            .transpose()?;
+        let layer = Linear::from_native(native, b);
+        return Ok(QLinear {
+            base: QLinearBase::Adapt(LoraLinear::from_linear(
+                layer,
+                in_features,
+                out_features,
+                path.clone(),
+            )),
+            path,
+            in_features,
+            out_features,
+            attestation,
+            bounded_packed_training: false,
+        });
     }
     let scales_key = format!("{key}.scales");
     if vb.contains_tensor(&scales_key) {

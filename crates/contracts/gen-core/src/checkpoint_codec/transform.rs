@@ -16,6 +16,11 @@ pub trait LogicalKeyMapping {
         false
     }
 
+    /// A shape-inferred model may consume an explicit pre-padding shape recorded by the exporter.
+    fn accepts_descriptor_shape(&self) -> bool {
+        false
+    }
+
     /// The canonical logical key for one on-disk key, or `None` when the key is foreign to this
     /// dialect (the plan compiler refuses; nothing is skipped silently).
     fn logical_key(&self, physical_key: &str) -> Option<String>;
@@ -520,7 +525,12 @@ pub(super) fn resolve_logical_transform(
             TensorCodecSpec::Mxfp8 { .. } | TensorCodecSpec::Nvfp4 { .. }
         );
         for output in &resolved {
-            if output.half_swap && !matches!(codec, TensorCodecSpec::ConvRotInt8 { .. }) {
+            if output.half_swap
+                && !matches!(
+                    codec,
+                    TensorCodecSpec::ConvRotInt8 { .. } | TensorCodecSpec::ScalarFp8 { .. }
+                )
+            {
                 return Err(LogicalTransformError::HalfSwapOnPackedResidency {
                     logical_key: output.logical_key.clone(),
                     codec_id,

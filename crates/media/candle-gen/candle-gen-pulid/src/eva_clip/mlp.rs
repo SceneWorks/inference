@@ -19,12 +19,7 @@ pub struct SwiGlu {
 
 impl SwiGlu {
     pub fn from_weights(w: &Weights, prefix: &str) -> GenResult<Self> {
-        let lin = |leaf: &str| -> GenResult<Linear> {
-            Ok(Linear::new(
-                w.require(&join(prefix, &format!("{leaf}.weight")))?,
-                Some(w.require(&join(prefix, &format!("{leaf}.bias")))?),
-            ))
-        };
+        let lin = |leaf: &str| -> GenResult<Linear> { w.linear(&join(prefix, leaf), true) };
         Ok(Self {
             w1: lin("w1")?,
             w2: lin("w2")?,

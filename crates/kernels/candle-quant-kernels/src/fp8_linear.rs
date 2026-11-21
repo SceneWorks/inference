@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 /// An fp8 E4M3 linear: `y = (X · Wᵀ) · scale_w · scale_x` with a per-tensor-quantized weight and
 /// dynamic per-tensor activation quant. Optional bias added back in the output dtype.
+pub type ActivationQuantizer = fn(&Tensor) -> Result<(Tensor, f32)>;
+
 pub struct Fp8Linear {
+    dynamic_quantizer: Option<ActivationQuantizer>,
     w_fp8: crate::cublaslt::DevFp8,
     device: Device,
     dims: (usize, usize),
@@ -35,6 +38,21 @@ impl Fp8Linear {
             candle_core::bail!("expected E4M3FN weight codes");
         }
         Self::from_codes(codes, scale_w, Some(input_scale.unwrap_or(1.0)), bias, lt)
+    }
+
+    /// A from-dense recipe may define its own activation rounding/scale floor, while sharing the original GEMM.
+    pub fn from_dynamic_codes(
+        codes: Tensor,
+        scale_w: f32,
+        lt: Arc<CublasLt>,
+        activation_quantizer: ActivationQuantizer,
+    ) -> Result<Self> {
+        if codes.dtype() != candle_core::DType::F8E4M3 {
+            candle_core::bail!("dynamic codes must be E4M3FN");
+        }
+        let mut base = Self::from_codes(codes, scale_w, None, None, lt)?;
+        base.dynamic_quantizer = Some(activation_quantizer);
+        Ok(base)
     }
 
     pub fn from_e5m2_parts(
@@ -70,6 +88,7 @@ impl Fp8Linear {
         }
         let device = codes.device().clone();
         Ok(Self {
+            dynamic_quantizer: None,
             dims: codes.dims2()?,
             block_scales: None,
             w_fp8: lt.stage_fp8(&codes)?,
@@ -109,6 +128,19 @@ impl Fp8Linear {
         Ok(layer)
     }
 
+    pub fn format_id(&self) -> &'static str {
+        use gen_core::checkpoint_codec::{
+            FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, MXFP8_CODEC,
+        };
+        if self.block_scales.is_some() {
+            MXFP8_CODEC.codec_id
+        } else if self.w_fp8.is_e5m2() {
+            FP8_E5M2_SCALAR_CODEC.codec_id
+        } else {
+            FP8_E4M3_SCALAR_CODEC.codec_id
+        }
+    }
+
     pub fn dims(&self) -> (usize, usize) {
         self.dims
     }
@@ -132,9 +164,13 @@ impl Fp8Linear {
             self.lt
                 .mxfp8_linear(&self.w_fp8, scales, &flat, self.dims.0)?
         } else {
-            let (qx, sx) =
+            let (qx, sx) = if let Some(quantize) = self.dynamic_quantizer {
+                let (codes, scale) = quantize(&flat)?;
+                (self.lt.stage_fp8(&codes)?, scale)
+            } else {
                 self.lt
-                    .scaled_fp8_activation(&flat, self.input_scale, self.w_fp8.is_e5m2())?;
+                    .scaled_fp8_activation(&flat, self.input_scale, self.w_fp8.is_e5m2())?
+            };
             self.lt
                 .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, sx)?
         };
