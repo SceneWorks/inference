@@ -14,7 +14,7 @@ ROUTES = {
     "chroma": ("pipeline:load_sorted_mmap(", "quant:Self::linear_detect_gs("),
     "clip": ("lib:mmap_var_builder(", "lib:w.linear("),
     "depth": ("common:candle_gen::Weights::from_files(", "common:w.0.native_linear("),
-    "face": ("common:mmap_var_builder(", "common:vb.native_linear_weight(", "iresnet:w.linear("),
+    "face": ("common:mmap_var_builder(", "common:Linear::from_var_builder(", "iresnet:w.linear("),
     "flux": ("flux1_load:mmap_var_builder(", "control:candle_nn::linear(", "ip_adapter:w.linear("),
     "flux2": ("lib:load_path_mmap(", "single_file:LogicalWeightReader", "single_file:.native_projection("),
     "flux3": ("dit:mmap_var_builder(", "nn:vb.native_linear_weight_with_shape(", "nn:publisher.linear(", "dit:validate_source_checkpoint("),

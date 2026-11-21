@@ -333,7 +333,7 @@ impl Qwen35VisionModel {
         let req = |k: String| -> Result<Tensor> { Ok(w.require(&k)?.to_dtype(dtype)?) };
         let opt = |k: String| -> Result<Option<Tensor>> {
             match w.optional(&k)? {
-                Some(t) => Ok(Some(t.to_dtype(dtype)?)),
+                Some(t) => Ok(Some(t.to_dtype(w.parameter_dtype(&k, dtype))?)),
                 None => Ok(None),
             }
         };

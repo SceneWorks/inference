@@ -315,8 +315,12 @@ fn linear_b_initialized(
         return linear_b(in_dim, out_dim, bias, vb);
     }
     let native = vb.native_linear_weight_with_shape("weight", Some((out_dim, in_dim)))?;
+    let dtype = native
+        .as_ref()
+        .and_then(|op| op.checkpoint_bias_dtype())
+        .unwrap_or(vb.dtype());
     let bias = bias
-        .then(|| vb.get_with_hints(out_dim, "bias", Init::Const(0.0)))
+        .then(|| vb.get_with_hints_dtype(out_dim, "bias", Init::Const(0.0), dtype))
         .transpose()?;
     match native {
         Some(op) if op.dims() == (out_dim, in_dim) => Ok(Linear::from_native(op, bias)),

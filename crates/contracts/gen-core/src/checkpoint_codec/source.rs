@@ -113,6 +113,29 @@ pub fn projected_bytes_from_plan(
         };
         bytes.insert(row.physical_key.clone(), resident);
     }
+    // A bias is also independently addressable. Apply the native projection's retention rule
+    // after individual rows so an encoded bias's coefficient width is charged exactly once.
+    for row in &plan.tensors {
+        if bytes[&row.physical_key] == 0 {
+            continue;
+        }
+        let Some(key) = row.retained_convrot_bias_key() else {
+            continue;
+        };
+        if let Some(bias) = physical.get(key.as_str()) {
+            let width = match bias.dtype {
+                Dtype::F32 | Dtype::F8_E4M3 | Dtype::F8_E5M2 => 4,
+                Dtype::BF16 | Dtype::F16 => 2,
+                _ => continue,
+            };
+            let retained = if dense_width(bias) == 0 {
+                0
+            } else {
+                bias.materialized_bytes(width)?
+            };
+            bytes.insert(key, retained);
+        }
+    }
     for c in &plan.companions {
         let retained = if bytes[&c.owner_physical_key] == 0 {
             0
@@ -563,6 +586,7 @@ mod tests {
             &shards[0],
             &[
                 ("model.a.weight", "I8", &[1, 64], &[0x80; 64]),
+                ("model.a.bias", "F32", &[1], &1f32.to_le_bytes()),
                 ("model.b.weight", "F8_E4M3", &[1, 2], &[0x81, 0x33]),
             ],
         );
@@ -586,12 +610,13 @@ mod tests {
         let bytes = projected_checkpoint_bytes(
             &shards,
             &headers,
-            |_| 4,
+            |h| if h.name == "model.a.bias" { 2 } else { 4 },
             &SourceCodecResidency,
             |_, shape| shape.len() == 2,
         )
         .unwrap();
         assert_eq!(bytes["model.a.weight"], 64);
+        assert_eq!(bytes["model.a.bias"], 4);
         assert_eq!(bytes["model.a.weight_scale"], 4);
         assert_eq!(bytes["model.a.comfy_quant"], 0);
         assert_eq!(bytes["model.b.weight"], 8);
@@ -605,6 +630,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(filtered["model.a.weight"], 0);
+        assert!(!filtered.contains_key("model.a.bias"));
         assert_eq!(filtered["model.a.weight_scale"], 0);
         assert_eq!(filtered["model.b.weight"], 8);
         assert!(projected_checkpoint_bytes(

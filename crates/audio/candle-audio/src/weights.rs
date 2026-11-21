@@ -209,11 +209,7 @@ impl candle_nn::var_builder::SimpleBackend for AudioCheckpoint {
 /// Resolve a Linear whose geometry comes from its checkpoint. Native builders use the original
 /// descriptors while plain builders preserve the actual dense weight and optional bias.
 pub fn checkpoint_linear(vb: &VarBuilder, bias: bool) -> candle_core::Result<candle_nn::Linear> {
-    let bias = bias.then(|| vb.get_unchecked("bias")).transpose()?;
-    match vb.native_linear_weight("weight")? {
-        Some(op) => Ok(candle_nn::Linear::from_native(op, bias)),
-        None => Ok(candle_nn::Linear::new(vb.get_unchecked("weight")?, bias)),
-    }
+    candle_nn::Linear::from_var_builder(vb, bias)
 }
 
 /// A tied token matrix needs coefficients for embedding lookup and may also carry a native

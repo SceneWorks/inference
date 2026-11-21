@@ -269,9 +269,15 @@ impl Checkpoint {
     /// The exported depth head is a 1×1 convolution evaluated by a matrix projection.
     pub(crate) fn pointwise_linear(&self, channels: usize, dtype: DType) -> Result<Linear> {
         use candle_gen::candle_nn::var_builder::SimpleBackend;
-        let bias = self.take_as("bias", dtype)?;
-        expect_shape("depth_reducer.bias", &bias, &[1])?;
         let key = format!("{}weight", self.prefix);
+        let bias_dtype = match &self.source {
+            Source::Mmap(candle_gen::loader::MappedWeights::Checkpoint(src)) => {
+                src.reader().projection_bias_dtype(&key).unwrap_or(dtype)
+            }
+            _ => dtype,
+        };
+        let bias = self.take_as("bias", bias_dtype)?;
+        expect_shape("depth_reducer.bias", &bias, &[1])?;
         let physical = [1, channels, 1, 1];
         if let Source::Mmap(candle_gen::loader::MappedWeights::Checkpoint(src)) = &self.source {
             if let Some(op) =

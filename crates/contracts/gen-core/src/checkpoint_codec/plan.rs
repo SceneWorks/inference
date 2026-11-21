@@ -34,6 +34,18 @@ pub struct LogicalTensorPlan {
 }
 
 impl LogicalTensorPlan {
+    /// Native ConvRot keeps its floating bias at source precision across activation dtypes.
+    pub fn retained_convrot_bias_key(&self) -> Option<String> {
+        if self.residency.mode != ResidencyMode::Packed
+            || !matches!(self.codec, TensorCodecSpec::ConvRotInt8 { .. })
+        {
+            return None;
+        }
+        self.physical_key
+            .strip_suffix(".weight")
+            .map(|base| format!("{base}.bias"))
+    }
+
     /// The logical shape the codec decodes **before** this entry's transform: the physical tensor's
     /// own geometry. Equal to [`Self::shape`] for an untransformed entry.
     ///

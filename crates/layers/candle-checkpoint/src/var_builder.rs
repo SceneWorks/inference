@@ -365,6 +365,9 @@ impl NativeLinearWeight for SourceLinear {
             NativeOp::Fp8(op) => op.forward_with_bias(x, bias),
         }
     }
+    fn checkpoint_bias_dtype(&self) -> Option<DType> {
+        self.source.reader().projection_bias_dtype(&self.key)
+    }
     fn compute_dtype(&self) -> DType {
         self.dtype
     }
@@ -665,8 +668,12 @@ impl MappedWeights {
         shape: Option<&[usize]>,
     ) -> Result<candle_nn::Linear> {
         let key = format!("{base}.weight");
+        let bias_dtype = match self {
+            Self::Checkpoint(src) => src.reader().projection_bias_dtype(&key).unwrap_or(dtype),
+            Self::Plain(_) => dtype,
+        };
         let bias = bias
-            .then(|| self.read(&format!("{base}.bias"), dtype, dev))
+            .then(|| self.read(&format!("{base}.bias"), bias_dtype, dev))
             .transpose()?;
         let dims = shape
             .map(|shape| {
@@ -1000,12 +1007,18 @@ mod tests {
         use safetensors::tensor::TensorView;
         let codes = [0u8; 16 * 64];
         let scales = 1f32.to_le_bytes().repeat(16);
+        let bias_value = 1.0f32 + 1.0 / 4096.0;
+        let bias = bias_value.to_le_bytes().repeat(16);
         let desc = br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":64}"#;
         let bytes = safetensors::tensor::serialize(
             [
                 (
                     "p.weight",
                     TensorView::new(Dtype::I8, vec![16, 64], &codes).unwrap(),
+                ),
+                (
+                    "p.bias",
+                    TensorView::new(Dtype::F32, vec![16], &bias).unwrap(),
                 ),
                 (
                     "p.weight_scale",
@@ -1054,6 +1067,18 @@ mod tests {
                 policy.native_execution_capability(),
                 &[],
             );
+            for dtype in [DType::BF16, DType::F16, DType::F32] {
+                assert_eq!(
+                    reader.projection_bias_dtype("p.weight").unwrap_or(dtype),
+                    DType::F32
+                );
+                let bias = reader
+                    .retained_projection_bias("p.weight", "p.bias", &Device::Cpu)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(bias.dtype(), DType::F32);
+                assert_eq!(bias.to_vec1::<f32>().unwrap(), [bias_value; 16]);
+            }
             let bad_bias = Tensor::zeros(15, DType::F32, &Device::Cpu).unwrap();
             let err = reader
                 .convrot_projection("p.weight", Some(bad_bias))

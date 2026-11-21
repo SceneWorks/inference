@@ -1274,8 +1274,22 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         .is_some_and(|r| r.has_native_projection(&weight_key))
     {
         let reader = w.logical.as_ref().expect("planned weight has a reader");
+        let bias_key = format!("{base}.bias");
         let bias = bias
-            .then(|| w.get(&format!("{base}.bias"))?.to_device(reader.device()))
+            .then(|| -> Result<Tensor> {
+                if let Some(t) = w.overlay.get(&bias_key) {
+                    let dtype = reader
+                        .projection_bias_dtype(&weight_key)
+                        .unwrap_or(w.dtype());
+                    return t.to_dtype(dtype)?.to_device(reader.device());
+                }
+                if let Some(b) = w.read_source_unchanged(|| {
+                    reader.retained_projection_bias(&weight_key, &bias_key, reader.device())
+                })? {
+                    return Ok(b);
+                }
+                w.get(&bias_key)?.to_device(reader.device())
+            })
             .transpose()?;
         let projection = w
             .read_source_unchanged(|| {

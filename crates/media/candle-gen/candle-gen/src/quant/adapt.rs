@@ -1009,12 +1009,7 @@ impl AdaptLinear {
 
     fn from_builder(vb: &VarBuilder, name: &str, bias: bool) -> candle_core::Result<Self> {
         let sub = vb.pp(name);
-        let b = bias.then(|| sub.get_unchecked("bias")).transpose()?;
-        let layer = if let Some(op) = sub.native_linear_weight("weight")? {
-            Linear::from_native(op, b)
-        } else {
-            Linear::new(sub.get_unchecked("weight")?, b)
-        };
+        let layer = Linear::from_var_builder(&sub, bias)?;
         let (out_features, in_features) = layer.weight_dims()?;
         Ok(Self::from_dense(layer, in_features, out_features))
     }

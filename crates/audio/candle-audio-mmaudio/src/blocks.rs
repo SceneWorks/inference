@@ -27,8 +27,13 @@ impl PatchEmbed3d {
         // Conv3d weight arrives as (out=768, in=3, kz=2, kh=16, kw=16); flatten trailing dims.
         let shape = [config::EMBED_DIM, config::IN_CHANS, z, p, p];
         let key = "proj.weight";
-        let bias = vb.get(config::EMBED_DIM, "proj.bias")?;
-        let projection = if let Some(op) = vb.native_linear_weight_flattened(key, &shape)? {
+        let native = vb.native_linear_weight_flattened(key, &shape)?;
+        let dtype = native
+            .as_ref()
+            .and_then(|op| op.checkpoint_bias_dtype())
+            .unwrap_or(vb.dtype());
+        let bias = vb.to_dtype(dtype).get(config::EMBED_DIM, "proj.bias")?;
+        let projection = if let Some(op) = native {
             Linear::from_native(op, Some(bias))
         } else {
             let weight = vb

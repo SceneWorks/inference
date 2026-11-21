@@ -482,6 +482,19 @@ impl Weights {
         self.tensors.get(key)
     }
 
+    /// Honor the native projection's bias storage when a model binds its named parameter.
+    pub(crate) fn parameter_dtype(&self, key: &str, dtype: DType) -> DType {
+        key.strip_suffix(".bias")
+            .and_then(|base| self.encoded.get(&format!("{base}.weight")))
+            .and_then(|weight| {
+                self.source
+                    .as_ref()?
+                    .reader()
+                    .projection_bias_dtype(&weight.key)
+            })
+            .unwrap_or(dtype)
+    }
+
     pub(crate) fn encoded_dense(
         &self,
         key: &str,

@@ -29,15 +29,7 @@ impl Weights {
     }
     pub fn linear(&self, base: &str) -> Result<candle_gen::candle_nn::Linear> {
         let vb = self.vb.pp(base);
-        let bias = Some(vb.get_unchecked("bias")?);
-        if let Some(native) = vb.native_linear_weight("weight")? {
-            Ok(candle_gen::candle_nn::Linear::from_native(native, bias))
-        } else {
-            Ok(candle_gen::candle_nn::Linear::new(
-                vb.get_unchecked("weight")?,
-                bias,
-            ))
-        }
+        Ok(candle_gen::candle_nn::Linear::from_var_builder(&vb, true)?)
     }
     #[cfg(test)]
     pub fn from_map(raw: std::collections::HashMap<String, Tensor>) -> Result<Self> {

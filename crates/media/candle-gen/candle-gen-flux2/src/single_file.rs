@@ -331,11 +331,17 @@ impl PlannedDitWeights {
     ) -> Result<QLinear> {
         let weight_key = format!("{base}.weight");
         let bias_key = format!("{base}.bias");
-        let dense_bias = if bias {
-            Some(self.dense(&bias_key)?)
-        } else {
-            None
-        };
+        let dense_bias = bias
+            .then(|| {
+                match self
+                    .reader
+                    .retained_projection_bias(&weight_key, &bias_key, &self.device)?
+                {
+                    Some(bias) => Ok(bias),
+                    None => self.dense(&bias_key),
+                }
+            })
+            .transpose()?;
         if let Some(projection) = self
             .reader
             .native_projection(&weight_key, dense_bias.clone())

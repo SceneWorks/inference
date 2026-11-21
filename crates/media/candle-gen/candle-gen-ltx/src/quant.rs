@@ -267,13 +267,9 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
     let path = vb.pp(key).prefix();
     if let Some(source) = active_source() {
         if source.is_advanced_projection(&path) {
-            let bias_tensor = if bias {
-                Some(
-                    vb.get_unchecked(&format!("{key}.bias"))?
-                        .to_dtype(vb.dtype())?,
-                )
-            } else {
-                None
+            let load_bias = |dtype| {
+                bias.then(|| vb.get_unchecked_dtype(&format!("{key}.bias"), dtype))
+                    .transpose()
             };
             let loaded = source.load_projection(&path, vb.device())?;
             let (base, in_features, out_features, attestation) = match loaded {
@@ -291,8 +287,9 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
                         );
                     }
                     let (out_features, in_features) = operand.dims();
+                    let bias = load_bias(operand.checkpoint_bias_dtype().unwrap_or(vb.dtype()))?;
                     (
-                        QLinearBase::ConvRot(Linear::from_native(operand, bias_tensor)),
+                        QLinearBase::ConvRot(Linear::from_native(operand, bias)),
                         in_features,
                         out_features,
                         attestation,
@@ -307,7 +304,7 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
                     let in_features = packed.cols;
                     let linear = Nvfp4Linear::from_packed_in(
                         packed,
-                        bias_tensor,
+                        load_bias(vb.dtype())?,
                         vb.device(),
                         ActPrecision::W4A4,
                         &context,
@@ -341,7 +338,12 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         let (out_features, in_features) = native.dims();
         let attestation = native.format_id().to_owned();
         let b = bias
-            .then(|| vb.get_unchecked(&format!("{key}.bias")))
+            .then(|| {
+                vb.get_unchecked_dtype(
+                    &format!("{key}.bias"),
+                    native.checkpoint_bias_dtype().unwrap_or(vb.dtype()),
+                )
+            })
             .transpose()?;
         let layer = Linear::from_native(native, b);
         return Ok(QLinear {

@@ -20,7 +20,12 @@ pub(crate) fn attention_in_projection(vb: &VarBuilder, width: usize) -> CResult<
     } else {
         "in_proj_weight"
     };
-    let bias = vb.get(
+    let native = vb.native_linear_weight_with_shape(key, Some(dims))?;
+    let dtype = native
+        .as_ref()
+        .and_then(|op| op.checkpoint_bias_dtype())
+        .unwrap_or(vb.dtype());
+    let bias = vb.to_dtype(dtype).get(
         3 * width,
         if vb.contains_tensor("in_proj.bias") {
             "in_proj.bias"
@@ -28,7 +33,7 @@ pub(crate) fn attention_in_projection(vb: &VarBuilder, width: usize) -> CResult<
             "in_proj_bias"
         },
     )?;
-    let in_proj = match vb.native_linear_weight_with_shape(key, Some(dims))? {
+    let in_proj = match native {
         Some(op) if op.dims() == dims => Linear::from_native(op, Some(bias)),
         Some(op) => candle_audio::candle_core::bail!(
             "attention in_proj expected {dims:?}, got {:?}",

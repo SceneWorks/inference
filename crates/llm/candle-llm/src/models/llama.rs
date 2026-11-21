@@ -59,6 +59,7 @@ fn dense_tensor(
     dtype: DType,
     target_device: Option<&Device>,
 ) -> Result<Tensor> {
+    let dtype = w.parameter_dtype(key, dtype);
     if let Some(dense) = w.encoded_dense(key, dtype, target_device)? {
         return Ok(dense);
     }

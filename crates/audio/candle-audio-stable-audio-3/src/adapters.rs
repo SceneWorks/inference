@@ -928,6 +928,9 @@ impl candle_nn::linear::NativeLinearWeight for NativeLora {
         weight.to_dtype(base.dtype())
     }
 
+    fn checkpoint_bias_dtype(&self) -> Option<DType> {
+        self.base.checkpoint_bias_dtype()
+    }
     fn format_id(&self) -> &'static str {
         self.base.format_id()
     }

@@ -313,7 +313,9 @@ impl Gemma4VisionEmbedder {
         dtype: DType,
     ) -> Result<Self> {
         let vp = layout.vision_prefix();
-        let get = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
+        let get = |key: String| -> Result<Tensor> {
+            Ok(w.require(&key)?.to_dtype(w.parameter_dtype(&key, dtype))?)
+        };
 
         let pos = get(format!("{vp}.pos_embedding"))?;
         let shape = pos.dims().to_vec();

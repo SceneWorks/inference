@@ -76,7 +76,9 @@ pub struct StarCoder2 {
 impl StarCoder2 {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: StarCoder2Config) -> Result<Self> {
         let dtype = crate::device::compute_dtype(w.device());
-        let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
+        let req = |key: String| -> Result<Tensor> {
+            Ok(w.require(&key)?.to_dtype(w.parameter_dtype(&key, dtype))?)
+        };
         let key = |suffix: &str| join(prefix, suffix);
         let embed_tokens = req(key("model.embed_tokens.weight"))?;
         let expected_embedding_shape = [cfg.vocab_size, cfg.hidden_size];
@@ -347,7 +349,9 @@ impl StarCoder2Layer {
         dtype: DType,
     ) -> Result<Self> {
         let key = |suffix: &str| join(prefix, suffix);
-        let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
+        let req = |key: String| -> Result<Tensor> {
+            Ok(w.require(&key)?.to_dtype(w.parameter_dtype(&key, dtype))?)
+        };
         Ok(Self {
             input_norm_weight: req(key("input_layernorm.weight"))?,
             input_norm_bias: req(key("input_layernorm.bias"))?,
@@ -417,7 +421,9 @@ impl StarCoder2Attention {
         dtype: DType,
     ) -> Result<Self> {
         let key = |suffix: &str| join(prefix, suffix);
-        let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
+        let req = |key: String| -> Result<Tensor> {
+            Ok(w.require(&key)?.to_dtype(w.parameter_dtype(&key, dtype))?)
+        };
         Ok(Self {
             q_weight: w.linear(&key("q_proj.weight"), dtype, Some(req(key("q_proj.bias"))?))?,
             k_weight: w.linear(&key("k_proj.weight"), dtype, Some(req(key("k_proj.bias"))?))?,

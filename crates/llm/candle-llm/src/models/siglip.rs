@@ -256,8 +256,9 @@ struct SiglipAttention {
 impl SiglipAttention {
     fn from_weights(w: &Weights, prefix: &str, cfg: &SiglipVisionConfig) -> Result<Self> {
         let bias = |leaf: &str| -> Result<Option<Tensor>> {
-            match w.optional(&join(prefix, leaf))? {
-                Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+            let key = join(prefix, leaf);
+            match w.optional(&key)? {
+                Some(t) => Ok(Some(t.to_dtype(w.parameter_dtype(&key, DType::F32))?)),
                 None => Ok(None),
             }
         };
@@ -316,8 +317,9 @@ struct SiglipMlp {
 impl SiglipMlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let bias = |leaf: &str| -> Result<Option<Tensor>> {
-            match w.optional(&join(prefix, leaf))? {
-                Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+            let key = join(prefix, leaf);
+            match w.optional(&key)? {
+                Some(t) => Ok(Some(t.to_dtype(w.parameter_dtype(&key, DType::F32))?)),
                 None => Ok(None),
             }
         };

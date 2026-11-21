@@ -1009,6 +1009,44 @@ impl LogicalWeightReader {
             .map(|index| &self.plan.tensors[*index])
     }
 
+    /// ConvRot applies activation-dtype rounding to the bias at execution. Keep the original
+    /// floating operand so the same projection can receive inputs at different precisions.
+    pub fn projection_bias_dtype(&self, weight_key: &str) -> Option<DType> {
+        self.projection_bias_storage(weight_key)
+            .map(|(_, dtype)| dtype)
+    }
+
+    fn projection_bias_storage(&self, weight_key: &str) -> Option<(String, DType)> {
+        use ::safetensors::Dtype as StDtype;
+        let key = self.planned(weight_key)?.retained_convrot_bias_key()?;
+        let dtype = match self.st.get(&key).ok()?.dtype() {
+            StDtype::F32 | StDtype::F8_E4M3 | StDtype::F8_E5M2 => DType::F32,
+            StDtype::F16 => DType::F16,
+            StDtype::BF16 => DType::BF16,
+            _ => return None,
+        };
+        Some((key, dtype))
+    }
+
+    /// Read a bias whose native epilogue retains source precision. A mapped or split bias
+    /// follows its own logical row. A sparse plan keeps ordinary biases in the original mmap.
+    pub fn retained_projection_bias(
+        &self,
+        weight_key: &str,
+        bias_key: &str,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let Some((physical, dtype)) = self.projection_bias_storage(weight_key) else {
+            return Ok(None);
+        };
+        let bias = if self.planned(bias_key).is_some() {
+            self.read_dense(bias_key, dtype, device)?
+        } else {
+            self.st.load(&physical, device)?.to_dtype(dtype)?
+        };
+        Ok(Some(bias))
+    }
+
     /// Materialize one planned logical tensor through its codec and record what it keeps resident.
     pub fn read(&self, logical_key: &str) -> Result<LogicalTensor> {
         let decoded = self.prepare_operand(logical_key, None, &self.device)?;

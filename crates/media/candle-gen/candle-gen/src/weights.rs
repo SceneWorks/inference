@@ -314,6 +314,16 @@ impl Weights {
             let host = key.rsplit_once('.').is_some_and(|(base, suffix)| {
                 matches!(suffix, "weight" | "scales" | "biases") && packed_bases.contains(base)
             });
+            let dtype = key
+                .strip_suffix(".bias")
+                .and_then(|base| {
+                    source
+                        .as_ref()
+                        .ok()?
+                        .reader()
+                        .projection_bias_dtype(&format!("{base}.weight"))
+                })
+                .unwrap_or(dtype);
             let t = load_map_tensor(mmap, &key, if host { &Device::Cpu } else { device }, dtype)?;
             weights.map.insert(key, t);
         }
@@ -412,8 +422,9 @@ impl Weights {
             return Ok(None);
         }
         let (source, device, _) = self.source.as_ref().expect("owned projection source");
+        let bias_dtype = source.reader().projection_bias_dtype(&key).unwrap_or(dtype);
         let b = bias
-            .then(|| self.read_dense_with_shape(&format!("{base}.bias"), None, dtype))
+            .then(|| self.read_dense_with_shape(&format!("{base}.bias"), None, bias_dtype))
             .transpose()?;
         let op = match &self.projection_window_device {
             Some(destination) => source.host_fp8_linear(&key, shape, dtype, destination)?,

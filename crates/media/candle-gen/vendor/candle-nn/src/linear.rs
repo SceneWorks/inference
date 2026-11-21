@@ -30,6 +30,10 @@ pub trait NativeLinearWeight: Send + Sync {
     fn retained_coefficients(&self, _tensor: &Tensor) -> Result<()> {
         Ok(())
     }
+    /// Storage precision of the checkpoint bias when its epilogue rounds at execution.
+    fn checkpoint_bias_dtype(&self) -> Option<candle::DType> {
+        None
+    }
     fn compute_dtype(&self) -> candle::DType {
         candle::DType::BF16
     }
@@ -81,11 +85,17 @@ impl Linear {
     /// Read the checkpoint's own matrix geometry. Dimensioned constructors continue validating
     /// the caller's expectation; this form is for architectures whose matrix width is inferred.
     pub fn from_var_builder(vb: &crate::VarBuilder<'_>, with_bias: bool) -> Result<Self> {
-        let bias = with_bias.then(|| vb.get_unchecked("bias")).transpose()?;
         if let Some(op) = vb.native_linear_weight("weight")? {
-            let bias = bias.map(|b| b.to_device(op.device())).transpose()?;
+            let dtype = op.checkpoint_bias_dtype().unwrap_or(vb.dtype());
+            let bias = with_bias
+                .then(|| {
+                    vb.get_unchecked_dtype("bias", dtype)?
+                        .to_device(op.device())
+                })
+                .transpose()?;
             return Ok(Self::from_native(op, bias));
         }
+        let bias = with_bias.then(|| vb.get_unchecked("bias")).transpose()?;
         let weight = vb.get_unchecked("weight")?;
         weight.dims2()?;
         Ok(Self::new(weight, bias))
@@ -257,13 +267,18 @@ impl super::Module for Linear {
 pub fn linear(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Linear> {
     let mut layer = linear_no_bias(in_dim, out_dim, vb.clone())?;
     let bound = 1. / (in_dim as f64).sqrt();
-    let bs = vb.get_with_hints(
+    let dtype = layer
+        .native_weight()
+        .and_then(|op| op.checkpoint_bias_dtype())
+        .unwrap_or(vb.dtype());
+    let bs = vb.get_with_hints_dtype(
         out_dim,
         "bias",
         crate::Init::Uniform {
             lo: -bound,
             up: bound,
         },
+        dtype,
     )?;
     layer.bias = Some(bs.to_device(layer.device())?);
     Ok(layer)
