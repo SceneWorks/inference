@@ -540,6 +540,11 @@ impl MappedWeights {
 #[derive(Debug, Clone)]
 pub enum SourceView {
     Whole(String),
+    Transposed(String),
+    Reshape {
+        name: String,
+        shape: Vec<usize>,
+    },
     Rows {
         name: String,
         first: usize,
@@ -554,7 +559,11 @@ pub enum SourceView {
 impl SourceView {
     fn name(&self) -> &str {
         match self {
-            Self::Whole(name) | Self::Rows { name, .. } | Self::Matrix { name, .. } => name,
+            Self::Whole(name)
+            | Self::Transposed(name)
+            | Self::Reshape { name, .. }
+            | Self::Rows { name, .. }
+            | Self::Matrix { name, .. } => name,
         }
     }
 }
@@ -595,6 +604,8 @@ impl SimpleBackend for Remapped {
                     .read_dense(logical, dtype, dev)?;
                 return match view {
                     SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
+                    SourceView::Transposed(_) => t.t()?.contiguous(),
+                    SourceView::Reshape { shape, .. } => t.reshape(shape.as_slice()),
                     _ => Ok(t),
                 };
             }
@@ -604,6 +615,8 @@ impl SimpleBackend for Remapped {
             SourceView::Whole(_) => Ok(t),
             SourceView::Rows { first, rows, .. } => t.narrow(0, *first, *rows)?.contiguous(),
             SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
+            SourceView::Transposed(_) => t.t()?.contiguous(),
+            SourceView::Reshape { shape, .. } => t.reshape(shape.as_slice()),
         }
     }
     fn get(&self, shape: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
@@ -634,6 +647,23 @@ impl SimpleBackend for Remapped {
         let MappedWeights::Checkpoint(src) = &self.source else {
             return Ok(None);
         };
+        if matches!(view, SourceView::Transposed(_)) {
+            let stored = src.mmap().get(physical)?;
+            let [cols, rows] = stored.shape() else {
+                candle_core::bail!("{name}: transposed projection requires a matrix");
+            };
+            let dims = (*rows, *cols);
+            if shape.is_some_and(|expected| expected != dims) {
+                candle_core::bail!(
+                    "{name}: transposed projection has shape {dims:?}, expected {shape:?}"
+                );
+            }
+            return src.native_linear_weight_transposed(physical, dims, dtype, dev);
+        }
+        if matches!(view, SourceView::Reshape { .. }) {
+            // Matrix contractions use SourceView::Matrix, which declares the exact geometry.
+            return Ok(None);
+        }
         if let SourceView::Matrix { rows, cols, .. } = view {
             if shape.is_some_and(|s| s != (*rows, *cols)) {
                 candle_core::bail!(
