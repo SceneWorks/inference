@@ -68,14 +68,79 @@ pub fn projected_checkpoint_bytes(
     policy: &dyn CodecResidencyPolicy,
     native_matrix: impl Fn(&str, &[usize]) -> bool,
 ) -> crate::Result<BTreeMap<String, u64>> {
+    let Some(plan) = projected_checkpoint_plan(
+        paths,
+        headers,
+        |_| true,
+        policy,
+        |key, shape| native_matrix(key, shape).then(|| shape.to_vec()),
+    )?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    projected_bytes_from_plan(&plan, headers, dense_width)
+}
+
+/// Price the same compiled source under a consumer's actual coefficient widths.
+pub fn projected_bytes_from_plan(
+    plan: &LogicalWeightPlan,
+    headers: &[SafetensorsTensorHeader],
+    dense_width: impl Fn(&SafetensorsTensorHeader) -> u64,
+) -> crate::Result<BTreeMap<String, u64>> {
+    let physical: BTreeMap<_, _> = headers.iter().map(|h| (h.name.as_str(), h)).collect();
+    let mut bytes = BTreeMap::new();
+    for row in &plan.tensors {
+        let header = physical.get(row.physical_key.as_str()).ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "missing projected source header {}",
+                row.physical_key
+            ))
+        })?;
+        let width = dense_width(header);
+        let resident = match row.residency.mode {
+            _ if width == 0 => 0,
+            ResidencyMode::Packed => row.residency.resident_bytes,
+            ResidencyMode::Dense => row
+                .shape
+                .iter()
+                .try_fold(width, |count, &extent| count.checked_mul(extent as u64))
+                .ok_or_else(|| {
+                    crate::Error::Msg(format!(
+                        "{}: dense checkpoint resident byte count overflow",
+                        row.physical_key
+                    ))
+                })?,
+        };
+        bytes.insert(row.physical_key.clone(), resident);
+    }
+    for c in &plan.companions {
+        let retained = if bytes[&c.owner_physical_key] == 0 {
+            0
+        } else {
+            c.resident_bytes
+        };
+        bytes.insert(c.physical_key.clone(), retained);
+    }
+    Ok(bytes)
+}
+
+/// Compile projection rows selected by their actual operator. A component can separately
+/// own other encodings (e.g. H3 W4A8) or consume an otherwise eligible matrix as coefficients.
+pub fn projected_checkpoint_plan(
+    paths: &[PathBuf],
+    headers: &[SafetensorsTensorHeader],
+    selected: impl Fn(&str) -> bool,
+    policy: &dyn CodecResidencyPolicy,
+    matrix_shape: impl Fn(&str, &[usize]) -> Option<Vec<usize>>,
+) -> crate::Result<Option<LogicalWeightPlan>> {
     if !headers.iter().any(|h| {
         matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::I8)
             || h.name.ends_with(".comfy_quant")
     }) {
-        return Ok(BTreeMap::new());
+        return Ok(None);
     }
     struct Consumer<'a, F>(&'a dyn CodecResidencyPolicy, F);
-    impl<F: Fn(&str, &[usize]) -> bool> CodecResidencyPolicy for Consumer<'_, F> {
+    impl<F: Fn(&str, &[usize]) -> Option<Vec<usize>>> CodecResidencyPolicy for Consumer<'_, F> {
         fn residency(
             &self,
             codec: &CheckpointCodecRegistration,
@@ -91,8 +156,8 @@ pub fn projected_checkpoint_bytes(
             spec: &TensorCodecSpec,
             shape: &[usize],
         ) -> ResidencyMode {
-            if (self.1)(key, shape) {
-                self.0.residency_for_key(key, codec, spec, shape)
+            if let Some(matrix) = (self.1)(key, shape) {
+                self.0.residency_for_key(key, codec, spec, &matrix)
             } else {
                 ResidencyMode::Dense
             }
@@ -115,46 +180,14 @@ pub fn projected_checkpoint_bytes(
     }
     let registry = CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied())
         .expect("valid baseline checkpoint codecs");
-    let Some(plan) = plan_projection_source_headers(
+    plan_projection_source_headers(
         headers,
         &descriptors,
-        |_| true,
+        selected,
         &tables,
         &registry,
-        &Consumer(policy, native_matrix),
-    )?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let physical: BTreeMap<_, _> = headers.iter().map(|h| (h.name.as_str(), h)).collect();
-    let mut bytes = BTreeMap::new();
-    for row in &plan.tensors {
-        let width = dense_width(physical[row.physical_key.as_str()]);
-        let resident = match row.residency.mode {
-            _ if width == 0 => 0,
-            ResidencyMode::Packed => row.residency.resident_bytes,
-            ResidencyMode::Dense => row
-                .shape
-                .iter()
-                .try_fold(width, |count, &extent| count.checked_mul(extent as u64))
-                .ok_or_else(|| {
-                    crate::Error::Msg(format!(
-                        "{}: dense checkpoint resident byte count overflow",
-                        row.physical_key
-                    ))
-                })?,
-        };
-        bytes.insert(row.physical_key.clone(), resident);
-    }
-    for c in plan.companions {
-        let retained = if bytes[&c.owner_physical_key] == 0 {
-            0
-        } else {
-            c.resident_bytes
-        };
-        bytes.insert(c.physical_key, retained);
-    }
-    Ok(bytes)
+        &Consumer(policy, matrix_shape),
+    )
 }
 
 /// Inspect the encoded operands of a complete source before a model importer chooses a dialect.

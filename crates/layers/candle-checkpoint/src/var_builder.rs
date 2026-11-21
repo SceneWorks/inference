@@ -125,6 +125,55 @@ impl ProjectionSource {
             .map(|op| candle_nn::Linear::from_native(op, bias)))
     }
 
+    /// A streamed block keeps the original encoded operand on the host until its window opens.
+    /// The destination policy selects the codec; an unsupported destination uses the caller's
+    /// ordinary dense preparation. No execution receipt is published until the device binds it.
+    pub fn host_fp8_linear(
+        &self,
+        key: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        destination: &Device,
+    ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
+        #[cfg(feature = "cuda")]
+        {
+            let source = self.on_device(destination)?;
+            if !source.reader().has_native_projection(key) {
+                return Ok(None);
+            }
+            let row = source.reader().planned(key).expect("selected logical row");
+            let dims = match (shape, row.shape.as_slice()) {
+                (Some((n, k)), _) => (n, k),
+                (None, [n, k]) if row.undeclared_padded_storage().is_none() => (*n, *k),
+                _ => {
+                    candle_core::bail!("{key}: host projection requires logical matrix dimensions")
+                }
+            };
+            source
+                .reader()
+                .validate_matrix_shape(key, [dims.0, dims.1])?;
+            let operand = source
+                .reader()
+                .prepare_operand(key, Some(dims), &Device::Cpu)?;
+            let layer = SourceLinear {
+                key: key.into(),
+                dtype,
+                format_id: row.codec_id,
+                resident_bytes: operand.resident_bytes(),
+                transpose: false,
+                first_row: None,
+                op: NativeOp::HostFp8 { operand, dims },
+                source,
+            };
+            Ok(Some(Arc::new(layer)))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (key, shape, dtype, destination);
+            Ok(None)
+        }
+    }
+
     /// Select a contiguous physical row range from a stack of equally shaped scalar-FP8 matrices.
     pub fn native_linear_slice(
         &self,
@@ -264,6 +313,10 @@ impl ProjectionSource {
 
 #[cfg(feature = "cuda")]
 enum NativeOp {
+    HostFp8 {
+        operand: crate::logical_weights::LogicalTensor,
+        dims: (usize, usize),
+    },
     Fp8(candle_quant_kernels::fp8_linear::Fp8Linear),
     ConvRot(candle_quant_kernels::convrot_int8::ConvRotLinear),
 }
@@ -297,6 +350,10 @@ impl SourceLinear {
 impl NativeLinearWeight for SourceLinear {
     fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         match &self.op {
+            NativeOp::HostFp8 { .. } => candle_core::bail!(
+                "{}: streamed host projection must enter its execution window",
+                self.key
+            ),
             NativeOp::ConvRot(op) => match bias {
                 Some(b) => op.forward_with_bias(x, b),
                 None => op.forward(x),
@@ -309,6 +366,28 @@ impl NativeLinearWeight for SourceLinear {
     }
     fn relocated(&self, dev: &Device) -> Result<candle_nn::Linear> {
         let source = self.source.on_device(dev)?;
+        if let NativeOp::HostFp8 { operand, dims } = &self.op {
+            if source.reader().has_native_projection(&self.key) {
+                let op = source.reader().bind_fp8_operand(
+                    &self.key,
+                    operand,
+                    None,
+                    Some(*dims),
+                    false,
+                )?;
+                let layer = SourceLinear {
+                    op: NativeOp::Fp8(op),
+                    source,
+                    key: self.key.clone(),
+                    dtype: self.dtype,
+                    format_id: self.format_id,
+                    resident_bytes: self.resident_bytes,
+                    transpose: false,
+                    first_row: None,
+                };
+                return Ok(candle_nn::Linear::from_native(Arc::new(layer), None));
+            }
+        }
         if let Some(first) = self.first_row {
             let (rows, cols) = self.dims();
             if let Some(layer) =
@@ -374,12 +453,14 @@ impl NativeLinearWeight for SourceLinear {
     }
     fn dims(&self) -> (usize, usize) {
         match &self.op {
+            NativeOp::HostFp8 { dims, .. } => *dims,
             NativeOp::Fp8(op) => op.dims(),
             NativeOp::ConvRot(op) => (op.descriptor().out_features, op.descriptor().in_features),
         }
     }
     fn device(&self) -> &Device {
         match &self.op {
+            NativeOp::HostFp8 { .. } => &Device::Cpu,
             NativeOp::Fp8(op) => op.device(),
             NativeOp::ConvRot(op) => op.device(),
         }
@@ -566,16 +647,71 @@ impl MappedWeights {
         dtype: DType,
         dev: &Device,
     ) -> Result<candle_nn::Linear> {
-        let w = format!("{base}.weight");
-        let b = bias
+        self.linear_shaped(base, bias, dtype, dev, None)
+    }
+
+    /// Bind an explicitly shaped projection, including a flattened patch projection.
+    /// A checkpoint may store the original spatial kernel or its canonical 2-D matrix.
+    pub fn linear_shaped(
+        &self,
+        base: &str,
+        bias: bool,
+        dtype: DType,
+        dev: &Device,
+        shape: Option<&[usize]>,
+    ) -> Result<candle_nn::Linear> {
+        let key = format!("{base}.weight");
+        let bias = bias
             .then(|| self.read(&format!("{base}.bias"), dtype, dev))
             .transpose()?;
+        let dims = shape
+            .map(|shape| {
+                let [n, tail @ ..] = shape else {
+                    candle_core::bail!("{key}: expected a projection shape")
+                };
+                if tail.is_empty() {
+                    candle_core::bail!("{key}: missing contraction dimensions");
+                }
+                let k = tail
+                    .iter()
+                    .try_fold(1usize, |k, &d| k.checked_mul(d))
+                    .ok_or_else(|| Error::Msg(format!("{key}: contraction overflow")))?;
+                Ok((*n, k))
+            })
+            .transpose()?;
         if let Self::Checkpoint(src) = self {
-            if let Some(layer) = src.native_linear(&w, dtype, dev, b.clone())? {
-                return Ok(layer);
+            if let (Some((n, k)), Some(row)) = (dims, src.reader().planned(&key)) {
+                if row.shape.len() == 2 {
+                    src.reader().validate_matrix_shape(&key, [n, k])?;
+                }
+            }
+            let op = match shape {
+                Some(shape) if shape.len() > 2 => {
+                    src.native_linear_weight_flattened(&key, shape, dtype, dev)?
+                }
+                _ => src.native_linear_weight(&key, dims, dtype, dev)?,
+            };
+            if let Some(op) = op {
+                return Ok(candle_nn::Linear::from_native(op, bias));
+            }
+            if let Some(row) = src.reader().planned(&key) {
+                if row.shape.len() == 2 {
+                    let weight = src.reader().read_dense_with_shape(&key, dims, dtype, dev)?;
+                    if dims.is_some_and(|(n, k)| weight.dims() != [n, k]) {
+                        candle_core::bail!("{key}: expected {dims:?}, got {:?}", weight.dims());
+                    }
+                    return Ok(candle_nn::Linear::new(weight, bias));
+                }
             }
         }
-        Ok(candle_nn::Linear::new(self.read(&w, dtype, dev)?, b))
+        let mut weight = self.read(&key, dtype, dev)?;
+        if let (Some(shape), Some((n, k))) = (shape, dims) {
+            if weight.dims() != shape && weight.dims() != [n, k] {
+                candle_core::bail!("{key}: expected {shape:?}, got {:?}", weight.dims());
+            }
+            weight = weight.reshape((n, k))?;
+        }
+        Ok(candle_nn::Linear::new(weight, bias))
     }
 }
 
@@ -844,6 +980,174 @@ pub fn mmap_var_builder_with_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_convrot_projection_does_not_publish_packed_execution() {
+        use safetensors::tensor::TensorView;
+        let codes = [0u8; 16 * 64];
+        let scales = 1f32.to_le_bytes().repeat(16);
+        let desc = br#"{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":64}"#;
+        let bytes = safetensors::tensor::serialize(
+            [
+                (
+                    "p.weight",
+                    TensorView::new(Dtype::I8, vec![16, 64], &codes).unwrap(),
+                ),
+                (
+                    "p.weight_scale",
+                    TensorView::new(Dtype::F32, vec![16, 1], &scales).unwrap(),
+                ),
+                (
+                    "p.comfy_quant",
+                    TensorView::new(Dtype::U8, vec![desc.len()], desc).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        let scope = gen_core::CheckpointReceiptScope::default();
+        scope.with(|| {
+            let st = MmapedSafetensors::from_buffers([Ok(bytes)]).unwrap();
+            let policy = CandleCodecResidency::from_cuda_compute_cap((12, 0));
+            let headers = st
+                .tensors()
+                .into_iter()
+                .map(
+                    |(name, view)| gen_core::weightsmeta::SafetensorsTensorHeader {
+                        name,
+                        dtype: gen_core::weightsmeta::Dtype::parse(&format!("{:?}", view.dtype()))
+                            .unwrap(),
+                        shape: view.shape().to_vec(),
+                        data_bytes: view.data().len() as u64,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let descriptors = BTreeMap::from([("p.comfy_quant".into(), desc.to_vec())]);
+            let plan = gen_core::checkpoint_codec::plan_projection_source_headers(
+                &headers,
+                &descriptors,
+                |_| true,
+                &[],
+                baseline_codec_registry(),
+                &policy,
+            )
+            .unwrap()
+            .unwrap();
+            let reader = LogicalWeightReader::from_mapped(
+                Arc::new(st),
+                plan,
+                &Device::Cpu,
+                policy.native_execution_capability(),
+                &[],
+            );
+            let bad_bias = Tensor::zeros(15, DType::F32, &Device::Cpu).unwrap();
+            let err = reader
+                .convrot_projection("p.weight", Some(bad_bias))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid ConvRot bias"), "{err}");
+            assert!(scope.try_snapshots().unwrap().is_empty());
+        });
+    }
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn prepared_fp8_window_keeps_source_operands_until_device_binding() {
+        use safetensors::tensor::TensorView;
+        // Simulate only the destination policy. Every tensor actually allocated by this test
+        // is on CPU; no CUDA handle, runtime kernel or module forward is invoked.
+        for (encoding, format) in [
+            (
+                Dtype::F8_E4M3,
+                gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id,
+            ),
+            (
+                Dtype::F8_E5M2,
+                gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id,
+            ),
+        ] {
+            let codes = [0x3c; 16 * 32];
+            let weight_scale = 0.5_f32.to_le_bytes();
+            let input_scale = 2.0_f32.to_le_bytes();
+            let bytes = safetensors::tensor::serialize(
+                [
+                    (
+                        "proj.weight",
+                        TensorView::new(encoding, vec![16, 32], &codes).unwrap(),
+                    ),
+                    (
+                        "proj.weight_scale",
+                        TensorView::new(Dtype::F32, vec![], &weight_scale).unwrap(),
+                    ),
+                    (
+                        "proj.input_scale",
+                        TensorView::new(Dtype::F32, vec![], &input_scale).unwrap(),
+                    ),
+                ],
+                None,
+            )
+            .unwrap();
+            let scope = gen_core::CheckpointReceiptScope::default();
+            scope.with(|| {
+                let st = MmapedSafetensors::from_buffers([Ok(bytes)]).unwrap();
+                let cpu = ProjectionSource::from_mapped(st, &[], &Device::Cpu)
+                    .unwrap()
+                    .ok()
+                    .unwrap();
+                let policy = CandleCodecResidency::from_cuda_compute_cap((12, 0));
+                let plan = cpu
+                    .1
+                    .headers
+                    .compile(&cpu.1.mapping, baseline_codec_registry(), &policy)
+                    .unwrap();
+                let target = ProjectionSource(
+                    Arc::new(LogicalWeightReader::from_mapped(
+                        cpu.0.st.clone(),
+                        plan,
+                        &Device::Cpu,
+                        policy.native_execution_capability(),
+                        &[],
+                    )),
+                    cpu.1,
+                );
+                assert!(target
+                    .host_fp8_linear("proj.weight", Some((32, 16)), DType::F32, &Device::Cpu)
+                    .is_err());
+                let prepared = target
+                    .host_fp8_linear("proj.weight", Some((16, 32)), DType::F32, &Device::Cpu)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(prepared.format_id(), format);
+                assert_eq!(prepared.resident_bytes(), 16 * 32 + 8);
+                assert_eq!(prepared.dims(), (16, 32));
+                assert_eq!(prepared.compute_dtype(), DType::F32);
+                let raw = target
+                    .reader()
+                    .prepare_operand("proj.weight", Some((16, 32)), &Device::Cpu)
+                    .unwrap();
+                let crate::logical_weights::LogicalTensor::PackedScalarFp8 {
+                    codes,
+                    weight_scale,
+                    input_scale,
+                    ..
+                } = raw
+                else {
+                    panic!("expected original FP8 operand")
+                };
+                assert_eq!(weight_scale, 0.5);
+                assert_eq!(input_scale, Some(2.0));
+                assert_eq!(codes.device().location(), Device::Cpu.location());
+                assert_eq!(
+                    codes.dtype(),
+                    if encoding == Dtype::F8_E5M2 {
+                        DType::U8
+                    } else {
+                        DType::F8E4M3
+                    }
+                );
+                assert!(scope.try_snapshots().unwrap().is_empty());
+            });
+        }
+    }
+
     #[test]
     fn remapped_dense_mxfp8_uses_the_callers_unpadded_dimensions() {
         use safetensors::tensor::TensorView;

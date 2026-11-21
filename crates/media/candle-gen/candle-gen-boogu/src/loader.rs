@@ -151,6 +151,50 @@ impl Weights {
         }
     }
 
+    pub(crate) fn vector_len(&self, name: &str) -> Result<usize> {
+        let shape = match &self.storage {
+            WeightStorage::Mmap(st) => st.mmap().get(name)?.shape().to_vec(),
+            WeightStorage::Owned(tensors) => tensors
+                .get(name)
+                .ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(format!("missing tensor {name}"))
+                })?
+                .dims()
+                .to_vec(),
+        };
+        match shape.as_slice() {
+            [n] => Ok(*n),
+            _ => candle_gen::candle_core::bail!("{name}: expected a vector, got {shape:?}"),
+        }
+    }
+
+    /// Native or dense projection at the vision tower's F32 precision, independent
+    /// of the language model's store dtype. Owned training tensors retain their graph.
+    pub(crate) fn vision_projection(
+        &self,
+        base: &str,
+        bias: bool,
+        shape: Option<&[usize]>,
+    ) -> Result<Linear> {
+        if let WeightStorage::Mmap(st) = &self.storage {
+            return st.linear_shaped(base, bias, DType::F32, self.device(), shape);
+        }
+        let mut weight = self.get_f32(&format!("{base}.weight"))?;
+        if let Some(shape) = shape {
+            if weight.dims() != shape {
+                candle_gen::candle_core::bail!(
+                    "{base}: expected {shape:?}, got {:?}",
+                    weight.dims()
+                );
+            }
+            weight = weight.flatten_from(1)?;
+        }
+        let bias = bias
+            .then(|| self.get_f32(&format!("{base}.bias")))
+            .transpose()?;
+        Ok(Linear::new(weight, bias))
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         match &self.storage {
             WeightStorage::Mmap(st) => st.mmap().get(name).is_ok(),

@@ -648,23 +648,27 @@ impl LogicalWeightReader {
         {
             return Ok(None);
         }
+        let operand = self.prepare_operand(key, None, &self.device)?;
+        let bytes = operand.resident_bytes();
         let LogicalTensor::PackedConvRot {
             codes,
             scales,
             geometry,
-        } = self.read(key)?
+        } = operand
         else {
             candle_core::bail!("{key}: expected ConvRot operands")
         };
-        Ok(Some(
-            candle_quant_kernels::convrot_int8::ConvRotLinear::from_native_parts(
-                &self.resources,
-                geometry,
-                codes,
-                scales,
-                bias,
-            )?,
-        ))
+        let op = candle_quant_kernels::convrot_int8::ConvRotLinear::from_native_parts(
+            &self.resources,
+            geometry,
+            codes,
+            scales,
+            bias,
+        )?;
+        self.accounting
+            .record(key, ExecutionRepresentation::NativePacked, bytes)
+            .map_err(CandleError::wrap)?;
+        Ok(Some(op))
     }
 
     /// Whether the native projection constructor owns this row of the compiled plan.
@@ -712,9 +716,6 @@ impl LogicalWeightReader {
         if !self.has_native_projection(key) {
             return Ok(None);
         }
-        use candle_quant_kernels::fp8_linear::Fp8Linear;
-        let ctx = self.resources.int8_context(&self.device)?;
-        let lt = ctx.handle_for(&self.device)?.clone();
         if transpose
             && !self
                 .planned(key)
@@ -722,7 +723,42 @@ impl LogicalWeightReader {
         {
             return Ok(None);
         }
-        let layer = match self.read_with_shape(key, shape)? {
+        let operand = self.prepare_operand(key, shape, &self.device)?;
+        self.bind_fp8_operand(key, &operand, bias, shape, transpose)
+            .map(Some)
+    }
+
+    /// Prepare the exact frozen operand once, either on the execution device or on the host
+    /// for a bounded block window. Preparation alone does not report a model projection.
+    pub(crate) fn prepare_operand(
+        &self,
+        key: &str,
+        shape: Option<(usize, usize)>,
+        device: &Device,
+    ) -> Result<LogicalTensor> {
+        let row = self.planned(key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "logical weight read: `{key}` has no entry in the compiled plan (mapping {})",
+                self.plan.mapping_id
+            ))
+        })?;
+        let row = Self::shaped_row(row, shape)?;
+        decode(&self.st, &row, device, DType::BF16)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn bind_fp8_operand(
+        &self,
+        key: &str,
+        operand: &LogicalTensor,
+        bias: Option<Tensor>,
+        shape: Option<(usize, usize)>,
+        transpose: bool,
+    ) -> Result<candle_quant_kernels::fp8_linear::Fp8Linear> {
+        use candle_quant_kernels::fp8_linear::Fp8Linear;
+        let ctx = self.resources.int8_context(&self.device)?;
+        let lt = ctx.handle_for(&self.device)?.clone();
+        let layer = match operand {
             LogicalTensor::PackedScalarFp8 {
                 codes,
                 weight_scale,
@@ -732,7 +768,7 @@ impl LogicalWeightReader {
                 let codes = if transpose {
                     codes.t()?.contiguous()?
                 } else {
-                    codes
+                    codes.clone()
                 };
                 if shape.is_some_and(|(n, k)| codes.dims() != [n, k]) {
                     candle_core::bail!(
@@ -740,10 +776,11 @@ impl LogicalWeightReader {
                         codes.dims()
                     );
                 }
+                let codes = codes.to_device(&self.device)?;
                 if codes.dtype() == DType::U8 {
-                    Fp8Linear::from_e5m2_parts(codes, weight_scale, input_scale, bias, lt)?
+                    Fp8Linear::from_e5m2_parts(codes, *weight_scale, *input_scale, bias, lt)?
                 } else {
-                    Fp8Linear::from_parts(codes, weight_scale, input_scale, bias, lt)?
+                    Fp8Linear::from_parts(codes, *weight_scale, *input_scale, bias, lt)?
                 }
             }
             LogicalTensor::PackedRowwiseFp8 { codes, scales } => {
@@ -751,7 +788,7 @@ impl LogicalWeightReader {
                     candle_core::bail!("{key}: FP8R source shape/orientation mismatch");
                 }
                 Fp8Linear::from_rowwise_parts(
-                    codes,
+                    codes.to_device(&self.device)?,
                     &scales.to_device(&Device::Cpu)?.to_vec1::<f32>()?,
                     bias,
                     lt,
@@ -761,10 +798,23 @@ impl LogicalWeightReader {
                 codes,
                 scales,
                 logical,
-            } => Fp8Linear::from_mxfp8_parts(codes, scales, logical, bias, lt)?,
+            } => Fp8Linear::from_mxfp8_parts(
+                codes.to_device(&self.device)?,
+                scales.to_device(&self.device)?,
+                *logical,
+                bias,
+                lt,
+            )?,
             _ => candle_core::bail!("{key}: expected packed FP8 projection"),
         };
-        Ok(Some(layer))
+        self.accounting
+            .record(
+                key,
+                ExecutionRepresentation::NativePacked,
+                operand.resident_bytes(),
+            )
+            .map_err(CandleError::wrap)?;
+        Ok(layer)
     }
 
     #[cfg(feature = "cuda")]
@@ -961,23 +1011,8 @@ impl LogicalWeightReader {
 
     /// Materialize one planned logical tensor through its codec and record what it keeps resident.
     pub fn read(&self, logical_key: &str) -> Result<LogicalTensor> {
-        self.read_with_shape(logical_key, None)
-    }
-
-    fn read_with_shape(
-        &self,
-        logical_key: &str,
-        shape: Option<(usize, usize)>,
-    ) -> Result<LogicalTensor> {
-        let tensor = self.planned(logical_key).ok_or_else(|| {
-            CandleError::Msg(format!(
-                "logical weight read: `{logical_key}` has no entry in the compiled plan \
-                 (mapping {})",
-                self.plan.mapping_id
-            ))
-        })?;
-        let tensor = Self::shaped_row(tensor, shape)?;
-        let decoded = decode(&self.st, &tensor, &self.device, DType::BF16)?;
+        let decoded = self.prepare_operand(logical_key, None, &self.device)?;
+        let tensor = self.planned(logical_key).expect("prepared logical row");
         let repr = if tensor.residency.mode == ResidencyMode::Packed {
             ExecutionRepresentation::NativePacked
         } else {

@@ -23,7 +23,9 @@ pub use warm_estimate::{video_warm_estimate, VideoWarmEstimate, VideoWarmWeights
 // Shared with the MiniMax-H3-Image contract (SW-7095): the same block stack, loaders and adapter
 // install, priced by the same header-only inventory.
 pub(crate) use adapters::profile_for as adapter_profile_for;
-pub(crate) use streaming::{dit_window_for, runtime_payloads, text_encoder_stream};
+pub(crate) use streaming::{
+    dit_window_for, runtime_payloads, text_encoder_stream, text_fp8_work, text_payloads,
+};
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;

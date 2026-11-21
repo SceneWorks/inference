@@ -69,6 +69,7 @@ pub struct Weights {
     /// The device the set is *destined for* when some tensors were deliberately left on the host
     /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
     target: Option<Device>,
+    projection_window_device: Option<Device>,
 }
 
 /// Decode a little-endian F32 plane into its `f32` values, for value-validating native scale and
@@ -389,6 +390,13 @@ impl Weights {
         self.native_linear_shaped(base, bias, None, *dtype)
     }
 
+    /// Prepare native FP8 operands on the host for byte-preserving windows on this device.
+    pub fn stage_projection_windows(&mut self, device: &Device) {
+        if self.device().is_some_and(Device::is_cpu) {
+            self.projection_window_device = Some(device.clone());
+        }
+    }
+
     /// Construct the encoded matrix at the consumer's logical size and compute dtype.
     /// MXFP8's tile padding alone cannot identify either logical dimension.
     pub fn native_linear_shaped(
@@ -407,7 +415,11 @@ impl Weights {
         let b = bias
             .then(|| self.read_dense_with_shape(&format!("{base}.bias"), None, dtype))
             .transpose()?;
-        let layer = match source.native_linear_weight(&key, shape, dtype, device)? {
+        let op = match &self.projection_window_device {
+            Some(destination) => source.host_fp8_linear(&key, shape, dtype, destination)?,
+            None => source.native_linear_weight(&key, shape, dtype, device)?,
+        };
+        let layer = match op {
             Some(op) => candle_nn::Linear::from_native(op, b),
             None => candle_nn::Linear::new(self.read_dense_with_shape(&key, shape, dtype)?, b),
         };
@@ -521,6 +533,7 @@ impl Weights {
             companion_keys: Default::default(),
             projection_resources: Default::default(),
             target: None,
+            projection_window_device: None,
         }
     }
 

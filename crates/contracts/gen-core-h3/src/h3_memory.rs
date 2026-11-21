@@ -267,6 +267,7 @@ fn allocation_with_fp8(
     let mut projections = Vec::new();
     let mut copied_native_companions = 0u64;
     let mut encoded_bytes = BTreeMap::new();
+    let mut native_fp8 = false;
     if headers.iter().any(is_fp8_operand) {
         use gen_core::checkpoint_codec::*;
         let registry = CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied())
@@ -277,6 +278,7 @@ fn allocation_with_fp8(
         {
             for t in plan.tensors {
                 let bytes = if t.residency.mode == ResidencyMode::Packed {
+                    native_fp8 = true;
                     t.residency.resident_bytes
                 } else {
                     let w = encoded_head_width(&t.physical_key, &by_name)
@@ -548,13 +550,20 @@ fn allocation_with_fp8(
             .checked_add(4 * g * g)
             .ok_or_else(|| invalid("rotation byte overflow"))?;
     }
-    if !projections.is_empty() {
+    if native_fp8 || !projections.is_empty() {
         if let NativeBackend::Candle {
             workspace_bytes, ..
         } = backend
         {
             resident_bytes = resident_bytes
                 .checked_add(workspace_bytes)
+                .and_then(|n| {
+                    if native_fp8 && projections.iter().any(|p| p.w4a8) {
+                        n.checked_add(workspace_bytes)
+                    } else {
+                        Some(n)
+                    }
+                })
                 .ok_or_else(|| invalid("workspace byte overflow"))?;
         }
     }
@@ -1165,8 +1174,15 @@ impl NativeAllocationFactsInternal for NativeAllocationFacts {
             .projections
             .iter()
             .fold(0u64, |n, p| n.saturating_add(p.descriptor_bytes));
+        let fp8 = task
+            .window
+            .as_ref()
+            .map(|w| w.fp8_precompute_bytes(rows))
+            .transpose()?
+            .unwrap_or(0);
         Ok(task.constructor_bytes.max(
             task.resident_bytes
+                .saturating_add(fp8)
                 .saturating_add(descriptors.max(refiner.max(tables.saturating_add(precompute)))),
         ))
     }

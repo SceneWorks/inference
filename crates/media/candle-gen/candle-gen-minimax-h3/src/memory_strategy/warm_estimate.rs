@@ -20,7 +20,7 @@ use candle_gen::gen_core::{Error as CoreError, GenerationRequest, MemoryProvider
 use gen_core_h3::h3_memory::NativeAllocationFactsExt;
 
 use crate::image_memory_strategy::admission::{
-    block_working_bytes, header_bytes, minimax_vision_dims, VISION_PATCH,
+    block_working_bytes, minimax_vision_dims, VISION_PATCH,
 };
 use crate::MODEL_ID;
 
@@ -115,19 +115,18 @@ pub fn video_warm_estimate(
     // --- conditioning: the vision tower (fl2va / ref2va), then the layer-50 tap ----------------
     let te_cfg = crate::text_encoder::MiniMaxH3TeConfig::from_component_dir(te_dir)
         .map_err(|e| CoreError::Unsupported(e.to_string()))?;
-    let (payload, _, te_decode) = super::runtime_payloads(te_dir, true)?;
+    let payloads = super::text_payloads(te_dir)?;
     // `text_encoder_stream` folds the vision tower into the conditioner's root at its runtime
     // width; the tower is loaded f32 (`crate::text_encoder::load_vision_tower`), so it is taken
     // back out there and priced from its headers at four bytes per element.
     let vision_runtime = add_all(
-        payload
+        payloads
+            .by_name
             .iter()
             .filter(|(name, _)| name.starts_with(crate::text_encoder::VISION_PREFIX))
             .map(|(_, &bytes)| bytes),
     )?;
-    let vision_bytes = header_bytes(te_dir, 4, |name| {
-        name.starts_with(crate::text_encoder::VISION_PREFIX)
-    })?;
+    let vision_bytes = vision_runtime;
     let weights = warm_weights(
         contract,
         native,
@@ -148,7 +147,8 @@ pub fn video_warm_estimate(
             f32_bytes,
             CUDA_DENSE_SCORE_ELEMENTS,
         )?,
-        te_decode,
+        payloads.decode,
+        super::text_fp8_work(&payloads.fp8, false, rows.conditioning)?,
         // The f32 layer-50 context the later phases carry.
         mul(
             mul(rows.conditioning, te_cfg.hidden_size as u64)?,
@@ -161,6 +161,7 @@ pub fn video_warm_estimate(
         let patches = u64::from(crate::pipeline::CANVAS_MAX_PIXELS / (VISION_PATCH * VISION_PATCH));
         let (hidden, heads, head_dim, mlp) = minimax_vision_dims();
         add_all([
+            super::text_fp8_work(&payloads.fp8, true, patches)?,
             block_working_bytes(
                 patches,
                 hidden,

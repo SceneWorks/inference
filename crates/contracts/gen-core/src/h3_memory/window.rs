@@ -44,6 +44,110 @@ pub struct WindowAllocation {
     pruned: bool,
     cuda_working: Option<CudaWorkingSet>,
     cuda_adaln: Option<Vec<CudaAdalnWorkingSet>>,
+    fp8: Vec<CudaFp8Projection>,
+}
+
+/// Device staging and forward temporaries for one source-native matrix. All counts are
+/// structural upper bounds from the CUDA FP8 operator, additional to the base model's
+/// carried hidden states, weight, attention and sampling buffers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CudaFp8Projection {
+    key: String,
+    input: u64,
+    output: u64,
+    staging_bytes: u64,
+    codec_id: &'static str,
+}
+impl CudaFp8Projection {
+    pub fn from_plan(plan: &crate::LogicalWeightPlan) -> Vec<Self> {
+        plan.tensors
+            .iter()
+            .filter_map(|row| {
+                let (n, contraction) = row.shape.split_first()?;
+                let k = contraction
+                    .iter()
+                    .try_fold(1u64, |k, &d| k.checked_mul(d as u64))?;
+                (row.residency.mode == crate::checkpoint_codec::ResidencyMode::Packed
+                    && matches!(
+                        row.codec,
+                        crate::checkpoint_codec::TensorCodecSpec::ScalarFp8 { .. }
+                            | crate::checkpoint_codec::TensorCodecSpec::RowwiseFp8 { .. }
+                            | crate::checkpoint_codec::TensorCodecSpec::Mxfp8 { .. }
+                    ))
+                .then(|| Self {
+                    key: row.physical_key.clone(),
+                    input: k,
+                    output: *n as u64,
+                    staging_bytes: row.residency.resident_bytes,
+                    codec_id: row.codec_id,
+                })
+            })
+            .collect()
+    }
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub fn working_bytes(&self, rows: u64) -> Result<u64> {
+        if rows == 0 {
+            return Ok(0);
+        }
+        let k = self.input;
+        let n = self.output;
+        let x = times(rows, k)?;
+        let y = times(rows, n)?;
+        // Narrowed result and bias-added output can overlap the kernel's returned F32 tensor.
+        let outputs = times(8, y)?;
+        let scratch = if self.codec_id == crate::checkpoint_codec::MXFP8_CODEC.codec_id {
+            let pad = |v: u64, multiple| v.checked_next_multiple_of(multiple).ok_or_else(invalid);
+            let (m32, k32, n32) = (pad(rows, 32)?, pad(k, 32)?, pad(n, 32)?);
+            let codes = times(m32, k32)?;
+            let scales = times(pad(rows, 128)?, pad(k32 / 32, 4)?)?;
+            let padded_output = times(4, times(m32, n32)?)?;
+            plus(
+                plus(plus(times(4, x)?, codes)?, scales)?,
+                plus(padded_output, outputs)?,
+            )?
+        } else if self.codec_id == crate::checkpoint_codec::FP8_E4M3_ROWWISE_CODEC.codec_id {
+            // BF16 input round, contiguous F32 quantizer input, activation codes and row
+            // scales; F32 accumulation and typed epilogue are independently allocated.
+            plus(
+                plus(times(7, x)?, times(4, rows)?)?,
+                plus(times(4, y)?, outputs)?,
+            )?
+        } else {
+            // Scalar activation cast to F32 and original FP8 activation codes.
+            plus(times(5, x)?, outputs)?
+        };
+        // The staged cuBLAS weight buffer and the original upload overlap on window entry.
+        Ok(self.staging_bytes.max(plus(scratch, 8)?))
+    }
+    fn phase_rows(&self, rows: NativeRows) -> u64 {
+        if self.key.contains(".adaln_proj.")
+            || self.key.starts_with("time_")
+            || self.key.starts_with("norm_out.linear")
+        {
+            rows.schedule
+        } else if self.key.starts_with("token_refiner.")
+            || self.key.starts_with("context_embedder.")
+        {
+            rows.conditioning
+        } else if self.key.ends_with(".ff.net.0.proj.weight")
+            || self.key.ends_with(".ff.net.2.weight")
+        {
+            let projected = if self.key.ends_with(".ff.net.2.weight") {
+                self.input.saturating_mul(2)
+            } else {
+                self.output
+            };
+            crate::attention_budget::AttentionBudget::from_score_elements(
+                super::FFN_INTERMEDIATE_BUDGET,
+                false,
+            )
+            .query_block_rows(projected, rows.packed)
+        } else {
+            rows.packed
+        }
+    }
 }
 
 /// Actual full-width AdaLN projection consumed by CUDA's modulation_for_window. Specialized
@@ -436,6 +540,9 @@ impl WindowAllocation {
             .collect::<BTreeSet<_>>();
         let mut names = BTreeSet::new();
         for (name, bytes) in resident_by_name {
+            if name.ends_with(".comfy_quant") && *bytes == 0 {
+                continue; // consumed FP8 source descriptor
+            }
             if name.ends_with(".comfy_quant") || !names.insert(name) {
                 return Err(invalid());
             }
@@ -484,7 +591,35 @@ impl WindowAllocation {
             pruned,
             cuda_working: None,
             cuda_adaln: None,
+            fp8: Vec::new(),
         })
+    }
+
+    /// Native weights share one CUDA execution context within this mapped component.
+    pub fn with_cuda_fp8(
+        mut self,
+        plan: &crate::LogicalWeightPlan,
+        workspace: u64,
+    ) -> Result<Self> {
+        self.fp8 = CudaFp8Projection::from_plan(plan);
+        if !self.fp8.is_empty() {
+            self.root.payload = plus(self.root.payload, workspace)?;
+        }
+        Ok(self)
+    }
+
+    fn fp8_work(&self, rows: NativeRows, included: impl Fn(Location) -> bool) -> Result<u64> {
+        self.fp8.iter().try_fold(0u64, |peak, p| {
+            Ok(if included(locate(&p.key)?) {
+                peak.max(p.working_bytes(p.phase_rows(rows))?)
+            } else {
+                peak
+            })
+        })
+    }
+
+    pub fn fp8_precompute_bytes(&self, rows: NativeRows) -> Result<u64> {
+        self.fp8_work(rows, |l| !matches!(l, Location::Body(_)))
     }
 
     pub fn with_cuda_working_set(mut self, facts: CudaWorkingSet) -> Result<Self> {
@@ -741,7 +876,10 @@ impl WindowAllocation {
                     .root_peak(rows, conditioning)?,
             );
         }
-        plus(peak, self.root.forward_cast)
+        plus(
+            plus(peak, self.root.forward_cast)?,
+            self.fp8_work(rows, |l| matches!(l, Location::Root))?,
+        )
     }
 
     /// Exact aligned window's payload and fresh-view shared matrices. Root and window groups
@@ -840,7 +978,13 @@ impl WindowAllocation {
         // descriptors do not clear until the later body verification, so they are NOT maxed
         // away against AdaLN work. Cast output overlaps the active projection only once.
         let verifying = plus(weights, adaln.descriptors)?;
-        let forwarding = plus(plus(weights, table)?, plus(work, adaln.forward_cast)?)?;
+        let forwarding = plus(
+            plus(weights, table)?,
+            plus(
+                plus(work, adaln.forward_cast)?,
+                self.fp8_work(rows, |l| matches!(l, Location::Adaln(_)))?,
+            )?,
+        )?;
         peak = peak.max(verifying).max(forwarding);
         Ok(peak)
     }
@@ -865,7 +1009,10 @@ impl WindowAllocation {
             .descriptors
             .max(plus(body_work, body.forward_cast)?)
             .max(self.root_working(task, backend, rows, false)?);
-        plus(base, working)
+        plus(
+            plus(base, working)?,
+            self.fp8_work(rows, |l| matches!(l, Location::Body(_)))?,
+        )
     }
 
     pub fn precompute_peak_bytes(
@@ -922,7 +1069,10 @@ impl WindowAllocation {
                     plus(plus(root, carried)?, prior)?,
                     plus(
                         self.layers[index].adaln.resident()?,
-                        projection.working_bytes(rows.schedule, cuda.element_bytes)?,
+                        plus(
+                            projection.working_bytes(rows.schedule, cuda.element_bytes)?,
+                            self.fp8_work(rows, |l| l == Location::Adaln(index))?,
+                        )?,
                     )?,
                 )?;
                 peak = peak.max(live);
@@ -1018,8 +1168,12 @@ impl WindowAllocation {
                     bounded_qk,
                 )?);
             }
+            let fp8 = self.fp8_work(
+                rows,
+                |l| matches!(l,Location::Body(i) if range.contains(&i)),
+            )?;
             peak = peak.max(plus(
-                plus(base, partition.resident()?)?,
+                plus(plus(base, partition.resident()?)?, fp8)?,
                 partition
                     .descriptors
                     .max(plus(work, partition.forward_cast)?),

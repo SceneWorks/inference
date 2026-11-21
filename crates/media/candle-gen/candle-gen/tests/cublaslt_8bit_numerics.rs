@@ -320,6 +320,51 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
     use float8::{F8E4M3, F8E5M2};
     use half::bf16;
     use safetensors::{tensor::TensorView, Dtype};
+    fn assert_windows(
+        path: &std::path::Path,
+        base: &str,
+        resident: &candle_gen::candle_nn::Linear,
+        x: &Tensor,
+        expected: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use candle_gen::quant::AdaptLinear;
+        let scope = candle_gen::gen_core::CheckpointReceiptScope::default();
+        scope.with(|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut weights = candle_gen::Weights::from_files_native_int8(&[path], &Device::Cpu)?;
+            weights.stage_projection_windows(x.device());
+            let (n, k) = resident.weight_dims()?;
+            let host = weights
+                .native_linear_shaped(base, resident.bias().is_some(), Some((n, k)), x.dtype())?
+                .expect("prepared source");
+            let id = resident.native_format_id().expect("native resident source");
+            let bytes = resident.native_resident_bytes().unwrap();
+            assert_eq!(host.native_format_id(), Some(id));
+            assert_eq!(host.native_resident_bytes(), Some(bytes));
+            let host = AdaptLinear::from_dense(host, k, n);
+            assert!(scope.try_snapshots()?.is_empty());
+            drop(weights);
+            for _ in 0..2 {
+                let window = host.copy_to_device(x.device())?;
+                assert_eq!(
+                    window.base_qlinear().and_then(|q| q.native_format_id()),
+                    Some(id)
+                );
+                let actual = __model_proof_output!(window.forward_upcast(x))?;
+                assert_eq!(actual.dtype(), x.dtype());
+                assert_eq!(
+                    actual
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    expected
+                );
+                let facts = scope.try_snapshots()?;
+                assert_eq!(facts.len(), 1);
+                assert_eq!(facts[0].resident_bytes(), bytes);
+            }
+            Ok(())
+        })
+    }
     let dev = Device::new_cuda(0)?;
     let tmp = tempfile::tempdir()?;
     let scalar = |e5: bool, v: f32| {
@@ -371,7 +416,7 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 .path()
                 .join(format!("scalar-{e5}-{}.safetensors", sx.is_some()));
             safetensors::tensor::serialize_to_file(tensors, None, &path)?;
-            let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+            let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
             let lin = candle_gen::candle_nn::linear_no_bias(16, 16, vb.pp("linear"))?;
             assert_eq!(
                 lin.native_format_id(),
@@ -392,6 +437,13 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
             let got = __model_proof_output!(lin.forward(&x))?
                 .flatten_all()?
                 .to_vec1::<bf16>()?;
+            assert_windows(
+                &path,
+                "linear",
+                &lin,
+                &x,
+                &got.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            )?;
             let mut adapted = AdaptLinear::from_dense(lin, 16, 16);
             let mut a = vec![bf16::ZERO; 16];
             a[0] = bf16::ONE;
@@ -508,7 +560,7 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
         None,
         &path,
     )?;
-    let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+    let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
     let lin = candle_gen::candle_nn::linear_no_bias(k, n, vb.pp("linear"))?;
     assert_eq!(lin.native_format_id(), Some("mxfp8-v1"));
     let input: Vec<bf16> = (0..(m + 1) * k)
@@ -518,6 +570,13 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
     let got = __model_proof_output!(lin.forward(&x))?
         .flatten_all()?
         .to_vec1::<bf16>()?;
+    assert_windows(
+        &path,
+        "linear",
+        &lin,
+        &x,
+        &got.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+    )?;
     for row in 0..m {
         for (j, &(col, w)) in factors.iter().enumerate() {
             assert_eq!(
@@ -553,7 +612,7 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
         None,
         &path,
     )?;
-    let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+    let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
     let lin = candle_gen::candle_nn::linear_no_bias(k, k, vb.pp("proj"))?;
     assert_eq!(lin.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
     let inputs: Vec<_> = (0..17 * k)
@@ -563,6 +622,13 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
     let outputs = __model_proof_output!(lin.forward(&x))?
         .flatten_all()?
         .to_vec1::<bf16>()?;
+    assert_windows(
+        &path,
+        "proj",
+        &lin,
+        &x,
+        &outputs.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+    )?;
     for (row, (input, output)) in inputs
         .chunks_exact(k)
         .zip(outputs.chunks_exact(k))
@@ -622,6 +688,7 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 }
             })
             .collect();
+        assert_windows(&path, "proj", &op, &x, &expected)?;
         assert_eq!(
             y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
             expected
