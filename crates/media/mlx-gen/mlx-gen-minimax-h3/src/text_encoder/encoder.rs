@@ -327,8 +327,7 @@ impl MiniMaxH3TextEncoder {
             TokenEmbedding::Native(p, dtype) => {
                 mlx_rs::with_new_default_stream(stream.as_ref().clone(), || {
                     p.rows_as(input_ids, *dtype)
-                })
-                .map_err(mlx_gen::Error::from)?
+                })?
             }
             TokenEmbedding::Dense(weight) => weight.take_axis_device(input_ids, 0, stream)?,
             TokenEmbedding::Quantized {
