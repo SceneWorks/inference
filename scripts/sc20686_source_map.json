@@ -26,29 +26,29 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "to_k.forward",
-              "line": 394
+              "line": 398
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "to_v.forward",
-              "line": 395
+              "line": 399
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "add_k.forward",
-              "line": 405
+              "line": 409
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "add_v.forward",
-              "line": 410
+              "line": 414
             }
           ],
           "reference_slice": [
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "record_flux_kv_created",
-              "line": 396
+              "line": 400
             },
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
@@ -65,7 +65,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
               "symbol": "attention",
-              "line": 426
+              "line": 430
             }
           ],
           "release": [
