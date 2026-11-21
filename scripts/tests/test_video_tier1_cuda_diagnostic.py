@@ -1,6 +1,12 @@
 """Metadata-only checks for the frozen CUDA diagnostic and its evidence provenance."""
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
+import json
 import math
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -94,6 +100,67 @@ class TargetedCudaTests(unittest.TestCase):
         for bad in (roles[1:], roles[::-1], [roles[0], dict(roles[1], start_ns=15)]):
             with self.assertRaises(ValueError):
                 proof.verify_execution_order(bad, contract, complete=False)
+
+    def test_operational_failures_keep_raw_windows_but_only_clean_completed_miss_can_be_reused(self):
+        from scripts.tests.test_wan_tier1_comparison import request
+        cases, extension = self.binding(proof.cohorts.SCAIL)
+        case = cases[0]
+        source = extension["retained"][case]
+        req = dict(request("candle-cuda", proof.cohorts.VIDEO_BASE), selection=proof.cohorts.SCAIL,
+                   followup=diagnostic.NAME)
+        req["policy"]["cudaDeviceUuid"] = followup.CUDA_UUID
+        contract = dict(request=req, backend="candle-cuda", cases=cases, followup=extension,
+                        fixture_contracts={case: {}}, fixture_source_sha256={"base": "hash", "head": "hash"},
+                        claim_budget_seconds=572.125, release_reserve_seconds=32.125)
+        for issue in (None, "changed case fixture", "changed final fixture", "release failed", "missing log", "cleanup failed"):
+            with self.subTest(issue=issue), TemporaryDirectory() as tmp, ExitStack() as patches:
+                root = Path(tmp)
+                args = SimpleNamespace(output=root / "evidence")
+                patches.enter_context(patch.dict(os.environ, RUNNER_TEMP=tmp, RUNNER_NAME="runner",
+                    MODEL_PROOF_RUNNER_ENVIRONMENT="self-hosted", GITHUB_RUN_ID="7", GITHUB_RUN_ATTEMPT="1",
+                    GITHUB_ENV=str(root / "bindings")))
+                def mock(module, method, **kw):
+                    return patches.enter_context(patch.object(module, method, **kw))
+                mock(proof.proof, "require_host")
+                mock(proof.paired, "hardware", return_value=extension["prior_hardware"])
+                mock(proof, "cuda_adapter", return_value=source["dedicated_adapter"])
+                mock(proof.cohorts, "fixture")
+                mock(proof, "inspect_fixture", side_effect=[source["fixture"],
+                    {} if issue == "changed case fixture" else source["fixture"],
+                    {} if issue == "changed final fixture" else source["fixture"]])
+                mock(proof, "build", return_value=(root, {"scail2": root / "binary"}, {}, {"fixture_source_sha256": "hash"}))
+                mock(proof, "execution_claim", return_value=nullcontext({"post_execution_verified": issue != "release failed"}))
+                def simulate(binary, cwd, out, *unused, **kwargs):
+                    out.mkdir()
+                    for name in ("stdout.log", "stderr.log", "supervisor.json", "cuda-pool.json"):
+                        if issue != "missing log" or name != "stderr.log":
+                            (out / name).write_text("{}")
+                mock(proof.paired, "invoke", side_effect=simulate)
+                mock(proof, "read_observed", return_value={"raw": True})
+                evaluation = mock(proof, "evaluate", return_value={"evaluated": True})
+                mock(proof, "compare_case", return_value={"accepted": False, "initial_noise": "pass", "parity": "pass"})
+                if issue == "cleanup failed":
+                    mock(proof.paired, "remove_work", side_effect=OSError("failed cleanup"))
+                with self.assertRaises((ValueError, OSError)):
+                    proof.execute(args, contract)
+                receipt = json.loads((args.output / "receipt.json").read_bytes())
+                self.assertEqual(len(receipt["observations"]), 2)
+                self.assertEqual(receipt["eligible_for_domain_reuse"], issue is None)
+                self.assertEqual(bool(receipt["comparisons"]), issue is None)
+                provenance = mock(proof, "check_complete_provenance")
+                def verify(row):
+                    proof.proof.write_json(args.output / "receipt.json", row)
+                    with patch.dict(os.environ, VIDEO_PAIR_RECEIPT_SHA256=proof.sha(args.output / "receipt.json")):
+                        proof.verify(args, contract)
+                evaluation.reset_mock()
+                verify(receipt)
+                self.assertEqual(provenance.call_count, int(issue is None))
+                self.assertEqual(evaluation.call_count, 2 if issue is None else 0)
+                if issue is None:
+                    for change in ({"failure": "other"}, {"log_errors": []}, {"cleanup_failure": "failed"},
+                                   {"final_fixtures": {}}, {"eligible_for_domain_reuse": False}):
+                        with self.assertRaises(ValueError):
+                            verify(dict(receipt, **change))
 
     def test_selected_card_clock_samples_are_outside_each_timing_role(self):
         uuid = followup.CUDA_UUID

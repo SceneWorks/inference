@@ -42,6 +42,7 @@ SETTINGS = {
     "parity": "bit-identical finite terminal tensor and identical ordered events exposed by the production route",
     "allocator": "same physical device, one fresh child per arm in each adjacent AB/BA pair; :4096:8 cuBLAS workspace",
 }
+COMPARISON_MISS = "paired parity or performance failed or was inconclusive; see per-case comparisons"
 VARIANTS = {name: case.variant for name, case in cohorts.BY_NAME.items()}
 
 
@@ -418,6 +419,14 @@ def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool
     return dict(facts, body=body, peaks=peaks)
 
 
+def log_entries(contract):
+    limits = paired.retained_log_limits(contract["request"]["policy"])
+    if contract["backend"] == "candle-cuda":
+        limits["cuda-pool.json"] = 4096
+    return {f"{phase}.{suffix}": cap for phase in phases(contract["cases"], contract.get("followup"))
+            for suffix, cap in limits.items()}
+
+
 def execute(args, contract):
     selection = contract["request"]["selection"]
     backend = contract["backend"]
@@ -430,6 +439,10 @@ def execute(args, contract):
                "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"],
                "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                "builds": {}, "fixtures": {}, "observations": {}, "execution_order": [], "comparisons": {}, "logs": {}}
+    diagnostic = contract["request"].get("followup") == targeted.NAME
+    completed_comparison = False
+    if diagnostic:
+        receipt.update(eligible_for_domain_reuse=False, final_fixtures={})
     prefix = "wan" if selection == SELECTION else "video"
     work = temporary / f"{prefix}-{receipt['run_id']}-{receipt['run_attempt']}"
     proof.unlinked_path(work, temporary)
@@ -514,26 +527,47 @@ def execute(args, contract):
                 receipt["comparisons"][case] = compare_case(case, contract.get("followup"), results)
                 if receipt["fixtures"][case] != inspect_fixture(paths[case], case, contract["fixture_contracts"][case]):
                     raise ValueError("fixture content changed across the adjacent measurements")
+            if diagnostic:
+                # A later case may share a fixture with an earlier case. Rehash
+                # each distinct directory after the last child under this claim.
+                final = {}
+                for case, path in paths.items():
+                    if path not in final:
+                        final[path] = inspect_fixture(path, case, contract["fixture_contracts"][case])
+                    receipt["final_fixtures"][case] = final[path]
+                if receipt["final_fixtures"] != receipt["fixtures"]:
+                    raise ValueError("fixture content changed across the adjacent measurements")
         if not claim.get("post_execution_verified"):
             raise ValueError("physical claim did not verify device release")
         receipt["accepted"] = all(r["accepted"] for r in receipt["comparisons"].values())
+        # Only the fully completed sweep can reach this decision. An exception
+        # from a child, final fixture inspection or lease release leaves it false.
+        completed_comparison = True
         if not receipt["accepted"]:
-            raise ValueError("paired parity or performance failed or was inconclusive; see per-case comparisons")
+            raise ValueError(COMPARISON_MISS)
     except BaseException as error:
         receipt["failure"] = proof.redact(str(error), dict(os.environ))
         raise
     finally:
         errors = paired.retain_logs(work, output, receipt, phases(contract["cases"], contract.get("followup")))
+        if diagnostic and completed_comparison:
+            required = {n for n in log_entries(contract) if not n.endswith(".guard.jsonl")}
+            errors.extend(f"{n}: missing completed child log" for n in sorted(required - receipt["logs"].keys()))
         if errors:
             receipt.update(accepted=False, log_errors=errors)
         proof.write_json(output / "receipt.json", receipt)
         try:
             paired.remove_work(work, temporary)
-        except OSError as error:
+        except BaseException as error:
             receipt.update(accepted=False, cleanup_failure=str(error))
             proof.write_json(output / "receipt.json", receipt)
             raise
         finally:
+            if diagnostic:
+                receipt["eligible_for_domain_reuse"] = completed_comparison and not errors and "cleanup_failure" not in receipt
+                if not receipt["eligible_for_domain_reuse"]:
+                    receipt["comparisons"] = {}
+                proof.write_json(output / "receipt.json", receipt)
             # This workflow-owned channel is never inherited by either build or learned child.
             # Bind the exact producer receipt to the subsequent verification/upload step.
             with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as bindings:
@@ -647,6 +681,23 @@ def verify_execution_order(actual, contract, *, complete):
         previous = end
 
 
+def diagnostic_reuse(receipt):
+    eligible = receipt.get("eligible_for_domain_reuse")
+    if type(eligible) is not bool:
+        raise ValueError("missing targeted diagnostic reuse status")
+    if not eligible:
+        if receipt["accepted"] or receipt["comparisons"]:
+            raise ValueError("ineligible diagnostic contains reusable conclusions")
+        return False
+    conclusions = receipt["comparisons"].values()
+    if ("log_errors" in receipt or "cleanup_failure" in receipt or not receipt["comparisons"]
+            or receipt.get("final_fixtures") != receipt["fixtures"]
+            or receipt["accepted"] != all(r["accepted"] for r in conclusions)
+            or receipt.get("failure") != (None if receipt["accepted"] else COMPARISON_MISS)):
+        raise ValueError("targeted diagnostic lacks a completed, reusable comparison outcome")
+    return True
+
+
 def verify(args, contract):
     temporary = Path(os.environ["RUNNER_TEMP"])
     output = args.output
@@ -664,10 +715,7 @@ def verify(args, contract):
             or receipt.get("run_attempt") != os.environ["GITHUB_RUN_ATTEMPT"]):
         raise ValueError("video comparison artifact contract/run mismatch")
     backend = contract["backend"]
-    limits = paired.retained_log_limits(contract["request"]["policy"])
-    if backend == "candle-cuda":
-        limits["cuda-pool.json"] = 4096
-    entries = {f"{phase}.{suffix}": cap for phase in phases(contract["cases"], contract.get("followup")) for suffix, cap in limits.items()}
+    entries = log_entries(contract)
     logs = receipt["logs"]
     if not logs.keys() <= entries.keys() or set(p.name for p in output.iterdir()) != {"receipt.json", *logs}:
         raise ValueError("unexpected proof upload contents")
@@ -679,19 +727,23 @@ def verify(args, contract):
         from scripts.ci import wddm_process_memory
         wddm_process_memory.validate_adapter(receipt.get("dedicated_adapter"), contract["request"]["policy"]["cudaDeviceUuid"])
     diagnostic = contract["request"].get("followup") == targeted.NAME
-    if receipt["accepted"]:
+    complete = receipt["accepted"]
+    if diagnostic:
+        complete = diagnostic_reuse(receipt)
+        if not complete:
+            # Keep bounded, hash-sealed raw diagnostics from interrupted jobs.
+            # No independently reusable case conclusion can survive this path.
+            verify_execution_order(receipt["execution_order"], contract, complete=False)
+            if not receipt["observations"].keys() <= {role["phase"] for role in receipt["execution_order"]}:
+                raise ValueError("recorded measurements lack ordered child windows")
+            return
+    if complete:
         check_complete_provenance(receipt, contract)
-    elif diagnostic:
-        # An inconclusive timing metric can coexist with a usable memory pair.
-        # Prove every completed role ran in its predeclared position in that case too.
-        verify_execution_order(receipt["execution_order"], contract, complete=False)
-        if not receipt["observations"].keys() <= {role["phase"] for role in receipt["execution_order"]}:
-            raise ValueError("recorded measurements lack ordered child windows")
     required = {name for name in entries if not name.endswith(".guard.jsonl")}
     observations = receipt["observations"]
     if not observations.keys() <= set(phases(contract["cases"], contract.get("followup"))):
         raise ValueError("unregistered observation")
-    if receipt["accepted"] and (receipt.get("failure") or not required <= logs.keys()
+    if complete and ((receipt["accepted"] and receipt.get("failure")) or not required <= logs.keys()
             or set(observations) != set(phases(contract["cases"], contract.get("followup"))) or not receipt["physical_claim"]["post_execution_verified"]
             or set(receipt["fixtures"]) != set(contract["cases"]) or set(receipt["comparisons"]) != set(contract["cases"])):
         raise ValueError("accepted comparison lacks logs, fixture identity, measurements or release")
@@ -703,7 +755,7 @@ def verify(args, contract):
             for _, arm, name, repeats in expected_schedule:
                 row = observations.get(name)
                 if row is None or "result" not in row:
-                    if receipt["accepted"]:
+                    if complete:
                         raise ValueError("missing completed observation")
                     continue
                 def read(suffix):
