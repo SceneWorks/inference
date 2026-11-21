@@ -417,6 +417,27 @@ class SharedHeadroom(unittest.TestCase):
             with self.assertRaises(ValueError):
                 proof.validate_configurations(row)
 
+    def test_projection_proofs_bind_only_the_registered_gpu0_uuid_and_index(self):
+        rows = [row for row in proof.load_registry()
+                if (row['package'], row['target'], row['fqn']) in proof.GPU0_PROJECTION_PROOFS]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            with self.subTest(case=proof.identity(row)):
+                configured = proof.configured_case(row, 'fixed_cuda')
+                self.assertEqual(configured['required_cuda_device_uuid'], proof.training_comparison.DEVICES['gpu0'][0])
+                self.assertEqual(configured['required_cuda_physical_index'], 0)
+                self.assertEqual(resources.bound_cuda_activity_profile(configured), PROFILE)
+                for key, value in [('uuid', UUID), ('index', 1), ('fqn', 'unbound_fixture')]:
+                    modified = copy.deepcopy(row)
+                    if key == 'uuid':
+                        modified['required_cuda_device_uuid'] = value
+                    elif key == 'index':
+                        modified['configurations']['fixed_cuda']['required_cuda_physical_index'] = value
+                    else:
+                        modified['fqn'] = value
+                    with self.assertRaises(ValueError):
+                        proof.validate_configurations(modified)
+
     def test_all_bounded_cases_bind_source_owned_gpu1_headroom_without_implicit_selection(self):
         rows = [row for row in proof.load_registry() if 'bounded_acceleration' in row['fqn']]
         self.assertTrue(rows)

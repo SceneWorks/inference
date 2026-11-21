@@ -17933,7 +17933,7 @@
     "target": "integration",
     "target_kind": "test",
     "fqn": "cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16",
-    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
     "source": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs",
     "cargo_target_metadata": {
       "name": "integration",
@@ -17964,7 +17964,7 @@
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen/tests/cublaslt_8bit_numerics.rs::cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16/fixed_cuda",
         "cuda_activity_profile": "non-isolated-correctness-headroom",
-        "required_cuda_physical_index": 1,
+        "required_cuda_physical_index": 0,
         "environment": {},
         "cargo_features": [
           "cuda",
@@ -70004,7 +70004,7 @@
     "target": "integration",
     "target_kind": "test",
     "fqn": "convrot_int8::native_projections_match_pinned_kitchen",
-    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
     "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs",
     "cargo_target_metadata": {
       "name": "integration",
@@ -70035,7 +70035,7 @@
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/convrot_int8.rs::convrot_int8::native_projections_match_pinned_kitchen/fixed_cuda",
         "cuda_activity_profile": "non-isolated-correctness-headroom",
-        "required_cuda_physical_index": 1,
+        "required_cuda_physical_index": 0,
         "environment": {},
         "cargo_features": [
           "cuda",
