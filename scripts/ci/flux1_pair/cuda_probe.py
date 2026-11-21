@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 
+from scripts.ci.wddm_process_memory import DedicatedSamples
 from scripts.media_campaign_supervisor import SupervisionError, SystemProbe
 
 _MISSING = object()
@@ -53,10 +54,12 @@ def _read_pool_proof(path: Path):
 
 
 class PairCudaProbe:
-    def __init__(self, policy, proof_path: Path):
+    def __init__(self, policy, proof_path: Path, *, dedicated_adapter=None):
         self.policy = policy
         self.proof_path = proof_path
         self.system = SystemProbe(policy)
+        self.dedicated = (DedicatedSamples(dedicated_adapter, policy.cuda_device_uuid)
+                          if dedicated_adapter is not None else None)
         self.pid_peak_bytes = 0
         self.unknown_pid_polls = 0
         self.global_upper_bytes = 0
@@ -69,6 +72,8 @@ class PairCudaProbe:
     def gpu_free_and_tree_bytes(self, owner):
         free, used = self.system.gpu_free_and_tree_bytes(owner)
         self.gpu_usage_basis = self.system.gpu_usage_basis
+        if self.dedicated is not None:
+            self.dedicated.poll(owner, cuda_active=self.gpu_usage_basis == "global-used-upper-bound" or used > 0)
         if self.gpu_usage_basis != "global-used-upper-bound":
             self.pid_peak_bytes = max(self.pid_peak_bytes, used)
             return free, used
@@ -100,6 +105,11 @@ class PairCudaProbe:
         self.pool_fallback_peak_bytes = max(self.pool_fallback_peak_bytes, values[3])
         return free, values[3]
 
+    def close(self):
+        if self.dedicated is not None:
+            self.dedicated.close()
+
     def measurement(self):
-        return {"pid_peak_bytes": self.pid_peak_bytes, "unknown_pid_polls": self.unknown_pid_polls,
+        extra = {"wddm_dedicated": self.dedicated.record} if self.dedicated is not None else {}
+        return {**extra, "pid_peak_bytes": self.pid_peak_bytes, "unknown_pid_polls": self.unknown_pid_polls,
                 "global_upper_bytes": self.global_upper_bytes, "pool_fallback_peak_bytes": self.pool_fallback_peak_bytes}
