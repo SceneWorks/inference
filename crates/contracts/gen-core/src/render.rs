@@ -103,14 +103,12 @@ struct AdapterPhasePlan {
     need_negative: bool,
     sampling: AdapterPhaseSampling,
     installation: AdapterPhaseInstallation,
-    #[serde(skip)]
-    compiled_load: AdapterPhaseLoadSpec,
 }
 
 #[derive(Clone, Debug)]
-struct AdapterPhaseLoadSpec(std::sync::Arc<LoadSpec>);
+struct ExactRenderLoad(std::sync::Arc<LoadSpec>);
 
-impl PartialEq for AdapterPhaseLoadSpec {
+impl PartialEq for ExactRenderLoad {
     fn eq(&self, other: &Self) -> bool {
         self.0.same_load_except_placement(&other.0)
     }
@@ -171,6 +169,25 @@ struct AuthoredAdapterPhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+struct ExactImageControls {
+    strength_bits: Option<u32>,
+    pag: Option<crate::PagConfig>,
+    text_style_gain_bits: Option<u32>,
+    output_rgba: bool,
+}
+
+impl From<&GenerationRequest> for ExactImageControls {
+    fn from(req: &GenerationRequest) -> Self {
+        Self {
+            strength_bits: req.strength.map(f32::to_bits),
+            pag: req.pag.clone(),
+            text_style_gain_bits: req.text_style_gain.map(f32::to_bits),
+            output_rgba: req.output_channels == crate::OutputChannels::Rgba,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct ImageInputs {
     prompt_sha256: [u8; 32],
     negative_prompt: Option<String>,
@@ -187,6 +204,8 @@ struct ImageInputs {
     low_res_start: Option<LowResStartInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adapter_phases: Option<AdapterPhaseInputs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exact_controls: Option<ExactImageControls>,
     steps: Option<u32>,
     sampler: Option<String>,
     scheduler: Option<String>,
@@ -415,6 +434,7 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             source_image,
             low_res_start,
             adapter_phases,
+            exact_controls: None,
             steps: req.steps,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
@@ -523,6 +543,8 @@ pub struct RenderPlan {
     provider: String,
     inputs: ImageInputs,
     preparation: Option<RenderLoadBinding>,
+    #[serde(skip)]
+    exact_load: Option<ExactRenderLoad>,
     count: CountPlan,
     pass: ImagePass,
     /// Position inside a [`MultiPassRenderPlan`]; 0 for a single-pass plan.
@@ -562,6 +584,26 @@ impl RenderPlan {
             )));
         }
         Self::packed_image_trajectory_inner(descriptor, req, pass)
+    }
+
+    /// Compile an ordinary packed image pass with its prepared sources and controls for
+    /// reference strength, PAG, text style and output channels bound before placement.
+    pub fn packed_image_trajectory_with_exact_load(
+        descriptor: &ModelDescriptor,
+        spec: &LoadSpec,
+        req: &GenerationRequest,
+        pass: PackedImagePass<'_>,
+    ) -> Result<Self> {
+        let pins = spec.prepared_file_pins();
+        if !pins.is_finalized() && (pins.is_prepared() || !spec.file_source_paths().is_empty()) {
+            return Err(Error::Unsupported(
+                "exact image plans require finalized file source pins".into(),
+            ));
+        }
+        let mut plan = Self::packed_image_trajectory(descriptor, req, pass)?;
+        plan.inputs.exact_controls = Some(req.into());
+        plan.seal_load(spec);
+        Ok(plan)
     }
 
     /// Compile the Krea Raw phase Feature over the provider's untrimmed global schedule.
@@ -650,9 +692,8 @@ impl RenderPlan {
                 .any(|phase| phase.guidance.unwrap_or(plan.guidance()) != 0.0),
             sampling: AdapterPhaseSampling::ResetSolverAndReuseImageSeed,
             installation: AdapterPhaseInstallation::ImmutableResiduals,
-            compiled_load: AdapterPhaseLoadSpec(std::sync::Arc::new(spec.clone())),
         });
-        plan.preparation = Some(RenderLoadBinding::from_spec(spec));
+        plan.seal_load(spec);
         Ok(plan)
     }
 
@@ -741,6 +782,7 @@ impl RenderPlan {
             provider: descriptor.id.to_owned(),
             inputs,
             preparation: None,
+            exact_load: None,
             count: CountPlan::SequentialWrappingSeeds {
                 count: req.count,
                 base_seed: req.seed.unwrap_or_else(default_seed),
@@ -789,6 +831,9 @@ impl RenderPlan {
         req: &GenerationRequest,
     ) -> Result<()> {
         let mut live = ImageInputs::try_from(req)?;
+        if self.inputs.exact_controls.is_some() {
+            live.exact_controls = Some(req.into());
+        }
         if self.pass_index > 0 {
             live.low_res_start = None;
         }
@@ -799,7 +844,6 @@ impl RenderPlan {
             strength_bits,
         } = &self.inputs.conditioning
         {
-            live.source_image = None;
             // The produced image is bound by shape and strength: its bytes come from the earlier
             // pass and cannot be digested before load.
             match &live.conditioning {
@@ -890,9 +934,14 @@ impl RenderPlan {
         !matches!(self.inputs.conditioning, PackedImageConditioning::None)
     }
 
-    /// Replace a compiled single-reference input with a declaration that pass `from_pass`
+    /// Number of image references used to admit this pass, including its produced reference.
+    pub fn reference_count(&self) -> u32 {
+        self.inputs.references
+    }
+
+    /// Replace a compiled single-reference input with a declaration that an earlier pass
     /// produces it, keeping the compiled geometry and strength.
-    fn into_produced_reference(mut self, from_pass: usize) -> Result<Self> {
+    fn into_produced_reference(mut self, produced: ProducedReference) -> Result<Self> {
         let PackedImageConditioning::Reference {
             width,
             height,
@@ -904,8 +953,19 @@ impl RenderPlan {
                 "a produced reference needs a single-reference pass".into(),
             ));
         };
+        if (width, height, strength_bits)
+            != (
+                produced.width,
+                produced.height,
+                produced.strength.map(f32::to_bits),
+            )
+        {
+            return Err(Error::Unsupported(
+                "the compiled reference differs from the produced reference declaration".into(),
+            ));
+        }
         self.inputs.conditioning = PackedImageConditioning::ProducedReference {
-            from_pass,
+            from_pass: produced.from_pass,
             width,
             height,
             strength_bits,
@@ -916,48 +976,51 @@ impl RenderPlan {
     fn preparation(&self) -> Option<&RenderLoadBinding> {
         self.preparation.as_ref()
     }
-    /// Bind an ordinary plan to its load contract. Adapter phase plans already bind the spec
-    /// whose scales they compiled. Use [`Self::rebind_load_placement`] to update their placement.
+    /// Bind a plan to its load contract. An exactly bound plan keeps its original source and
+    /// placement. Use [`Self::rebind_load_placement`] to update its placement.
     pub fn bind_load(mut self, spec: &LoadSpec) -> Self {
-        if self.pass.adapter_phases.is_none() {
+        if self.exact_load.is_none() {
             self.preparation = Some(RenderLoadBinding::from_spec(spec));
         }
         self
     }
 
-    /// Update an adapter phase plan with the actual loader placement. No source, pin, adapter
-    /// slot, default scale or other load input may differ from the spec used to compile it.
+    fn seal_load(&mut self, spec: &LoadSpec) {
+        self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        self.exact_load = Some(ExactRenderLoad(std::sync::Arc::new(spec.clone())));
+    }
+
+    /// Update an exactly bound plan with the actual loader placement. Source pins, adapter order
+    /// and default scales remain as compiled.
     pub fn rebind_load_placement(mut self, spec: &LoadSpec) -> Result<Self> {
-        let phases = self.pass.adapter_phases.as_ref().ok_or_else(|| {
-            Error::Unsupported("load placement rebinding requires an adapter phase plan".into())
-        })?;
-        Self::check_adapter_phase_load(phases, spec)?;
+        self.check_exact_sources(spec)?;
         self.preparation = Some(RenderLoadBinding::from_spec(spec));
         Ok(self)
     }
 
-    /// Check an exact load spec, including the pinned source and ordered adapter identity for
-    /// adapter phases, against the plan and its bound placement.
+    /// Require an exact binding and check the loaded spec, including its placement, prepared
+    /// source pins, and ordered adapter identity.
     pub fn check_load_spec(&self, spec: &LoadSpec) -> Result<()> {
-        if let Some(phases) = &self.pass.adapter_phases {
-            Self::check_adapter_phase_load(phases, spec)?;
-        }
+        self.check_exact_sources(spec)?;
         self.check_bound_load(&RenderLoadBinding::from_spec(spec))
     }
 
-    fn check_adapter_phase_load(phases: &AdapterPhasePlan, spec: &LoadSpec) -> Result<()> {
-        if !phases.compiled_load.0.same_load_except_placement(spec) {
+    fn check_exact_sources(&self, spec: &LoadSpec) -> Result<()> {
+        let exact = self.exact_load.as_ref().ok_or_else(|| {
+            Error::Unsupported("render plan requires an exact load binding".into())
+        })?;
+        if !exact.0.same_load_except_placement(spec) {
             return Err(Error::Unsupported(
-                "adapter phase plan belongs to a different model or adapter stack".into(),
+                "render plan belongs to a different model or adapter stack".into(),
             ));
         }
         Ok(())
     }
 
     pub fn check_load(&self, loaded: &RenderLoadBinding) -> Result<()> {
-        if self.pass.adapter_phases.is_some() {
+        if self.exact_load.is_some() {
             return Err(Error::Unsupported(
-                "adapter phase plans require checking the exact load spec".into(),
+                "exactly bound render plans require checking the load spec".into(),
             ));
         }
         self.check_bound_load(loaded)
