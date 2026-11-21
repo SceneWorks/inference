@@ -69,6 +69,7 @@ pub mod gdn_prep;
 pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
+pub mod nvfp4_kitchen;
 pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 pub mod nvfp4_weight;

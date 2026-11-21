@@ -661,6 +661,7 @@ pub mod media {
 #[cfg(feature = "media")]
 pub use mlx_gen_ios_catalog::iris_depth;
 pub use mlx_llm as llm;
+pub use mlx_llm::mlx_layers as layers;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
 /// Platform label for this bundle; matches [`RuntimeCatalog::platform`].
@@ -1738,6 +1739,18 @@ mod tests {
         assert_eq!(
             super::SUPPORTED_TARGET_TRIPLES,
             ["aarch64-apple-ios", "aarch64-apple-ios-sim"]
+        );
+    }
+
+    #[test]
+    fn bundle_reexports_shared_mlx_layers_spine_in_both_partitions() {
+        assert_eq!(
+            std::any::TypeId::of::<super::layers::Linear>(),
+            std::any::TypeId::of::<super::llm::mlx_layers::Linear>()
+        );
+        assert_eq!(
+            std::any::TypeId::of::<super::layers::llm_projection::Projection>(),
+            std::any::TypeId::of::<super::llm::primitives::Projection>()
         );
     }
 }

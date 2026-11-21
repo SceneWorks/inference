@@ -76,25 +76,7 @@ fn reference_kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel) -> Result<T>)
     })
 }
 
-/// Source operands and load-scoped rotation cache. Both engines mark operands through their
-/// normal access-tracking weight map so block eviction and materialization keep their semantics.
-pub trait MlxWeightSource {
-    fn require(&self, key: &str) -> Result<&Array> {
-        self.get(key)
-            .ok_or_else(|| crate::Error::Msg(format!("missing tensor {key}")))
-    }
-    fn planned_fp8(&self, _base: &str) -> Option<&crate::fp8::Fp8Linear> {
-        None
-    }
-    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array;
-    fn get(&self, key: &str) -> Option<&Array>;
-    fn observation(&self, _key: &str) -> Option<crate::source::Observation> {
-        None
-    }
-    fn planned_geometry(&self, _base: &str) -> Option<ConvRotInt8> {
-        None
-    }
-}
+pub use crate::MlxWeightSource;
 
 pub fn descriptor(blob: &Array, base: &str) -> Result<gen_core::comfy_quant::ComfyQuantDescriptor> {
     if blob.dtype() != Dtype::Uint8 || blob.ndim() != 1 || blob.size() > MAX_DESCRIPTOR_BYTES {
@@ -216,8 +198,8 @@ impl ConvRotLinear {
     }
 
     /// Admit only a complete authoritative descriptor plus I8/F32 operands. No dequantization.
-    pub fn from_weights(
-        w: &(impl MlxWeightSource + ?Sized),
+    pub fn from_weights<W: MlxWeightSource + ?Sized>(
+        w: &W,
         base: &str,
         bias: bool,
     ) -> Result<Option<Self>> {

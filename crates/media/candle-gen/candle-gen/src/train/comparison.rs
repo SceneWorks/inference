@@ -202,6 +202,7 @@ pub fn reference_owner_enabled() -> bool {
 
 #[cfg(all(test, feature = "model-inference-proof"))]
 pub(crate) fn with_metadata_stage_for_test<T>(stage: ComparisonStage, f: impl FnOnce() -> T) -> T {
+    crate::ensure_reference_math_hook();
     struct Reset(Option<ComparisonStage>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -258,6 +259,7 @@ pub fn with_stage<T>(
     cadence: ComparisonCadence,
     f: impl FnOnce() -> T,
 ) -> T {
+    crate::ensure_reference_math_hook();
     let stage = requested_stage().expect("manual comparison stage required");
     assert!(
         !model_id.is_empty() && !model_id.to_ascii_lowercase().contains("krea"),

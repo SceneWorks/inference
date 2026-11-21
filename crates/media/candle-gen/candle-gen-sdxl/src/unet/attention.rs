@@ -599,6 +599,7 @@ impl Default for SpatialTransformerConfig {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Proj {
     Conv2d(nn::Conv2d),
     // sc-9416: the linear projection variant (SDXL's `use_linear_projection = true`) packed-detects.

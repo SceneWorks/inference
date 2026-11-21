@@ -7,6 +7,7 @@ use std::collections::HashMap;
 /// One compact signed INT8 projection. Non-CUDA builds refuse, never dequantize.
 pub struct ConvRotLinear {
     descriptor: ConvRotInt8,
+    resident_bytes: u64,
     device: Device,
     #[cfg(feature = "cuda")]
     rotation: Tensor,
@@ -21,6 +22,12 @@ impl std::fmt::Debug for ConvRotLinear {
     }
 }
 impl ConvRotLinear {
+    /// Bytes held by this projection's code, scale and bias tensors. The rotation belongs to
+    /// the model-wide resource cache and is shared by every projection of the same group size.
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
     /// Immutable validated logical geometry.
     pub fn descriptor(&self) -> ConvRotInt8 {
         self.descriptor
@@ -65,6 +72,9 @@ impl ConvRotLinear {
                     "ConvRot CUDA output width must be a multiple of 16".into(),
                 ));
             }
+            let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+            let resident_bytes =
+                (bytes(&codes) + bytes(&scales) + bias.as_ref().map_or(0, bytes)) as u64;
             let linear = crate::eight_bit_linear::Int8Linear::from_native_bytes(
                 &codes,
                 scales,
@@ -74,6 +84,7 @@ impl ConvRotLinear {
             let rotation = resources.convrot_rotation(descriptor.rotation_group, codes.device())?;
             Ok(Self {
                 descriptor,
+                resident_bytes,
                 device: codes.device().clone(),
                 rotation,
                 linear,

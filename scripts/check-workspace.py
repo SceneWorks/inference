@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 136
+EXPECTED_MEMBER_COUNT = 137
 INTERNAL_PACKAGES = {
     "sceneworks-gen-cv",
     "candle-audio",
@@ -22,13 +22,14 @@ INTERNAL_PACKAGES = {
     "candle-audio-kokoro",
     "candle-audio-moss-sfx",
     "candle-gen-catalog",
+    "candle-layers",
     "candle-quant-kernels",
     "candle-checkpoint",
-    "mlx-layers",
     "core-llm",
     "core-llm-testkit",
     "mlx-gen-catalog",
     "mlx-gen-ios-catalog",
+    "mlx-layers",
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",
@@ -1301,6 +1302,138 @@ def check_provider_tier_edges(metadata: dict) -> None:
         fail("; ".join(errors))
 
 
+# SW-6958 (ENG-4a / R2-08 / BACK-1 / XL-3 / E4): the lower-level layer spine (`mlx-layers` and
+# `candle-layers`) sits strictly below both media and LLM engines on each backend. Neither layer
+# crate may depend upward on an engine, provider, CV crate, catalog, or bundle, or across backends;
+# both media and LLM engines must depend downward on their backend's layer crate; and LLM engines
+# must never depend on media engines or providers (keeping the locked workspace graph acyclic on
+# both backends).
+LAYER_SPINE_PACKAGES = {
+    "mlx-layers": "mlx",
+    "candle-layers": "candle",
+}
+ENGINE_TO_LAYER_SPINE = {
+    "mlx-gen": "mlx-layers",
+    "mlx-llm": "mlx-layers",
+    "candle-gen": "candle-layers",
+    "candle-llm": "candle-layers",
+}
+LLM_ENGINE_PACKAGES = ("mlx-llm", "candle-llm")
+MEDIA_ENGINE_PACKAGES = ("mlx-gen", "candle-gen", "candle-audio", "sceneworks-gen-cv")
+
+
+def _dependency_backend(name: str) -> str | None:
+    if name.startswith(("mlx-", "pmetal-mlx-")):
+        return "mlx"
+    if name.startswith("candle-"):
+        return "candle"
+    return None
+
+
+def workspace_normal_cycle_errors(metadata: dict) -> list[str]:
+    packages = {package["id"]: package for package in metadata["packages"]}
+    members = [packages[member_id] for member_id in metadata["workspace_members"]]
+    by_name = {package["name"]: package for package in members}
+    adjacency = {
+        package["name"]: sorted(
+            {
+                dependency["name"]
+                for dependency in package["dependencies"]
+                if dependency.get("kind") is None and dependency["name"] in by_name
+            }
+        )
+        for package in members
+    }
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    cycles: list[str] = []
+
+    def visit(node: str) -> None:
+        state[node] = 1
+        stack.append(node)
+        for neighbor in adjacency.get(node, ()):
+            neighbor_state = state.get(neighbor, 0)
+            if neighbor_state == 0:
+                visit(neighbor)
+            elif neighbor_state == 1:
+                start = stack.index(neighbor)
+                cycle = " -> ".join([*stack[start:], neighbor])
+                cycles.append(f"workspace normal-dependency cycle: {cycle}")
+        stack.pop()
+        state[node] = 2
+
+    for name in sorted(by_name):
+        if state.get(name, 0) == 0:
+            visit(name)
+    return cycles
+
+
+def layer_spine_edge_errors(metadata: dict) -> list[str]:
+    packages = {package["id"]: package for package in metadata["packages"]}
+    members = [packages[member_id] for member_id in metadata["workspace_members"]]
+    by_name = {package["name"]: package for package in members}
+    composition = {
+        package["name"]
+        for package in members
+        if package["name"].endswith("-catalog") or "/crates/bundles/" in package["manifest_path"]
+    }
+    upward_tiers = (
+        set(ENGINE_TO_LAYER_SPINE)
+        | set(MEDIA_ENGINE_PACKAGES)
+        | {"mlx-llm-server"}
+        | composition
+        | {name for name in by_name if _is_provider(name)}
+    )
+    errors = workspace_normal_cycle_errors(metadata)
+
+    for layer_pkg, expected_backend in sorted(LAYER_SPINE_PACKAGES.items()):
+        package = by_name.get(layer_pkg)
+        if package is None:
+            errors.append(f"missing required layer-spine workspace member {layer_pkg}")
+            continue
+        for dependency in package["dependencies"]:
+            if dependency.get("kind") not in (None, "build"):
+                continue
+            target = dependency["name"]
+            target_backend = _dependency_backend(target)
+            if target in upward_tiers or _is_provider(target):
+                errors.append(f"layer-spine crate {layer_pkg} depends upward on {target}")
+            elif target_backend is not None and target_backend != expected_backend:
+                errors.append(f"layer-spine crate {layer_pkg} depends across backends on {target}")
+
+    for engine_pkg, expected_layer in sorted(ENGINE_TO_LAYER_SPINE.items()):
+        package = by_name.get(engine_pkg)
+        if package is None:
+            errors.append(f"missing required engine workspace member {engine_pkg}")
+            continue
+        engine_backend = _dependency_backend(engine_pkg)
+        normal_targets = {
+            dependency["name"]
+            for dependency in package["dependencies"]
+            if dependency.get("kind") is None
+        }
+        if expected_layer not in normal_targets:
+            errors.append(f"engine {engine_pkg} must depend on layer-spine crate {expected_layer}")
+        for target in sorted(normal_targets):
+            target_backend = _dependency_backend(target)
+            if target in composition:
+                errors.append(f"engine {engine_pkg} depends upward on composition root {target}")
+            elif target_backend is not None and target_backend != engine_backend:
+                errors.append(f"engine {engine_pkg} depends across backends on {target}")
+            elif engine_pkg in LLM_ENGINE_PACKAGES and (
+                target in MEDIA_ENGINE_PACKAGES or _is_provider(target)
+            ):
+                errors.append(f"LLM engine {engine_pkg} depends on media package {target}")
+
+    return errors
+
+
+def check_layer_spine_edges(metadata: dict) -> None:
+    errors = layer_spine_edge_errors(metadata)
+    if errors:
+        fail("; ".join(errors))
+
+
 # Published upstream lockfiles are retained as archive/source provenance, NOT independent
 # active workspace locks. Register only these exact excluded package paths and versions;
 # arbitrary nested locks, including any other vendor lock, remain errors.
@@ -1492,40 +1625,214 @@ def check_graph(metadata: dict) -> None:
         fail(f"expected intentional tokenizers 0.21/0.22 split, found {tokenizer_minors}")
 
 
-def ios_root_graph(root: str, offline: bool) -> dict[str, set[str]]:
+def bundle_target_graph(
+    package: str,
+    offline: bool,
+    *,
+    target: str | None = None,
+    no_default_features: bool = False,
+    features: tuple[str, ...] = (),
+) -> dict[str, set[str]]:
+    """Package name -> activated features for one root's normal-edge Cargo build graph."""
+    command = [
+        "cargo", "tree", "--locked", "-p", package,
+        "-e", "normal", "--prefix", "none", "--format", "{p}|{f}",
+    ]
+    if target is not None:
+        command.extend(["--target", target])
+    if no_default_features:
+        command.append("--no-default-features")
+    if features:
+        command.extend(["--features", ",".join(features)])
+    if offline:
+        command.append("--offline")
+    result = subprocess.run(command, cwd=ROOT, check=False, capture_output=True)
+    target_desc = f" on {target}" if target else ""
+    if result.returncode:
+        sys.stderr.write(result.stderr.decode("utf-8", errors="replace"))
+        fail(f"cargo tree for {package}{target_desc} failed with exit code {result.returncode}")
+    graph: dict[str, set[str]] = {}
+    for line in result.stdout.decode("utf-8").splitlines():
+        pkg, _, raw_features = line.partition("|")
+        if not pkg.strip():
+            continue
+        name = pkg.split()[0]
+        enabled = {
+            feature
+            for feature in raw_features.replace("(*)", "").strip().split(",")
+            if feature
+        }
+        graph.setdefault(name, set()).update(enabled)
+    if package not in graph:
+        fail(f"cargo tree for {package}{target_desc} did not list the root itself")
+    return graph
+
+
+def ios_root_graph(
+    root: str, offline: bool, *, no_default_features: bool = False
+) -> dict[str, set[str]]:
     """Package name -> activated features for one root's normal-edge iOS build graph.
 
     `cargo tree --target` only asks rustc for the target's cfg set, so it needs neither the iOS
     standard library nor an SDK and runs on the Linux workspace lane.
     """
-    command = [
-        "cargo", "tree", "--locked", "-p", root, "--target", IOS_GRAPH_TARGET,
-        "-e", "normal", "--prefix", "none", "--format", "{p}|{f}",
-    ]
-    if offline:
-        command.append("--offline")
-    result = subprocess.run(command, cwd=ROOT, check=False, capture_output=True)
-    if result.returncode:
-        sys.stderr.write(result.stderr.decode("utf-8", errors="replace"))
-        fail(f"cargo tree for {root} on {IOS_GRAPH_TARGET} failed with exit code {result.returncode}")
-    graph: dict[str, set[str]] = {}
-    for line in result.stdout.decode("utf-8").splitlines():
-        package, _, features = line.partition("|")
-        if not package.strip():
-            continue
-        name = package.split()[0]
-        enabled = {feature for feature in features.replace("(*)", "").strip().split(",") if feature}
-        graph.setdefault(name, set()).update(enabled)
-    if root not in graph:
-        fail(f"cargo tree for {root} on {IOS_GRAPH_TARGET} did not list the root itself")
-    return graph
+    return bundle_target_graph(
+        root,
+        offline,
+        target=IOS_GRAPH_TARGET,
+        no_default_features=no_default_features,
+    )
+
+
+IOS_MEDIA_REQUIRED_PACKAGES = frozenset({
+    "runtime-ios",
+    "runtime-catalog",
+    "mlx-layers",
+    "mlx-llm",
+    "mlx-gen",
+    "mlx-gen-ios-catalog",
+})
+IOS_LLM_ONLY_REQUIRED_PACKAGES = frozenset({
+    "runtime-ios",
+    "runtime-catalog",
+    "mlx-layers",
+    "mlx-llm",
+})
+IOS_LLM_ONLY_FORBIDDEN_PACKAGES = frozenset({
+    "mlx-gen",
+    "mlx-gen-catalog",
+    "mlx-gen-ios-catalog",
+    "sceneworks-gen-cv",
+    "sceneworks-gen-core-train",
+    "image",
+})
+
+
+def ios_partition_errors(
+    media_graph: dict[str, set[str]], llm_only_graph: dict[str, set[str]]
+) -> list[str]:
+    """Validate that iOS media and LLM-only partitions retain distinct dependencies (SW-6958 / E4)."""
+    errors: list[str] = []
+    prefix, feature = IOS_FORBIDDEN_FEATURE
+
+    missing_media = sorted(IOS_MEDIA_REQUIRED_PACKAGES - media_graph.keys())
+    if missing_media:
+        errors.append(
+            f"runtime-ios (media) on {IOS_GRAPH_TARGET} is missing required packages: {missing_media}"
+        )
+    forbidden_media = sorted(
+        (IOS_FORBIDDEN_PACKAGES | {"mlx-gen-catalog", "sceneworks-gen-cv"}) & media_graph.keys()
+    )
+    if forbidden_media:
+        errors.append(
+            f"runtime-ios (media) on {IOS_GRAPH_TARGET} reaches forbidden packages: {forbidden_media}"
+        )
+    candle_in_media = sorted(name for name in media_graph if name.startswith("candle-"))
+    if candle_in_media:
+        errors.append(
+            f"runtime-ios (media) on {IOS_GRAPH_TARGET} reaches Candle packages: {candle_in_media}"
+        )
+    media_training = sorted(
+        name
+        for name, features in media_graph.items()
+        if (name.startswith(prefix) or name == "mlx-layers") and feature in features
+    )
+    if media_training:
+        errors.append(
+            f"runtime-ios (media) on {IOS_GRAPH_TARGET} enables `{feature}` on: {media_training}"
+        )
+
+    missing_llm = sorted(IOS_LLM_ONLY_REQUIRED_PACKAGES - llm_only_graph.keys())
+    if missing_llm:
+        errors.append(
+            f"runtime-ios (llm-only) on {IOS_GRAPH_TARGET} is missing required packages: {missing_llm}"
+        )
+    leaked_media = sorted(
+        name
+        for name in llm_only_graph
+        if name in IOS_LLM_ONLY_FORBIDDEN_PACKAGES
+        or name in IOS_FORBIDDEN_PACKAGES
+        or name.startswith("mlx-gen-")
+        or name.startswith("candle-")
+    )
+    if leaked_media:
+        errors.append(
+            f"runtime-ios (llm-only) on {IOS_GRAPH_TARGET} leaks media or cross-backend packages: {leaked_media}"
+        )
+    unexpected_llm_only = sorted(llm_only_graph.keys() - media_graph.keys())
+    if unexpected_llm_only:
+        errors.append(
+            f"runtime-ios (llm-only) on {IOS_GRAPH_TARGET} resolves packages absent from media: {unexpected_llm_only}"
+        )
+    media_only = media_graph.keys() - llm_only_graph.keys()
+    if not ({"mlx-gen", "mlx-gen-ios-catalog"} <= media_only):
+        errors.append(
+            f"runtime-ios media and llm-only partitions on {IOS_GRAPH_TARGET} are not distinct: "
+            f"media_only={sorted(media_only)}"
+        )
+    return errors
+
+
+BUNDLE_LLM_ONLY_CONTRACTS = {
+    "runtime-macos": {
+        "required": frozenset({"runtime-macos", "runtime-catalog", "mlx-layers", "mlx-llm"}),
+        "forbidden_prefixes": ("mlx-gen", "candle-"),
+        "forbidden_exact": frozenset({"sceneworks-gen-cv", "sceneworks-gen-core-train"}),
+    },
+    "runtime-cpu": {
+        "required": frozenset({
+            "runtime-cpu",
+            "runtime-catalog",
+            "candle-layers",
+            "candle-quant-kernels",
+            "candle-llm",
+        }),
+        "forbidden_prefixes": ("candle-gen", "candle-audio", "mlx-", "pmetal-mlx-"),
+        "forbidden_exact": frozenset({"sceneworks-gen-cv", "sceneworks-gen-core-train"}),
+    },
+    "runtime-cuda": {
+        "required": frozenset({
+            "runtime-cuda",
+            "runtime-catalog",
+            "candle-layers",
+            "candle-quant-kernels",
+            "candle-llm",
+        }),
+        "forbidden_prefixes": ("candle-gen", "candle-audio", "mlx-", "pmetal-mlx-"),
+        "forbidden_exact": frozenset({"sceneworks-gen-cv", "sceneworks-gen-core-train", "candle-flash-attn"}),
+    },
+}
+
+
+def bundle_llm_only_partition_errors(
+    bundle: str, graph: dict[str, set[str]]
+) -> list[str]:
+    contract = BUNDLE_LLM_ONLY_CONTRACTS[bundle]
+    errors: list[str] = []
+    missing = sorted(contract["required"] - graph.keys())
+    if missing:
+        errors.append(f"{bundle} (llm-only) is missing required packages: {missing}")
+    forbidden = sorted(
+        name
+        for name in graph
+        if name in contract["forbidden_exact"]
+        or name.startswith(contract["forbidden_prefixes"])
+    )
+    if forbidden:
+        errors.append(
+            f"{bundle} (llm-only) leaks media, audio, or cross-backend packages: {forbidden}"
+        )
+    return errors
 
 
 def check_ios_graph(offline: bool) -> None:
-    """No trainer and no training-only perceptor in any iOS root's build graph (sc-26265 / E6)."""
+    """No trainer and no training-only perceptor in any iOS root's build graph (sc-26265 / E6),
+    and target-specific bundle partitions stay isolated (SW-6958 / ENG-4a / E4)."""
     prefix, feature = IOS_FORBIDDEN_FEATURE
+    graphs: dict[str, dict[str, set[str]]] = {}
     for root in IOS_GRAPH_ROOTS:
         graph = ios_root_graph(root, offline)
+        graphs[root] = graph
         forbidden = sorted(IOS_FORBIDDEN_PACKAGES & graph.keys())
         if forbidden:
             fail(f"{root} on {IOS_GRAPH_TARGET} reaches training-only packages: {forbidden}")
@@ -1535,6 +1842,14 @@ def check_ios_graph(offline: bool) -> None:
         )
         if training:
             fail(f"{root} on {IOS_GRAPH_TARGET} enables `{feature}` on: {training}")
+
+    ios_llm_only = ios_root_graph("runtime-ios", offline, no_default_features=True)
+    errors = ios_partition_errors(graphs["runtime-ios"], ios_llm_only)
+    for bundle in sorted(BUNDLE_LLM_ONLY_CONTRACTS):
+        llm_only_graph = bundle_target_graph(bundle, offline, no_default_features=True)
+        errors.extend(bundle_llm_only_partition_errors(bundle, llm_only_graph))
+    if errors:
+        fail("; ".join(errors))
 
 
 def check_network_clients(metadata: dict) -> None:
@@ -3951,6 +4266,7 @@ def main() -> int:
         check_network_clients(metadata)
         check_workspace_dependency_inheritance(metadata, ROOT)
         check_provider_tier_edges(metadata)
+        check_layer_spine_edges(metadata)
         check_ios_graph(args.offline)
         check_rust_sources(ROOT)
         check_production_env_reads(ROOT, reject_stale=True)

@@ -15,9 +15,8 @@ use std::{
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{gelu_tanh_exact, group_norm_affine, layer_norm, silu_exact};
 use mlx_rs::ops::{
-    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, conv_general_bias,
-    dequantize, divide, erf, multiply, pad, power, quantize, quantized_matmul,
-    quantized_matmul_bias as quantized_matmul_bias_op, sigmoid, subtract, tanh,
+    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, conv_general_bias, divide,
+    erf, multiply, pad, power, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::compile::{
     compile, compile_retained, RetainedBinary as MlxRetainedBinary,
@@ -56,111 +55,9 @@ fn record_exact_epilogue_fallback(operation: &'static str) {
     );
 }
 
-/// A token-embedding table (`[vocab, hidden]`), dense or group-quantized (Q4/Q8) — the shared
-/// implementation behind the FLUX.2 and Z-Image text encoders' `embed_tokens` (F-083). `forward` is a
-/// row-gather (dequantizing the packed form on the fly), mirroring mlx's `QuantizedEmbedding`, and
-/// returns **f32** (both encoders run f32 internally). FLUX.1's CLIP/T5 embedding intentionally
-/// returns native bf16, so it keeps its own variant rather than using this.
-pub enum TokenEmbedding {
-    Dense(Array),
-    Native(mlx_layers::NativeProjection, Dtype),
-    Quantized {
-        wq: Array,
-        scales: Array,
-        biases: Array,
-        group_size: i32,
-        bits: i32,
-    },
-}
-
-impl TokenEmbedding {
-    /// Gather rows for `ids` (`[b, s]`) → `[b, s, hidden]`, cast to f32.
-    pub fn forward(&self, ids: &Array) -> Result<Array> {
-        Ok(self.rows(ids)?.as_dtype(Dtype::Float32)?)
-    }
-    pub fn rows(&self, ids: &Array) -> Result<Array> {
-        let out = match self {
-            Self::Dense(w) => w.take_axis(ids, 0)?,
-            Self::Native(p, dtype) => p.rows_as(ids, *dtype)?,
-            Self::Quantized {
-                wq,
-                scales,
-                biases,
-                group_size,
-                bits,
-            } => {
-                let pw = wq.take_axis(ids, 0)?;
-                let sc = scales.take_axis(ids, 0)?;
-                let bi = biases.take_axis(ids, 0)?;
-                dequantize(&pw, &sc, &bi, *group_size, *bits)?
-            }
-        };
-        Ok(out)
-    }
-
-    /// Build a quantized table directly from **already-packed** parts read off disk — the
-    /// consume-side counterpart to [`quantize`](Self::quantize), for a *pre-quantized* checkpoint
-    /// (the FLUX.2-dev path, sc-5917). No re-quantization happens; the on-disk `scales`/`biases`
-    /// are used as-is. Mirrors [`AdaptableLinear::from_quantized_parts`] for the embedding case.
-    ///
-    /// [`AdaptableLinear::from_quantized_parts`]: crate::adapters::AdaptableLinear::from_quantized_parts
-    pub fn from_quantized_parts(
-        wq: Array,
-        scales: Array,
-        biases: Array,
-        group_size: i32,
-        bits: i32,
-    ) -> Self {
-        Self::Quantized {
-            wq,
-            scales,
-            biases,
-            group_size,
-            bits,
-        }
-    }
-
-    /// Quantize a dense table in place (group_size 64), the mlx-rs equivalent of
-    /// `nn.Embedding.to_quantized`. No-op if already quantized. `cast_to_bf16` packs the **bf16**
-    /// weight (FLUX.2's path, to byte-match the fork's bf16 `nn.quantize`); when false the weight is
-    /// packed as-is (Z-Image's path). The two are equivalent for a bf16-native checkpoint — the flag
-    /// preserves each caller's exact prior behaviour.
-    pub fn quantize(&mut self, bits: i32, cast_to_bf16: bool) -> Result<()> {
-        if let Self::Dense(w) = self {
-            let (wq, scales, biases) = if cast_to_bf16 {
-                quantize(&w.as_dtype(Dtype::Bfloat16)?, 64, bits)?
-            } else {
-                quantize(w, 64, bits)?
-            };
-            *self = Self::Quantized {
-                wq,
-                scales,
-                biases,
-                group_size: 64,
-                bits,
-            };
-        }
-        Ok(())
-    }
-
-    pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Quantized { .. })
-    }
-
-    /// Evaluate the retained embedding representation without evaluating any other model weight.
-    /// Used by bounded load-time quantization walks to keep the dense-to-packed transient local to
-    /// this table.
-    pub fn materialize_weights(&self) -> Result<()> {
-        match self {
-            Self::Dense(weight) => mlx_rs::transforms::eval([weight])?,
-            Self::Native(p, _) => p.materialize()?,
-            Self::Quantized {
-                wq, scales, biases, ..
-            } => mlx_rs::transforms::eval([wq, scales, biases])?,
-        }
-        Ok(())
-    }
-}
+/// A token-embedding table (`[vocab, hidden]`), dense or group-quantized (Q4/Q8) — re-exported from
+/// [`mlx_layers::quant::TokenEmbedding`] (`SW-6955`).
+pub use mlx_layers::quant::TokenEmbedding;
 
 struct RetainedSignatures {
     cache_generation: u64,
@@ -1017,34 +914,16 @@ pub fn quantized_matmul_with_bias(
     group_size: i32,
     bits: i32,
 ) -> Result<Array> {
-    if let Some(output_bias) = output_bias {
-        if exact_epilogues_enabled() {
-            match quantized_matmul_bias_op(
-                x,
-                w,
-                scales,
-                biases,
-                output_bias,
-                true,
-                group_size,
-                bits,
-            ) {
-                Ok(y) => {
-                    record_exact_epilogue_applied(crate::diagnostics::EXACT_QUANTIZED_MATMUL_BIAS);
-                    return Ok(y);
-                }
-                Err(_) => {
-                    record_exact_epilogue_fallback(crate::diagnostics::EXACT_QUANTIZED_MATMUL_BIAS)
-                }
-            }
-        }
-    }
-
-    let y = quantized_matmul(x, w, scales, biases, true, group_size, bits)?;
-    match output_bias {
-        Some(output_bias) => Ok(add(&y, output_bias)?),
-        None => Ok(y),
-    }
+    crate::ensure_exact_epilogue_hooks();
+    mlx_layers::adapters::quantized_matmul_with_bias(
+        x,
+        w,
+        scales,
+        biases,
+        output_bias,
+        group_size,
+        bits,
+    )
 }
 
 /// SiLU / swish activation: `x · sigmoid(x)`.
@@ -1588,7 +1467,7 @@ mod tests {
     use super::*;
     use crate::diagnostics::{self, DiagnosticCounter, ToggleDisposition, EXACT_EPILOGUES};
     use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
-    use mlx_rs::ops::{abs, array_eq, max, subtract};
+    use mlx_rs::ops::{abs, array_eq, max, quantize, subtract};
     use mlx_rs::Dtype;
 
     /// sc-27453: the Wan / Z-Image / Qwen-Image RoPE glue computed the imaginary part as

@@ -49,6 +49,8 @@ enum WeightScale {
 /// rotation-agnostic, computing `X·(stored W)ᵀ` either way. The per-channel dequant fold runs on-device
 /// (int32 IGEMM → `cast_i32_f32` → candle float fold) when the device supports it, else the host fold.
 pub struct Int8Linear {
+    shape: (usize, usize),
+    device: Device,
     w_i8: Tensor, // (N, K) int codes carried in F32 — the resident weight for the non-staged path
     /// A **pre-staged** on-device `i8` weight (sc-9300): the ConvRot consume path stages the `(N, K)`
     /// codes once so the resident weight is native `i8` (1 byte/elem), not an 8×-larger I64/F32 tensor
@@ -69,6 +71,8 @@ impl Int8Linear {
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
         let qw = quantize_weight_int8(weight)?;
         Ok(Self {
+            shape: weight.dims2()?,
+            device: weight.device().clone(),
             w_i8: qw.q,
             w_staged: None,
             scale_w: WeightScale::PerTensor(qw.scale),
@@ -78,6 +82,13 @@ impl Int8Linear {
         })
     }
 
+    pub fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
     pub fn from_device(weight: &Tensor, bias: Option<Tensor>, dev: &Device) -> Result<Self> {
         Self::new(weight, bias, Arc::new(CublasLt::new(dev)?))
     }
@@ -92,6 +103,8 @@ impl Int8Linear {
     ) -> Result<Self> {
         let qw = quantize_weight_int8_per_channel(weight)?;
         Ok(Self {
+            shape: weight.dims2()?,
+            device: weight.device().clone(),
             w_i8: qw.q,
             w_staged: None,
             scale_w: WeightScale::PerChannel(qw.scale),
@@ -125,6 +138,8 @@ impl Int8Linear {
         // Probe once whether the on-device int32→f32 dequant fast path is available (sc-9601).
         let ondevice_dequant = lt.supports_ondevice_int8_dequant();
         Ok(Self {
+            shape: w_i8.dims2()?,
+            device: lt.device(),
             w_i8,
             w_staged,
             scale_w: WeightScale::PerChannel(scale_w),
@@ -147,6 +162,8 @@ impl Int8Linear {
         }
         let w_staged = Some(lt.stage_int8_bytes(codes)?);
         Ok(Self {
+            shape: codes.dims2()?,
+            device: codes.device().clone(),
             w_i8: Tensor::zeros((0, 0), candle_core::DType::U8, &Device::Cpu)?,
             w_staged,
             scale_w: WeightScale::Kitchen(scales.reshape((1, n))?.to_device(codes.device())?),

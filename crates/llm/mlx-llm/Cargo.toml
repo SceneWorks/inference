@@ -13,7 +13,6 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
-mlx-layers = { workspace = true }
 # mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
 # build ONE mlx-rs and share a single `Array` type (the inversion: mlx-gen will consume mlx-llm).
 # `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX core 0.32.0 (epic 12742; faster Metal
@@ -26,6 +25,7 @@ mlx-layers = { workspace = true }
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
 mlx-rs = { workspace = true }
+mlx-layers = { workspace = true }
 # The raw MLX C API, for the stream → device query the Gated DeltaNet kernel dispatch needs
 # (a custom Metal kernel only runs on a GPU stream; mlx-rs exposes no stream-device getter).
 # The mlx-c binding for ops mlx-rs does not wrap (`mlx_contiguous`, sc-20676), same pinned rev.
@@ -83,7 +83,7 @@ name = "sc20677_capture_kv"
 required-features = ["campaign"]
 
 [features]
-model-inference-proof = ["core-llm/model-inference-proof"]
+model-inference-proof = ["mlx-layers/model-inference-proof", "core-llm/model-inference-proof"]
 # The sc-20671/20676/20677 measurement-campaign harness (`campaign`, `campaign_supervisor`,
 # `kv_capture`, `sc20676_evidence` and the provider's campaign entry points). Off by default: it
 # spawns subprocesses and knows the SceneWorks checkout, so no runtime consumer compiles it.

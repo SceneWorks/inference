@@ -151,6 +151,14 @@ def check_mlx(root: Path) -> list[str]:
         for path in models:
             if not re.search(r"Projection::(?:native|from_named)\(", _production(llm / path)):
                 issues.append(f"{name}: {path} lost shared native projection construction")
+    layers = root / "crates/layers/mlx-layers/src"
+    for path, module, symbol in (
+        (media / "src/quant.rs", "quant", "native_lin"),
+        (llm / "primitives/projection.rs", "llm_projection", "Projection"),
+    ):
+        export = rf"pub\s+use\s+mlx_layers::{module}::(?:\{{[^}}]*\b{symbol}\b[^}}]*\}}|{symbol}|\*)\s*;"
+        if not re.search(export, _production(path)):
+            issues.append(f"{path.relative_to(root)} lost the shared {module}::{symbol} export")
     for path, needle in (
         (media / "src/weights.rs", "mlx_layers::source::prepare_sources("),
         (llm / "primitives/weights.rs", "mlx_layers::source::prepare_sources_with_experts("),
@@ -166,8 +174,8 @@ def check_mlx(root: Path) -> list[str]:
         (media / "mlx-gen-minimax-h3/src/text_encoder/mod.rs", "Weights::from_selected_files("),
         (media / "mlx-gen-lens/src/text_encoder/gpt_oss.rs", "SwitchLinear::from_scalar_source("),
         (media / "mlx-gen-minimax-h3/src/dit/heads.rs", "source_projection("),
-        (media / "src/quant.rs", "NativeProjection::from_weights("),
-        (llm / "primitives/projection.rs", "NativeProjection::from_key("),
+        (layers / "quant.rs", "NativeProjection::from_weights("),
+        (layers / "llm_projection.rs", "NativeProjection::from_key("),
     ):
         if needle not in _production(path):
             issues.append(f"{path.relative_to(root)} lacks {needle}")

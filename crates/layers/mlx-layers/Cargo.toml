@@ -3,12 +3,19 @@ name = "mlx-layers"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-
-[dependencies]
-mlx-rs = { workspace = true }
-mlx-sys = { workspace = true }
-sceneworks-gen-core = { workspace = true }
-thiserror = { workspace = true }
+repository = "https://github.com/SceneWorks/inference"
+description = "Lower-level MLX linear, quantization, and residual adapter primitives shared below media and LLM engines"
 
 [features]
+default = []
+# Opt-in test helpers (e.g., host comparison helpers on INT8 GEMM / W4A8).
 test-support = []
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "core-llm/model-inference-proof"]
+
+[dependencies]
+sceneworks-gen-core = { workspace = true }
+core-llm = { workspace = true }
+mlx-rs = { workspace = true }
+mlx-sys = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }

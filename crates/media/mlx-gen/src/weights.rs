@@ -178,9 +178,7 @@ impl Weights {
         {
             return Ok(None);
         }
-        Ok(mlx_layers::NativeProjection::from_key(
-            self, base, key, false,
-        )?)
+        mlx_layers::NativeProjection::from_key(self, base, key, false)
     }
 
     pub fn insert_source_projection(
@@ -1005,6 +1003,12 @@ pub fn join(prefix: &str, name: &str) -> String {
 }
 
 impl mlx_layers::MlxWeightSource for Weights {
+    fn peek(&self, key: &str) -> Option<&Array> {
+        Weights::peek(self, key)
+    }
+    fn require(&self, key: &str) -> Result<&Array> {
+        Weights::require(self, key)
+    }
     fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
         self.source_reads.get(key)
     }

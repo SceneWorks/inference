@@ -554,6 +554,12 @@ mod cuda_impl {
             })
         }
 
+        /// The CUDA [`Device`] this handle is bound to and onto which its weight-staging helpers
+        /// upload device buffers.
+        pub fn device(&self) -> Device {
+            Device::Cuda(self.device.clone())
+        }
+
         /// Compute capability of the bound device as `(major, minor)` — the sm_89 eligibility gate
         /// (locked-decision-7) reads this. For the worker, this is queryable straight off the candle
         /// device via `CudaDevice::cuda_stream().context().attribute(..)` (see module writeup).
@@ -2097,6 +2103,10 @@ mod cuda_impl {
     }
 
     impl DevFp8 {
+        pub(crate) fn resident_bytes(&self) -> usize {
+            self.buf.len()
+        }
+
         pub fn is_e5m2(&self) -> bool {
             self.dtype == sys::cudaDataType_t::CUDA_R_8F_E5M2
         }

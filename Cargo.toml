@@ -43,6 +43,7 @@ members = [
     "crates/kernels/candle-quant-kernels",
     "crates/layers/candle-checkpoint",
     "crates/layers/mlx-layers",
+    "crates/layers/candle-layers",
     "crates/bundles/*",
     "crates/llm/candle-llm",
     "crates/llm/mlx-llm",
@@ -71,12 +72,13 @@ sceneworks-gen-cv = { path = "crates/media/gen-cv" }
 sceneworks-load-progress = { path = "crates/contracts/load-progress" }
 core-llm = { path = "crates/contracts/core-llm" }
 core-llm-testkit = { path = "crates/contracts/core-llm/core-llm-testkit" }
-mlx-layers = { path = "crates/layers/mlx-layers" }
 mlx-llm = { path = "crates/llm/mlx-llm" }
 candle-llm = { path = "crates/llm/candle-llm" }
 # The shared low-precision kernels (NVFP4 codec + cuBLASLt wrapper) both Candle engines serve
 # from (sc-24135): one implementation, consumed by candle-gen (media) and candle-llm (LLM).
 candle-quant-kernels = { path = "crates/kernels/candle-quant-kernels" }
+mlx-layers = { path = "crates/layers/mlx-layers" }
+candle-layers = { path = "crates/layers/candle-layers" }
 sceneworks-gen-core = { path = "crates/contracts/gen-core" }
 sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
 # The Iris host TCP collective transport and the opt-in H3 host telemetry, split out of gen-core

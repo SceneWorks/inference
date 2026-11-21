@@ -145,13 +145,13 @@ readme = "README.md"
 autotests = false
 
 [dependencies]
-mlx-layers = { workspace = true }
 # Backend-neutral host-side test helpers (`gen_core_testkit::host`, sc-27323), re-exported from
 # `testing`. Zero tensor deps; only compiled with the test-only `test-support` feature.
 sceneworks-gen-core-testkit = { workspace = true, optional = true }
 # Shared pins live in [workspace.dependencies] above (F-151).
 mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
+mlx-layers = { workspace = true }
 sceneworks-gen-core = { workspace = true }
 sceneworks-gen-core-checkpoint = { workspace = true }
 sceneworks-gen-core-iris = { workspace = true }
@@ -200,7 +200,7 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-layers/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Shared test-only comparison helpers (`mlx_gen::testing`, sc-27323) for provider tests; enabled
 # through a provider dev-dependency, never by a runtime bundle.
 test-support = ["dep:sceneworks-gen-core-testkit", "mlx-layers/test-support"]

@@ -148,6 +148,18 @@ impl Fp8Linear {
         Ok(layer)
     }
 
+    /// Device bytes held by the stored codes, device scale planes and optional fused bias.
+    pub fn resident_bytes(&self) -> u64 {
+        let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        (self.w_fp8.resident_bytes()
+            + self.block_scales.as_ref().map_or(0, bytes)
+            + self
+                .row_scales
+                .as_ref()
+                .map_or(0, |_| self.dims.0 * size_of::<f32>())
+            + self.bias.as_ref().map_or(0, bytes)) as u64
+    }
+
     pub fn format_id(&self) -> &'static str {
         use gen_core::checkpoint_codec::{
             FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, MXFP8_CODEC,
@@ -166,6 +178,11 @@ impl Fp8Linear {
 
     pub fn dims(&self) -> (usize, usize) {
         self.dims
+    }
+
+    /// Logical (output, input) matrix dimensions.
+    pub fn shape(&self) -> (usize, usize) {
+        self.dims()
     }
 
     pub fn device(&self) -> &Device {

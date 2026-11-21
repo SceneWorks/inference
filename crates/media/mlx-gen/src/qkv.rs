@@ -1399,10 +1399,7 @@ fn try_pack(
     v: &AdaptableLinear,
 ) -> std::result::Result<(AdaptableLinear, [i32; 2]), NoFusion> {
     let parts = [q, k, v];
-    if parts
-        .iter()
-        .any(|l| l.adapters().iter().any(|a| !a.is_disabled()))
-    {
+    if parts.iter().any(|l| l.has_live_adapters()) {
         return Err(NoFusion::AdaptersInstalled);
     }
 

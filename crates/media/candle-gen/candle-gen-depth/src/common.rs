@@ -69,7 +69,8 @@ pub(crate) fn join(prefix: &str, leaf: &str) -> String {
     }
 }
 
-/// A dense linear over the LAST dim (the loaded `[out, in]` weight + optional bias). Applies to any
+/// A dense linear over the LAST dim (the loaded `[out, in]` weight + bias), backed by the shared
+/// [`candle_gen::quant::QLinear`] pre-transposed layout (`SW-6956`, `BACK-1`). Applies to any
 /// `[.., in]` tensor by flattening the leading dims (robust for both the `[b, n, c]` token
 /// projections and the `[b, nh, seq, hd]` head tensors).
 #[derive(Clone)]

@@ -486,19 +486,13 @@ fn companion<'a>(
 /// so those two codes are substituted explicitly. Pinned by the 256-code cross-check test against
 /// `gen_core::fp8_e4m3fn_to_f32`.
 fn e4m3_bytes_to_f32(codes: &Array) -> Result<Array> {
-    Ok(mlx_layers::fp8::decoded_codes(
-        codes,
-        gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn,
-    )?)
+    mlx_layers::fp8::decoded_codes(codes, gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn)
 }
 
 /// Decode E5M2 bytes (`U8` view) to f32: E5M2 is IEEE binary16 truncated to its top byte, so
 /// `u16(byte) << 8` reinterpreted as f16 is the exact value (inf/NaN codes included).
 fn e5m2_bytes_to_f32(codes: &Array) -> Result<Array> {
-    Ok(mlx_layers::fp8::decoded_codes(
-        codes,
-        gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2,
-    )?)
+    mlx_layers::fp8::decoded_codes(codes, gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2)
 }
 
 /// Decode E8M0 shared-exponent bytes (`U8` view) to f32: `2^(byte − 127)` = `u32(byte) << 23`

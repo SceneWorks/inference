@@ -528,6 +528,9 @@ pub(crate) fn eval_groups(groups: &[Vec<Array>]) -> Result<()> {
 }
 
 impl mlx_layers::MlxWeightSource for Weights {
+    fn peek(&self, key: &str) -> Option<&Array> {
+        self.metadata(key)
+    }
     fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
         self.source_reads.get(key)
     }
