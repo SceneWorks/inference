@@ -309,6 +309,9 @@ impl VideoRenderPlan {
     pub fn reference_rgb_digests(&self) -> &[[u8; 32]] {
         &self.inputs.reference_rgb_digests
     }
+    pub(crate) fn backend_id(&self) -> &str {
+        self.backend
+    }
     pub(crate) fn provider_id(&self) -> &str {
         self.registration.provider_id
     }

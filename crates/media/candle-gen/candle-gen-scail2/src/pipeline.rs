@@ -719,8 +719,13 @@ fn registered_layout(req: &GenerationRequest) -> gen_core::Result<gen_core::Vide
 }
 
 impl Generator for Scail2 {
-    fn retained_weight_bytes(&self) -> Option<u64> {
-        if !self.device.is_cuda() {
+    fn video_plan_resident_weight_bytes(&self, plan: &gen_core::VideoRenderPlan) -> Option<u64> {
+        if !self.device.is_cuda()
+            || plan.geometry().reference_count < 2
+            || plan
+                .check_provider(self.descriptor(), self.video_load_binding())
+                .is_err()
+        {
             return None;
         }
         let ready = self.components.lock().ok()?;

@@ -84,6 +84,13 @@ pub trait Generator {
         None
     }
 
+    /// Materialized weights owned by this exact loaded, planned video generator.
+    /// They remain live throughout the request. A caller can deduct them once from a
+    /// gross cold price when its committed snapshot already contains those same bytes.
+    fn video_plan_resident_weight_bytes(&self, _plan: &crate::VideoRenderPlan) -> Option<u64> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the
