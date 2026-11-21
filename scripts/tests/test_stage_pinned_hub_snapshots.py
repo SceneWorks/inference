@@ -356,6 +356,7 @@ class Staging(unittest.TestCase):
             self.assertNotIn("QWEN38_FULL_TIER_SNAPSHOT", proofs.staged_hub_snapshots(draft, bound, env))
 
 
+@unittest.skipIf(os.name == "nt", "secondary macOS directory-descriptor primitives")
 class ScailPluralCache(unittest.TestCase):
     def setUp(self):
         from scripts.ci.scail_plural import contract as plural
@@ -383,13 +384,91 @@ class ScailPluralCache(unittest.TestCase):
         for other in (dict(self.plan, backend="candle-cuda"), {"asset_setup": "hub-snapshots"}):
             self.assertEqual(staging.hub_root(self.env, other), Path(self.env["MODEL_PROOF_HUB_ROOT"]))
 
-    @unittest.skipIf(os.name == "nt", "secondary macOS symlink route")
     def test_linked_cache_does_not_publish_outside_the_runner_home(self):
         with tempfile.TemporaryDirectory() as other, patch.object(staging, "runner_account_home", return_value=self.home):
             (self.home / "Library").symlink_to(other, target_is_directory=True)
             with self.assertRaisesRegex(ValueError, "directly beneath"):
                 staging.hub_root(self.env, self.plan)
             self.assertEqual(list(Path(other).iterdir()), [])
+
+    def test_linked_lock_tree_cannot_redirect_staging(self):
+        self.cache.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as other, patch.object(staging, "runner_account_home", return_value=self.home):
+            target = Path(other)
+            link = self.cache / ".locks"
+            for destination in (target, target / "absent"):
+                link.symlink_to(destination, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "directly beneath"):
+                    staging.hub_root(self.env, self.plan)
+                self.assertEqual(list(target.iterdir()), [])
+                link.unlink()
+
+    def test_pinned_weight_and_lock_leaves_must_be_local_regular_files(self):
+        pin = next(iter(self.plan["hub_snapshots"].values()))
+        tier = staging.snapshot_dir(self.cache, pin["repository"], pin["revision"]) / "q4"
+        lock = staging.lock_path(self.cache, pin["repository"], pin["revision"], "q4/clip.safetensors")
+        with tempfile.TemporaryDirectory() as other, patch.object(staging, "runner_account_home", return_value=self.home):
+            external = Path(other) / "external"
+            external.touch()
+            for path in (tier / "clip.safetensors", lock):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                for target in (external, external.with_name("absent")):
+                    path.symlink_to(target)
+                    with self.assertRaisesRegex(ValueError, "single local regular file"):
+                        staging.hub_root(self.env, self.plan)
+                    path.unlink()
+                os.link(external, path)
+                with self.assertRaisesRegex(ValueError, "single local regular file"):
+                    staging.hub_root(self.env, self.plan)
+                path.unlink()
+            self.assertEqual(external.read_bytes(), b"")
+
+    def test_native_stage_uses_only_the_six_manifest_names_and_reuses_regular_members(self):
+        from scripts.ci.scail_plural import contract as plural
+
+        manifest = {"q4/" + name: {"size": size} for name, (size, _) in plural.FILES.items()}
+        with patch.object(staging, "runner_account_home", return_value=self.home):
+            staging.hub_root(self.env, self.plan)
+        downloads = []
+
+        def fetch(url, path):
+            downloads.append(path)
+            path.touch()
+            return 0, "", None, False
+
+        def run():
+            return staging.stage(self.plan["hub_snapshots"], self.cache, native_home=self.home, fetch=fetch,
+                                 manifest=lambda *_: (None, None, manifest), free_bytes=lambda _: 10**12,
+                                 verify=lambda *_: {"status": "test-only", "manifest_sha256": "", "files": []})
+
+        manifest["q4/unexpected"] = {"size": 3}
+        with self.assertRaisesRegex(ValueError, "six pinned"):
+            run()
+        self.assertFalse(downloads)
+        del manifest["q4/unexpected"]
+        self.assertEqual(run()[plural.SLOT]["fetched"], sorted(manifest))
+        self.assertEqual(run()[plural.SLOT]["fetched"], [])
+        self.assertEqual(len(downloads), 6)
+
+    def test_native_lock_open_rechecks_symlinks_and_hardlinks_after_preflight(self):
+        pin = next(iter(self.plan["hub_snapshots"].values()))
+        key = (self.cache, pin["repository"], pin["revision"], "q4/dit.safetensors")
+        with patch.object(staging, "runner_account_home", return_value=self.home):
+            staging.hub_root(self.env, self.plan)
+        lock = staging.lock_path(*key)
+        external = self.home / "unrelated"
+        external.touch()
+        lock.symlink_to(external)
+        with self.assertRaises(OSError), staging.staging_lock(*key, native_home=self.home):
+            self.fail("redirected lock acquired")
+        lock.unlink()
+        os.link(external, lock)
+        with self.assertRaisesRegex(ValueError, "single local regular file"), staging.staging_lock(*key, native_home=self.home):
+            self.fail("hard-linked lock acquired")
+        self.assertEqual(external.read_bytes(), b"")
+        lock.unlink()
+        with staging.staging_lock(*key, native_home=self.home):
+            self.assertEqual(lock.read_bytes(), b"0")
 
     def test_failed_native_link_probe_aborts_before_hub_staging(self):
         plan_file = self.home / "plan.json"

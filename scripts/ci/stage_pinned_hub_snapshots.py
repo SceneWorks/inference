@@ -24,13 +24,14 @@ loaded; the one manual proof invocation that follows re-checks the receipt again
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -74,14 +75,72 @@ def _try_lock(handle) -> bool:
         raise
 
 
+def lock_path(hub: Path, repository: str, revision: str, file: str) -> Path:
+    return (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
+            / revision / (file + ".lock"))
+
+
 @contextmanager
-def staging_lock(hub: Path, repository: str, revision: str, file: str):
+def native_directory(home: Path, path: Path):
+    """Create/open only real directories on the secondary runner's home volume."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as handles:
+        fd = os.open(home, flags)
+        handles.callback(os.close, fd)
+        device = os.fstat(fd).st_dev
+        for part in path.relative_to(home).parts:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            try:
+                fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTDIR, errno.ELOOP):
+                    raise
+                raise ValueError("SCAIL-2 native cache must resolve directly beneath the runner account home") from exc
+            handles.callback(os.close, fd)
+            if os.fstat(fd).st_dev != device:
+                raise ValueError("SCAIL-2 native cache must be on the runner home volume")
+        yield fd
+
+
+def check_native_file(info, device: int, name: str) -> None:
+    if not stat.S_ISREG(info.st_mode) or info.st_dev != device or info.st_nlink != 1:
+        raise ValueError(f"SCAIL-2 native cache requires a single local regular file for {name}")
+
+
+def check_native_leaves(fd: int, names) -> None:
+    device = os.fstat(fd).st_dev
+    for name in names:
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        check_native_file(info, device, name)
+
+
+@contextmanager
+def native_lock_handle(home: Path, path: Path):
+    with native_directory(home, path.parent) as parent:
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW
+        fd = os.open(path.name, flags, 0o600, dir_fd=parent)
+        with os.fdopen(fd, "a+b") as handle:
+            check_native_file(os.fstat(fd), os.fstat(parent).st_dev, path.name)
+            yield handle
+
+
+@contextmanager
+def staging_lock(hub: Path, repository: str, revision: str, file: str, *, native_home=None):
     """Hold the host-wide lock for one pinned file. The lock file is never deleted, because a
     waiter could otherwise lock a different inode; the OS releases the lock if a job dies."""
-    path = (hub / ".locks" / ("models--" + repository.replace("/", "--")) / "model-proof-staging"
-            / revision / (file + ".lock"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+b") as handle:
+    path = lock_path(hub, repository, revision, file)
+    if native_home is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opened = open(path, "a+b")
+    else:
+        opened = native_lock_handle(native_home, path)
+    with opened as handle:
         if handle.seek(0, 2) == 0:
             handle.write(b"0")
             handle.flush()
@@ -124,8 +183,12 @@ def runner_account_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
 
 
+def uses_native_hub(plan: dict) -> bool:
+    return plan.get("protocol") == "scail2-plural-fit-v1" and plan.get("backend") == "mlx"
+
+
 def hub_root(env: dict[str, str], plan: dict) -> Path:
-    if plan.get("protocol") == "scail2-plural-fit-v1" and plan.get("backend") == "mlx":
+    if uses_native_hub(plan):
         from scripts.ci.scail_plural import contract as plural
 
         if (plan["request"]["selection"] != plural.SELECTION
@@ -135,12 +198,11 @@ def hub_root(env: dict[str, str], plan: dict) -> Path:
         home = runner_account_home()
         hub = home / "Library/Caches/SceneWorks/model-proof/huggingface/hub"
         tier = snapshot_dir(hub, plural.REPO, plural.REV) / "q4"
-        if tier.resolve() != tier:
-            raise ValueError("SCAIL-2 native cache must resolve directly beneath the runner account home")
-        existing = next(parent for parent in (tier, *tier.parents) if parent.exists())
-        if existing.stat().st_dev != home.stat().st_dev:
-            raise ValueError("SCAIL-2 native cache must be on the runner home volume")
-        tier.mkdir(parents=True, exist_ok=True)
+        with native_directory(home, tier) as fd:
+            check_native_leaves(fd, plural.FILES)
+        locks = [lock_path(hub, plural.REPO, plural.REV, "q4/" + name) for name in plural.FILES]
+        with native_directory(home, locks[0].parent) as fd:
+            check_native_leaves(fd, (path.name for path in locks))
         # Probe the actual target directory before contacting the Hub or fetching a large file.
         with tempfile.TemporaryDirectory(dir=tier, prefix=".publish-check-") as scratch:
             source = Path(scratch) / "source"
@@ -158,7 +220,7 @@ def hub_root(env: dict[str, str], plan: dict) -> Path:
 
 
 def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fetch=None,
-          verify=verify_pinned_hub_files, free_bytes=None) -> dict:
+          verify=verify_pinned_hub_files, free_bytes=None, native_home=None) -> dict:
     """Fetch every absent pinned file, then authenticate every pinned file; return the receipt."""
     if fetch is None:
         from scripts.ci.flux1_conditional_asset_inventory import fetch_pinned as fetch
@@ -168,6 +230,12 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
         repository, revision, subfolder = pin["repository"], pin["revision"], pin["subfolder"]
         _, _, inventory = manifest(repository, revision)
         files = pinned_files(inventory, subfolder)
+        if native_home is not None:
+            from scripts.ci.scail_plural import contract as plural
+
+            if ((name, repository, revision, subfolder) != (plural.SLOT, plural.REPO, plural.REV, "q4")
+                    or files != {"q4/" + member: size for member, (size, _) in plural.FILES.items()}):
+                raise ValueError("SCAIL-2 native staging requires the exact six pinned q4 files")
         base = snapshot_dir(hub, repository, revision)
         absent = {file: size for file, size in files.items() if not (base / file).exists()}
         plans.append((name, pin, base, files, absent))
@@ -180,7 +248,10 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
     for name, pin, base, files, absent in plans:
         fetched, placed_by_another_job = [], []
         for file in sorted(absent):
-            with staging_lock(hub, pin["repository"], pin["revision"], file):
+            with staging_lock(hub, pin["repository"], pin["revision"], file, native_home=native_home):
+                if native_home is not None:
+                    with native_directory(native_home, (base / file).parent) as fd:
+                        check_native_leaves(fd, [Path(file).name])
                 # Staged for an earlier slot of the same revision, or by another job on this host.
                 if (base / file).exists():
                     continue
@@ -188,6 +259,10 @@ def stage(snapshots: dict[str, dict], hub: Path, *, manifest=pinned_manifest, fe
                 print(f"staging {pin['repository']}@{pin['revision']}/{file} ({absent[file] / GIB:.2f} GiB)", flush=True)
                 _, _, _, placed = fetch(url, base / file)
                 (placed_by_another_job if placed else fetched).append(file)
+        if native_home is not None:
+            # Another listener may have published members since the initial preflight.
+            with native_directory(native_home, base / pin["subfolder"]) as fd:
+                check_native_leaves(fd, (Path(file).name for file in files))
         verified = verify(pin["repository"], pin["revision"], base, tuple(sorted(files)))
         path = base / pin["subfolder"] if pin["subfolder"] else base
         receipt[name] = {**pin, "path": str(path), "status": verified["status"], "fetched": fetched,
@@ -210,7 +285,8 @@ def main() -> int:
     if not github_env or not temporary:
         raise ValueError("GitHub Actions environment file and RUNNER_TEMP are required")
     hub = hub_root(env, plan)
-    receipt = {"hub_root": str(hub), "snapshots": stage(snapshots, hub)}
+    home = runner_account_home() if uses_native_hub(plan) else None
+    receipt = {"hub_root": str(hub), "snapshots": stage(snapshots, hub, native_home=home)}
     receipt_path = Path(temporary) / "model-proof-hub-snapshots.json"
     receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     with open(github_env, "a", encoding="utf-8") as out:
