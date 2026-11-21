@@ -657,9 +657,19 @@ fn codec_registry_rejects_duplicate_ids_and_double_claimed_formats() {
 }
 
 #[test]
-fn comfy_codec_table_separates_the_two_fp8_e4m3_rows_by_descriptor() {
+fn comfy_codec_table_separates_scalar_rowwise_and_block_fp8_e4m3_descriptors() {
     let registry = full();
-    assert_eq!(registry.len(), 9);
+    assert_eq!(registry.len(), 10);
+    assert_eq!(
+        registry
+            .for_format(StoredTensorFormat::described(
+                WeightEncoding::Fp8E4M3,
+                ComfyQuantFormat::Fp8Rowwise
+            ))
+            .unwrap()
+            .codec_id,
+        "fp8-e4m3-rowwise-v1"
+    );
     // NVFP4 is the one `U8`-stored codec, separated from an undescribed `U8` tensor (which has
     // no codec at all) by its descriptor half.
     assert_eq!(
@@ -953,16 +963,10 @@ fn mixed_checkpoint_dispatches_per_layer_and_accounts_every_companion() {
     assert_eq!(all, file);
 }
 
-/// sc-20385 review: the shared MXFP8 / int8-per-row companion arm recorded `input_scale` at
-/// **zero** resident bytes unconditionally, while the ScalarFp8 arm branched on the residency
-/// mode, so a packed MXFP8 row under-priced its retained activation scale. Both arms now use
-/// the same `match mode` rule.
-///
-/// Only the MXFP8 half of that arm can actually carry an `input_scale`: the companion-surface
-/// check refuses one on an `int8_tensorwise` layer by format (asserted below), so the int8 row
-/// here contributes its `weight_scale` only.
+/// Some MX sources carry a scalar input-scale sidecar, but MX computes its activation
+/// scales per group of 32 at runtime. Record the file's bytes and the actual retained operands.
 #[test]
-fn packed_mxfp8_rows_retain_their_input_scale_companion() {
+fn packed_mxfp8_counts_a_static_input_scale_only_in_source_bytes() {
     struct PackEverything;
     impl CodecResidencyPolicy for PackEverything {
         fn residency(
@@ -1016,14 +1020,19 @@ fn packed_mxfp8_rows_retain_their_input_scale_companion() {
             .unwrap()
             .resident_bytes
     };
-    // Retained at its stored width — 4 bytes, not zero.
-    assert_eq!(companion(&packed, "model.v.input_scale"), 4);
+    let input = packed
+        .companions
+        .iter()
+        .find(|c| c.physical_key == "model.v.input_scale")
+        .unwrap();
+    assert_eq!(input.source_bytes, 4);
+    assert_eq!(input.resident_bytes, 0);
     // And the weight scales alongside it, so the input-scale row is the only thing this
     // fixture could be getting wrong.
     assert_eq!(companion(&packed, "model.o.weight_scale"), 16);
     assert_eq!(companion(&packed, "model.v.weight_scale"), 512);
     // The plan total accounts for every retained byte.
-    assert_eq!(packed.resident_bytes(), 32 + 16 + 32 * 64 + 512 + 4);
+    assert_eq!(packed.resident_bytes(), 32 + 16 + 32 * 64 + 512);
 
     // Under the dense policy the same companion is consumed, so the assertion above is about
     // the packed branch, not about the fixture always pricing scales.

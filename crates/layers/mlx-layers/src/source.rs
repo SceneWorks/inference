@@ -419,6 +419,8 @@ pub fn bind_source_layout(
             );
             if let Some(sx) = sx {
                 tensors.insert(format!("{base}.input_scale"), sx);
+            } else {
+                tensors.remove(&format!("{base}.input_scale"));
             }
         }
     }

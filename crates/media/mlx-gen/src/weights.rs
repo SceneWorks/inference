@@ -148,6 +148,12 @@ impl Weights {
 
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_with_experts(path, |_| false)
+    }
+    pub fn from_file_with_experts(
+        path: impl AsRef<Path>,
+        expert_key: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         #[cfg(feature = "model-inference-proof")]
         let __input_path = path.as_ref();
         let (mut tensors, metadata) = gen_core::__model_input_reader!(
@@ -167,10 +173,11 @@ path.as_ref(),
             .cloned()
             .into_iter()
             .collect();
-        let source_reads = mlx_layers::source::prepare_sources(
+        let source_reads = mlx_layers::source::prepare_sources_with_experts(
             &mut tensors,
             &[path.as_ref().to_owned()],
             &declarations,
+            expert_key,
         )?;
         Ok(Self {
             source_reads,
@@ -456,6 +463,12 @@ path.as_ref(),
     /// `.safetensors` extension but are not shards, and sort ahead of the real file — see
     /// [`gen_core::weightsmeta::is_hidden_file`].
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::from_dir_with_experts(dir, |_| false)
+    }
+    pub fn from_dir_with_experts(
+        dir: impl AsRef<Path>,
+        expert_key: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         let dir = dir.as_ref();
         let mut files: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -466,12 +479,19 @@ path.as_ref(),
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", dir.display()).into());
         }
-        Self::from_paths(&files, dir)
+        Self::from_paths_with_experts(&files, dir, expert_key)
     }
 
     /// Load a previously selected shard set with the same disjoint-key and metadata behavior as
     /// [`Self::from_dir`]. The caller chooses and validates the complete path list before loading.
     pub fn from_paths(files: &[PathBuf], source_dir: &Path) -> Result<Self> {
+        Self::from_paths_with_experts(files, source_dir, |_| false)
+    }
+    fn from_paths_with_experts(
+        files: &[PathBuf],
+        source_dir: &Path,
+        expert_key: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", source_dir.display()).into());
         }
@@ -511,7 +531,12 @@ f,
             "mlx-gen::Weights::from_paths",
             files,
         );
-        let source_reads = mlx_layers::source::prepare_sources(&mut tensors, files, &declarations)?;
+        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+            &mut tensors,
+            files,
+            &declarations,
+            expert_key,
+        )?;
         Ok(Self {
             source_reads,
             tensors,

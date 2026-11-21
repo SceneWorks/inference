@@ -38,23 +38,7 @@ use crate::text_encoder::mxfp4::dequantize_mxfp4;
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight and `[out]` bias (the gpt-oss attention
 /// projections all have biases — `attention_bias: true`).
-struct LinearBias {
-    w: Array, // [out, in]
-    b: Array, // [out]
-}
-
-impl LinearBias {
-    fn load(w: &Weights, key: &str, dtype: Dtype) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{key}.weight"))?.as_dtype(dtype)?,
-            b: w.require(&format!("{key}.bias"))?.as_dtype(dtype)?,
-        })
-    }
-
-    fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(add(&matmul(x, self.w.t())?, &self.b)?)
-    }
-}
+type LinearBias = crate::dit::Linear;
 
 /// One gpt-oss decoder layer's attention (`self_attn`). Consumes the RMSNorm'd hidden state and
 /// returns the attention output *before* the residual add (matching `GptOssAttention.forward`).
@@ -82,10 +66,10 @@ impl GptOssAttention {
         dtype: Dtype,
     ) -> Result<Self> {
         Ok(Self {
-            q_proj: LinearBias::load(w, &format!("{prefix}.q_proj"), dtype)?,
-            k_proj: LinearBias::load(w, &format!("{prefix}.k_proj"), dtype)?,
-            v_proj: LinearBias::load(w, &format!("{prefix}.v_proj"), dtype)?,
-            o_proj: LinearBias::load(w, &format!("{prefix}.o_proj"), dtype)?,
+            q_proj: LinearBias::load(w, &format!("{prefix}.q_proj"), true, dtype)?,
+            k_proj: LinearBias::load(w, &format!("{prefix}.k_proj"), true, dtype)?,
+            v_proj: LinearBias::load(w, &format!("{prefix}.v_proj"), true, dtype)?,
+            o_proj: LinearBias::load(w, &format!("{prefix}.o_proj"), true, dtype)?,
             sinks: w.require(&format!("{prefix}.sinks"))?.as_dtype(dtype)?,
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
@@ -538,6 +522,10 @@ impl StackedQuant {
 /// (the dequantized-MXFP4 encoder path) or MLX group-wise affine Q4/Q8 (the ~12 GB path, sc-3172).
 /// Replaces the former per-expert `Vec<Expert>` + all-32-dense-then-mask loop.
 enum ExpertBank {
+    Source {
+        gu: mlx_llm::primitives::moe::SwitchLinear,
+        dn: mlx_llm::primitives::moe::SwitchLinear,
+    },
     /// `gu_w [E, hidden, 2·inter]`, `gu_b [E, 2·inter]`, `dn_w [E, inter, hidden]`, `dn_b [E, hidden]`
     /// — the `GptOssExperts` `[E, in, out]` layout, forward `x·w` via `gather_mm`.
     Dense {
@@ -550,18 +538,28 @@ enum ExpertBank {
     Quant { gu: StackedQuant, dn: StackedQuant },
 }
 
+pub(crate) fn stacked_expert_key(key: &str) -> bool {
+    key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj")
+}
+
 impl ExpertBank {
     /// gate_up projection: `x [.., 1, hidden]` → `[.., 1, 2·inter]`.
-    fn gate_up(&self, x: &Array, idx: &Array, sorted: bool) -> Result<Array> {
+    fn gate_up(&self, x: &Array, idx: &Array, sorted: bool, offsets: &[i32]) -> Result<Array> {
         match self {
+            ExpertBank::Source { gu, .. } => gu
+                .project_sorted(x, idx, offsets)
+                .map_err(|e| mlx_gen::Error::Msg(e.to_string())),
             ExpertBank::Dense { gu_w, gu_b, .. } => dense_gather(x, gu_w, gu_b, idx, sorted),
             ExpertBank::Quant { gu, .. } => gu.forward(x, idx, sorted),
         }
     }
 
     /// down projection: `gated [.., 1, inter]` → `[.., 1, hidden]`.
-    fn down(&self, gated: &Array, idx: &Array, sorted: bool) -> Result<Array> {
+    fn down(&self, gated: &Array, idx: &Array, sorted: bool, offsets: &[i32]) -> Result<Array> {
         match self {
+            ExpertBank::Source { dn, .. } => dn
+                .project_sorted(gated, idx, offsets)
+                .map_err(|e| mlx_gen::Error::Msg(e.to_string())),
             ExpertBank::Dense { dn_w, dn_b, .. } => dense_gather(gated, dn_w, dn_b, idx, sorted),
             ExpertBank::Quant { dn, .. } => dn.forward(gated, idx, sorted),
         }
@@ -595,6 +593,7 @@ fn dense_gather(x: &Array, w: &Array, b: &Array, idx: &Array, sorted: bool) -> R
 pub struct GptOssMoe {
     router_w: Array, // [E, hidden]
     router_b: Array, // [E]
+    router_source: Option<mlx_gen::NativeProjection>,
     bank: ExpertBank,
     top_k: i32,
     inter: i32,
@@ -627,7 +626,30 @@ impl GptOssMoe {
         // directly with NO MXFP4 dequant + re-quant transient — the memory win realized on disk. A
         // dense (MXFP4) source has no `experts.gate_up_proj.scales`, so it falls through to the
         // dequant-then-(optionally)-quantize paths below.
-        let bank = if crate::quant::has_packed_experts(w, prefix, "gate_up") {
+        let bank = if w
+            .get(&format!("{prefix}.experts.gate_up_proj.comfy_quant"))
+            .is_some()
+        {
+            let project = |name: &str, n: i32, k: i32| -> Result<_> {
+                let key = format!("{prefix}.experts.{name}_proj");
+                let bias = req(&format!("{key}_bias"))?;
+                mlx_llm::primitives::moe::SwitchLinear::from_scalar_source(
+                    w,
+                    &key,
+                    [cfg.num_experts, n, k],
+                    true,
+                    Some(&bias),
+                )
+                .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?
+                .ok_or_else(|| {
+                    mlx_gen::Error::Msg(format!("{key}: missing source expert descriptor"))
+                })
+            };
+            ExpertBank::Source {
+                gu: project("gate_up", 2 * cfg.intermediate, cfg.hidden_size)?,
+                dn: project("down", cfg.hidden_size, cfg.intermediate)?,
+            }
+        } else if crate::quant::has_packed_experts(w, prefix, "gate_up") {
             ExpertBank::Quant {
                 gu: stacked_quant_from_pack(crate::quant::load_packed_stack(w, prefix, "gate_up")?),
                 dn: stacked_quant_from_pack(crate::quant::load_packed_stack(w, prefix, "down")?),
@@ -683,7 +705,8 @@ impl GptOssMoe {
         };
 
         Ok(Self {
-            router_w: req(&format!("{prefix}.router.weight"))?,
+            router_source: w.source_projection(&format!("{prefix}.router.weight"))?,
+            router_w: w.require(&format!("{prefix}.router.weight"))?.clone(),
             router_b: req(&format!("{prefix}.router.bias"))?,
             bank,
             top_k: cfg.experts_per_tok,
@@ -701,7 +724,14 @@ impl GptOssMoe {
         let xf = x.reshape(&[n, hidden])?;
 
         // Router logits [n, E] → on-device top-`k` routing (selected indices + softmax weights).
-        let logits = add(&matmul(&xf, self.router_w.t())?, &self.router_b)?;
+        let logits = if let Some(p) = &self.router_source {
+            p.forward_with_bias(&xf, Some(&self.router_b))?
+        } else {
+            add(
+                &matmul(&xf, self.router_w.as_dtype(x.dtype())?.t())?,
+                &self.router_b,
+            )?
+        };
         let (idx, weights) = self.route(&logits)?; // idx [n, k], weights [n, k]
         let k = self.top_k;
 
@@ -722,7 +752,9 @@ impl GptOssMoe {
         k: i32,
         hidden: i32,
     ) -> Result<Array> {
-        if (n as i64) * (k as i64) >= GATHER_SORT_THRESHOLD {
+        if matches!(self.bank, ExpertBank::Source { .. })
+            || (n as i64) * (k as i64) >= GATHER_SORT_THRESHOLD
+        {
             // mlx-lm `_gather_sort`: sort the `n·k` (token, expert) pairs by expert so `gather_qmm`'s
             // `sorted_indices` fast path does contiguous per-expert GEMM, then scatter-unsort. Each
             // pair's math is x[token]·W[expert] — identical values, so this is numerically equivalent
@@ -733,21 +765,28 @@ impl GptOssMoe {
             let sorted_idx = idx_flat.take(&order)?; // [n*k] ascending expert
             let token = floor_divide(&order, Array::from_slice(&[k], &[1]))?; // [n*k] token per pair
             let x_rows = xf.take_axis(&token, 0)?.reshape(&[n * k, 1, hidden])?; // [n*k, 1, hidden]
-            let out = self.expert_mlp(&x_rows, &sorted_idx, true)?; // [n*k, 1, hidden]
+            let offsets = match &self.bank {
+                ExpertBank::Source { gu, .. } => {
+                    mlx_llm::primitives::moe::routed_offsets(&sorted_idx, gu.num_experts())
+                        .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?
+                }
+                _ => vec![],
+            };
+            let out = self.expert_mlp(&x_rows, &sorted_idx, true, &offsets)?; // [n*k, 1, hidden]
             let out = out.reshape(&[n * k, hidden])?.take_axis(&inv_order, 0)?; // unsort
             Ok(out.reshape(&[n, k, hidden])?)
         } else {
             // Direct broadcast: `x [n, 1, 1, hidden]` against `idx [n, k]` → `[n, k, 1, hidden]`.
             let x4 = xf.reshape(&[n, 1, 1, hidden])?;
-            Ok(self.expert_mlp(&x4, idx, false)?.squeeze_axes(&[2])?) // [n, k, hidden]
+            Ok(self.expert_mlp(&x4, idx, false, &[])?.squeeze_axes(&[2])?) // [n, k, hidden]
         }
     }
 
     /// The clamped-SwiGLU expert body over gathered rows: `gate_up` (fused, one gather) →
     /// de-interleave → clamp → SwiGLU → `down`. Shape-agnostic in the batch dims: `x` is `[.., 1,
     /// hidden]` (broadcasting against `idx`) and the result is `[.., 1, hidden]`.
-    fn expert_mlp(&self, x: &Array, idx: &Array, sorted: bool) -> Result<Array> {
-        let gate_up = self.bank.gate_up(x, idx, sorted)?; // [.., 1, 2*inter]
+    fn expert_mlp(&self, x: &Array, idx: &Array, sorted: bool, offsets: &[i32]) -> Result<Array> {
+        let gate_up = self.bank.gate_up(x, idx, sorted, offsets)?; // [.., 1, 2*inter]
 
         // De-interleave gate/up: reshape the last axis `2*inter` → `(inter, 2)`, split (gate = `[..,
         // 0]`, up = `[.., 1]`), matching the dense `GptOssExperts` layout.
@@ -771,7 +810,7 @@ impl GptOssMoe {
         let glu = multiply(&gate, &sigmoid(&multiply(&gate, &alpha)?)?)?;
         let gated = multiply(&add(&up, &one)?, &glu)?; // [.., 1, inter]
 
-        self.bank.down(&gated, idx, sorted) // [.., 1, hidden]
+        self.bank.down(&gated, idx, sorted, offsets) // [.., 1, hidden]
     }
 
     /// On-device top-`k` routing. Returns `(idx, weights)`: `idx [n, k]` the selected expert indices
@@ -1018,6 +1057,7 @@ mod moe_grouped_tests {
     fn build_dense(e: i32, k: i32, hidden: i32, inter: i32, dtype: Dtype) -> GptOssMoe {
         let s_in = 1.0 / (hidden as f32).sqrt();
         GptOssMoe {
+            router_source: None,
             router_w: rn(&[e, hidden], s_in, dtype),
             router_b: rn(&[e], 0.1, dtype),
             bank: ExpertBank::Dense {
@@ -1140,6 +1180,7 @@ mod moe_grouped_tests {
     /// Reference single-expert projection: `x·w + b` (dense) or per-expert `quantized_matmul` (quant).
     fn proj_ref(bank: &ExpertBank, gate_up: bool, e: usize, x: &Array) -> Array {
         match bank {
+            ExpertBank::Source { .. } => panic!("dense/affine reference helper"),
             ExpertBank::Dense {
                 gu_w,
                 gu_b,
@@ -1241,6 +1282,7 @@ mod moe_grouped_tests {
             let (e, k, hidden, inter) = (8, 2, 64, 128);
             let dense = build_dense(e, k, hidden, inter, Dtype::Float32);
             let moe = GptOssMoe {
+                router_source: dense.router_source.clone(),
                 router_w: dense.router_w.clone(),
                 router_b: dense.router_b.clone(),
                 bank: quantize_bank(&dense.bank, bits),
