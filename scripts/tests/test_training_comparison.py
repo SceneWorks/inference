@@ -398,13 +398,16 @@ class ComparisonContract(unittest.TestCase):
         self.assertNotIn('measurement',receipt)
 
     def test_shared_source_policy_rejects_math_counter_only_mutations(self):
-        root=Path(__file__).resolve().parents[2]/'crates/media/candle-gen/candle-gen/src'
+        repo=Path(__file__).resolve().parents[2]
+        root=repo/'crates/media/candle-gen/candle-gen/src'
         sources={name:(root/('train/' if name!='reference_training_attention.rs' else '')/name).read_text(encoding='utf-8')
                  for name in ('projection.rs','norm.rs','reference_training_attention.rs','profile.rs','optim.rs')}
+        sources['adapt.rs']=(repo/'crates/layers/candle-layers/src/adapt.rs').read_text(encoding='utf-8')
         comparison.validate_shared_source_controls(sources)
         mutations=(
-            ('projection.rs','return x.broadcast_matmul(w);','return x.matmul(w);'),
-            ('projection.rs','return apply_factor(&rank, up)? * scale;','return apply_factor(&(rank * scale)?, up);'),
+            ('adapt.rs','return x.broadcast_matmul(w);','return x.matmul(w);'),
+            ('adapt.rs','return apply_factor(&rank, up)? * scale;','return apply_factor(&(rank * scale)?, up);'),
+            ('projection.rs','crate::ensure_reference_math_hook();',''),
             ('norm.rs','return normalize_composable(x, eps, reference);','return normalize_composable(&x.detach(), eps, reference);'),
             ('norm.rs','xf.broadcast_div(&rms)','xf.broadcast_mul(&rms.recip()?)'),
             ('reference_training_attention.rs','reference_owner_enabled()','cache_enabled()'),

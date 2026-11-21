@@ -104,8 +104,10 @@ pub use weights::Weights;
 pub const NVRTC_SOURCES: &[candle_quant_kernels::KernelSource] =
     &[prism::PRISM_SRC, sampler::SAMPLER_SRC];
 
+#[cfg(test)]
+pub(crate) use prism::launch_elems;
 #[cfg(any(feature = "cuda", test))]
-pub(crate) use prism::{launch_elems, launch_grid_x, launch_u32};
+pub(crate) use prism::{launch_grid_x, launch_u32};
 
 #[cfg(test)]
 mod launch_param_tests {
