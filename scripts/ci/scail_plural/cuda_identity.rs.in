@@ -1,0 +1,52 @@
+fn cuda_identity() -> Result<serde_json::Value> {
+    use candle_gen::candle_core::cuda::cudarc::driver::{result, sys};
+    use std::ffi::CStr;
+
+    result::init()?;
+    let count = result::device::get_count()?;
+    if count != 1 {
+        return Err("SCAIL qualification requires one visible CUDA device".into());
+    }
+    let dev = result::device::get(0)?;
+    let raw = result::device::get_uuid(dev)?;
+    let hex: String = raw
+        .bytes
+        .iter()
+        .map(|b| format!("{:02x}", *b as u8))
+        .collect();
+    let uuid = format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    let mut bus = [0u8; 32];
+    let mut luid = [0u8; 8];
+    let mut mask = 0;
+    // The driver writes a NUL-terminated PCI ID in the supplied buffer and an eight-byte LUID.
+    unsafe {
+        sys::cuDeviceGetPCIBusId(bus.as_mut_ptr().cast(), bus.len() as i32, dev).result()?;
+        sys::cuDeviceGetLuid(luid.as_mut_ptr().cast(), &mut mask, dev).result()?;
+    }
+    let bus = CStr::from_bytes_until_nul(&bus)?.to_str()?;
+    let (domain, address) = bus.split_once(':').ok_or("invalid CUDA PCI address")?;
+    let pci = format!(
+        "{:08x}:{}",
+        u32::from_str_radix(domain, 16)?,
+        address.to_ascii_lowercase()
+    );
+    let luid = u64::from_le_bytes(luid);
+    let luid = format!("luid_0x{:08x}_0x{:08x}", luid >> 32, luid as u32);
+    let observed = json!({"ordinal":0,"visible_count":count,"uuid":uuid,"pci_bus_id":pci,
+                          "luid":luid,"node_mask":mask});
+    let expected: serde_json::Value =
+        serde_json::from_str(&env::var("SCAIL_EXPECTED_CUDA_DEVICE")?)?;
+    if observed != expected {
+        return Err(
+            "native CUDA ordinal zero differs from the selected NVML device or WDDM adapter".into(),
+        );
+    }
+    Ok(observed)
+}

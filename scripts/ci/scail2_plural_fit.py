@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import flux1_comparison as paired, model_inference_proofs as proof
 from scripts.ci import video_tier1_comparison as tier1, video_tier1_evidence as evidence
 from scripts.ci import wddm_process_memory as wddm
-from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.model_proof_resources import execution_claim, proof_cuda_shared_release
 from scripts.ci.scail_plural import contract as c
 from scripts.ci.scail_plural.cuda_stage import KeepSystemGrowth, RenderEnd
 from scripts.ci.scail_plural.wddm_retry import SameTickSamples
@@ -26,24 +26,29 @@ def row(backend):
     return dict(tier1.case_row(backend, "scail2"), fqn=c.FQN)
 
 
-def source(backend):
+def source(backend, cuda_uuid=None):
     directory = ROOT / "scripts/ci/scail_plural"
     shim = (directory / ("mlx.rs.in" if backend == "mlx" else "cuda.rs.in")).read_text()
     if backend == "candle-cuda":
         shim = shim.replace("@POOL@", (ROOT / "scripts/ci/wan_pair/cuda_pool.rs.in").read_text())
+    gpu0 = backend == "candle-cuda" and cuda_uuid == c.GPU0
     return (
         (directory / "probe.rs.in")
         .read_text()
+        .replace("@CHECK_CUDA_DEVICE@", "    let cuda_device = cuda_identity()?;\n" if gpu0 else "")
+        .replace("@RECORD_CUDA_DEVICE@", '    let mut result = result;\n    result["cuda_device"] = cuda_device;\n' if gpu0 else "")
         .replace("@BACKEND@", shim)
         .replace("@CARRIERS@", json.dumps(c.CARRIERS, separators=(",", ":")))
         .replace("@PINS@", ",\n".join(f'("{n}","{d}")' for n, (_, d) in c.FILES.items()))
-    )
+    ) + ((directory / "cuda_identity.rs.in").read_text() if gpu0 else "")
 
 
 def plan(backend, request, head):
     identity = proof.repository_identity(head)
-    if c.digest_json(request) != c.digest_json(
-        {"selection": c.SELECTION, "policy": c.policy(backend)}
+    devices = c.CUDA_INDICES if backend == "candle-cuda" else (None,)
+    if not any(
+        c.digest_json(request) == c.digest_json({"selection": c.SELECTION, "policy": c.policy(backend, cuda_uuid=uuid)})
+        for uuid in devices
     ):
         raise ValueError(
             "plural campaign requires its complete fixed count set and exact guard policy"
@@ -58,7 +63,7 @@ def plan(backend, request, head):
         "counts": c.COUNTS[backend],
         "asset_setup": "hub-snapshots",
         "hub_snapshots": {c.SLOT: {"repository": c.REPO, "revision": c.REV, "subfolder": "q4"}},
-        "fixture_module_sha256": hashlib.sha256(source(backend).encode()).hexdigest(),
+        "fixture_module_sha256": hashlib.sha256(source(backend, request["policy"].get("cudaDeviceUuid")).encode()).hexdigest(),
         "inventory_sha256": c.INVENTORY,
         "files": c.FILES,
         "case": row(backend),
@@ -159,7 +164,7 @@ def build(work, contract, policy):
     with lib.open("a", encoding="utf8") as f:
         f.write("\n#[cfg(test)]\nmod plural_fit;\n")
     native = lib.with_name("plural_fit.rs")
-    native.write_bytes(source(backend).encode())
+    native.write_bytes(source(backend, policy.cuda_device_uuid).encode())
     if tier1.sha(native) != contract["fixture_module_sha256"]:
         raise ValueError("wrong native fixture")
     env = tier1.build_env(policy)
@@ -195,11 +200,38 @@ def measured_outcome(native, guard, pool, adapter, hw, backend, count, approved,
     return {"accepted": True, "candidate_row_pending_physical_review": candidate}
 
 
-def require_release(claim, backend):
+def require_release(claim, backend, hardware, policy):
     if claim.get("post_execution_verified") is not True or (
         backend == "candle-cuda" and claim.get("lease_released") is not True
     ):
         raise ValueError("physical resource release unverified")
+    if backend == "candle-cuda":
+        c.validate_cuda_hardware(hardware, policy.cuda_device_uuid)
+        if claim.get("device_uuid") != policy.cuda_device_uuid or type(claim.get("physical_index")) is not int or (
+            claim["physical_index"] != c.CUDA_INDICES[policy.cuda_device_uuid]
+        ):
+            raise ValueError("release belongs to a different physical CUDA device")
+        # Replay the prospective GPU 0 admission and release samples. Earlier GPU 1
+        # archives keep their original release contract.
+        if policy.cuda_device_uuid == c.GPU0:
+            tier1.verify_cuda_claim(claim, hardware, policy)
+            release = claim["release_background_activity"]
+            samples = release["samples"]
+            verification = claim["release_metadata_verification"]
+            status = verification["status"]
+            if not (release["sample_count"] == len(samples) and (
+                (status == "verified" and len(samples) == 5)
+                or (status == "inconclusive-driver-query-timing" and 1 <= len(samples) <= 5
+                    and verification["diagnostic"] == release)
+            )):
+                raise ValueError("missing selected CUDA release samples")
+            for number, sample in enumerate(samples, 1):
+                if not (sample["sample_number"] == number and sample["predicates"]["unique_uuid"] is True
+                        and sample["selected_index_matches_admission"] is True
+                        and sample["post_owned_exit_primary_metadata_valid"] is True
+                        and proof_cuda_shared_release({"uuid":policy.cuda_device_uuid, **sample["selected_card"]},
+                            policy.cuda_device_uuid, claim["physical_index"], int(hardware["memory.total"]))):
+                    raise ValueError("release sample belongs to a different physical CUDA device")
 
 
 def execute(args, contract):
@@ -232,7 +264,7 @@ def execute(args, contract):
     }
     try:
         approved = tier1.read_policy(work, "policy.json", contract["request"]["policy"])
-        hw = receipt["hardware"] = paired.hardware(backend, approved)
+        hw = receipt["hardware"] = paired.hardware(backend, approved, pci_bus=approved.cuda_device_uuid == c.GPU0)
         adapter = receipt["adapter"] = (
             tier1.cuda_adapter(approved) if backend == "candle-cuda" else None
         )
@@ -240,8 +272,9 @@ def execute(args, contract):
             receipt["runner"] != "nax-macos-2" or hw["chip"] != "Apple M5 Max"
         ):
             raise ValueError("wrong secondary Mac")
-        if backend == "candle-cuda" and (hw["uuid"] != c.GPU or int(hw["index"]) != 1):
-            raise ValueError("wrong Windows GPU")
+        if backend == "candle-cuda":
+            c.validate_cuda_hardware(hw, approved.cuda_device_uuid)
+        expected_device = c.cuda_identity(hw, adapter) if approved.cuda_device_uuid == c.GPU0 else None
         stage = json.loads(Path(os.environ["MODEL_PROOF_HUB_SNAPSHOT_RECEIPT"]).read_text())[
             "snapshots"
         ][c.SLOT]
@@ -258,7 +291,8 @@ def execute(args, contract):
             record = receipt["counts"][str(count)] = {"accepted": False}
             deadline = time.monotonic() + 2520
             with execution_claim(
-                backend, claim_policy, claim_dir, build_env, original_deadline_monotonic=deadline
+                backend, claim_policy, claim_dir, build_env, original_deadline_monotonic=deadline,
+                constraints=c.cuda_constraints(approved.cuda_device_uuid) if backend == "candle-cuda" else None,
             ) as claim:
                 record["claim"] = claim
                 env = {k: v for k, v in build_env.items() if k.upper() in tier1.RUNTIME_ENV}
@@ -272,6 +306,8 @@ def execute(args, contract):
                         "MODEL_INFERENCE_CASE_FQN": c.FQN,
                     }
                 )
+                if expected_device is not None:
+                    env["SCAIL_EXPECTED_CUDA_DEVICE"] = json.dumps(expected_device)
                 if backend == "mlx":
                     env["WAN_VAE_BUDGET_GIB"] = "28"
                 out = work / name
@@ -299,7 +335,7 @@ def execute(args, contract):
                     if adapter
                     else None
                 )
-            require_release(claim, backend)
+            require_release(claim, backend, hw, approved)
             record.update(measured_outcome(
                 native, guard, pool, adapter, hw, backend, count, approved, contract["head"]
             ))
@@ -381,7 +417,7 @@ def verify(args, contract):
         required = {f"{name}.{suffix}" for suffix in limits if suffix != "guard.jsonl"}
         if not required.issubset(receipt["logs"]):
             raise ValueError("missing completed child evidence")
-        require_release(record["claim"], backend)
+        require_release(record["claim"], backend, receipt["hardware"], approved)
         guard = json.loads((dest / (name + ".supervisor.json")).read_bytes())
         pool = (
             json.loads((dest / (name + ".cuda-pool.json")).read_bytes())

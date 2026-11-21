@@ -199,7 +199,7 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 
-def hardware(backend, policy):
+def hardware(backend, policy, *, pci_bus=False):
     if backend == "mlx":
         def sysctl(name):
             return subprocess.check_output(["/usr/sbin/sysctl", "-n", name], text=True, timeout=10).strip()
@@ -207,6 +207,8 @@ def hardware(backend, policy):
                 "os_build": sysctl("kern.osversion")}
     from scripts.media_campaign_windows import trusted_nvidia_smi
     fields = ["name", "uuid", "index", "memory.total", "driver_version"]
+    if pci_bus:
+        fields.append("pci.bus_id")
     command = [trusted_nvidia_smi(), "--id=" + policy.cuda_device_uuid, "--query-gpu=" + ",".join(fields),
                "--format=csv,noheader,nounits"]
     values = subprocess.check_output(command, text=True, timeout=15).strip().split(", ")

@@ -156,7 +156,7 @@ fn ordered_rgb_fixture_digests_match_pinned_bytes() -> Result<()> {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn measure_real_weights() -> Result<()> {
-    let count = env::var("SCAIL_PLURAL_COUNT")?.parse::<usize>()?;
+@CHECK_CUDA_DEVICE@    let count = env::var("SCAIL_PLURAL_COUNT")?.parse::<usize>()?;
     assert!((2..=6).contains(&count));
     let out = PathBuf::from(env::var("PAIR_OUT")?);
     let root = PathBuf::from(env::var("SCAIL_PLURAL_Q4")?);
@@ -246,7 +246,7 @@ fn measure_real_weights() -> Result<()> {
     let result = json!({"schema":1,"pid":std::process::id(),"backend":BACKEND,"count":count,"axes":profile.axes(),"character_hashes":pairs_sha,"driving_hashes":driving_hashes,"render_ns":render_ns,"process_work_ns":began.elapsed().as_nanos() as u64,"prompt_tokens":[pos,neg],"files":files,"allocator_baseline":baseline,"allocator_peak":allocator,"allocator_samples":allocator_samples,"phases":phases,"source_bytes":plan.source_bytes(gen_core::MemoryBudgetDomain::HostRam)+plan.source_bytes(gen_core::MemoryBudgetDomain::UnifiedMemory),
         "execution":identity,"steps":steps,"output":{"width":WIDTH,"height":HEIGHT,"frames":frames.len(),"fps":fps,"sha256":format!("{:x}",output.finalize())}});
     println!("\nMODEL_INFERENCE_DEVICE {FQN} {device}");
-    fs::write(out.join("native.json"), serde_json::to_vec(&result)?)?;
+@RECORD_CUDA_DEVICE@    fs::write(out.join("native.json"), serde_json::to_vec(&result)?)?;
     println!("\nMODEL_INFERENCE_BODY_COMPLETED {FQN}");
     Ok(())
 }

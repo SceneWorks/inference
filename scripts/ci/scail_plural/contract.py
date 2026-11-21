@@ -18,6 +18,9 @@ REV = "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
 REPO = "SceneWorks/scail2-mlx"
 INVENTORY = "cbe28c27f7a594cb3da8ec54d7f293963c36188a2d371a12be6c3e7fea42f59f"
 GPU = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+GPU0 = "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+GPU0_PCI = "00000000:21:00.0"
+CUDA_INDICES = {GPU: 1, GPU0: 0}
 SLOT = "SCAIL_PLURAL_Q4"
 FILES = {
     "clip.safetensors": (
@@ -47,7 +50,29 @@ FQN = "plural_fit::measure_real_weights"
 CARRIERS = json.loads(Path(__file__).with_name("carriers.json").read_text())
 
 
-def policy(backend):
+def cuda_constraints(uuid):
+    if uuid not in CUDA_INDICES:
+        raise ValueError("unregistered SCAIL physical CUDA device")
+    return {"required_cuda_device_uuid": uuid, "required_cuda_physical_index": CUDA_INDICES[uuid]}
+
+
+def validate_cuda_hardware(hardware, uuid):
+    index = cuda_constraints(uuid)["required_cuda_physical_index"]
+    actual = hardware["index"]
+    if hardware["uuid"] != uuid or type(actual) not in (int, str) or str(actual) != str(index):
+        raise ValueError("wrong Windows GPU")
+
+
+def cuda_identity(hardware, adapter):
+    validate_cuda_hardware(hardware, GPU0)
+    if hardware.get("pci.bus_id", "").lower() != GPU0_PCI:
+        raise ValueError("wrong PCI address for SCAIL GPU 0")
+    wddm.validate_adapter(adapter, GPU0)
+    return dict(ordinal=0, visible_count=1, uuid=GPU0, pci_bus_id=GPU0_PCI,
+                luid=adapter["luid"], node_mask=adapter["node_mask"])
+
+
+def policy(backend, *, cuda_uuid=None):
     settings = dict(
         schemaVersion=1,
         deadlineSeconds=2400,
@@ -57,7 +82,7 @@ def policy(backend):
         stderrCapBytes=4 * MIB,
         eventCapBytes=16 * MIB,
     )
-    if backend == "mlx":
+    if backend == "mlx" and cuda_uuid is None:
         return dict(
             settings,
             backend="darwin-mlx",
@@ -65,12 +90,14 @@ def policy(backend):
             hostFreeReserveBytes=12 * GIB,
         )
     if backend == "candle-cuda":
+        uuid = GPU if cuda_uuid is None else cuda_uuid
+        cuda_constraints(uuid)
         return dict(
             settings,
             backend="windows-cuda",
             childFootprintCapBytes=64 * GIB,
             hostFreeReserveBytes=8 * GIB,
-            cudaDeviceUuid=GPU,
+            cudaDeviceUuid=uuid,
             childGpuCapBytes=84 * GIB,
             gpuFreeReserveBytes=6 * GIB,
         )
@@ -206,9 +233,15 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
             ),
         )
     else:
+        uuid = approved.cuda_device_uuid
+        validate_cuda_hardware(hardware, uuid)
+        if uuid == GPU0 and digest_json(data.get("cuda_device")) != digest_json(cuda_identity(hardware, adapter)):
+            raise ValueError("native CUDA ordinal zero differs from NVML or WDDM")
+        if guard["admission"]["cudaDeviceUuid"] != uuid:
+            raise ValueError("CUDA admission belongs to a different physical device")
         if (
             pool["pid"] != data["pid"]
-            or pool["cudaDeviceUuid"] != GPU
+            or pool["cudaDeviceUuid"] != uuid
             or not 0
             < pool["poolUsedHighBytes"]
             <= pool["poolReservedHighBytes"]
@@ -222,9 +255,7 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
         if (
             not shared["created_filetime"]
             or shared["created_filetime"] != guard["cuda_attribution"]["wddm_dedicated"]["created_filetime"]
-            or adapter["cuda_uuid"] != GPU
-            or hardware["uuid"] != GPU
-            or int(hardware["index"]) != 1
+            or adapter["cuda_uuid"] != uuid
         ):
             raise ValueError("missing owned WDDM dedicated or shared observations")
         dedicated_record = guard["cuda_attribution"]["wddm_dedicated"]
@@ -271,8 +302,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
                     or admission["gpuFreeReserveBytes"] != approved.gpu_free_reserve_bytes
                     or admission["childGpuCapBytes"] != approved.child_gpu_cap_bytes):
                 raise ValueError("rejected CUDA attempt budget differs from the approved guard")
-        growth, growth_count = tenant_growth(guard, GPU)
-        stage = render_scope(guard, pool, GPU, growth_count)
+        growth, growth_count = tenant_growth(guard, uuid)
+        stage = render_scope(guard, pool, uuid, growth_count)
         if incomplete and stage is not None:
             scope = stage
             incomplete = False

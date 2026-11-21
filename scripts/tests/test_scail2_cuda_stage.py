@@ -417,7 +417,7 @@ class CudaRenderEnd(unittest.TestCase):
         g.update(
             returncode=0,
             elapsed_seconds=20,
-            admission={"gpuGlobalUsedBaselineBytes": 50},
+            admission={"gpuGlobalUsedBaselineBytes": 50, "cudaDeviceUuid": GPU},
             peak_host_bytes=50,
             peak_gpu_bytes=60,
         )
@@ -440,7 +440,7 @@ class CudaRenderEnd(unittest.TestCase):
         n.update(pid=PID, allocator_peak=60)
         adapter = g["cuda_attribution"]["wddm_dedicated"]["adapter"]
         policy = SimpleNamespace(
-            child_footprint_cap_bytes=90,
+            cuda_device_uuid=GPU, child_footprint_cap_bytes=90,
             child_gpu_cap_bytes=80,
             poll_millis=250,
             sha256="policy",

@@ -99,6 +99,53 @@ class PluralQualification(unittest.TestCase):
             self.assertNotIn("@BACKEND@", runner.source(backend))
             self.assertNotIn("@PINS@", runner.source(backend))
 
+    def test_gpu0_must_be_explicit_and_keeps_all_counts_guards_and_native_code(self):
+        with patch.object(runner.proof, "repository_identity", return_value={"tree": "tree", "revision": "head"}):
+            request = {"selection": c.SELECTION, "policy": c.policy("candle-cuda")}
+            previous = runner.plan("candle-cuda", request, "head")
+            selected = dict(request, policy=c.policy("candle-cuda", cuda_uuid=c.GPU0))
+            plan = runner.plan("candle-cuda", selected, "head")
+            self.assertEqual(plan, dict(previous, request=selected,
+                fixture_module_sha256=hashlib.sha256(runner.source("candle-cuda", c.GPU0).encode()).hexdigest()))
+            self.assertEqual(previous["fixture_module_sha256"], "ea14d6259e4c2bfc903c69bb34178f413585e91eeeec48649d78d6a67377a67c")
+            self.assertEqual(selected["policy"], dict(request["policy"], cudaDeviceUuid=c.GPU0))
+            self.assertEqual(previous["request"]["policy"]["cudaDeviceUuid"], c.GPU)
+            self.assertNotEqual(c.digest_json(plan), c.digest_json(previous))
+            for key, value in (("cudaDeviceUuid", "0"), ("cudaDeviceUuid", "GPU-unknown"),
+                               ("childGpuCapBytes", 83*c.GIB), ("gpuFreeReserveBytes", 5*c.GIB)):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    runner.plan("candle-cuda", dict(selected, policy=dict(selected["policy"], **{key: value})), "head")
+        limits = c.cuda_constraints(c.GPU0)
+        self.assertEqual(limits, {"required_cuda_device_uuid": c.GPU0, "required_cuda_physical_index": 0})
+        approved = SimpleNamespace(backend="windows-cuda", cuda_device_uuid=c.GPU0)
+        self.assertEqual(runner.tier1.build_env(approved)["CUDA_VISIBLE_DEVICES"], c.GPU0)
+        with patch.object(runner.wddm, "preflight") as preflight:
+            runner.tier1.cuda_adapter(approved)
+            preflight.assert_called_once_with(c.GPU0)
+        hw = {"uuid": c.GPU0, "index": "0", "memory.total": "98000"}
+        claim = dict(post_execution_verified=True, lease_released=True, device_uuid=c.GPU0, physical_index=0)
+        samples = [dict(sample_number=i, predicates={"unique_uuid":True}, selected_index_matches_admission=True,
+                        post_owned_exit_primary_metadata_valid=True,
+                        selected_card={"index":0,"total_mib":98000,"used_mib":500,"free_mib":97000}) for i in range(1,6)]
+        release = claim["release_background_activity"] = {"samples":samples, "sample_count":5}
+        claim["release_metadata_verification"] = {"status":"verified"}
+        with patch.object(runner.tier1, "verify_cuda_claim") as replay:
+            runner.require_release(claim, "candle-cuda", hw, approved)
+            replay.assert_called_once_with(claim, hw, approved)
+            samples[-1]["selected_card"]["index"] = 1
+            with self.assertRaisesRegex(ValueError, "release sample"):
+                runner.require_release(claim, "candle-cuda", hw, approved)
+            samples[-1]["selected_card"]["index"] = 0
+            release.update(samples=samples[:2], sample_count=2)
+            claim["release_metadata_verification"] = {"status":"inconclusive-driver-query-timing","diagnostic":release}
+            runner.require_release(claim, "candle-cuda", hw, approved)
+            for wrong in (dict(claim, physical_index=1), dict(claim, physical_index=False), dict(claim, device_uuid=c.GPU)):
+                with self.assertRaisesRegex(ValueError, "different physical"):
+                    runner.require_release(wrong, "candle-cuda", hw, approved)
+            for crossed in (dict(hw, uuid=c.GPU), dict(hw, index="1"), dict(hw, index=False)):
+                with self.assertRaisesRegex(ValueError, "wrong Windows GPU"):
+                    runner.require_release(claim, "candle-cuda", crossed, approved)
+
     def test_mlx_guard_accepts_the_tightened_policy_and_refuses_the_previous_cap(self):
         policy = c.policy("mlx")
         self.assertEqual(policy["childFootprintCapBytes"], 80 * c.GIB)
@@ -253,8 +300,8 @@ class PluralQualification(unittest.TestCase):
                         "counts": [6, 2, 3, 4, 5], "backend": "candle-cuda", "case": {}}
             receipt = {"contract": contract, "request": contract["request"], "run_id": "1",
                        "run_attempt": "1", "accepted": False, "failure": "incomplete campaign",
-                       "logs": {}, "adapter": {"fixture": True}, "hardware": {}, "counts": {}}
-            claim = {"post_execution_verified": True, "lease_released": True}
+                       "logs": {}, "adapter": {"fixture": True}, "hardware": {"uuid": c.GPU, "index": "1"}, "counts": {}}
+            claim = {"post_execution_verified": True, "lease_released": True, "device_uuid": c.GPU, "physical_index": 1}
             gap = {"accepted": False, "telemetry_failure": "incomplete_wddm_samples"}
             passed = {"accepted": True, "candidate_row_pending_physical_review": {"price": 200}}
             for n, result in [(6, gap), (2, passed)]:
@@ -342,7 +389,7 @@ class PluralQualification(unittest.TestCase):
             pid=31,
             returncode=0,
             elapsed_seconds=10,
-            admission={},
+            admission={"cudaDeviceUuid": c.GPU},
             samples=[],
             peak_host_bytes=800,
             peak_gpu_bytes=600,
@@ -371,7 +418,7 @@ class PluralQualification(unittest.TestCase):
         pool = dict(pid=31, cudaDeviceUuid=c.GPU, poolUsedHighBytes=299, poolReservedHighBytes=300)
         machine = dict(uuid=c.GPU, index=1, name="GPU", driver_version="driver")
         approved = SimpleNamespace(
-            sha256="hash", child_footprint_cap_bytes=10000, child_gpu_cap_bytes=10000, poll_millis=250
+            cuda_device_uuid=c.GPU, sha256="hash", child_footprint_cap_bytes=10000, child_gpu_cap_bytes=10000, poll_millis=250
         )
         with patch.object(c, "validate_admission"):
             row = c.measured_row(
@@ -381,6 +428,26 @@ class PluralQualification(unittest.TestCase):
             self.assertEqual(row["witness"]["gross_host_bytes"], 800)
             self.assertEqual(row["witness"]["text_tokens"], 512)
             self.assertIsNone(row["witness"]["mlx_decode_budget_bytes"])
+            selected = SimpleNamespace(**dict(vars(approved), cuda_device_uuid=c.GPU0))
+            board = dict(machine, uuid=c.GPU0, index="0", **{"pci.bus_id":c.GPU0_PCI})
+            selected_pool = dict(pool, cudaDeviceUuid=c.GPU0)
+            selected_adapter = dict(adapter, cuda_uuid=c.GPU0)
+            selected_guard = copy.deepcopy(guard)
+            selected_guard["admission"]["cudaDeviceUuid"] = c.GPU0
+            selected_guard["cuda_attribution"]["wddm_dedicated"]["adapter"] = selected_adapter
+            selected_guard["fit_observation"]["wddm_shared"]["adapter"] = selected_adapter
+            gpu0_data = dict(data, cuda_device=c.cuda_identity(board, selected_adapter))
+            def measure(g=selected_guard, p=selected_pool, a=selected_adapter, h=board, n=gpu0_data):
+                return c.measured_row(n, g, p, a, h, "candle-cuda", 6, selected, "f"*40)
+            self.assertEqual(measure()["witness"], row["witness"])
+            for field, value in (("uuid", c.GPU),("pci_bus_id","00000000:22:00.0"),("ordinal",False),
+                                 ("visible_count",2),("luid","luid_0x00000000_0x00000009"),("node_mask",2)):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    measure(n=dict(data, cuda_device=dict(gpu0_data["cuda_device"], **{field:value})))
+            for crossed in ({"g": guard}, {"p": pool}, {"a": adapter}, {"h": machine}, {"n": data},
+                            {"h":dict(board, **{"pci.bus_id":"00000000:22:00.0"})}):
+                with self.assertRaises(ValueError):
+                    measure(**crossed)
             missing = copy.deepcopy(guard)
             obs = missing["fit_observation"]
             obs["wddm_shared"]["missing_active_polls"] = 1

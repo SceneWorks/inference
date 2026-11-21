@@ -16,7 +16,9 @@ Both arms render a 45-frame 832×480 driving clip and all its color masks with d
 | Backend | Counts in execution order | Child limit | Host cap / reserve | Device cap / reserve |
 | --- | --- | --- | --- | --- |
 | Secondary M5 Max | 6, 2 | 40 min each | 80 / 12 GiB unified | 28 GiB native VAE planner ceiling |
-| Windows CUDA GPU 1 | 6, 2, 3, 4, 5 | 40 min each | 64 / 8 GiB | 84 / 6 GiB |
+| Windows CUDA GPU 1 (default) or GPU 0 (explicit) | 6, 2, 3, 4, 5 | 40 min each | 64 / 8 GiB | 84 / 6 GiB |
+
+To select physical GPU 0, generate the Windows request with `policy("candle-cuda", cuda_uuid=GPU0)` from `scripts.ci.scail_plural.contract`. The hosted planner binds that exact UUID. Each count claims the same UUID and physical index, and its native child reads the driver UUID, PCI address (`00000000:21:00.0`), LUID and node mask from logical ordinal 0 before rendering. Its receipt must match the selected physical device and Windows adapter.
 
 Each arm compiles the release probe once. Each count gets a fresh child and an independently guarded and released lease. Watchdog cadence is 250 ms and termination grace is 2 seconds. Model time is capped at 80 minutes on MLX and 200 minutes on CUDA. The workflow's 360-minute outer limit includes file staging, builds and claims. On Windows, an absent active PDH gauge gets one owned re-read within its scheduled poll. The raw local FILETIME and monotonic bounds establish freshness. A missing gauge after retry rejects that count unless the sealed pool proves that the native render already returned RGB and the supervisor then recorded zero owned device bytes on the same original Job. The raw missed polls remain in the archive. The campaign can run the remaining counts once the native output, hard guards and release pass. Other failures stop the arm. The verifier replays each completed count, and qualification requires every planned count to pass.
 
