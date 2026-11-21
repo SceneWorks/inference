@@ -213,6 +213,31 @@ fn metal_projection_matches_fixed_codebook_reference_and_dtype_rounding() {
             [expected]
         );
     }
+    // A gathered coefficient rounds once to the embedding consumer’s dtype.
+    let mut weights = crate::weights::Weights::empty();
+    let desc = br#"{"format":"float8_e4m3fn"}"#;
+    weights.insert(
+        "table.comfy_quant",
+        Array::from_slice(desc, &[desc.len() as i32]),
+    );
+    weights.insert("table.weight", Array::from_slice(&[0x38u8, 0x40], &[2, 1]));
+    let scale = 1.0 + 2.0f32.powi(-9);
+    weights.insert("table.weight_scale", Array::from_f32(scale));
+    let ids = Array::from_slice(&[0i32], &[1]);
+    for (dtype, expected) in [
+        (Dtype::Float32, scale),
+        (Dtype::Float16, scale),
+        (Dtype::Bfloat16, 1.),
+    ] {
+        let rows = crate::quant::embedding_compute(&weights, "table", dtype)
+            .unwrap()
+            .rows(&ids)
+            .unwrap();
+        assert_eq!(rows.dtype(), dtype);
+        let actual = rows.as_dtype(Dtype::Float32).unwrap();
+        actual.eval().unwrap();
+        assert_eq!(actual.as_slice::<f32>(), &[expected]);
+    }
     crate::model_inference_device::record_model_inference_device();
     println!("\nMODEL_INFERENCE_BODY_COMPLETED logical_weights::fp8_metal_proof::metal_projection_matches_fixed_codebook_reference_and_dtype_rounding");
 }
