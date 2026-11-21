@@ -49,10 +49,10 @@ fn ordered_bf16(v: f32) -> i32 {
 fn metal_projection_matches_fixed_codebook_reference_and_dtype_rounding() {
     use ComfyQuantFormat::*;
     assert!(crate::metal_available());
-    assert_eq!(
+    assert!(matches!(
         mlx_rs::Device::try_default().unwrap().get_type().unwrap(),
         mlx_rs::DeviceType::Gpu
-    );
+    ));
     for format in [Float8E4M3Fn, Float8E5M2, Mxfp8, Fp8Rowwise] {
         for (m, n, k) in [(1usize, 1usize, 32usize), (3, 17, 35)] {
             let mx = format == Mxfp8;

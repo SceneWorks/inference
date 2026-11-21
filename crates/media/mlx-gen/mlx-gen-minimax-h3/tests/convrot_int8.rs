@@ -71,10 +71,10 @@ fn malformed_metadata_is_not_dense_or_affine_q8() {
 #[ignore = "requires coordinator-reserved exclusive local Metal token; never skip-as-pass"]
 fn native_projections_match_pinned_kitchen() {
     assert!(mlx_gen::metal_available());
-    assert_eq!(
+    assert!(matches!(
         mlx_rs::Device::try_default().unwrap().get_type().unwrap(),
         mlx_rs::DeviceType::Gpu
-    );
+    ));
     let fixture = fixture();
     assert_eq!(
         fixture["kitchen_revision"],
