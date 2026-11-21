@@ -20,4 +20,5 @@ pub mod h3_schedule;
 pub mod pruned_adaln;
 pub mod veda;
 
+pub use h3_image_tier::h3_projection_keeps_fp32;
 pub use h3_reference::{resolve_reference_image_size, truncate_reference_audio};
