@@ -35,7 +35,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::{AdaptLinear, DenseLinear, LokrFactors, QLinear};
+use crate::quant::{AdaptLinear, Base as SpineBase, DenseLinear, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -184,49 +184,15 @@ impl AdditiveResidual {
 
 pub use candle_layers::adapt::kron2d;
 
-/// The frozen base projection behind a [`LoraLinear`] — a plain dense `Linear` (the training default,
-/// byte-identical to pre-sc-9416) or a **GGUF-quantized** [`QLinear`] loaded straight from a
-/// pre-quantized MLX tier (sc-9416, the candle SDXL packed-load). Both compute `x·Wᵀ + b`; the packed
-/// arm dequantizes-on-forward into a dense matmul (sc-7702). The packed base remains frozen, but an
-/// independent trainable LoRA residual may be installed over it (the LTX q4 trainer path).
-#[derive(Clone)]
-enum LoraBase {
-    Dense(Linear),
-    Packed(QLinear),
-}
-
-// `QLinear` holds a `QMatMul`/`QTensor` that are not `Debug`; `LoraLinear` derives `Debug` (it drops
-// into `#[derive(Debug)]` vendored modules), so summarize the base rather than recurse into the weight.
-impl std::fmt::Debug for LoraBase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Dense(l) => f.debug_tuple("Dense").field(l).finish(),
-            Self::Packed(_) => f.write_str("Packed(QLinear)"),
-        }
-    }
-}
-
-impl LoraBase {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(q) => q.forward(x),
-        }
-    }
-
-    fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
-
-/// A frozen base projection (dense or packed — `LoraBase`) with an optional trainable LoRA/LoKr
-/// residual. Implements [`Module`] so it drops into a vendored model exactly where an
+/// A frozen base projection on the shared [`candle_layers::adapt::Base`] spine (`SW-6956`, `BACK-1`)
+/// with an optional trainable LoRA/LoKr residual and per-pass additive inference residuals.
+/// Implements [`Module`] so it drops into a vendored model exactly where an
 /// `nn::Linear` was, and carries its own PEFT-style `path` (captured from the `VarBuilder` prefix at
 /// construction) so a [`LoraHost`] visitor can route adapters without threading prefixes through the
 /// module tree.
 #[derive(Debug, Clone)]
 pub struct LoraLinear {
-    base: LoraBase,
+    base: SpineBase,
     in_features: usize,
     out_features: usize,
     path: String,
@@ -255,7 +221,7 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base: LoraBase::Dense(base),
+            base: SpineBase::Dense(base),
             in_features,
             out_features,
             path,
@@ -277,7 +243,7 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base: LoraBase::Packed(base),
+            base: SpineBase::Packed(base),
             in_features,
             out_features,
             path,
@@ -286,6 +252,25 @@ impl LoraLinear {
             additive: Vec::new(),
             additive_pass: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Construct a [`LoraLinear`] directly from a shared-spine [`AdaptLinear`] at `path` (`SW-6956`).
+    pub fn from_adapt_linear(adapt: AdaptLinear, path: String) -> Self {
+        Self {
+            base: adapt.base,
+            in_features: adapt.in_features,
+            out_features: adapt.out_features,
+            path,
+            adapter: None,
+            frozen: None,
+            additive: Vec::new(),
+            additive_pass: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Inspect the underlying shared [`candle_layers::adapt::Base`].
+    pub fn spine_base(&self) -> &SpineBase {
+        &self.base
     }
 
     /// Whether the frozen base is a packed (GGUF-quantized) [`QLinear`] rather than a dense `Linear`
@@ -297,12 +282,12 @@ impl LoraLinear {
     /// Fold only the frozen dense base to Q4/Q8, preserving trainable and forward-time residuals.
     /// Already-packed bases are idempotent.
     pub fn quantize_base(&mut self, quant: crate::gen_core::Quant) -> Result<()> {
-        let LoraBase::Dense(linear) = &self.base else {
+        let SpineBase::Dense(linear) = &self.base else {
             return Ok(());
         };
         let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
         packed.quantize(quant)?;
-        self.base = LoraBase::Packed(packed);
+        self.base = SpineBase::Packed(packed);
         Ok(())
     }
 
@@ -321,12 +306,12 @@ impl LoraLinear {
                     .into(),
             ));
         }
-        if let LoraBase::Dense(linear) = &self.base {
+        if let SpineBase::Dense(linear) = &self.base {
             let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
             // SDXL's established quantized forward uses the dequant-dense arm; only the destination
             // changes here, so CPU staging is numerically identical to `quantize_base`.
             packed.quantize_dequant_onto(quant, device)?;
-            self.base = LoraBase::Packed(packed);
+            self.base = SpineBase::Packed(packed);
         }
         for residual in &mut self.additive {
             match residual {
@@ -540,7 +525,7 @@ impl LoraLinear {
     /// Other packed operators and graph-retaining backward keep their native path.
     pub fn forward_bounded_packed(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let y = match &self.base {
-            LoraBase::Packed(QLinear::Quantized {
+            SpineBase::Packed(QLinear::Quantized {
                 weight: crate::quant::QuantWeight::Dequant(weight),
                 bias,
                 ..
@@ -553,13 +538,13 @@ impl LoraLinear {
     /// Dense base inspection without dequantizing packed weights.
     pub fn dense_base(&self) -> Option<&Linear> {
         match &self.base {
-            LoraBase::Dense(base) => Some(base),
-            LoraBase::Packed(_) => None,
+            SpineBase::Dense(base) => Some(base),
+            _ => None,
         }
     }
 
     pub(crate) fn replace_dense_base(&mut self, base: Linear) {
-        self.base = LoraBase::Dense(base);
+        self.base = SpineBase::Dense(base);
     }
 
     /// Apply live adapters to an externally computed frozen base output.

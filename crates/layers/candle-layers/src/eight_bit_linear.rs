@@ -32,18 +32,34 @@ pub struct Fp8Linear {
     scale_w: f32,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
+    shape: (usize, usize),
+    device: Device,
 }
 
 impl Fp8Linear {
     /// Quantize a dense `(N, K)` weight to fp8 E4M3 once and bind it to a cuBLASLt handle.
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
+        let shape = weight.dims2()?;
+        let device = weight.device().clone();
         let qw = quantize_weight_fp8(weight)?;
         Ok(Self {
             w_fp8: qw.q,
             scale_w: qw.scale,
             bias,
             lt,
+            shape,
+            device,
         })
+    }
+
+    /// Logical `(out_features, in_features)` of the quantized projection.
+    pub fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    /// Device on which the quantized weight is resident.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Build sharing an existing handle for the device (constructs a fresh handle when `None`).
@@ -102,11 +118,15 @@ pub struct Int8Linear {
     /// `i32 → f32` via the vendored `cast_i32_f32` kernel. When set, the per-channel staged forward folds
     /// on-device (no int32→host round-trip); otherwise it falls back to the exact host fold. Probed once.
     ondevice_dequant: bool,
+    shape: (usize, usize),
+    device: Device,
 }
 
 impl Int8Linear {
     /// Per-tensor int8 (sc-9299): quantize a dense `(N, K)` weight once and bind a cuBLASLt handle.
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
+        let shape = weight.dims2()?;
+        let device = weight.device().clone();
         let qw = quantize_weight_int8(weight)?;
         Ok(Self {
             w_i8: qw.q,
@@ -115,7 +135,19 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant: false, // per-tensor forward uses the host fold (tests)
+            shape,
+            device,
         })
+    }
+
+    /// Logical `(out_features, in_features)` of the quantized projection.
+    pub fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    /// Device on which the quantized weight is resident.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     pub fn from_device(weight: &Tensor, bias: Option<Tensor>, dev: &Device) -> Result<Self> {
@@ -130,6 +162,8 @@ impl Int8Linear {
         bias: Option<Tensor>,
         lt: Arc<CublasLt>,
     ) -> Result<Self> {
+        let shape = weight.dims2()?;
+        let device = weight.device().clone();
         let qw = quantize_weight_int8_per_channel(weight)?;
         Ok(Self {
             w_i8: qw.q,
@@ -138,6 +172,8 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant: false, // from-dense (no staged weight) uses the host fold (tests)
+            shape,
+            device,
         })
     }
 
@@ -152,13 +188,15 @@ impl Int8Linear {
         bias: Option<Tensor>,
         lt: Arc<CublasLt>,
     ) -> Result<Self> {
-        let n = w_i8.dims2()?.0;
+        let shape = w_i8.dims2()?;
+        let n = shape.0;
         if scale_w.len() != n {
             candle_core::bail!(
                 "Int8Linear::from_per_channel_parts: scale_w len {} != weight rows {n}",
                 scale_w.len()
             );
         }
+        let device = w_i8.device().clone();
         // Pre-stage the codes to a resident native-`i8` device buffer (1 byte/elem) so the 224
         // projections of a 12B DiT don't hold their codes as 8×-larger I64 tensors on the GPU.
         let w_staged = Some(lt.stage_int8(&w_i8)?);
@@ -171,6 +209,8 @@ impl Int8Linear {
             bias,
             lt,
             ondevice_dequant,
+            shape,
+            device,
         })
     }
     /// Exact I8 byte-pattern parts, one staged compact base and resident F32 scales.
@@ -181,18 +221,21 @@ impl Int8Linear {
         bias: Option<Tensor>,
         lt: Arc<CublasLt>,
     ) -> Result<Self> {
-        let (n, _) = codes.dims2()?;
+        let (n, k) = codes.dims2()?;
         if scales.dtype() != candle_core::DType::F32 || scales.dims() != [n, 1] {
             candle_core::bail!("native INT8 requires F32 [out,1] scales");
         }
+        let device = codes.device().clone();
         let w_staged = Some(lt.stage_int8_bytes(codes)?);
         Ok(Self {
             w_i8: Tensor::zeros((0, 0), candle_core::DType::U8, &Device::Cpu)?,
             w_staged,
-            scale_w: WeightScale::Kitchen(scales.reshape((1, n))?.to_device(codes.device())?),
+            scale_w: WeightScale::Kitchen(scales.reshape((1, n))?.to_device(&device)?),
             bias,
             lt,
             ondevice_dequant: true,
+            shape: (n, k),
+            device,
         })
     }
 

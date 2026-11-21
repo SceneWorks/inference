@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, dequantize, divide, matmul, multiply, sigmoid, subtract};
+use mlx_rs::ops::{add, concatenate_axis, dequantize, divide, multiply, sigmoid, subtract};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
@@ -46,7 +46,7 @@ pub(crate) mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::CancelFlag;
 
-use mlx_gen::nn::{linear, quantized_matmul_with_bias, DitCompileGlue, DitGlue};
+use mlx_gen::nn::{DitCompileGlue, DitGlue};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle, RopeTables,
     RotationAxes,

@@ -817,6 +817,14 @@ impl LinearBase {
 pub struct AdaptableLinear {
     pub base: LinearBase,
     adapters: Vec<Adapter>,
+    /// Optional per-adapter pass-scale schedule (one entry per adapter in `adapters`).
+    /// When `Some(scales)` is present for an adapter, its effective base scale at the active
+    /// pass (`ScaleContext::pass`, or `active_pass` when `ScaleContext` is `None`) is
+    /// `scales[pass.min(scales.len() - 1)]` (`PIPE-14`, `BACK-1`, `BACK-4`, `SW-6956`).
+    pass_scales: Vec<Option<Vec<f32>>>,
+    /// Active multi-pass index (e.g. distilled stage pass), consultable via `&self` when
+    /// callers invoke [`Self::forward`] after [`Self::set_active_pass`] / [`Self::set_lora_pass`].
+    active_pass: std::cell::Cell<usize>,
     /// `true` only for a **training** adapter stack (installed via
     /// [`set_training_adapters`](Self::set_training_adapters)), which opts OUT of both sc-15265
     /// rules in `apply_adapters` — see that method's doc for why.
@@ -838,6 +846,8 @@ impl AdaptableLinear {
         Self {
             base: LinearBase::Dense(linear),
             adapters: Vec::new(),
+            pass_scales: Vec::new(),
+            active_pass: std::cell::Cell::new(0),
             training_residual: false,
         }
     }
@@ -847,6 +857,8 @@ impl AdaptableLinear {
         Self {
             base: LinearBase::Quantized(q),
             adapters: Vec::new(),
+            pass_scales: Vec::new(),
+            active_pass: std::cell::Cell::new(0),
             training_residual: false,
         }
     }
@@ -855,6 +867,8 @@ impl AdaptableLinear {
         Self {
             base: LinearBase::ConvRot(q),
             adapters: Vec::new(),
+            pass_scales: Vec::new(),
+            active_pass: std::cell::Cell::new(0),
             training_residual: false,
         }
     }
@@ -864,6 +878,8 @@ impl AdaptableLinear {
         Self {
             base: LinearBase::W4A8(q),
             adapters: Vec::new(),
+            pass_scales: Vec::new(),
+            active_pass: std::cell::Cell::new(0),
             training_residual: false,
         }
     }
@@ -913,14 +929,86 @@ impl AdaptableLinear {
     /// Stack a new adapter (LoRA or LoKr) on top of any already installed.
     pub fn push(&mut self, adapter: Adapter) {
         self.adapters.push(adapter);
+        self.pass_scales.push(None);
+    }
+
+    /// Stack an adapter with an explicit per-pass scale schedule (`SW-6956`, `PIPE-14`).
+    /// During forward, the active pass index (from [`ScaleContext::pass`] or [`Self::active_pass`])
+    /// clamps into `pass_scales` to select that pass's effective base scale.
+    pub fn push_with_pass_scales(&mut self, adapter: Adapter, pass_scales: Vec<f32>) {
+        self.adapters.push(adapter);
+        self.pass_scales.push(Some(pass_scales));
+    }
+
+    /// Stack a LoRA residual with per-pass effective scales (`a = Aᵀ [in, rank]`, `b = Bᵀ [rank, out]`).
+    pub fn push_lora_per_pass(&mut self, a: Array, b: Array, pass_scales: Vec<f32>) {
+        let scale = pass_scales.first().copied().unwrap_or(0.0);
+        self.push_with_pass_scales(Adapter::Lora { a, b, scale }, pass_scales);
+    }
+
+    /// Stack a materialized LoKr residual (`delta = ΔW [out, in]`) with per-pass user strengths.
+    pub fn push_lokr_per_pass(&mut self, delta: Array, pass_scales: Vec<f32>) {
+        let scale = pass_scales.first().copied().unwrap_or(0.0);
+        self.push_with_pass_scales(Adapter::Lokr { delta, scale }, pass_scales);
     }
 
     /// Replace the entire adapter stack under the normal (inference) dtype rules — see
     /// `apply_adapters`. An empty `Vec` clears the stack back to the bare
     /// frozen base, which is what every non-training caller uses this for.
     pub fn set_adapters(&mut self, adapters: Vec<Adapter>) {
+        self.pass_scales = vec![None; adapters.len()];
         self.adapters = adapters;
+        self.active_pass.set(0);
         self.training_residual = false;
+    }
+
+    /// Clear all installed adapters and reset pass state back to the bare frozen base.
+    pub fn clear_adapters(&mut self) {
+        self.adapters.clear();
+        self.pass_scales.clear();
+        self.active_pass.set(0);
+        self.training_residual = false;
+    }
+
+    /// Select the active multi-pass index (e.g. distilled stage pass) when no explicit
+    /// [`ScaleContext`] override is passed into forward (`SW-6956`, `PIPE-14`).
+    pub fn set_active_pass(&self, pass: usize) {
+        self.active_pass.set(pass);
+    }
+
+    /// Alias for [`Self::set_active_pass`] preserving the LTX multi-pass LoRA selector name.
+    pub fn set_lora_pass(&self, pass: usize) {
+        self.set_active_pass(pass);
+    }
+
+    /// The currently selected multi-pass index.
+    pub fn active_pass(&self) -> usize {
+        self.active_pass.get()
+    }
+
+    /// Inspect the per-pass scale schedule for adapter at `index`, if one was attached.
+    pub fn pass_scales_for(&self, index: usize) -> Option<&[f32]> {
+        self.pass_scales.get(index).and_then(|s| s.as_deref())
+    }
+
+    /// Whether the current adapter stack was installed as a training residual stack.
+    pub fn is_training_residual(&self) -> bool {
+        self.training_residual
+    }
+
+    /// Whether any adapter (even a disabled one) is attached.
+    pub fn has_adapters(&self) -> bool {
+        !self.adapters.is_empty()
+    }
+
+    /// Whether any installed adapter is live (`scale != 0`, or has any non-zero pass scale).
+    pub fn has_live_adapters(&self) -> bool {
+        self.adapters.iter().enumerate().any(|(idx, a)| {
+            match self.pass_scales.get(idx).and_then(|s| s.as_ref()) {
+                Some(ps) => ps.iter().any(|&s| s != 0.0),
+                None => !a.is_disabled(),
+            }
+        })
     }
 
     /// Replace the entire adapter stack as a **training** stack. The forward-time counterpart to
@@ -936,7 +1024,9 @@ impl AdaptableLinear {
     /// `install_training_lokr`) and every family's gradient-checkpoint recompute go through this
     /// method, so the train/recompute consistency invariant is preserved by construction.
     pub fn set_training_adapters(&mut self, adapters: Vec<Adapter>) {
+        self.pass_scales = vec![None; adapters.len()];
         self.adapters = adapters;
+        self.active_pass.set(0);
         self.training_residual = true;
     }
 
@@ -1094,6 +1184,59 @@ impl AdaptableLinear {
             LinearBase::Dense(l) => Some(l.weight.value.dtype()),
             LinearBase::Quantized(_) | LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
         }
+    }
+
+    /// Effective float compute dtype of the base weight (the dense weight dtype, or the quantized
+    /// affine scales dtype when packed — `None` for descriptor-driven integer bases).
+    pub fn compute_dtype(&self) -> Option<Dtype> {
+        match &self.base {
+            LinearBase::Dense(l) => Some(l.weight.value.dtype()),
+            LinearBase::Quantized(q) => Some(q.scales.value.dtype()),
+            LinearBase::ConvRot(_) | LinearBase::W4A8(_) => None,
+        }
+    }
+
+    /// Cast the base's float-bearing tensors to `dtype` in place (`SW-6956`, `sc-4942`).
+    /// A dense base casts its weight and bias; an affine quantized base keeps its packed U32 codes
+    /// untouched and casts its float `scales`, `biases`, and optional dense `bias`.
+    pub fn cast_compute_dtype(&mut self, dtype: Dtype) -> Result<()> {
+        match &mut self.base {
+            LinearBase::Dense(l) => {
+                if l.weight.value.dtype() != dtype {
+                    l.weight = Param::new(l.weight.value.as_dtype(dtype)?);
+                }
+                if let Some(b) = l.bias.value.as_ref() {
+                    if b.dtype() != dtype {
+                        l.bias = Param::new(Some(b.as_dtype(dtype)?));
+                    }
+                }
+            }
+            LinearBase::Quantized(q) => {
+                if q.scales.value.dtype() != dtype {
+                    q.scales = Param::new(q.scales.value.as_dtype(dtype)?);
+                }
+                if q.biases.value.dtype() != dtype {
+                    q.biases = Param::new(q.biases.value.as_dtype(dtype)?);
+                }
+                if let Some(b) = q.inner.bias.value.as_ref() {
+                    if b.dtype() != dtype {
+                        q.inner.bias = Param::new(Some(b.as_dtype(dtype)?));
+                    }
+                }
+            }
+            LinearBase::ConvRot(_) | LinearBase::W4A8(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Logical input feature dimension (`base_shape()[1]`).
+    pub fn in_features(&self) -> i32 {
+        self.base_shape()[1]
+    }
+
+    /// Logical output feature dimension (`base_shape()[0]`).
+    pub fn out_features(&self) -> i32 {
+        self.base_shape()[0]
     }
 
     /// `true` once the base has been quantized (Q4/Q8).
@@ -1299,6 +1442,7 @@ impl AdaptableLinear {
         mut out: Array,
         scales: Option<&ScaleContext<'_>>,
     ) -> Result<Array> {
+        let pass = scales.map_or_else(|| self.active_pass.get(), |ctx| ctx.pass);
         for (idx, adapter) in self.adapters.iter().enumerate() {
             // sc-15265 rule 0 — the TRAINING exemption. A training stack
             // ([`set_training_adapters`]) opts out of both rules and runs the pre-sc-15265 add
@@ -1329,10 +1473,17 @@ impl AdaptableLinear {
             //     trainer numerics than doing nothing, so it cannot be justified as conservative.
             // No before/after Wan training run was measured (a 14B run is not a CI-scale
             // experiment); this exemption is what makes that measurement unnecessary.
-            let eff_scale = scales.map_or_else(
-                || adapter.default_scale(),
-                |ctx| ctx.scale_for(idx, adapter.default_scale()),
-            );
+            let base_scale = match self.pass_scales.get(idx).and_then(|s| s.as_ref()) {
+                Some(ps) => *ps
+                    .get(pass.min(ps.len().saturating_sub(1)))
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "ltx adapter: pass_scale must have at least one entry".to_string(),
+                        )
+                    })?,
+                None => adapter.default_scale(),
+            };
+            let eff_scale = scales.map_or(base_scale, |ctx| ctx.scale_for(idx, base_scale));
             if self.training_residual {
                 out = add(&out, &adapter.residual_with_scale(x, eff_scale)?)?;
                 continue;
@@ -1529,7 +1680,7 @@ impl LinearFacts {
         Self {
             base_shape: lin.base_shape(),
             is_quantized: lin.is_quantized(),
-            has_live_adapters: lin.adapters().iter().any(|a| !a.is_disabled()),
+            has_live_adapters: lin.has_live_adapters(),
             adapter_count: lin.adapters().len(),
             bias_shape: lin.bias().map(|b| b.shape().to_vec()),
         }
@@ -1738,5 +1889,61 @@ mod tests {
             lokr_structured_layout(&[64, 128], &[8, 15], &[8, 8], false),
             None
         );
+    }
+
+    #[test]
+    fn adaptable_linear_per_pass_schedule_and_compute_dtype_transitions() {
+        let mut lin = AdaptableLinear::dense(Array::zeros::<f32>(&[4, 8]).unwrap(), None);
+        assert_eq!(lin.out_features(), 4);
+        assert_eq!(lin.in_features(), 8);
+        assert_eq!(lin.compute_dtype(), Some(Dtype::Float32));
+        assert!(!lin.has_adapters());
+        assert!(!lin.has_live_adapters());
+        assert!(!lin.is_training_residual());
+        assert_eq!(lin.active_pass(), 0);
+
+        let a = Array::zeros::<f32>(&[8, 2]).unwrap();
+        let b = Array::zeros::<f32>(&[2, 4]).unwrap();
+        lin.push_lora_per_pass(a.clone(), b.clone(), vec![0.0, 0.75]);
+        assert!(lin.has_adapters());
+        assert!(
+            lin.has_live_adapters(),
+            "a per-pass adapter with a non-zero pass scale is live even when pass 0 is 0.0"
+        );
+        assert_eq!(lin.pass_scales_for(0), Some(&[0.0, 0.75][..]));
+        let facts = LinearFacts::of(&lin);
+        assert!(facts.has_live_adapters);
+        assert_eq!(facts.adapter_count, 1);
+
+        lin.set_lora_pass(1);
+        assert_eq!(lin.active_pass(), 1);
+
+        lin.set_training_adapters(vec![Adapter::Lora {
+            a: a.clone(),
+            b: b.clone(),
+            scale: 1.0,
+        }]);
+        assert!(lin.is_training_residual());
+        assert_eq!(lin.active_pass(), 0);
+        assert_eq!(lin.pass_scales_for(0), None);
+
+        lin.clear_adapters();
+        assert!(!lin.has_adapters());
+        assert!(!lin.has_live_adapters());
+        assert!(!lin.is_training_residual());
+
+        let mut q = AdaptableLinear::from_quantized_parts(
+            Array::zeros::<u32>(&[4, 8]).unwrap(),
+            Array::zeros::<f32>(&[4, 1]).unwrap(),
+            Array::zeros::<f32>(&[4, 1]).unwrap(),
+            None,
+            64,
+            4,
+        );
+        assert!(q.is_quantized());
+        assert_eq!(q.base_shape(), vec![4, 64]);
+        assert_eq!(q.compute_dtype(), Some(Dtype::Float32));
+        q.cast_compute_dtype(Dtype::Bfloat16).unwrap();
+        assert_eq!(q.compute_dtype(), Some(Dtype::Bfloat16));
     }
 }

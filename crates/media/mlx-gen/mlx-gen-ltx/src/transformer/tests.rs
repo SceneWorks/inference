@@ -352,19 +352,16 @@ fn timestep_embedding_shape_and_pad() {
     assert!(s[128].abs() < 1e-6); // sin(0)
 }
 
-use mlx_rs::ops::{all_close, array_eq};
+use mlx_rs::ops::{all_close, array_eq, matmul};
 
 /// A bare dense Linear (no bias contribution) for the residual-math gates.
 fn dense(w: Array) -> Linear {
     let out = w.shape()[0];
     let dt = w.dtype();
-    Linear {
-        kind: LinearKind::Dense {
-            b: Some(Array::zeros::<f32>(&[out]).unwrap().as_dtype(dt).unwrap()),
-            w,
-        },
-        lora: None,
-    }
+    Linear::from_dense(
+        w,
+        Some(Array::zeros::<f32>(&[out]).unwrap().as_dtype(dt).unwrap()),
+    )
 }
 
 /// The sc-15265 contract this crate's `Linear::forward` implements, spelled out independently
@@ -716,14 +713,8 @@ fn ff_bias_flag_changes_constructed_params_and_forward() {
     let ff_unbiased = FeedForward::load(&w, "ff", prec, false).expect("bias:false loads");
 
     // Structural: bias:false never installs a bias term, regardless of the source map.
-    assert!(matches!(
-        &ff_unbiased.proj_in.kind,
-        LinearKind::Dense { b: None, .. }
-    ));
-    assert!(matches!(
-        &ff_biased.proj_in.kind,
-        LinearKind::Dense { b: Some(_), .. }
-    ));
+    assert!(ff_unbiased.proj_in.bias().is_none());
+    assert!(ff_biased.proj_in.bias().is_some());
 
     // Forward: the two constructions produce numerically different output on the same input —
     // the flag is exercised, not defaulted past.
