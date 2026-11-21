@@ -25,6 +25,7 @@ use mlx_rs::ops::{add, broadcast_to, divide, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::phase::ScaleContext;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
@@ -44,7 +45,7 @@ use crate::vocoder::LtxVocoder;
 
 /// Number of distilled denoise passes (stage-1 + stage-2). Drives the per-pass LoRA strength
 /// schedule (sc-2687): `pass_scales` on an [`AdapterSpec`](mlx_gen::AdapterSpec) carries one entry
-/// per pass, and [`generate_t2v_latents`] selects the active pass on the DiT before each stage.
+/// per pass. Each denoise stage supplies its index through a request-owned scale context.
 pub const NUM_DENOISE_PASSES: usize = 2;
 
 /// Distilled stage-1 sigmas (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps).
@@ -110,6 +111,23 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
+    denoise_with_scales(
+        dit, latents, context, positions, sigmas, state, cancel, on_step, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_with_scales(
+    dit: &LtxDiT,
+    latents: &Array,
+    context: &Array,
+    positions: &Array,
+    sigmas: &[f32],
+    state: Option<&I2vConditioning>,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<Array> {
     mlx_gen::video_execution::sampling(
         "ltx_denoise",
         "distilled_euler",
@@ -141,7 +159,15 @@ pub fn denoise(
             Some(st) => st.token_timesteps(sigma, h, w)?,
             None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[b, num_tokens])?,
         };
-        let velocity = dit.forward(&flat, &ts, context, None, positions, rope_epoch)?;
+        let velocity = dit.forward_with_scales(
+            &flat,
+            &ts,
+            context,
+            None,
+            positions,
+            rope_epoch,
+            adapter_scales,
+        )?;
         // (B, S, C) → (B, C, S) → (B, C, F, H, W).
         let velocity = velocity
             .transpose_axes(&[0, 2, 1])?
@@ -586,8 +612,8 @@ pub fn generate_t2v_latents(
     // parity gates aren't left running compiled after a generate.
     let _compile_glue = crate::CompileGlueGuard::enable();
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
-    dit.set_lora_pass(0);
-    let lat = denoise(
+    let stage_one_scales = ScaleContext::new().with_pass(0);
+    let lat = denoise_with_scales(
         dit,
         stage1_noise,
         context,
@@ -596,11 +622,12 @@ pub fn generate_t2v_latents(
         None,
         cancel,
         on_step,
+        Some(&stage_one_scales),
     )?;
     let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
     let lat = renoise(&lat, stage2_noise, STAGE2_SIGMAS[0])?;
-    dit.set_lora_pass(1);
-    denoise(
+    let stage_two_scales = ScaleContext::new().with_pass(1);
+    denoise_with_scales(
         dit,
         &lat,
         context,
@@ -609,6 +636,7 @@ pub fn generate_t2v_latents(
         None,
         cancel,
         on_step,
+        Some(&stage_two_scales),
     )
 }
 
@@ -742,6 +770,37 @@ pub fn denoise_av(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
+    denoise_av_with_scales(
+        dit,
+        video,
+        audio,
+        video_ctx,
+        audio_ctx,
+        video_pos,
+        audio_pos,
+        sigmas,
+        video_state,
+        cancel,
+        on_step,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_av_with_scales(
+    dit: &AvDiT,
+    video: &Array,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    video_pos: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    video_state: Option<&I2vConditioning>,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<(Array, Array)> {
     mlx_gen::video_execution::sampling(
         "ltx_denoise_av",
         "distilled_euler",
@@ -777,9 +836,21 @@ pub fn denoise_av(
             None => broadcast_to(&scalar(sigma).as_dtype(dt)?, &[vb, v_tokens])?,
         };
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-        let (vvel, avel) = dit.forward(
-            &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
-            None, rope_epoch,
+        let (vvel, avel) = dit.forward_controlled_with_scales(
+            &vflat,
+            &vts,
+            video_ctx,
+            None,
+            video_pos,
+            &aflat,
+            &ats,
+            audio_ctx,
+            None,
+            audio_pos,
+            None,
+            rope_epoch,
+            AvPerturbation::NONE,
+            adapter_scales,
         )?;
         let vvel = vvel
             .transpose_axes(&[0, 2, 1])?
@@ -822,6 +893,41 @@ pub fn denoise_av_dev(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
+    denoise_av_dev_with_scales(
+        dit,
+        video,
+        audio,
+        video_ctx,
+        audio_ctx,
+        negative_video_ctx,
+        negative_audio_ctx,
+        video_pos,
+        audio_pos,
+        sigmas,
+        video_state,
+        cancel,
+        on_step,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_av_dev_with_scales(
+    dit: &AvDiT,
+    video: &Array,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    negative_video_ctx: &Array,
+    negative_audio_ctx: &Array,
+    video_pos: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    video_state: Option<&I2vConditioning>,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<(Array, Array)> {
     mlx_gen::video_execution::sampling(
         "ltx_denoise_av_dev",
         "distilled_euler",
@@ -855,7 +961,7 @@ pub fn denoise_av_dev(
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
 
         let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
-            dit.forward_controlled(
+            dit.forward_controlled_with_scales(
                 &vflat,
                 &vts,
                 vctx,
@@ -869,6 +975,7 @@ pub fn denoise_av_dev(
                 None,
                 rope_epoch,
                 perturbation,
+                adapter_scales,
             )
         };
         let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
@@ -949,6 +1056,39 @@ pub fn denoise_av_curated(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<(Array, Array)> {
+    denoise_av_curated_with_scales(
+        dit,
+        sampler_name,
+        video,
+        audio,
+        video_ctx,
+        audio_ctx,
+        video_pos,
+        audio_pos,
+        sigmas,
+        seed,
+        cancel,
+        on_progress,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn denoise_av_curated_with_scales(
+    dit: &AvDiT,
+    sampler_name: &str,
+    video: &Array,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    video_pos: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<(Array, Array)> {
     mlx_gen::video_execution::curated_sampling(
         "ltx_denoise_av_curated",
         sampler_name,
@@ -986,9 +1126,21 @@ pub fn denoise_av_curated(
                 .reshape(&[ab, at, ac * af])?;
             let vts = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[vb, v_tokens])?;
             let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-            let (vvel, avel) = dit.forward(
-                &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
-                None, rope_epoch,
+            let (vvel, avel) = dit.forward_controlled_with_scales(
+                &vflat,
+                &vts,
+                video_ctx,
+                None,
+                video_pos,
+                &aflat,
+                &ats,
+                audio_ctx,
+                None,
+                audio_pos,
+                None,
+                rope_epoch,
+                AvPerturbation::NONE,
+                adapter_scales,
             )?;
             let vvel = vvel
                 .transpose_axes(&[0, 2, 1])?
@@ -1066,6 +1218,24 @@ pub fn denoise_av_tokens(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Array)> {
+    denoise_av_tokens_with_scales(
+        dit, video, audio, video_ctx, audio_ctx, audio_pos, sigmas, cancel, on_step, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_av_tokens_with_scales(
+    dit: &AvDiT,
+    video: &VideoTokenState,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<(VideoTokenState, Array)> {
     mlx_gen::video_execution::sampling(
         "ltx_denoise_av_tokens",
         "distilled_euler",
@@ -1098,7 +1268,7 @@ pub fn denoise_av_tokens(
         // instead of rebuilding a throwaway VideoTokenState each step (F-060).
         let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-        let (vvel, avel) = dit.forward(
+        let (vvel, avel) = dit.forward_controlled_with_scales(
             &vtok,
             &vts,
             video_ctx,
@@ -1111,6 +1281,8 @@ pub fn denoise_av_tokens(
             audio_pos,
             video.keyframes_mask.as_ref(),
             rope_epoch,
+            AvPerturbation::NONE,
+            adapter_scales,
         )?;
         let avel = avel
             .reshape(&[ab, at, ac, af])?
@@ -1161,6 +1333,37 @@ pub fn denoise_av_tokens_dev(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Array)> {
+    denoise_av_tokens_dev_with_scales(
+        dit,
+        video,
+        audio,
+        video_ctx,
+        audio_ctx,
+        negative_video_ctx,
+        negative_audio_ctx,
+        audio_pos,
+        sigmas,
+        cancel,
+        on_step,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_av_tokens_dev_with_scales(
+    dit: &AvDiT,
+    video: &VideoTokenState,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    negative_video_ctx: &Array,
+    negative_audio_ctx: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<(VideoTokenState, Array)> {
     mlx_gen::video_execution::sampling(
         "ltx_denoise_av_tokens_dev",
         "distilled_euler",
@@ -1186,7 +1389,7 @@ pub fn denoise_av_tokens_dev(
         let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
         let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
-            dit.forward_controlled(
+            dit.forward_controlled_with_scales(
                 &vtok,
                 &vts,
                 vctx,
@@ -1200,6 +1403,7 @@ pub fn denoise_av_tokens_dev(
                 video.keyframes_mask.as_ref(),
                 rope_epoch,
                 perturbation,
+                adapter_scales,
             )
         };
         let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
@@ -1310,6 +1514,25 @@ pub fn denoise_tokens_rf_ancestral(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Option<Array>)> {
+    denoise_tokens_rf_ancestral_with_scales(
+        dit, video, video_ctx, audio, sigmas, eta, s_noise, noise_seed, cancel, on_step, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_tokens_rf_ancestral_with_scales(
+    dit: &AvDiT,
+    video: &VideoTokenState,
+    video_ctx: &Array,
+    audio: Option<AncestralAudio<'_>>,
+    sigmas: &[f32],
+    eta: f32,
+    s_noise: f32,
+    noise_seed: u64,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<(VideoTokenState, Option<Array>)> {
     mlx_gen::video_execution::sampling(
         "ltx_denoise_tokens_rf_ancestral",
         "rf_ancestral",
@@ -1355,7 +1578,7 @@ pub fn denoise_tokens_rf_ancestral(
                     .transpose_axes(&[0, 2, 1, 3])?
                     .reshape(&[ab, at, ac * af])?;
                 let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
-                let (vv, av) = dit.forward(
+                let (vv, av) = dit.forward_controlled_with_scales(
                     &vtok,
                     &vts,
                     video_ctx,
@@ -1368,6 +1591,8 @@ pub fn denoise_tokens_rf_ancestral(
                     a.positions,
                     video.keyframes_mask.as_ref(),
                     rope_epoch,
+                    AvPerturbation::NONE,
+                    adapter_scales,
                 )?;
                 let av = av
                     .reshape(&[ab, at, ac, af])?
@@ -1375,7 +1600,7 @@ pub fn denoise_tokens_rf_ancestral(
                 (vv, Some(av))
             }
             _ => (
-                dit.forward_video_only(
+                dit.forward_video_only_controlled_with_scales(
                     &vtok,
                     &vts,
                     video_ctx,
@@ -1383,6 +1608,8 @@ pub fn denoise_tokens_rf_ancestral(
                     &video.positions,
                     video.keyframes_mask.as_ref(),
                     rope_epoch,
+                    AvPerturbation::NONE,
+                    adapter_scales,
                 )?,
                 None,
             ),
@@ -1564,7 +1791,7 @@ pub fn generate_av_latents_for_variant(
         }
     };
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
-    dit.set_lora_pass(0);
+    let stage_one_scales = ScaleContext::new().with_pass(0);
     // Curated unified solver (epic 7114, sc-7122): the gen-core-only solvers route through the
     // two-stream `denoise_av_curated`; the native distilled Euler default stays on `denoise_av` (N1).
     // Curated only reaches here for pure T2V (`vstate = None`) — the keyframe/I2V per-token-σ path is
@@ -1588,7 +1815,7 @@ pub fn generate_av_latents_for_variant(
                     "ltx_2_5: dev sampling requires staged negative audio conditioning".into(),
                 )
             })?;
-            denoise_av_dev(
+            denoise_av_dev_with_scales(
                 dit,
                 &vlat1,
                 audio_s1_noise,
@@ -1602,10 +1829,11 @@ pub fn generate_av_latents_for_variant(
                 vstate1.as_ref(),
                 cancel,
                 on_step,
+                Some(&stage_one_scales),
             )?
         }
         crate::dev_sampler::TransformerVariant::Distilled => match (sampler, vstate1.as_ref()) {
-            (Some(name), None) => denoise_av_curated(
+            (Some(name), None) => denoise_av_curated_with_scales(
                 dit,
                 name,
                 &vlat1,
@@ -1622,8 +1850,9 @@ pub fn generate_av_latents_for_variant(
                         on_step(current as usize)
                     }
                 },
+                Some(&stage_one_scales),
             )?,
-            _ => denoise_av(
+            _ => denoise_av_with_scales(
                 dit,
                 &vlat1,
                 audio_s1_noise,
@@ -1635,6 +1864,7 @@ pub fn generate_av_latents_for_variant(
                 vstate1.as_ref(),
                 cancel,
                 on_step,
+                Some(&stage_one_scales),
             )?,
         },
     };
@@ -1649,9 +1879,9 @@ pub fn generate_av_latents_for_variant(
             None => (renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?, None),
         };
     let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
-    dit.set_lora_pass(1);
+    let stage_two_scales = ScaleContext::new().with_pass(1);
     match (sampler, vstate2.as_ref()) {
-        (Some(name), None) => denoise_av_curated(
+        (Some(name), None) => denoise_av_curated_with_scales(
             dit,
             name,
             &vlat2,
@@ -1670,8 +1900,9 @@ pub fn generate_av_latents_for_variant(
                     on_step(current as usize)
                 }
             },
+            Some(&stage_two_scales),
         ),
-        _ => denoise_av(
+        _ => denoise_av_with_scales(
             dit,
             &vlat2,
             &a,
@@ -1683,6 +1914,7 @@ pub fn generate_av_latents_for_variant(
             vstate2.as_ref(),
             cancel,
             on_step,
+            Some(&stage_two_scales),
         ),
     }
 }
@@ -1771,7 +2003,7 @@ pub fn generate_av_latents_iclora(
         clips,
         fps,
     )?;
-    dit.set_lora_pass(0);
+    let stage_one_scales = ScaleContext::new().with_pass(0);
     let (vstate, a) = match variant {
         crate::dev_sampler::TransformerVariant::Dev => {
             let negative_video_ctx = negative_video_ctx.ok_or_else(|| {
@@ -1786,7 +2018,7 @@ pub fn generate_av_latents_iclora(
                         .into(),
                 )
             })?;
-            denoise_av_tokens_dev(
+            denoise_av_tokens_dev_with_scales(
                 dit,
                 &vstate,
                 audio_s1_noise,
@@ -1798,9 +2030,10 @@ pub fn generate_av_latents_iclora(
                 stage1_sigmas,
                 cancel,
                 on_step,
+                Some(&stage_one_scales),
             )?
         }
-        crate::dev_sampler::TransformerVariant::Distilled => denoise_av_tokens(
+        crate::dev_sampler::TransformerVariant::Distilled => denoise_av_tokens_with_scales(
             dit,
             &vstate,
             audio_s1_noise,
@@ -1810,6 +2043,7 @@ pub fn generate_av_latents_iclora(
             stage1_sigmas,
             cancel,
             on_step,
+            Some(&stage_one_scales),
         )?,
     };
     // Read back the generated grid (the first `target_tokens` tokens) → (B, 128, f, h1, w1).
@@ -1823,8 +2057,8 @@ pub fn generate_av_latents_iclora(
     let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
     let vlat2 = renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?;
     let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
-    dit.set_lora_pass(1);
-    denoise_av(
+    let stage_two_scales = ScaleContext::new().with_pass(1);
+    denoise_av_with_scales(
         dit,
         &vlat2,
         &a,
@@ -1836,6 +2070,7 @@ pub fn generate_av_latents_iclora(
         None,
         cancel,
         on_step,
+        Some(&stage_two_scales),
     )
 }
 
@@ -2019,6 +2254,23 @@ mod tests {
         assert_eq!(STAGE1_SIGMAS[5], STAGE2_SIGMAS[0]);
     }
 
+    #[test]
+    fn native_and_curated_denoisers_receive_the_stage_adapter_scales() {
+        let body = fn_body("generate_av_latents_for_variant");
+        let (first, second) = body
+            .split_once("let stage_two_scales = ScaleContext::new().with_pass(1)")
+            .expect("AV stage two must select adapter pass 1");
+        assert!(first.contains("let stage_one_scales = ScaleContext::new().with_pass(0)"));
+        assert!(first.contains("denoise_av_dev_with_scales("));
+        assert!(first.contains("denoise_av_curated_with_scales("));
+        assert!(first.contains("denoise_av_with_scales("));
+        assert_eq!(first.matches("Some(&stage_one_scales)").count(), 3);
+        assert!(second.contains("denoise_av_curated_with_scales("));
+        assert!(second.contains("denoise_av_with_scales("));
+        assert_eq!(second.matches("Some(&stage_two_scales)").count(), 2);
+        assert!(!body.contains("set_lora_pass("));
+    }
+
     /// IC-LoRA does not get to borrow the distilled stage-one token loop when the loaded transformer
     /// declares `dev`: this pins the actual production branch, its negative-conditioning inputs, and
     /// the pass-1 distilled refinement. A default-only test would miss all of those seams.
@@ -2033,7 +2285,7 @@ mod tests {
             .find("TransformerVariant::Dev =>")
             .expect("IC-LoRA must branch for the dev transformer");
         let guided = body[dev..]
-            .find("denoise_av_tokens_dev(")
+            .find("denoise_av_tokens_dev_with_scales(")
             .map(|offset| dev + offset)
             .expect("dev IC-LoRA must execute the token-native four-pass denoiser");
         assert!(
@@ -2041,15 +2293,21 @@ mod tests {
                 && body[dev..guided].contains("negative_audio_ctx"),
             "the dev IC-LoRA branch must consume both negative contexts"
         );
+        let stage_one_pass = body
+            .find("let stage_one_scales = ScaleContext::new().with_pass(0)")
+            .expect("stage one must select adapter pass 0");
         let stage_two_pass = body
-            .find("dit.set_lora_pass(1)")
+            .find("let stage_two_scales = ScaleContext::new().with_pass(1)")
             .expect("IC-LoRA must select the shipped stage-two adapter pass");
         assert!(
-            body.find("dit.set_lora_pass(0)") < Some(guided) && guided < stage_two_pass,
+            stage_one_pass < guided
+                && guided < stage_two_pass
+                && body[guided..stage_two_pass].contains("Some(&stage_one_scales)"),
             "the guided dev loop must be stage one, after pass 0 and before pass 1"
         );
         assert!(
-            body[stage_two_pass..].contains("denoise_av(")
+            body[stage_two_pass..].contains("denoise_av_with_scales(")
+                && body[stage_two_pass..].contains("Some(&stage_two_scales)")
                 && body[stage_two_pass..].contains("&STAGE2_SIGMAS"),
             "stage two must remain the simple distilled refinement on pass 1"
         );
@@ -2068,7 +2326,7 @@ mod tests {
     /// controlled forwards whose removal would otherwise leave a structurally valid single-pass loop.
     #[test]
     fn token_native_dev_denoiser_executes_negative_stg_and_modality_guidance() {
-        let body = fn_body("denoise_av_tokens_dev");
+        let body = fn_body("denoise_av_tokens_dev_with_scales");
         for required in [
             "forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)",
             "AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS)",

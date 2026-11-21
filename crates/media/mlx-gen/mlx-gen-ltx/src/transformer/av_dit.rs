@@ -289,6 +289,7 @@ impl AvDiT {
     /// Select the active distilled denoise pass for every installed LoRA residual (sc-2687 per-pass
     /// strength) across both streams and all blocks. The pipeline calls this before each stage; a
     /// no-adapter model is unaffected.
+    /// Staged generation supplies request scales directly and does not use this selector.
     pub fn set_lora_pass(&self, pass: usize) {
         self.video.set_lora_pass(pass);
         self.audio.set_lora_pass(pass);
@@ -367,6 +368,42 @@ impl AvDiT {
         rope_epoch: Option<u64>,
         perturbation: AvPerturbation,
     ) -> Result<(Array, Array)> {
+        self.forward_controlled_with_scales(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_mask,
+            audio_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            perturbation,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_controlled_with_scales(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<(Array, Array)> {
         let vp = self.video.prepare(
             video_latent,
             video_timestep,
@@ -374,6 +411,7 @@ impl AvDiT {
             video_positions,
             video_keyframes_mask,
             rope_epoch,
+            adapter_scales,
         )?;
         let ap = self.audio.prepare(
             audio_latent,
@@ -382,6 +420,7 @@ impl AvDiT {
             audio_positions,
             None,
             rope_epoch,
+            adapter_scales,
         )?;
         let (vx0, ax0) = (vp.x.clone(), ap.x.clone());
         let (va, aa) = (vp.args(video_mask), ap.args(audio_mask));
@@ -395,6 +434,7 @@ impl AvDiT {
                         &va,
                         &aa,
                         perturbation.attention_plan(index),
+                        adapter_scales,
                     )?;
                     vx = nv;
                     ax = na;
@@ -421,6 +461,7 @@ impl AvDiT {
                                 &va,
                                 &aa,
                                 perturbation.attention_plan(index),
+                                adapter_scales,
                             )?;
                             vx = nv;
                             ax = na;
@@ -438,8 +479,8 @@ impl AvDiT {
                 )?
             }
         };
-        let v_vel = self.video.output_head(&vx, &vp.emb_ts)?;
-        let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
+        let v_vel = self.video.output_head(&vx, &vp.emb_ts, adapter_scales)?;
+        let a_vel = self.audio.output_head(&ax, &ap.emb_ts, adapter_scales)?;
         Ok((v_vel, a_vel))
     }
 
@@ -485,6 +526,32 @@ impl AvDiT {
         rope_epoch: Option<u64>,
         perturbation: AvPerturbation,
     ) -> Result<Array> {
+        self.forward_video_only_controlled_with_scales(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            perturbation,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_video_only_controlled_with_scales(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
         let vp = self.video.prepare(
             video_latent,
             video_timestep,
@@ -492,6 +559,7 @@ impl AvDiT {
             video_positions,
             video_keyframes_mask,
             rope_epoch,
+            adapter_scales,
         )?;
         let va = vp.args(video_mask);
         let vx = match &self.blocks {
@@ -502,6 +570,7 @@ impl AvDiT {
                         &vx,
                         &va,
                         perturbation.attention_plan(index).run_self,
+                        adapter_scales,
                     )?;
                 }
                 vx
@@ -520,6 +589,7 @@ impl AvDiT {
                                 &vx,
                                 &va,
                                 perturbation.attention_plan(index).run_self,
+                                adapter_scales,
                             )?;
                         }
                         Ok(vx)
@@ -528,7 +598,7 @@ impl AvDiT {
                 )?
             }
         };
-        self.video.output_head(&vx, &vp.emb_ts)
+        self.video.output_head(&vx, &vp.emb_ts, adapter_scales)
     }
 
     /// Audio-only flexible-training forward. The video stream and both cross-modal attentions are
@@ -550,13 +620,14 @@ impl AvDiT {
             audio_positions,
             None,
             rope_epoch,
+            None,
         )?;
         let aa = ap.args(audio_mask);
         let ax = match &self.blocks {
             AvBlocks::Resident(blocks) => {
                 let mut ax = ap.x.clone();
                 for block in blocks {
-                    ax = block.forward_audio_only(&ax, &aa)?;
+                    ax = block.forward_audio_only(&ax, &aa, None)?;
                 }
                 ax
             }
@@ -570,7 +641,7 @@ impl AvDiT {
                     |mut ax, view, range| {
                         for index in range {
                             let block = stream.materialize(view, index)?;
-                            ax = block.forward_audio_only(&ax, &aa)?;
+                            ax = block.forward_audio_only(&ax, &aa, None)?;
                         }
                         Ok(ax)
                     },
@@ -578,6 +649,6 @@ impl AvDiT {
                 )?
             }
         };
-        self.audio.output_head(&ax, &ap.emb_ts)
+        self.audio.output_head(&ax, &ap.emb_ts, None)
     }
 }

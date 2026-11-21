@@ -93,6 +93,7 @@ impl LtxDiT {
 
     /// Select the active distilled denoise pass for every installed LoRA residual (sc-2687 per-pass
     /// strength). The pipeline calls this before each stage; a no-adapter model is unaffected.
+    /// Staged generation supplies request scales directly and does not use this selector.
     pub fn set_lora_pass(&self, pass: usize) {
         self.patchify_proj.set_lora_pass(pass);
         self.proj_out.set_lora_pass(pass);
@@ -159,13 +160,16 @@ impl LtxDiT {
         context: &Array,
         positions: &Array,
         rope_epoch: Option<u64>,
+        adapter_scales: Option<&ScaleContext<'_>>,
     ) -> Result<Preprocessed> {
         let dt = self.prec.dtype();
         let b = latent.shape()[0];
         let inner = self.cfg.inner_dim();
         let coeff = self.cfg.adaln_embedding_coefficient;
 
-        let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
+        let x = self
+            .patchify_proj
+            .forward_with_scales(&latent.as_dtype(dt)?, adapter_scales)?;
         // sc-18758/sc-18789: the DFR keyframe-slot marker. This video-only (2.3) preprocess never
         // carries generated slots, so no mask — the AV token loops are the mask-threading path
         // (see `apply_keyframes_embedding`).
@@ -178,7 +182,7 @@ impl LtxDiT {
         // in the bf16 path). f32 input is unaffected (`f32(σ)·1000` either way).
         let mult = scalar(self.cfg.timestep_scale_multiplier as f32).as_dtype(timestep.dtype())?;
         let ts_flat = multiply(timestep, &mult)?.reshape(&[-1])?;
-        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt)?;
+        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, dt, adapter_scales)?;
         let ts_emb = ts_emb.reshape(&[b, -1, coeff * inner])?;
         let emb_ts = emb_ts.reshape(&[b, -1, inner])?;
 
@@ -191,7 +195,7 @@ impl LtxDiT {
                     timestep.clone()
                 };
                 let src = multiply(&src, &mult)?.reshape(&[-1])?;
-                let (pts, _) = padaln.forward(&src, dt)?;
+                let (pts, _) = padaln.forward(&src, dt, adapter_scales)?;
                 Some(pts.reshape(&[b, -1, 2 * inner])?)
             }
             None => None,
@@ -243,10 +247,31 @@ impl LtxDiT {
         positions: &Array,
         rope_epoch: Option<u64>,
     ) -> Result<Array> {
-        let p = self.preprocess(latent, timestep, context, positions, rope_epoch)?;
+        self.forward_with_scales(latent, timestep, context, mask, positions, rope_epoch, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_scales(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        positions: &Array,
+        rope_epoch: Option<u64>,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
+        let p = self.preprocess(
+            latent,
+            timestep,
+            context,
+            positions,
+            rope_epoch,
+            adapter_scales,
+        )?;
         let mut h = p.x;
         for block in &self.blocks {
-            h = block.forward(
+            h = block.forward_with_scales(
                 &h,
                 &p.ts_emb,
                 p.prompt_ts.as_ref(),
@@ -254,9 +279,10 @@ impl LtxDiT {
                 mask,
                 &p.cos,
                 &p.sin,
+                adapter_scales,
             )?;
         }
-        self.output_head(&h, &p.emb_ts)
+        self.output_head_with_scales(&h, &p.emb_ts, adapter_scales)
     }
 
     /// Training forward with **per-block gradient checkpointing** (sc-4942). Identical compute to
@@ -286,7 +312,7 @@ impl LtxDiT {
         // `None`: content-keyed memo. Training positions are constant within a step (incl. the
         // checkpoint recompute), so the content compare hits; a per-step epoch would need threading
         // through the checkpoint closure for no inference benefit (sc-7141).
-        let p = self.preprocess(latent, timestep, context, positions, None)?;
+        let p = self.preprocess(latent, timestep, context, positions, None, None)?;
         let mut h = p.x;
         for (i, block) in self.blocks.iter().enumerate() {
             // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
@@ -383,7 +409,7 @@ impl LtxDiT {
         positions: &Array,
         n: usize,
     ) -> Result<Array> {
-        let p = self.preprocess(latent, timestep, context, positions, None)?; // diagnostic: content-keyed
+        let p = self.preprocess(latent, timestep, context, positions, None, None)?; // diagnostic: content-keyed
         let mut h = p.x;
         for block in self.blocks.iter().take(n) {
             h = block.forward(
@@ -415,6 +441,15 @@ impl LtxDiT {
     /// The output head in isolation (LayerNorm-affine-false → final scale-shift → proj_out), for the
     /// S3b bisection: feed the reference post-block hidden + embedded timestep, compare the velocity.
     pub fn output_head(&self, h: &Array, emb_ts: &Array) -> Result<Array> {
+        self.output_head_with_scales(h, emb_ts, None)
+    }
+
+    fn output_head_with_scales(
+        &self,
+        h: &Array,
+        emb_ts: &Array,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
         let b = h.shape()[0];
         let inner = self.cfg.inner_dim();
         let table = self.scale_shift_table.reshape(&[1, 1, 2, inner])?;
@@ -423,7 +458,7 @@ impl LtxDiT {
         let scale = ss.index_axis(1, 2)?;
         let normed = layer_norm(h, None, None, self.cfg.norm_eps as f32)?;
         let out = modulate(&normed, &scale, &shift)?;
-        self.proj_out.forward(&out)
+        self.proj_out.forward_with_scales(&out, adapter_scales)
     }
 }
 
