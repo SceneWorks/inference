@@ -97,7 +97,7 @@ def overlay_identity(overlay):
     return {name: hashlib.sha256(data).hexdigest() for name, data in sorted(overlay.items())}
 
 
-def build(work, origin, arm, contract, profile, env):
+def build(work, origin, arm, contract, profile, env, *, release=False, cuda_features="cuda"):
     root = work / arm
     expected = contract[arm]
     observed = paired.add_source_worktree(origin, root, expected["revision"])
@@ -119,10 +119,12 @@ def build(work, origin, arm, contract, profile, env):
     target = work / (arm + "-target")
     env["CARGO_TARGET_DIR"] = str(target)
     command = ["cargo", "build", "--locked", "-p", profile.package(backend), "--bin", PROOF_BIN, "--no-default-features"]
+    if release:
+        command += ["--release"]
     if backend == "candle-cuda":
-        command += ["--features", "cuda"]
+        command += ["--features", cuda_features]
     subprocess.run(command, env=env, cwd=root, check=True, timeout=BUILD_TIMEOUT_SECONDS)
-    binary = target / "debug" / (PROOF_BIN + (".exe" if backend == "candle-cuda" else ""))
+    binary = target / ("release" if release else "debug") / (PROOF_BIN + (".exe" if backend == "candle-cuda" else ""))
     return binary, {**observed, "overlay_sha256": overlay_identity(overlay), "toolchain": toolchain,
                     "build_command": command, "binary_sha256": sha(binary)}
 
