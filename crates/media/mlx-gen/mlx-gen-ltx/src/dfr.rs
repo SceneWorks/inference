@@ -8,7 +8,7 @@
 //! slicing, anchor gathering, slot seeding, per-tile noise seeds, the latent stitch, slot
 //! dedup and the carry-forward merge — behind two injected closures (the temporal upsampler and
 //! the per-tile denoise), so the exact code path production runs is drivable by tests without the
-//! 22B DiT. [`denoise_dfr_tile`] is the production tile closure body: it assembles the tile's
+//! 22B DiT. The tile denoiser assembles the tile's
 //! token state (anchors → hard keyframes, slots → generated-keyframe slots) and runs the
 //! rectified-flow ancestral loop at [`gen_core_dfr::TEMPORAL_ANCESTRAL_ETA`].
 
@@ -17,13 +17,14 @@ use mlx_rs::Array;
 
 use gen_core_ltx::ltx_dfr as gen_core_dfr;
 use gen_core_ltx::ltx_dfr::DfrTileRange;
+use mlx_gen::gen_core::phase::ScaleContext;
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::conditioning::{
     append_generated_keyframe_slots, append_single_frame_keyframes, token_timesteps,
     VideoTokenState,
 };
-use crate::pipeline::{denoise_tokens_rf_ancestral, TEMPORAL_SIGMAS};
+use crate::pipeline::{denoise_tokens_rf_ancestral_with_scales, TEMPORAL_SIGMAS};
 use crate::positions::{SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::transformer::AvDiT;
 
@@ -501,6 +502,18 @@ pub fn denoise_dfr_tile(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<DfrTileResult> {
+    denoise_dfr_tile_with_scales(dit, job, video_ctx, positions, cancel, on_step, None)
+}
+
+fn denoise_dfr_tile_with_scales(
+    dit: &AvDiT,
+    job: &DfrTileJob<'_>,
+    video_ctx: &Array,
+    positions: &Array,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    adapter_scales: Option<&ScaleContext<'_>>,
+) -> Result<DfrTileResult> {
     let sh = job.tile_video.shape();
     let (h, w) = (sh[3] as usize, sh[4] as usize);
     let spatial_scale = SPATIAL_SCALE;
@@ -567,7 +580,7 @@ pub fn denoise_dfr_tile(
             noise_slot_tokens(&state, TEMPORAL_SIGMAS[0], job.noise_seed.wrapping_add(1))?;
     }
 
-    let (state, _) = denoise_tokens_rf_ancestral(
+    let (state, _) = denoise_tokens_rf_ancestral_with_scales(
         dit,
         &state,
         video_ctx,
@@ -578,6 +591,7 @@ pub fn denoise_dfr_tile(
         job.noise_seed,
         cancel,
         on_step,
+        adapter_scales,
     )?;
 
     let grid_tokens: Vec<i32> = (0..state.target_tokens).collect();
@@ -709,7 +723,9 @@ pub fn generate_dfr_av_latents(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<DfrOutput> {
-    use crate::pipeline::{denoise_av_tokens, denoise_av_tokens_dev, renoise, STAGE2_SIGMAS};
+    use crate::pipeline::{
+        denoise_av_tokens_dev_with_scales, denoise_av_tokens_with_scales, renoise, STAGE2_SIGMAS,
+    };
 
     let rounds = req.temporal_upsample_rounds;
     if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
@@ -768,7 +784,7 @@ pub fn generate_dfr_av_latents(
     // Zero-seeded slots still enter at full noise: lerp them toward the stage-entry σ.
     state.latent = noise_slot_tokens(&state, stage1_sigmas[0], req.seed.wrapping_add(11))?;
 
-    parts.dit.set_lora_pass(0);
+    let stage_one_scales = ScaleContext::new().with_pass(0);
     let (state, audio_s1) = match parts.variant {
         crate::dev_sampler::TransformerVariant::Dev => {
             let negative_video_ctx = parts.negative_video_ctx.ok_or_else(|| {
@@ -781,7 +797,7 @@ pub fn generate_dfr_av_latents(
                     "ltx_2_5: dev DFR sampling requires staged negative audio conditioning".into(),
                 )
             })?;
-            denoise_av_tokens_dev(
+            denoise_av_tokens_dev_with_scales(
                 parts.dit,
                 &state,
                 audio_s1_noise,
@@ -793,9 +809,10 @@ pub fn generate_dfr_av_latents(
                 stage1_sigmas,
                 cancel,
                 on_step,
+                Some(&stage_one_scales),
             )?
         }
-        crate::dev_sampler::TransformerVariant::Distilled => denoise_av_tokens(
+        crate::dev_sampler::TransformerVariant::Distilled => denoise_av_tokens_with_scales(
             parts.dit,
             &state,
             audio_s1_noise,
@@ -805,6 +822,7 @@ pub fn generate_dfr_av_latents(
             stage1_sigmas,
             cancel,
             on_step,
+            Some(&stage_one_scales),
         )?,
     };
     let stage1_audio_latent = audio_s1.clone();
@@ -870,8 +888,8 @@ pub fn generate_dfr_av_latents(
     }
     let audio2 = renoise(&stage1_audio_latent, audio_s2_noise, s2_entry)?;
 
-    parts.dit.set_lora_pass(1);
-    let (state2, _audio2) = denoise_av_tokens(
+    let stage_two_scales = ScaleContext::new().with_pass(1);
+    let (state2, _audio2) = denoise_av_tokens_with_scales(
         parts.dit,
         &state2,
         &audio2,
@@ -881,6 +899,7 @@ pub fn generate_dfr_av_latents(
         &STAGE2_SIGMAS,
         cancel,
         on_step,
+        Some(&stage_two_scales),
     )?;
     let grid_tokens: Vec<i32> = (0..state2.target_tokens).collect();
     let grid2 = state2
@@ -901,9 +920,6 @@ pub fn generate_dfr_av_latents(
     let mut playback_fps = req.fps;
     if rounds > 0 {
         let upsampler = parts.temporal_upsampler.expect("validated above");
-        // Temporal tiles run the base (stage-1) LoRA pass, like the reference's non-detailing
-        // stage.
-        parts.dit.set_lora_pass(0);
         // Replace-latent image anchors ride into every round, re-attached tile-locally (the
         // reference's per-tile image conditionings). A multi-latent-frame conditioning clip has
         // no per-tile replace-latent projection — typed refusal, never a silent drop.
@@ -940,7 +956,15 @@ pub fn generate_dfr_av_latents(
                 job.cond_fps,
                 true,
             );
-            denoise_dfr_tile(parts.dit, job, parts.video_ctx, &positions, cancel, on_step)
+            denoise_dfr_tile_with_scales(
+                parts.dit,
+                job,
+                parts.video_ctx,
+                &positions,
+                cancel,
+                on_step,
+                Some(&stage_one_scales),
+            )
         };
         let out = run_temporal_rounds(
             &video,
@@ -1000,7 +1024,7 @@ mod tests {
             .find("TransformerVariant::Dev =>")
             .expect("DFR must branch for a dev transformer");
         let guided = body[dev..]
-            .find("denoise_av_tokens_dev(")
+            .find("denoise_av_tokens_dev_with_scales(")
             .map(|offset| dev + offset)
             .expect("dev DFR must execute the token-native four-pass denoiser");
         assert!(
@@ -1008,18 +1032,30 @@ mod tests {
                 && body[dev..guided].contains("negative_audio_ctx"),
             "the dev DFR branch must consume both staged negative contexts"
         );
+        let stage_one_pass = body
+            .find("let stage_one_scales = ScaleContext::new().with_pass(0)")
+            .expect("stage one must select adapter pass 0");
         let stage_two_pass = body
-            .find("parts.dit.set_lora_pass(1)")
+            .find("let stage_two_scales = ScaleContext::new().with_pass(1)")
             .expect("DFR stage two must select the built-in distilled adapter pass");
         assert!(
-            body.find("parts.dit.set_lora_pass(0)") < Some(guided) && guided < stage_two_pass,
+            stage_one_pass < guided
+                && guided < stage_two_pass
+                && body[guided..stage_two_pass].contains("Some(&stage_one_scales)"),
             "the guided dev loop must run in stage one on adapter pass 0"
         );
         assert!(
-            body[stage_two_pass..].contains("denoise_av_tokens(")
+            body[stage_two_pass..].contains("denoise_av_tokens_with_scales(")
+                && body[stage_two_pass..].contains("Some(&stage_two_scales)")
                 && body[stage_two_pass..].contains("&STAGE2_SIGMAS"),
             "DFR stage two must remain the simple distilled refinement on pass 1"
         );
+        let tile = body[stage_two_pass..]
+            .split_once("denoise_dfr_tile_with_scales(")
+            .expect("DFR temporal rounds must pass adapter scales to the tile denoiser")
+            .1;
+        assert!(tile.contains("Some(&stage_one_scales)"));
+        assert!(!body.contains("set_lora_pass("));
         assert_eq!(
             crate::dev_sampler::ExecutionPlan::for_variant(
                 crate::dev_sampler::TransformerVariant::Dev

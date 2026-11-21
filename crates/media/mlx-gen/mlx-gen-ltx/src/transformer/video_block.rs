@@ -48,12 +48,27 @@ impl VideoBlock {
         cos: &Array,
         sin: &Array,
     ) -> Result<Array> {
+        self.forward_with_scales(x, timesteps, prompt_timestep, context, mask, cos, sin, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_with_scales(
+        &self,
+        x: &Array,
+        timesteps: &Array,
+        prompt_timestep: Option<&Array>,
+        context: &Array,
+        mask: Option<&Array>,
+        cos: &Array,
+        sin: &Array,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<Array> {
         // --- MSA (self-attention) ---
         let msa = ada_values(&self.scale_shift_table, timesteps, 0, 3)?;
         let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
         let attn = self
             .attn1
-            .forward(&norm, None, None, Some((cos, sin)), None)?;
+            .forward(&norm, None, None, Some((cos, sin)), None, adapter_scales)?;
         let mut x = gated(x, &attn, &msa[2])?;
 
         // --- prompt-adaLN on the text context ---
@@ -74,15 +89,15 @@ impl VideoBlock {
         // --- text cross-attention (adaLN rows 6..9) ---
         let ca = ada_values(&self.scale_shift_table, timesteps, 6, 9)?;
         let norm_ca = modulate(&rms_norm_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
-        let cross = self
-            .attn2
-            .forward(&norm_ca, Some(&v_context), mask, None, None)?;
+        let cross =
+            self.attn2
+                .forward(&norm_ca, Some(&v_context), mask, None, None, adapter_scales)?;
         x = gated(&x, &cross, &ca[2])?;
 
         // --- FeedForward (adaLN rows 3..6) ---
         let mlp = ada_values(&self.scale_shift_table, timesteps, 3, 6)?;
         let norm_mlp = modulate(&rms_norm_noweight(&x, self.eps)?, &mlp[1], &mlp[0])?;
-        let ff = self.ff.forward(&norm_mlp)?;
+        let ff = self.ff.forward_with_scales(&norm_mlp, adapter_scales)?;
         x = gated(&x, &ff, &mlp[2])?;
 
         Ok(x)
@@ -163,11 +178,18 @@ impl AdaLayerNormSingle {
 
     /// `timestep` is the already-scaled `(N,)` f32. Returns `(scale_shift (N, coeff·dim), embedded
     /// (N, dim))` in `dt`.
-    pub(super) fn forward(&self, timestep: &Array, dt: Dtype) -> Result<(Array, Array)> {
+    pub(super) fn forward(
+        &self,
+        timestep: &Array,
+        dt: Dtype,
+        adapter_scales: Option<&ScaleContext<'_>>,
+    ) -> Result<(Array, Array)> {
         let proj = timestep_embedding(timestep)?.as_dtype(dt)?;
-        let h = mlx_gen::nn::silu(&self.ts_lin1.forward(&proj)?)?;
-        let embedded = self.ts_lin2.forward(&h)?;
-        let scale_shift = self.linear.forward(&mlx_gen::nn::silu(&embedded)?)?;
+        let h = mlx_gen::nn::silu(&self.ts_lin1.forward_with_scales(&proj, adapter_scales)?)?;
+        let embedded = self.ts_lin2.forward_with_scales(&h, adapter_scales)?;
+        let scale_shift = self
+            .linear
+            .forward_with_scales(&mlx_gen::nn::silu(&embedded)?, adapter_scales)?;
         Ok((scale_shift, embedded))
     }
 
