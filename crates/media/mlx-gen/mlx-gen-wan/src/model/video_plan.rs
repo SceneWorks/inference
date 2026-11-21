@@ -110,6 +110,7 @@ pub(super) fn video_layout(
         .and_then(|n| n.checked_mul(3))
         .ok_or_else(|| Error::Unsupported("Wan decoded clip overflows".into()))?;
     Ok(VideoPlanLayout {
+        retained_allocations: vec![],
         packed_components,
         // frames_u8, its contiguous view and reshape share one allocation. All frames are
         // copied to host before the trimmed prefix is drained.
@@ -136,6 +137,7 @@ pub(super) fn video_layout(
             latent_bytes: channels(lat[0] as u64)?,
             // Channel-concat holds the 16-channel encoded video and four-channel mask as y.
             retained_bytes: if is_i2v { channels(20)? } else { 0 },
+            decoded_host_bytes: 0,
             decoded_tensor_bytes: decoded_rgb_bytes
                 .checked_mul(4)
                 .ok_or_else(|| Error::Unsupported("Wan f32 decoder output overflows".into()))?,

@@ -32,6 +32,8 @@ pub struct VideoPhaseLayout {
     pub retained_bytes: u64,
     /// Known materialized decoder output and preceding stitched buffers live during decode.
     pub decoded_tensor_bytes: u64,
+    /// Separate host storage at this decoder peak, including earlier emitted chunks.
+    pub decoded_host_bytes: u64,
     pub decoded_frames: u32,
     pub decode_chunk_frames: u32,
     pub source: Range<usize>,
@@ -58,6 +60,8 @@ pub struct VideoOutputConversion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoPlanLayout {
+    /// Distinct prepared source buffers retained through denoise, decoding and final output.
+    pub retained_allocations: Vec<crate::PricedAllocation>,
     pub packed_components: Vec<VideoPackedComponent>,
     pub output_conversion: VideoOutputConversion,
     pub output: MemoryGeometry,
@@ -78,6 +82,7 @@ impl VideoPlanLayout {
         domain: MemoryBudgetDomain,
     ) -> Self {
         Self {
+            retained_allocations: vec![],
             packed_components: vec![],
             output_conversion: Default::default(),
             output,
@@ -88,6 +93,7 @@ impl VideoPlanLayout {
                 latent_bytes,
                 retained_bytes: 0,
                 decoded_tensor_bytes: 0,
+                decoded_host_bytes: 0,
                 decoded_frames,
                 decode_chunk_frames,
                 source: 0..output.frames as usize,
@@ -399,10 +405,9 @@ impl VideoRenderPlan {
     pub fn minimum_denoise_live_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
         let mut peak = 0;
         for phase in &self.layout.phases {
-            peak = peak.max(crate::sum_deduplicated_live_bytes(
+            peak = peak.max(self.operation_bytes(
                 domain,
                 &[
-                    self.source_allocation(),
                     crate::PricedAllocation::new(
                         "video_latent",
                         self.layout.domain,
@@ -427,8 +432,22 @@ impl VideoRenderPlan {
         }
     }
 
-    fn source_allocation(&self) -> crate::PricedAllocation {
-        crate::PricedAllocation::new("source_rgb", self.host_domain(), self.inputs.carrier_bytes)
+    fn operation_bytes(
+        &self,
+        domain: MemoryBudgetDomain,
+        operation: &[crate::PricedAllocation],
+    ) -> Result<u64> {
+        let source = crate::PricedAllocation::new(
+            "source_rgb",
+            self.host_domain(),
+            self.inputs.carrier_bytes,
+        );
+        crate::sum_deduplicated_live_bytes(
+            domain,
+            std::iter::once(&source)
+                .chain(&self.layout.retained_allocations)
+                .chain(operation),
+        )
     }
 
     /// Minimum live buffers on a single physical budget. Source pixels survive until the
@@ -446,10 +465,9 @@ impl VideoRenderPlan {
             .into_iter()
             .try_fold(1u64, |n, d| n.checked_mul(u64::from(d)))
             .ok_or_else(|| Error::Unsupported("video output size overflow".into()))?;
-        let decode = crate::sum_deduplicated_live_bytes(
+        let decode = self.operation_bytes(
             domain,
             &[
-                self.source_allocation(),
                 crate::PricedAllocation::new("output_rgb", self.host_domain(), bytes),
                 crate::PricedAllocation::new(
                     "output_device_staging",
@@ -463,21 +481,25 @@ impl VideoRenderPlan {
                 ),
             ],
         )?;
-        let tensor = self
-            .layout
-            .phases
-            .iter()
-            .map(|p| p.decoded_tensor_bytes)
-            .max()
-            .unwrap_or(0);
-        let materialization = crate::sum_deduplicated_live_bytes(
-            domain,
-            &[
-                self.source_allocation(),
-                crate::PricedAllocation::new("decoder_output", self.layout.domain, tensor),
-            ],
-        )?;
-        Ok(decode.max(materialization))
+        let mut peak = decode;
+        for phase in &self.layout.phases {
+            peak = peak.max(self.operation_bytes(
+                domain,
+                &[
+                    crate::PricedAllocation::new(
+                        "decoder_output",
+                        self.layout.domain,
+                        phase.decoded_tensor_bytes,
+                    ),
+                    crate::PricedAllocation::new(
+                        "decoded_host",
+                        self.host_domain(),
+                        phase.decoded_host_bytes,
+                    ),
+                ],
+            )?);
+        }
+        Ok(peak)
     }
 
     fn check_output(&self, completed: &crate::generator::CompletedGeneration) -> Result<()> {

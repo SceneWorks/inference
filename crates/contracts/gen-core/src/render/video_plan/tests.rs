@@ -45,6 +45,7 @@ fn compile(_: &LoadSpec, req: &GenerationRequest) -> Result<Option<VideoPlanLayo
         reference_count: 1,
     };
     Ok(Some(VideoPlanLayout {
+        retained_allocations: vec![],
         packed_components: vec![],
         output_conversion: VideoOutputConversion {
             device_bytes: 700,
@@ -68,6 +69,7 @@ fn compile(_: &LoadSpec, req: &GenerationRequest) -> Result<Option<VideoPlanLayo
             latent_frames: 2,
             latent_bytes: 256,
             retained_bytes: 64,
+            decoded_host_bytes: 0,
             decoded_tensor_bytes: 350,
             decoded_frames: 5,
             decode_chunk_frames: 5,
@@ -425,4 +427,42 @@ impl MemoryRequestScope for BorrowedScope {
     fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
         unreachable!()
     }
+}
+
+#[test]
+fn persistent_sources_and_emitted_chunks_charge_their_actual_phase_and_domain() {
+    use MemoryBudgetDomain::{DeviceVram, HostRam, UnifiedMemory};
+    let spec = LoadSpec::new(WeightsSource::Dir("fixtures".into()));
+    let mut plan = registry()
+        .compile_video_plan(descriptor().id, &spec, &request())
+        .unwrap()
+        .unwrap();
+    // Model two chunk materializations. Large device and host stages occur separately.
+    let mut phase = plan.layout.phases[0].clone();
+    plan.layout.phases[0].decoded_tensor_bytes = 6000;
+    plan.layout.phases[0].decoded_host_bytes = 90;
+    phase.decoded_tensor_bytes = 2000;
+    phase.decoded_host_bytes = 5000;
+    plan.layout.phases.push(phase);
+    plan.layout.retained_allocations = vec![crate::PricedAllocation::new(
+        "prepared_stacks",
+        HostRam,
+        900,
+    )];
+    assert_eq!(plan.minimum_decode_live_bytes(DeviceVram).unwrap(), 6000);
+    assert_eq!(
+        plan.minimum_decode_live_bytes(HostRam).unwrap(),
+        5000 + 900 + 6
+    );
+    assert_eq!(plan.minimum_denoise_live_bytes(HostRam).unwrap(), 900 + 6);
+    plan.layout.domain = UnifiedMemory;
+    plan.layout.retained_allocations[0].domain = UnifiedMemory;
+    assert_eq!(
+        plan.minimum_decode_live_bytes(UnifiedMemory).unwrap(),
+        2000 + 5000 + 900 + 6
+    );
+    assert_eq!(
+        plan.minimum_denoise_live_bytes(UnifiedMemory).unwrap(),
+        320 + 900 + 6
+    );
 }
