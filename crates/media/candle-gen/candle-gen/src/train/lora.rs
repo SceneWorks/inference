@@ -254,16 +254,99 @@ impl LoraLinear {
         }
     }
 
-    /// Construct a [`LoraLinear`] directly from a shared-spine [`AdaptLinear`] at `path` (`SW-6956`).
+    /// Construct a [`LoraLinear`] directly from a shared-spine [`AdaptLinear`] at `path` (`SW-6956`),
+    /// preserving any attached forward-time additive or trainable LoRA/LoKr residuals.
     pub fn from_adapt_linear(adapt: AdaptLinear, path: String) -> Self {
+        let out_features = adapt.out_features;
+        let in_features = adapt.in_features;
+        let mut adapter = None;
+        let mut frozen = None;
+        let mut additive = Vec::new();
+        for a in adapt.adapters {
+            match a {
+                candle_layers::adapt::Adapter::Lora { a, b, scale } => {
+                    additive.push(AdditiveResidual::Lora {
+                        a,
+                        b,
+                        scales: vec![scale],
+                    });
+                }
+                candle_layers::adapt::Adapter::LokrStructured { factors, scale } => {
+                    additive.push(AdditiveResidual::LokrStructured {
+                        factors,
+                        scales: vec![scale],
+                    });
+                }
+                candle_layers::adapt::Adapter::TrainableLora {
+                    down,
+                    up,
+                    scale,
+                    frozen: is_frozen,
+                } => {
+                    if is_frozen {
+                        let detached = Adapter::Lora {
+                            down: down.detach(),
+                            up: up.detach(),
+                            scale,
+                        };
+                        frozen = Some(Adapter::Lora { down, up, scale });
+                        adapter = Some(detached);
+                    } else {
+                        adapter = Some(Adapter::Lora { down, up, scale });
+                        frozen = None;
+                    }
+                }
+                candle_layers::adapt::Adapter::TrainableLokr {
+                    w1,
+                    w2_a,
+                    w2_b,
+                    scale,
+                    frozen: is_frozen,
+                } => {
+                    let live = Adapter::Lokr {
+                        w1: w1.clone(),
+                        w2: match &w2_b {
+                            Some(b) => LokrW2::LowRank {
+                                a: w2_a.clone(),
+                                b: b.clone(),
+                            },
+                            None => LokrW2::Full(w2_a.clone()),
+                        },
+                        out_f: out_features,
+                        in_f: in_features,
+                        scale,
+                    };
+                    if is_frozen {
+                        let detached = Adapter::Lokr {
+                            w1: w1.detach(),
+                            w2: match w2_b {
+                                Some(b) => LokrW2::LowRank {
+                                    a: w2_a.detach(),
+                                    b: b.detach(),
+                                },
+                                None => LokrW2::Full(w2_a.detach()),
+                            },
+                            out_f: out_features,
+                            in_f: in_features,
+                            scale,
+                        };
+                        frozen = Some(live);
+                        adapter = Some(detached);
+                    } else {
+                        adapter = Some(live);
+                        frozen = None;
+                    }
+                }
+            }
+        }
         Self {
             base: adapt.base,
-            in_features: adapt.in_features,
-            out_features: adapt.out_features,
+            in_features,
+            out_features,
             path,
-            adapter: None,
-            frozen: None,
-            additive: Vec::new(),
+            adapter,
+            frozen,
+            additive,
             additive_pass: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -280,15 +363,9 @@ impl LoraLinear {
     }
 
     /// Fold only the frozen dense base to Q4/Q8, preserving trainable and forward-time residuals.
-    /// Already-packed bases are idempotent.
+    /// Already-packed bases are idempotent; non-dense/non-packed bases refuse re-quantization.
     pub fn quantize_base(&mut self, quant: crate::gen_core::Quant) -> Result<()> {
-        let SpineBase::Dense(linear) = &self.base else {
-            return Ok(());
-        };
-        let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
-        packed.quantize(quant)?;
-        self.base = SpineBase::Packed(packed);
-        Ok(())
+        Ok(self.base.quantize(quant)?)
     }
 
     /// Fold the frozen dense base from a CPU-staged model directly onto `device`, preserving every
@@ -306,13 +383,7 @@ impl LoraLinear {
                     .into(),
             ));
         }
-        if let SpineBase::Dense(linear) = &self.base {
-            let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
-            // SDXL's established quantized forward uses the dequant-dense arm; only the destination
-            // changes here, so CPU staging is numerically identical to `quantize_base`.
-            packed.quantize_dequant_onto(quant, device)?;
-            self.base = SpineBase::Packed(packed);
-        }
+        self.base.quantize_dequant_onto(quant, device)?;
         for residual in &mut self.additive {
             match residual {
                 AdditiveResidual::Lora { a, b, .. } => {
