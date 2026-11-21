@@ -1182,10 +1182,8 @@ impl Pipeline {
         let stage2_keyframes =
             self.build_keyframes(req, &comps.vae, geometry.t, req.width, req.height)?;
         let clips = self.build_clips(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
-        let stage_seeds =
-            orchestration.stage1_setup(!keyframes.is_empty(), !clips.is_empty(), |pass| {
-                comps.avdit.set_adapter_pass(pass)
-            });
+        let (stage_seeds, stage1_scales) =
+            orchestration.stage1_setup(!keyframes.is_empty(), !clips.is_empty());
         let vnoise =
             pipeline::create_noise(stage_seeds.video_stage1, t_lat, h_lat, w_lat, &self.device)?;
         let anoise = pipeline::create_audio_noise(stage_seeds.audio_stage1, af, &self.device)?;
@@ -1257,7 +1255,7 @@ impl Pipeline {
                 .iter()
                 .map(|&block| block as usize)
                 .collect();
-            let (state, audio) = pipeline::denoise_av_dev_conditioned(
+            let (state, audio) = pipeline::denoise_av_dev_conditioned_with_scales(
                 &comps.avdit,
                 &state,
                 &anoise,
@@ -1271,6 +1269,7 @@ impl Pipeline {
                 &stage1_stg_blocks,
                 crate::params::LTX_2_5_PARAMS.video_guider,
                 crate::params::LTX_2_5_PARAMS.audio_guider,
+                &stage1_scales,
                 &req.cancel,
                 &mut stage1_forward,
                 &mut stage1_progress,
@@ -1307,7 +1306,7 @@ impl Pipeline {
                 )?;
             }
             let mut stage1_forward = || Ok(());
-            let (state, audio) = pipeline::denoise_av_conditioned(
+            let (state, audio) = pipeline::denoise_av_conditioned_with_scales(
                 &comps.avdit,
                 &state,
                 &anoise,
@@ -1316,6 +1315,7 @@ impl Pipeline {
                 af,
                 &audio_grid,
                 &STAGE1_SIGMAS,
+                &stage1_scales,
                 &req.cancel,
                 &mut stage1_forward,
                 &mut stage1_progress,
@@ -1356,6 +1356,7 @@ impl Pipeline {
                         &video_grid,
                         &audio_grid,
                         &stage1_rope,
+                        &stage1_scales,
                     )?;
                     Ok(AvLatents {
                         video: pipeline::unflatten_latent(
@@ -1398,16 +1399,13 @@ impl Pipeline {
             fps as f32,
             &self.device,
         )?;
-        let stage2_initial = orchestration.stage2_renoise(
-            STAGE2_SIGMAS[0],
-            || {
+        let (stage2_initial, stage2_scales) =
+            orchestration.stage2_renoise(STAGE2_SIGMAS[0], || {
                 Ok(AvLatents {
                     video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
                     audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
                 })
-            },
-            |pass| comps.avdit.set_adapter_pass(pass),
-        )?;
+            })?;
         let mut stage2_fold = pipeline::StageProgressFold::new(stage1_steps, 3, total_steps);
         let mut stage2_progress = |event: Progress| {
             if let Some(event) = stage2_fold.fold(event) {
@@ -1443,6 +1441,7 @@ impl Pipeline {
                             &stage2_grid,
                             &audio_grid,
                             &stage2_rope,
+                            &stage2_scales,
                         )?;
                         Ok(AvLatents {
                             video: pipeline::unflatten_latent(
@@ -1481,7 +1480,7 @@ impl Pipeline {
                     .stage2_forward(|| Ok(()))
                     .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
             };
-            let (state, audio) = pipeline::denoise_av_conditioned(
+            let (state, audio) = pipeline::denoise_av_conditioned_with_scales(
                 &comps.avdit,
                 &state,
                 &stage2_initial.audio,
@@ -1490,6 +1489,7 @@ impl Pipeline {
                 af,
                 &audio_grid,
                 &STAGE2_SIGMAS,
+                &stage2_scales,
                 &req.cancel,
                 &mut stage2_forward,
                 &mut stage2_progress,
@@ -3019,7 +3019,7 @@ mod tests {
             .expect("ordinary renderer exists");
         assert!(renderer.contains("resolve_request_num_frames("));
         assert!(renderer.contains("self.render_dfr("));
-        assert!(renderer.contains("denoise_av_dev_conditioned("));
+        assert!(renderer.contains("denoise_av_dev_conditioned_with_scales("));
         assert!(renderer.contains("negative_context"));
         assert!(source.contains("dfr::generate_dfr_av_latents("));
     }

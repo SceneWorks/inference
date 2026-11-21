@@ -21,8 +21,8 @@ use crate::conditioning::{
 use crate::config::{SPATIAL_SCALE, TEMPORAL_SCALE, TEMPORAL_SIGMAS};
 use crate::dev_sampler::{ExecutionPlan, TransformerVariant};
 use crate::pipeline::{
-    denoise_av_conditioned, denoise_av_dev_conditioned, denoise_tokens_rf_ancestral,
-    unflatten_latent,
+    denoise_av_conditioned_with_scales, denoise_av_dev_conditioned_with_scales,
+    denoise_tokens_rf_ancestral, unflatten_latent, BASE_DENOISE_SCALES, REFINEMENT_DENOISE_SCALES,
 };
 use crate::transformer::AvDiT;
 
@@ -707,10 +707,9 @@ pub fn generate_dfr_av_latents(
     )?;
     state.latent = noise_slot_tokens(&state, stage1_plan.sigmas[0], req.seed.wrapping_add(11))?;
 
-    parts.dit.set_adapter_pass(0);
     let mut on_forward = || Ok(());
     let (state, audio_s1) = match parts.transformer_variant {
-        TransformerVariant::Distilled => denoise_av_conditioned(
+        TransformerVariant::Distilled => denoise_av_conditioned_with_scales(
             parts.dit,
             &state,
             &anoise1,
@@ -719,6 +718,7 @@ pub fn generate_dfr_av_latents(
             parts.audio_frames,
             parts.audio_grid,
             &stage1_plan.sigmas,
+            &BASE_DENOISE_SCALES,
             cancel,
             &mut on_forward,
             on_progress,
@@ -739,7 +739,7 @@ pub fn generate_dfr_av_latents(
                 .iter()
                 .map(|&block| block as usize)
                 .collect();
-            denoise_av_dev_conditioned(
+            denoise_av_dev_conditioned_with_scales(
                 parts.dit,
                 &state,
                 &anoise1,
@@ -753,6 +753,7 @@ pub fn generate_dfr_av_latents(
                 &stg_blocks,
                 crate::params::LTX_2_5_PARAMS.video_guider,
                 crate::params::LTX_2_5_PARAMS.audio_guider,
+                &BASE_DENOISE_SCALES,
                 cancel,
                 &mut on_forward,
                 on_progress,
@@ -813,9 +814,8 @@ pub fn generate_dfr_av_latents(
     }
     let audio2 = renoise(&stage1_audio_latent, &anoise2, s2_entry)?;
 
-    parts.dit.set_adapter_pass(1);
     let mut on_forward = || Ok(());
-    let (state2, _audio2) = denoise_av_conditioned(
+    let (state2, _audio2) = denoise_av_conditioned_with_scales(
         parts.dit,
         &state2,
         &audio2,
@@ -824,6 +824,7 @@ pub fn generate_dfr_av_latents(
         parts.audio_frames,
         parts.audio_grid,
         &STAGE2_SIGMAS,
+        &REFINEMENT_DENOISE_SCALES,
         cancel,
         &mut on_forward,
         on_progress,
@@ -837,9 +838,6 @@ pub fn generate_dfr_av_latents(
     let mut playback_fps = req.fps;
     if rounds > 0 {
         let upsampler = parts.temporal_upsampler.expect("validated above");
-        // Temporal tiles run the base (stage-1) adapter pass, like the reference's non-detailing
-        // stage.
-        parts.dit.set_adapter_pass(0);
         // Replace-latent image anchors ride into every round, re-attached tile-locally; a
         // multi-latent-frame conditioning has no per-tile replace-latent projection — typed
         // refusal, never a silent drop (twin of the mlx arm).
@@ -959,15 +957,17 @@ mod tests {
             .expect("two-stage DFR source markers");
         assert!(stage_one.contains("ExecutionPlan::for_variant(parts.transformer_variant)"));
         assert!(stage_one.contains("TransformerVariant::Dev =>"));
-        assert!(stage_one.contains("denoise_av_dev_conditioned("));
+        assert!(stage_one.contains("denoise_av_dev_conditioned_with_scales("));
         assert!(stage_one.contains("let stg_blocks: Vec<usize>"));
         assert!(stage_one.contains("&stg_blocks"));
+        assert_eq!(stage_one.matches("&BASE_DENOISE_SCALES").count(), 2);
         let stage_two = source
             .split("// --- Stage 2:")
             .nth(1)
             .expect("DFR stage two marker");
-        assert!(stage_two.contains("denoise_av_conditioned("));
+        assert!(stage_two.contains("denoise_av_conditioned_with_scales("));
         assert!(stage_two.contains("&STAGE2_SIGMAS"));
+        assert!(stage_two.contains("&REFINEMENT_DENOISE_SCALES"));
     }
 
     #[derive(Clone, Debug)]

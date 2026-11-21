@@ -61,6 +61,7 @@ use std::sync::OnceLock;
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
+use candle_gen::gen_core::phase::ScaleContext;
 use candle_gen::quant as shared;
 #[cfg(feature = "cuda")]
 use candle_gen::quant::Int8Linear;
@@ -131,11 +132,21 @@ impl QLinear {
     /// `x·Wᵀ + b` plus any inference residuals. The frozen dense/packed base dispatch is owned by the
     /// shared [`LoraLinear`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_scales(x, &ScaleContext::new())
+    }
+
+    pub(crate) fn forward_with_scales(
+        &self,
+        x: &Tensor,
+        scales: &ScaleContext<'_>,
+    ) -> Result<Tensor> {
         let output = match &self.base {
             QLinearBase::Adapt(linear) if self.bounded_packed_training => {
-                __model_proof_output!(linear.forward_bounded_packed(x))
+                __model_proof_output!(linear.forward_bounded_packed_with_scales(x, scales))
             }
-            QLinearBase::Adapt(linear) => __model_proof_output!(linear.forward(x)),
+            QLinearBase::Adapt(linear) => {
+                __model_proof_output!(linear.forward_with_scales(x, scales))
+            }
             QLinearBase::ConvRot(linear) => __model_proof_output!(linear.forward(x)),
             QLinearBase::Nvfp4(linear) => __model_proof_output!(linear.forward(x)),
         }?;
@@ -203,13 +214,6 @@ impl QLinear {
             QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => candle_gen::candle_core::bail!(
                 "LTX advanced native quant projections refuse adapters; no dense merge/fallback is permitted"
             ),
-        }
-    }
-
-    /// Select the active distilled denoise pass for this projection's additive residuals.
-    pub(crate) fn set_additive_pass(&self, pass: usize) {
-        if let QLinearBase::Adapt(linear) = &self.base {
-            linear.set_additive_pass(pass);
         }
     }
 
@@ -854,6 +858,7 @@ impl TrainingProjectionPacks {
         self.input.is_some() || self.context.is_some()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -862,13 +867,25 @@ impl TrainingProjectionPacks {
         k: &LoraLinear,
         v: &LoraLinear,
         gate: Option<&LoraLinear>,
+        scales: Option<&ScaleContext<'_>>,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        use candle_gen::train::projection::FrozenProjectionPack;
+
+        let packed =
+            |pack: &FrozenProjectionPack, input: &Tensor, layers: &[&LoraLinear]| match scales {
+                Some(scales) => pack.forward_lora_with_scales(input, layers, scales),
+                None => pack.forward_lora(input, layers),
+            };
+        let individual = |layer: &LoraLinear, input: &Tensor| match scales {
+            Some(scales) => layer.forward_with_scales(input, scales),
+            None => layer.forward(input),
+        };
         if let (None, Some(pack)) = (context, &self.input) {
             let layers = match gate {
                 Some(gate) if pack.widths().len() == 4 => vec![q, k, v, gate],
                 _ => vec![q, k, v],
             };
-            let values = pack.forward_lora(x, &layers)?;
+            let values = packed(pack, x, &layers)?;
             return Ok((
                 values[0].clone(),
                 values[1].clone(),
@@ -878,18 +895,18 @@ impl TrainingProjectionPacks {
         }
         let (query, logits) = match (&self.input, gate) {
             (Some(pack), Some(gate)) => {
-                let values = pack.forward_lora(x, &[q, gate])?;
+                let values = packed(pack, x, &[q, gate])?;
                 (values[0].clone(), Some(values[1].clone()))
             }
-            _ => (q.forward(x)?, None),
+            _ => (individual(q, x)?, None),
         };
         let ctx = context.unwrap_or(x);
         let (key, value) = match &self.context {
             Some(pack) => {
-                let values = pack.forward_lora(ctx, &[k, v])?;
+                let values = packed(pack, ctx, &[k, v])?;
                 (values[0].clone(), values[1].clone())
             }
-            None => (k.forward(ctx)?, v.forward(ctx)?),
+            None => (individual(k, ctx)?, individual(v, ctx)?),
         };
         Ok((query, key, value, logits))
     }
