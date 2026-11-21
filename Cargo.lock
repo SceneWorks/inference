@@ -1271,6 +1271,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
+ "candle-layers",
  "candle-llm",
  "candle-nn",
  "candle-quant-kernels",
@@ -3286,6 +3287,7 @@ dependencies = [
  "half",
  "libc",
  "memmap2",
+ "mlx-layers",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-load-progress",

@@ -30,6 +30,7 @@ core-llm = { workspace = true }
 # The shared low-precision kernels (sc-24135): the one NVFP4 codec + cuBLASLt FP4 GEMM the media
 # lane also serves, behind `Projection::Nvfp4`. Device code is gated by this crate's `cuda` feature.
 candle-quant-kernels = { workspace = true }
+candle-layers = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-llm convention.
@@ -52,15 +53,15 @@ tempfile = { workspace = true }
 candle-llm = { path = ".", features = ["test-kv-arm"] }
 
 [features]
-model-inference-proof = ["candle-llm/model-inference-proof", "candle-quant-kernels/model-inference-proof", "candle-core/model-inference-proof", "core-llm/model-inference-proof"]
+model-inference-proof = ["candle-llm/model-inference-proof", "candle-layers/model-inference-proof", "candle-quant-kernels/model-inference-proof", "candle-core/model-inference-proof", "core-llm/model-inference-proof"]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
 default = []
 # Development-only frozen dense-model tensor visitation; never enabled by bundles.
 test-support = []
 # NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda", "candle-layers/cuda"]
 # Apple Metal GPU backend.
-metal = ["candle-core/metal", "candle-nn/metal", "candle-quant-kernels/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-quant-kernels/metal", "candle-layers/metal"]
 # FlashAttention-2 (Windows/CUDA). Implies `cuda` and pulls in `candle-flash-attn`'s fused kernels,
 # which the attention seam (`primitives::attention::sdpa`) dispatches to for the dense causal path,
 # falling back to the eager softmax SDPA for the cases the kernel can't serve (soft-cap, mismatched

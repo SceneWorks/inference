@@ -1,63 +1,12 @@
-//! Fused-versus-reference route tally (epic sc-24432 E3): the MLX primitives that have a fused
-//! Metal route — the Prism Hadamard rotation ([`super::prism`]) and the Gated DeltaNet recurrence
-//! ([`super::gated_delta`]) — count every run by the route that served it, on this thread, so a
-//! request reports `fused` / `reference` / `mixed` / `none` from what actually ran
-//! ([`DecodeReport::fused_primitives`](core_llm::DecodeReport::fused_primitives)) — the same
-//! shared [`FusedTally`] Candle reports through (E8).
+//! Fused-versus-reference route tally (epic sc-24432 E3).
 //!
-//! A route is decided when the op is built (MLX is lazy), on the thread building the request's
-//! graph, which is the thread the provider and the engine run on. The tally is monotone; a request
-//! reports [`FusedTally::since`] its start.
+//! Moved to [`mlx_layers::prism::fused`] (`SW-6957` / `SW-F335`) and re-exported here so all
+//! internal decoders and external consumers remain 100% compatible.
 
-use std::cell::Cell;
-
-pub use core_llm::FusedTally;
-
-/// Why a fused route did not run: the op was built for a CPU stream (a custom Metal kernel runs
-/// only on the GPU).
-pub const REASON_CPU_STREAM: &str = "cpu_stream";
-/// Why a fused route did not run: the input's shape or dtype is outside the kernel's (a Prism
-/// rotation block that is not a power of two up to the fused maximum, an unsupported dtype, an
-/// empty input).
-pub const REASON_SHAPE: &str = "shape";
-/// Why a fused route did not run: a test forced the reference route (the parity oracle).
-pub const REASON_FORCED_REFERENCE: &str = "forced_reference";
-/// Why a fused route did not run: its process switch ([`crate::switches`]) — the MLX row of the
-/// defaults table, the environment, or a runtime override — turned the kernel off (the label
-/// Candle uses for its own switch).
-pub const REASON_DISABLED: &str = "disabled";
-
-thread_local! {
-    static TALLY: Cell<FusedTally> = const {
-        Cell::new(FusedTally { fused: 0, reference: 0, reference_reason: None })
-    };
-}
-
-/// This thread's monotone tally.
-pub fn fused_tally() -> FusedTally {
-    TALLY.with(Cell::get)
-}
-
-/// Record one run served by a fused kernel.
-#[inline]
-pub(crate) fn note_fused() {
-    TALLY.with(|c| {
-        let mut t = c.get();
-        t.fused = t.fused.wrapping_add(1);
-        c.set(t);
-    });
-}
-
-/// Record one run served by the reference route, with why.
-#[inline]
-pub(crate) fn note_reference(reason: &'static str) {
-    TALLY.with(|c| {
-        let mut t = c.get();
-        t.reference = t.reference.wrapping_add(1);
-        t.reference_reason = Some(reason);
-        c.set(t);
-    });
-}
+pub use mlx_layers::prism::fused::{
+    fused_tally, note_fused, note_reference, FusedTally, REASON_CPU_STREAM, REASON_DISABLED,
+    REASON_FORCED_REFERENCE, REASON_SHAPE,
+};
 
 #[cfg(test)]
 mod tests {

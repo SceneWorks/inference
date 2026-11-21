@@ -7,6 +7,7 @@
 
 pub use ::gen_core;
 
+#[allow(unused_imports, unused_macros)]
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
@@ -25,6 +26,11 @@ pub use adapters::{
     LinearFacts, LokrFactors, ScaleContext,
 };
 pub use error::{Error, Result};
+pub use llm_projection::{
+    quantize_on_stored_grid, KvProjection, Projection, QuantGrid, QuantSpec, QuantizedEmbedding,
+    QuantizedLinear,
+};
+pub use prism::{PrismEmbedding, PrismLinear};
 pub use quant::TokenEmbedding;
 
 use mlx_rs::Array;
