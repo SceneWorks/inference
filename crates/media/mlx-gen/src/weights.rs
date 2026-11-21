@@ -29,7 +29,6 @@ pub struct Weights {
     accessed: RefCell<std::collections::HashSet<String>>,
     planned_convrot: HashMap<String, gen_core::convrot_int8::ConvRotInt8>,
     planned_fp8: HashMap<String, mlx_layers::fp8::Fp8Linear>,
-    convrot_rotations: RefCell<HashMap<usize, Array>>,
 }
 
 impl Weights {
@@ -42,7 +41,6 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
-            convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
 
@@ -81,6 +79,52 @@ impl Weights {
             source_reads: self.source_reads.clone(),
             ..Self::empty()
         }
+    }
+
+    /// Copy the selected array handles and retain their logical operators and load receipts.
+    /// Component splits may rename keys, including companions of encodings handled by other layers.
+    pub fn select_renamed(&self, mut select: impl FnMut(&str) -> Option<String>) -> Self {
+        let mut dest = self.component_view();
+        for key in self.keys() {
+            let Some(target) = select(key) else { continue };
+            let a = self.get(key).expect("key iterated from this map");
+            dest.tensors.insert(target.clone(), a.clone());
+            dest.alias_source_row(key, &target);
+            if let (Some(from), Some(to)) =
+                (key.strip_suffix(".weight"), target.strip_suffix(".weight"))
+            {
+                if let Some(p) = self.planned_fp8(from) {
+                    dest.planned_fp8.insert(to.to_owned(), p.clone());
+                }
+                if let Some(g) = self.planned_convrot(from) {
+                    dest.planned_convrot.insert(to.to_owned(), g);
+                }
+            }
+        }
+        dest
+    }
+
+    /// Retain the complete physical matrix once when a family splits contiguous output rows.
+    pub fn insert_split_projection(
+        &mut self,
+        key: &str,
+        p: mlx_layers::NativeProjection,
+        targets: &[String],
+    ) -> Result<()> {
+        let rows = p.shape()[0];
+        let parts = i32::try_from(targets.len()).unwrap_or(0);
+        if parts == 0 || rows % parts != 0 {
+            return Err(Error::Msg(format!(
+                "{key}: {rows} rows cannot be divided across {parts} projections"
+            )));
+        }
+        p.materialize()?;
+        let width = rows / parts;
+        for (index, target) in targets.iter().enumerate() {
+            let lo = index as i32 * width;
+            self.insert_source_projection(target, p.slice_rows(lo, lo + width)?)?;
+        }
+        Ok(())
     }
 
     pub fn alias_source_row(&mut self, from: &str, to: &str) {
@@ -160,10 +204,8 @@ impl Weights {
                 self.insert_fp8(base, p, true, input);
             }
             mlx_layers::NativeProjection::ConvRot(p) => {
-                self.convrot_rotations
-                    .borrow_mut()
-                    .entry(p.descriptor().rotation_group)
-                    .or_insert_with(|| p.rotation().clone());
+                self.source_reads
+                    .rotation(p.descriptor().rotation_group, || p.rotation().clone());
                 self.insert_convrot(base, p.descriptor(), p.codes().clone(), p.scales().clone());
             }
         }
@@ -180,7 +222,6 @@ impl Weights {
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
-            convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
 
@@ -224,7 +265,6 @@ path.as_ref(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
-            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -345,12 +385,9 @@ path.as_ref(),
         named
     }
 
-    /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
+    /// Load an FP8-capable safetensors file, preserving native projection codes.
     ///
-    /// MLX has no fp8 storage dtype: its safetensors reader maps `F8_E4M3` / `F8_E8M0` to **raw
-    /// uint8 bytes** (`mlx/io/safetensors.cpp`, sc-26685 audit), so the regular loader hands a W4A8
-    /// `weight_s_rel` back as `Dtype::Uint8`. This opt-in loader is the separate fp8→bf16 path for
-    /// the fp8 VAE weights that need the numeric conversion, and is never used by the H3 DiT.
+    /// Non-projection tensors take the dense representation selected by the logical source plan.
     pub fn from_file_with_fp8(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_file_with_fp8_filter(path, |_| true)
     }
@@ -489,7 +526,6 @@ path.as_ref(),
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
-            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -582,7 +618,6 @@ f,
             accessed: RefCell::new(std::collections::HashSet::new()),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
-            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1324,11 +1359,7 @@ impl mlx_layers::MlxWeightSource for Weights {
         self.get(key)
     }
     fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
-        self.convrot_rotations
-            .borrow_mut()
-            .entry(group)
-            .or_insert_with(build)
-            .clone()
+        self.source_reads.rotation(group, build)
     }
     fn planned_geometry(&self, base: &str) -> Option<gen_core::convrot_int8::ConvRotInt8> {
         self.planned_convrot(base)

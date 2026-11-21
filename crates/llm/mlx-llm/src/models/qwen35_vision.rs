@@ -248,7 +248,7 @@ pub type Qwen3VLVisionModel = Qwen35VisionModel;
 pub struct Qwen35VisionModel {
     frozen_hf_bf16: bool,
     patch_embed: PatchEmbed,
-    pos_embed: Array,
+    pos_embed: Projection,
     blocks: Vec<VisionBlock>,
     merger: PatchMerger,
     deepstack_mergers: Vec<PatchMerger>,
@@ -301,7 +301,7 @@ impl Qwen35VisionModel {
             weight: patch_weight.reshape(&[cfg.hidden_size, cfg.patch_in()])?,
             bias: opt(p("patch_embed.proj.bias")),
         };
-        let pos_embed = req(p("pos_embed.weight"))?;
+        let pos_embed = Projection::from_named(w, &p("pos_embed.weight"), None, None)?;
 
         let blocks = (0..cfg.depth)
             .map(|i| {
@@ -455,10 +455,10 @@ impl Qwen35VisionModel {
             self.cfg.spatial_merge_size,
         );
         let idx_arr = Array::from_slice(&idx, &[4 * n]);
-        let gathered =
-            self.pos_embed
-                .take_axis(&idx_arr, 0)?
-                .reshape(&[4, n, self.cfg.hidden_size])?;
+        let gathered = self
+            .pos_embed
+            .rows(&idx_arr)?
+            .reshape(&[4, n, self.cfg.hidden_size])?;
         let w_arr = Array::from_slice(&wts, &[4, n, 1]);
         if self.frozen_hf_bf16 {
             return Ok(sum_axis(multiply(&gathered, w_arr)?, 0, false)?.as_dtype(gathered.dtype())?);

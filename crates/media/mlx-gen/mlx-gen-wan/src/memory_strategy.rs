@@ -79,10 +79,16 @@ fn tensor_elements(component: &str, tensor: &SafetensorsTensorHeader) -> gen_cor
     Ok(elements)
 }
 
+struct EncodedRow {
+    tensor: gen_core::LogicalTensorPlan,
+    companions: Vec<gen_core::CompanionTensorPlan>,
+}
+
 struct Headers {
     component: &'static str,
     tensors: BTreeMap<String, SafetensorsTensorHeader>,
     accounted: HashSet<String>,
+    encoded: BTreeMap<String, EncodedRow>,
 }
 
 impl Headers {
@@ -104,6 +110,37 @@ impl Headers {
         for tensor in &headers {
             tensor_elements(component, tensor)?;
         }
+        let mut encoded = BTreeMap::new();
+        if headers.iter().any(|h| {
+            matches!(h.dtype, Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::I8)
+                || h.name.ends_with(".comfy_quant")
+        }) {
+            let declarations = gen_core::safetensors_path_quantization_metadata(path)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Some(plan) = gen_core::checkpoint_codec::plan_projection_sources(
+                &[path.to_owned()],
+                |_| true,
+                &declarations,
+                mlx_gen::logical_weights::baseline_codec_registry(),
+                &mlx_gen::logical_weights::MlxCodecResidency,
+            )? {
+                for tensor in plan.tensors {
+                    encoded.insert(
+                        tensor.physical_key.clone(),
+                        EncodedRow {
+                            tensor,
+                            companions: vec![],
+                        },
+                    );
+                }
+                for c in plan.companions {
+                    if let Some(row) = encoded.get_mut(&c.owner_physical_key) {
+                        row.companions.push(c);
+                    }
+                }
+            }
+        }
         Ok(Self {
             component,
             tensors: headers
@@ -111,6 +148,7 @@ impl Headers {
                 .map(|tensor| (tensor.name.clone(), tensor))
                 .collect(),
             accounted: HashSet::new(),
+            encoded,
         })
     }
 
@@ -132,10 +170,6 @@ impl Headers {
                 self.component, tensor.shape
             )));
         }
-        // FP8 posture: `is_float` excludes `F8_E4M3`. MLX Wan reads canonical BF16 storage (see
-        // `stored`/`materialized` below) through the plain `Weights::from_file` path, which rejects
-        // fp8 files outright — the fp8-decoding loader (`from_file_with_fp8`) is opt-in and this
-        // provider does not use it, so refusing fp8 here matches the loader it prices for.
         if require_float && !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: {} tensor {name} must be floating, got {:?}",
@@ -146,7 +180,47 @@ impl Headers {
         Ok(tensor)
     }
 
+    // The same source plan that binds the actual layer determines whether the resident set holds
+    // original codes/scales or the consumer's dense output. Each companion is accounted once.
+    fn encoded_bytes(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        dense_width: u64,
+    ) -> gen_core::Result<Option<u64>> {
+        let Some(row) = self.encoded.get(name) else {
+            return Ok(None);
+        };
+        if row.tensor.shape != shape {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: {} {name} declares {:?}, model requires {shape:?}",
+                self.component, row.tensor.shape
+            )));
+        }
+        self.accounted.insert(name.to_owned());
+        self.accounted
+            .extend(row.companions.iter().map(|c| c.physical_key.clone()));
+        if row.tensor.residency.mode == gen_core::ResidencyMode::Packed {
+            return checked_sum(
+                name,
+                std::iter::once(row.tensor.residency.resident_bytes)
+                    .chain(row.companions.iter().map(|c| c.resident_bytes)),
+            )
+            .map(Some);
+        }
+        shape
+            .iter()
+            .try_fold(dense_width, |bytes, &dim| bytes.checked_mul(dim as u64))
+            .map(Some)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: {name} dense residency overflow"))
+            })
+    }
+
     fn stored(&mut self, name: &str, shape: &[usize]) -> gen_core::Result<u64> {
+        if let Some(bytes) = self.encoded_bytes(name, shape, 2)? {
+            return Ok(bytes);
+        }
         let tensor = self.take(name, shape, true)?;
         if tensor.dtype != Dtype::BF16 {
             return Err(gen_core::Error::Unsupported(format!(
@@ -158,6 +232,9 @@ impl Headers {
     }
 
     fn materialized(&mut self, name: &str, shape: &[usize], width: u64) -> gen_core::Result<u64> {
+        if let Some(bytes) = self.encoded_bytes(name, shape, width)? {
+            return Ok(bytes);
+        }
         let tensor = self.take(name, shape, true)?;
         if tensor.dtype != Dtype::BF16 {
             return Err(gen_core::Error::Unsupported(format!(
@@ -176,6 +253,9 @@ impl Headers {
     }
 
     fn f32_projected(&mut self, name: &str, shape: &[usize], width: u64) -> gen_core::Result<u64> {
+        if let Some(bytes) = self.encoded_bytes(name, shape, width)? {
+            return Ok(bytes);
+        }
         let tensor = self.take(name, shape, true)?;
         if tensor.dtype != Dtype::F32 {
             return Err(gen_core::Error::Unsupported(format!(
@@ -216,6 +296,9 @@ impl Headers {
         bits: i32,
         group_size: usize,
     ) -> gen_core::Result<u64> {
+        if let Some(bytes) = self.encoded_bytes(&format!("{base}.weight"), &[out, input], 2)? {
+            return Ok(bytes);
+        }
         if !matches!(bits, 4 | 8)
             || group_size == 0
             || input < group_size
@@ -258,6 +341,9 @@ impl Headers {
         bits: i32,
         group_size: usize,
     ) -> gen_core::Result<u64> {
+        if let Some(bytes) = self.encoded_bytes(&format!("{base}.weight"), &[out, input], 2)? {
+            return Ok(bytes);
+        }
         if self.packed_present(base) {
             return self.packed_linear(base, out, input, bits, group_size);
         }
@@ -1439,6 +1525,7 @@ mod tests {
     impl HeaderTensor {
         fn new(name: impl Into<String>, dtype: &'static str, shape: &[usize]) -> Self {
             let width = match dtype {
+                "F8_E4M3" | "F8_E5M2" => 1_u64,
                 "BF16" => 2_u64,
                 "F32" | "U32" => 4,
                 other => panic!("unsupported fixture dtype {other}"),
@@ -1670,6 +1757,31 @@ mod tests {
             .unwrap();
         file.write_all(&header).unwrap();
         file.set_len(8 + header.len() as u64 + offset).unwrap();
+    }
+
+    #[test]
+    fn fp8_projection_pricing_follows_source_residency_and_consumes_the_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("model.safetensors");
+        write_headers(
+            &file,
+            &[
+                HeaderTensor::new("p.weight", "F8_E4M3", &[10, 64]),
+                HeaderTensor::new("p.scale_weight", "F32", &[1]),
+            ],
+        );
+        let mut headers = Headers::read(&file, "Wan transformer").unwrap();
+        let expected = if mlx_gen::metal_available() {
+            640 + 4
+        } else {
+            1280
+        };
+        assert_eq!(headers.dense_linear("p", 10, 64).unwrap(), expected);
+        headers.finish().unwrap();
+        assert!(Headers::read(&file, "Wan transformer")
+            .unwrap()
+            .dense_linear("p", 11, 64)
+            .is_err());
     }
 
     fn write_parts(

@@ -213,6 +213,7 @@ impl Observation {
 #[derive(Default, Clone, Debug)]
 pub struct SourceReads {
     rows: HashMap<String, Observation>,
+    rotations: Arc<Mutex<HashMap<usize, Array>>>,
     accounting: Option<Arc<gen_core::CheckpointReadAccounting>>,
 }
 impl SourceReads {
@@ -261,7 +262,16 @@ impl SourceReads {
         Self {
             rows,
             accounting: Some(accounting),
+            rotations: Default::default(),
         }
+    }
+    pub fn rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.rotations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(group)
+            .or_insert_with(build)
+            .clone()
     }
     pub fn get(&self, key: &str) -> Option<Observation> {
         self.rows.get(key).cloned()
@@ -371,6 +381,12 @@ pub fn bind_source_layout(
             .or_else(|| expert_key(key).then_some(key.as_str()));
         let (format, scale, sx) = match &t.codec {
             TensorCodecSpec::ConvRotInt8 { geometry, .. } => {
+                if t.residency.mode != ResidencyMode::Packed {
+                    return Err(format!(
+                        "{key}: ConvRot requires the Metal signed integer projection operator"
+                    )
+                    .into());
+                }
                 let base = base.ok_or("missing ConvRot projection base")?;
                 tensors.insert(
                     format!("{base}.comfy_quant"),
@@ -406,6 +422,12 @@ pub fn bind_source_layout(
         };
         let sw = scale.map(get).transpose()?;
         let sx = sx.map(get).transpose()?;
+        // Keep one normalized spelling for consumed producer aliases. A downstream component
+        // remap must not apply a legacy scale to a value already bound or decoded here.
+        let physical_base = key.strip_suffix(".weight").unwrap_or(key);
+        for suffix in [".scale_weight", ".scale_input"] {
+            tensors.remove(&format!("{physical_base}{suffix}"));
+        }
         if t.residency.mode == ResidencyMode::Dense || base.is_none() {
             let value = if array.ndim() == 2 {
                 crate::fp8::Fp8Linear::new(format, array, sw, sx, &t.shape, None)?.dense_weight()?
@@ -417,10 +439,8 @@ pub fn bind_source_layout(
                 value.as_dtype(Dtype::Bfloat16)?
             };
             tensors.insert(key.clone(), value);
-            if let Some(base) = base {
-                for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
-                    tensors.remove(&format!("{base}{suffix}"));
-                }
+            for suffix in [".comfy_quant", ".weight_scale", ".input_scale"] {
+                tensors.remove(&format!("{}{suffix}", base.unwrap_or(physical_base)));
             }
         } else if let Some(base) = base {
             let shape = (format == ComfyQuantFormat::Mxfp8).then_some(t.shape.as_slice());
