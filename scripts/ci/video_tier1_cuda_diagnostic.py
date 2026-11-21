@@ -101,9 +101,18 @@ TIMING_CONTINUATION = "sw-6954-cuda-conditioning-timing-v1"
 MEMORY_CONTINUATION = "sw-6954-cuda-process-memory-v1"
 GPU0_TIMING = "sw-6954-gpu0-conditioning-timing-v1"
 GPU0_MEMORY = "sw-6954-gpu0-process-memory-v1"
-GPU0_CONTINUATIONS = (GPU0_TIMING, GPU0_MEMORY)
+MOCHI_P1 = "sw-6954-gpu0-mochi-p1-completion-v1"
+MOCHI_TEMPLATE = "scripts/ci/ms_pair/mochi_completion.rs.in"
+MOCHI_GPU0_HISTORY = {
+    "run": "44933388562", "attempt": 1, "job": "136934832842", "artifact": "14719258247",
+    "controller": "7f6c4cca3fc053030bd71f0bfce6886adb762eb6",
+    "receipt_sha256": "823f91359bb1c22447c8dbba5c624e21ef6eed059b0c40ce2909910ffeabe011",
+    "archive_sha256": "ff6853ec2c7d57b96ff835ac8bb864a254eb5fce6ad8c56909e0cc5ae7f1b745",
+    "retained_passing_slots": {"cuda-mochi-masked-euler": [2], "cuda-svd-euler-cfg": [2]},
+}
+GPU0_CONTINUATIONS = (GPU0_TIMING, GPU0_MEMORY, MOCHI_P1)
 TIMING_CONTINUATIONS = (TIMING_CONTINUATION, GPU0_TIMING)
-MEMORY_CONTINUATIONS = (MEMORY_CONTINUATION, GPU0_MEMORY)
+MEMORY_CONTINUATIONS = (MEMORY_CONTINUATION, GPU0_MEMORY, MOCHI_P1)
 CONTINUATIONS = (*TIMING_CONTINUATIONS, *MEMORY_CONTINUATIONS)
 # Recorded GPU0 inventory from the two-card Windows real-weights host.
 GPU0_HARDWARE = {
@@ -227,6 +236,11 @@ def continuation(name, selection, extension):
     else:
         protocol.update(original_slots=history["unresolved_memory"], warmups=1, samples_per_child=1,
                         retry_reason=RETRY_REASON, retry="one immediate, same owned PID, creation time, LUID and poll")
+    if name == MOCHI_P1:
+        cases = ["cuda-mochi-masked-euler"]
+        protocol.update(original_slots={cases[0]: [1]}, previous_gpu0=MOCHI_GPU0_HISTORY,
+                        native_ack_timeout_seconds=5, memory_window="first owned PDH sample through native release; "
+                        "full owned Job lifetime remains recorded; no increase after acknowledged completion")
     return cases, {**extension, "name": name, "protocol": protocol, "prior_targeted": history}
 
 
@@ -243,6 +257,18 @@ class DedicatedRetryObserver:
         gauge = self.cuda.dedicated
         return {"reason": RETRY_REASON, "pid": gauge.record["pid"], "created_filetime": gauge.record["created_filetime"],
                 "adapter": gauge.record["adapter"], "diagnostics": gauge.diagnostics}
+
+
+class MochiCompletionObserver(DedicatedRetryObserver):
+    def __init__(self, cuda, policy):
+        from scripts.ci.mochi_pair_completion import CompletionSamples
+        self.cuda = cuda
+        cuda.dedicated = CompletionSamples(cuda.dedicated, policy, cuda.proof_path.parent)
+
+    def fit_observation(self):
+        gauge = self.cuda.dedicated
+        gauge.check_release()
+        return dict(super().fit_observation(), ready=gauge.ready, ack=gauge.ack, release=gauge.release)
 
 
 def verify_retry(guard, policy, adapter):

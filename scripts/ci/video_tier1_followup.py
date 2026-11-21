@@ -72,6 +72,10 @@ def groups(case, name=NAME):
         if case in targeted.TIMING_CALLS:
             yield "timing", range(1, targeted.CONTINUATION_PAIRS + 1), targeted.TIMING_CALLS[case]
         return
+    if name == targeted.MOCHI_P1:
+        if case == "cuda-mochi-masked-euler":
+            yield "memory", (1,), 1
+        return
     if name in targeted.MEMORY_CONTINUATIONS:
         if case in targeted.CONTINUATION_MEMORY:
             yield "memory", targeted.CONTINUATION_MEMORY[case], 1
@@ -169,7 +173,7 @@ def compare(case, retained, observations, settings, name=NAME, *, adapter=None):
             slots.append({"source": source, "pair": i, "base_bytes": dedicated["base"]["sampled_peak_bytes"],
                           "head_bytes": dedicated["head"]["sampled_peak_bytes"], "ratio": dedicated["ratio"],
                           "verdict": verdict, "native": native})
-        if len(slots) != (len(targeted.CONTINUATION_MEMORY[case]) if name in targeted.MEMORY_CONTINUATIONS else 5):
+        if len(slots) != (len(schedule["memory"][0]) if name in targeted.MEMORY_CONTINUATIONS else 5):
             raise ValueError("incomplete original process-memory slot set")
         result["dedicated_process_memory"] = {"pairs": slots, "verdict": evidence.peak_verdict(slots), "ceiling": 1.02}
         verdicts.append(result["dedicated_process_memory"]["verdict"])

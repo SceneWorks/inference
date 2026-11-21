@@ -114,6 +114,9 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
                 if value["followup"] in targeted.GPU0_CONTINUATIONS and shim != tracked(targeted.GPU0_PROTOCOL_SOURCE, path):
                     raise ValueError("GPU0 continuation changed the fixed GPU1 measurement protocol source")
                 extension[field] = hashlib.sha256(shim).hexdigest()
+                if value["followup"] == targeted.MOCHI_P1:
+                    extension["completion_source_sha256"] = {path: hashlib.sha256(tracked(head, path)).hexdigest() for path in
+                        (targeted.MOCHI_TEMPLATE, "scripts/ci/mochi_pair_completion.py")}
         subprocess.run(["git", "merge-base", "--is-ancestor", base, engine_head], cwd=ROOT, check=True)
         subprocess.run(["git", "merge-base", "--is-ancestor", engine_head, head], cwd=ROOT, check=True)
         if (paired.git(ROOT, "rev-parse", engine_head + "^{tree}") != extension["historical_head_tree"]
@@ -256,6 +259,17 @@ def compiled_overlay(head, backend, arm, model, engine_head, extension):
                 raise ValueError("expected one call to the unmodified historical measurement helper")
             wrapper = tracked(head, targeted.CONDITIONING_TEMPLATE)
             blob = blob.replace(b"pair.measure(", b"pair.measure_conditioned(") + b"\n" + wrapper
+        elif extension["name"] == targeted.MOCHI_P1:
+            tail = b"    })\n}\n"
+            if model != "mochi" or backend != "candle-cuda" or not blob.endswith(tail):
+                raise ValueError("completion fence requires the unchanged native Mochi fixture")
+            blob = blob[:-len(tail)] + b"""    })?;
+    device.synchronize()?;
+    mochi_completion(&pair)?;
+    std::hint::black_box((&model, &inputs, &device));
+    Ok(())
+}
+""" + tracked(head, targeted.MOCHI_TEMPLATE)
     return module, blob, edits
 
 
@@ -414,7 +428,7 @@ def cuda_adapter(policy):
     return wddm_process_memory.validate_adapter(json.loads(raw), uuid)
 
 
-def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool, adapter=None):
+def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool, adapter=None, *, role=None):
     spec = evidence.case_spec(case)
     facts = evidence.capture(observed["result"], bytes.fromhex(observed["initial_le_f32_hex"]),
                              bytes.fromhex(observed["terminal_le_f32_hex"]),
@@ -457,6 +471,10 @@ def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool
             raise ValueError("invalid CUDA pool high-water evidence")
         peaks.update(cuda_pool_used_high_bytes=used_high, cuda_pool_reserved_high_bytes=reserved_high)
     if backend == "candle-cuda":
+        if settings.get("campaign") == targeted.MOCHI_P1:
+            from scripts.ci.mochi_pair_completion import live_record
+            live = live_record(guard, observed["mochi_release"], adapter, role)
+            guard = dict(guard, cuda_attribution=dict(guard["cuda_attribution"], wddm_dedicated=live))
         process = evidence.cuda_process(guard, reserved_high, adapter)
         if (process.get("dedicated", {}).get("sampled_peak_bytes") or 0) > policy.child_gpu_cap_bytes:
             raise ValueError("observed dedicated process usage exceeded the child GPU cap")
@@ -549,9 +567,13 @@ def execute(args, contract):
                     out = work / name
                     started = time.monotonic_ns()
                     latest = last_start - (targeted.CLOCK_TIMEOUT if diagnostics is not None else 0)
-                    memory_retry = contract["request"].get("followup") in targeted.MEMORY_CONTINUATIONS
+                    name_of_campaign = contract["request"].get("followup")
+                    observer = targeted.DedicatedRetryObserver if name_of_campaign in targeted.MEMORY_CONTINUATIONS else None
+                    completion = name_of_campaign == targeted.MOCHI_P1
+                    if completion:
+                        observer = targeted.MochiCompletionObserver
                     paired.invoke(binary, root, out, env, policy, lease_env, last_child_start=latest,
-                                  observer=targeted.DedicatedRetryObserver if memory_retry else None,
+                                  observer=observer, retain_owned_completion=completion,
                                   arguments=(cohorts.FQN[model], "--exact", "--ignored", "--nocapture", "--test-threads=1"),
                                   capture_cuda_basis=True, dedicated_adapter=adapter)
                     ended = time.monotonic_ns()
@@ -561,6 +583,8 @@ def execute(args, contract):
                         order["clock_diagnostics"] = diagnostics
                     receipt["execution_order"].append(order)
                     observed = read_observed(out, case)
+                    if completion:
+                        observed["mochi_release"] = json.loads(evidence.owned_file(out, "mochi-release.json", 4096).read_bytes())
                     if contract["request"].get("followup") in targeted.TIMING_CONTINUATIONS:
                         observed["conditioning"] = json.loads(evidence.owned_file(out, "conditioning.json", 16 * 1024).read_bytes())
                     info = {"observed": observed}
@@ -569,7 +593,7 @@ def execute(args, contract):
                             if backend == "candle-cuda" else None)
                     stdout = evidence.owned_file(out, "stdout.log", policy.stdout_cap_bytes).read_text(encoding="utf-8")
                     info["result"] = evaluate(observed, case, backend, policy, dict(SETTINGS, samples_per_child=repeats, campaign=contract["request"].get("followup")),
-                                              stdout, guard, pool, adapter)
+                                              stdout, guard, pool, adapter, role=order)
                     receipt["observations"][name] = info
                     results[name] = info["result"]
                 receipt["comparisons"][case] = compare_case(case, contract.get("followup"), results, adapter=adapter)
@@ -871,6 +895,7 @@ def verify(args, contract):
         raise ValueError("accepted comparison lacks logs, fixture identity, measurements or release")
     with TemporaryDirectory() as directory:
         policy = read_policy(Path(directory), "policy.json", contract["request"]["policy"])
+        windows = {row["phase"]: row for row in receipt["execution_order"]}
         for case in contract["cases"]:
             results = {}
             expected_schedule = list(schedule(case, contract.get("followup")))
@@ -888,7 +913,7 @@ def verify(args, contract):
                 observed = evaluate(row["observed"], case, backend, policy, dict(SETTINGS, samples_per_child=repeats, campaign=contract["request"].get("followup")), read("stdout.log"),
                                     json.loads(read("supervisor.json")),
                                     json.loads(read("cuda-pool.json")) if backend == "candle-cuda" else None,
-                                    receipt.get("dedicated_adapter"))
+                                    receipt.get("dedicated_adapter"), role=windows.get(name))
                 if observed != row["result"]:
                     raise ValueError("recorded measurements differ from raw observations")
                 results[name] = observed
