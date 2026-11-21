@@ -517,22 +517,16 @@ fn text_encoder_bytes(dir: &Path) -> CoreResult<u64> {
     let untied_head = !mlx_llm::ModelConfig::from_dir(dir)
         .map_err(|e| CoreError::Msg(format!("{MODEL_ID}: reading the text encoder config: {e}")))?
         .tie_word_embeddings;
-    let mut total = 0_u64;
-    for shard in crate::text_encoder::weight_shards(dir)? {
-        let bytes = projected_safetensors_bytes(&shard, |header| {
-            if header.name.starts_with(LANGUAGE_TOWER_PREFIX)
-                || (untied_head && header.name == LANGUAGE_HEAD_KEY)
-            {
-                ResidentProjection::Bfloat16
-            } else {
-                ResidentProjection::Omit
-            }
-        })?;
-        total = total
-            .checked_add(bytes)
-            .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: text encoder byte sum overflow")))?;
-    }
-    Ok(total)
+    let shards = crate::text_encoder::weight_shards(dir)?;
+    mlx_gen::asset_facts::projected_shards_bytes(&shards, |header| {
+        if header.name.starts_with(LANGUAGE_TOWER_PREFIX)
+            || (untied_head && header.name == LANGUAGE_HEAD_KEY)
+        {
+            ResidentProjection::Bfloat16
+        } else {
+            ResidentProjection::Omit
+        }
+    })
 }
 
 /// The provider safety check: the shared handshake (calibration identity, loaded tier,

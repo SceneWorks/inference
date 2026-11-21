@@ -771,7 +771,7 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    let components = crate::registry::component_footprint(spec)?;
+    let (components, encoded) = crate::registry::footprint_with_source_qualification(spec)?;
     contract_with_asset_facts(
         provider_id,
         spec,
@@ -780,7 +780,11 @@ pub fn memory_strategy_contract(
         components.dit,
         components.vae,
         resident_overlay_components(spec)?,
-        production_calibration_identity(provider_id, spec),
+        if encoded {
+            None
+        } else {
+            production_calibration_identity(provider_id, spec)
+        },
     )
 }
 
@@ -1553,6 +1557,7 @@ mod tests {
         /// Write one `dtype` tensor of `shape` at `rel`, creating parents.
         fn write(&self, rel: &str, name: &str, dtype: safetensors::Dtype, shape: &[usize]) {
             let width = match dtype {
+                safetensors::Dtype::F8_E4M3 => 1,
                 safetensors::Dtype::F16 | safetensors::Dtype::BF16 => 2,
                 safetensors::Dtype::F32 => 4,
                 other => panic!("unhandled test dtype {other:?}"),
@@ -1623,6 +1628,21 @@ mod tests {
 
     fn tiered_snapshot(tmp: &tempfile::TempDir, tier: &str) -> Snapshot {
         Snapshot::new(tmp, tier).with_base().with_tier(tier)
+    }
+
+    #[test]
+    fn encoded_projection_qualifies_the_source_out_of_dense_calibration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tiered_snapshot(&tmp, "bf16");
+        snapshot.write(
+            "unet/diffusion_pytorch_model.safetensors",
+            "attention.to_q.weight",
+            safetensors::Dtype::F8_E4M3,
+            &[4, 8],
+        );
+        let spec = production_spec(&snapshot.0, None);
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(contract.calibration.is_none());
     }
 
     /// The worker's own MLX still-image load shape, parameterized by the requested quant.

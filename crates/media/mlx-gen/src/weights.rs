@@ -233,20 +233,7 @@ impl Weights {
         path: impl AsRef<Path>,
         expert_key: impl Fn(&str) -> bool,
     ) -> Result<Self> {
-        #[cfg(feature = "model-inference-proof")]
-        let __input_path = path.as_ref();
-        let (mut tensors, metadata) = gen_core::__model_input_reader!(
-load_safetensors_on_cpu(path.as_ref()),
-"crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543",
-TensorInput,
-path.as_ref(),
-|__model_input_path| load_safetensors_on_cpu(__model_input_path)
-)?;
-        #[cfg(feature = "model-inference-proof")]
-        gen_core::model_input_proof::record_model_weight_paths(
-            "mlx-gen::Weights::from_file",
-            &[__input_path],
-        );
+        let (mut tensors, metadata) = Self::read_file(path.as_ref())?;
         let declarations: Vec<_> = metadata
             .get("_quantization_metadata")
             .cloned()
@@ -266,6 +253,68 @@ path.as_ref(),
             planned_convrot: HashMap::new(),
             planned_fp8: HashMap::new(),
         })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn read_file(path: &Path) -> Result<(HashMap<String, Array>, HashMap<String, String>)> {
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path;
+        let (tensors, metadata) = gen_core::__model_input_reader!(
+load_safetensors_on_cpu(path),
+"crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543",
+TensorInput,
+path,
+|__model_input_path| load_safetensors_on_cpu(__model_input_path)
+)?;
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_model_weight_paths(
+            "mlx-gen::Weights::from_file",
+            &[__input_path],
+        );
+        Ok((tensors, metadata))
+    }
+
+    /// A component may use a fixed subset of a shard set. Each shard passes through the same
+    /// physical file reader and source receipt, then the selected rows bind as a single checkpoint
+    /// so an authoritative declaration or scale can live on a different shard.
+    pub fn from_selected_files(
+        paths: &[PathBuf],
+        include: impl Fn(&Path, &str) -> bool,
+    ) -> Result<Self> {
+        mlx_llm::load_progress::register_files(paths);
+        let mut tensors = HashMap::new();
+        let mut metadata = HashMap::new();
+        let mut tables = Vec::new();
+        let mut excluded = std::collections::HashSet::new();
+        for path in paths {
+            let (shard, meta) = Self::read_file(path)?;
+            tables.extend(meta.get("_quantization_metadata").cloned());
+            metadata.extend(meta);
+            for (key, a) in shard {
+                if !include(path, &key) {
+                    excluded.insert(key.clone());
+                }
+                if tensors.insert(key.clone(), a).is_some() {
+                    return Err(Error::Msg(format!(
+                        "duplicate key {key} in {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let selected_weights: std::collections::HashSet<_> = tensors
+            .keys()
+            .filter(|key| key.ends_with(".weight") && !excluded.contains(*key))
+            .filter_map(|key| key.strip_suffix(".weight").map(str::to_owned))
+            .collect();
+        tensors.retain(|key, _| {
+            !excluded.contains(key)
+                || gen_core::checkpoint_codec::projection_companion_base(key)
+                    .is_some_and(|base| selected_weights.contains(base))
+        });
+        let mut weights = Self::from_source_map(tensors, paths, &tables)?;
+        weights.metadata = metadata;
+        Ok(weights)
     }
 
     /// Evaluate every retained array before a mutation-sensitive source read is considered complete.

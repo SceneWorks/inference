@@ -23,6 +23,19 @@ pub fn metal_available() -> bool {
 
 pub struct MlxCodecResidency;
 impl CodecResidencyPolicy for MlxCodecResidency {
+    fn residency_for_key(
+        &self,
+        key: &str,
+        codec: &CheckpointCodecRegistration,
+        spec: &TensorCodecSpec,
+        shape: &[usize],
+    ) -> ResidencyMode {
+        if key.ends_with(".weight") || key.ends_with("_weight") {
+            self.residency(codec, spec, shape)
+        } else {
+            ResidencyMode::Dense
+        }
+    }
     fn residency(
         &self,
         _: &CheckpointCodecRegistration,
@@ -348,7 +361,11 @@ pub fn prepare_sources_with_layout(
             {
                 ResidencyMode::Packed
             } else {
-                self.residency(c, spec, shape)
+                if (self.0)(key) {
+                    self.residency(c, spec, shape)
+                } else {
+                    MlxCodecResidency.residency_for_key(key, c, spec, shape)
+                }
             }
         }
     }

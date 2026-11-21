@@ -772,39 +772,33 @@ pub(crate) fn text_encoder_bytes(dir: &Path, quant: Option<gen_core::Quant>) -> 
         crate::text_encoder::text_encoder_quant_spec(&config, quant)?
     };
     let embedding = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
-    let mut total = 0_u64;
-    for shard in crate::text_encoder::weight_shards(dir, untied_head)? {
-        let bytes = projected_safetensors_bytes(&shard, |header| {
-            let packed_part = header.name.ends_with(".scales")
-                || header.name.ends_with(".biases")
-                || header.dtype == gen_core::weightsmeta::Dtype::U32;
-            if stored && packed_part && header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
-                ResidentProjection::Stored
-            } else if header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
-                match packed {
-                    Some(spec)
-                        if header.shape.len() == 2
-                            && header.name.ends_with(".weight")
-                            && header.name != embedding =>
-                    {
-                        ResidentProjection::GroupQuantized {
-                            bits: spec.bits,
-                            group_size: spec.group_size as usize,
-                        }
+    let shards = crate::text_encoder::weight_shards(dir, untied_head)?;
+    mlx_gen::asset_facts::projected_shards_bytes(&shards, |header| {
+        let packed_part = header.name.ends_with(".scales")
+            || header.name.ends_with(".biases")
+            || header.dtype == gen_core::weightsmeta::Dtype::U32;
+        if stored && packed_part && header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
+            ResidentProjection::Stored
+        } else if header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
+            match packed {
+                Some(spec)
+                    if header.shape.len() == 2
+                        && header.name.ends_with(".weight")
+                        && header.name != embedding =>
+                {
+                    ResidentProjection::GroupQuantized {
+                        bits: spec.bits,
+                        group_size: spec.group_size as usize,
                     }
-                    _ => ResidentProjection::Bfloat16,
                 }
-            } else if untied_head && header.name == LANGUAGE_HEAD_KEY {
-                ResidentProjection::Bfloat16
-            } else {
-                ResidentProjection::Omit
+                _ => ResidentProjection::Bfloat16,
             }
-        })?;
-        total = total
-            .checked_add(bytes)
-            .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: text encoder byte sum overflow")))?;
-    }
-    Ok(total)
+        } else if untied_head && header.name == LANGUAGE_HEAD_KEY {
+            ResidentProjection::Bfloat16
+        } else {
+            ResidentProjection::Omit
+        }
+    })
 }
 
 /// Stable provider-local ids for the adapter overlays [`adapter_overlay_components`] declares.

@@ -133,8 +133,114 @@ pub fn projected_safetensors_tensors(
     path: impl AsRef<Path>,
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
 ) -> Result<Vec<ResidentTensorBytes>> {
-    let tensors = safetensors_path_tensor_headers(path)?;
-    projected_tensor_headers(&tensors, projection)
+    let path = path.as_ref();
+    let headers = safetensors_path_tensor_headers(path)?;
+    let files = source_files(path)?;
+    Ok(projected_source_rows(&files, &headers, projection)?.0)
+}
+
+fn projected_source_rows(
+    files: &[std::path::PathBuf],
+    headers: &[SafetensorsTensorHeader],
+    projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
+) -> Result<(Vec<ResidentTensorBytes>, bool)> {
+    let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        files,
+        headers,
+        |h| match projection(h) {
+            ResidentProjection::Float32 => 4,
+            ResidentProjection::Omit => 0,
+            _ => 2,
+        },
+        &crate::logical_weights::MlxCodecResidency,
+        |_, shape| shape.len() == 2,
+    )?;
+    let mut rows = projected_tensor_headers(headers, |h| {
+        if encoded.contains_key(&h.name) {
+            ResidentProjection::Stored
+        } else {
+            projection(h)
+        }
+    })?;
+    for row in &mut rows {
+        if let Some(&bytes) = encoded.get(&row.name) {
+            row.resident_bytes = bytes;
+        }
+    }
+    Ok((rows, !encoded.is_empty()))
+}
+
+/// Return the physical source qualification with the retained bytes used for admission, so
+/// historical dense/affine calibration identities only attach to those storage contracts.
+pub fn projected_source_bytes(
+    path: &Path,
+    projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
+) -> Result<(u64, bool)> {
+    let headers = safetensors_path_tensor_headers(path)?;
+    let (rows, encoded) = projected_source_rows(&source_files(path)?, &headers, projection)?;
+    Ok((total_projected_bytes(rows)?, encoded))
+}
+
+/// Use exactly the shards selected by the model, so a scale or declaration may live separately
+/// from the matrix it describes and unselected variants in the same directory remain untouched.
+pub fn projected_shards_bytes(
+    files: &[std::path::PathBuf],
+    projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
+) -> Result<u64> {
+    let mut headers = Vec::new();
+    for file in files {
+        headers.extend(safetensors_path_tensor_headers(file)?);
+    }
+    total_projected_bytes(projected_source_rows(files, &headers, projection)?.0)
+}
+
+fn source_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    if path.is_file() {
+        return Ok(vec![path.to_owned()]);
+    }
+    let mut files = Vec::new();
+    gen_core::weightsmeta::collect_safetensors_files(path, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+/// Forecast the exact retained source operands for a component at its consumer's dense width.
+/// Unknown raw integer/control rows keep the calling architecture's own admission rules.
+pub fn source_bytes(
+    path: &Path,
+    headers: &[SafetensorsTensorHeader],
+    dense_width: impl Fn(&SafetensorsTensorHeader) -> u64,
+) -> Result<std::collections::BTreeMap<String, u64>> {
+    let files = source_files(path)?;
+    gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        &files,
+        headers,
+        dense_width,
+        &crate::logical_weights::MlxCodecResidency,
+        |_, shape| shape.len() == 2,
+    )
+}
+
+/// Strict float-component admission admits typed source rows and their validated sidecars and
+/// rejects unrelated control planes. Both the prepared load and its pin recheck use this sum.
+pub fn projected_float_component_bytes(path: &Path, width: u64) -> Result<u64> {
+    let headers = safetensors_path_tensor_headers(path)?;
+    let encoded = source_bytes(path, &headers, |_| width)?;
+    headers.iter().try_fold(0u64, |sum, h| {
+        let bytes = if let Some(bytes) = encoded.get(&h.name) {
+            *bytes
+        } else if h.is_float() {
+            h.materialized_bytes(width)?
+        } else {
+            return Err(Error::Unsupported(format!(
+                "{}: {} is neither a floating tensor nor a verified encoded operand",
+                path.display(),
+                h.name
+            )));
+        };
+        sum.checked_add(bytes)
+            .ok_or_else(|| Error::Msg(format!("{}: resident-byte sum overflow", path.display())))
+    })
 }
 
 /// Project an already validated tensor-header inventory into the bytes MLX will retain.
@@ -257,32 +363,25 @@ pub fn projected_safetensors_bytes(
     path: impl AsRef<Path>,
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
 ) -> Result<u64> {
-    projected_safetensors_tensors(path, projection)?
-        .into_iter()
-        .try_fold(0_u64, |total, tensor| {
-            total.checked_add(tensor.resident_bytes).ok_or_else(|| {
-                Error::Msg(format!(
-                    "resident byte sum overflow at tensor {:?}",
-                    tensor.name
-                ))
-            })
+    total_projected_bytes(projected_safetensors_tensors(path, projection)?)
+}
+
+fn total_projected_bytes(rows: Vec<ResidentTensorBytes>) -> Result<u64> {
+    rows.into_iter().try_fold(0_u64, |total, tensor| {
+        total.checked_add(tensor.resident_bytes).ok_or_else(|| {
+            Error::Msg(format!(
+                "resident byte sum overflow at tensor {:?}",
+                tensor.name
+            ))
         })
+    })
 }
 
 pub fn projected_tensor_headers_bytes(
     tensors: &[SafetensorsTensorHeader],
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
 ) -> Result<u64> {
-    projected_tensor_headers(tensors, projection)?
-        .into_iter()
-        .try_fold(0_u64, |total, tensor| {
-            total.checked_add(tensor.resident_bytes).ok_or_else(|| {
-                Error::Msg(format!(
-                    "resident byte sum overflow at tensor {:?}",
-                    tensor.name
-                ))
-            })
-        })
+    total_projected_bytes(projected_tensor_headers(tensors, projection)?)
 }
 
 #[cfg(test)]

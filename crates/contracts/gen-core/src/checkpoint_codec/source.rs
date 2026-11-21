@@ -58,8 +58,8 @@ pub fn plan_projection_sources(
 }
 
 /// Retained bytes of the encoded portion of a component, keyed by physical name. A consumed
-/// descriptor or scale is present with zero bytes. Ordinary floats and unrelated integer/control
-/// buffers remain the caller's responsibility. Read only bounded declarations from the same
+/// descriptor or scale is present with zero bytes. A zero dense width omits the entire owner group.
+/// Ordinary floats and unrelated integer/control buffers remain the caller's responsibility. Read only bounded declarations from the same
 /// files whose complete physical header inventory was supplied by the caller.
 pub fn projected_checkpoint_bytes(
     paths: &[PathBuf],
@@ -129,30 +129,31 @@ pub fn projected_checkpoint_bytes(
     let physical: BTreeMap<_, _> = headers.iter().map(|h| (h.name.as_str(), h)).collect();
     let mut bytes = BTreeMap::new();
     for row in &plan.tensors {
+        let width = dense_width(physical[row.physical_key.as_str()]);
         let resident = match row.residency.mode {
+            _ if width == 0 => 0,
             ResidencyMode::Packed => row.residency.resident_bytes,
-            ResidencyMode::Dense => {
-                let h = physical[row.physical_key.as_str()];
-                row.shape
-                    .iter()
-                    .try_fold(dense_width(h), |count, &extent| {
-                        count.checked_mul(extent as u64)
-                    })
-                    .ok_or_else(|| {
-                        crate::Error::Msg(format!(
-                            "{}: dense checkpoint resident byte count overflow",
-                            row.physical_key
-                        ))
-                    })?
-            }
+            ResidencyMode::Dense => row
+                .shape
+                .iter()
+                .try_fold(width, |count, &extent| count.checked_mul(extent as u64))
+                .ok_or_else(|| {
+                    crate::Error::Msg(format!(
+                        "{}: dense checkpoint resident byte count overflow",
+                        row.physical_key
+                    ))
+                })?,
         };
         bytes.insert(row.physical_key.clone(), resident);
     }
-    bytes.extend(
-        plan.companions
-            .into_iter()
-            .map(|c| (c.physical_key, c.resident_bytes)),
-    );
+    for c in plan.companions {
+        let retained = if bytes[&c.owner_physical_key] == 0 {
+            0
+        } else {
+            c.resident_bytes
+        };
+        bytes.insert(c.physical_key, retained);
+    }
     Ok(bytes)
 }
 
@@ -487,6 +488,17 @@ mod tests {
         assert_eq!(bytes["model.a.comfy_quant"], 0);
         assert_eq!(bytes["model.b.weight"], 8);
         assert_eq!(bytes["model.b.weight_scale"], 0);
+        let filtered = projected_checkpoint_bytes(
+            &shards,
+            &headers,
+            |h| if h.name == "model.a.weight" { 0 } else { 4 },
+            &SourceCodecResidency,
+            |_, shape| shape.len() == 2,
+        )
+        .unwrap();
+        assert_eq!(filtered["model.a.weight"], 0);
+        assert_eq!(filtered["model.a.weight_scale"], 0);
+        assert_eq!(filtered["model.b.weight"], 8);
         assert!(projected_checkpoint_bytes(
             &shards,
             &headers,

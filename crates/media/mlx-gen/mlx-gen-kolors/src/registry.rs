@@ -1808,6 +1808,13 @@ pub fn compile_kolors(
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    footprint_with_source_qualification(spec).map(|(components, _)| components)
+}
+
+pub(crate) fn footprint_with_source_qualification(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<(mlx_gen::PerComponentBytes, bool)> {
+    use mlx_gen::asset_facts::{projected_source_bytes, ResidentProjection};
     let mut components = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
@@ -1815,21 +1822,39 @@ pub(crate) fn component_footprint(
         &["vae"],
     )?;
     let WeightsSource::Dir(root) = &spec.weights else {
-        // Unreachable: `from_spec_subdirs` already rejected a single-file checkpoint.
-        return Ok(components);
+        unreachable!("from_spec_subdirs validated the directory")
     };
-    components.vae = projected_vae_bytes(root)?;
-    Ok(components)
-}
-
-/// The VAE's **resident** bytes: every tensor of the file [`mlx_gen_sdxl::load_vae`] opens,
-/// materialized f32.
-pub(crate) fn projected_vae_bytes(root: &std::path::Path) -> mlx_gen::gen_core::Result<u64> {
-    let file = mlx_gen_sdxl::resolve_vae_weight_file(root)
-        .map_err(|e| mlx_gen::gen_core::Error::Msg(format!("kolors: {e}")))?;
-    mlx_gen::asset_facts::projected_safetensors_bytes(&file, |_| {
-        mlx_gen::asset_facts::ResidentProjection::Float32
-    })
+    let vae = mlx_gen_sdxl::resolve_vae_weight_file(root)
+        .map_err(|e| mlx_gen::gen_core::Error::Msg(e.to_string()))?;
+    let (vae_bytes, mut encoded) = projected_source_bytes(&vae, |_| ResidentProjection::Float32)?;
+    components.vae = vae_bytes;
+    let dtype = if spec.precision == mlx_gen::Precision::Fp32 {
+        Dtype::Float32
+    } else {
+        Dtype::Float16
+    };
+    let compute = if dtype == Dtype::Float32 {
+        ResidentProjection::Float32
+    } else {
+        ResidentProjection::Bfloat16
+    };
+    let unet = mlx_gen_sdxl::resolve_unet_weight_file(root, dtype).ok();
+    for (path, bytes) in [
+        (
+            Some(root.join("text_encoder")),
+            &mut components.text_encoder,
+        ),
+        (unet, &mut components.dit),
+    ] {
+        if let Some(path) = path.filter(|p| mlx_gen::safetensors_path_bytes(p) > 0) {
+            let (resident, has_source) = projected_source_bytes(&path, |_| compute)?;
+            if has_source {
+                *bytes = resident;
+                encoded = true;
+            }
+        }
+    }
+    Ok((components, encoded))
 }
 
 mlx_gen::register_generators! {

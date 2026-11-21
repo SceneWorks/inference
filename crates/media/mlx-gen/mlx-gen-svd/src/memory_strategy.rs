@@ -217,19 +217,8 @@ impl PreparedSvdMemory {
                 gen_core::PinnedWeightsFile::pin(&path)?
             };
             pin.ensure_unchanged()?;
-            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&path)?;
-            if headers.is_empty() || headers.iter().any(|header| !header.is_float()) {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: {relative} is empty or contains a non-float tensor",
-                    crate::MODEL_ID
-                )));
-            }
-            let resident_bytes = headers.iter().try_fold(0_u64, |sum, header| {
-                sum.checked_add(header.materialized_bytes(width)?)
-                    .ok_or_else(|| {
-                        gen_core::Error::Msg(format!("{}: resident byte overflow", crate::MODEL_ID))
-                    })
-            })?;
+            let resident_bytes =
+                mlx_gen::asset_facts::projected_float_component_bytes(&path, width)?;
             if resident_bytes == 0 {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: {relative} has zero resident bytes",
@@ -295,17 +284,11 @@ impl PreparedSvdMemory {
         for file in &self.files {
             file.pin.ensure_unchanged()?;
             let path = self.root.join(file.relative);
-            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
             let width = SELECTED_FILES
                 .iter()
                 .find_map(|(relative, width, _)| (*relative == file.relative).then_some(*width))
                 .expect("sealed selected file");
-            let resident = headers.iter().try_fold(0_u64, |sum, header| {
-                sum.checked_add(header.materialized_bytes(width)?)
-                    .ok_or_else(|| {
-                        gen_core::Error::Msg(format!("{}: resident byte overflow", crate::MODEL_ID))
-                    })
-            })?;
+            let resident = mlx_gen::asset_facts::projected_float_component_bytes(&path, width)?;
             if resident != file.resident_bytes {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: {} tensor geometry changed after admission",
@@ -839,6 +822,7 @@ mod tests {
             let width = match dtype {
                 "F32" => 4,
                 "F16" => 2,
+                "F8_E4M3" | "U8" => 1,
                 _ => panic!("dtype"),
             };
             let bytes = shape.iter().product::<usize>() * width;
@@ -938,6 +922,34 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 1;
         std::fs::write(selected, bytes).unwrap();
         assert!(prepared.ensure_unchanged().is_err());
+    }
+
+    #[test]
+    fn prepared_component_admits_encoded_rows_and_refuses_unowned_integer_planes() {
+        let (_tmp, original) = fixture();
+        let WeightsSource::Dir(root) = &original.weights else {
+            unreachable!()
+        };
+        let file = root.join(SELECTED_FILES[0].0);
+        let fresh = || {
+            LoadSpec::new(original.weights.clone())
+                .with_resolved_route(crate::MODEL_ID)
+                .with_offload_policy(OffloadPolicy::Resident)
+        };
+        write_safetensors(&file, &[("p.weight", "F8_E4M3", &[2, 3])]);
+        let mut spec = fresh();
+        prepare_load_spec(&mut spec).unwrap();
+        let prepared = PreparedSvdMemory::prepare(&spec).unwrap();
+        let expected = if mlx_gen::metal_available() { 6 } else { 12 };
+        assert_eq!(prepared.contract.asset_facts.conditioning_bytes, expected);
+        prepared.ensure_unchanged().unwrap();
+        write_safetensors(
+            &file,
+            &[("p.weight", "F8_E4M3", &[2, 3]), ("unknown", "U8", &[1])],
+        );
+        let mut spec = fresh();
+        prepare_load_spec(&mut spec).unwrap();
+        assert!(PreparedSvdMemory::prepare(&spec).is_err());
     }
 
     #[test]

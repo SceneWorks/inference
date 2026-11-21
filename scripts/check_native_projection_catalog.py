@@ -160,6 +160,8 @@ def check_mlx(root: Path) -> list[str]:
         (media / "mlx-gen-z-image/src/comfyui.rs", "insert_split_projection("),
         (media / "mlx-gen-qwen-image-2-1/src/loader.rs", "visual.into_language_weights("),
         (media / "mlx-gen-wan/src/memory_strategy.rs", "plan_projection_sources("),
+        (media / "mlx-gen-svd/src/memory_strategy.rs", "projected_float_component_bytes("),
+        (media / "mlx-gen-minimax-h3/src/text_encoder/mod.rs", "Weights::from_selected_files("),
         (media / "mlx-gen-lens/src/text_encoder/gpt_oss.rs", "SwitchLinear::from_scalar_source("),
         (media / "mlx-gen-minimax-h3/src/dit/heads.rs", "source_projection("),
         (media / "src/quant.rs", "NativeProjection::from_weights("),
