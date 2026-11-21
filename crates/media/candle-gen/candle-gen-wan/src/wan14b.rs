@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
+use candle_gen::gen_core::runtime::{
+    select_expert_adapters, CancelFlag, ExpertAdapterOrder, LoadPhase,
+};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
@@ -273,25 +275,20 @@ impl Pipeline {
         sub: &str,
         expert: MoeExpert,
     ) -> CResult<(WanTransformer, Option<usize>)> {
-        let specs: Vec<AdapterSpec> = self
-            .adapters
-            .iter()
-            .filter(|s| s.moe_expert.is_none_or(|e| e == expert))
-            .cloned()
-            .collect();
         let vb = self.component_vb(sub, DIT_DTYPE)?;
         // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`), so a
         // `proj_out.scales` sibling is present iff this is a pre-quantized q4/q8 tier.
         let packed = vb.contains_tensor("proj_out.scales");
         if packed {
             let mut dit = WanTransformer::new(&self.dit_cfg, vb)?;
-            if specs.is_empty() {
-                return Ok((dit, Some(0)));
-            }
             // Additive install on the packed base — no dense weight materialized (sc-10094/10095).
-            let report = crate::adapters::install_additive(&mut dit, &specs, expert)?;
+            let report = crate::adapters::install_additive(&mut dit, &self.adapters, expert)?;
             return Ok((dit, Some(report.applied)));
         }
+        let specs: Vec<AdapterSpec> =
+            select_expert_adapters(&self.adapters, expert, ExpertAdapterOrder::Request)
+                .map(|(_, spec)| spec.clone())
+                .collect();
         if specs.is_empty() {
             return Ok((WanTransformer::new(&self.dit_cfg, vb)?, None));
         }

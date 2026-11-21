@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::gen_core::runtime::{select_expert_adapters, ExpertAdapterOrder};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec, MoeExpert};
 use candle_gen::quant::adapters::install_dotted_adapters;
 use candle_gen::train::lora::{
@@ -574,6 +575,11 @@ pub fn install_additive(
     specs: &[AdapterSpec],
     expert: MoeExpert,
 ) -> Result<AdditiveReport> {
+    let mut ordered =
+        select_expert_adapters(specs, expert, ExpertAdapterOrder::SharedFirst).peekable();
+    if ordered.peek().is_none() {
+        return Ok(AdditiveReport::default());
+    }
     let packed = dit.is_packed();
     let table: BTreeMap<String, String> = dit
         .adaptable_paths()
@@ -581,20 +587,12 @@ pub fn install_additive(
         .map(|p| (p.replace('.', "_"), p))
         .collect();
 
-    // Resolve shared specs first, then this expert's — so shared residuals stack before expert ones
-    // (mlx pass-1/pass-2 order).
-    let ordered: Vec<AdapterSpec> = specs
-        .iter()
-        .filter(|s| s.moe_expert.is_none())
-        .chain(specs.iter().filter(|s| s.moe_expert == Some(expert)))
-        .cloned()
-        .collect();
-
     let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut lokr_specs = Vec::new();
     let mut report = AdditiveReport::default();
-    let mut lora_sources = BTreeMap::new();
-    for (source, spec) in ordered.iter().enumerate() {
+    // Keep application order for error reporting, and keep the original slot for match tracking.
+    let mut lora_sources = Vec::new();
+    for (source, spec) in ordered {
         let af = read_adapter(&spec.path)?;
         if is_lokr_or_loha(&af, spec.kind) {
             if !has_loha_factors(&af) {
@@ -617,7 +615,7 @@ pub fn install_additive(
                 spec.path.display()
             )));
         }
-        lora_sources.insert(source, spec.path.clone());
+        lora_sources.push((source, &spec.path));
         resolve_lora_file(
             &af,
             spec.scale,
