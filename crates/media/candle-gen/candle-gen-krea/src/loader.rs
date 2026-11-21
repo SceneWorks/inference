@@ -24,7 +24,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use candle_gen::gen_core::checkpoint_codec::{
     LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, MXFP8_CODEC, NVFP4_CODEC,
@@ -88,7 +87,7 @@ pub struct Weights {
     /// True **only** for a community **INT8-ConvRot** checkpoint (sc-9300): its quantized projections carry
     /// a `{native_base}.weight_scale` + int8 `.weight` whose stored weight is the *rotated* `W·R`, so
     /// [`linear_detect`] engages the int8 IGEMM + the online group-256 Hadamard **rotation** legs
-    /// ([`crate::quant::ConvRotInt8`]). Split out from [`native_keys`](Weights::native_keys) (sc-14022): a
+    /// ([`candle_gen::quant::convrot_int8::ConvRotLinear`]). Split out from [`native_keys`](Weights::native_keys) (sc-14022): a
     /// dense-bf16 native file is `native_keys: true, convrot: false` — remap ON, rotation/int8 OFF.
     convrot: bool,
     /// True only for a native-keyed, non-rotated ComfyUI
@@ -120,16 +119,6 @@ pub struct Weights {
     /// [`LogicalWeightReader::read`] (sc-21482): the provider owns **mapping and construction**,
     /// the codec owns classification and decode, and the reader measures the receipt.
     logical: Option<LogicalWeightReader>,
-    /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
-    /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
-    /// and the handle must be built at most once for the whole trunk, on first int8 projection.
-    ///
-    /// This weight set is the right owner and the right *lifetime*: the handle is a per-device compute
-    /// resource for exactly these weights, so it dies when they do — no process-global outliving an
-    /// unloaded model. `pipeline::load_components_convrot` seeds it up front via
-    /// [`with_int8_context`](Weights::with_int8_context) so the sm_89 floor probe's handle *becomes* the
-    /// trunk's shared handle instead of being built and thrown away.
-    int8: OnceLock<Int8Context>,
 }
 
 impl Weights {
@@ -217,7 +206,6 @@ impl Weights {
             plain_int8: false,
             native_nvfp4: false,
             logical: None,
-            int8: OnceLock::new(),
         })
     }
 
@@ -242,7 +230,6 @@ impl Weights {
             plain_int8: false,
             native_nvfp4: false,
             logical: None,
-            int8: OnceLock::new(),
         })
     }
 
@@ -424,7 +411,6 @@ impl Weights {
             plain_int8,
             native_nvfp4,
             logical: Some(logical),
-            int8: OnceLock::new(),
         };
         pinned_source
             .ensure_unchanged()
@@ -609,23 +595,11 @@ impl Weights {
         Ok(Some(facts))
     }
 
-    /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).
-    ///
-    /// The seam for scope 5 of the story: `pipeline::ensure_int8_floor` must build a cuBLASLt handle
-    /// anyway to read the device's compute capability against the sm_89 floor, so it hands that handle
-    /// here instead of dropping it — the probe *becomes* the trunk's shared handle. Absent this call,
-    /// [`int8_context`](Self::int8_context) simply builds one lazily on the first int8 projection.
-    ///
-    /// Takes `self` by value (called at construction, before any projection reads the cell), so seeding
-    /// a fresh `OnceLock` cannot lose a race with a lazy build.
-    pub fn with_int8_context(mut self, ctx: Int8Context) -> Self {
-        let cell = OnceLock::new();
-        // Infallible: the cell was created one line above and nothing else holds it.
-        let _ = cell.set(ctx);
-        if let (Some(reader), Some(context)) = (self.logical.as_mut(), cell.get()) {
-            reader.set_int8_context(context.clone());
+    /// Reuse the floor probe's cuBLASLt handle in the checkpoint reader.
+    pub fn with_int8_context(mut self, context: Int8Context) -> Self {
+        if let Some(reader) = self.logical.as_mut() {
+            reader.set_int8_context(context);
         }
-        self.int8 = cell;
         self
     }
 
@@ -654,28 +628,6 @@ impl Weights {
         pin.ensure_unchanged()
             .map_err(|error| Error::Msg(error.to_string()))?;
         result
-    }
-
-    /// The **one** [`Int8Context`] every INT8-ConvRot projection from this weight set shares (sc-12301),
-    /// built on first use if [`with_int8_context`](Self::with_int8_context) did not seed it.
-    ///
-    /// This is the fix for the defect the story names: `QLinear::convrot_int8` built a fresh cuBLASLt
-    /// handle — and its eager 32 MiB workspace — for *every* int8 projection, so a ConvRot DiT's ~224 of
-    /// them carried ~7 GiB of duplicated scratch that a weights-only footprint sum cannot see.
-    ///
-    /// Errors (rather than caching a failure) if the handle cannot be built on a CUDA device, so the
-    /// F-121 / sc-11208 typed-error-at-load property survives the move to a shared handle: the error
-    /// surfaces from the first `linear_detect` that reaches an int8 projection, still inside load, where
-    /// `?` is available.
-    pub fn int8_context(&self) -> Result<&Int8Context> {
-        if let Some(ctx) = self.int8.get() {
-            return Ok(ctx);
-        }
-        // Built OUTSIDE the cell so a failure propagates instead of being cached as a poisoned context
-        // (`OnceLock` has no stable `get_or_try_init`). A lost race here just drops the loser's handle;
-        // the winner's is the one every projection then shares.
-        let ctx = Int8Context::new(&self.device)?;
-        Ok(self.int8.get_or_init(|| ctx))
     }
 
     /// Whether this checkpoint applies the **int8 + online-rotation** legs, i.e. it is a genuine
@@ -1087,7 +1039,7 @@ fn is_block_padded_codec(codec_id: &str) -> bool {
 // the canonical `to_q`), so reconstructing `X·Wᵀ` needs the matching **online activation rotation**
 // `RHT(x)` — the regular-Hadamard (group 256) leg from arXiv 2512.03673 (clean-room from the paper +
 // the `comfy_quant` descriptor). The ConvRot projection now applies it before the int8 IGEMM
-// ([`crate::quant::ConvRotInt8`]), lifting the render from the sc-9300 NO-GO's noise (PSNR ≈ 8 dB) to
+// ([`candle_gen::quant::convrot_int8::ConvRotLinear`]), lifting the render from the sc-9300 NO-GO's noise (PSNR ≈ 8 dB) to
 // coherent (verified cosine 0.99991 vs the f32 reference linear).
 
 /// Translate a **diffusers** tensor key to the **native-mmdit** key the INT8-ConvRot checkpoint stores.
@@ -2302,7 +2254,15 @@ mod tests {
         let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw).unwrap();
         let scale_col = Tensor::from_vec(pc.scale.clone(), (out_dim, 1), &dev).unwrap();
         // On disk: I8 codes of W·R, F32 [out,1] weight_scale, U8 comfy_quant JSON descriptor.
-        let codes_i8 = pc.q.to_dtype(DType::I64).unwrap(); // safetensors save has no I8; I64 codes round-trip identically at the int8 stage
+        let signed =
+            pc.q.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(|v| v as i8 as u8)
+                .collect::<Vec<_>>();
+        let codes_i8 = Tensor::from_vec(signed, (out_dim, in_dim), &dev).unwrap();
         let cq = format!(
             "{{\"format\": \"int8_tensorwise\", \"convrot\": true, \"convrot_groupsize\": {CONVROT_G}}}"
         );
@@ -2327,6 +2287,49 @@ mod tests {
         safetensors::save(&tensors, path).unwrap();
     }
 
+    fn write_convrot_file(path: &Path, tensors: HashMap<String, Tensor>) {
+        // Candle has no I8 tensor type. Serialize the original byte patterns using the equal-width
+        // U8 carrier, then mark exactly the weight as I8 in the safetensors header.
+        write_single_file(path, tensors);
+        let mut bytes = std::fs::read(path).unwrap();
+        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header = &mut bytes[8..8 + n];
+        let mut data: serde_json::Value = serde_json::from_slice(header).unwrap();
+        let dtype = &mut data["blocks.0.attn.wq.weight"]["dtype"];
+        assert_eq!(dtype.as_str(), Some("U8"));
+        *dtype = serde_json::Value::String("I8".into());
+        let json = serde_json::to_vec(&data).unwrap();
+        header.fill(b' ');
+        header[..json.len()].copy_from_slice(&json);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    // The CPU test inspects a mixed plan and binds only its dense sibling. The actual CPU
+    // capability must refuse native ConvRot before materialization.
+    fn inspect_convrot_plan(path: &Path) -> Result<Weights> {
+        let error = Weights::from_convrot_file(path, &Device::Cpu, DType::F32)
+            .err()
+            .expect("CPU must refuse native ConvRot");
+        assert!(
+            error
+                .to_string()
+                .contains("requires native integer execution"),
+            "{error}"
+        );
+        let pinned = candle_gen::gen_core::PinnedWeightsFile::pin(path)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        Weights::from_pinned_native_file_with_residency(
+            &pinned,
+            &Device::Cpu,
+            DType::F32,
+            DeclaredLogicalShapes::NotInScope,
+            CandleCodecResidency {
+                fp8_e4m3_native: true,
+                ..CandleCodecResidency::DENSE
+            },
+        )
+    }
+
     /// **ConvRot detect fires on the native int8 layout and the online rotation reconstructs the
     /// canonical weight (sc-9300 loader + sc-9601 rotation).** `linear_detect(w, "…attn.to_q", …)` on a
     /// ConvRot checkpoint must resolve to the native `blocks.0.attn.wq`, see its `weight_scale` sibling,
@@ -2336,13 +2339,13 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_detect_fires_and_reconstructs_canonical_weight() -> Result<()> {
-        let dev = Device::Cpu;
+        let dev = Device::new_cuda(0)?;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (map, ref_w) = convrot_int8_weight(out_dim, in_dim);
 
         let path_tmp = tempfile::tempdir().unwrap();
         let path = path_tmp.path().join("krea2_int8_convrot.safetensors");
-        write_single_file(&path, map);
+        write_convrot_file(&path, map);
 
         let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
         assert!(w.is_convrot(), "from_convrot_file ⇒ convrot mode");
@@ -2358,7 +2361,7 @@ mod tests {
         // Without the rotation this would be ~0.1 (the sc-9300 NO-GO); the sc-9601 leg lifts it to ~1.
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let got = lin.forward(&x)?.to_dtype(DType::F32)?;
-        let want = __model_proof_output!(Linear::new(ref_w, None).forward(&x))?;
+        let want = __model_proof_output!(Linear::new(ref_w.to_device(&dev)?, None).forward(&x))?;
         let cos = tensor_cosine(&got, &want);
         assert!(
             cos > 0.99,
@@ -2403,8 +2406,8 @@ mod tests {
         );
         let path_tmp = tempfile::tempdir().unwrap();
         let path = path_tmp.path().join("m.safetensors");
-        write_single_file(&path, map);
-        let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
+        write_convrot_file(&path, map);
+        let w = inspect_convrot_plan(&path)?;
 
         // The dense native norm resolves through the diffusers key `norm1.weight` → `prenorm.scale`.
         let normw = w.get("transformer_blocks.0.norm1.weight")?;
@@ -4050,8 +4053,8 @@ mod tests {
         let (cmap, _ref) = convrot_int8_weight(out_dim, in_dim);
         let cpath_tmp = tempfile::tempdir().unwrap();
         let cpath = cpath_tmp.path().join("convrot.safetensors");
-        write_single_file(&cpath, cmap);
-        let convrot = Weights::from_convrot_file(&cpath, &dev, DType::F32)?;
+        write_convrot_file(&cpath, cmap);
+        let convrot = inspect_convrot_plan(&cpath)?;
         assert!(convrot.uses_native_keys());
         assert!(convrot.is_convrot(), "INT8-ConvRot ⇒ rotation ON");
 

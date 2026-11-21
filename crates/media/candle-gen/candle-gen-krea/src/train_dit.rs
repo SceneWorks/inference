@@ -1611,31 +1611,23 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn convrot_time_mod_projection_is_exposed_to_additive_adapter_walk() {
-        let dev = Device::Cpu;
-        let canonical = Tensor::from_vec(
-            vec![
-                0.5f32, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
-                -0.1,
-            ],
-            (4, 4),
-            &dev,
-        )
-        .unwrap();
-        let rotation = candle_gen::quant::regular_hadamard(4, &dev).unwrap();
+        let dev = Device::new_cuda(0).unwrap();
+        let canonical = Tensor::ones((16, 64), DType::F32, &dev).unwrap();
+        let rotation = candle_gen::quant::regular_hadamard(64, &dev).unwrap();
         let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation).unwrap();
         let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated).unwrap();
         let mut projection = ComposableLinear::ConvRot(
-            KreaQLinear::convrot_int8(parts.q, parts.scale, 4, None, &dev).unwrap(),
+            KreaQLinear::convrot_int8(parts.q, parts.scale, 64, None, &dev).unwrap(),
         );
-        let x = Tensor::ones((1, 4), DType::F32, &dev).unwrap();
+        let x = Tensor::ones((1, 64), DType::F32, &dev).unwrap();
         let bare = projection.forward(&x).unwrap();
         let mut visited = 0usize;
         projection
             .visit_additive("time_mod_proj", &mut |path, host| {
                 assert_eq!(path, "time_mod_proj");
                 host.add_lora(
-                    Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
-                    Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
+                    Tensor::ones((64, 1), DType::F32, &dev).unwrap(),
+                    Tensor::ones((1, 16), DType::F32, &dev).unwrap(),
                     0.5,
                 )?;
                 visited += 1;
