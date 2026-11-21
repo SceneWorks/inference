@@ -28,6 +28,7 @@ pub use adapters::{
 pub use error::{Error, Result};
 pub use llm_projection::{
     quantize_on_stored_grid, KvProjection, Projection, QuantGrid, QuantSpec, QuantizedEmbedding,
+    QuantizedLinear,
 };
 pub use prism::{PrismEmbedding, PrismLinear};
 pub use quant::TokenEmbedding;

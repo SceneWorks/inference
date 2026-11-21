@@ -1277,11 +1277,18 @@ impl Projection {
             QLinear::Quantized {
                 weight: QuantWeight::Matmul(m),
                 bias,
-                ..
-            } => Ok(Projection::Quantized(QuantizedLinear {
-                inner: QuantizedWeight::Matmul(m.clone()),
-                bias: bias.clone(),
-            })),
+                fwd,
+            } => {
+                if !fwd.cast_back {
+                    return Err(Error::Unsupported(
+                        "QLinear with cast_back=false cannot convert to QuantizedLinear (which always casts back to activation dtype)".into(),
+                    ));
+                }
+                Ok(Projection::Quantized(QuantizedLinear {
+                    inner: QuantizedWeight::Matmul(m.clone()),
+                    bias: bias.clone(),
+                }))
+            }
             QLinear::Quantized {
                 weight: QuantWeight::Dequant(w),
                 bias,
@@ -1324,6 +1331,11 @@ impl Projection {
     /// Construct a [`Projection`] from an [`AdaptLinear`] (`crate::Linear`) on the shared
     /// `candle-layers` spine (`BACK-1`, `BACK-4`).
     pub fn from_adapt_linear(linear: &AdaptLinear) -> Result<Self> {
+        if !linear.adapters.is_empty() {
+            return Err(Error::Unsupported(
+                "AdaptLinear with installed LoRA/LoKr residuals cannot convert to a base-only LLM Projection".into(),
+            ));
+        }
         match &linear.base {
             Base::Dense(l) => Ok(Projection::Dense(l.clone())),
             Base::Packed(q) => Self::from_qlinear(q),

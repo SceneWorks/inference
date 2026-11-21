@@ -622,6 +622,11 @@ impl Projection {
     /// Construct a [`Projection`] from an [`AdaptableLinear`] (`crate::Linear`) on the shared
     /// `mlx-layers` spine (`BACK-1`, `BACK-4`).
     pub fn from_adaptable_linear(linear: &AdaptableLinear) -> Result<Self> {
+        if !linear.adapters().is_empty() {
+            return Err(Error::Unsupported(
+                "AdaptableLinear with installed LoRA/LoKr residuals cannot convert to a base-only LLM Projection".into(),
+            ));
+        }
         match &linear.base {
             LinearBase::Dense(l) => Ok(Projection::Dense {
                 weight: l.weight.value.clone(),
