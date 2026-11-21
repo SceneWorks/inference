@@ -1,0 +1,169 @@
+// Installed only into each disposable same-job checkout by sga_adapter_comparison.py.
+use candle_gen::attention::{
+    attention_budget_from_usize, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
+};
+use candle_gen::candle_core::{safetensors, DType, Device, DeviceLocation, Tensor};
+use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, CancelFlag};
+use candle_gen::quant::{PackedConfig, PackedWeightSidecars};
+use candle_gen_z_image::__z_image_module__::ZImageTransformer2DModel as Dit;
+use candle_transformers::models::z_image::transformer::Config;
+use serde_json::{json, Value};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+const LATENT: [usize; 5] = [1, 16, 1, 4, 4];
+const CAPTION: [usize; 3] = [1, 32, 2560];
+const TIMES: [f32; 2] = [0.25, 0.75];
+
+type ProofResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+struct Inputs {
+    latent: Tensor,
+    caption: Tensor,
+    caption_mask: Tensor,
+}
+
+impl Inputs {
+    fn load(root: &Path, device: &Device) -> ProofResult<Self> {
+        let mut inputs = safetensors::load(root.join("inputs.safetensors"), device)?;
+        let latent = inputs.remove("latent").ok_or("missing fixture latent")?;
+        let caption = inputs.remove("caption").ok_or("missing fixture caption")?;
+        assert!(inputs.is_empty());
+        assert_eq!(latent.dims(), LATENT);
+        assert_eq!(caption.dims(), CAPTION);
+        assert_eq!(
+            (latent.dtype(), caption.dtype()),
+            (DType::BF16, DType::BF16)
+        );
+        let mut mask = [0_u8; CAPTION[1]];
+        mask[..5].fill(1);
+        let caption_mask = Tensor::from_slice(&mask, (1, CAPTION[1]), device)?;
+        Ok(Self {
+            latent,
+            caption,
+            caption_mask,
+        })
+    }
+
+    fn velocities(&self, dit: &Dit, plan: AttentionPlan<'_>) -> ProofResult<Vec<Vec<u32>>> {
+        let prepared =
+            dit.prepare_conditioning(&self.latent, &self.caption, &self.caption_mask, plan)?;
+        let device = self.latent.device();
+        TIMES
+            .iter()
+            .map(|time| {
+                let timestep = Tensor::from_slice(&[*time], 1, device)?;
+                let velocity =
+                    dit.forward_prepared_with_memory(&self.latent, &timestep, &prepared, plan, 1)?;
+                device.synchronize()?;
+                assert_eq!(
+                    velocity.device().location(),
+                    DeviceLocation::Cuda { gpu_id: 0 }
+                );
+                assert_eq!(velocity.dims(), LATENT);
+                assert_eq!(velocity.dtype(), DType::BF16);
+                let values = velocity
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(values.iter().all(|v| v.is_finite()));
+                Ok(values.into_iter().map(f32::to_bits).collect())
+            })
+            .collect()
+    }
+}
+
+fn run_route(
+    dit: &mut Dit,
+    inputs: &Inputs,
+    budget: usize,
+    adapter: &AdapterSpec,
+) -> ProofResult<Value> {
+    let plan = AttentionPlan::budgeted(attention_budget_from_usize(budget));
+    let bare = inputs.velocities(dit, plan)?;
+    let report = candle_gen_z_image::install_additive(dit, std::slice::from_ref(adapter))?;
+    assert_eq!((report.applied, report.skipped_keys), (2, 0));
+    assert!(report.skipped_targets.is_empty());
+    let adapted = inputs.velocities(dit, plan)?;
+    assert_ne!(bare, adapted, "fixture LoRA did not change the Q4 velocity");
+    Ok(json!({"applied": report.applied, "bare": bare, "adapted": adapted}))
+}
+
+// __SGA_CUDA_RECEIPT__
+
+fn main() -> ProofResult<()> {
+    let root = PathBuf::from(env::var_os("PAIR_SGA_FIXTURE").ok_or("missing fixture")?);
+    let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing proof output")?);
+    let device = Device::new_cuda(0)?;
+    assert_eq!(device.location(), DeviceLocation::Cuda { gpu_id: 0 });
+    let mut config = Config::z_image_turbo();
+    assert_eq!(
+        (config.dim, config.n_heads, config.n_kv_heads),
+        (3840, 30, 30)
+    );
+    assert_eq!(
+        (config.in_channels, config.cap_feat_dim),
+        (LATENT[1], CAPTION[2])
+    );
+    assert_eq!((config.n_layers, config.n_refiner_layers), (30, 2));
+    config.n_layers = 1;
+    config.n_refiner_layers = 1;
+    config.set_use_accelerated_attn(false);
+    let inputs = Inputs::load(&root, &device)?;
+    let adapter = AdapterSpec::new(root.join("adapter.safetensors"), 1.25, AdapterKind::Lora);
+    let sources = [root.join("transformer.safetensors")];
+
+    let resident = {
+        let vb = candle_gen::mmap_var_builder(&sources, DType::BF16, &device)?;
+        let mut dit = Dit::__z_image_resident__(&config, vb)?;
+        run_route(&mut dit, &inputs, candle_gen::ATTN_SCORES_BUDGET, &adapter)?
+    };
+    device.synchronize()?;
+
+    let cache = output.join("sidecars");
+    fs::create_dir(&cache)?;
+    let (source, sidecars) = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
+        &sources,
+        &cache,
+        PackedConfig {
+            bits: 4,
+            group_size: 64,
+        },
+        &device,
+        &CancelFlag::default(),
+        "layers.",
+    )?;
+    assert_eq!(sidecars.created_count(), 8);
+    let vb = VarBuilder::from_backend(Box::new(source), DType::BF16, device.clone());
+    let mut windowed = Dit::new_block_streamed_with_sidecars(&config, vb, Arc::new(sidecars))?;
+    let sidecar = run_route(
+        &mut windowed,
+        &inputs,
+        CONSTRAINED_ATTN_SCORES_BUDGET as usize,
+        &adapter,
+    )?;
+
+    retain_cuda_pool(&output, &device)?;
+    let row = json!({
+        "device": {"kind": "candle-cuda", "index": 0},
+        "shape": LATENT,
+        "timesteps": TIMES,
+        "applied": {"resident": resident["applied"], "sidecar": sidecar["applied"]},
+        "velocity_bits": {
+            "resident": {"bare": resident["bare"], "adapted": resident["adapted"]},
+            "sidecar": {"bare": sidecar["bare"], "adapted": sidecar["adapted"]},
+        },
+    });
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(&mut file, &row)?;
+    file.sync_all()?;
+    println!("SGA_ADAPTER_TIER1_BODY z-image-q4-dit");
+    Ok(())
+}
