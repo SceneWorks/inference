@@ -40,7 +40,7 @@ impl Fp8Linear {
     /// Quantize a dense `(N, K)` weight to fp8 E4M3 once and bind it to a cuBLASLt handle.
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
         let shape = weight.dims2()?;
-        let device = weight.device().clone();
+        let device = lt.device();
         let qw = quantize_weight_fp8(weight)?;
         Ok(Self {
             w_fp8: qw.q,
@@ -126,7 +126,7 @@ impl Int8Linear {
     /// Per-tensor int8 (sc-9299): quantize a dense `(N, K)` weight once and bind a cuBLASLt handle.
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
         let shape = weight.dims2()?;
-        let device = weight.device().clone();
+        let device = lt.device();
         let qw = quantize_weight_int8(weight)?;
         Ok(Self {
             w_i8: qw.q,
@@ -163,7 +163,7 @@ impl Int8Linear {
         lt: Arc<CublasLt>,
     ) -> Result<Self> {
         let shape = weight.dims2()?;
-        let device = weight.device().clone();
+        let device = lt.device();
         let qw = quantize_weight_int8_per_channel(weight)?;
         Ok(Self {
             w_i8: qw.q,
@@ -196,7 +196,7 @@ impl Int8Linear {
                 scale_w.len()
             );
         }
-        let device = w_i8.device().clone();
+        let device = lt.device();
         // Pre-stage the codes to a resident native-`i8` device buffer (1 byte/elem) so the 224
         // projections of a 12B DiT don't hold their codes as 8×-larger I64 tensors on the GPU.
         let w_staged = Some(lt.stage_int8(&w_i8)?);
@@ -225,7 +225,7 @@ impl Int8Linear {
         if scales.dtype() != candle_core::DType::F32 || scales.dims() != [n, 1] {
             candle_core::bail!("native INT8 requires F32 [out,1] scales");
         }
-        let device = codes.device().clone();
+        let device = lt.device();
         let w_staged = Some(lt.stage_int8_bytes(codes)?);
         Ok(Self {
             w_i8: Tensor::zeros((0, 0), candle_core::DType::U8, &Device::Cpu)?,

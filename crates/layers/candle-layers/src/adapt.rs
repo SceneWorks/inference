@@ -344,6 +344,94 @@ impl Base {
             Base::External { device, .. } => Some(device.clone()),
         }
     }
+
+    /// Fold a **dense** base to an MLX-packed base in place (`Q4`/`Q8`), treating an already-packed
+    /// base as an idempotent no-op and refusing re-quantization on `Nvfp4`, `ConvRot`, `W4A8`, `Fp8`,
+    /// `Int8`, and `External` bases.
+    pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
+        reject_rowwise_as_legacy_quant(quant)?;
+        match self {
+            Base::Packed(QLinear::W4A8(_)) | Base::W4A8(_) => {
+                candle_core::bail!("W4A8 refuses re-quantization to {quant:?}")
+            }
+            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
+            Base::Packed(_) => Ok(()),
+            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
+            Base::ConvRot(_) => {
+                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
+            }
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
+            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize(quant)?;
+                *self = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
+
+    /// As [`Self::quantize`] but folds a **dense** base to a dequant-dense packed base landing on
+    /// `device` via [`QLinear::quantize_dequant_onto`].
+    pub fn quantize_dequant_onto(
+        &mut self,
+        quant: Quant,
+        device: &Device,
+    ) -> candle_core::Result<()> {
+        reject_rowwise_as_legacy_quant(quant)?;
+        match self {
+            Base::Packed(QLinear::W4A8(_)) | Base::W4A8(_) => {
+                candle_core::bail!("W4A8 refuses re-quantization to {quant:?}")
+            }
+            Base::Packed(_) => Ok(()),
+            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
+            Base::ConvRot(_) => {
+                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
+            }
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
+            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize_dequant_onto(quant, device)?;
+                *self = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
+
+    /// Quantize a **dense** base with [`QLinear::quantize_onto`], treating an already-packed base as
+    /// an idempotent no-op and refusing re-quantization on `Nvfp4`, `ConvRot`, `W4A8`, `Fp8`, `Int8`,
+    /// and `External` bases.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
+        reject_rowwise_as_legacy_quant(quant)?;
+        match self {
+            Base::Packed(QLinear::W4A8(_)) | Base::W4A8(_) => {
+                candle_core::bail!("W4A8 refuses re-quantization to {quant:?}")
+            }
+            Base::Packed(_) => Ok(()),
+            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
+            Base::ConvRot(_) => {
+                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
+            }
+            #[cfg(feature = "cuda")]
+            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
+            #[cfg(feature = "cuda")]
+            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
+            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize_onto(quant, device)?;
+                *self = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A forward-time additive residual attached to an [`AdaptLinear`] — it never touches the frozen base
@@ -1797,27 +1885,7 @@ impl AdaptLinear {
     /// refused too: NVFP4 is packed from the bf16 master, so "re-NVFP4ing" an NVFP4 base could only
     /// mean a double quantization.
     pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
-        reject_rowwise_as_legacy_quant(quant)?;
-        match &mut self.base {
-            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize(quant)?;
-                self.base = Base::Packed(q);
-                Ok(())
-            }
-        }
+        self.base.quantize(quant)
     }
 
     /// As [`Self::quantize`] but folds a **dense** base to a packed base landing on an explicit `device`
@@ -1830,51 +1898,13 @@ impl AdaptLinear {
         quant: Quant,
         device: &Device,
     ) -> candle_core::Result<()> {
-        reject_rowwise_as_legacy_quant(quant)?;
-        match &mut self.base {
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize_dequant_onto(quant, device)?;
-                self.base = Base::Packed(q);
-                Ok(())
-            }
-        }
+        self.base.quantize_dequant_onto(quant, device)
     }
 
     /// Quantize the base projection with [`QLinear::quantize_onto`] while preserving all attached
     /// forward-time residuals.
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
-        reject_rowwise_as_legacy_quant(quant)?;
-        match &mut self.base {
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Fp8(_) => candle_core::bail!("FP8 refuses re-quantization to {quant:?}"),
-            #[cfg(feature = "cuda")]
-            Base::Int8(_) => candle_core::bail!("INT8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize_onto(quant, device)?;
-                self.base = Base::Packed(q);
-                Ok(())
-            }
-        }
+        self.base.quantize_onto(quant, device)
     }
 
     /// Move the projection — base + every attached residual factor — onto `device`, in place. The seam
