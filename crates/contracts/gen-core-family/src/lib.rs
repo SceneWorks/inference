@@ -15,6 +15,7 @@ pub mod krea_multiphase;
 pub mod krea_schedule;
 pub mod lens_resolution;
 pub mod qwen_image_2_1;
+pub mod scail2;
 pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
 pub mod sdxl_ldm;

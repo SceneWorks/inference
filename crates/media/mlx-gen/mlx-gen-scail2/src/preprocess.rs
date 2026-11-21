@@ -89,3 +89,50 @@ pub fn extract_and_compress_mask_to_latent(mask: &Array, temporal_stride: usize)
         .reshape(&[t_lat, stride * 7, hl, wl])?
         .transpose_axes(&[1, 0, 2, 3])?) // (28, T_latent, hl, wl)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn all_seven_mask_colors_keep_frame_zero_and_source_time_order() {
+        let stream = mlx_rs::Stream::new_with_device(&mlx_rs::Device::cpu());
+        mlx_rs::with_new_default_stream(stream, || {
+            // Seven colored 8x8 blocks on each frame, shifted one block per source frame.
+            let rgb = [
+                [1., 1., 1.],
+                [1., -1., -1.],
+                [-1., 1., -1.],
+                [-1., -1., 1.],
+                [1., 1., -1.],
+                [1., -1., 1.],
+                [-1., 1., 1.],
+            ];
+            let mut pixels = Vec::<f32>::new();
+            for channel in [0, 1, 2] {
+                for frame in 0..5 {
+                    for _row in 0..8 {
+                        for x in 0..56 {
+                            pixels.push(rgb[(x / 8 + frame) % 7][channel]);
+                        }
+                    }
+                }
+            }
+            let mask = Array::from_slice(&pixels, &[3, 5, 8, 56]);
+            let packed = extract_and_compress_mask_to_latent(&mask, TEMPORAL_STRIDE).unwrap();
+            assert_eq!(packed.shape(), &[28, 2, 1, 7]);
+            let packed = packed.reshape(&[-1]).unwrap();
+            let values = packed.as_slice::<f32>();
+            for slot in 0..4 {
+                for color in 0..7 {
+                    for time in 0..2 {
+                        let frame = if time == 0 { 0 } else { slot + 1 };
+                        for x in 0..7 {
+                            let index = ((slot * 7 + color) * 2 + time) * 7 + x;
+                            assert_eq!(values[index], f32::from((x + frame) % 7 == color));
+                        }
+                    }
+                }
+            }
+        });
+    }
+}

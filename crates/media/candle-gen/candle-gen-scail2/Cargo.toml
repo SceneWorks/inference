@@ -9,6 +9,7 @@ keywords = ["candle", "cuda", "video", "character-animation", "inference"]
 categories = ["science"]
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 candle-gen = { path = "../candle-gen" }
 # SCAIL-2 is Wan2.1-14B I2V: the z16 VAE, UMT5 text encoder, the flow/UniPC scheduler, the base 3-axis
 # RoPE apply (`rope::apply_rope`), and the pipeline glue (noise / CFG / frames→Image) all come from
