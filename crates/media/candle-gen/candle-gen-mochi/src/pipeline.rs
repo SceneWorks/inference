@@ -22,11 +22,12 @@ use rand::SeedableRng;
 use tokenizers::Tokenizer;
 
 use crate::config::{MochiConfig, MochiVaeConfig};
-use crate::scheduler::{cfg_combine, MochiScheduler};
+use crate::scheduler::{advance, cfg_combine};
 use crate::text_encoder::{encode_prompt, MochiT5};
 use crate::transformer::{load_transformer_var_builder, MochiDitConfig, MochiTransformer3DModel};
 use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
 use crate::{DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE, DEFAULT_STEPS, DIT_DTYPE};
+use gen_core_family::mochi::{inverted_sigmas, MochiEuler};
 
 /// AsymmVAE latent channels fed to the DiT / seeded as init noise.
 const LATENT_CHANNELS: usize = 12;
@@ -41,7 +42,15 @@ pub struct Components {
     t5: Arc<MochiT5>,
     transformer: Arc<MochiTransformer3DModel>,
     vae: Arc<MochiVaeDecoder>,
-    vae_cfg: MochiVaeConfig,
+    pub(crate) vae_cfg: MochiVaeConfig,
+}
+
+/// Read the small configuration independently of resident tensors so phase admission
+/// can use the checkpoint's temporal ratio before loading weights on a cold request.
+pub(crate) struct ComponentLayout {
+    dit_root: PathBuf,
+    shared_root: PathBuf,
+    pub(crate) vae_cfg: MochiVaeConfig,
 }
 
 /// The lazy pipeline handle (root + device); [`load_components`](Pipeline::load_components) assembles
@@ -62,6 +71,10 @@ impl Pipeline {
     /// Assemble the full Mochi model from a snapshot directory: the reused T5-XXL encoder + tokenizer
     /// (bf16), the AsymmDiT transformer (bf16-stored, f32-activation), and the AsymmVAE decoder (f32).
     pub fn load_components(&self) -> CResult<Components> {
+        self.load_components_from(&self.component_layout()?)
+    }
+
+    pub(crate) fn component_layout(&self) -> CResult<ComponentLayout> {
         // A pre-quantized tier dir (`.../q4|q8|bf16`) holds only the packed/dense transformer +
         // `split_model.json`; its shared T5-XXL / AsymmVAE live in the parent (the `convert.rs` staged
         // layout). A raw diffusers snapshot has them all under one root (`detect` ⇒ `None`). Resolve the
@@ -80,22 +93,35 @@ impl Pipeline {
         // call keeps the snapshot-driven seam for symmetry with the VAE config.
         let _cfg = MochiConfig::from_model_dir(&shared_root)?;
         let vae_cfg = MochiVaeConfig::from_model_dir(&shared_root)?;
+        Ok(ComponentLayout {
+            dit_root,
+            shared_root,
+            vae_cfg,
+        })
+    }
+
+    pub(crate) fn load_components_from(&self, layout: &ComponentLayout) -> CResult<Components> {
+        let ComponentLayout {
+            dit_root,
+            shared_root,
+            vae_cfg,
+        } = layout;
         let dit_cfg = MochiDitConfig::default();
 
         let tokenizer = crate::tokenizer::load_tokenizer()?;
         let t5 = MochiT5::load_reference_regime(&shared_root.join("text_encoder"), &self.device)?;
         // The DiT root is the tier dir (packed/dense `transformer/`) or the raw snapshot root; the packed
         // attn/ff Linears self-detect on their `.scales` siblings (`transformer::QLinear::linear_detect`).
-        let dit_vb = load_transformer_var_builder(&dit_root, DIT_DTYPE, &self.device)?;
+        let dit_vb = load_transformer_var_builder(dit_root, DIT_DTYPE, &self.device)?;
         let transformer = MochiTransformer3DModel::new(dit_vb, &dit_cfg, &self.device)?;
-        let vae = MochiVaeDecoder::load(&shared_root, &self.device)?;
+        let vae = MochiVaeDecoder::load(shared_root, &self.device)?;
 
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
             t5: Arc::new(t5),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
-            vae_cfg,
+            vae_cfg: vae_cfg.clone(),
         })
     }
 
@@ -107,10 +133,30 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
+        self.render_scoped(req, &comps.vae_cfg, || Ok(comps.clone()), None, on_progress)
+    }
 
+    pub(crate) fn render_scoped(
+        &self,
+        req: &GenerationRequest,
+        vae_cfg: &MochiVaeConfig,
+        components: impl FnOnce() -> CResult<Components>,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32)> {
+        let t_ratio = vae_cfg.temporal_compression_ratio() as u32;
+        let s_ratio = vae_cfg.spatial_compression_ratio() as u32;
+        let phase = gen_core_family::mochi::phase(
+            req.width,
+            req.height,
+            req.frames.unwrap_or(DEFAULT_FRAMES),
+            t_ratio,
+            req.steps.unwrap_or(DEFAULT_STEPS) as usize,
+            MOCHI_SHIFT,
+            req.seed.unwrap_or_else(gen_core::default_seed),
+        )?;
+        let active = phase.enter(&req.cancel, scope)?;
+        let comps = components()?;
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch.
         let (_pos, _neg, enc, enc_mask) = candle_gen::gen_core::with_prompt_encoding(
             on_progress,
@@ -127,33 +173,33 @@ impl Pipeline {
         )?;
         // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
         // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
-        let t_ratio = comps.vae_cfg.temporal_compression_ratio() as u32;
-        let s_ratio = comps.vae_cfg.spatial_compression_ratio() as u32;
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let lf = 1 + (frames - 1) / t_ratio;
         let lh = req.height / s_ratio;
         let lw = req.width / s_ratio;
 
         // Seeded init noise `[1, 12, F_lat, H_lat, W_lat]` (FlowMatchEuler `init_noise_sigma = 1`, used
         // unscaled). The draw is CPU-`StdRng` (launch-portable); the reference's `torch.Generator` RNG is
         // not portable, so the e2e parity gate teacher-forces the init latents instead.
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let init = seeded_latents(seed, lf as usize, lh as usize, lw as usize, &self.device)?;
+        let init = seeded_latents(
+            phase.seed,
+            phase.latent_frames as usize,
+            lh as usize,
+            lw as usize,
+            &self.device,
+        )?;
 
-        let latents = denoise(
+        let latents = denoise_schedule(
             &comps.transformer,
             &init,
             &enc,
             &enc_mask,
-            steps,
+            &phase.sigmas,
             guidance,
-            MOCHI_SHIFT,
             &req.cancel,
             on_progress,
         )?;
 
+        active.finish()?;
         on_progress(Progress::Decoding);
         // Chunked decode: an untiled decode holds the 128-channel `block_out` stage at full output
         // resolution for the whole clip, so its peak grows with clip length (sc-12291). Chunking is
@@ -205,9 +251,30 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Tensor> {
-    let mut sched = MochiScheduler::new();
-    sched.set_timesteps(steps, shift);
-    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+    let sigmas = inverted_sigmas(steps, shift);
+    denoise_schedule(
+        transformer,
+        init_latents,
+        enc,
+        enc_mask,
+        &sigmas,
+        guidance,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_schedule(
+    transformer: &MochiTransformer3DModel,
+    init_latents: &Tensor,
+    enc: &Tensor,
+    enc_mask: &Tensor,
+    sigmas: &[f32],
+    guidance: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> CResult<Tensor> {
     candle_gen::execution::policy(
         "mochi_guidance",
         serde_json::json!({"f32_bits": guidance.to_bits()}),
@@ -215,24 +282,22 @@ pub fn denoise(
     let device = init_latents.device();
 
     let mut latents = init_latents.clone();
-    for (i, &t) in timesteps.iter().enumerate() {
-        // Cooperative cancel at the top of every step.
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        // latent_model_input = cat([latents, latents]) → [2, C, F, H, W] (the two CFG branches).
-        let lmi = Tensor::cat(&[&latents, &latents], 0)?;
-        // Same model timestep for both branches.
-        let timestep = Tensor::from_vec(vec![t, t], 2, device)?;
-        // AsymmDiT velocity for [neg, pos]; true-CFG recombine inside the predict step.
-        let noise_pred = transformer.forward(&lmi, enc, &timestep, enc_mask)?; // [2, C, F, H, W] f32
-        let velocity = cfg_combine(&noise_pred, guidance)?; // [1, C, F, H, W]
-        latents = sched.step(&velocity, &latents)?;
-        on_progress(Progress::Step {
-            current: (i + 1) as u32,
-            total: steps as u32,
-        });
-    }
+    MochiEuler::run(
+        sigmas,
+        cancel,
+        |step, t| -> CResult<()> {
+            // latent_model_input = cat([latents, latents]) → [2, C, F, H, W] (the two CFG branches).
+            let lmi = Tensor::cat(&[&latents, &latents], 0)?;
+            // Same model timestep for both branches.
+            let timestep = Tensor::from_vec(vec![t, t], 2, device)?;
+            // AsymmDiT velocity for [neg, pos]; true-CFG recombine inside the predict step.
+            let noise_pred = transformer.forward(&lmi, enc, &timestep, enc_mask)?; // [2, C, F, H, W] f32
+            let velocity = cfg_combine(&noise_pred, guidance)?; // [1, C, F, H, W]
+            latents = advance(step, sigmas, &velocity, &latents)?;
+            Ok(())
+        },
+        on_progress,
+    )?;
     Ok(latents)
 }
 
@@ -279,6 +344,90 @@ pub fn frames_to_images(frames: &Tensor) -> CResult<Vec<Image>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_render_enters_physical_clip_once_before_requesting_components() {
+        use gen_core::{
+            render::RenderPhaseIdentity, MemoryGeometry, MemoryPhase, MemoryRequestScope,
+            MemoryRunOutcome,
+        };
+        use std::cell::Cell;
+
+        struct Scope<'a>(&'a Cell<usize>);
+        impl MemoryRequestScope for Scope<'_> {
+            fn enter_render_phase(
+                &mut self,
+                phase: MemoryPhase,
+                id: &RenderPhaseIdentity,
+            ) -> gen_core::Result<()> {
+                assert_eq!(phase, MemoryPhase::Denoise);
+                assert_eq!((id.pass, id.phase), (0, 0));
+                assert_eq!(
+                    id.geometry,
+                    MemoryGeometry {
+                        width: 64,
+                        height: 48,
+                        frames: 19,
+                        batch: 1,
+                        reference_count: 0
+                    }
+                );
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+            fn enter_phase(&mut self, _: MemoryPhase) -> gen_core::Result<()> {
+                panic!("unexpected second entry")
+            }
+            fn leave_phase(&mut self, _: MemoryPhase) -> gen_core::Result<()> {
+                panic!("failed prepare cannot complete a phase")
+            }
+            fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn configure_decode(
+                &mut self,
+                _: u32,
+                _: u32,
+                _: MemoryGeometry,
+            ) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+                panic!("caller owns request teardown")
+            }
+        }
+
+        let entered = Cell::new(0);
+        let mut scope = Scope(&entered);
+        let request = GenerationRequest {
+            width: 64,
+            height: 48,
+            frames: Some(19),
+            steps: Some(2),
+            seed: Some(37),
+            ..Default::default()
+        };
+        let result = Pipeline::new(Path::new(""), &Device::Cpu).render_scoped(
+            &request,
+            &MochiVaeConfig::default(),
+            || {
+                assert_eq!(entered.get(), 1);
+                Err(CandleError::Msg("injected prepare failure".into()))
+            },
+            Some(&mut scope),
+            &mut |_| panic!("progress before prepare"),
+        );
+        assert!(
+            matches!(result, Err(CandleError::Msg(message)) if message == "injected prepare failure")
+        );
+        assert_eq!(entered.get(), 1);
+    }
 
     /// `to_uint8_frames` clips to [0, 255] and lays frames out row-major `(F, H, W, 3)`.
     #[test]

@@ -10,6 +10,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+sceneworks-gen-core-family = { workspace = true }
 mlx-gen = { path = ".." }
 # Reuse the T5-XXL (t5-v1.1-xxl) text encoder type — Mochi conditions on the identical encoder FLUX /
 # Chroma use (the masked-encode path, like Chroma).

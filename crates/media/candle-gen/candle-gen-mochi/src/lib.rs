@@ -42,10 +42,9 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 
-use candle_gen::candle_core::{DType, Device};
+use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, Quant, WeightsSource,
@@ -129,16 +128,47 @@ pub fn descriptor() -> ModelDescriptor {
 /// dir (`tokenizer/` vendored, `text_encoder/`, `transformer/`, `vae/`).
 pub struct MochiGenerator {
     descriptor: ModelDescriptor,
-    root: PathBuf,
-    device: Device,
+    pipe: Pipeline,
     components: Mutex<Option<Components>>,
 }
 
 impl MochiGenerator {
-    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components()
-        })?)
+    fn generate_scoped(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        // Use the loaded codec's geometry on a warm request. On a cold request,
+        // resolve metadata first and reserve the phase before loading tensors.
+        let resident = candle_gen::lock_recover(&self.components).clone();
+        let (frames, fps) = if let Some(comps) = resident {
+            self.pipe.render_scoped(
+                req,
+                &comps.vae_cfg,
+                || Ok(comps.clone()),
+                scope,
+                on_progress,
+            )?
+        } else {
+            let layout = self.pipe.component_layout()?;
+            self.pipe.render_scoped(
+                req,
+                &layout.vae_cfg,
+                || candle_gen::cached(&self.components, || self.pipe.load_components_from(&layout)),
+                scope,
+                on_progress,
+            )?
+        };
+        Ok(GenerationOutput::Video {
+            frames,
+            fps,
+            audio: None,
+        })
     }
 }
 
@@ -180,7 +210,19 @@ impl Generator for MochiGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_generation(self.descriptor(), req, on_progress, |progress| {
+            self.generate_scoped(req, scope, progress)
+                .map(gen_core::GenerationReport::from_output)
+        })
     }
 
     fn generate(
@@ -188,15 +230,7 @@ impl Generator for MochiGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        let pipe = Pipeline::new(&self.root, &self.device);
-        let components = self.components(&pipe)?;
-        let (frames, fps) = pipe.render(req, &components, on_progress)?;
-        Ok(GenerationOutput::Video {
-            frames,
-            fps,
-            audio: None,
-        })
+        self.generate_scoped(req, None, on_progress)
     }
 }
 
@@ -262,8 +296,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     Ok(Box::new(MochiGenerator {
         descriptor: descriptor(),
-        root,
-        device,
+        pipe: Pipeline::new(&root, &device),
         components: Mutex::new(None),
     }))
 }
