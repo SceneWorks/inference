@@ -10,6 +10,50 @@ use gen_core::checkpoint_codec::{CodecResidencyPolicy, LogicalKeyMapping, Logica
 use gen_core::checkpoint_facts::{CheckpointWeightFacts, NativeExecutionCapability};
 use std::path::Path;
 
+/// Price the physical rows the model materializes as F32, replacing source-encoded
+/// projections and their consumed scale/descriptor companions with the backend's actual layout.
+pub fn component_f32_bytes(
+    path: &Path,
+    require_float: bool,
+    is_matrix: impl Fn(&str, &[usize]) -> bool,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::{collect_safetensors_files, safetensors_path_tensor_headers};
+    let headers = safetensors_path_tensor_headers(path)?;
+    let mut paths = Vec::new();
+    if path.is_dir() {
+        collect_safetensors_files(path, &mut paths)?;
+        paths.sort();
+    } else {
+        paths.push(path.to_owned());
+    }
+    let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        &paths,
+        &headers,
+        |_| 4,
+        &CandleCodecResidency::default_device_for_admission(),
+        is_matrix,
+    )?;
+    headers.iter().try_fold(0u64, |total, h| {
+        let bytes =
+            if let Some(&bytes) = encoded.get(&h.name) {
+                bytes
+            } else if !require_float || h.is_float() {
+                h.materialized_bytes(4)?
+            } else {
+                return Err(gen_core::Error::Unsupported(format!(
+                "{} requires floating weights or a supported checkpoint codec, found {:?} for {}",
+                path.display(), h.dtype, h.name
+            )));
+            };
+        total.checked_add(bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{}: component resident byte overflow",
+                path.display()
+            ))
+        })
+    })
+}
+
 pub fn plan_logical_weights(
     path: &Path,
     mapping: &dyn LogicalKeyMapping,
