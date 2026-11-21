@@ -868,7 +868,7 @@ impl AdaptLinear {
     }
     /// Native symmetric INT8 base with shared adapter residual semantics.
     pub fn from_convrot(base: super::convrot_int8::ConvRotLinear) -> Self {
-        let d = base.descriptor;
+        let d = base.descriptor();
         Self {
             base: Base::ConvRot(Arc::new(base)),
             in_features: d.in_features,

@@ -785,17 +785,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                     );
                     let input_scale_key = format!("{base}{INPUT_SCALE_SUFFIX}");
                     if let Some(input_header) = by_name.get(input_scale_key.as_str()) {
-                        // Same rule as the ScalarFp8 arm: a packed-native load keeps the activation
-                        // scale resident, a dense decode consumes it. Pricing it at zero
-                        // unconditionally would under-report a packed MXFP8 row. (Only the MXFP8
-                        // half of this arm can get here — the companion-surface check above refuses
-                        // an `input_scale` on an `int8_tensorwise` layer by format.)
-                        let retained = match mode {
-                            ResidencyMode::Packed => {
-                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
-                            ResidencyMode::Dense => 0,
-                        };
+                        // MXFP8 activation exponents are dynamic per block. Stored input_scale
+                        // remains a source fact but occupies no resident execution storage.
+                        let retained = 0;
                         consume_companion(
                             input_header,
                             CompanionRole::InputScale,

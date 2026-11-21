@@ -47,3 +47,31 @@ extern "C" __global__ void scalar_e5m2_gemm(const unsigned char* x, const unsign
         }
     }
 }
+
+// One warp computes the activation scale and codes for a block of 32 elements.
+// Pad both dimensions for the block-scaled GEMM. Unused scale atom entries are zero.
+extern "C" __global__ void mxfp8_activation(const float* x, unsigned char* codes,
+    unsigned char* scales, unsigned m, unsigned k, unsigned k_padded, unsigned m_padded) {
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned block = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const unsigned blocks = k_padded / 32;
+    const unsigned row = block / blocks, col_block = block % blocks;
+    if (row >= m_padded) return;
+    const unsigned col = col_block * 32 + lane;
+    const float v = row < m && col < k ? x[(unsigned long long)row*k + col] : 0;
+    float amax = fabsf(v);
+    for (unsigned offset = 16; offset; offset /= 2)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    const float need = fmaxf(amax / 448.f, 0x1p-127f);
+    int power;
+    const float mantissa = frexpf(need, &power);
+    const int exp = max(0, min(254, power - (mantissa == 0.5f) + 127));
+    const float scaled = ldexpf(v, 127 - exp);
+    unsigned short bits;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;" : "=h"(bits) : "f"(0.f),"f"(scaled));
+    codes[(unsigned long long)row*k_padded + col] = (unsigned char)bits;
+    if (lane == 0) {
+        const unsigned atom = (row / 128) * ((blocks + 3) / 4) + col_block / 4;
+        scales[atom*512 + (row%32)*16 + ((row%128)/32)*4 + col_block%4] = amax == 0.f ? 0 : (unsigned char)exp;
+    }
+}

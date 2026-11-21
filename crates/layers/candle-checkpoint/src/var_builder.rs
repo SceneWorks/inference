@@ -29,10 +29,68 @@ impl LogicalKeyMapping for SourceMapping {
 
 /// The same source can serve stock builders and typed models that collect a raw tensor map.
 #[derive(Clone)]
-pub struct ProjectionSource(Arc<LogicalWeightReader>);
+pub struct ProjectionSource(Arc<LogicalWeightReader>, Arc<SourcePlan>);
+struct SourcePlan {
+    headers: Vec<SafetensorsTensorHeader>,
+    descriptors: BTreeMap<String, Vec<u8>>,
+    metadata: Option<String>,
+    other_devices: std::sync::Mutex<Vec<Arc<LogicalWeightReader>>>,
+}
+impl SourcePlan {
+    fn open(&self, st: Arc<MmapedSafetensors>, dev: &Device) -> Result<Arc<LogicalWeightReader>> {
+        let policy = CandleCodecResidency::probe(dev);
+        let plan = gen_core::compile_logical_weight_plan_with_metadata(
+            &self.headers,
+            &self.descriptors,
+            self.metadata.as_deref(),
+            &SourceMapping,
+            baseline_codec_registry(),
+            &policy,
+        )
+        .map_err(Error::wrap)?;
+        Ok(Arc::new(LogicalWeightReader::from_mapped(
+            st,
+            plan,
+            dev,
+            policy.native_execution_capability(),
+        )))
+    }
+}
 impl ProjectionSource {
     pub fn reader(&self) -> &LogicalWeightReader {
         &self.0
+    }
+
+    pub fn on_device(&self, dev: &Device) -> Result<Self> {
+        if self.0.device().same_device(dev) {
+            return Ok(self.clone());
+        }
+        let mut cache = self
+            .1
+            .other_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(reader) = cache.iter().find(|reader| reader.device().same_device(dev)) {
+            return Ok(Self(reader.clone(), self.1.clone()));
+        }
+        let reader = self.1.open(self.0.st.clone(), dev)?;
+        cache.push(reader.clone());
+        Ok(Self(reader, self.1.clone()))
+    }
+
+    pub fn mmap(&self) -> &MmapedSafetensors {
+        &self.0.st
+    }
+    pub fn native_linear(
+        &self,
+        key: &str,
+        dtype: DType,
+        dev: &Device,
+        bias: Option<Tensor>,
+    ) -> Result<Option<candle_nn::Linear>> {
+        Ok(self
+            .native_linear_weight(key, None, dtype, dev)?
+            .map(|op| candle_nn::Linear::from_native(op, bias)))
     }
 
     /// Return the original mmap for a plain checkpoint. Detection inspects tensor headers only.
@@ -126,23 +184,21 @@ impl ProjectionSource {
             }
         }
         let meta = (!layers.is_empty()).then(|| serde_json::json!({"layers":layers}).to_string());
-        let residency = CandleCodecResidency::probe(dev);
-        let plan = gen_core::compile_logical_weight_plan_with_metadata(
-            &headers,
-            &descriptors,
-            meta.as_deref(),
-            &SourceMapping,
-            baseline_codec_registry(),
-            &residency,
-        )
-        .map_err(Error::wrap)?;
-        Ok(Ok(Self(Arc::new(LogicalWeightReader::from_mapped(
-            st,
-            plan,
-            dev,
-            residency.native_execution_capability(),
-        )))))
+        let definition = Arc::new(SourcePlan {
+            headers,
+            descriptors,
+            metadata: meta,
+            other_devices: Default::default(),
+        });
+        let reader = definition.open(Arc::new(st), dev)?;
+        Ok(Ok(Self(reader, definition)))
     }
+}
+
+#[cfg(feature = "cuda")]
+enum NativeOp {
+    Fp8(candle_quant_kernels::fp8_linear::Fp8Linear),
+    ConvRot(candle_quant_kernels::convrot_int8::ConvRotLinear),
 }
 
 #[cfg(feature = "cuda")]
@@ -150,23 +206,49 @@ struct SourceLinear {
     source: ProjectionSource,
     key: String,
     dtype: DType,
-    op: candle_quant_kernels::fp8_linear::Fp8Linear,
+    op: NativeOp,
+    format_id: &'static str,
+    resident_bytes: u64,
 }
 #[cfg(feature = "cuda")]
 impl NativeLinearWeight for SourceLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.op.forward(x)?.to_dtype(x.dtype())
+    fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        match &self.op {
+            NativeOp::ConvRot(op) => match bias {
+                Some(b) => op.forward_with_bias(x, b),
+                None => op.forward(x),
+            },
+            NativeOp::Fp8(op) => {
+                let y = op.forward(x)?.to_dtype(x.dtype())?;
+                match bias {
+                    Some(b) => y.broadcast_add(&b.to_dtype(x.dtype())?),
+                    None => Ok(y),
+                }
+            }
+        }
+    }
+    fn format_id(&self) -> &'static str {
+        self.format_id
+    }
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
     }
     fn dense_weight(&self) -> Result<Tensor> {
         self.source
             .0
-            .read_dense(&self.key, self.dtype, self.op.device())
+            .read_dense(&self.key, self.dtype, self.device())
     }
     fn dims(&self) -> (usize, usize) {
-        self.op.dims()
+        match &self.op {
+            NativeOp::Fp8(op) => op.dims(),
+            NativeOp::ConvRot(op) => (op.descriptor().out_features, op.descriptor().in_features),
+        }
     }
     fn device(&self) -> &Device {
-        self.op.device()
+        match &self.op {
+            NativeOp::Fp8(op) => op.device(),
+            NativeOp::ConvRot(op) => op.device(),
+        }
     }
 }
 
@@ -174,23 +256,49 @@ impl SimpleBackend for ProjectionSource {
     fn native_linear_weight(
         &self,
         name: &str,
+        shape: Option<(usize, usize)>,
         dtype: DType,
         dev: &Device,
     ) -> Result<Option<Arc<dyn NativeLinearWeight>>> {
+        if !self.reader().device().same_device(dev) {
+            return self
+                .on_device(dev)?
+                .native_linear_weight(name, shape, dtype, dev);
+        }
         #[cfg(feature = "cuda")]
-        if let Some(op) = self.0.fp8_projection(name, None)? {
-            if !op.device().same_device(dev) {
-                candle_core::bail!("{name}: source and requested execution device differ");
-            }
-            return Ok(Some(Arc::new(SourceLinear {
+        {
+            let op = if let Some(base) = self.0.convrot_projection(name, None)? {
+                NativeOp::ConvRot(base)
+            } else if let Some(base) = self.0.fp8_projection_with_shape(name, None, shape)? {
+                NativeOp::Fp8(base)
+            } else {
+                return Ok(None);
+            };
+            let layer = SourceLinear {
                 source: self.clone(),
                 key: name.to_owned(),
                 dtype,
                 op,
-            })));
+                format_id: self
+                    .0
+                    .planned(name)
+                    .expect("constructed planned projection")
+                    .codec_id,
+                resident_bytes: self
+                    .0
+                    .materialized_bytes(name)
+                    .expect("constructed projection recorded"),
+            };
+            if !layer.device().same_device(dev) {
+                candle_core::bail!("{name}: source and requested execution device differ");
+            }
+            Ok(Some(Arc::new(layer)))
         }
-        let _ = (name, dtype, dev);
-        Ok(None)
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, shape, dtype, dev);
+            Ok(None)
+        }
     }
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         if self.0.planned(name).is_some() {

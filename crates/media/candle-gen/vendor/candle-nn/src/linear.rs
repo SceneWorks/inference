@@ -24,8 +24,10 @@ use std::sync::{Arc, OnceLock};
 /// A frozen, checkpoint-native matrix implementing unbiased x Wᵀ.
 /// Operators requiring the actual dense matrix can request its decoded weight explicitly.
 pub trait NativeLinearWeight: Send + Sync {
-    fn forward(&self, x: &Tensor) -> Result<Tensor>;
+    fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>;
     fn dense_weight(&self) -> Result<Tensor>;
+    fn format_id(&self) -> &'static str;
+    fn resident_bytes(&self) -> u64;
     fn dims(&self) -> (usize, usize);
     fn device(&self) -> &candle::Device;
 }
@@ -77,6 +79,19 @@ impl Linear {
         matches!(self.weight, Weight::Native { .. })
     }
 
+    pub fn native_format_id(&self) -> Option<&'static str> {
+        match &self.weight {
+            Weight::Native { projection, .. } => Some(projection.format_id()),
+            Weight::Dense(_) => None,
+        }
+    }
+    pub fn native_resident_bytes(&self) -> Option<u64> {
+        match &self.weight {
+            Weight::Native { projection, .. } => Some(projection.resident_bytes()),
+            Weight::Dense(_) => None,
+        }
+    }
+
     pub fn weight_dims(&self) -> Result<(usize, usize)> {
         match &self.weight {
             Weight::Dense(t) => t.dims2(),
@@ -123,11 +138,7 @@ impl super::Module for Linear {
         let weight = match &self.weight {
             Weight::Dense(weight) => weight,
             Weight::Native { projection, .. } => {
-                let y = projection.forward(x)?;
-                return match &self.bias {
-                    Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),
-                    None => Ok(y),
-                };
+                return projection.forward(x, self.bias.as_ref());
             }
         };
         // When possible, we avoid using a broadcasted matmul as it is much slower
@@ -187,7 +198,7 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Li
 
 /// Create or initialize a new linear layer without biases.
 pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Linear> {
-    if let Some(native) = vb.native_linear_weight("weight")? {
+    if let Some(native) = vb.native_linear_weight_with_shape("weight", Some((out_dim, in_dim)))? {
         if native.dims() != (out_dim, in_dim) {
             candle::bail!(
                 "native weight {} expected [{out_dim},{in_dim}], got {:?}",

@@ -10,6 +10,7 @@ pub struct Fp8Linear {
     device: Device,
     dims: (usize, usize),
     input_scale: Option<f32>,
+    block_scales: Option<Tensor>,
     scale_w: f32,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
@@ -70,6 +71,7 @@ impl Fp8Linear {
         let device = codes.device().clone();
         Ok(Self {
             dims: codes.dims2()?,
+            block_scales: None,
             w_fp8: lt.stage_fp8(&codes)?,
             device,
             scale_w,
@@ -77,6 +79,34 @@ impl Fp8Linear {
             bias,
             lt,
         })
+    }
+
+    pub fn from_mxfp8_parts(
+        codes: Tensor,
+        block_scales: Tensor,
+        logical: (usize, usize),
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        if codes.dtype() != candle_core::DType::F8E4M3
+            || block_scales.dtype() != candle_core::DType::U8
+            || codes.dims()
+                != [
+                    logical.0.next_multiple_of(32),
+                    logical.1.next_multiple_of(32),
+                ]
+            || !codes.device().same_device(block_scales.device())
+            || bias
+                .as_ref()
+                .is_some_and(|b| b.dims() != [logical.0] || !b.device().same_device(codes.device()))
+        {
+            candle_core::bail!("invalid MXFP8 shape, bias or scale storage");
+        }
+        let mut layer = Self::from_codes(codes, 1.0, None, None, lt)?;
+        layer.dims = logical;
+        layer.block_scales = Some(block_scales.contiguous()?);
+        layer.bias = bias;
+        Ok(layer)
     }
 
     pub fn dims(&self) -> (usize, usize) {
@@ -95,12 +125,19 @@ impl Fp8Linear {
     /// `x`: `(..., K)`; flattened to `(M, K)` for the GEMM, then reshaped back. Output bf16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (flat, restore) = flatten_tokens(x)?;
-        let (qx, scale_x) =
+        if flat.dim(1)? != self.dims.1 || !flat.device().same_device(self.device()) {
+            candle_core::bail!("FP8 input width or device differs from weight");
+        }
+        let y = if let Some(scales) = &self.block_scales {
             self.lt
-                .scaled_fp8_activation(&flat, self.input_scale, self.w_fp8.is_e5m2())?;
-        let y = self
-            .lt
-            .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, scale_x)?;
+                .mxfp8_linear(&self.w_fp8, scales, &flat, self.dims.0)?
+        } else {
+            let (qx, sx) =
+                self.lt
+                    .scaled_fp8_activation(&flat, self.input_scale, self.w_fp8.is_e5m2())?;
+            self.lt
+                .matmul_fp8_staged(&self.w_fp8, self.scale_w, &qx, sx)?
+        };
         let y = restore(y)?;
         match &self.bias {
             Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),

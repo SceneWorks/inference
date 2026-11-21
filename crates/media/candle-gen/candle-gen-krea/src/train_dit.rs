@@ -1243,11 +1243,12 @@ mod tests {
         candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
         for quant in [Quant::Q4, Quant::Q8] {
             let (dit, native_nvfp4) = crate::control_provider::load_control_native_dit(
-                &path,
+                &gen_core::PinnedWeightsFile::pin(&path).unwrap(),
                 &cfg,
                 &[],
                 Some(quant),
                 &Device::Cpu,
+                &gen_core::CheckpointFactsSink::new(),
             )
             .unwrap();
             assert!(!native_nvfp4);
@@ -1295,11 +1296,12 @@ mod tests {
         let (path, cfg) = crate::testfix::tiny_native_nvfp4_fixture(&tmp);
         for quant in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
             let error = crate::control_provider::load_control_native_dit(
-                &path,
+                &gen_core::PinnedWeightsFile::pin(&path).unwrap(),
                 &cfg,
                 &[],
                 Some(quant),
                 &Device::Cpu,
+                &gen_core::CheckpointFactsSink::new(),
             )
             .err()
             .unwrap()

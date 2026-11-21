@@ -355,6 +355,7 @@ impl Weights {
             CandleCodecResidency {
                 fp8_e4m3_native: false,
                 nvfp4_native: true,
+                mxfp8_native: false,
             },
             false,
         )
@@ -814,6 +815,7 @@ impl Weights {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype),
                 LogicalTensor::PackedNvfp4 { .. }
                 | LogicalTensor::PackedConvRot { .. }
+                | LogicalTensor::PackedMxFp8 { .. }
                 | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
                     "krea: `{name}` was planned packed-native; construct it through \
                          `linear_detect_planned`, not a dense read — or re-open the checkpoint \
@@ -866,6 +868,7 @@ impl Weights {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(DType::F32),
                 LogicalTensor::PackedNvfp4 { .. }
                 | LogicalTensor::PackedConvRot { .. }
+                | LogicalTensor::PackedMxFp8 { .. }
                 | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
                     "krea: `{name}` was planned packed-native; construct it through \
                          `linear_detect_planned`, not a dense read — or re-open the checkpoint \
@@ -1442,7 +1445,9 @@ pub fn linear_detect_planned(
                 let weight = weight.to_dtype(w.dtype())?;
                 Ok(QLinear::dense(Linear::new(weight, dense_bias)))
             }
-            LogicalTensor::PackedConvRot { .. } | LogicalTensor::PackedScalarFp8 { .. } => {
+            LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedMxFp8 { .. }
+            | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "krea NVFP4: `{weight_key}` is planned as `{}` but the reader returned a \
                      packed fp8 container; the plan and reader disagree about this row's codec",
@@ -3731,6 +3736,7 @@ mod tests {
         let sm120 = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
 
         let cases: [(

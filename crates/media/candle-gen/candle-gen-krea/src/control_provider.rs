@@ -215,6 +215,7 @@ struct Krea2ControlHeavy {
 /// retain only the heavy phase and its encoded prompt between poses. Sequential still bounds peak at
 /// `max(Qwen3-VL, DiT + branch + VAE)` and drops the heavy phase before encoding a different prompt.
 pub struct Krea2Control {
+    checkpoint_facts: candle_gen::gen_core::CheckpointFactsSink,
     unobserved_adapter_count: usize,
     pub(crate) device: Device,
     residency: candle_gen::Residency<Krea2ControlText, Rc<Krea2ControlHeavy>>,
@@ -319,6 +320,11 @@ impl<Heavy> StagedPoseCache<Heavy> {
 }
 
 impl Krea2Control {
+    /// Measured residency of the imported transformer materialized by this handle.
+    pub fn checkpoint_weight_facts(&self) -> Option<candle_gen::gen_core::CheckpointWeightFacts> {
+        self.checkpoint_facts.facts()
+    }
+
     /// Projection regimes of the resident native transformer after a completed render.
     pub fn nvfp4_report(&self) -> Result<Option<crate::nvfp4_dit::Nvfp4Report>> {
         if let Some((_, heavy, _)) = self.staged_cache.state.borrow().as_ref() {
@@ -363,7 +369,13 @@ impl Krea2Control {
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
         let heavy_convrot_dit = paths.convrot_dit.clone();
-        let heavy_native_dit = paths.native_dit.clone();
+        let heavy_native_dit = paths
+            .native_dit
+            .as_deref()
+            .map(candle_gen::gen_core::PinnedWeightsFile::pin)
+            .transpose()?;
+        let checkpoint_facts = candle_gen::gen_core::CheckpointFactsSink::new();
+        let heavy_facts = checkpoint_facts.clone();
         let heavy_control = paths.control.clone();
         let heavy_adapters = paths.adapters.clone();
         let heavy_branch_tier = paths.branch_tier;
@@ -375,7 +387,8 @@ impl Krea2Control {
                 load_control_heavy(
                     &heavy_root,
                     heavy_convrot_dit.as_deref(),
-                    heavy_native_dit.as_deref(),
+                    heavy_native_dit.as_ref(),
+                    &heavy_facts,
                     transformer_quant,
                     &heavy_control,
                     &heavy_adapters,
@@ -387,6 +400,7 @@ impl Krea2Control {
             },
         );
         Ok(Self {
+            checkpoint_facts,
             unobserved_adapter_count: paths.adapters.len(),
             device,
             residency,
@@ -608,7 +622,8 @@ fn resolve_control_text_encoder_source(
 fn load_control_heavy(
     root: &Path,
     convrot_dit: Option<&Path>,
-    native_dit: Option<&Path>,
+    native_dit: Option<&candle_gen::gen_core::PinnedWeightsFile>,
+    facts: &candle_gen::gen_core::CheckpointFactsSink,
     transformer_quant: Option<Quant>,
     control: &Path,
     adapters: &[AdapterSpec],
@@ -619,7 +634,7 @@ fn load_control_heavy(
     let cfg = Krea2Config::from_snapshot(root)?;
 
     let mut branch_tier = branch_tier;
-    let mut dit = match control_dit_source(convrot_dit, native_dit)? {
+    let mut dit = match control_dit_source(convrot_dit, native_dit.map(|pin| pin.loader_path()))? {
         ControlDitSource::Snapshot => {
             let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
             // Diff-patch (`.diff`/`.diff_b`) deltas fold into the dense baseline weights before the DiT
@@ -651,9 +666,10 @@ fn load_control_heavy(
             }
             dit
         }
-        ControlDitSource::Native(native_dit) => {
+        ControlDitSource::Native(_) => {
+            let pin = native_dit.expect("native source selected");
             let (dit, native_nvfp4) =
-                load_control_native_dit(native_dit, &cfg, adapters, transformer_quant, device)?;
+                load_control_native_dit(pin, &cfg, adapters, transformer_quant, device, facts)?;
             if native_nvfp4 {
                 branch_tier =
                     candle_gen::gen_core::tier_integrity::control_branch_tier(Some(Quant::Nvfp4));
@@ -692,40 +708,52 @@ fn load_control_heavy(
 /// The imported pose trunk uses the generation lane's CPU-stage/fold ordering, so a
 /// Q4/Q8 request never constructs a complete dense transformer on the compute device.
 pub(crate) fn load_control_native_dit(
-    native_dit: &Path,
+    native_dit: &candle_gen::gen_core::PinnedWeightsFile,
     cfg: &Krea2Config,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
     device: &Device,
+    facts: &candle_gen::gen_core::CheckpointFactsSink,
 ) -> Result<(KreaTrainDit, bool)> {
-    let source_device = if matches!(quant, Some(Quant::Q4 | Quant::Q8)) {
-        &Device::Cpu
-    } else {
-        device
-    };
-    let mut weights = Weights::from_native_file_for(
-        native_dit,
-        source_device,
-        DType::BF16,
-        crate::native_mapping::DeclaredLogicalShapes::FromConfig(cfg),
-    )?;
-    let native_nvfp4 = weights.is_native_nvfp4();
-    if native_nvfp4 && matches!(quant, Some(Quant::Q4 | Quant::Q8)) {
-        return Err(CandleError::Msg(
-            "Krea Kitchen NVFP4 weights cannot be requantized as Q4/Q8".into(),
-        ));
-    }
-    crate::convert::validate_native_transformer(&weights, cfg)?;
-    let diff = crate::adapters::fold_diff_patch(&mut weights, adapters)?;
-    let mut dit = KreaTrainDit::load_inference(&weights, cfg)?;
-    if let Some(quant) = quant.filter(|_| !native_nvfp4) {
-        dit.quantize_imported_onto(quant, device)?;
-    }
-    if !adapters.is_empty() {
-        crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
-    }
-    device.synchronize()?;
-    Ok((dit, native_nvfp4))
+    native_dit
+        .read_unchanged(|_| {
+            let mut weights = Weights::from_pinned_native_file_for(
+                native_dit,
+                device,
+                DType::BF16,
+                crate::native_mapping::DeclaredLogicalShapes::FromConfig(cfg),
+                matches!(quant, Some(Quant::Q4 | Quant::Q8)),
+            )?;
+            let source_encoded = weights
+                .logical_plan()
+                .is_some_and(|plan| plan.has_encoded_weights());
+            let native_nvfp4 = weights.is_native_nvfp4();
+            if native_nvfp4 && matches!(quant, Some(Quant::Q4 | Quant::Q8)) {
+                return Err(CandleError::Msg(
+                    "Krea Kitchen NVFP4 weights cannot be requantized as Q4/Q8".into(),
+                ));
+            }
+            crate::convert::validate_native_transformer(&weights, cfg)?;
+            let diff = crate::adapters::fold_diff_patch(&mut weights, adapters)?;
+            let mut dit = KreaTrainDit::load_inference(&weights, cfg)?;
+            if let Some(quant) = quant.filter(|_| !source_encoded) {
+                dit.quantize_imported_onto(quant, device)?;
+            }
+            if !adapters.is_empty() {
+                crate::adapters::install_additive_with_diff(
+                    &mut dit,
+                    adapters,
+                    &diff.applied_by_spec,
+                )?;
+            }
+            device.synchronize()?;
+            let receipt = weights.checkpoint_weight_facts()?;
+            Ok((dit, native_nvfp4, receipt))
+        })
+        .map(|(dit, nvfp4, receipt)| {
+            facts.publish_optional(receipt);
+            (dit, nvfp4)
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

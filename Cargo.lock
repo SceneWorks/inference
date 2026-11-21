@@ -1318,6 +1318,7 @@ dependencies = [
  "candle-nn",
  "float8",
  "half",
+ "sceneworks-gen-core",
 ]
 
 [[package]]

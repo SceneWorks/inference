@@ -111,6 +111,8 @@ pub struct CandleCodecResidency {
     /// The bound device runs the cuBLASLt NVFP4 block-scaled FP4 GEMM (CUDA, compute capability
     /// ≥ 12.0 — consumer Blackwell `sm_120`).
     pub nvfp4_native: bool,
+    /// Native VEC32_UE8M0 block scaling is available on Blackwell.
+    pub mxfp8_native: bool,
 }
 
 impl CandleCodecResidency {
@@ -118,6 +120,7 @@ impl CandleCodecResidency {
     pub const DENSE: Self = Self {
         fp8_e4m3_native: false,
         nvfp4_native: false,
+        mxfp8_native: false,
     };
 
     /// Render this policy as the backend-neutral **host capability** that crosses the worker
@@ -138,6 +141,9 @@ impl CandleCodecResidency {
             ]);
             ids.push(gen_core::convrot_int8::CODEC_ID);
         }
+        if self.mxfp8_native {
+            ids.push(MXFP8_CODEC.codec_id);
+        }
         if self.nvfp4_native {
             ids.push(NVFP4_CODEC.codec_id);
         }
@@ -149,9 +155,22 @@ impl CandleCodecResidency {
     /// treated as below both floors (dense fallback — the safe direction, never the silent-packed
     /// one).
     pub fn probe(device: &Device) -> Self {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(dev) = device {
+            if let Ok(cap) = candle_quant_kernels::device_compute_cap(dev) {
+                return Self::from_cuda_compute_cap(cap);
+            }
+        }
+        let _ = device;
+        Self::DENSE
+    }
+
+    /// Eligibility from a CUDA capability already measured by the process (e.g. NVML at startup).
+    pub fn from_cuda_compute_cap(cap: (i32, i32)) -> Self {
         Self {
-            fp8_e4m3_native: cuda_meets_sm89_floor(device),
-            nvfp4_native: cuda_meets_sm120_floor(device),
+            fp8_e4m3_native: candle_quant_kernels::compute_cap_meets_fp8_floor(cap),
+            nvfp4_native: candle_quant_kernels::compute_cap_meets_nvfp4_floor(cap),
+            mxfp8_native: candle_quant_kernels::cublaslt::compute_cap_meets_mxfp8_floor(cap),
         }
     }
 }
@@ -187,6 +206,9 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         // here keeps this predicate honest if that ever moved.
         if spec.full_precision_matrix_mult() {
             return ResidencyMode::Dense;
+        }
+        if self.mxfp8_native && matches!(spec, TensorCodecSpec::Mxfp8 { .. }) {
+            return ResidencyMode::Packed;
         }
         if let TensorCodecSpec::ConvRotInt8 { geometry, .. } = spec {
             return if self.fp8_e4m3_native && geometry.out_features.is_multiple_of(16) {
@@ -238,62 +260,6 @@ impl CodecResidencyPolicy for CandleCodecResidency {
     }
 }
 
-/// The locked-decision-7 sm_89 predicate, applied to a plan-time `Device`.
-///
-/// The threshold is **not** re-derived here: the capability is read off the device and handed to
-/// [`candle_quant_kernels::compute_cap_meets_fp8_floor`], the same predicate
-/// `CublasLt::meets_fp8_floor` (`cfg(cuda)`, hence unlinked here) applies to a
-/// bound handle. Planning cannot go through the handle itself — `CublasLt::new` allocates the
-/// handle's 32 MiB workspace, and residency is decided before any GEMM exists.
-#[cfg(feature = "cuda")]
-fn cuda_meets_sm89_floor(device: &Device) -> bool {
-    use candle_core::cuda::cudarc::driver::sys::CUdevice_attribute as Attr;
-    let Device::Cuda(cuda) = device else {
-        return false;
-    };
-    let stream = cuda.cuda_stream();
-    let ctx = stream.context();
-    let (Ok(major), Ok(minor)) = (
-        ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
-        ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
-    ) else {
-        return false;
-    };
-    candle_quant_kernels::compute_cap_meets_fp8_floor((major, minor))
-}
-
-#[cfg(not(feature = "cuda"))]
-fn cuda_meets_sm89_floor(_device: &Device) -> bool {
-    false
-}
-
-/// The NVFP4 `sm_120` predicate, applied to a plan-time `Device` (sc-20641) — the same shape as
-/// [`cuda_meets_sm89_floor`], and for the same reason: the threshold is **not** re-derived, the
-/// capability is read off the device and handed to
-/// [`candle_quant_kernels::compute_cap_meets_nvfp4_floor`], the same predicate `CublasLt::meets_nvfp4_floor`
-/// applies to a bound handle.
-#[cfg(feature = "cuda")]
-fn cuda_meets_sm120_floor(device: &Device) -> bool {
-    use candle_core::cuda::cudarc::driver::sys::CUdevice_attribute as Attr;
-    let Device::Cuda(cuda) = device else {
-        return false;
-    };
-    let stream = cuda.cuda_stream();
-    let ctx = stream.context();
-    let (Ok(major), Ok(minor)) = (
-        ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
-        ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
-    ) else {
-        return false;
-    };
-    candle_quant_kernels::compute_cap_meets_nvfp4_floor((major, minor))
-}
-
-#[cfg(not(feature = "cuda"))]
-fn cuda_meets_sm120_floor(_device: &Device) -> bool {
-    false
-}
-
 /// Header-plus-descriptors plan for one safetensors file under the given mapping and residency
 /// policy. Refuses before any tensor is created; the error names the exact on-disk tensor.
 pub fn plan_logical_weights(
@@ -312,6 +278,12 @@ pub fn plan_logical_weights(
 
 /// One decoded logical tensor.
 pub enum LogicalTensor {
+    /// Original, padded E4M3 matrix and contiguous swizzled E8M0 block-scale surface.
+    PackedMxFp8 {
+        codes: Tensor,
+        scales: Tensor,
+        logical: (usize, usize),
+    },
     /// Exact two's-complement storage bytes, F32 row scales, and required online rotation.
     PackedConvRot {
         codes: Tensor,
@@ -368,6 +340,9 @@ impl LogicalTensor {
         /// One retained `f32` scale.
         const SCALE_BYTES: u64 = std::mem::size_of::<f32>() as u64;
         match self {
+            Self::PackedMxFp8 { codes, scales, .. } => {
+                (codes.elem_count() + scales.elem_count()) as u64
+            }
             Self::PackedConvRot { codes, scales, .. } => {
                 (codes.elem_count() + scales.elem_count() * scales.dtype().size_in_bytes()) as u64
             }
@@ -484,9 +459,8 @@ pub fn read_logical_weights(
 ///   receipt remain the independent pair the contract requires. A companion's source bytes are
 ///   attributed to its owner's codec row only once that owner has materialized.
 pub struct LogicalWeightReader {
-    pub(crate) st: MmapedSafetensors,
-    #[cfg(feature = "cuda")]
-    fp8_context: std::sync::Mutex<Option<candle_quant_kernels::cublaslt::Int8Context>>,
+    pub(crate) st: std::sync::Arc<MmapedSafetensors>,
+    resources: candle_quant_kernels::convrot_int8::ProjectionResources,
     plan: LogicalWeightPlan,
     device: Device,
     /// Logical key → index into `plan.tensors`, built once at [`Self::open`].
@@ -567,11 +541,16 @@ impl LogicalWeightReader {
                 path.display(),
             )));
         }
-        Ok(Self::from_mapped(st, plan, device, capability))
+        Ok(Self::from_mapped(
+            std::sync::Arc::new(st),
+            plan,
+            device,
+            capability,
+        ))
     }
 
     pub(crate) fn from_mapped(
-        st: MmapedSafetensors,
+        st: std::sync::Arc<MmapedSafetensors>,
         plan: LogicalWeightPlan,
         device: &Device,
         capability: NativeExecutionCapability,
@@ -587,12 +566,45 @@ impl LogicalWeightReader {
             plan,
             device: device.clone(),
             by_logical_key,
-            #[cfg(feature = "cuda")]
-            fp8_context: Default::default(),
+            resources: Default::default(),
             measured: std::sync::Mutex::new(BTreeMap::new()),
             demoted: std::sync::Mutex::new(BTreeMap::new()),
             capability,
         }
+    }
+
+    pub fn set_int8_context(&mut self, context: candle_quant_kernels::Int8Context) {
+        self.resources.set_int8_context(context)
+    }
+
+    pub fn convrot_projection(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+    ) -> Result<Option<candle_quant_kernels::convrot_int8::ConvRotLinear>> {
+        if !self
+            .planned(key)
+            .is_some_and(|row| matches!(row.codec, TensorCodecSpec::ConvRotInt8 { .. }))
+        {
+            return Ok(None);
+        }
+        let LogicalTensor::PackedConvRot {
+            codes,
+            scales,
+            geometry,
+        } = self.read(key)?
+        else {
+            candle_core::bail!("{key}: expected ConvRot operands")
+        };
+        Ok(Some(
+            candle_quant_kernels::convrot_int8::ConvRotLinear::from_native_parts(
+                &self.resources,
+                geometry,
+                codes,
+                scales,
+                bias,
+            )?,
+        ))
     }
 
     /// Whether the native projection constructor owns this row of the compiled plan.
@@ -601,6 +613,7 @@ impl LogicalWeightReader {
             [
                 FP8_E4M3_SCALAR_CODEC.codec_id,
                 FP8_E5M2_SCALAR_CODEC.codec_id,
+                MXFP8_CODEC.codec_id,
             ]
             .contains(&row.codec_id)
                 && row.residency.mode == ResidencyMode::Packed
@@ -615,46 +628,45 @@ impl LogicalWeightReader {
         key: &str,
         bias: Option<Tensor>,
     ) -> Result<Option<candle_quant_kernels::fp8_linear::Fp8Linear>> {
+        self.fp8_projection_with_shape(key, bias, None)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn fp8_projection_with_shape(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+        shape: Option<(usize, usize)>,
+    ) -> Result<Option<candle_quant_kernels::fp8_linear::Fp8Linear>> {
         if !self.has_native_projection(key) {
             return Ok(None);
         }
-        #[cfg(feature = "cuda")]
-        {
-            let LogicalTensor::PackedScalarFp8 {
+        use candle_quant_kernels::fp8_linear::Fp8Linear;
+        let ctx = self.resources.int8_context(&self.device)?;
+        let lt = ctx.handle_for(&self.device)?.clone();
+        let layer = match self.read_with_shape(key, shape)? {
+            LogicalTensor::PackedScalarFp8 {
                 codes,
                 weight_scale,
                 input_scale,
                 ..
-            } = self.read(key)?
-            else {
-                return Err(CandleError::Msg(format!(
-                    "{key}: expected packed FP8 operand"
-                )));
-            };
-            let lt = {
-                let mut context = self
-                    .fp8_context
-                    .lock()
-                    .map_err(|_| CandleError::Msg("FP8 context lock poisoned".into()))?;
-                if context.is_none() {
-                    *context = Some(candle_quant_kernels::cublaslt::Int8Context::new(
-                        &self.device,
-                    )?);
-                }
-                context
-                    .as_ref()
-                    .expect("context initialized")
-                    .handle_for(&self.device)?
-                    .clone()
-            };
-            use candle_quant_kernels::fp8_linear::Fp8Linear;
-            let build = if codes.dtype() == DType::U8 {
-                Fp8Linear::from_e5m2_parts
-            } else {
-                Fp8Linear::from_parts
-            };
-            Ok(Some(build(codes, weight_scale, input_scale, bias, lt)?))
-        }
+            } if codes.dtype() == DType::U8 => {
+                Fp8Linear::from_e5m2_parts(codes, weight_scale, input_scale, bias, lt)?
+            }
+            LogicalTensor::PackedScalarFp8 {
+                codes,
+                weight_scale,
+                input_scale,
+                ..
+            } => Fp8Linear::from_parts(codes, weight_scale, input_scale, bias, lt)?,
+            LogicalTensor::PackedMxFp8 {
+                codes,
+                scales,
+                logical,
+            } => Fp8Linear::from_mxfp8_parts(codes, scales, logical, bias, lt)?,
+            _ => candle_core::bail!("{key}: expected packed FP8 projection"),
+        };
+        Ok(Some(layer))
     }
 
     /// Record that the provider served `logical_key` — a row the plan priced
@@ -706,6 +718,16 @@ impl LogicalWeightReader {
     }
 
     /// This host's native-execution declaration — the capability the plan was priced under.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    pub fn materialized_bytes(&self, key: &str) -> Option<u64> {
+        self.measured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+    }
     pub fn native_execution_capability(&self) -> &NativeExecutionCapability {
         &self.capability
     }
@@ -726,6 +748,14 @@ impl LogicalWeightReader {
 
     /// Materialize one planned logical tensor through its codec and record what it keeps resident.
     pub fn read(&self, logical_key: &str) -> Result<LogicalTensor> {
+        self.read_with_shape(logical_key, None)
+    }
+
+    fn read_with_shape(
+        &self,
+        logical_key: &str,
+        shape: Option<(usize, usize)>,
+    ) -> Result<LogicalTensor> {
         let tensor = self.planned(logical_key).ok_or_else(|| {
             CandleError::Msg(format!(
                 "logical weight read: `{logical_key}` has no entry in the compiled plan \
@@ -733,6 +763,34 @@ impl LogicalWeightReader {
                 self.plan.mapping_id
             ))
         })?;
+        let shaped;
+        let tensor = if let (
+            Some((n, k)),
+            TensorCodecSpec::Mxfp8 {
+                stored_shape,
+                logical_shape_declared: false,
+                ..
+            },
+        ) = (shape, &tensor.codec)
+        {
+            if gen_core::mxfp8_padded_shape([n, k]) != *stored_shape {
+                candle_core::bail!("{logical_key}: MXFP8 stored {stored_shape:?} does not pad model shape [{n},{k}]");
+            }
+            let mut row = tensor.clone();
+            let TensorCodecSpec::Mxfp8 {
+                logical_shape_declared,
+                ..
+            } = &mut row.codec
+            else {
+                unreachable!()
+            };
+            *logical_shape_declared = true;
+            row.shape = vec![n, k];
+            shaped = row;
+            &shaped
+        } else {
+            tensor
+        };
         let decoded = decode(&self.st, tensor, &self.device)?;
         self.measured
             .lock()
@@ -1067,6 +1125,21 @@ fn decode(
                 stored_shape,
             )?;
             let scales = companion_bytes(st, tensor, scale)?;
+            if tensor.residency.mode == ResidencyMode::Packed {
+                let scale_shape = gen_core::mxfp8_scale_shape(*stored_shape);
+                let scale_tensor =
+                    Tensor::from_raw_buffer(scales, DType::U8, &scale_shape, device)?;
+                let codes = st.load(&tensor.physical_key, device)?;
+                let logical = (source_shape[0], source_shape[1]);
+                return apply_transform(
+                    tensor,
+                    LogicalTensor::PackedMxFp8 {
+                        codes,
+                        scales: scale_tensor,
+                        logical,
+                    },
+                );
+            }
             let mut values = Vec::new();
             cst::read_source_byte_sets(&[view.data(), scales], || {
                 gen_core::decode_mxfp8(
@@ -1334,6 +1407,23 @@ pub fn apply_transform(
     };
     let (start, len) = (transform.rows.start, transform.rows.len);
     match decoded {
+        LogicalTensor::PackedMxFp8 {
+            codes,
+            scales,
+            logical,
+        } => {
+            if transform.half_swap || !start.is_multiple_of(128) || !len.is_multiple_of(128) {
+                return Err(CandleError::Msg(format!(
+                    "{}: MXFP8 transform must select complete 128-row scale tiles",
+                    tensor.logical_key
+                )));
+            }
+            Ok(LogicalTensor::PackedMxFp8 {
+                codes: codes.narrow(0, start, len)?.contiguous()?,
+                scales: scales.narrow(0, start, len)?.contiguous()?,
+                logical: (len, logical.1),
+            })
+        }
         LogicalTensor::PackedConvRot { .. } => Err(CandleError::Msg(
             "ConvRot slices read directly from source".into(),
         )),

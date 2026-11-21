@@ -1471,6 +1471,9 @@ pub fn linear_from_weights_gs(
     bias: bool,
     group_size: usize,
 ) -> crate::Result<QLinear> {
+    if let Some(native) = weights.native_linear(base, bias)? {
+        return Ok(QLinear::from_dense(DenseLinear::Linear(native)));
+    }
     if weights.contains(&format!("{base}.comfy_quant"))
         && weights.contains(&format!("{base}.weight_scale"))
     {

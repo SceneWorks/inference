@@ -18,10 +18,7 @@ pub fn plan_logical_weights(
     Ok(shared::plan_logical_weights(path, mapping, policy)?)
 }
 
-pub struct LogicalWeightReader(
-    shared::LogicalWeightReader,
-    crate::weights::ProjectionResources,
-);
+pub struct LogicalWeightReader(shared::LogicalWeightReader);
 
 impl std::ops::Deref for LogicalWeightReader {
     type Target = shared::LogicalWeightReader;
@@ -32,10 +29,7 @@ impl std::ops::Deref for LogicalWeightReader {
 
 impl LogicalWeightReader {
     pub fn open(path: &Path, plan: LogicalWeightPlan, device: &Device) -> crate::Result<Self> {
-        Ok(Self(
-            shared::LogicalWeightReader::open(path, plan, device)?,
-            Default::default(),
-        ))
+        Ok(Self(shared::LogicalWeightReader::open(path, plan, device)?))
     }
 
     pub fn open_with_capability(
@@ -44,10 +38,9 @@ impl LogicalWeightReader {
         device: &Device,
         capability: NativeExecutionCapability,
     ) -> crate::Result<Self> {
-        Ok(Self(
-            shared::LogicalWeightReader::open_with_capability(path, plan, device, capability)?,
-            Default::default(),
-        ))
+        Ok(Self(shared::LogicalWeightReader::open_with_capability(
+            path, plan, device, capability,
+        )?))
     }
 
     pub fn checkpoint_weight_facts(&self) -> crate::Result<CheckpointWeightFacts> {
@@ -56,7 +49,7 @@ impl LogicalWeightReader {
 
     /// Seed a model's shared cuBLASLt context after the provider checked the device.
     pub fn set_int8_context(&mut self, context: crate::quant::Int8Context) {
-        self.1.set_int8_context(context);
+        self.0.set_int8_context(context);
     }
 
     /// Materialize and bind a planned ConvRot projection to this reader's shared device resources.
@@ -65,26 +58,11 @@ impl LogicalWeightReader {
         key: &str,
         bias: Option<Tensor>,
     ) -> crate::Result<Option<crate::quant::AdaptLinear>> {
-        if !self
-            .planned(key)
-            .is_some_and(|p| matches!(p.codec, gen_core::TensorCodecSpec::ConvRotInt8 { .. }))
-        {
-            return Ok(None);
-        }
-        let LogicalTensor::PackedConvRot {
-            codes,
-            scales,
-            geometry,
-        } = self.read(key)?
-        else {
-            return Err(crate::CandleError::Msg(format!(
-                "{key}: expected native ConvRot operands"
-            )));
-        };
-        let linear = crate::quant::convrot_int8::ConvRotLinear::from_native_parts(
-            &self.1, geometry, codes, scales, bias,
-        )?;
-        Ok(Some(crate::quant::AdaptLinear::from_convrot(linear)))
+        Ok(self
+            .0
+            .convrot_projection(key, bias)?
+            .map(crate::quant::convrot_int8::ConvRotLinear::from_native)
+            .map(crate::quant::AdaptLinear::from_convrot))
     }
 
     pub fn has_native_projection(&self, key: &str) -> bool {
@@ -454,6 +432,7 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap(),
             LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedMxFp8 { .. }
             | LogicalTensor::PackedScalarFp8 { .. }
             | LogicalTensor::PackedNvfp4 { .. } => {
                 panic!("{key} unexpectedly packed")
@@ -1119,6 +1098,7 @@ mod tests {
         );
         let native = CandleCodecResidency {
             nvfp4_native: false,
+            mxfp8_native: false,
             fp8_e4m3_native: true,
         };
         let plan = plan_logical_weights(&path, &StripModel, &native).expect("plan");
@@ -1331,6 +1311,7 @@ mod tests {
         let native = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         // Unpadded fixture; the adapter declares the grid it was built at (see above).
         let mapping = StripModelDeclaring(vec![rows, cols]);
@@ -1470,6 +1451,7 @@ mod tests {
         let (packed_plan, packed_reader) = facts_for(CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         });
         let packed = packed_reader.checkpoint_weight_facts().expect("facts");
         // Fact 2 is identical across the two hosts — it is a property of the file.
@@ -1509,6 +1491,7 @@ mod tests {
         let residency = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
         let reader = LogicalWeightReader::open_with_capability(
@@ -1676,6 +1659,7 @@ mod tests {
         let sm_100 = CandleCodecResidency {
             fp8_e4m3_native: compute_cap_meets_fp8_floor((10, 0)),
             nvfp4_native: compute_cap_meets_nvfp4_floor((10, 0)),
+            mxfp8_native: true,
         };
         let capability = sm_100.native_execution_capability();
         assert!(!capability.executes_natively(NVFP4_CODEC.codec_id));
@@ -1686,6 +1670,7 @@ mod tests {
         let sm_120 = CandleCodecResidency {
             fp8_e4m3_native: compute_cap_meets_fp8_floor((12, 0)),
             nvfp4_native: compute_cap_meets_nvfp4_floor((12, 0)),
+            mxfp8_native: true,
         };
         assert!(sm_120
             .native_execution_capability()
@@ -1767,6 +1752,7 @@ mod tests {
         let native = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         let plan = plan_logical_weights(&path, &DeclaresSixty, &native).expect("plan");
         let tensor = &plan.tensors[0];
@@ -1861,6 +1847,7 @@ mod tests {
         let native = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         let stored_bytes = [256_usize, 64];
         assert_eq!(
@@ -1992,6 +1979,7 @@ mod tests {
         let native = CandleCodecResidency {
             fp8_e4m3_native: true,
             nvfp4_native: false,
+            mxfp8_native: false,
         };
         let scalar_fp8 = TensorCodecSpec::ScalarFp8 {
             scale: ScalarScaleSource::Unit,
@@ -2421,6 +2409,7 @@ mod tests {
         let native = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         let mapping = FusedLayouts {
             source_logical_shape: Some(vec![rows, cols]),

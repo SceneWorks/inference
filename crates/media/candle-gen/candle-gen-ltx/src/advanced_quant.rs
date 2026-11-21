@@ -158,6 +158,7 @@ pub fn inspect_transformer_source(
                 &CandleCodecResidency {
                     fp8_e4m3_native: false,
                     nvfp4_native: true,
+                    mxfp8_native: false,
                 },
             )
             .map_err(|error| invalid(error.to_string()))?;
@@ -327,6 +328,7 @@ impl AdvancedQuantSource {
                 let residency = CandleCodecResidency {
                     fp8_e4m3_native: false,
                     nvfp4_native: true,
+                    mxfp8_native: false,
                 };
                 let plan = plan_logical_weights(path, &IdentityKeyMapping, &residency)
                     .map_err(|error| invalid(error.to_string()))?;

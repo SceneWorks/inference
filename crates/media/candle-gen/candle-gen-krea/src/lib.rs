@@ -4914,6 +4914,7 @@ mod tests {
         let native = CandleCodecResidency {
             fp8_e4m3_native: true,
             nvfp4_native: false,
+            mxfp8_native: false,
         };
         assert_eq!(
             native_dit_resident_bytes(&fp8, None, &native).unwrap(),
@@ -4939,6 +4940,7 @@ mod tests {
         let packed = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
         let prefix = crate::native_mapping::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
         let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::for_config(prefix, &cfg);
