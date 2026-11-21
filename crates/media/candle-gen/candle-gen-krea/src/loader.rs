@@ -776,6 +776,7 @@ impl Weights {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype),
                 LogicalTensor::PackedNvfp4 { .. }
                 | LogicalTensor::PackedConvRot { .. }
+                | LogicalTensor::PackedRowwiseFp8 { .. }
                 | LogicalTensor::PackedMxFp8 { .. }
                 | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
                     "krea: `{name}` was planned packed-native; construct it through \
@@ -829,6 +830,7 @@ impl Weights {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(DType::F32),
                 LogicalTensor::PackedNvfp4 { .. }
                 | LogicalTensor::PackedConvRot { .. }
+                | LogicalTensor::PackedRowwiseFp8 { .. }
                 | LogicalTensor::PackedMxFp8 { .. }
                 | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
                     "krea: `{name}` was planned packed-native; construct it through \
@@ -1407,6 +1409,7 @@ pub fn linear_detect_planned(
                 Ok(QLinear::dense(Linear::new(weight, dense_bias)))
             }
             LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedRowwiseFp8 { .. }
             | LogicalTensor::PackedMxFp8 { .. }
             | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(

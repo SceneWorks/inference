@@ -432,6 +432,7 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap(),
             LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedRowwiseFp8 { .. }
             | LogicalTensor::PackedMxFp8 { .. }
             | LogicalTensor::PackedScalarFp8 { .. }
             | LogicalTensor::PackedNvfp4 { .. } => {

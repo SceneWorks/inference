@@ -25,6 +25,8 @@ pub enum TensorCodecSpec {
         input_scale: Option<String>,
         full_precision_matrix_mult: bool,
     },
+    /// Dynamic per-token activation quantization and one original F32 weight scale per output row.
+    RowwiseFp8 { scale: String },
     /// MXFP8: stored 32×32-padded E4M3 values + swizzled E8M0 block scales.
     Mxfp8 {
         scale: String,
@@ -71,7 +73,7 @@ pub enum TensorCodecSpec {
 impl TensorCodecSpec {
     pub fn full_precision_matrix_mult(&self) -> bool {
         match self {
-            Self::Dense | Self::ConvRotInt8 { .. } => false,
+            Self::Dense | Self::RowwiseFp8 { .. } | Self::ConvRotInt8 { .. } => false,
             Self::ScalarFp8 {
                 full_precision_matrix_mult,
                 ..
