@@ -663,6 +663,56 @@ impl SparseMoe {
     }
 }
 
+// Read only E+1 boundaries for the three operators, regardless of prompt length. Token data,
+// sorted IDs, and expert operands stay on device. Each active expert receives a contiguous batch.
+pub fn routed_offsets(ids: &Array, experts: usize) -> Result<Vec<i32>> {
+    use mlx_rs::fast::MetalKernel;
+    thread_local! {static KERNEL:std::cell::RefCell<Option<MetalKernel>>=const{std::cell::RefCell::new(None)};}
+    const SOURCE: &str = r#"
+    uint e=thread_position_in_grid.x;
+    if(e<=uint(E)){
+        uint lo=0,hi=uint(P);
+        while(lo<hi){uint mid=lo+(hi-lo)/2u;if(uint(ids[mid])<e){lo=mid+1u;}else{hi=mid;}}
+        offsets[e]=int(lo);
+    }"#;
+    let count = i32::try_from(experts + 1)
+        .map_err(|_| Error::Config("expert count exceeds Metal indexing".into()))?;
+    let pairs = i32::try_from(ids.size())
+        .map_err(|_| Error::Config("token routes exceed Metal indexing".into()))?;
+    let offsets = KERNEL.with(|cell| -> Result<Array> {
+        let mut cache = cell.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(MetalKernel::with_options(
+                "sc_routed_offsets_v1",
+                &["ids"],
+                &["offsets"],
+                SOURCE,
+                "",
+                true,
+                false,
+            )?);
+        }
+        Ok(cache
+            .as_ref()
+            .unwrap()
+            .apply()
+            .inputs([ids])
+            .output_shape([count], Dtype::Int32)
+            .template_arg("E", count - 1)
+            .template_arg("P", pairs)
+            .grid(count, 1, 1)
+            .thread_group(32, 1, 1)
+            .run()?
+            .remove(0))
+    })?;
+    offsets.eval()?;
+    let offsets = offsets.as_slice::<i32>().to_vec();
+    if offsets.first() != Some(&0) || offsets.last() != Some(&pairs) {
+        return Err(Error::Config("routed expert ID outside bank".into()));
+    }
+    Ok(offsets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,54 +1108,4 @@ mod tests {
             assert!(whole.is_ok(), "{quant:?}: a matching router is refused");
         }
     }
-}
-
-// Read only E+1 boundaries for the three operators, regardless of prompt length. Token data,
-// sorted IDs, and expert operands stay on device. Each active expert receives a contiguous batch.
-pub fn routed_offsets(ids: &Array, experts: usize) -> Result<Vec<i32>> {
-    use mlx_rs::fast::MetalKernel;
-    thread_local! {static KERNEL:std::cell::RefCell<Option<MetalKernel>>=const{std::cell::RefCell::new(None)};}
-    const SOURCE: &str = r#"
-    uint e=thread_position_in_grid.x;
-    if(e<=uint(E)){
-        uint lo=0,hi=uint(P);
-        while(lo<hi){uint mid=lo+(hi-lo)/2u;if(uint(ids[mid])<e){lo=mid+1u;}else{hi=mid;}}
-        offsets[e]=int(lo);
-    }"#;
-    let count = i32::try_from(experts + 1)
-        .map_err(|_| Error::Config("expert count exceeds Metal indexing".into()))?;
-    let pairs = i32::try_from(ids.size())
-        .map_err(|_| Error::Config("token routes exceed Metal indexing".into()))?;
-    let offsets = KERNEL.with(|cell| -> Result<Array> {
-        let mut cache = cell.borrow_mut();
-        if cache.is_none() {
-            *cache = Some(MetalKernel::with_options(
-                "sc_routed_offsets_v1",
-                &["ids"],
-                &["offsets"],
-                SOURCE,
-                "",
-                true,
-                false,
-            )?);
-        }
-        Ok(cache
-            .as_ref()
-            .unwrap()
-            .apply()
-            .inputs([ids])
-            .output_shape([count], Dtype::Int32)
-            .template_arg("E", count - 1)
-            .template_arg("P", pairs)
-            .grid(count, 1, 1)
-            .thread_group(32, 1, 1)
-            .run()?
-            .remove(0))
-    })?;
-    offsets.eval()?;
-    let offsets = offsets.as_slice::<i32>().to_vec();
-    if offsets.first() != Some(&0) || offsets.last() != Some(&pairs) {
-        return Err(Error::Config("routed expert ID outside bank".into()));
-    }
-    Ok(offsets)
 }

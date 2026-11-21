@@ -527,6 +527,18 @@ pub(crate) fn eval_groups(groups: &[Vec<Array>]) -> Result<()> {
     Ok(())
 }
 
+impl mlx_layers::MlxWeightSource for Weights {
+    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
+        self.source_reads.get(key)
+    }
+    fn get(&self, key: &str) -> Option<&Array> {
+        self.get(key)
+    }
+    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.source_reads.rotation(group, build)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,17 +770,5 @@ mod tests {
         w.remove_accessed();
         assert_eq!(w.keys().collect::<Vec<_>>(), ["model.layers.0.never_read"]);
         assert_eq!(w.unused_keys(), ["model.layers.0.never_read"]);
-    }
-}
-
-impl mlx_layers::MlxWeightSource for Weights {
-    fn observation(&self, key: &str) -> Option<mlx_layers::source::Observation> {
-        self.source_reads.get(key)
-    }
-    fn get(&self, key: &str) -> Option<&Array> {
-        self.get(key)
-    }
-    fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
-        self.source_reads.rotation(group, build)
     }
 }
