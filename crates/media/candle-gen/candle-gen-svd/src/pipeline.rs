@@ -6,8 +6,10 @@
 //! Deterministic CPU-seeded noise (sc-3673 convention, matching candle-gen-wan).
 
 use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::gen_core::render::video::VideoDenoisePhase;
 use candle_gen::gen_core::sampling::EdmModelSampling;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
+use candle_gen::gen_core::{MemoryGeometry, MemoryRequestScope};
 use candle_gen::{check_cancel, CandleError, Result as CResult};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -173,10 +175,63 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Tensor> {
-    let device = latents.device().clone();
-    let sched = EdmSchedule::karras(steps, scheduler);
-    let ms = EdmModelSampling::svd();
+    let schedule = EdmSchedule::karras(steps, scheduler);
+    let phase = video_phase(latents, sampler, schedule.sigmas, seed)?;
+    denoise_phase(
+        &phase,
+        unet,
+        latents,
+        image_embeds,
+        image_latents,
+        added_time_ids,
+        num_frames,
+        min_g,
+        max_g,
+        cancel,
+        None,
+        on_progress,
+    )
+}
 
+pub(crate) fn video_phase<'a>(
+    latents: &Tensor,
+    sampler: Option<&'a str>,
+    sigmas: Vec<f32>,
+    seed: u64,
+) -> CResult<VideoDenoisePhase<(), Option<&'a str>>> {
+    let (batch, frames, _, height, width) = latents.dims5()?;
+    let geometry = MemoryGeometry {
+        width: width as u32 * crate::config::VAE_SCALE,
+        height: height as u32 * crate::config::VAE_SCALE,
+        frames: frames as u32,
+        batch: batch as u32,
+        reference_count: 1,
+    };
+    Ok(VideoDenoisePhase::fixed(
+        geometry,
+        frames as u32,
+        sampler,
+        sigmas,
+        seed,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_phase(
+    phase: &VideoDenoisePhase<(), Option<&str>>,
+    unet: &SvdUnet,
+    latents: &Tensor,
+    image_embeds: &Tensor,
+    image_latents: &Tensor,
+    added_time_ids: &Tensor,
+    num_frames: usize,
+    min_g: f32,
+    max_g: f32,
+    cancel: &CancelFlag,
+    scope: Option<&mut dyn MemoryRequestScope>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> CResult<Tensor> {
+    let active = phase.enter(cancel, scope)?;
     // Whether classifier-free guidance is active. SVD ramps the guidance per frame via
     // `linspace(min, max, F)`, so the diffusers `do_classifier_free_guidance` gate is `max > 1.0`:
     // when the max is 1.0 every per-frame scale is ≤ 1.0 and the blend `uncond + g·(cond − uncond)`
@@ -190,18 +245,18 @@ pub fn denoise(
     let cfg_inputs = if cfg_active {
         let zeros_e = image_embeds.zeros_like()?;
         let zeros_l = image_latents.zeros_like()?;
-        let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
+        let guidance = guidance_schedule(num_frames, min_g, max_g, latents.device())?;
         Some((zeros_e, zeros_l, guidance))
     } else {
         None
     };
 
-    candle_gen::run_curated_sampler(
-        sampler,
-        &ms,
-        &sched.sigmas,
+    let output = candle_gen::run_curated_sampler(
+        phase.solver,
+        &EdmModelSampling::svd(),
+        &phase.sigmas,
         latents.clone(),
-        seed,
+        phase.seed,
         cancel,
         on_progress,
         None,
@@ -229,7 +284,9 @@ pub fn denoise(
                 }
             }
         },
-    )
+    )?;
+    active.finish()?;
+    Ok(output)
 }
 
 /// Chunked temporal VAE decode (diffusers `decode_latents`): divide by `scaling_factor`, decode in
@@ -352,6 +409,31 @@ pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn phase_uses_uncompressed_frames_and_the_output_pixel_grid() {
+        let latents = Tensor::zeros(
+            (1, 5, 4, 2, 3),
+            candle_gen::candle_core::DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let phase = video_phase(&latents, Some("heun"), vec![700., 0.002, 0.], 41).unwrap();
+        assert_eq!(phase.latent_frames, 5);
+        assert_eq!(
+            phase.identity.geometry,
+            MemoryGeometry {
+                batch: 1,
+                frames: 5,
+                width: 24,
+                height: 16,
+                reference_count: 1
+            }
+        );
+        assert_eq!(phase.seed, 41);
+        assert_eq!(phase.sigmas, [700., 0.002, 0.]);
+        assert_eq!(phase.solver, Some("heun"));
+    }
 
     /// sc-8993 (F-013): when guidance is disabled every per-frame scale is `1.0`, and the CFG blend
     /// `uncond + g·(cond − uncond)` with `g == 1.0` is exactly `cond` for ANY uncond. This is the

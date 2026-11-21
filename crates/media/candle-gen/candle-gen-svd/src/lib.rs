@@ -515,12 +515,63 @@ impl Generator for SvdGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_generation(self.descriptor(), req, on_progress, |progress| {
+            self.generate_scoped(req, scope, progress)
+                .map(gen_core::GenerationReport::from_output)
+        })
     }
 
     fn generate(
         &self,
         req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_scoped(req, None, on_progress)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
+            },
+            |prepared| memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "svd_xt: loaded generator has no sealed memory receipt".into(),
+            )
+        })?;
+        memory_strategy::begin_request(memory, self.device.clone(), context)
+    }
+}
+
+impl SvdGenerator {
+    fn generate_scoped(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
@@ -609,12 +660,13 @@ impl Generator for SvdGenerator {
             .map_err(CandleError::from)?;
         dbg("init_latents", &latents);
 
-        let mut dispatch_state = (on_progress, Some(latents));
+        let phase = pipeline::video_phase(&latents, req.sampler.as_deref(), sched.sigmas, seed)?;
+        let mut dispatch_state = (on_progress, Some(latents), scope);
         let frames = dispatch_svd_offload(
             self.offload,
             &mut dispatch_state,
             |dispatch| {
-                let (on_progress, latents) = dispatch;
+                let (on_progress, latents, scope) = dispatch;
                 let comps = self.components()?;
                 let image_embeds = self.clip_embeds(&comps.image_encoder, img)?;
                 dbg("image_embeds", &image_embeds);
@@ -628,9 +680,9 @@ impl Generator for SvdGenerator {
                     seed,
                 )?;
                 dbg("image_latents", &image_latents);
-                let final_latents = pipeline::denoise(
+                let final_latents = pipeline::denoise_phase(
+                    &phase,
                     &comps.unet,
-                    &sched_cfg,
                     latents
                         .as_ref()
                         .expect("init latents seeded before residency dispatch"),
@@ -638,12 +690,10 @@ impl Generator for SvdGenerator {
                     &image_latents,
                     &atid,
                     params.num_frames,
-                    params.num_inference_steps,
                     params.min_guidance_scale,
                     params.max_guidance_scale,
-                    req.sampler.as_deref(),
-                    seed,
                     &req.cancel,
+                    scope.take(),
                     &mut **on_progress,
                 )?;
                 dbg("final_latents", &final_latents);
@@ -657,7 +707,7 @@ impl Generator for SvdGenerator {
                 )
             },
             |dispatch| {
-                let (on_progress, latents) = dispatch;
+                let (on_progress, latents, scope) = dispatch;
                 let mut state = SequentialState {
                     image_embeds: None,
                     image_latents: None,
@@ -694,9 +744,9 @@ impl Generator for SvdGenerator {
                         load_unet(&self.root, &self.device)
                     },
                     |unet, st| {
-                        let final_latents = pipeline::denoise(
+                        let final_latents = pipeline::denoise_phase(
+                            &phase,
                             unet,
-                            &sched_cfg,
                             st.latents
                                 .as_ref()
                                 .expect("init latents seeded before staging"),
@@ -708,12 +758,10 @@ impl Generator for SvdGenerator {
                                 .expect("image latents produced in conditioning phase"),
                             &atid,
                             params.num_frames,
-                            params.num_inference_steps,
                             params.min_guidance_scale,
                             params.max_guidance_scale,
-                            req.sampler.as_deref(),
-                            seed,
                             &req.cancel,
+                            scope.take(),
                             st.on_progress,
                         )?;
                         dbg("final_latents", &final_latents);
@@ -753,34 +801,6 @@ impl Generator for SvdGenerator {
             fps: req.fps.unwrap_or(params.fps),
             audio: None,
         })
-    }
-
-    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        self.memory.as_ref().map(|prepared| &prepared.contract)
-    }
-
-    fn memory_strategy_safety_check(
-        &self,
-        context: &gen_core::MemoryRunContext,
-    ) -> gen_core::MemorySafetyDecision {
-        self.memory.as_ref().map_or_else(
-            || gen_core::MemorySafetyDecision::Reject {
-                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
-            },
-            |prepared| memory_strategy::safety_check(prepared, context),
-        )
-    }
-
-    fn begin_memory_strategy_request(
-        &self,
-        context: &gen_core::MemoryRunContext,
-    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        let memory = self.memory.as_ref().ok_or_else(|| {
-            gen_core::Error::Unsupported(
-                "svd_xt: loaded generator has no sealed memory receipt".into(),
-            )
-        })?;
-        memory_strategy::begin_request(memory, self.device.clone(), context)
     }
 }
 
