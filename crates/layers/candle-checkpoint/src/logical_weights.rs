@@ -1082,10 +1082,10 @@ impl LogicalWeightReader {
             .planned(key)
             .ok_or_else(|| CandleError::Msg(format!("unplanned weight {key}")))?;
         let shaped = Self::shaped_row(row, shape)?;
+        let t = self.dense_coefficients(key, shape, dtype, device)?;
         self.accounting
             .declare_dense_layout(key, &shaped.shape, dtype.size_in_bytes())
             .map_err(CandleError::wrap)?;
-        let t = self.dense_coefficients(key, shape, dtype, device)?;
         let bytes = (t.elem_count() * t.dtype().size_in_bytes()) as u64;
         self.accounting
             .record(key, ExecutionRepresentation::DenseFallback, bytes)
