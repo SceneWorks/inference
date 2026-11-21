@@ -411,7 +411,13 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
 #[test]
 #[ignore = "requires the exclusive local Metal token"]
 fn selected_kernel_actual_device_smoke() {
+    assert!(matches!(
+        mlx_rs::Device::try_default().unwrap().get_type().unwrap(),
+        mlx_rs::DeviceType::Gpu
+    ));
     crate::veda::device_self_test().unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda_fixture::selected_kernel_actual_device_smoke");
 }
 
 #[test]

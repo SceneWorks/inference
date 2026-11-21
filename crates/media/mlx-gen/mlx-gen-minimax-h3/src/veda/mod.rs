@@ -1133,6 +1133,11 @@ fn scorer_self_test(l: &Layout, q: &Array, k: &Array, heads: usize, dim: usize) 
             host.len()
         )));
     }
+    #[cfg(test)]
+    println!(
+        "Veda dense BF16 predictor: all {} Metal logits match the host contract bit for bit",
+        host.len()
+    );
     Ok(())
 }
 

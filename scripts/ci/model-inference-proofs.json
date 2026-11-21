@@ -205875,6 +205875,45 @@
     }
   },
   {
+    "package": "mlx-gen-minimax-h3",
+    "target": "mlx_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "veda_fixture::selected_kernel_actual_device_smoke",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "Veda device_self_test deterministic BF16 activations and two-head dense BF16 Q/K predictor; no files",
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda/mod.rs::device_self_test and scorer_self_test",
+    "output_contract": "All dense BF16 predictor FP32 logits match gen-core host pool_video_tiles and tile_logits bit for bit. Sparse attention maximum absolute error <= 0.025 and mask discrimination > 0.1.",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "requires the exclusive local Metal token",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "mlx_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda_fixture.rs",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "requirements": [],
+      "source_identity": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/veda_fixture.rs::veda_fixture::selected_kernel_actual_device_smoke"
+    },
+    "reachable_helper_trace": [
+      "device_self_test -> scorer_self_test -> metal::scores -> scores_with_weights -> PROJECT -> LOGITS -> host_scores",
+      "device_self_test -> metal_batch -> attend -> host_masked_attention"
+    ]
+  },
+  {
     "package": "mlx-gen-mochi",
     "target": "integration",
     "target_kind": "test",

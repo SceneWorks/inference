@@ -646,7 +646,9 @@ pub fn scores_with_weights(
                 .remove(0))
         };
         let (fq, fk) = (pool(x_q)?, pool(x_k)?);
-        let unit = Array::from_f32(1.0);
+        // PROJECT indexes both scale arguments. MLX binds a rank-zero input as a Metal scalar
+        // even when its template branch is disabled, so the dense placeholders must be vectors.
+        let unit = Array::from_slice(&[1.0_f32], &[1]);
         let mut projected = k
             .project
             .apply()
