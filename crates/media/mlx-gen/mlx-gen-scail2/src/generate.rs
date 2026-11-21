@@ -106,12 +106,7 @@ pub(crate) const EXECUTION_SURFACE: mlx_gen::gen_core::ExecutionSurface =
 /// geometry on the same lattice [`align`] snaps it to, not on the pre-alignment request.
 pub(crate) const DIM_ALIGN: u32 = VAE_TILING.spatial_scale as u32 * 4;
 
-/// One masked character reference (the primary subject or an extra character): an RGB image paired
-/// with its color-coded segmentation mask.
-pub struct CharacterRef<'a> {
-    pub image: &'a Image,
-    pub mask: &'a Image,
-}
+pub use mlx_gen::gen_core::generator::Scail2CharacterRef as CharacterRef;
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
 /// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the

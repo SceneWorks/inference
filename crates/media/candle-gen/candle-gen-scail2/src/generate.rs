@@ -51,13 +51,7 @@ pub struct Components {
     pub tok: TextTokenizer,
 }
 
-/// One masked character reference (the primary subject or an extra character): an RGB image paired with
-/// its color-coded segmentation mask.
-#[derive(Debug)]
-pub struct CharacterRef<'a> {
-    pub image: &'a Image,
-    pub mask: &'a Image,
-}
+pub use candle_gen::gen_core::generator::Scail2CharacterRef as CharacterRef;
 
 /// A fully-specified SCAIL-2 generation job (the engine-internal form the worker maps a
 /// `GenerationRequest` onto). `width` and `height` must already be non-zero multiples of the

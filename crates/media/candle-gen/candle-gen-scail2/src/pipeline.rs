@@ -24,9 +24,9 @@ use candle_gen::candle_core::{
 use candle_gen::candle_nn::var_builder::{Rename, SimpleBackend};
 use candle_gen::candle_nn::{Init, VarBuilder};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    ReplacementMode, SizeFloor, WeightsSource,
+    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, ReplacementMode,
+    SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
@@ -36,7 +36,7 @@ use cst::Load;
 
 use crate::clip::{ClipVisionConfig, ScailClip};
 use crate::config::Scail2Config;
-use crate::generate::{align, CharacterRef, Components, Scail2Job, DIM_ALIGN};
+use crate::generate::{align, Components, Scail2Job, DIM_ALIGN};
 use crate::model::Scail2Dit;
 use crate::ProviderVae;
 
@@ -47,10 +47,8 @@ const DEFAULT_SHIFT: f32 = 5.0;
 const DEFAULT_GUIDANCE: f32 = 5.0;
 const DEFAULT_FPS: u32 = 16;
 
-/// The upstream source-position table is trained through source id 5, inclusive. The primary character
-/// occupies id 0, so a request may carry at most five additional image/mask pairs. Refusing the seventh
-/// pair is intentional: silently clipping it would make a caller believe a character was conditioned.
-const MAX_REFERENCE_CHARACTERS: usize = 6;
+#[cfg(test)]
+use gen_core::generator::SCAIL2_MAX_CHARACTERS as MAX_REFERENCE_CHARACTERS;
 
 /// The only DiT projections the SCAIL2 MLX converter packs. These raw `SCAIL2Model` names are
 /// deliberately not diffusers-prefixed: the hosted `dit.safetensors` is a flat file, while the
@@ -484,6 +482,7 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
 /// The loaded SCAIL-2 model: resolved config + snapshot dir, with the heavy components (DiT / VAE /
 /// UMT5 / CLIP) loaded lazily on first generate and cached.
 pub struct Scail2 {
+    load_binding: gen_core::RenderLoadBinding,
     descriptor: ModelDescriptor,
     config: Scail2Config,
     root: PathBuf,
@@ -637,6 +636,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let device = candle_gen::default_device()?;
     Ok(Box::new(Scail2 {
+        load_binding: gen_core::RenderLoadBinding::from_video_spec(spec),
         descriptor: descriptor(),
         config,
         root,
@@ -667,7 +667,120 @@ fn capture_scail2_execution(
     })
 }
 
+fn registered_inputs<'a>(
+    descriptor: &ModelDescriptor,
+    req: &'a GenerationRequest,
+) -> CResult<(
+    gen_core::generator::Scail2CharacterReferences<'a>,
+    gen_core::ControlClipRef<'a>,
+    (u32, u32),
+)> {
+    let characters =
+        gen_core::generator::Scail2CharacterReferences::from_request(descriptor.id, req)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+    let driving = req.control_clip().ok_or_else(|| {
+        CandleError::Msg(
+            "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
+                .into(),
+        )
+    })?;
+
+    let first: &Image = driving
+        .frames
+        .first()
+        .ok_or_else(|| CandleError::Msg("scail2: the ControlClip has no driving frames".into()))?;
+    // The shared floor exempts `0×0` because it cannot inspect the driving clip. Resolve and
+    // enforce the edge/area envelope before loading components, then project source media to the
+    // same render lattice used by the MLX sibling.
+    let (width, height) = resolve_render_size(&descriptor.capabilities, req, first)?;
+
+    Ok((characters, driving, (width, height)))
+}
+
+pub(crate) fn compile_video_plan(
+    _spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::VideoPlanLayout>> {
+    registered_layout(req).map(Some)
+}
+
+fn registered_layout(req: &GenerationRequest) -> gen_core::Result<gen_core::VideoPlanLayout> {
+    let descriptor = descriptor();
+    reject_zero_steps(MODEL_ID, req)?;
+    reject_unimplemented_control_clip_knobs(req)?;
+    descriptor.capabilities.validate_request(MODEL_ID, req)?;
+    let (characters, driving, size) = registered_inputs(&descriptor, req)?;
+    gen_core_family::scail2::video_layout(
+        gen_core_family::scail2::SegmentTail::AlignedRemainder,
+        candle_gen::default_memory_budget_domain(),
+        size,
+        1 + characters.additional.len(),
+        driving,
+    )
+}
+
 impl Generator for Scail2 {
+    fn video_load_binding(&self) -> Option<&gen_core::RenderLoadBinding> {
+        Some(&self.load_binding)
+    }
+
+    fn validate_video_plan(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<()> {
+        plan.check_provider(self.descriptor(), self.video_load_binding())?;
+        if &registered_layout(req)? != plan.layout() {
+            return Err(gen_core::Error::Unsupported(
+                "scail2: compiled video layout differs from this decoder and source".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn video_memory_evidence_tier(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+    ) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+        self.validate_video_plan(plan, req)?;
+        Ok(self
+            .memory_strategy
+            .as_ref()
+            .filter(|_| crate::memory_strategy::validate_generation_request(req).is_ok())
+            .map(|memory| memory.structural_evidence.tier))
+    }
+
+    fn project_video_memory_context(
+        &self,
+        plan: &gen_core::VideoRenderPlan,
+        req: &GenerationRequest,
+        context: &mut gen_core::MemoryRunContext,
+    ) -> gen_core::Result<bool> {
+        self.validate_video_plan(plan, req)?;
+        let Some(memory) = &self.memory_strategy else {
+            return Ok(false);
+        };
+        if crate::memory_strategy::validate_generation_request(req).is_err() {
+            return Ok(false);
+        }
+        plan.check_inputs(req)?;
+        memory.ensure_unchanged(&self.adapters)?;
+        let revision = crate::memory_strategy::request_evidence_revision(
+            &memory.structural_evidence,
+            req,
+            context.selection,
+        )?;
+        gen_core_family::scail2::project_catalog_context(
+            self.descriptor.backend,
+            req,
+            plan.geometry(),
+            &memory.structural_evidence,
+            revision,
+            context,
+        )
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -689,7 +802,8 @@ impl Generator for Scail2 {
         // Validate pair/order/cardinality before the generic capability floor. This keeps an image-only
         // MultiReference or an orphan Mask an actionable request error instead of a render that omits a
         // character, and does not load any components.
-        let _ = resolve_character_references(self.descriptor.id, req)?;
+        let _ =
+            gen_core::generator::Scail2CharacterReferences::from_request(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
         // sc-20262 — refuse the ControlClip knobs this pipeline does not implement, rather than
         // silently dropping them. One site is enough on this lane: `generate` above calls
@@ -768,101 +882,6 @@ impl Generator for Scail2 {
         };
         crate::memory_strategy::begin_request(memory, self.device.clone(), context)
     }
-}
-
-/// One strictly ordered character-pair request, split into the primary subject and any later subjects.
-/// The references borrow from [`GenerationRequest`] so no pixel buffers are copied before the model
-/// pipeline resizes and encodes them.
-#[derive(Debug)]
-struct CharacterReferences<'a> {
-    primary: CharacterRef<'a>,
-    additional: Vec<CharacterRef<'a>>,
-}
-
-/// Parse the public conditioning list into ordered `(Reference, Mask)` character pairs.
-///
-/// `Conditioning::MultiReference` intentionally remains unsupported *as a payload*: it is just an
-/// image vector and therefore cannot name the corresponding color masks. The routing capability is
-/// advertised, while the usable no-schema-change representation is repeated `Reference, Mask` pairs.
-/// We inspect only those two kinds here, so the required `ControlClip` may retain its established
-/// position before, after, or between the pairs without changing its own semantics.
-fn resolve_character_references<'a>(
-    id: &str,
-    req: &'a GenerationRequest,
-) -> gen_core::Result<CharacterReferences<'a>> {
-    let mut pairs = Vec::new();
-    let mut pending: Option<(&Image, usize)> = None;
-
-    for (index, conditioning) in req.conditioning.iter().enumerate() {
-        match conditioning {
-            Conditioning::Reference { image, .. } => {
-                if let Some((_, reference_index)) = pending {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "{id}: conditioning[{reference_index}] is a Reference without its following \
-                         Mask before conditioning[{index}] starts another Reference; pass ordered \
-                         Reference, Mask pairs"
-                    )));
-                }
-                pending = Some((image, index));
-            }
-            Conditioning::Mask { image } => {
-                let Some((reference, reference_index)) = pending.take() else {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "{id}: conditioning[{index}] is a Mask without a preceding Reference; pass \
-                         ordered Reference, Mask pairs"
-                    )));
-                };
-                pairs.push(CharacterRef {
-                    image: reference,
-                    mask: image,
-                });
-                if pairs.len() > MAX_REFERENCE_CHARACTERS {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "{id}: received {} reference/mask character pairs, but SCAIL-2 supports at \
-                         most {MAX_REFERENCE_CHARACTERS}; no pairs were truncated",
-                        pairs.len()
-                    )));
-                }
-                debug_assert!(reference_index < index);
-            }
-            Conditioning::MultiReference { .. } => {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{id}: MultiReference carries only images and has no paired color-coded \
-                     segmentation masks; pass ordered Reference, Mask pairs instead"
-                )));
-            }
-            _ => {}
-        }
-    }
-
-    if let Some((_, index)) = pending {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: conditioning[{index}] is a Reference without its following Mask; pass ordered \
-             Reference, Mask pairs"
-        )));
-    }
-
-    let Some(primary) = pairs.first() else {
-        return Err(gen_core::Error::Msg(
-            "scail2: a Reference character image paired with a color-coded Mask is required".into(),
-        ));
-    };
-    let primary = CharacterRef {
-        image: primary.image,
-        mask: primary.mask,
-    };
-    let additional = pairs
-        .iter()
-        .skip(1)
-        .map(|pair| CharacterRef {
-            image: pair.image,
-            mask: pair.mask,
-        })
-        .collect();
-    Ok(CharacterReferences {
-        primary,
-        additional,
-    })
 }
 
 /// Refuse the [`Conditioning::ControlClip`] knobs SCAIL-2 does not implement (sc-20262).
@@ -1118,23 +1137,7 @@ impl Scail2 {
         scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
-        let characters = resolve_character_references(self.descriptor.id, req)
-            .map_err(|error| CandleError::Msg(error.to_string()))?;
-        let driving = req.control_clip().ok_or_else(|| {
-            CandleError::Msg(
-                "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
-                    .into(),
-            )
-        })?;
-
-        let first: &Image = driving.frames.first().ok_or_else(|| {
-            CandleError::Msg("scail2: the ControlClip has no driving frames".into())
-        })?;
-        // The shared floor exempts `0×0` because it cannot inspect the driving clip. Resolve and
-        // enforce the edge/area envelope before loading components, then project source media to the
-        // same render lattice used by the MLX sibling.
-        let (width, height) = resolve_render_size(&self.descriptor.capabilities, req, first)?;
-
+        let (characters, driving, (width, height)) = registered_inputs(&self.descriptor, req)?;
         let neg = req.negative_prompt.clone().unwrap_or_default();
         let job = Scail2Job {
             prompt: &req.prompt,
@@ -1176,7 +1179,38 @@ fn replace_flag_for_request(req: &GenerationRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scail2_video_plan_projects_only_the_sealed_worker_request() {
+        use crate::memory_strategy::{tests, PreparedMemory};
+        let (_temp, spec) = tests::candle_fixture(Some("hybrid"));
+        let memory = PreparedMemory::prepare(&spec).unwrap();
+        let req = tests::request("replacement", 832, 480, 45);
+        let context = tests::admitted_context(&memory, &req, gen_core::MemoryCacheState::Warm);
+        let mut generator = unloaded();
+        generator.load_binding = gen_core::RenderLoadBinding::from_video_spec(&spec);
+        generator.adapters = spec.adapters.clone();
+        generator.memory_strategy = Some(memory);
+        gen_core_testkit::scail2::assert_projected_context(
+            crate::provider_registry().unwrap(),
+            &generator,
+            &spec,
+            &req,
+            context,
+        );
+    }
+
+    #[test]
+    fn scail2_video_plan_tracks_registered_characters_and_backend_windows() {
+        let generator = unloaded();
+        gen_core_testkit::scail2::assert_registered_characters_and_windows(
+            crate::provider_registry().unwrap(),
+            &generator,
+            |req| registered_inputs(generator.descriptor(), req).unwrap().0,
+        );
+    }
+
     use super::*;
+    use gen_core::Conditioning;
     use std::collections::BTreeSet;
 
     struct AdapterReportFixture(ModelDescriptor);
@@ -2116,7 +2150,9 @@ mod tests {
             .capabilities
             .validate_request(MODEL_ID, &paired)
             .expect("the advertised pair kinds validate");
-        let resolved = resolve_character_references(MODEL_ID, &paired).expect("ordered pairs");
+        let resolved =
+            gen_core::generator::Scail2CharacterReferences::from_request(MODEL_ID, &paired)
+                .expect("ordered pairs");
         assert_eq!(resolved.primary.image.pixels[0], 11);
         assert_eq!(resolved.primary.mask.pixels[0], 12);
         assert!(resolved.additional.is_empty());
@@ -2132,7 +2168,8 @@ mod tests {
             .validate_request(MODEL_ID, &image_only)
             .expect_err("MultiReference is outside the public SCAIL-2 carrier");
         let error =
-            resolve_character_references(MODEL_ID, &image_only).expect_err("maskless input");
+            gen_core::generator::Scail2CharacterReferences::from_request(MODEL_ID, &image_only)
+                .expect_err("maskless input");
         assert!(
             matches!(error, gen_core::Error::Unsupported(_)),
             "got: {error}"
@@ -2152,7 +2189,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        let error = resolve_character_references(MODEL_ID, &misordered).expect_err("misordered");
+        let error =
+            gen_core::generator::Scail2CharacterReferences::from_request(MODEL_ID, &misordered)
+                .expect_err("misordered");
         assert!(error.to_string().contains("without a preceding Reference"));
 
         let mut too_many = Vec::new();
@@ -2165,7 +2204,7 @@ mod tests {
                 image: image(tag as u8 + 64),
             });
         }
-        let error = resolve_character_references(
+        let error = gen_core::generator::Scail2CharacterReferences::from_request(
             MODEL_ID,
             &GenerationRequest {
                 conditioning: too_many,
@@ -2335,6 +2374,7 @@ mod tests {
             _ => unreachable!(),
         };
         let generator = Scail2 {
+            load_binding: gen_core::RenderLoadBinding::from_video_spec(&spec),
             descriptor: descriptor(),
             config: Scail2Config::default(),
             root,
@@ -2417,7 +2457,7 @@ mod tests {
             },
         );
         assert_eq!(
-            resolve_character_references(MODEL_ID, &pairs)
+            gen_core::generator::Scail2CharacterReferences::from_request(MODEL_ID, &pairs)
                 .unwrap()
                 .additional
                 .len(),
@@ -2432,6 +2472,9 @@ mod tests {
 
     fn unloaded() -> Scail2 {
         Scail2 {
+            load_binding: gen_core::RenderLoadBinding::from_video_spec(&LoadSpec::new(
+                WeightsSource::Dir(PathBuf::from("/nonexistent-scail2-snapshot")),
+            )),
             descriptor: descriptor(),
             config: Scail2Config::default(),
             root: PathBuf::from("/nonexistent-scail2-snapshot"),

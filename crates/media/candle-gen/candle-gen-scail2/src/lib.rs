@@ -94,7 +94,12 @@ pub use rope::ScailRope;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry.register_generator(pipeline::REGISTRATION);
+    let registry = registry
+        .register_generator(pipeline::REGISTRATION)
+        .register_video_plan(candle_gen::gen_core::VideoPlanRegistration {
+            provider_id: pipeline::MODEL_ID,
+            compile: pipeline::compile_video_plan,
+        });
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry);
     registry

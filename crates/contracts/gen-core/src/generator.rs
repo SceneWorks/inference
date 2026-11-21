@@ -41,6 +41,9 @@ pub use params::*;
 mod views;
 pub use views::*;
 
+mod scail2;
+pub use scail2::*;
+
 mod conditioning;
 pub use conditioning::*;
 

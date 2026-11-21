@@ -135,6 +135,215 @@ pub fn resolve_segments(
     Ok(segments)
 }
 
+/// Describe the registered render, including the physical frames returned by each z16 decoder.
+/// Both providers materialize one f32 noise tensor on the 16-channel, spatially 8x-compressed lattice.
+pub fn video_layout(
+    tail: SegmentTail,
+    domain: gen_core::MemoryBudgetDomain,
+    size: (u32, u32),
+    character_count: usize,
+    driving: gen_core::ControlClipRef<'_>,
+) -> Result<gen_core::VideoPlanLayout> {
+    if driving.frames.len() != driving.mask.len() {
+        return Err(Error::Unsupported(
+            "scail2: driving frames need an equal number of masks".into(),
+        ));
+    }
+    let geometry = MemoryGeometry {
+        width: size.0,
+        height: size.1,
+        frames: u32::try_from(driving.frames.len())
+            .map_err(|_| Error::Unsupported("scail2: too many driving frames".into()))?,
+        batch: 1,
+        reference_count: u32::try_from(character_count)
+            .map_err(|_| Error::Unsupported("scail2: too many character references".into()))?,
+    };
+    let segments = resolve_segments(tail, geometry, SEGMENT_LEN, SEGMENT_OVERLAP)?;
+    let admission = segments[0].identity.geometry;
+    let last = segments.last().unwrap();
+    let consumed_frames = last.source.end as u32;
+    let final_history_frames = last.history_frames as u64;
+    let mut phases = Vec::with_capacity(segments.len());
+    let mut output_frames = 0u32;
+    let mut retained_rgb_frames = 0u64;
+    let spatial_area = u64::from(size.0) * u64::from(size.1);
+    let latent_area = spatial_area / (8 * 8);
+    let overflow = || Error::Unsupported("scail2: video buffer size overflow".into());
+    for segment in segments {
+        let causal_frames = segment.identity.geometry.frames;
+        let (decoded_frames, decode_chunk_frames) = match tail {
+            SegmentTail::FullWindows => {
+                // MLX decodes four frames per latent and stitches all of them, including its
+                // extra three frames per window. Quality-overlap tiling can fall back to this
+                // complete window depending on the live budget.
+                let frames = segment.latent_frames * 4;
+                (frames, frames)
+            }
+            SegmentTail::AlignedRemainder => (causal_frames, causal_frames.min(4)),
+        };
+        output_frames = output_frames
+            .checked_add(decoded_frames - segment.history_frames as u32)
+            .ok_or_else(|| Error::Unsupported("scail2: stitched frame count overflow".into()))?;
+        let frames = u64::from(segment.latent_frames);
+        let latent_bytes = latent_area
+            .checked_mul(frames * 16 * 4)
+            .ok_or_else(overflow)?;
+        // Native forward inputs are f32: one 16-channel latent + 28 mask channels per
+        // character, 28 full-grid null/noisy channels, and a 16+28 channel pose/mask at
+        // half width and height. Subsequent windows also pin a clean latent and mask.
+        let mut channels = 44 * u64::from(geometry.reference_count) + 28 * frames + 44 * frames / 4;
+        if segment.history_frames > 0 {
+            channels += 16 * (1 + (segment.history_frames as u64 - 1) / 4) + 4 * frames;
+        }
+        let conditioning_bytes = latent_area.checked_mul(channels * 4).ok_or_else(overflow)?;
+        // Both providers keep a separate packed copy of the preceding overlap in RGB until
+        // the next segment replaces it. Candle's narrow is made contiguous; MLX gathers it.
+        let window_rgb_frames = retained_rgb_frames + segment.history_frames as u64;
+        let retained_bytes = spatial_area
+            .checked_mul(window_rgb_frames * 3 * 4)
+            .and_then(|rgb| rgb.checked_add(conditioning_bytes))
+            .ok_or_else(overflow)?;
+        // MLX materializes the cropped piece; Candle's narrow view keeps the complete
+        // decoded allocation alive until the pieces are concatenated.
+        let decoded_tensor_bytes = spatial_area
+            .checked_mul((window_rgb_frames + u64::from(decoded_frames)) * 3 * 4)
+            .ok_or_else(overflow)?;
+        retained_rgb_frames += u64::from(match tail {
+            SegmentTail::FullWindows => decoded_frames - segment.history_frames as u32,
+            SegmentTail::AlignedRemainder => decoded_frames,
+        });
+        phases.push(gen_core::VideoPhaseLayout {
+            identity: segment.identity,
+            latent_frames: segment.latent_frames,
+            latent_bytes,
+            retained_bytes,
+            decoded_tensor_bytes,
+            decoded_frames,
+            decode_chunk_frames,
+            source: segment.source,
+            history_frames: segment.history_frames,
+        });
+    }
+    // Both cat implementations alias their input for one piece. With multiple pieces the
+    // stitched float allocation is distinct from the pieces, which live through RGB export.
+    let output = u64::from(output_frames);
+    let stitched = if phases.len() > 1 { output } else { 0 };
+    let float_frames = retained_rgb_frames + final_history_frames + stitched;
+    // MLX borrows the contiguous uint8 tensor while copying returned frames. Candle keeps
+    // its scaled f32 tensor, its CPU uint8 clip, and one contiguous HWC frame during to_vec1.
+    let (device_planes, host_planes) = match tail {
+        SegmentTail::FullWindows => (4 * float_frames + output, 0),
+        SegmentTail::AlignedRemainder => (4 * (float_frames + output), output + 1),
+    };
+    let rgb_bytes = |planes| spatial_area.checked_mul(3 * planes).ok_or_else(overflow);
+    let output_conversion = gen_core::VideoOutputConversion {
+        device_bytes: rgb_bytes(device_planes)?,
+        host_bytes: rgb_bytes(host_planes)?,
+    };
+    let role = |role, width, height, frames| gen_core::VideoReferenceLayout {
+        role,
+        width,
+        height,
+        frames,
+    };
+    let mut references = Vec::new();
+    for _ in 0..character_count {
+        references.push(role("reference", size.0, size.1, 1));
+        references.push(role("reference-mask", size.0, size.1, 1));
+    }
+    references.push(role(
+        "driving-pose",
+        size.0 / 2,
+        size.1 / 2,
+        consumed_frames,
+    ));
+    references.push(role(
+        "driving-mask",
+        size.0 / 2,
+        size.1 / 2,
+        consumed_frames,
+    ));
+    Ok(gen_core::VideoPlanLayout {
+        packed_components: Vec::new(),
+        output_conversion,
+        domain,
+        output: MemoryGeometry {
+            frames: output_frames,
+            ..geometry
+        },
+        admission,
+        phases,
+        references,
+    })
+}
+
+/// Project the catalog mode and content receipt onto the native Resident scope. A caller
+/// supplying an already-native scope must present the exact previously sealed revision.
+pub fn project_catalog_context(
+    backend: &str,
+    req: &gen_core::GenerationRequest,
+    geometry: MemoryGeometry,
+    evidence: &gen_core::MemoryStructuralResidentEvidence,
+    native_revision: String,
+    context: &mut gen_core::MemoryRunContext,
+) -> Result<bool> {
+    let crossed = || {
+        Error::Unsupported(
+            "scail2: selected memory evidence crossed its request, artifact or route".into(),
+        )
+    };
+    if context.geometry != geometry
+        || context.selection.tier != evidence.tier
+        || context.selection.strategy != gen_core::MemoryStrategy::Resident
+        || !context.has_reference
+        || context.has_phases
+        || context.use_pid
+        || geometry.reference_count != 1
+    {
+        return Err(crossed());
+    }
+    let mode = req.video_mode.as_deref().ok_or_else(crossed)?;
+    let catalog_mode = match mode {
+        "animation" => "animate_character",
+        "replacement" => "replace_person",
+        _ => return Err(crossed()),
+    };
+    let native_overlay = (evidence.adapter_count > 0).then_some("adapter");
+    if context.mode.as_key() == mode {
+        if context.overlay.as_deref() != native_overlay
+            || context.evidence_revision != native_revision
+        {
+            return Err(crossed());
+        }
+    } else {
+        let receipt = gen_core::generator::Scail2AnimationConditioningRef::catalog_receipt(
+            backend,
+            catalog_mode,
+            req.width,
+            req.height,
+            &req.conditioning,
+        )?;
+        let adapters = if native_overlay.is_some() {
+            "adapter+"
+        } else {
+            ""
+        };
+        let expected = format!("{adapters}provider_video_mode:{mode}+{receipt}");
+        if context.mode.as_key() != catalog_mode
+            || context.overlay.as_deref() != Some(&expected)
+            || context.evidence_revision.is_empty()
+            || context.evidence_revision.starts_with("scail2-resident-v1:")
+                && context.evidence_revision != native_revision
+        {
+            return Err(crossed());
+        }
+    }
+    context.mode = gen_core::MemoryMode::Other(mode.to_owned());
+    context.overlay = native_overlay.map(str::to_owned);
+    context.evidence_revision = native_revision;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

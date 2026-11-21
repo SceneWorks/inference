@@ -50,6 +50,7 @@ pub mod host;
 pub mod memory_strategy;
 pub mod moss_training_fixture;
 pub mod moss_training_probe;
+pub mod scail2;
 pub mod trainer;
 pub mod transcriber;
 pub mod voice_embedder;
