@@ -1,52 +1,15 @@
 @WAN_PAIR_COMMON@
 
+const SAMPLER: &str = "heun";
+
 use crate::{gen_core, pipeline, Device, DitSource, GenerationRequest, Pipeline, Progress};
 use candle_gen::candle_core::{safetensors, DType};
-#[cfg(feature = "cuda")]
-use std::io::Write;
-
-#[cfg(feature = "cuda")]
-fn pool_proof(pair: &Pair) -> ProofResult<u64> {
-    let pool =
-        candle_gen::cuda_mempool::MemPool::device_current(0).ok_or("missing current pool")?;
-    let used = pool.used().ok_or("missing CUDA pool usage")?;
-    let used_high = pool.used_high().ok_or("missing peak CUDA pool usage")?;
-    let reserved = pool.reserved().ok_or("missing CUDA pool reservation")?;
-    let reserved_high = pool
-        .reserved_high()
-        .ok_or("missing peak CUDA pool reservation")?;
-    assert!(used > 0 && used <= used_high && used <= reserved);
-    assert!(used_high <= reserved_high && reserved <= reserved_high);
-    let proof = json!({
-        "pid":std::process::id(),"cudaDeviceUuid":env::var("CUDA_VISIBLE_DEVICES")?,
-        "poolUsedBytes":used,"poolUsedHighBytes":used_high,
-        "poolReservedBytes":reserved,"poolReservedHighBytes":reserved_high
-    });
-    let pending = pair.out.join("cuda-pool.pending");
-    let path = pair.out.join("cuda-pool.json");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&pending)?;
-    file.write_all(&serde_json::to_vec(&proof)?)?;
-    file.sync_all()?;
-    drop(file);
-    assert!(!path.exists());
-    fs::rename(pending, path)?;
-    // Keep weights and the process-owned CUDA context live across supervisor sampling ticks.
-    std::thread::sleep(std::time::Duration::from_millis(3500));
-    Ok(reserved_high)
-}
-
-#[cfg(not(feature = "cuda"))]
-fn pool_proof(_: &Pair) -> ProofResult<u64> {
-    Err("the Wan paired proof requires the CUDA feature".into())
-}
+@CUDA_POOL_WITNESS@
 
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn curated_tier1() -> ProofResult<()> {
-    let pair = Pair::from_env()?;
+    let pair = Pair::from_env("wan_pair_fixture::curated_tier1", "WAN_PAIR")?;
     assert_eq!(pair.case, "cuda-ti2v5b-t2v-heun");
     let device = Device::new_cuda(0)?;
     let mut model = Pipeline::load(

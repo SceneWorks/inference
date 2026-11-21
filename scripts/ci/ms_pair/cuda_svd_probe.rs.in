@@ -1,0 +1,67 @@
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env(FQN, "VIDEO_PAIR")?;
+    let (sampler, max_g) = match pair.case.as_str() {
+        "cuda-svd-euler-cfg" => (None, 3.0),
+        "cuda-svd-euler-single" => (None, 1.0),
+        "cuda-svd-heun-cfg" => (Some("heun"), 3.0),
+        _ => return Err("unknown CUDA SVD proof".into()),
+    };
+    let device = Device::new_cuda(0)?;
+    let cfg = UnetConfig {
+        layers_per_block: 1,
+        ..Default::default()
+    };
+    let dtype = crate::dense_dtype();
+    assert_eq!(dtype, DType::F32);
+    let vb = crate::component_vb(
+        &pair.root,
+        "unet",
+        "diffusion_pytorch_model",
+        dtype,
+        &device,
+    )?;
+    let model = crate::unet::SvdUnet::new(&cfg, vb)?;
+    let scheduler = SchedulerConfig::default();
+    let schedule = EdmSchedule::karras(STEPS, &scheduler);
+    let params = SvdParams {
+        num_frames: FRAMES,
+        num_inference_steps: STEPS,
+        max_guidance_scale: max_g,
+        ..Default::default()
+    };
+    let inputs = safetensors::load(pair.root.join("inputs.safetensors"), &device)?;
+    let noise = inputs["noise"].affine(schedule.init_noise_sigma() as f64, 0.)?;
+    let (embeds, image) = (&inputs["image_embeds"], &inputs["image_latents"]);
+    let ids = crate::pipeline::added_time_ids(&params, &device)?;
+    let settings = svd_settings(
+        &cfg,
+        &schedule,
+        &params,
+        noise.dims(),
+        embeds.dims(),
+        &f32_values(&ids)?,
+        "F32",
+        sampler,
+    );
+    let cancel = CancelFlag::new();
+    measure(&pair, &noise, settings, |p| {
+        crate::pipeline::denoise(
+            &model,
+            &scheduler,
+            &noise,
+            embeds,
+            image,
+            &ids,
+            params.num_frames,
+            params.num_inference_steps,
+            params.min_guidance_scale,
+            params.max_guidance_scale,
+            sampler,
+            SEED,
+            &cancel,
+            p,
+        )
+    })
+}

@@ -107,7 +107,7 @@ def _write_tensors(path, tensors):
     header = {}
     offset = 0
     for name, (dtype, shape, _) in tensors.items():
-        size = math.prod(shape) * {"BF16": 2, "F32": 4}[dtype]
+        size = math.prod(shape) * {"BF16": 2, "F16": 2, "F32": 4}[dtype]
         header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
         offset += size
     raw = json.dumps(header, separators=(",", ":")).encode()

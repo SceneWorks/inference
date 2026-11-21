@@ -1,5 +1,7 @@
 @WAN_PAIR_COMMON@
 
+const SAMPLER: &str = "heun";
+
 use crate::config::WanModelConfig;
 use crate::pipeline::{denoise_curated, denoise_moe_curated, denoise_moe_curated_swapped, Expert};
 use crate::transformer::WanTransformer;
@@ -59,7 +61,7 @@ impl Drop for Listener {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn curated_tier1() -> ProofResult<()> {
-    let pair = Pair::from_env()?;
+    let pair = Pair::from_env("wan_pair_fixture::curated_tier1", "WAN_PAIR")?;
     let mut cfg = match pair.case.as_str() {
         "mlx-a14b-t2v-resident-heun" => WanModelConfig::wan22_t2v_14b(),
         "mlx-a14b-i2v-resident-heun" | "mlx-a14b-i2v-swapped-heun" => {

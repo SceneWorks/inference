@@ -42,23 +42,34 @@ def geometry(variant):
     return data
 
 
-def bf16_blocks(key, shape):
+def weight_blocks(key, shape, dtype):
     # Stable nonzero signed weights, scaled by fan-in. Normalization scales are
     # centered on one. Generate bounded chunks without holding a second tensor.
     ident = hashlib.sha256(f"{SEED}/{key}".encode()).digest()
     rng = random.Random(int.from_bytes(ident, "little"))
     center = 1 if len(shape) == 1 and key.endswith("weight") and "norm" in key.lower() else 0
     scale = 1 / math.sqrt(math.prod(shape[1:])) if len(shape) > 1 else 0.01
-    palette = [struct.pack("<f", center + scale * (2 * (n + 0.5) / 256 - 1))[2:] for n in range(256)]
-    low, high = bytes(p[0] for p in palette), bytes(p[1] for p in palette)
+    values = [center + scale * (2 * (n + 0.5) / 256 - 1) for n in range(256)]
+    if dtype == "BF16":
+        palette = [struct.pack("<f", value)[2:] for value in values]
+    else:
+        fmt = {"F16": "<e", "F32": "<f"}[dtype]
+        palette = [struct.pack(fmt, value) for value in values]
+    width = len(palette[0])
+    planes = [bytes(p[i] for p in palette) for i in range(width)]
     remaining = math.prod(shape)
     while remaining:
         count = min(remaining, 2**18)
         indices = rng.randbytes(count)
-        out = bytearray(count * 2)
-        out[::2], out[1::2] = indices.translate(low), indices.translate(high)
+        out = bytearray(count * width)
+        for i, plane in enumerate(planes):
+            out[i::width] = indices.translate(plane)
         yield out
         remaining -= count
+
+
+def bf16_blocks(key, shape):
+    return weight_blocks(key, shape, "BF16")
 
 
 def write_component(path, tensors):

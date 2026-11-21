@@ -1,0 +1,23 @@
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env(FQN, "VIDEO_PAIR")?;
+    assert_eq!(pair.case, "cuda-mochi-masked-euler");
+    let device = Device::new_cuda(0)?;
+    let cfg = MochiDitConfig {
+        num_layers: 2,
+        ..Default::default()
+    };
+    assert_eq!(crate::DIT_DTYPE, DType::BF16);
+    let vb = crate::load_transformer_var_builder(&pair.root, crate::DIT_DTYPE, &device)?;
+    let model = MochiTransformer3DModel::new(vb, &cfg, &device)?;
+    let inputs = safetensors::load(pair.root.join("inputs.safetensors"), &device)?;
+    let (noise, context, mask) = (&inputs["noise"], &inputs["context"], &inputs["mask"]);
+    let settings = mochi_settings(&cfg, noise.dims(), context.dims(), &f32_values(mask)?);
+    let cancel = CancelFlag::new();
+    measure(&pair, noise, settings, |p| {
+        crate::denoise(
+            &model, noise, context, mask, STEPS, GUIDANCE, SHIFT, &cancel, p,
+        )
+    })
+}

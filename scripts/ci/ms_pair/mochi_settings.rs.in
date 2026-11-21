@@ -1,0 +1,24 @@
+use crate::{MochiDitConfig, MochiScheduler, MochiTransformer3DModel};
+
+const SHIFT: f32 = 1.0;
+const GUIDANCE: f32 = 4.5;
+
+fn mochi_settings(cfg: &MochiDitConfig, shape: &[usize], context: &[usize], mask: &[f32]) -> Value {
+    let mut schedule = MochiScheduler::new();
+    schedule.set_timesteps(STEPS, SHIFT);
+    assert_eq!(shape, [1, 12, 2, 4, 6]);
+    assert_eq!(context, [2, 256, 4096]);
+    assert_eq!(mask.len(), 512);
+    let lengths: Vec<_> = mask
+        .chunks_exact(256)
+        .map(|row| {
+            let n = row.iter().take_while(|&&x| x == 1.0).count();
+            assert!(row[n..].iter().all(|&x| x == 0.0));
+            n
+        })
+        .collect();
+    json!({"seed":SEED,"steps":STEPS,"sampler":"flow_euler","shift":SHIFT,"guidance":GUIDANCE,
+        "frames":1+6*(shape[2]-1),"denoiser_dtype":"BF16","heads":cfg.num_heads,"model_width":cfg.inner_dim(),
+        "depth":cfg.num_layers,"latent_shape":shape,"context_shape":context,"mask_tokens":lengths,
+        "sigma_bits":schedule.sigmas().iter().map(|v|v.to_bits()).collect::<Vec<_>>()})
+}

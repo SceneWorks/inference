@@ -5,8 +5,6 @@ use std::{env, error::Error as StdError, fs, path::PathBuf, time::Instant};
 type ProofResult<T> = Result<T, Box<dyn StdError>>;
 const SEED: u64 = 104729;
 const STEPS: usize = 4;
-const SAMPLER: &str = "heun";
-const FQN: &str = "wan_pair_fixture::curated_tier1";
 
 struct Pair {
     case: String,
@@ -15,11 +13,11 @@ struct Pair {
 }
 
 impl Pair {
-    fn from_env() -> ProofResult<Self> {
-        assert_eq!(env::var("MODEL_INFERENCE_CASE_FQN")?, FQN);
+    fn from_env(fqn: &str, prefix: &str) -> ProofResult<Self> {
+        assert_eq!(env::var("MODEL_INFERENCE_CASE_FQN")?, fqn);
         Ok(Self {
-            case: env::var("WAN_PAIR_CASE")?,
-            root: env::var_os("WAN_PAIR_FIXTURE")
+            case: env::var(format!("{prefix}_CASE"))?,
+            root: env::var_os(format!("{prefix}_FIXTURE"))
                 .ok_or("missing fixture")?
                 .into(),
             out: env::var_os("PAIR_OUT").ok_or("missing output")?.into(),
@@ -58,10 +56,15 @@ impl Pair {
             .filter(|e| e["event"] == "step")
             .map(|e| (e["current"].as_u64().unwrap(), e["total"].as_u64().unwrap()))
             .collect();
-        assert_eq!(
-            steps,
-            [(1, 4), (2, 4), (2, 4), (3, 4), (3, 4), (4, 4), (4, 4)]
-        );
+        let expected: &[u64] = if settings["sampler"] == "heun" {
+            &[1, 2, 2, 3, 3, 4, 4]
+        } else {
+            &[1, 2, 3, 4]
+        };
+        assert!(steps
+            .iter()
+            .copied()
+            .eq(expected.iter().map(|&i| (i, STEPS as u64))));
         assert!(elapsed_ns > 0);
         let samples = [json!({"elapsed_ns":elapsed_ns,"outer_steps":steps.last().unwrap().0})];
         let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
