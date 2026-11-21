@@ -2418,7 +2418,7 @@ pub struct KreaHiresEncoderWeights {
 /// decoder and does not load `post_quant_conv` or the decoder subtree.
 pub fn hires_encoder_weights(spec: &LoadSpec) -> gen_core::Result<KreaHiresEncoderWeights> {
     let root = match &spec.weights {
-        WeightsSource::File(_) if spec.components.get(KREA_CONVROT_DIT_COMPONENT).is_none() => {
+        WeightsSource::File(_) if !spec.components.contains_key(KREA_CONVROT_DIT_COMPONENT) => {
             gen_core::require_base_snapshot(spec, KREA_2_TURBO_ID)?
         }
         WeightsSource::Dir(root) if is_convrot_import(spec) => root.as_path(),
