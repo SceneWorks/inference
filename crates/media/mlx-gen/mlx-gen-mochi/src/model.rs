@@ -265,7 +265,7 @@ impl Mochi {
 
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch (the
         // reference encodes the negative prompt, or "" when unset, with `do_classifier_free_guidance`).
-        let (_pos, _neg, enc, enc_mask) = mlx_gen::gen_core::with_prompt_encoding(
+        let (pos, neg, enc, enc_mask) = mlx_gen::gen_core::with_prompt_encoding(
             on_progress,
             || -> std::result::Result<_, mlx_gen::Error> {
                 let pos = encode_prompt(&self.tokenizer, &self.t5, &req.prompt)?;
@@ -313,9 +313,11 @@ impl Mochi {
             on_progress,
         )?;
 
+        drop((pos, neg, enc, enc_mask, init));
         active.finish()?;
         on_progress(Progress::Decoding);
         let frames_arr = crate::pipeline::decode_to_frames(&self.vae, &latents, &req.cancel)?;
+        drop(latents);
         let images: Vec<Image> = crate::pipeline::frames_to_images(&frames_arr)?;
         Ok(GenerationOutput::Video {
             frames: images,

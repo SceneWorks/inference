@@ -126,7 +126,7 @@ impl Default for MochiDitConfig {
             num_layers: 48,
             pooled_dim: 1536,
             in_channels: 12,
-            text_embed_dim: 4096,
+            text_embed_dim: gen_core_family::mochi::TEXT_EMBED_DIM,
             time_embed_dim: 256,
             eps: 1e-6,
             quantization: None,

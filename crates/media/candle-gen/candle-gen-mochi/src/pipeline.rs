@@ -12,7 +12,7 @@
 //! so the pipeline only supplies the latent + conditioning.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{self, CancelFlag, GenerationRequest, Image, Progress};
@@ -38,7 +38,7 @@ pub struct Components {
     t5: Arc<MochiT5>,
     transformer: Arc<MochiTransformer3DModel>,
     vae: Arc<MochiVaeDecoder>,
-    pub(crate) vae_cfg: MochiVaeConfig,
+    pub(crate) layout: Arc<ComponentLayout>,
 }
 
 /// Read the small configuration independently of resident tensors so phase admission
@@ -52,7 +52,6 @@ pub(crate) struct ComponentLayout {
 /// The lazy pipeline handle (root + device); [`load_components`](Pipeline::load_components) assembles
 /// the heavy components on first use.
 pub struct Pipeline {
-    layout: Mutex<Option<Arc<ComponentLayout>>>,
     root: PathBuf,
     device: Device,
 }
@@ -60,7 +59,6 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(root: &Path, device: &Device) -> Self {
         Self {
-            layout: Mutex::new(None),
             root: root.to_path_buf(),
             device: device.clone(),
         }
@@ -69,11 +67,11 @@ impl Pipeline {
     /// Assemble the full Mochi model from a snapshot directory: the reused T5-XXL encoder + tokenizer
     /// (bf16), the AsymmDiT transformer (bf16-stored, f32-activation), and the AsymmVAE decoder (f32).
     pub fn load_components(&self) -> CResult<Components> {
-        self.load_components_from(self.component_layout()?.as_ref())
+        self.load_components_from(self.component_layout()?)
     }
 
     pub(crate) fn component_layout(&self) -> CResult<Arc<ComponentLayout>> {
-        candle_gen::cached(&self.layout, || Self::read_layout(&self.root).map(Arc::new))
+        Self::read_layout(&self.root).map(Arc::new)
     }
 
     pub(crate) fn read_layout(root: &Path) -> CResult<ComponentLayout> {
@@ -102,12 +100,12 @@ impl Pipeline {
         })
     }
 
-    pub(crate) fn load_components_from(&self, layout: &ComponentLayout) -> CResult<Components> {
+    pub(crate) fn load_components_from(&self, layout: Arc<ComponentLayout>) -> CResult<Components> {
         let ComponentLayout {
             dit_root,
             shared_root,
             vae_cfg,
-        } = layout;
+        } = layout.as_ref();
         let dit_cfg = MochiDitConfig::default();
 
         let tokenizer = crate::tokenizer::load_tokenizer()?;
@@ -123,7 +121,7 @@ impl Pipeline {
             t5: Arc::new(t5),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
-            vae_cfg: vae_cfg.clone(),
+            layout,
         })
     }
 
@@ -135,7 +133,13 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
-        self.render_scoped(req, &comps.vae_cfg, || Ok(comps.clone()), None, on_progress)
+        self.render_scoped(
+            req,
+            &comps.layout.vae_cfg,
+            || Ok(comps.clone()),
+            None,
+            on_progress,
+        )
     }
 
     pub(crate) fn render_scoped(
@@ -156,7 +160,7 @@ impl Pipeline {
         let active = phase.enter(&req.cancel, scope)?;
         let comps = acquire_components(&req.cancel, components)?;
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch.
-        let (_pos, _neg, enc, enc_mask) = candle_gen::gen_core::with_prompt_encoding(
+        let (pos, neg, enc, enc_mask) = candle_gen::gen_core::with_prompt_encoding(
             on_progress,
             || -> std::result::Result<_, candle_gen::CandleError> {
                 let pos = encode_prompt(&comps.tokenizer, &comps.t5, &req.prompt, &self.device)?;
@@ -195,6 +199,7 @@ impl Pipeline {
             on_progress,
         )?;
 
+        drop((pos, neg, enc, enc_mask, init));
         active.finish()?;
         on_progress(Progress::Decoding);
         // Chunked decode: an untiled decode holds the 128-channel `block_out` stage at full output
@@ -210,6 +215,7 @@ impl Pipeline {
         let video = comps
             .vae
             .decode_chunked(&latents, DEFAULT_DECODE_CHUNK_FRAMES)?; // [1, 3, F, H, W], ~[-1, 1]
+        drop(latents);
         let frames_arr = to_uint8_frames(&video)?; // [F, H, W, 3] u8
         let images = frames_to_images(&frames_arr)?;
         Ok((images, req.fps.unwrap_or(DEFAULT_FPS)))

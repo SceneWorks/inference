@@ -91,6 +91,11 @@ mod explicit_registry_tests {
             .unwrap();
         let phase = &plan.layout().phases[0];
         assert_eq!(
+            plan.minimum_denoise_live_bytes(plan.layout().domain)
+                .unwrap(),
+            16_891_904
+        );
+        assert_eq!(
             (phase.latent_frames, phase.latent_bytes),
             (3, 3 * 12 * 16 * 12 * 4)
         );

@@ -6,6 +6,8 @@ use gen_core::{
 };
 
 pub const LATENT_CHANNELS: u32 = 12;
+pub const MAX_SEQUENCE_LENGTH: usize = 256;
+pub const TEXT_EMBED_DIM: usize = 4096;
 pub const SIZE_MULTIPLE: u32 = 16;
 pub const MOCHI_SHIFT: f32 = 1.0;
 const DEFAULT_STEPS: u32 = 64;
@@ -145,6 +147,15 @@ impl MochiVideo {
             vec![],
             domain,
         );
+        // Both pipelines retain the two original f32 embeddings/masks and their [neg, pos]
+        // concatenations. The batched DiT input is distinct from the current latent. From
+        // the second step the original seeded latent is distinct from the current state too.
+        let conditioning_bytes = 4 * MAX_SEQUENCE_LENGTH * (TEXT_EMBED_DIM + 1) * size_of::<f32>();
+        let latent_copies = if self.phase.sigmas.len() > 2 { 3 } else { 2 };
+        layout.phases[0].retained_bytes = latent_bytes
+            .checked_mul(latent_copies)
+            .and_then(|n| n.checked_add(conditioning_bytes as u64))
+            .ok_or_else(|| Error::Unsupported("Mochi CFG byte count overflows".into()))?;
         // A returned frame has three channels. The VAE projects into f32 on both backends.
         let overflow = || Error::Unsupported("Mochi decoder byte count overflows".into());
         let rgb_frame = u64::from(output.width)
@@ -158,7 +169,7 @@ impl MochiVideo {
         let raw = u64::from(decoded_frames);
         let rgb = rgb_frame.checked_mul(frames).ok_or_else(overflow)?;
         let chunked = chunk < latent_frames;
-        let (decoder_frames, conversion) = match decoder {
+        let (decoder_bytes, conversion) = match decoder {
             MochiDecoder::Candle => {
                 // narrow() retains the entire first chunk, including its discarded prefix.
                 // A multi-chunk cat allocates the cropped clip beside all raw chunk backings.
@@ -168,10 +179,19 @@ impl MochiVideo {
                     (raw, raw)
                 };
                 let decoded = f32_frame.checked_mul(returned).ok_or_else(overflow)?;
+                // to_uint8_frames keeps the source backing and three distinct f32 arrays
+                // (the contiguous channel-last copy, half, and clipped) across round_rgb8.
+                // The shared rounding calculation already includes scaled.
+                let retained = rgb
+                    .checked_mul(3 * size_of::<f32>() as u64)
+                    .and_then(|n| n.checked_add(decoded))
+                    .ok_or_else(overflow)?;
+                let rounding = crate::candle_round_rgb8_live_bytes(rgb, retained)?;
+                let stitched = f32_frame.checked_mul(live).ok_or_else(overflow)?;
                 // render retains the f32 video and u8 frames tensor. to_vec1 creates a flat host
                 // Vec that stays live as the individual Image.pixels buffers are copied.
                 (
-                    live,
+                    stitched.max(rounding),
                     gen_core::VideoOutputConversion {
                         device_bytes: decoded.checked_add(rgb).ok_or_else(overflow)?,
                         host_bytes: rgb,
@@ -187,7 +207,7 @@ impl MochiVideo {
                 // decode_to_frames releases the f32 handle before the final copy. The u8
                 // frame tensor is already row-major: the reshape and host slice share its storage.
                 (
-                    live,
+                    f32_frame.checked_mul(live).ok_or_else(overflow)?,
                     gen_core::VideoOutputConversion {
                         device_bytes: rgb,
                         host_bytes: 0,
@@ -195,8 +215,7 @@ impl MochiVideo {
                 )
             }
         };
-        layout.phases[0].decoded_tensor_bytes =
-            f32_frame.checked_mul(decoder_frames).ok_or_else(overflow)?;
+        layout.phases[0].decoded_tensor_bytes = decoder_bytes;
         layout.output_conversion = conversion;
         Ok(layout)
     }
@@ -366,7 +385,7 @@ mod tests {
     fn decoder_backings_and_output_staging_follow_the_backend_crop() {
         let frame_bytes = 80 * 48 * 3;
         for (frames, candle_live, candle_staging, mlx_live) in
-            [(1, 6, 25, 7), (7, 19, 35, 14), (19, 43, 95, 38)]
+            [(1, 61, 25, 7), (7, 287, 35, 14), (19, 779, 95, 38)]
         {
             let req = gen_core::GenerationRequest {
                 width: 80,
@@ -384,7 +403,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 candle.phases[0].decoded_tensor_bytes,
-                candle_live * frame_bytes * 4
+                candle_live * frame_bytes
             );
             assert_eq!(
                 candle.output_conversion.device_bytes,
@@ -410,6 +429,28 @@ mod tests {
                 u64::from(frames) * frame_bytes
             );
             assert_eq!(mlx.output_conversion.host_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn cfg_counts_both_prompt_backings_and_only_distinct_latents() {
+        for (steps, copies) in [(1, 2), (2, 3)] {
+            let req = gen_core::GenerationRequest {
+                width: 80,
+                height: 48,
+                frames: Some(7),
+                steps: Some(steps),
+                ..Default::default()
+            };
+            let video = MochiVideo::new(&req, &[6], &[8], 4).unwrap();
+            for backend in [MochiDecoder::Candle, MochiDecoder::Mlx] {
+                let layout = video
+                    .layout(1, backend, gen_core::MemoryBudgetDomain::UnifiedMemory)
+                    .unwrap();
+                let phase = &layout.phases[0];
+                assert_eq!(phase.latent_bytes, 5_760);
+                assert_eq!(phase.retained_bytes, 16_781_312 + copies * 5_760);
+            }
         }
     }
 

@@ -17,7 +17,7 @@ use mlx_gen::Result;
 const T5_TOKENIZER_JSON: &str = include_str!("../assets/t5_tokenizer.json");
 
 /// Mochi's `max_sequence_length` (`_get_t5_prompt_embeds` default).
-pub const MAX_SEQUENCE_LENGTH: usize = 256;
+pub use gen_core_family::mochi::MAX_SEQUENCE_LENGTH;
 
 /// T5 `<pad>` token id.
 pub const PAD_TOKEN_ID: i32 = 0;

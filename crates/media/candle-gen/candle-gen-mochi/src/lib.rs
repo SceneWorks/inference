@@ -42,7 +42,10 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
@@ -127,6 +130,15 @@ pub struct MochiGenerator {
 }
 
 impl MochiGenerator {
+    /// Only a successful load owns a layout. Cold preflight must reread the resolved
+    /// snapshot so a failed acquisition can be retried after its files are repaired.
+    fn component_layout(&self) -> candle_gen::Result<Arc<pipeline::ComponentLayout>> {
+        if let Some(resident) = candle_gen::lock_recover(&self.components).as_ref() {
+            return Ok(Arc::clone(&resident.layout));
+        }
+        self.pipe.component_layout()
+    }
+
     fn generate_scoped(
         &self,
         req: &GenerationRequest,
@@ -137,11 +149,25 @@ impl MochiGenerator {
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        let layout = self.pipe.component_layout()?;
+        let layout = self.component_layout()?;
         let (frames, fps) = self.pipe.render_scoped(
             req,
             &layout.vae_cfg,
-            || candle_gen::cached(&self.components, || self.pipe.load_components_from(&layout)),
+            || {
+                let comps = candle_gen::cached(&self.components, || {
+                    self.pipe.load_components_from(Arc::clone(&layout))
+                })?;
+                // Another first request can win the cold cache. Its actual codec must
+                // agree with the geometry already entered by this request.
+                if comps.layout.vae_cfg.temporal_expansions != layout.vae_cfg.temporal_expansions
+                    || comps.layout.vae_cfg.spatial_expansions != layout.vae_cfg.spatial_expansions
+                {
+                    return Err(candle_gen::CandleError::Unsupported(
+                        "Mochi codec geometry changed during component acquisition".into(),
+                    ));
+                }
+                Ok(comps)
+            },
             scope,
             on_progress,
         )?;
@@ -165,7 +191,7 @@ impl Generator for MochiGenerator {
     ) -> gen_core::Result<()> {
         plan.check_provider(self.descriptor(), self.video_load_binding())?;
         self.validate(req)?;
-        let layout = self.pipe.component_layout()?;
+        let layout = self.component_layout()?;
         gen_core_family::mochi::check_layout(plan, &video_layout(req, &layout.vae_cfg)?)
     }
 
@@ -363,6 +389,11 @@ mod explicit_registry_tests {
             .unwrap();
         let phase = &plan.layout().phases[0];
         assert_eq!(
+            plan.minimum_denoise_live_bytes(plan.layout().domain)
+                .unwrap(),
+            16_891_904
+        );
+        assert_eq!(
             (phase.latent_frames, phase.latent_bytes),
             (3, 3 * 12 * 16 * 12 * 4)
         );
@@ -382,16 +413,17 @@ mod explicit_registry_tests {
         let rgb_frame = 64 * 48 * 3;
         let domain = candle_gen::default_memory_budget_domain();
         let host = gen_core::MemoryBudgetDomain::HostRam;
-        let expected = if domain == gen_core::MemoryBudgetDomain::DeviceVram {
+        if domain == gen_core::MemoryBudgetDomain::DeviceVram {
             assert_eq!(
                 single.minimum_decode_live_bytes(host).unwrap(),
                 2 * rgb_frame
             );
-            13 * rgb_frame
-        } else {
-            15 * rgb_frame
-        };
-        assert_eq!(single.minimum_decode_live_bytes(domain).unwrap(), expected);
+        }
+        // Three raw f32 frames plus 37 bytes per cropped RGB sample at eager rounding.
+        assert_eq!(
+            single.minimum_decode_live_bytes(domain).unwrap(),
+            49 * rgb_frame
+        );
         let invalid = GenerationRequest {
             frames: Some(8),
             ..req
@@ -402,7 +434,7 @@ mod explicit_registry_tests {
     }
 
     #[test]
-    fn warmed_metadata_refuses_spatial_drift_before_weight_acquisition() {
+    fn failed_cold_load_accepts_recompiled_plan_after_metadata_repair() {
         let root = tempfile::tempdir().unwrap();
         let vae = root.path().join("vae");
         std::fs::create_dir(&vae).unwrap();
@@ -428,6 +460,11 @@ mod explicit_registry_tests {
             components: Mutex::new(None),
         };
         generator.validate_video_plan(&original, &req).unwrap();
+        let err = generator
+            .generate(&req, &mut |_| panic!("progress before weight load"))
+            .unwrap_err();
+        assert!(err.to_string().contains("text_encoder"), "{err}");
+        assert!(candle_gen::lock_recover(&generator.components).is_none());
         std::fs::write(&config, r#"{"spatial_expansions":[1,2,2]}"#).unwrap();
         let changed = registry
             .compile_video_plan(MODEL_ID, &spec, &req)
@@ -443,8 +480,9 @@ mod explicit_registry_tests {
             changed.layout().phases[0].latent_bytes
         );
         assert!(
-            matches!(generator.validate_video_plan(&changed, &req), Err(gen_core::Error::Unsupported(msg)) if msg.contains("Mochi codec geometry"))
+            matches!(generator.validate_video_plan(&original, &req), Err(gen_core::Error::Unsupported(msg)) if msg.contains("Mochi codec geometry"))
         );
+        generator.validate_video_plan(&changed, &req).unwrap();
         assert!(candle_gen::lock_recover(&generator.components).is_none());
     }
 
