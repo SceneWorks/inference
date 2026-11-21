@@ -12,6 +12,11 @@
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes.
 
+use candle_gen::gen_core::render::video::{run_video_steps, VideoDenoisePhase};
+use candle_gen::gen_core::{MemoryGeometry, MemoryRequestScope};
+
+use gen_core_family::scail2::{resolve_segments, Scail2Segment, SegmentTail};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
@@ -221,52 +226,6 @@ fn apply_clean_history(latent: &Tensor, history: Option<&Tensor>) -> CResult<Ten
     Ok(Tensor::cat(&[&head, &tail], 1)?)
 }
 
-/// Round `n` down to the VAE temporal grid the z16 encoder needs: a `4k + 1` frame count (one latent
-/// frame per [`TEMPORAL_STRIDE`] pixel frames, plus the leading key frame). `n == 0` maps to `0`.
-fn vae_align(n: usize) -> usize {
-    if n == 0 {
-        0
-    } else {
-        ((n - 1) / TEMPORAL_STRIDE) * TEMPORAL_STRIDE + 1
-    }
-}
-
-/// Segment plan over `total` driving frames (upstream `build_segments`): a single VAE-aligned segment
-/// when the clip fits, else overlapping `segment_len` windows striding by `len − overlap`, **including a
-/// final shortened window that reaches the end of the clip** so no trailing driving frames are dropped.
-///
-/// Callers must guarantee `overlap < len` (validated in [`generate`]); a `len == 0` clip yields no
-/// segments. The tail window keeps the same `overlap` join with its predecessor as every interior
-/// window, so the fixed `keep_from = overlap` stitch in [`generate`] stays correct.
-fn build_segments(total: usize, len: usize, overlap: usize) -> Vec<(usize, usize)> {
-    if total == 0 || len == 0 || overlap >= len {
-        // Defensive: `generate` rejects these, but never underflow `len - overlap` for a direct
-        // engine consumer who built a pathological `Scail2Job` (all fields are `pub`).
-        return Vec::new();
-    }
-    if total <= len {
-        return vec![(0, vae_align(total))];
-    }
-    let stride = len - overlap;
-    let mut segs = Vec::new();
-    let mut start = 0;
-    while start + len <= total {
-        segs.push((start, start + len));
-        start += stride;
-    }
-    // Trailing partial: `start` now points just past the last full window's stride step, so frames
-    // `[start, total)` are uncovered. Emit one more window that overlaps the previous by `overlap`
-    // (i.e. begins at the same `start`) and extends to the clip end, VAE-aligned. Skip it only when
-    // the remainder is shorter than a single latent frame (nothing decodable is lost).
-    if start < total {
-        let tail_len = vae_align(total - start);
-        if tail_len > overlap {
-            segs.push((start, start + tail_len));
-        }
-    }
-    segs
-}
-
 /// Global denoise progress for step `i` (0-based) of segment `seg_idx` (0-based), given `steps` denoise
 /// steps per segment over `num_segments` segments (F-125 / sc-11225).
 ///
@@ -350,6 +309,17 @@ pub fn generate(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<GenerationOutput> {
+    generate_scoped(|| Ok(comps), te_cfg, job, cancel, None, on_progress)
+}
+
+pub(crate) fn generate_scoped<C: Deref<Target = Components>>(
+    load: impl Fn() -> CResult<C>,
+    te_cfg: &TextEncoderConfig,
+    job: &Scail2Job,
+    cancel: &CancelFlag,
+    mut scope: Option<&mut dyn MemoryRequestScope>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> CResult<GenerationOutput> {
     if job.driving_frames.is_empty() {
         return Err(CandleError::Msg(
             "scail2: a driving video is required".into(),
@@ -362,18 +332,10 @@ pub fn generate(
             job.driving_frames.len()
         )));
     }
-    if job.segment_len == 0 {
-        return Err(CandleError::Msg("scail2: segment_len must be > 0".into()));
+    let segments = job_segments(job)?;
+    if job.steps == 0 {
+        return Err(CandleError::Msg("scail2: steps must be positive".into()));
     }
-    if job.segment_overlap >= job.segment_len {
-        // Guards the `stride = segment_len − segment_overlap` subtraction (a direct engine consumer can
-        // build a `Scail2Job` with any `pub` field values) and keeps clean-history overlap well-defined.
-        return Err(CandleError::Msg(format!(
-            "scail2: segment_overlap ({}) must be < segment_len ({})",
-            job.segment_overlap, job.segment_len
-        )));
-    }
-    let dev = comps.dit.device();
     // This is the exact geometry all image and latent paths consume. Keeping validation in the
     // conversion makes it impossible for the public job API to snap before rendering.
     let (tw, th) = validate_job_geometry(job.width, job.height)?;
@@ -387,6 +349,202 @@ pub fn generate(
         }),
     );
 
+    let mut out_pieces: Vec<Tensor> = Vec::new();
+    let mut prev_history_pixel: Option<Tensor> = None;
+
+    // Progress is reported **globally** across all segments (F-125 / sc-11225) — see
+    // `segment_step_progress`. `Decoding` is likewise emitted once (on the final segment) rather than
+    // mid-sweep, so the step count reaches 100% before the single decode signal.
+    let seg_count = segments.len();
+    let mut prepared = None;
+
+    for segment in &segments {
+        let seg_idx = segment.identity.pass;
+        let (seg_start, seg_end) = (segment.source.start, segment.source.end);
+        let mut sched = FlowScheduler::new(job.sampler, job.steps, job.shift);
+        let phase = segment.denoise_phase(
+            job.sampler,
+            sched.sigmas().iter().map(|&sigma| sigma as f32).collect(),
+            job.seed,
+        );
+        let active = phase.enter(
+            cancel,
+            scope
+                .as_mut()
+                .map(|s| &mut **s as &mut dyn MemoryRequestScope),
+        )?;
+        // This route loads all resident components together. Its first admitted segment owns
+        // the load and conditioning. Later segments reuse the request's prepared inputs.
+        let (comps, conditioning) = match &mut prepared {
+            Some(prepared) => prepared,
+            None => {
+                let comps = load()?;
+                let conditioning = prepare(
+                    &comps,
+                    te_cfg,
+                    job,
+                    cancel,
+                    on_progress,
+                    (tw, th),
+                    cfg_disabled,
+                )?;
+                prepared.insert((comps, conditioning))
+            }
+        };
+        let (lat_h, lat_w) = conditioning.latent_size;
+        let dev = comps.dit.device();
+        // Pose latent (half spatial res) + driving mask for this segment.
+        let pose_seg = conditioning
+            .driving
+            .narrow(0, seg_start, seg_end - seg_start)?; // [T,3,H,W]
+        let pose_half = downsample_half(&pose_seg)?; // [T,3,H/2,W/2]
+        let pose_cthw = pose_half
+            .permute((1, 0, 2, 3))?
+            .contiguous()?
+            .to_device(dev)?; // one upload: [3,T,H/2,W/2]
+        let pose_latent = vae_encode_cthw(&comps.vae, &pose_cthw)?; // [16,T_lat,h/2,w/2]
+        let lat_t = pose_latent.dim(1)?;
+        if lat_t != phase.latent_frames as usize {
+            return Err(CandleError::Msg(format!(
+                "scail2: pose encoder produced {lat_t} latent frames for {} source frames, expected {}",
+                seg_end - seg_start, phase.latent_frames
+            )));
+        }
+
+        let dmask_seg = conditioning
+            .driving_mask
+            .narrow(1, seg_start, seg_end - seg_start)?; // [3,T,H,W]
+        let dmask_half = downsample_half(&dmask_seg)?.to_device(dev)?; // one upload: [3,T,H/2,W/2]
+                                                                       // Keep threshold/pool/pack on the model device exactly as before; only its input transfer
+                                                                       // moved from full resolution to half resolution.
+        let driving_masks = extract_and_compress_mask_to_latent(&dmask_half, TEMPORAL_STRIDE)?;
+
+        // ref_masks = ref_mask_28 ++ zero null-noisy-mask over the latent length.
+        let null_noisy = Tensor::zeros((28, lat_t, lat_h, lat_w), DType::F32, dev)?;
+        let ref_masks = Tensor::cat(&[&conditioning.ref_mask_28, &null_noisy], 1)?; // [28,1+T,h,w]
+
+        // Clean-history latent + i2v mask for segments after the first.
+        let (history_latent, history_mask) = match &prev_history_pixel {
+            Some(hp) if seg_idx > 0 => {
+                let hl = vae_encode_cthw(&comps.vae, hp)?; // [16,h_t,h,w]
+                let h_t = hl.dim(1)?.min(lat_t);
+                let ones = Tensor::ones((4, h_t, lat_h, lat_w), DType::F32, dev)?;
+                let hm = if h_t < lat_t {
+                    let z = Tensor::zeros((4, lat_t - h_t, lat_h, lat_w), DType::F32, dev)?;
+                    Tensor::cat(&[&ones, &z], 1)?
+                } else {
+                    ones
+                };
+                (Some(hl), Some(hm))
+            }
+            _ => (None, None),
+        };
+
+        // Seeded init noise (per-segment).
+        let noise =
+            candle_gen_wan::pipeline::create_noise(phase.seed, 16, lat_t, lat_h, lat_w, dev)?
+                .reshape((16, lat_t, lat_h, lat_w))?;
+
+        // --- denoise (plain CFG, clean-history pinned) ---
+        let latent = denoise_segment(
+            &phase,
+            seg_count,
+            &noise,
+            history_latent.as_ref(),
+            cancel,
+            on_progress,
+            |i, x, latent| {
+                let t = sched.timestep(i);
+                let mut inp = Scail2Inputs {
+                    x,
+                    ref_latent: &conditioning.ref_latent,
+                    ref_masks: &ref_masks,
+                    pose_latent: &pose_latent,
+                    driving_masks: &driving_masks,
+                    history_mask: history_mask.as_ref(),
+                    additional_ref_latent: conditioning.additional_ref_latent.as_ref(),
+                    additional_ref_masks: conditioning.additional_ref_masks.as_ref(),
+                    clip_fea: &conditioning.clip_fea,
+                    context: &conditioning.context,
+                    t,
+                    replace_flag: job.replace_flag,
+                };
+                let pred_cond = comps.dit.forward(&inp)?;
+                let pred = if cfg_disabled {
+                    pred_cond
+                } else {
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    inp.context = &conditioning.context_null;
+                    let pred_uncond = comps.dit.forward(&inp)?;
+                    cfg_combine(&pred_uncond, &pred_cond, job.guidance)?
+                };
+                Ok(sched.step(&pred, latent)?)
+            },
+        )?;
+        active.finish()?;
+
+        // --- decode this segment → pixels; stitch + carry history ---
+        // Emit `Decoding` once, after the final segment's denoise completes, so the global step sweep
+        // reaches 100% before the single decode signal (rather than firing mid-sweep per segment).
+        if seg_idx + 1 == seg_count {
+            on_progress(Progress::Decoding);
+        }
+        let video = comps
+            .vae
+            .decode_with_cancel(&latent.reshape((1, 16, lat_t, lat_h, lat_w))?, cancel)?; // [1,3,T_out,H,W]
+        let (_, vc, vt, vh, vw) = video.dims5()?;
+        let seg_video = video.reshape((vc, vt, vh, vw))?; // [3,T_out,H,W]
+        let t_out = seg_video.dim(1)?;
+
+        let keep_from = segment.history_frames;
+        let piece = seg_video.narrow(1, keep_from, t_out - keep_from)?;
+        out_pieces.push(piece);
+
+        let ov = segments
+            .get(seg_idx + 1)
+            .map_or(0, |next| next.history_frames);
+        if ov > 0 {
+            prev_history_pixel = Some(seg_video.narrow(1, t_out - ov, ov)?.contiguous()?);
+        }
+    }
+
+    let piece_refs: Vec<&Tensor> = out_pieces.iter().collect();
+    let full = Tensor::cat(&piece_refs, 1)?; // [3,T_total,H,W]
+    let (fc, ft, fh, fw) = full.dims4()?;
+    let frames = frames_to_images(&full.reshape((1, fc, ft, fh, fw))?)?;
+    Ok(GenerationOutput::Video {
+        frames,
+        fps: job.fps,
+        audio: None,
+    })
+}
+
+struct Prepared {
+    ref_latent: Tensor,
+    ref_mask_28: Tensor,
+    driving: Tensor,
+    driving_mask: Tensor,
+    additional_ref_latent: Option<Tensor>,
+    additional_ref_masks: Option<Tensor>,
+    context: Tensor,
+    context_null: Tensor,
+    clip_fea: Tensor,
+    latent_size: (usize, usize),
+}
+
+fn prepare(
+    comps: &Components,
+    te_cfg: &TextEncoderConfig,
+    job: &Scail2Job,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    render_size: (usize, usize),
+    cfg_disabled: bool,
+) -> CResult<Prepared> {
+    let (tw, th) = render_size;
+    let dev = comps.dit.device();
     // --- decode + resize all pixel inputs to (tw, th) ---
     let ref_chw = image_to_chw(job.reference.image, tw, th, Interp::Bicubic, dev)?; // [3,H,W]
     let ref_mask_chw = image_to_chw(job.reference.mask, tw, th, Interp::Bilinear, dev)?; // [3,H,W]
@@ -450,151 +608,234 @@ pub fn generate(
         comps.clip.encode(&pixel)?
     };
 
-    let segments = build_segments(
-        job.driving_frames.len(),
+    Ok(Prepared {
+        ref_latent,
+        ref_mask_28,
+        driving,
+        driving_mask,
+        additional_ref_latent,
+        additional_ref_masks,
+        context,
+        context_null,
+        clip_fea,
+        latent_size: (lat_h, lat_w),
+    })
+}
+
+/// Pin decoded-and-reencoded history on both sides of the native scheduler update.
+fn denoise_segment(
+    phase: &VideoDenoisePhase<(), Sampler>,
+    segment_count: usize,
+    noise: &Tensor,
+    history: Option<&Tensor>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut advance: impl FnMut(usize, &Tensor, &Tensor) -> CResult<Tensor>,
+) -> CResult<Tensor> {
+    let segment = phase.identity.pass;
+    let steps = phase.sigmas.len() - 1;
+    let mut latent = apply_clean_history(noise, history)?;
+    run_video_steps(&phase.sigmas, cancel, |step| -> CResult<()> {
+        let x = apply_clean_history(&latent, history)?;
+        latent = advance(step.index, &x, &latent)?;
+        latent = apply_clean_history(&latent, history)?;
+        let (current, total) = segment_step_progress(segment, step.index, steps, segment_count);
+        on_progress(Progress::Step { current, total });
+        Ok(())
+    })?;
+    Ok(latent)
+}
+
+fn job_segments(job: &Scail2Job) -> candle_gen::gen_core::Result<Vec<Scail2Segment>> {
+    let frames = u32::try_from(job.driving_frames.len()).map_err(|_| {
+        candle_gen::gen_core::Error::Unsupported("scail2: too many driving frames".into())
+    })?;
+    let reference_count = u32::try_from(job.additional.len())
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| {
+            candle_gen::gen_core::Error::Unsupported("scail2: too many character images".into())
+        })?;
+    resolve_segments(
+        SegmentTail::AlignedRemainder,
+        MemoryGeometry {
+            width: job.width,
+            height: job.height,
+            batch: 1,
+            frames,
+            reference_count,
+        },
         job.segment_len,
         job.segment_overlap,
-    );
-    let mut out_pieces: Vec<Tensor> = Vec::new();
-    let mut prev_history_pixel: Option<Tensor> = None;
-
-    // Progress is reported **globally** across all segments (F-125 / sc-11225) — see
-    // `segment_step_progress`. `Decoding` is likewise emitted once (on the final segment) rather than
-    // mid-sweep, so the step count reaches 100% before the single decode signal.
-    let seg_count = segments.len();
-
-    for (seg_idx, &(seg_start, seg_end)) in segments.iter().enumerate() {
-        // Pose latent (half spatial res) + driving mask for this segment.
-        let pose_seg = driving.narrow(0, seg_start, seg_end - seg_start)?; // [T,3,H,W]
-        let pose_half = downsample_half(&pose_seg)?; // [T,3,H/2,W/2]
-        let pose_cthw = pose_half
-            .permute((1, 0, 2, 3))?
-            .contiguous()?
-            .to_device(dev)?; // one upload: [3,T,H/2,W/2]
-        let pose_latent = vae_encode_cthw(&comps.vae, &pose_cthw)?; // [16,T_lat,h/2,w/2]
-        let lat_t = pose_latent.dim(1)?;
-
-        let dmask_seg = driving_mask.narrow(1, seg_start, seg_end - seg_start)?; // [3,T,H,W]
-        let dmask_half = downsample_half(&dmask_seg)?.to_device(dev)?; // one upload: [3,T,H/2,W/2]
-                                                                       // Keep threshold/pool/pack on the model device exactly as before; only its input transfer
-                                                                       // moved from full resolution to half resolution.
-        let driving_masks = extract_and_compress_mask_to_latent(&dmask_half, TEMPORAL_STRIDE)?;
-
-        // ref_masks = ref_mask_28 ++ zero null-noisy-mask over the latent length.
-        let null_noisy = Tensor::zeros((28, lat_t, lat_h, lat_w), DType::F32, dev)?;
-        let ref_masks = Tensor::cat(&[&ref_mask_28, &null_noisy], 1)?; // [28,1+T,h,w]
-
-        // Clean-history latent + i2v mask for segments after the first.
-        let (history_latent, history_mask) = match &prev_history_pixel {
-            Some(hp) if seg_idx > 0 => {
-                let hl = vae_encode_cthw(&comps.vae, hp)?; // [16,h_t,h,w]
-                let h_t = hl.dim(1)?.min(lat_t);
-                let ones = Tensor::ones((4, h_t, lat_h, lat_w), DType::F32, dev)?;
-                let hm = if h_t < lat_t {
-                    let z = Tensor::zeros((4, lat_t - h_t, lat_h, lat_w), DType::F32, dev)?;
-                    Tensor::cat(&[&ones, &z], 1)?
-                } else {
-                    ones
-                };
-                (Some(hl), Some(hm))
-            }
-            _ => (None, None),
-        };
-
-        // Seeded init noise (per-segment).
-        let noise = candle_gen_wan::pipeline::create_noise(
-            job.seed.wrapping_add(seg_idx as u64),
-            16,
-            lat_t,
-            lat_h,
-            lat_w,
-            dev,
-        )?
-        .reshape((16, lat_t, lat_h, lat_w))?;
-
-        // --- denoise (plain CFG, clean-history pinned) ---
-        let mut sched = FlowScheduler::new(job.sampler, job.steps, job.shift);
-        let mut latent = apply_clean_history(&noise, history_latent.as_ref())?;
-        for i in 0..job.steps {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let t = sched.timestep(i);
-            let x = apply_clean_history(&latent, history_latent.as_ref())?;
-            let mut inp = Scail2Inputs {
-                x: &x,
-                ref_latent: &ref_latent,
-                ref_masks: &ref_masks,
-                pose_latent: &pose_latent,
-                driving_masks: &driving_masks,
-                history_mask: history_mask.as_ref(),
-                additional_ref_latent: additional_ref_latent.as_ref(),
-                additional_ref_masks: additional_ref_masks.as_ref(),
-                clip_fea: &clip_fea,
-                context: &context,
-                t,
-                replace_flag: job.replace_flag,
-            };
-            let pred_cond = comps.dit.forward(&inp)?;
-            let pred = if cfg_disabled {
-                pred_cond
-            } else {
-                inp.context = &context_null;
-                let pred_uncond = comps.dit.forward(&inp)?;
-                cfg_combine(&pred_uncond, &pred_cond, job.guidance)?
-            };
-            latent = sched.step(&pred, &latent)?;
-            latent = apply_clean_history(&latent, history_latent.as_ref())?;
-            let (current, total) = segment_step_progress(seg_idx, i, job.steps, seg_count);
-            on_progress(Progress::Step { current, total });
-        }
-
-        // --- decode this segment → pixels; stitch + carry history ---
-        // Emit `Decoding` once, after the final segment's denoise completes, so the global step sweep
-        // reaches 100% before the single decode signal (rather than firing mid-sweep per segment).
-        if seg_idx + 1 == seg_count {
-            on_progress(Progress::Decoding);
-        }
-        let video = comps
-            .vae
-            .decode_with_cancel(&latent.reshape((1, 16, lat_t, lat_h, lat_w))?, cancel)?; // [1,3,T_out,H,W]
-        let (_, vc, vt, vh, vw) = video.dims5()?;
-        let seg_video = video.reshape((vc, vt, vh, vw))?; // [3,T_out,H,W]
-        let t_out = seg_video.dim(1)?;
-
-        let keep_from = if seg_idx == 0 { 0 } else { job.segment_overlap };
-        let piece = seg_video.narrow(1, keep_from, t_out - keep_from)?;
-        out_pieces.push(piece);
-
-        if seg_idx + 1 < segments.len() {
-            let ov = job.segment_overlap;
-            prev_history_pixel = Some(seg_video.narrow(1, t_out - ov, ov)?.contiguous()?);
-        }
-    }
-
-    let piece_refs: Vec<&Tensor> = out_pieces.iter().collect();
-    let full = Tensor::cat(&piece_refs, 1)?; // [3,T_total,H,W]
-    let (fc, ft, fh, fw) = full.dims4()?;
-    let frames = frames_to_images(&full.reshape((1, fc, ft, fh, fw))?)?;
-    Ok(GenerationOutput::Video {
-        frames,
-        fps: job.fps,
-        audio: None,
-    })
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_segments, image_to_chw_host, map_additional_references, segment_step_progress,
-        stack_frames, stack_masks, vae_align, validate_job_geometry, CharacterRef, Image, Interp,
-        TEMPORAL_STRIDE,
+        image_to_chw_host, map_additional_references, segment_step_progress, stack_frames,
+        stack_masks, validate_job_geometry, CharacterRef, Image, Interp, TEMPORAL_STRIDE,
     };
     use crate::preprocess::extract_and_compress_mask_to_latent;
     use crate::resize::{downsample_half, interpolate};
     use candle_gen::candle_core::{Device, Tensor};
     use candle_gen::gen_core::runtime::CancelFlag;
     use candle_gen::CandleError;
+
+    fn validate_segment_params(
+        total: usize,
+        window: usize,
+        overlap: usize,
+    ) -> candle_gen::gen_core::Result<Vec<super::Scail2Segment>> {
+        super::resolve_segments(
+            super::SegmentTail::AlignedRemainder,
+            super::MemoryGeometry {
+                width: 32,
+                height: 32,
+                batch: 1,
+                frames: total as u32,
+                reference_count: 1,
+            },
+            window,
+            overlap,
+        )
+    }
+
+    fn build_segments(total: usize, window: usize, overlap: usize) -> Vec<(usize, usize)> {
+        validate_segment_params(total, window, overlap)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.source.start, s.source.end))
+            .collect()
+    }
+
+    #[test]
+    fn native_segment_preserves_window_seed_progress_and_clean_history() {
+        use super::{denoise_segment, job_segments, Scail2Job};
+        use candle_gen::gen_core::Progress;
+
+        let image = Image {
+            width: 64,
+            height: 32,
+            pixels: Vec::new(),
+        };
+        let frames = vec![image.clone(); 25];
+        let job = Scail2Job {
+            prompt: "",
+            negative_prompt: "",
+            width: 64,
+            height: 32,
+            reference: CharacterRef {
+                image: &image,
+                mask: &image,
+            },
+            additional: vec![CharacterRef {
+                image: &image,
+                mask: &image,
+            }],
+            driving_frames: &frames,
+            driving_masks: &frames,
+            replace_flag: true,
+            seed: u64::MAX,
+            steps: 2,
+            shift: 5.0,
+            guidance: 5.0,
+            sampler: super::Sampler::parse(Some("dpm++")),
+            fps: 16,
+            segment_len: 13,
+            segment_overlap: 5,
+        };
+        let segments = job_segments(&job).unwrap();
+        let windows: Vec<_> = segments
+            .iter()
+            .map(|s| (s.source.start, s.source.end))
+            .collect();
+        assert_eq!(windows, vec![(0, 13), (8, 21), (16, 25)]);
+        for (index, (start, end)) in windows.iter().enumerate() {
+            let phase = segments[index].denoise_phase(job.sampler, vec![1., 0.5, 0.], job.seed);
+            assert_eq!(phase.identity.pass, index);
+            assert_eq!(phase.identity.geometry.width, 64);
+            assert_eq!(phase.identity.geometry.height, 32);
+            assert_eq!(phase.identity.geometry.reference_count, 2);
+            assert_eq!(phase.identity.geometry.frames as usize, end - start);
+            assert_eq!(phase.latent_frames as usize, (end - start - 1) / 4 + 1);
+            assert_eq!(phase.seed, u64::MAX.wrapping_add(index as u64));
+            assert_eq!(phase.solver, super::Sampler::UniPC);
+        }
+
+        // At the real generation entry, a refused denoise geometry must stop the
+        // lazy all-components load, including on a cold resident cache.
+        let admitted = candle_gen::gen_core::MemoryGeometry {
+            width: 32,
+            height: 32,
+            batch: 1,
+            frames: 13,
+            reference_count: 2,
+        };
+        let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
+            "scail2-test",
+            Device::Cpu,
+            admitted,
+            None,
+            false,
+            0,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let mut scope = candle_gen::request_scope::CandleRequestScopeCore::new(config);
+        let refused = super::generate_scoped(
+            || -> super::CResult<&super::Components> { panic!("loaded before admission") },
+            &super::TextEncoderConfig::umt5_xxl(),
+            &job,
+            &CancelFlag::new(),
+            Some(&mut scope),
+            &mut |_| panic!("progress before admission"),
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("geometry"), "{refused}");
+
+        let short_windows = Scail2Job {
+            driving_frames: &frames[..13],
+            driving_masks: &frames[..13],
+            segment_len: 5,
+            segment_overlap: 1,
+            ..job
+        };
+        let segments = job_segments(&short_windows).unwrap();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[1].latent_frames, 2);
+        // Poison the clean first frame on every update. The next forward, solver input,
+        // and returned segment must see the restored frame while the other frame evolves.
+        let dev = Device::Cpu;
+        let noise = Tensor::from_vec(vec![1.0f32, 2.0], (1, 2, 1, 1), &dev).unwrap();
+        let history = Tensor::from_vec(vec![19.0f32], (1, 1, 1, 1), &dev).unwrap();
+        let values = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let phase = segments[1].denoise_phase(job.sampler, vec![1., 0.5, 0.], job.seed);
+        let mut progress = Vec::new();
+        let solved = denoise_segment(
+            &phase,
+            3,
+            &noise,
+            Some(&history),
+            &CancelFlag::new(),
+            &mut |event| match event {
+                Progress::Step { current, total } => progress.push((current, total)),
+                _ => panic!("unexpected progress during a native segment"),
+            },
+            |i, x, previous| {
+                assert_eq!(values(x), [19.0, 2.0 + i as f32]);
+                assert_eq!(values(previous), values(x));
+                Ok(Tensor::from_vec(
+                    vec![-10.0, 3.0 + i as f32],
+                    (1, 2, 1, 1),
+                    &dev,
+                )?)
+            },
+        )
+        .unwrap();
+        assert_eq!(values(&solved), [19.0, 4.0]);
+        assert_eq!(progress, [(3, 6), (4, 6)]);
+    }
 
     #[test]
     fn public_job_geometry_is_exact_or_rejected() {
@@ -738,18 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn vae_align_rounds_down_to_4k_plus_1() {
-        assert_eq!(vae_align(0), 0);
-        assert_eq!(vae_align(1), 1);
-        assert_eq!(vae_align(4), 1);
-        assert_eq!(vae_align(5), 5);
-        assert_eq!(vae_align(8), 5);
-        assert_eq!(vae_align(9), 9);
-        assert_eq!(vae_align(81), 81); // a full window is already aligned
-        assert_eq!(vae_align(200), 197);
-    }
-
-    #[test]
     fn single_segment_when_clip_fits() {
         // total <= len: one VAE-aligned window.
         let segs = build_segments(50, LEN, OVERLAP);
@@ -765,8 +994,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_clip_yields_no_segments() {
-        assert!(build_segments(0, LEN, OVERLAP).is_empty());
+    fn empty_clip_refuses_segment_resolution() {
+        assert!(validate_segment_params(0, LEN, OVERLAP).is_err());
     }
 
     /// The core F-006 regression: a clip a bit longer than one window must NOT silently drop most of its
@@ -782,7 +1011,7 @@ mod tests {
         assert_eq!(segs.first().copied(), Some((0, 81)));
         let (_, last_end) = *segs.last().unwrap();
         // Covers to the clip end, modulo VAE alignment (≤ 3 frames lost, not a whole window).
-        assert_eq!(last_end, vae_align(total));
+        assert_eq!(last_end, 117);
         assert!(total - last_end < TEMPORAL_STRIDE);
     }
 
@@ -809,7 +1038,7 @@ mod tests {
         }
         // The last window reaches the VAE-aligned clip end: at most TEMPORAL_STRIDE-1 frames lost.
         let (_, last_end) = *segs.last().unwrap();
-        assert_eq!(last_end, vae_align(total));
+        assert_eq!(last_end, 197);
         assert!(total - last_end < TEMPORAL_STRIDE);
     }
 
@@ -839,13 +1068,13 @@ mod tests {
     }
 
     /// Underflow guard: a pathological direct-consumer job with `overlap >= len` must not underflow
-    /// `len - overlap` (panic in debug / wrap in release) — it returns no segments and `generate`
+    /// `len - overlap` (panic in debug / wrap in release) — segment resolution returns an error and `generate`
     /// rejects it up front.
     #[test]
     fn overlap_ge_len_does_not_underflow() {
-        assert!(build_segments(200, 81, 81).is_empty());
-        assert!(build_segments(200, 81, 200).is_empty());
-        assert!(build_segments(200, 0, 0).is_empty());
+        assert!(validate_segment_params(200, 81, 81).is_err());
+        assert!(validate_segment_params(200, 81, 200).is_err());
+        assert!(validate_segment_params(200, 0, 0).is_err());
     }
 
     /// Replays the exact `(current, total)` sequence `generate`'s denoise loop emits over a multi-segment

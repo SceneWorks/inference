@@ -40,9 +40,7 @@ use crate::generate::{align, CharacterRef, Components, Scail2Job, DIM_ALIGN};
 use crate::model::Scail2Dit;
 use crate::ProviderVae;
 
-/// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
-const SEGMENT_LEN: usize = 81;
-const SEGMENT_OVERLAP: usize = 5;
+use gen_core_family::scail2::{SEGMENT_LEN, SEGMENT_OVERLAP};
 /// Upstream `generate()` sampler defaults: 40 steps, shift 5.0, guide 5.0, 16 fps.
 const DEFAULT_STEPS: u32 = 40;
 const DEFAULT_SHIFT: f32 = 5.0;
@@ -652,18 +650,20 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
-fn capture_scail2_execution<G: Generator + ?Sized>(
-    generator: &G,
+fn capture_scail2_execution(
+    descriptor: &ModelDescriptor,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
     loaded_adapter_count: usize,
+    run: impl FnOnce(&mut dyn FnMut(Progress)) -> gen_core::Result<GenerationOutput>,
 ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
-    candle_gen::execution::capture_with(generator, req, on_progress, || {
+    candle_gen::execution::capture_generation(descriptor, req, on_progress, |progress| {
         // Dense DiT merging discards its install report; a retained spec is not an applied receipt.
         candle_gen::execution::unobserved_adapters(
             loaded_adapter_count,
             "candle-gen-scail2/src/pipeline.rs",
         );
+        run(progress).map(gen_core::GenerationReport::from_output)
     })
 }
 
@@ -711,7 +711,22 @@ impl Generator for Scail2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        capture_scail2_execution(self, req, on_progress, self.adapters.len())
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        capture_scail2_execution(
+            self.descriptor(),
+            req,
+            on_progress,
+            self.adapters.len(),
+            |progress| self.generate_scoped(req, scope, progress),
+        )
     }
 
     fn generate(
@@ -719,15 +734,7 @@ impl Generator for Scail2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.validate(req)?;
-        if let Some(memory) = &self.memory_strategy {
-            memory.ensure_unchanged(&self.adapters)?;
-        }
-        let output = self.run(req, on_progress)?;
-        if let Some(memory) = &self.memory_strategy {
-            memory.ensure_unchanged(&self.adapters)?;
-        }
-        Ok(output)
+        self.generate_scoped(req, None, on_progress)
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -1087,10 +1094,28 @@ fn reject_over_area(id: &str, width: u32, height: u32) -> gen_core::Result<()> {
 }
 
 impl Scail2 {
+    fn generate_scoped(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        let output = self.run(req, scope, on_progress)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        Ok(output)
+    }
+
     /// Map the request conditioning onto a [`Scail2Job`] and run the denoise pipeline.
     fn run(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn candle_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
         let characters = resolve_character_references(self.descriptor.id, req)
@@ -1130,9 +1155,15 @@ impl Scail2 {
             segment_len: SEGMENT_LEN,
             segment_overlap: SEGMENT_OVERLAP,
         };
-        let comps = self.components()?;
         let te_cfg = TextEncoderConfig::umt5_xxl();
-        crate::generate::generate(&comps, &te_cfg, &job, &req.cancel, on_progress)
+        crate::generate::generate_scoped(
+            || self.components(),
+            &te_cfg,
+            &job,
+            &req.cancel,
+            scope,
+            on_progress,
+        )
     }
 }
 
@@ -1187,12 +1218,20 @@ mod tests {
 
         let fixture = AdapterReportFixture(descriptor());
         let req = GenerationRequest::default();
-        let clean = capture_scail2_execution(&fixture, &req, &mut |_| {}, 0).unwrap();
+        let clean =
+            capture_scail2_execution(fixture.descriptor(), &req, &mut |_| {}, 0, |progress| {
+                fixture.generate(&req, progress)
+            })
+            .unwrap();
         assert!(matches!(
             clean.execution,
             ExecutionIdentity::Resolved { .. }
         ));
-        let adapted = capture_scail2_execution(&fixture, &req, &mut |_| {}, 1).unwrap();
+        let adapted =
+            capture_scail2_execution(fixture.descriptor(), &req, &mut |_| {}, 1, |progress| {
+                fixture.generate(&req, progress)
+            })
+            .unwrap();
         let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
             panic!("loaded adapters need an applied-stack receipt")
         };
@@ -2493,7 +2532,7 @@ mod tests {
             }
 
             let rendered = m
-                .run(&over, &mut |_| {})
+                .run(&over, None, &mut |_| {})
                 .expect_err("the render path must independently bound resolved geometry")
                 .to_string();
             assert_eq!(

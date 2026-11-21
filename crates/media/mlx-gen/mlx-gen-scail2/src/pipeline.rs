@@ -25,9 +25,7 @@ use mlx_gen_wan::SolverKind;
 use crate::config::Scail2Config;
 use crate::generate::{align, CharacterRef, Scail2Job, DIM_ALIGN};
 
-/// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
-const SEGMENT_LEN: usize = 81;
-const SEGMENT_OVERLAP: usize = 5;
+use gen_core_family::scail2::{SEGMENT_LEN, SEGMENT_OVERLAP};
 /// Upstream `generate()` sampler defaults: 40 steps, shift 5.0 (3.0 at 480p), guide 5.0, 16 fps.
 const DEFAULT_STEPS: u32 = 40;
 const DEFAULT_SHIFT: f32 = 5.0;
@@ -165,13 +163,14 @@ impl Scail2 {
     fn generate_execution_attempt(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         if let Some(memory) = &self.memory_strategy {
             memory.ensure_unchanged(&self.adapters)?;
         }
-        let output = self.run(req, on_progress)?;
+        let output = self.run(req, scope, on_progress)?;
         if let Some(memory) = &self.memory_strategy {
             memory.ensure_unchanged(&self.adapters)?;
         }
@@ -185,8 +184,17 @@ impl Generator for Scail2 {
         req: &mlx_gen::GenerationRequest,
         on_progress: &mut dyn FnMut(mlx_gen::Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        self.generate_with_scoped_execution_report(req, None, on_progress)
+    }
+
+    fn generate_with_scoped_execution_report(
+        &self,
+        req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
         mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
-            self.generate_execution_attempt(req, &mut |event| {
+            self.generate_execution_attempt(req, scope, &mut |event| {
                 mlx_gen::video_execution::without_capture(|| on_progress(event));
             })
             .map(mlx_gen::gen_core::GenerationReport::from_output)
@@ -240,7 +248,7 @@ impl Generator for Scail2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::video_execution::without_capture(|| {
-            self.generate_execution_attempt(req, on_progress)
+            self.generate_execution_attempt(req, None, on_progress)
         })
     }
 
@@ -540,6 +548,7 @@ impl Scail2 {
     fn run(
         &self,
         req: &GenerationRequest,
+        scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         // Self-validate the shared floor first (F-158). `impl_generator!`'s `generate` does NOT call
@@ -648,13 +657,14 @@ impl Scail2 {
             // sc-18317: carry the request's typed execution selections into the engine-internal job.
             memory: req.memory,
         };
-        crate::generate::generate(
+        crate::generate::generate_scoped(
             &self.root,
             &self.config,
             &job,
             self.quant,
             &self.adapters,
             &req.cancel,
+            scope,
             on_progress,
         )
     }
@@ -814,7 +824,7 @@ mod tests {
             ..Default::default()
         };
         let err = m
-            .run(&bad_count, &mut noop)
+            .run(&bad_count, None, &mut noop)
             .expect_err("oversized count must be rejected on the auto-size path");
         assert!(
             err.to_string().contains("count"),
@@ -831,7 +841,7 @@ mod tests {
             ..Default::default()
         };
         let err = m
-            .run(&bad_sampler, &mut noop)
+            .run(&bad_sampler, None, &mut noop)
             .expect_err("unadvertised sampler must be rejected on the auto-size path");
         assert!(
             err.to_string().contains("sampler"),
@@ -890,7 +900,7 @@ mod tests {
                 ..Default::default()
             };
             let err = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("an out-of-range explicit size must never reach the pipeline")
                 .to_string();
             assert!(
@@ -910,7 +920,7 @@ mod tests {
                 ..Default::default()
             };
             let err = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string();
             assert!(
@@ -1004,7 +1014,7 @@ mod tests {
             // (3) and what the floor inside `generate` actually enforces. `run` always errors without
             // weights, so "the floor accepted it" is read off the message, not off `is_ok`.
             let enforced_ok = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string()
                 .contains(CLEARED_THE_FLOOR);
@@ -1073,6 +1083,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_adapter_refuses_before_pixel_or_component_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut model = unloaded();
+        model.root = root.path().to_owned();
+        model.adapters.push(mlx_gen::AdapterSpec::new(
+            model.root.join("missing-adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        // The empty root cannot supply any component, and the sized input contains
+        // no RGB bytes. The first error must identify the unreadable adapter.
+        let error = model
+            .generate(&auto_sized(32, 32), &mut |_| {
+                panic!("prepared an invalid request")
+            })
+            .unwrap_err()
+            .to_string();
+        let header_error = crate::lora::has_diff_patch_keys(&model.adapters[0].path).unwrap_err();
+        assert_eq!(
+            error,
+            mlx_gen::gen_core::Error::from(header_error).to_string()
+        );
+        model.adapters.clear();
+        let pixel_error = model
+            .generate(&auto_sized(32, 32), &mut |_| {
+                panic!("encoded invalid pixels")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            pixel_error.contains(CLEARED_THE_GEOMETRY_GATE),
+            "{pixel_error}"
+        );
+        assert_ne!(error, pixel_error);
+    }
+
     /// The substring that identifies this gate's refusal, distinct from the shared floor's
     /// "outside supported range".
     const REFUSED: &str = "advertised size envelope";
@@ -1124,7 +1171,7 @@ mod tests {
             );
 
             let ran = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("the render path must refuse it too")
                 .to_string();
             assert!(
@@ -1178,7 +1225,7 @@ mod tests {
             // having got past the gate — not merely the absence of its message, which a request
             // that died earlier would also satisfy.
             let ran = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string();
             assert!(
@@ -1350,7 +1397,7 @@ mod tests {
             let req = auto_sized(w, h);
             let validate_ok = Generator::validate(&m, &req).is_ok();
             let generate_ok = !m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string()
                 .contains(REFUSED);
@@ -1432,7 +1479,7 @@ mod tests {
 
             // The `generate` seam refuses it too, rather than only the pre-flight.
             let msg = m
-                .run(&req, &mut noop)
+                .run(&req, None, &mut noop)
                 .expect_err("no request renders without weights")
                 .to_string();
             assert!(
@@ -1454,7 +1501,7 @@ mod tests {
 
         Generator::validate(&m, &req).expect("a default-valued ControlClip must still validate");
         let msg = m
-            .run(&req, &mut noop)
+            .run(&req, None, &mut noop)
             .expect_err("no request renders without weights")
             .to_string();
         assert!(

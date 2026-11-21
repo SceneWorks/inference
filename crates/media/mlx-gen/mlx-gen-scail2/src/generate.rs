@@ -19,6 +19,10 @@
 //!   * the noisy target latent `x [16,T,lat_h,lat_w]`; `ref_masks` is `ref_mask_28` padded with a
 //!     zero null-noisy-mask over the latent length (`[28,1+T,lat_h,lat_w]`).
 
+use mlx_gen::gen_core::render::video::{run_video_steps, VideoDenoisePhase};
+use mlx_gen::gen_core::{MemoryGeometry, MemoryRequestScope};
+
+use gen_core_family::scail2::{resolve_segments, Scail2Segment, SegmentTail};
 use std::path::Path;
 
 use mlx_gen::array::scalar;
@@ -270,63 +274,6 @@ fn apply_clean_history(latent: &Array, history: Option<&Array>) -> Result<Array>
     Ok(concatenate_axis(&[&head, &tail], 1)?)
 }
 
-/// F-039: validate the public `Scail2Job.segment_len` / `segment_overlap` fields. `build_segments`
-/// computes `stride = segment_len - segment_overlap` (so `overlap >= len` underflows `usize`), and
-/// the clean-history VAE encode in segment 2+ shape-errors when `segment_len` isn't `1 + 4k` (the 4×
-/// temporal compression factor). The guards apply only when the clip actually windows
-/// (`total_frames > segment_len`): the single-window path in [`build_segments`] never derives a
-/// stride or a cross-segment history from the window params, so a short-clip job must not be newly
-/// rejected over fields it doesn't use. Extracted so the guards have a unit test (generate() needs
-/// weights).
-fn validate_segment_params(
-    total_frames: usize,
-    segment_len: usize,
-    segment_overlap: usize,
-) -> Result<()> {
-    if total_frames <= segment_len {
-        return Ok(());
-    }
-    if segment_len == 0 {
-        return Err(Error::Msg("scail2: segment_len must be >= 1".into()));
-    }
-    if segment_overlap >= segment_len {
-        return Err(Error::Msg(format!(
-            "scail2: segment_overlap ({}) must be < segment_len ({}) \
-             (the window stride is segment_len − segment_overlap)",
-            segment_overlap, segment_len
-        )));
-    }
-    if !(segment_len - 1).is_multiple_of(TEMPORAL_STRIDE) {
-        return Err(Error::Msg(format!(
-            "scail2: segment_len ({}) must be 1 + {TEMPORAL_STRIDE}·k \
-             (VAE temporal alignment across overlapping segments)",
-            segment_len
-        )));
-    }
-    Ok(())
-}
-
-/// Segment plan over `total` driving frames (upstream `build_segments`): a single VAE-aligned segment
-/// when the clip fits, else overlapping `segment_len` windows striding by `len − overlap`.
-fn build_segments(total: usize, len: usize, overlap: usize) -> Vec<(usize, usize)> {
-    if total <= len {
-        let keep = ((total - 1) / TEMPORAL_STRIDE) * TEMPORAL_STRIDE + 1;
-        return vec![(0, keep)];
-    }
-    let mut segs = Vec::new();
-    let stride = len - overlap;
-    let mut start = 0;
-    while start < total {
-        let end = start + len;
-        if end > total {
-            break;
-        }
-        segs.push((start, end));
-        start += stride;
-    }
-    segs
-}
-
 /// `[3, T, H, W]` in `[-1,1]` → `[T, H, W, 3]` `u8` in `[0,255]`.
 fn pixels_to_u8(video_cthw: &Array) -> Result<Array> {
     let thwc = video_cthw.transpose_axes(&[1, 2, 3, 0])?; // [T,H,W,3]
@@ -345,6 +292,20 @@ pub fn generate(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
+    generate_scoped(root, cfg, job, quant, adapters, cancel, None, on_progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_scoped(
+    root: &Path,
+    cfg: &Scail2Config,
+    job: &Scail2Job,
+    quant: Option<Quant>,
+    adapters: &[AdapterSpec],
+    cancel: &CancelFlag,
+    mut scope: Option<&mut dyn MemoryRequestScope>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
     // Validate before touching media, adapter files, or model weights. This is also the exact
     // geometry all image and latent paths consume, so the public job API cannot fall back to
     // `align` and snap.
@@ -359,18 +320,10 @@ pub fn generate(
             job.driving_frames.len()
         )));
     }
-    // F-039: Scail2Job has public fields and nothing else validates them. `build_segments` computes
-    // `stride = segment_len - segment_overlap`, so `overlap >= len` underflows `usize` (debug panic;
-    // release wraps to a huge stride and silently renders one window). And the clean-history VAE
-    // encode in segment 2+ shape-errors when `segment_len` isn't VAE-temporal-aligned (the 4×
-    // temporal compression factor: segment_len must be `1 + 4k` so the decoded frame count matches
-    // across overlapping windows). Reject both up front with a typed error (windowing jobs only —
-    // a short clip takes the single-window path, which ignores these fields).
-    validate_segment_params(
-        job.driving_frames.len(),
-        job.segment_len,
-        job.segment_overlap,
-    )?;
+    let segments = job_segments(job)?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
     // Split the inference LoRAs BY ROLE, not by file (sc-18198). A lightx2v "lightning" file is a
     // hybrid, and its two halves want opposite treatment:
     //   * full-rank `.diff`/`.diff_b` deltas land on the qk-norms, `norm3`, `head.head`,
@@ -483,7 +436,7 @@ pub fn generate(
     };
 
     // --- DiT (bf16 production compute; optional Q4/Q8 load-time quant, sc-5445) ---
-    let dit = {
+    let load_dit = || -> Result<Scail2Dit> {
         let mut w = Weights::from_file(root.join("dit.safetensors"))?;
         // sc-5684: merge any lightx2v diff-patch ("lightning") LoRA(s) into the dense weights *before*
         // building + quantizing — `.diff`/`.diff_b`/low-rank factors fold uniformly into the raw
@@ -552,20 +505,16 @@ pub fn generate(
                 report.applied,
             );
         }
-        d
+        Ok(d)
     };
+    let mut dit = None;
 
-    let segments = build_segments(
-        job.driving_frames.len(),
-        job.segment_len,
-        job.segment_overlap,
-    );
-    // F-096: `build_segments` VAE-aligns the single window (`1 + 4k` frames kept) or drops the
+    // F-096: the segment planner VAE-aligns the single window (`1 + 4k` frames kept) or drops the
     // trailing partial window (multi-segment), so driving frames past the last window boundary are
     // silently cut from the output. Surface the drop like the `align` dimension crop above
     // (sc-6983) rather than reinterpreting the request invisibly; the caller stays infallible.
     let total_frames = job.driving_frames.len();
-    let covered = segments.last().map_or(0, |&(_, end)| end);
+    let covered = segments.last().map_or(0, |segment| segment.source.end);
     if covered < total_frames {
         eprintln!(
             "scail2: dropping the trailing {} of {total_frames} driving frame(s) — the segment \
@@ -576,17 +525,37 @@ pub fn generate(
             job.segment_overlap
         );
     }
-    let num_segments = segments.len() as u32;
+    let num_segments = segments.len();
     let mut out_pieces: Vec<Array> = Vec::new();
     let mut prev_history_pixel: Option<Array> = None;
 
-    for (seg_idx, &(seg_start, seg_end)) in segments.iter().enumerate() {
-        // Per-segment cancellation checkpoint (F-003): the inter-segment VAE pose-encode +
-        // full segment decode are minutes of work outside the inner step loop, so also bail
-        // here at each segment boundary.
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
+    for segment in &segments {
+        let seg_idx = segment.identity.pass;
+        let (seg_start, seg_end) = (segment.source.start, segment.source.end);
+        let mut sched = make_scheduler(job.sampler, NUM_TRAIN_TIMESTEPS);
+        sched.set_timesteps(job.steps, job.shift);
+        let phase = segment.denoise_phase(job.sampler, sched.sigmas().to_vec(), job.seed);
+        // A direct Scail2Job can request zero updates and decode its initial noise.
+        // The registered generator rejects zero steps before admission.
+        let active = if job.steps == 0 && scope.is_none() {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            None
+        } else {
+            Some(
+                phase.enter(
+                    cancel,
+                    scope
+                        .as_mut()
+                        .map(|s| &mut **s as &mut dyn MemoryRequestScope),
+                )?,
+            )
+        };
+        let dit = match &mut dit {
+            Some(dit) => dit,
+            None => dit.insert(load_dit()?),
+        };
 
         // Pose latent (half spatial res) + driving mask for this segment.
         let pose_seg = driving.take_axis(
@@ -600,6 +569,12 @@ pub fn generate(
         let pose_cthw = pose_half.transpose_axes(&[1, 0, 2, 3])?; // [3,T,H/2,W/2]
         let pose_latent = vae_encode_cthw(&vae, &pose_cthw)?; // [16,T_lat,h/2,w/2]
         let lat_t = pose_latent.shape()[1];
+        if lat_t as usize != phase.latent_frames as usize {
+            return Err(Error::Msg(format!(
+                "scail2: pose encoder produced {lat_t} latent frames for {} source frames, expected {}",
+                seg_end - seg_start, phase.latent_frames
+            )));
+        }
 
         let dmask_seg = driving_mask.take_axis(
             Array::from_slice(
@@ -633,17 +608,11 @@ pub fn generate(
         };
 
         // Seeded init noise (per-segment key; exact RNG values differ mlx-rs vs torch, as expected).
-        let key = random::key(job.seed.wrapping_add(seg_idx as u64))?;
-        mlx_gen::video_execution::draw(
-            0,
-            "scail2_segment_normal",
-            job.seed.wrapping_add(seg_idx as u64),
-        );
+        let key = random::key(phase.seed)?;
+        mlx_gen::video_execution::draw(0, "scail2_segment_normal", phase.seed);
         let noise = random::normal::<f32>(&[16, lat_t, lat_h, lat_w], None, None, Some(&key))?;
 
         // --- denoise (plain CFG, clean-history pinned) ---
-        let mut sched = make_scheduler(job.sampler, NUM_TRAIN_TIMESTEPS);
-        sched.set_timesteps(job.steps, job.shift);
         mlx_gen::video_execution::sampling(
             "scail2_segment",
             &format!("{:?}", job.sampler),
@@ -651,54 +620,43 @@ pub fn generate(
             serde_json::json!({"shift_bits":job.shift.to_bits(),"guidance_bits":job.guidance.to_bits()}),
         );
         mlx_gen::video_execution::schedule("scail2_segment", sched.sigmas());
-        let timesteps: Vec<f32> = sched.timesteps().to_vec();
-        // F-096: report progress over the WHOLE job (steps × segments), not per segment — the old
-        // per-segment `Step{i, steps}` restarted at 1/N on every segment boundary, so a multi-segment
-        // render appeared to loop. The schedule is rebuilt identically per segment, so the per-segment
-        // step count is constant.
-        let seg_steps = timesteps.len() as u32;
-        let total = seg_steps * num_segments;
-
-        let mut latent = apply_clean_history(&noise, history_latent.as_ref())?;
-        for (i, &t) in timesteps.iter().enumerate() {
-            // Honor the engine cancellation contract (F-003): a SCAIL-2 segment render runs
-            // minutes, so check before each (forward + step) iteration. The per-step `eval` below
-            // makes this effective — without it MLX's lazy graph defers all compute to the VAE
-            // decode and this check would pass for every step (mirrors mlx-gen-wan denoise).
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let x = apply_clean_history(&latent, history_latent.as_ref())?;
-            let mut inp = Scail2Inputs {
-                x: &x,
-                ref_latent: &ref_latent,
-                ref_masks: &ref_masks,
-                pose_latent: &pose_latent,
-                driving_masks: &driving_masks,
-                history_mask: history_mask.as_ref(),
-                additional_ref_latent: additional_ref_latent.as_ref(),
-                additional_ref_masks: additional_ref_masks.as_ref(),
-                clip_fea: &clip_fea,
-                context: &context,
-                t,
-                replace_flag: job.replace_flag,
-            };
-            let pred_cond = dit.forward(&inp)?;
-            let pred = if cfg_disabled {
-                pred_cond
-            } else {
-                inp.context = &context_null;
-                let pred_uncond = dit.forward(&inp)?;
-                cfg_combine(&pred_uncond, &pred_cond, job.guidance)?
-            };
-            latent = sched.step(&pred, &latent)?;
-            latent = apply_clean_history(&latent, history_latent.as_ref())?;
-            mlx_rs::transforms::eval([&latent])?;
-            on_progress(Progress::Step {
-                current: seg_idx as u32 * seg_steps + (i + 1) as u32,
-                total,
-            });
-        }
+        let latent = denoise_segment(
+            &phase,
+            num_segments,
+            &noise,
+            history_latent.as_ref(),
+            cancel,
+            on_progress,
+            |i, x, latent| {
+                let t = sched.timesteps()[i];
+                let mut inp = Scail2Inputs {
+                    x,
+                    ref_latent: &ref_latent,
+                    ref_masks: &ref_masks,
+                    pose_latent: &pose_latent,
+                    driving_masks: &driving_masks,
+                    history_mask: history_mask.as_ref(),
+                    additional_ref_latent: additional_ref_latent.as_ref(),
+                    additional_ref_masks: additional_ref_masks.as_ref(),
+                    clip_fea: &clip_fea,
+                    context: &context,
+                    t,
+                    replace_flag: job.replace_flag,
+                };
+                let pred_cond = dit.forward(&inp)?;
+                let pred = if cfg_disabled {
+                    pred_cond
+                } else {
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
+                    inp.context = &context_null;
+                    let pred_uncond = dit.forward(&inp)?;
+                    cfg_combine(&pred_uncond, &pred_cond, job.guidance)?
+                };
+                sched.step(&pred, latent)
+            },
+        )?;
         // F-096: the bf16 opt-in re-enables the sc-5681 long-sequence overflow path with no gate —
         // a NaN latent survives the decode and the `pixels_to_u8` clamp (min/max propagate NaN) and
         // ships garbage pixels as success. Fail loudly at the segment boundary instead. f32 (the
@@ -715,6 +673,9 @@ pub fn generate(
         // phase (Metal conv scratch ~2× its MLX-active), so the cache retained from preprocessing +
         // denoise (~35 GB) would otherwise stack under it — measured 832×480/5s footprint 111 → 76 GB.
         mlx_rs::memory::clear_cache();
+        if let Some(active) = active {
+            active.finish()?;
+        }
 
         // --- decode this segment → pixels; stitch + carry history ---
         // sc-5681: tile the VAE decode. Decoding the whole `[3, 4·T_lat, 480, 832]` segment in one
@@ -742,35 +703,37 @@ pub fn generate(
         // free-aware (`free × 0.85`, `free = MLX limit − resident`), so the old "bound the peak as the
         // resolution grows" intent is preserved and now measured against real availability rather than
         // a hard-coded pixel budget. The write-cap safety (sc-12438 Req 3) is inside the selector.
-        on_progress(Progress::Decoding);
-        let zs = latent.shape();
-        let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
-        let z_shape = z.shape();
-        let out_frames = z_shape[2] * VAE_TILING.temporal_scale;
-        let out_height = z_shape[3] * VAE_TILING.spatial_scale;
-        let out_width = z_shape[4] * VAE_TILING.spatial_scale;
-        let video = {
-            // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
-            let cfg = decode_tiling(out_height, out_width, out_frames)?;
-            mlx_gen::video_execution::policy(
-                "scail2_decode",
-                serde_json::json!({"tiling":format!("{cfg:?}"),"segment":seg_idx,"latent_shape":z_shape}),
-            );
-            match cfg.as_ref() {
-                // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
-                Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel))?,
-                None => vae.decode(&z)?,
-            }
-        };
+        let video = decode_segment(
+            cancel,
+            on_progress,
+            || {
+                let zs = latent.shape();
+                let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
+                let z_shape = z.shape();
+                let out_frames = z_shape[2] * VAE_TILING.temporal_scale;
+                let out_height = z_shape[3] * VAE_TILING.spatial_scale;
+                let out_width = z_shape[4] * VAE_TILING.spatial_scale;
+                // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
+                let cfg = decode_tiling(out_height, out_width, out_frames)?;
+                mlx_gen::video_execution::policy(
+                    "scail2_decode",
+                    serde_json::json!({"tiling":format!("{cfg:?}"),"segment":seg_idx,"latent_shape":z_shape}),
+                );
+                Ok((z, cfg))
+            },
+            |(z, cfg)| {
+                match cfg.as_ref() {
+                    // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
+                    Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel)),
+                    None => vae.decode(&z),
+                }
+            },
+        )?;
         let vs = video.shape();
         let seg_video = video.reshape(&[vs[1], vs[2], vs[3], vs[4]])?; // [3,T_out,H,W]
         let t_out = seg_video.shape()[1];
 
-        let keep_from = if seg_idx == 0 {
-            0
-        } else {
-            job.segment_overlap as i32
-        };
+        let keep_from = segment.history_frames as i32;
         let piece = seg_video.take_axis(
             Array::from_slice(
                 &(keep_from..t_out).collect::<Vec<i32>>(),
@@ -781,8 +744,10 @@ pub fn generate(
         mlx_rs::transforms::eval([&piece])?;
         out_pieces.push(piece);
 
-        if seg_idx + 1 < segments.len() {
-            let ov = job.segment_overlap as i32;
+        let ov = segments
+            .get(seg_idx + 1)
+            .map_or(0, |next| next.history_frames as i32);
+        if ov > 0 {
             prev_history_pixel = Some(seg_video.take_axis(
                 Array::from_slice(&(t_out - ov..t_out).collect::<Vec<i32>>(), &[ov]),
                 1,
@@ -801,9 +766,105 @@ pub fn generate(
     })
 }
 
+/// Decode policy selection can take a memory snapshot. Check cancellation both after
+/// notifying the caller and before invoking the chosen tiled or untiled decoder.
+fn decode_segment<P, T>(
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    prepare: impl FnOnce() -> Result<P>,
+    decode: impl FnOnce(P) -> Result<T>,
+) -> Result<T> {
+    on_progress(Progress::Decoding);
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let policy = prepare()?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    decode(policy)
+}
+
+/// Pin decoded-and-reencoded history on both sides of the native scheduler update.
+fn denoise_segment(
+    phase: &VideoDenoisePhase<(), SolverKind>,
+    segment_count: usize,
+    noise: &Array,
+    history: Option<&Array>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut advance: impl FnMut(usize, &Array, &Array) -> Result<Array>,
+) -> Result<Array> {
+    let segment = phase.identity.pass;
+    let steps = phase.sigmas.len() - 1;
+    let mut latent = apply_clean_history(noise, history)?;
+    run_video_steps(&phase.sigmas, cancel, |step| -> Result<()> {
+        let x = apply_clean_history(&latent, history)?;
+        latent = advance(step.index, &x, &latent)?;
+        latent = apply_clean_history(&latent, history)?;
+        mlx_rs::transforms::eval([&latent])?;
+        let current = (segment * steps + step.index + 1) as u32;
+        let total = (steps * segment_count) as u32;
+        on_progress(Progress::Step { current, total });
+        Ok(())
+    })?;
+    Ok(latent)
+}
+
+fn job_segments(job: &Scail2Job) -> mlx_gen::gen_core::Result<Vec<Scail2Segment>> {
+    let frames = u32::try_from(job.driving_frames.len()).map_err(|_| {
+        mlx_gen::gen_core::Error::Unsupported("scail2: too many driving frames".into())
+    })?;
+    let reference_count = u32::try_from(job.additional.len())
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| {
+            mlx_gen::gen_core::Error::Unsupported("scail2: too many character images".into())
+        })?;
+    resolve_segments(
+        SegmentTail::FullWindows,
+        MemoryGeometry {
+            width: job.width,
+            height: job.height,
+            batch: 1,
+            frames,
+            reference_count,
+        },
+        job.segment_len,
+        job.segment_overlap,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validate_segment_params(
+        total: usize,
+        window: usize,
+        overlap: usize,
+    ) -> mlx_gen::gen_core::Result<Vec<super::Scail2Segment>> {
+        super::resolve_segments(
+            super::SegmentTail::FullWindows,
+            super::MemoryGeometry {
+                width: 32,
+                height: 32,
+                batch: 1,
+                frames: total as u32,
+                reference_count: 1,
+            },
+            window,
+            overlap,
+        )
+    }
+
+    fn build_segments(total: usize, window: usize, overlap: usize) -> Vec<(usize, usize)> {
+        validate_segment_params(total, window, overlap)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.source.start, s.source.end))
+            .collect()
+    }
 
     #[test]
     fn build_segments_single_window_when_clip_fits() {
@@ -866,6 +927,114 @@ mod tests {
         // short-clip job must not be newly rejected over fields it doesn't use.
         validate_segment_params(13, 81, 81).expect("single-window job ignores window params");
         validate_segment_params(10, 10, 3).expect("total == segment_len is single-window");
+    }
+
+    #[test]
+    fn native_segment_preserves_window_seed_progress_and_clean_history() {
+        use super::{denoise_segment, job_segments, Scail2Job};
+        use mlx_gen::gen_core::Progress;
+
+        let image = Image {
+            width: 64,
+            height: 32,
+            pixels: Vec::new(),
+        };
+        let frames = vec![image.clone(); 25];
+        let job = Scail2Job {
+            prompt: "",
+            negative_prompt: "",
+            width: 64,
+            height: 32,
+            reference: CharacterRef {
+                image: &image,
+                mask: &image,
+            },
+            additional: vec![CharacterRef {
+                image: &image,
+                mask: &image,
+            }],
+            driving_frames: &frames,
+            driving_masks: &frames,
+            replace_flag: true,
+            seed: u64::MAX,
+            steps: 2,
+            shift: 5.0,
+            guidance: 5.0,
+            sampler: SolverKind::from_name("dpm++"),
+            fps: 16,
+            segment_len: 13,
+            segment_overlap: 5,
+            memory: None,
+        };
+        let segments = job_segments(&job).unwrap();
+        let windows: Vec<_> = segments
+            .iter()
+            .map(|s| (s.source.start, s.source.end))
+            .collect();
+        assert_eq!(windows, vec![(0, 13), (8, 21)]);
+        for (index, (start, end)) in windows.iter().enumerate() {
+            let phase = segments[index].denoise_phase(job.sampler, vec![1., 0.5, 0.], job.seed);
+            assert_eq!(phase.identity.pass, index);
+            assert_eq!(phase.identity.geometry.width, 64);
+            assert_eq!(phase.identity.geometry.height, 32);
+            assert_eq!(phase.identity.geometry.reference_count, 2);
+            assert_eq!(phase.identity.geometry.frames as usize, end - start);
+            assert_eq!(phase.latent_frames as usize, (end - start - 1) / 4 + 1);
+            assert_eq!(phase.seed, u64::MAX.wrapping_add(index as u64));
+            assert_eq!(phase.solver, SolverKind::Dpmpp2m);
+        }
+
+        let short_windows = Scail2Job {
+            driving_frames: &frames[..13],
+            driving_masks: &frames[..13],
+            segment_len: 5,
+            segment_overlap: 1,
+            ..job
+        };
+        let segments = job_segments(&short_windows).unwrap();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[1].latent_frames, 2);
+        // Poison the clean first frame on every update. The next forward, solver input,
+        // and returned segment must see the restored frame while the other frame evolves.
+        let stream = mlx_rs::Stream::new_with_device(&mlx_rs::Device::cpu());
+        mlx_rs::with_new_default_stream(stream, || {
+            let noise = Array::from_slice(&[1.0f32, 2.0], &[1, 2, 1, 1]);
+            let history = Array::from_slice(&[19.0f32], &[1, 1, 1, 1]);
+            let values = |a: &Array| a.reshape(&[-1]).unwrap().as_slice::<f32>().to_vec();
+            let phase = segments[1].denoise_phase(job.sampler, vec![1., 0.5, 0.], job.seed);
+            let mut progress = Vec::new();
+            let solved = denoise_segment(
+                &phase,
+                3,
+                &noise,
+                Some(&history),
+                &CancelFlag::new(),
+                &mut |event| match event {
+                    Progress::Step { current, total } => progress.push((current, total)),
+                    _ => panic!("unexpected progress during a native segment"),
+                },
+                |i, x, previous| {
+                    assert_eq!(values(x), [19.0, 2.0 + i as f32]);
+                    assert_eq!(values(previous), values(x));
+                    Ok(Array::from_slice(&[-10.0, 3.0 + i as f32], &[1, 2, 1, 1]))
+                },
+            )
+            .unwrap();
+            assert_eq!(values(&solved), [19.0, 4.0]);
+            assert_eq!(progress, [(3, 6), (4, 6)]);
+            let empty = segments[0].denoise_phase(job.sampler, vec![0.], job.seed);
+            let decoded_input = denoise_segment(
+                &empty,
+                1,
+                &noise,
+                None,
+                &CancelFlag::new(),
+                &mut |_| panic!("zero updates have no progress"),
+                |_, _, _| panic!("zero updates have no forward"),
+            )
+            .unwrap();
+            assert_eq!(values(&decoded_input), values(&noise));
+        });
     }
 
     #[test]
@@ -942,6 +1111,37 @@ mod tests {
         );
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED generate::tests::public_generate_rejects_geometry_before_adapter_io");
+    }
+
+    #[test]
+    fn canceled_untiled_decode_never_enters_the_vae() {
+        for cancel_on_progress in [true, false] {
+            let cancel = CancelFlag::new();
+            let mut notified = false;
+            let outcome = decode_segment(
+                &cancel,
+                &mut |event| {
+                    assert!(matches!(event, Progress::Decoding));
+                    notified = true;
+                    if cancel_on_progress {
+                        cancel.cancel();
+                    }
+                },
+                || {
+                    assert!(
+                        !cancel_on_progress,
+                        "selected a decode policy after cancellation"
+                    );
+                    cancel.cancel();
+                    Ok(None::<usize>)
+                },
+                |policy| -> Result<()> {
+                    panic!("entered decoder with policy {policy:?} after cancellation")
+                },
+            );
+            assert!(notified);
+            assert!(matches!(outcome, Err(Error::Canceled)));
+        }
     }
 
     /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.
