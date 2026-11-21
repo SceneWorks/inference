@@ -13,7 +13,7 @@ on:
       flux1_pair:
         description: Compare the FLUX.1 batch against its pre-migration source in this same job
         type: choice
-        options: [none, tier1, tier2, conditional-tier1, eng4b-tier1, eng4b-tier2]
+        options: [none, tier1, tier2, conditional-tier1, eng4b-tier1, eng4b-tier2, eng4b-conditional-tier1]
         default: none
       request:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
@@ -38,7 +38,7 @@ env:
     ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'sga-terminal-tier2' && 'sga_terminal_comparison.py'
     || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'sga-adapter-tier1' && 'sga_adapter_comparison.py'
     || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py'
-    || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py'
+    || (inputs.flux1_pair == 'conditional-tier1' || inputs.flux1_pair == 'eng4b-conditional-tier1') && 'flux1_conditional_comparison.py'
     || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2' || inputs.flux1_pair == 'eng4b-tier1' || inputs.flux1_pair == 'eng4b-tier2') && 'flux1_comparison.py'
     || 'model_inference_proofs.py' }}
 

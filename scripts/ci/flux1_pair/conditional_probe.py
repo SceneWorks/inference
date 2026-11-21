@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess
 
-from scripts.ci.flux1_pair import conditional, overlay
+from scripts.ci.flux1_pair import conditional, fixture, overlay
 
 HERE = Path(__file__).resolve().parent
 
@@ -201,16 +201,25 @@ def cuda_proof():
     drop(generator);'''
 
 
-def generate_source(backend, arm, case):
+def generate_source(backend, arm, case, tier="tier1"):
     template = (HERE / "conditional_probe.rs.in").read_text(encoding="utf-8")
     mlx = backend == "mlx"
     setup = mlx_setup(case) if mlx else candle_setup(case)
     if mlx:
         setup = setup.replace("@REGISTRY@", "mlx_gen_pulid" if case.startswith("pulid-") else "mlx_gen_flux")
+    cuda = "" if mlx else cuda_proof()
+    if tier == fixture.ENG4B:
+        # Permit native plan-only discovery on a non-CUDA host.
+        template = template.replace("    let case =", """    if !cfg!(feature = "cuda") && env::args().nth(1).as_deref() != Some("--preflight") {
+        return Err("ENG-4b conditional proof requires CUDA".into());
+    }
+    let case =""", 1)
+        cuda = '#[cfg(feature = "cuda")] {\n' + cuda + '\n}'
+    planned_arm = "head" if tier == fixture.ENG4B else arm
     return (template.replace("@ENGINE@", "mlx_gen" if mlx else "candle_gen")
             .replace("@SETUP@", setup)
-            .replace("@GENERATE@", mlx_generate(arm) if mlx else candle_generate(case, arm))
-            .replace("@CUDA_PROOF@", "" if mlx else cuda_proof()))
+            .replace("@GENERATE@", mlx_generate(arm) if mlx else candle_generate(case, planned_arm))
+            .replace("@CUDA_PROOF@", cuda))
 
 
 def proof_manifest(body, package):
@@ -248,7 +257,7 @@ def fetch_locked(root, timeout=CARGO_FETCH_TIMEOUT_SECONDS):
 
 
 def install(root, backend, arm, tier, case):
-    if tier != "tier1":
+    if tier not in ("tier1", fixture.ENG4B) or (tier == fixture.ENG4B and backend != "candle-cuda"):
         raise ValueError("conditional FLUX.1 comparison is Tier 1 only")
     # Fill the cargo cache from the untouched checkout before any manifest edit or offline step.
     fetch_locked(root)
@@ -269,5 +278,5 @@ def install(root, backend, arm, tier, case):
                    check=True, stdout=subprocess.DEVNULL)
     destination = root / "crates/media" / family / package / "src/bin/flux1-pair.rs"
     destination.parent.mkdir(exist_ok=True)
-    destination.write_text(generate_source(backend, arm, case), encoding="utf-8")
+    destination.write_text(generate_source(backend, arm, case, tier), encoding="utf-8")
     return package

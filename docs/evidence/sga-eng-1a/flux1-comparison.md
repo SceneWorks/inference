@@ -118,3 +118,26 @@ The profile measures CUDA resident Q4 Dev and Schnell. FLUX.1 conditional
 modes use `conditional-tier1` and its separate immutable asset bindings.
 Native BFL and the ControlNet and PuLID injection routes retain their
 own model proof cases. Their evidence applies to those cases' settings.
+
+### ENG-4b conditional fidelity
+
+Select `eng4b-conditional-tier1` on Candle CUDA and use the
+`flux1-eng4b-conditional-pair` request. The controller builds the exact merged
+ENG-4a baseline and dispatched head in private Git worktrees. Both arms compile
+and use the same plan. The profile covers ControlNet pose, XLabs IP Dev and
+PuLID fake CFG. It binds the historical shape-faithful BF16 fixture, source
+image bytes and real overlay inputs from the accepted
+[ControlNet](https://github.com/SceneWorks/inference/actions/runs/42462655901),
+[XLabs IP](https://github.com/SceneWorks/inference/actions/runs/43558292122)
+and [PuLID](https://github.com/SceneWorks/inference/actions/runs/42460488791)
+receipts. The profile compares current outputs within each new pair with
+bit-exact state, event and RGB8 requirements.
+
+For each case, reuse its archived receipt's `request`, set `selection` to
+`flux1-eng4b-conditional-pair` and use the existing 250 ms guard poll.
+Each dispatch builds twice and runs two model-free preflights and two renders.
+The child deadline is at most 20 minutes. At that limit, the claim budgets
+100 minutes plus its normal release reserve. The 24 GiB host and 18 GiB device
+caps apply. This comparison covers conditional fidelity on the fixed fixture.
+The complete real-Q4 Dev and Schnell timing and memory comparison uses the
+separate `eng4b-tier2` profile.
