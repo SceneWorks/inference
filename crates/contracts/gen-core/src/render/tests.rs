@@ -121,9 +121,7 @@ fn krea_plan_lowers_ordered_phase_arguments_and_binds_the_request_and_load() {
         "reset_solver_and_reuse_image_seed"
     );
     assert!(plan.check_request(&descriptor, &req).is_ok());
-    assert!(plan
-        .check_load(&RenderLoadBinding::from_spec(&spec))
-        .is_ok());
+    assert!(plan.check_load_spec(&spec).is_ok());
     assert!(plan.clone().with_inert_split_at(2).is_err());
     assert!(RenderPlan::packed_image_trajectory(
         &descriptor,
@@ -134,9 +132,7 @@ fn krea_plan_lowers_ordered_phase_arguments_and_binds_the_request_and_load() {
 
     let mut swapped = spec.clone();
     swapped.adapters.swap(0, 1);
-    assert!(plan
-        .check_load(&RenderLoadBinding::from_spec(&swapped))
-        .is_err());
+    assert!(plan.check_load_spec(&swapped).is_err());
     let mut changed = req.clone();
     changed.phases.as_mut().unwrap()[1].adapters.swap(0, 1);
     assert!(plan.check_request(&descriptor, &changed).is_err());
@@ -146,6 +142,79 @@ fn krea_plan_lowers_ordered_phase_arguments_and_binds_the_request_and_load() {
     changed = req;
     changed.text_style_gain = Some(0.75);
     assert!(plan.check_request(&descriptor, &changed).is_err());
+}
+
+#[test]
+fn krea_plan_rebinds_placement_without_replacing_compiled_load_identity() {
+    use crate::{LoadShape, LoadShapeDeclarationResult, OffloadPolicy, Precision};
+
+    let descriptor = adapter_phase_descriptor();
+    let spec = adapter_phase_spec();
+    let req = adapter_phase_request();
+    let plan = RenderPlan::krea_multiphase(
+        &descriptor,
+        &spec,
+        &req,
+        pass(vec![1.0, 0.75, 0.5, 0.25, 0.0], 4, 0.0),
+    )
+    .unwrap();
+    let mut placed = spec.clone().with_offload_policy(OffloadPolicy::Sequential);
+    placed.load_shape = LoadShape::DeferredMaterialization;
+    placed.load_shape_declaration_result = LoadShapeDeclarationResult::Eligible;
+    assert!(plan.check_load_spec(&placed).is_err());
+    let rebound = plan.clone().rebind_load_placement(&placed).unwrap();
+    assert_eq!(rebound.adapter_phases(), plan.adapter_phases());
+    assert!(rebound.check_load_spec(&placed).is_ok());
+    assert!(rebound.check_load_spec(&spec).is_err());
+
+    let mut rescaled = placed.clone();
+    rescaled.adapters[0].scale = 0.75;
+    let mut replaced_adapter = placed.clone();
+    replaced_adapter.adapters[0].path = "/different-adapter".into();
+    let mut replaced_weights = placed.clone();
+    replaced_weights.weights = WeightsSource::Dir("/different-weights".into());
+    let mut retyped = placed;
+    retyped.precision = Precision::Fp32;
+    for other in [rescaled, replaced_adapter, replaced_weights, retyped] {
+        assert!(matches!(
+            plan.clone().rebind_load_placement(&other),
+            Err(Error::Unsupported(message)) if message.contains("different model or adapter stack")
+        ));
+        let bypass = plan.clone().bind_load(&other);
+        assert!(bypass.check_load_spec(&other).is_err());
+        assert!(bypass
+            .check_load(&RenderLoadBinding::from_spec(&other))
+            .is_err());
+        assert!(bypass.check_load_spec(&spec).is_ok());
+    }
+}
+
+#[test]
+fn krea_phase_plan_rejects_a_new_pin_for_the_same_adapter_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("adapter.safetensors");
+    std::fs::write(&path, [1_u8]).unwrap();
+    let mut ordinary = adapter_phase_spec();
+    ordinary.adapters[0].path = path.clone();
+    ordinary.adapters[1].path = path.clone();
+    let mut sealed = ordinary.clone();
+    sealed.prepare_file_sources().unwrap();
+    let plan = RenderPlan::krea_multiphase(
+        &adapter_phase_descriptor(),
+        &sealed,
+        &adapter_phase_request(),
+        pass(vec![1.0, 0.75, 0.5, 0.25, 0.0], 4, 0.0),
+    )
+    .unwrap();
+    assert!(plan.check_load_spec(&sealed.clone()).is_ok());
+    assert!(plan.clone().rebind_load_placement(&ordinary).is_err());
+    std::fs::write(path, [2_u8, 3]).unwrap();
+    ordinary.prepare_file_sources().unwrap();
+    assert!(plan.clone().rebind_load_placement(&ordinary).is_err());
+    assert!(plan
+        .bind_load(&ordinary)
+        .check_load_spec(&ordinary)
+        .is_err());
 }
 
 #[test]
@@ -184,6 +253,68 @@ fn krea_plan_preserves_authored_stops_across_short_and_long_native_schedules() {
     assert_eq!(long.capture_sigma(), 0.4);
     assert_eq!(long.denoise_sigmas(), &[1.0, 0.85, 0.7, 0.55, 0.4]);
     assert_eq!(long.sigmas().len(), 7);
+}
+
+#[test]
+fn krea_pag_receipt_counts_the_prefix_on_the_full_ddim_uniform_grid() {
+    let req = GenerationRequest {
+        scheduler: Some("ddim_uniform".into()),
+        phases: Some(vec![
+            GenerationPhase {
+                steps: 16,
+                ..Default::default()
+            },
+            GenerationPhase {
+                steps: 15,
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    };
+    let sigmas =
+        crate::sampling::flow_schedule_with_shift(req.scheduler.as_deref(), 0.0, None, 31, &[])
+            .unwrap();
+    let plan = RenderPlan::krea_multiphase(
+        &adapter_phase_descriptor(),
+        &adapter_phase_spec(),
+        &req,
+        pass(sigmas, 32, 0.0),
+    )
+    .unwrap();
+    let executed_steps = plan.executed_steps();
+    let schedule_steps = plan.sigmas().len() - 1;
+    assert_eq!((executed_steps, schedule_steps), (31, 32));
+    assert_eq!(plan.denoise_spans(), [0..16, 16..31]);
+
+    let beyond_prefix = crate::PagResolved {
+        scale: 2.0,
+        adaptive_scale: 0.0,
+        layers: vec![2],
+        start: 0.96,
+        stop: 1.0,
+    };
+    let active_edge = crate::PagResolved {
+        start: 0.9375,
+        stop: 0.95,
+        ..beyond_prefix.clone()
+    };
+    assert!(beyond_prefix.step_scale(31, schedule_steps) > 0.0);
+    assert_eq!(beyond_prefix.active_steps(executed_steps as u32), 1);
+    assert!(active_edge.step_scale(30, schedule_steps) > 0.0);
+    assert_eq!(active_edge.active_steps(executed_steps as u32), 0);
+
+    for (pag, expected_steps) in [(beyond_prefix, 0), (active_edge, 1)] {
+        let evaluated_steps = plan
+            .adapter_phases()
+            .iter()
+            .flat_map(AdapterDenoisePhase::span)
+            .filter(|&step| pag.step_scale(step, schedule_steps) > 0.0)
+            .count() as u32;
+        let receipt = pag.execution_report_for_prefix(executed_steps as u32, schedule_steps as u32);
+        assert_eq!(receipt.total_steps, 31);
+        assert_eq!(receipt.active_steps, expected_steps);
+        assert_eq!(receipt.active_steps, evaluated_steps);
+    }
 }
 
 #[test]

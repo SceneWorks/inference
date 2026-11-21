@@ -901,7 +901,7 @@ impl Generator for KreaGenerator {
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
-        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+        plan.check_load_spec(&self.file_pin_spec)?;
         if req.phases.is_none() || plan.adapter_phases().is_empty() {
             return Err(gen_core::Error::Unsupported(
                 "Candle Krea's planned entry requires a multi-phase Raw render".into(),
@@ -1226,23 +1226,23 @@ impl KreaGenerator {
                 _ => unreachable!("residency phase variants are constructed in matching pairs"),
             },
         )?;
-        let pag_report = match &resolved_pag {
-            Some(pag) => {
+        let pag_report = match (&resolved_pag, plan) {
+            (Some(pag), Some(plan)) => Some(pag.execution_report_for_prefix(
+                plan.executed_steps() as u32,
+                plan.sigmas().len().saturating_sub(1) as u32,
+            )),
+            (Some(pag), None) => {
                 let raw_schedule = raw || (edit && !turbo_edit);
                 let img2img_strength = if edit {
                     None
                 } else {
                     reference.map(|(_, strength)| strength)
                 };
-                let executed_steps = match plan {
-                    Some(plan) => plan.sigmas().len().saturating_sub(1) as u32,
-                    None => {
-                        pipeline::executed_steps_for_request(raw_schedule, img2img_strength, req)?
-                    }
-                };
+                let executed_steps =
+                    pipeline::executed_steps_for_request(raw_schedule, img2img_strength, req)?;
                 Some(pag.execution_report(executed_steps))
             }
-            None => None,
+            (None, _) => None,
         };
         let mut report = gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
         report.pag = pag_report;

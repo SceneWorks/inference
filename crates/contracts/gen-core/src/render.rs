@@ -103,6 +103,17 @@ struct AdapterPhasePlan {
     need_negative: bool,
     sampling: AdapterPhaseSampling,
     installation: AdapterPhaseInstallation,
+    #[serde(skip)]
+    compiled_load: AdapterPhaseLoadSpec,
+}
+
+#[derive(Clone, Debug)]
+struct AdapterPhaseLoadSpec(std::sync::Arc<LoadSpec>);
+
+impl PartialEq for AdapterPhaseLoadSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_load_except_placement(&other.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -639,8 +650,10 @@ impl RenderPlan {
                 .any(|phase| phase.guidance.unwrap_or(plan.guidance()) != 0.0),
             sampling: AdapterPhaseSampling::ResetSolverAndReuseImageSeed,
             installation: AdapterPhaseInstallation::ImmutableResiduals,
+            compiled_load: AdapterPhaseLoadSpec(std::sync::Arc::new(spec.clone())),
         });
-        Ok(plan.bind_load(spec))
+        plan.preparation = Some(RenderLoadBinding::from_spec(spec));
+        Ok(plan)
     }
 
     fn packed_image_trajectory_inner(
@@ -903,13 +916,54 @@ impl RenderPlan {
     fn preparation(&self) -> Option<&RenderLoadBinding> {
         self.preparation.as_ref()
     }
-    /// Freeze the exact load contract for a direct provider that is not registry loaded.
+    /// Bind an ordinary plan to its load contract. Adapter phase plans already bind the spec
+    /// whose scales they compiled. Use [`Self::rebind_load_placement`] to update their placement.
     pub fn bind_load(mut self, spec: &LoadSpec) -> Self {
-        self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        if self.pass.adapter_phases.is_none() {
+            self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        }
         self
     }
 
+    /// Update an adapter phase plan with the actual loader placement. No source, pin, adapter
+    /// slot, default scale or other load input may differ from the spec used to compile it.
+    pub fn rebind_load_placement(mut self, spec: &LoadSpec) -> Result<Self> {
+        let phases = self.pass.adapter_phases.as_ref().ok_or_else(|| {
+            Error::Unsupported("load placement rebinding requires an adapter phase plan".into())
+        })?;
+        Self::check_adapter_phase_load(phases, spec)?;
+        self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        Ok(self)
+    }
+
+    /// Check an exact load spec, including the pinned source and ordered adapter identity for
+    /// adapter phases, against the plan and its bound placement.
+    pub fn check_load_spec(&self, spec: &LoadSpec) -> Result<()> {
+        if let Some(phases) = &self.pass.adapter_phases {
+            Self::check_adapter_phase_load(phases, spec)?;
+        }
+        self.check_bound_load(&RenderLoadBinding::from_spec(spec))
+    }
+
+    fn check_adapter_phase_load(phases: &AdapterPhasePlan, spec: &LoadSpec) -> Result<()> {
+        if !phases.compiled_load.0.same_load_except_placement(spec) {
+            return Err(Error::Unsupported(
+                "adapter phase plan belongs to a different model or adapter stack".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn check_load(&self, loaded: &RenderLoadBinding) -> Result<()> {
+        if self.pass.adapter_phases.is_some() {
+            return Err(Error::Unsupported(
+                "adapter phase plans require checking the exact load spec".into(),
+            ));
+        }
+        self.check_bound_load(loaded)
+    }
+
+    fn check_bound_load(&self, loaded: &RenderLoadBinding) -> Result<()> {
         if self
             .preparation
             .as_ref()
