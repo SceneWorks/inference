@@ -6,7 +6,7 @@
 
 use mlx_rs::{Array, Dtype};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::primitives::nn::linear;
 use crate::primitives::prism::PrismLinear;
 use crate::primitives::quant::QuantizedLinear;
