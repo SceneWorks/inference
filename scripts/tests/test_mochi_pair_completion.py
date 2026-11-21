@@ -18,17 +18,18 @@ WINDOW = {"start_ns": 4, "end_ns": 306}
 
 
 def evidence():
-    packet = {"pid": 14, "case": boundary.CASE, "uuid": UUID, "ready_utc_ns": 13}
-    ready = {"packet": packet, "seen_utc_ns": 14, "seen_ns": 14, "local_filetime": 1035}
-    ack = {"ready": packet, "sample": [1040, 36], "sample_count": 2, "created_filetime": 12345,
-           "adapter": ADAPTER, "end_local_filetime": 1050, "ack_ns": 15, "ack_utc_ns": 16}
-    native = {"ack": deepcopy(ack), "release_utc_ns": 20}
-    release = {"sample_count": 2, "seen_ns": 25, "seen_utc_ns": 26, "local_filetime": 1100, "retry_count": 0}
+    offset = 1000
+    packet = {"pid": 14, "case": boundary.CASE, "uuid": UUID, "ready_utc_ns": offset + 13}
+    ready = {"packet": packet, "seen_utc_ns": offset + 14, "seen_ns": 14, "local_filetime": 1035}
+    ack = {"ready": packet, "sample": [1040, 36], "sample_count": 2, "created_filetime": boundary.UNIX_EPOCH_FILETIME + 1,
+           "adapter": ADAPTER, "end_local_filetime": 1050, "ack_ns": 15, "ack_utc_ns": offset + 16}
+    native = {"ack": deepcopy(ack), "release_utc_ns": offset + 20}
+    release = {"packet": deepcopy(native), "sample_count": 2, "seen_ns": 25, "seen_utc_ns": offset + 26, "local_filetime": 1100, "retry_count": 0}
     miss = {"start_ns": 29, "end_ns": 31, "local_filetime_before": 1130, "local_filetime_after": 1140,
             "retried": True, "retry_sample": None, "previous": [1040, 36], "recovered": False}
     ev = {"diagnostics": {"attempts": 1, "events": [miss]}, "ready": ready, "release": release, "ack": ack,
-          "reason": diagnostic.RETRY_REASON, "pid": 14, "created_filetime": 12345, "adapter": ADAPTER}
-    raw = {"adapter": ADAPTER, "pid": 14, "created_filetime": 12345, "error": None,
+          "reason": diagnostic.RETRY_REASON, "pid": 14, "created_filetime": boundary.UNIX_EPOCH_FILETIME + 1, "adapter": ADAPTER}
+    raw = {"adapter": ADAPTER, "pid": 14, "created_filetime": boundary.UNIX_EPOCH_FILETIME + 1, "error": None,
            "missing_active_polls": 1, "samples": [[1010, 39], [1040, 36]]}
     guard = {"pid": 14, "fit_observation": ev, "cuda_attribution": {"wddm_dedicated": raw}, "owned_completion":
              {"scope": "supervisor-owned-windows-job", "root_pid": 14, "root_returncode": 0, "waited_returncode": 0,
@@ -93,6 +94,8 @@ class MochiCompletionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     grade(guard, native)
         guard, native = evidence()
+        with self.assertRaises(ValueError):
+            grade(guard, dict(native, release_utc_ns=native["release_utc_ns"]+1))
         guard["cuda_attribution"]["wddm_dedicated"]["error"] = "lost Job"
         self.assertIsNone(grade(guard, native))
 

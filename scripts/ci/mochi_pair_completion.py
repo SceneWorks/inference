@@ -9,6 +9,7 @@ from scripts.ci.scail_plural.wddm_retry import MAX_RETRY_EVENTS, SameTickSamples
 from scripts.ci.wddm_process_memory import sampled_peak
 
 CASE = "cuda-mochi-masked-euler"
+UNIX_EPOCH_FILETIME = 116444736000000000
 
 
 def utc_ns():
@@ -19,7 +20,7 @@ def utc_ns():
     read.argtypes, read.restype = [ctypes.POINTER(FILETIME)], None
     stamp = FILETIME()
     read(ctypes.byref(stamp))
-    return ((stamp.dwHighDateTime << 32 | stamp.dwLowDateTime) - 116444736000000000) * 100
+    return ((stamp.dwHighDateTime << 32 | stamp.dwLowDateTime) - UNIX_EPOCH_FILETIME) * 100
 
 
 class CompletionSamples(SameTickSamples):
@@ -37,7 +38,7 @@ class CompletionSamples(SameTickSamples):
         if packet is not _MISSING:
             if packet["ack"] != self.ack:
                 raise ValueError("native Mochi release differs from this owned acknowledgement")
-            self.release = {"seen_ns": time.monotonic_ns(), "seen_utc_ns": utc_ns(),
+            self.release = {"packet": packet, "seen_ns": time.monotonic_ns(), "seen_utc_ns": utc_ns(),
                             "local_filetime": local_filetime(), "retry_count": self.diagnostics["attempts"],
                             "sample_count": len(self.record["samples"])}
 
@@ -86,10 +87,11 @@ def live_record(guard, native, adapter, role):
     ack, packet = native["ack"], ready["packet"]
     ns = (packet["ready_utc_ns"], ready["seen_utc_ns"], ack["ack_utc_ns"], native["release_utc_ns"], release["seen_utc_ns"])
     mono = (ready["seen_ns"], ack["ack_ns"], release["seen_ns"])
-    if (not all(type(v) is int and v > 0 for v in (*ns, *mono)) or list(ns) != sorted(ns)
+    created_ns = (row["created_filetime"] - UNIX_EPOCH_FILETIME) * 100
+    if (not all(type(v) is int and v > 0 for v in (*ns, *mono)) or not 0 < created_ns <= ns[0] or list(ns) != sorted(ns)
             or list(mono) != sorted(mono) or not role["start_ns"] <= mono[0] <= mono[-1] <= role["end_ns"]
             or mono[1] - mono[0] > 5_000_000_000
-            or native != {"ack": witness["ack"], "release_utc_ns": native["release_utc_ns"]}
+            or native != release["packet"] or native != {"ack": witness["ack"], "release_utc_ns": native["release_utc_ns"]}
             or ack["ready"] != packet or packet["case"] != CASE or packet["uuid"] != diagnostic.GPU0_HARDWARE["uuid"]
             or packet["pid"] != row["pid"] or row["pid"] != guard["pid"] or ack["created_filetime"] != row["created_filetime"]
             or validate_adapter(ack["adapter"], packet["uuid"]) != adapter or row["adapter"] != adapter):
