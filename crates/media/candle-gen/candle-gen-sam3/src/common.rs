@@ -7,97 +7,56 @@
 //! MLX side does, because MLX convs are OHWI). We only transpose *activations* NHWC↔NCHW around each
 //! conv so the transformer body stays channels-last and mirrors the MLX modules line-by-line.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::{safetensors, DType, Device, Tensor, D};
+#[cfg(test)]
+use candle_gen::candle_core::safetensors;
+use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax;
 use candle_gen::candle_nn::{GroupNorm, LayerNorm, Module};
 use candle_gen::gen_core::Quant;
 use candle_gen::quant::{DenseLinear, QLinear};
-use candle_gen::{CandleError, Result};
+#[cfg(test)]
+use candle_gen::CandleError;
+use candle_gen::Result;
 
 /// A loaded SAM3 weight map. Tensors are coerced to f32 on load — the parity oracle is f32 and SAM3
 /// fits comfortably in f32 on the target box; the Q8/Q4 quant path lands in a later slice (sc-6246).
-pub struct Weights {
-    map: HashMap<String, Tensor>,
-}
+pub struct Weights(candle_gen::Weights);
 
 impl Weights {
-    /// Load every tensor from one `.safetensors` file onto `device`, coercing to f32.
-    pub fn from_file(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
-        let mut map = HashMap::new();
-        Self::extend_from(&mut map, path.as_ref(), device)?;
-        Ok(Self { map })
+    pub fn from_file(path: impl AsRef<Path>, dev: &Device) -> Result<Self> {
+        Ok(Self(candle_gen::Weights::from_file(
+            path.as_ref(),
+            dev,
+            DType::F32,
+        )?))
     }
-
-    /// Load + merge every `*.safetensors` shard in `dir` (the sharded `facebook/sam3` checkpoint).
-    pub fn from_dir(dir: impl AsRef<Path>, device: &Device) -> Result<Self> {
-        let dir = dir.as_ref();
-        let mut shards: Vec<_> = std::fs::read_dir(dir)
-            .map_err(|e| CandleError::Msg(format!("read_dir {}: {e}", dir.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-            .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
-            .collect();
-        shards.sort();
-        if shards.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "no .safetensors files in {}",
-                dir.display()
-            )));
-        }
-        let mut map = HashMap::new();
-        for shard in &shards {
-            Self::extend_from(&mut map, shard, device)?;
-        }
-        Ok(Self { map })
+    pub fn from_dir(path: impl AsRef<Path>, dev: &Device) -> Result<Self> {
+        let files = candle_gen::sorted_safetensors(path.as_ref(), "sam3")?;
+        Ok(Self(candle_gen::Weights::from_files(
+            &files,
+            dev,
+            DType::F32,
+        )?))
     }
-
-    fn extend_from(map: &mut HashMap<String, Tensor>, path: &Path, device: &Device) -> Result<()> {
-        let raw = safetensors::load(path, device)?;
-        for (k, v) in raw {
-            let v = match v.dtype() {
-                DType::F32 => v,
-                // Float casts run on-device. Integer casts (the parity fixtures' `input_ids` /
-                // `attention_mask` / `box_labels` / `instance_masks`) hit a missing int->f32 CUDA cast
-                // kernel on this candle build (`CUDA_ERROR_NOT_FOUND`), so route those through the CPU.
-                DType::F16 | DType::BF16 | DType::F64 => v.to_dtype(DType::F32)?,
-                _ => v
-                    .to_device(&Device::Cpu)?
-                    .to_dtype(DType::F32)?
-                    .to_device(device)?,
-            };
-            // A key that already exists means TWO shards define the same tensor. In a normal sharded
-            // safetensors checkpoint every key lives in exactly one shard, so a cross-shard duplicate is
-            // abnormal — a mis-sharded or double-listed checkpoint, or a stray `.safetensors` polluting
-            // the snapshot dir. Silently overwriting (the old `insert`) would let a stray file shadow the
-            // real weights with no diagnostic, so we hard-error naming the key and the offending shard
-            // rather than emit a bare library warning (F-064 / sc-9050; cf. the F-051 no-stderr policy —
-            // this is a genuine load fault, surfaced through the crate's normal `Result` channel).
-            if map.insert(k.clone(), v).is_some() {
-                return Err(CandleError::Msg(format!(
-                    "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors must \
-                     each live in exactly one .safetensors shard — this snapshot has {k:?} in more \
-                     than one file (mis-sharded checkpoint or a stray .safetensors in the dir)",
-                    path.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
     pub fn require(&self, key: &str) -> Result<Tensor> {
-        self.map
-            .get(key)
-            .cloned()
-            .ok_or_else(|| CandleError::Msg(format!("missing tensor: {key}")))
+        let tensor = self.0.require(key)?;
+        if tensor.dtype() == DType::F32 {
+            return Ok(tensor);
+        }
+        Ok(tensor
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .to_device(tensor.device())?)
     }
-
-    /// Fetch an optional tensor (e.g. a `.bias` that some projections omit).
     pub fn get(&self, key: &str) -> Option<Tensor> {
-        self.map.get(key).cloned()
+        self.0
+            .contains(key)
+            .then(|| self.require(key).ok())
+            .flatten()
     }
 }
 
@@ -135,7 +94,11 @@ impl Linear {
     /// `[in, out]` (sc-8997/F-017) — the SAM3 dense layout the shared seam's [`DenseLinear::Transposed`]
     /// arm carries.
     pub fn load(w: &Weights, name: &str) -> Result<Self> {
-        let weight = w.require(&format!("{name}.weight"))?; // [out, in]
+        let bias = w.0.contains(&format!("{name}.bias"));
+        if let Some(layer) = w.0.native_linear(name, bias)? {
+            return Ok(Self(QLinear::from_dense(DenseLinear::Linear(layer))));
+        }
+        let weight = w.require(&format!("{name}.weight"))?;
         Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
             weight_t: weight.t()?.contiguous()?,
             bias: w.get(&format!("{name}.bias")),

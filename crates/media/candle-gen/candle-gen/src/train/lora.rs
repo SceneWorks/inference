@@ -263,7 +263,11 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base: LoraBase::Dense(base),
+            base: if base.is_native() {
+                LoraBase::Packed(QLinear::from_dense(DenseLinear::Linear(base)))
+            } else {
+                LoraBase::Dense(base)
+            },
             in_features,
             out_features,
             path,

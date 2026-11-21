@@ -108,10 +108,7 @@ fn layer_norm(w: &Weights, prefix: &str) -> Result<LayerNorm> {
 /// `candle_nn::Linear` (`[out, in]` weight + bias) from `{prefix}.weight` / `{prefix}.bias`. Every
 /// CLIP attention/MLP projection is biased.
 fn linear(w: &Weights, prefix: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        w.require(&format!("{prefix}.weight"))?,
-        Some(w.require(&format!("{prefix}.bias"))?),
-    ))
+    w.linear(prefix, true)
 }
 
 /// QuickGELU `x · sigmoid(1.702·x)` (OpenAI CLIP-L/ViT-L). Computed in the input dtype to mirror the

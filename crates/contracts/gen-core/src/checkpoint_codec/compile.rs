@@ -199,6 +199,30 @@ pub fn compile_logical_weight_plan_with_metadata(
         descriptors.insert(base, descriptor);
     }
 
+    if mapping.inline_fp8_scales() {
+        for header in by_name.values() {
+            let Some(base) = header.name.strip_suffix(".weight") else {
+                continue;
+            };
+            if !by_name.contains_key(format!("{base}{WEIGHT_SCALE_SUFFIX}").as_str()) {
+                continue;
+            }
+            let format = match header.dtype {
+                Dtype::F8_E4M3 => ComfyQuantFormat::Float8E4M3Fn,
+                Dtype::F8_E5M2 => ComfyQuantFormat::Float8E5M2,
+                _ => continue,
+            };
+            descriptors
+                .entry(base.to_owned())
+                .or_insert(ComfyQuantDescriptor {
+                    format,
+                    full_precision_matrix_mult: false,
+                    orig_shape: None,
+                    rotation_group: None,
+                });
+        }
+    }
+
     let companion_owner = |name: &str| -> Option<(String, CompanionRole)> {
         if let Some(base) = name.strip_suffix(DESCRIPTOR_SUFFIX) {
             return Some((base.to_owned(), CompanionRole::Descriptor));
@@ -330,6 +354,13 @@ pub fn compile_logical_weight_plan_with_metadata(
         })?;
         let base = header.name.strip_suffix(".weight");
         let descriptor = base.and_then(|base| descriptors.get(base));
+        let declared_source_shape = declared_source_shape.or_else(|| {
+            if mapping.accepts_descriptor_shape() {
+                descriptor.and_then(|d| d.orig_shape.clone())
+            } else {
+                None
+            }
+        });
         // Descriptor ↔ stored-dtype agreement first: "declared e4m3 but stored bf16" is the exact
         // defect, not a missing codec row.
         if let Some(descriptor) = descriptor {
@@ -761,17 +792,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                     );
                     let input_scale_key = format!("{base}{INPUT_SCALE_SUFFIX}");
                     if let Some(input_header) = by_name.get(input_scale_key.as_str()) {
-                        // Same rule as the ScalarFp8 arm: a packed-native load keeps the activation
-                        // scale resident, a dense decode consumes it. Pricing it at zero
-                        // unconditionally would under-report a packed MXFP8 row. (Only the MXFP8
-                        // half of this arm can get here — the companion-surface check above refuses
-                        // an `input_scale` on an `int8_tensorwise` layer by format.)
-                        let retained = match mode {
-                            ResidencyMode::Packed => {
-                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
-                            }
-                            ResidencyMode::Dense => 0,
-                        };
+                        // MXFP8 activation exponents are dynamic per block. Stored input_scale
+                        // remains a source fact but occupies no resident execution storage.
+                        let retained = 0;
                         consume_companion(
                             input_header,
                             CompanionRole::InputScale,

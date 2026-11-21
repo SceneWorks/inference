@@ -59,9 +59,13 @@ fn load_map_tensor(
 }
 
 /// A loaded checkpoint weight map (every tensor coerced to the requested compute dtype on load).
+#[derive(Clone)]
 pub struct Weights {
     map: HashMap<String, Tensor>,
-    pub(crate) projection_resources: ProjectionResources,
+    source: Option<(candle_checkpoint::ProjectionSource, Device, DType)>,
+    encoded_keys: std::collections::BTreeSet<String>,
+    companion_keys: std::collections::BTreeSet<String>,
+    pub(crate) projection_resources: std::sync::Arc<ProjectionResources>,
     /// The device the set is *destined for* when some tensors were deliberately left on the host
     /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
     target: Option<Device>,
@@ -85,26 +89,24 @@ impl Weights {
     /// (e.g. `candle_gen::quant::Nvfp4Context`, one cuBLASLt handle instead of one per projection)
     /// needs the device up front, before it starts fetching individual weights.
     pub fn device(&self) -> Option<&Device> {
-        self.map.values().next().map(|t| t.device())
+        self.source
+            .as_ref()
+            .map(|(_, dev, _)| dev)
+            .or_else(|| self.map.values().next().map(|t| t.device()))
     }
 
     /// Load every tensor from a `.safetensors` file onto `device`, casting to `dtype` (f16 in
     /// production, f32 for CPU parity), matching how `mlx-gen-sdxl` casts the IP-Adapter bundle to the
     /// UNet dtype before building.
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
-        let st = crate::loader::mmap_safetensors(path)?;
-        let mut map = HashMap::new();
-        for (key, _) in st.tensors() {
-            let tensor = load_map_tensor(&st, &key, device, dtype)?;
-            map.insert(key, tensor);
-        }
-        #[cfg(feature = "model-inference-proof")]
-        gen_core::model_input_proof::record_reader_paths(
-            "candle-gen::Weights::from_file",
-            gen_core::model_input_proof::InputRole::ModelWeights,
+        Self::load_selected(
             &[path],
-        );
-        Ok(Self::from_map(map))
+            device,
+            dtype,
+            &[""],
+            false,
+            "candle-gen::Weights::from_file",
+        )
     }
 
     /// Load and MERGE every `.safetensors` file in `files` into one weight map, in the given order
@@ -121,34 +123,14 @@ impl Weights {
     /// [`crate::loader::sorted_safetensors`]); this is the shard-aware path for snapshots that
     /// ship the checkpoint across multiple `*.safetensors` instead of a single file (F-037, sc-9021).
     pub fn from_files(files: &[impl AsRef<Path>], device: &Device, dtype: DType) -> Result<Self> {
-        #[cfg(feature = "model-inference-proof")]
-        let mut __input_paths = Vec::with_capacity(files.len());
-        let mut map = HashMap::new();
-        for path in files {
-            let path = path.as_ref();
-            #[cfg(feature = "model-inference-proof")]
-            __input_paths.push(path);
-            let st = crate::loader::mmap_safetensors(path)?;
-            for (k, _) in st.tensors() {
-                let v = load_map_tensor(&st, &k, device, dtype)?;
-                if map.insert(k.clone(), v).is_some() {
-                    return Err(CandleError::Msg(format!(
-                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
-                         must each live in exactly one .safetensors shard — this snapshot has {k:?} \
-                         in more than one file (mis-sharded checkpoint or a stray .safetensors in \
-                         the dir)",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        #[cfg(feature = "model-inference-proof")]
-        gen_core::model_input_proof::record_reader_paths(
+        Self::load_selected(
+            files,
+            device,
+            dtype,
+            &[""],
+            false,
             "candle-gen::Weights::from_files",
-            gen_core::model_input_proof::InputRole::ModelWeights,
-            &__input_paths,
-        );
-        Ok(Self::from_map(map))
+        )
     }
 
     /// Load only the tensors whose key starts with one of `prefixes`, via a header-only mmap
@@ -165,25 +147,14 @@ impl Weights {
         dtype: DType,
         prefixes: &[&str],
     ) -> Result<Self> {
-        let st = crate::loader::mmap_safetensors(path)?;
-        let mut map = HashMap::new();
-        for (k, _view) in st.tensors() {
-            if !prefixes.iter().any(|p| k.starts_with(p)) {
-                continue;
-            }
-            // Load just this one tensor's bytes (header-only mmap), then re-cast floats to the compute
-            // dtype via the shared `coerce_float` helper — identical per-tensor handling to
-            // `from_file`, so retained values are byte-equal.
-            let v = load_map_tensor(&st, &k, device, dtype)?;
-            map.insert(k, v);
-        }
-        #[cfg(feature = "model-inference-proof")]
-        gen_core::model_input_proof::record_reader_paths(
-            "candle-gen::Weights::from_file_filtered",
-            gen_core::model_input_proof::InputRole::ModelWeights,
+        Self::load_selected(
             &[path],
-        );
-        Ok(Self::from_map(map))
+            device,
+            dtype,
+            prefixes,
+            false,
+            "candle-gen::Weights::from_file_filtered",
+        )
     }
 
     /// Shard-aware [`from_file_filtered`](Self::from_file_filtered): apply the same header-only,
@@ -199,37 +170,14 @@ impl Weights {
         dtype: DType,
         prefixes: &[&str],
     ) -> Result<Self> {
-        #[cfg(feature = "model-inference-proof")]
-        let mut __input_paths = Vec::with_capacity(files.len());
-        let mut map = HashMap::new();
-        for path in files {
-            let path = path.as_ref();
-            #[cfg(feature = "model-inference-proof")]
-            __input_paths.push(path);
-            let st = crate::loader::mmap_safetensors(path)?;
-            for (k, _view) in st.tensors() {
-                if !prefixes.iter().any(|p| k.starts_with(p)) {
-                    continue;
-                }
-                let v = load_map_tensor(&st, &k, device, dtype)?;
-                if map.insert(k.clone(), v).is_some() {
-                    return Err(CandleError::Msg(format!(
-                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
-                         must each live in exactly one .safetensors shard — this snapshot has {k:?} \
-                         in more than one file (mis-sharded checkpoint or a stray .safetensors in \
-                         the dir)",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        #[cfg(feature = "model-inference-proof")]
-        gen_core::model_input_proof::record_reader_paths(
+        Self::load_selected(
+            files,
+            device,
+            dtype,
+            prefixes,
+            false,
             "candle-gen::Weights::from_files_filtered",
-            gen_core::model_input_proof::InputRole::ModelWeights,
-            &__input_paths,
-        );
-        Ok(Self::from_map(map))
+        )
     }
 
     /// [`from_files_filtered`](Self::from_files_filtered) that keeps every MLX packed affine triple
@@ -249,46 +197,162 @@ impl Weights {
         dtype: DType,
         prefixes: &[&str],
     ) -> Result<Self> {
-        let mut stores = Vec::with_capacity(files.len());
-        let mut packed_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for path in files {
-            let st = crate::loader::mmap_safetensors(path.as_ref())?;
-            for (k, _view) in st.tensors() {
-                if prefixes.iter().any(|p| k.starts_with(p)) {
-                    if let Some(base) = k.strip_suffix(".scales") {
-                        packed_bases.insert(base.to_owned());
-                    }
+        Self::load_selected(
+            files,
+            device,
+            dtype,
+            prefixes,
+            true,
+            "candle-gen::Weights::from_files_filtered_host_packed",
+        )
+    }
+
+    fn load_selected(
+        files: &[impl AsRef<Path>],
+        device: &Device,
+        dtype: DType,
+        prefixes: &[&str],
+        host_packed: bool,
+        proof_site: &'static str,
+    ) -> Result<Self> {
+        let paths: Vec<_> = files.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        let st = crate::loader::mmap_safetensors_multi(&paths)?;
+        let mut names = std::collections::BTreeSet::new();
+        let mut packed_bases = std::collections::HashSet::new();
+        for (key, _) in st.tensors() {
+            if !prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+                continue;
+            }
+            if !names.insert(key.clone()) {
+                return Err(CandleError::Msg(format!(
+                    "duplicate tensor key {key:?} while merging shards {paths:?}"
+                )));
+            }
+            if host_packed {
+                if let Some(base) = key.strip_suffix(".scales") {
+                    packed_bases.insert(base.to_owned());
                 }
             }
-            stores.push(st);
         }
-        let host = Device::Cpu;
-        let mut map = HashMap::new();
-        for (path, st) in files.iter().zip(&stores) {
-            let path = path.as_ref();
-            for (k, _view) in st.tensors() {
-                if !prefixes.iter().any(|p| k.starts_with(p)) {
-                    continue;
-                }
-                let in_triple = [".weight", ".scales", ".biases"].iter().any(|s| {
-                    k.strip_suffix(s)
-                        .is_some_and(|base| packed_bases.contains(base))
+        let source =
+            candle_checkpoint::ProjectionSource::from_mapped_selected(st, &paths, device, |key| {
+                prefixes.iter().any(|prefix| key.starts_with(prefix))
+            })?;
+        let mmap = match &source {
+            Ok(src) => src.mmap(),
+            Err(st) => st,
+        };
+        let mut weights = Self::from_map(HashMap::new());
+        if let Ok(src) = &source {
+            weights.companion_keys.extend(
+                src.reader()
+                    .plan()
+                    .companions
+                    .iter()
+                    .map(|c| c.physical_key.clone()),
+            );
+        }
+        for key in names {
+            if weights.companion_keys.contains(&key) {
+                continue;
+            }
+            if source
+                .as_ref()
+                .is_ok_and(|src| src.reader().planned(&key).is_some())
+            {
+                weights.encoded_keys.insert(key);
+                continue;
+            }
+            let host = key.rsplit_once('.').is_some_and(|(base, suffix)| {
+                matches!(suffix, "weight" | "scales" | "biases") && packed_bases.contains(base)
+            });
+            let t = load_map_tensor(mmap, &key, if host { &Device::Cpu } else { device }, dtype)?;
+            weights.map.insert(key, t);
+        }
+        weights.source = source.ok().map(|src| (src, device.clone(), dtype));
+        weights.target = host_packed.then(|| device.clone());
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            proof_site,
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &paths,
+        );
+        let _ = proof_site;
+        Ok(weights)
+    }
+
+    /// Build a stock Linear through the same projection route used by VarBuilder.
+    pub fn linear(&self, base: &str, bias: bool) -> Result<candle_nn::Linear> {
+        if let Some(layer) = self.native_linear(base, bias)? {
+            return Ok(layer);
+        }
+        let weight = self.require(&format!("{base}.weight"))?;
+        let b = bias
+            .then(|| self.require(&format!("{base}.bias")))
+            .transpose()?;
+        Ok(candle_nn::Linear::new(weight, b))
+    }
+
+    /// Source-encoded weights have a non-affine checkpoint format.
+    pub fn is_affine_codes(&self, key: &str) -> bool {
+        self.map.get(key).is_some_and(|t| t.dtype() == DType::U32)
+    }
+
+    /// Replace one module operand without rebuilding other immutable native projections.
+    pub fn replace_tensor(&mut self, key: String, value: Tensor) {
+        self.encoded_keys.remove(&key);
+        self.companion_keys.remove(&key);
+        self.map.insert(key, value);
+    }
+
+    pub fn source_format_id(&self, key: &str) -> Option<&'static str> {
+        if !self.encoded_keys.contains(key) {
+            return None;
+        }
+        self.source
+            .as_ref()?
+            .0
+            .reader()
+            .planned(key)
+            .map(|row| row.codec_id)
+    }
+    pub fn materialized_bytes(&self, key: &str) -> Result<u64> {
+        if self.encoded_keys.contains(key) {
+            if let Some((source, _, _)) = &self.source {
+                return source.reader().materialized_bytes(key).ok_or_else(|| {
+                    CandleError::Msg(format!(
+                        "{key}: checkpoint operand has not been materialized"
+                    ))
                 });
-                let v = load_map_tensor(st, &k, if in_triple { &host } else { device }, dtype)?;
-                if map.insert(k.clone(), v).is_some() {
-                    return Err(CandleError::Msg(format!(
-                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
-                         must each live in exactly one .safetensors shard — this snapshot has \
-                         {k:?} in more than one file (mis-sharded checkpoint or a stray \
-                         .safetensors in the dir)",
-                        path.display()
-                    )));
-                }
             }
         }
-        let mut w = Self::from_map(map);
-        w.target = Some(device.clone());
-        Ok(w)
+        let tensor = self.require(key)?;
+        Ok((tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64)
+    }
+
+    /// Physical descriptors/scale planes are consumed by the logical source and excluded from module key counts.
+    pub fn is_checkpoint_companion(&self, key: &str) -> bool {
+        self.companion_keys.contains(key)
+    }
+    /// Construct a checkpoint projection with the same codec as VarBuilder consumers.
+    pub fn native_linear(&self, base: &str, bias: bool) -> Result<Option<candle_nn::Linear>> {
+        let key = format!("{base}.weight");
+        if !self.encoded_keys.contains(&key) {
+            return Ok(None);
+        }
+        let Some((source, device, dtype)) = &self.source else {
+            return Ok(None);
+        };
+        let b = bias
+            .then(|| self.require(&format!("{base}.bias")))
+            .transpose()?;
+        if let Some(layer) = source.native_linear(&key, *dtype, device, b.clone())? {
+            return Ok(Some(layer));
+        }
+        Ok(Some(candle_nn::Linear::new(
+            source.reader().read_dense(&key, *dtype, device)?,
+            b,
+        )))
     }
 
     /// The destination device of a [`from_files_filtered_host_packed`](Self::from_files_filtered_host_packed)
@@ -300,6 +364,21 @@ impl Weights {
 
     /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
     pub fn require(&self, key: &str) -> Result<Tensor> {
+        if self.companion_keys.contains(key) {
+            let (src, device, _) = self.source.as_ref().expect("owned companion source");
+            let view = src.mmap().get(key)?;
+            if view.dtype() == safetensors::Dtype::F8_E8M0 {
+                return Ok(cst::read_tensor_bytes(&view, |bytes| {
+                    Tensor::from_raw_buffer(bytes, DType::U8, view.shape(), device)
+                })?);
+            }
+            return Ok(src.mmap().load(key, device)?);
+        }
+        if self.encoded_keys.contains(key) {
+            if let Some((src, device, dtype)) = &self.source {
+                return Ok(src.reader().read_dense(key, *dtype, device)?);
+            }
+        }
         self.map
             .get(key)
             .cloned()
@@ -309,12 +388,17 @@ impl Weights {
     /// Whether `key` is present (e.g. the ControlNet's optional `encoder_hid_proj`).
     pub fn contains(&self, key: &str) -> bool {
         self.map.contains_key(key)
+            || self.encoded_keys.contains(key)
+            || self.companion_keys.contains(key)
     }
 
     /// Iterate the tensor keys (drives the `ip_adapter.{n}` index discovery in the SDXL
     /// `load_ip_kv_pairs` loader).
     pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.map.keys()
+        self.map
+            .keys()
+            .chain(self.encoded_keys.iter())
+            .chain(self.companion_keys.iter())
     }
 
     /// Build directly from an in-memory map — tests (including cross-crate ones, e.g. the FLUX
@@ -323,7 +407,10 @@ impl Weights {
     pub fn from_map(map: HashMap<String, Tensor>) -> Self {
         Self {
             map,
-            projection_resources: ProjectionResources::default(),
+            source: None,
+            encoded_keys: Default::default(),
+            companion_keys: Default::default(),
+            projection_resources: Default::default(),
             target: None,
         }
     }
@@ -359,7 +446,29 @@ impl Weights {
             }
             stores.push(st);
         }
+        // H3's immutable mixed-precision loader keeps F32 heads, F16 biases and the
+        // W4A8/INT8 value validators below. Route checkpoint FP8 matrices to the same
+        // logical source as stock VarBuilder instead of casting FP8 or consuming its scales twice.
+        let fp8_bases: std::collections::HashSet<_> = headers
+            .iter()
+            .filter_map(|(key, (_, dtype, _))| {
+                matches!(
+                    dtype,
+                    safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
+                )
+                .then(|| key.strip_suffix(".weight"))
+                .flatten()
+                .map(str::to_owned)
+            })
+            .collect();
+        let mut source_bases = fp8_bases.clone();
         for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
+            if key
+                .rsplit_once('.')
+                .is_some_and(|(base, _)| fp8_bases.contains(base))
+            {
+                continue;
+            }
             let base = key.trim_end_matches(".comfy_quant");
             let payload = stores[*di].get(key)?;
             let declared: serde_json::Value =
@@ -446,12 +555,50 @@ impl Weights {
                 gen_core::convrot_int8::ConvRotInt8::parse(data, ws, ss)
             })
             .map_err(CandleError::Msg)?;
+            source_bases.insert(base.to_owned());
             let scales = stores[*si].get(&scale)?;
             descriptor
                 .validate_scale_values(f32_le_planes(scales.data()))
                 .map_err(CandleError::Msg)?;
         }
+        let in_source = |key: &str| {
+            key.rsplit_once('.')
+                .is_some_and(|(base, _)| source_bases.contains(base))
+        };
+        let mut weights = Self::from_map(HashMap::new());
+        if !source_bases.is_empty() {
+            let paths: Vec<_> = files.iter().map(|p| p.as_ref().to_owned()).collect();
+            let st = crate::loader::mmap_safetensors_multi(&paths)?;
+            let source = candle_checkpoint::ProjectionSource::from_mapped_selected(
+                st, &paths, device, in_source,
+            )?
+            .ok()
+            .ok_or_else(|| CandleError::Msg("source checkpoint has no logical rows".into()))?;
+            weights.encoded_keys.extend(
+                source
+                    .reader()
+                    .plan()
+                    .tensors
+                    .iter()
+                    .map(|row| row.logical_key.clone()),
+            );
+            weights.companion_keys.extend(
+                source
+                    .reader()
+                    .plan()
+                    .companions
+                    .iter()
+                    .map(|row| row.physical_key.clone()),
+            );
+            weights.source = Some((source, device.clone(), DType::BF16));
+        }
         for (key, (_, stored_dtype, _)) in &headers {
+            if key
+                .rsplit_once('.')
+                .is_some_and(|(base, _)| fp8_bases.contains(base))
+            {
+                continue;
+            }
             let native = (key.ends_with(".weight") && *stored_dtype == safetensors::Dtype::I8)
                 || key.ends_with(".weight_scale")
                 || key.ends_with(".weight_s_rel")
@@ -466,18 +613,23 @@ impl Weights {
                 }
             }
         }
-        let mut map = HashMap::with_capacity(headers.len());
+        weights
+            .map
+            .reserve(headers.len() - weights.encoded_keys.len());
         for st in &stores {
             for (key, view) in st.tensors() {
+                if weights.encoded_keys.contains(&key) || weights.companion_keys.contains(&key) {
+                    continue;
+                }
                 let tensor = if view.dtype() == safetensors::Dtype::I8 {
                     Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
                 } else {
                     st.load(&key, device)?
                 };
-                map.insert(key, tensor);
+                weights.map.insert(key, tensor);
             }
         }
-        Ok(Self::from_map(map))
+        Ok(weights)
     }
 
     pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {

@@ -131,7 +131,7 @@ pub(crate) fn sdpa_diff_budgeted(
 /// PEFT module path the harness matches against.
 fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
     let base = linear(w, path, bias)?;
-    let (out_f, in_f) = base.weight().dims2()?;
+    let (out_f, in_f) = base.weight_dims()?;
     Ok(ComposableLinear::Adapt(LoraLinear::from_linear(
         base,
         in_f,
@@ -147,7 +147,7 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
 pub(crate) enum ComposableLinear {
     Adapt(LoraLinear),
     ConvRot(KreaQLinear),
-    NativeNvfp4(KreaQLinear),
+    NativeCheckpoint(KreaQLinear),
 }
 
 impl ComposableLinear {
@@ -161,7 +161,7 @@ impl ComposableLinear {
                         other => candle_gen::candle_core::Error::Msg(other.to_string()),
                     })
             }
-            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => {
+            Self::ConvRot(linear) | Self::NativeCheckpoint(linear) => {
                 linear.quantize_onto(quant, device)
             }
         }
@@ -198,13 +198,13 @@ impl ComposableLinear {
     fn lora(&self) -> Option<&LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
-            Self::ConvRot(_) | Self::NativeNvfp4(_) => None,
+            Self::ConvRot(_) | Self::NativeCheckpoint(_) => None,
         }
     }
     fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
-            Self::ConvRot(_) | Self::NativeNvfp4(_) => None,
+            Self::ConvRot(_) | Self::NativeCheckpoint(_) => None,
         }
     }
 
@@ -215,10 +215,12 @@ impl ComposableLinear {
     ) -> candle_gen::Result<()> {
         match self {
             Self::Adapt(linear) => f(path, linear),
-            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => match linear.as_additive_mut() {
-                Some(linear) => f(path, linear),
-                None => Ok(()),
-            },
+            Self::ConvRot(linear) | Self::NativeCheckpoint(linear) => {
+                match linear.as_additive_mut() {
+                    Some(linear) => f(path, linear),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -232,7 +234,7 @@ impl Module for ComposableLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Adapt(linear) => linear.forward(x),
-            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => linear.forward(x),
+            Self::ConvRot(linear) | Self::NativeCheckpoint(linear) => linear.forward(x),
         }
     }
 }
@@ -294,8 +296,8 @@ fn proj_loader(
     plan: &DitPlan,
 ) -> impl Fn(&Weights, &str, bool) -> Result<ComposableLinear> + '_ {
     move |weights, path, bias| {
-        if packed && weights.is_native_nvfp4() {
-            Ok(ComposableLinear::NativeNvfp4(linear_detect_planned(
+        if packed && (weights.is_native_nvfp4() || weights.is_native_projection(path)) {
+            Ok(ComposableLinear::NativeCheckpoint(linear_detect_planned(
                 weights, path, bias, plan,
             )?))
         } else if packed {
@@ -695,7 +697,7 @@ impl KreaTrainDit {
             &self.txt_in_l2,
             &self.final_linear,
         ] {
-            if let ComposableLinear::NativeNvfp4(projection) = projection {
+            if let ComposableLinear::NativeCheckpoint(projection) = projection {
                 add(projection);
             }
         }
@@ -707,7 +709,7 @@ impl KreaTrainDit {
                 &block.attn.gate,
                 &block.attn.o,
             ] {
-                if let ComposableLinear::NativeNvfp4(projection) = projection {
+                if let ComposableLinear::NativeCheckpoint(projection) = projection {
                     add(projection);
                 }
             }
@@ -1243,11 +1245,12 @@ mod tests {
         candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
         for quant in [Quant::Q4, Quant::Q8] {
             let (dit, native_nvfp4) = crate::control_provider::load_control_native_dit(
-                &path,
+                &gen_core::PinnedWeightsFile::pin(&path).unwrap(),
                 &cfg,
                 &[],
                 Some(quant),
                 &Device::Cpu,
+                &gen_core::CheckpointFactsSink::new(),
             )
             .unwrap();
             assert!(!native_nvfp4);
@@ -1295,11 +1298,12 @@ mod tests {
         let (path, cfg) = crate::testfix::tiny_native_nvfp4_fixture(&tmp);
         for quant in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
             let error = crate::control_provider::load_control_native_dit(
-                &path,
+                &gen_core::PinnedWeightsFile::pin(&path).unwrap(),
                 &cfg,
                 &[],
                 Some(quant),
                 &Device::Cpu,
+                &gen_core::CheckpointFactsSink::new(),
             )
             .err()
             .unwrap()

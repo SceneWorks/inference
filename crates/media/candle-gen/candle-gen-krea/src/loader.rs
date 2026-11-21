@@ -280,7 +280,7 @@ impl Weights {
     ) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes)
+        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes, false)
     }
 
     /// Open a native Krea file through a caller-owned pin. Registry-backed lazy/sequential loads keep
@@ -307,6 +307,7 @@ impl Weights {
         device: &Device,
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
+        stage_dense_on_cpu: bool,
     ) -> Result<Self> {
         let residency = native_import_residency(device);
         Self::from_pinned_native_file_with_residency(
@@ -315,6 +316,7 @@ impl Weights {
             dtype,
             shapes,
             residency,
+            stage_dense_on_cpu,
         )
     }
 
@@ -340,7 +342,9 @@ impl Weights {
             CandleCodecResidency {
                 fp8_e4m3_native: false,
                 nvfp4_native: true,
+                mxfp8_native: false,
             },
+            false,
         )
     }
 
@@ -350,6 +354,7 @@ impl Weights {
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
         residency: CandleCodecResidency,
+        stage_dense_on_cpu: bool,
     ) -> Result<Self> {
         pinned_source
             .ensure_unchanged()
@@ -359,6 +364,13 @@ impl Weights {
         let mapping = KreaNativeToDiffusersMapping::new(&native_prefix, shapes);
         let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)
             .map_err(|error| Error::Msg(error.to_string()))?;
+        // Only dense masters need CPU staging for an explicitly requested GGML conversion.
+        // Codec-declared checkpoints retain their source representation on the compute device.
+        let device = if stage_dense_on_cpu && !logical_plan.has_encoded_weights() {
+            &Device::Cpu
+        } else {
+            device
+        };
         let plain_int8 = logical_plan.tensors.iter().any(|t| {
             t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
         });
@@ -421,7 +433,7 @@ impl Weights {
     /// The compiled mapped-read plan for a single-file native checkpoint — the descriptor authority
     /// the NVFP4 import consults. `None` for the directory/packed-tier path.
     pub fn logical_plan(&self) -> Option<&LogicalWeightPlan> {
-        self.logical.as_ref().map(LogicalWeightReader::plan)
+        self.logical.as_ref().map(|reader| reader.plan())
     }
 
     /// The planned entry for one **diffusers** (logical) key, or `None` when the file has no plan or
@@ -645,6 +657,15 @@ impl Weights {
     }
 
     /// Whether this native checkpoint carries prepacked ComfyUI Kitchen NVFP4 projection triplets.
+    pub(crate) fn is_native_projection(&self, base: &str) -> bool {
+        let key = format!("{base}.weight");
+        !self.overlay_has(&key)
+            && self
+                .logical
+                .as_ref()
+                .is_some_and(|reader| reader.has_native_projection(&key))
+    }
+
     pub fn is_native_nvfp4(&self) -> bool {
         self.native_nvfp4
     }
@@ -755,7 +776,8 @@ impl Weights {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype),
                 LogicalTensor::PackedNvfp4 { .. }
                 | LogicalTensor::PackedConvRot { .. }
-                | LogicalTensor::PackedFp8E4M3 { .. } => Err(Error::Msg(format!(
+                | LogicalTensor::PackedMxFp8 { .. }
+                | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
                     "krea: `{name}` was planned packed-native; construct it through \
                          `linear_detect_planned`, not a dense read — or re-open the checkpoint \
                          under a residency whose `nvfp4_native` is false, so the plan prices this \
@@ -807,7 +829,8 @@ impl Weights {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(DType::F32),
                 LogicalTensor::PackedNvfp4 { .. }
                 | LogicalTensor::PackedConvRot { .. }
-                | LogicalTensor::PackedFp8E4M3 { .. } => Err(Error::Msg(format!(
+                | LogicalTensor::PackedMxFp8 { .. }
+                | LogicalTensor::PackedScalarFp8 { .. } => Err(Error::Msg(format!(
                     "krea: `{name}` was planned packed-native; construct it through \
                          `linear_detect_planned`, not a dense read — or re-open the checkpoint \
                          under a residency whose `nvfp4_native` is false, so the plan prices this \
@@ -1138,22 +1161,7 @@ pub(crate) fn detect_native_prefix_from_keys<'a>(
     }
 }
 
-/// The residency policy every planned single-file Krea import — the loader AND the memory
-/// contract that prices it — plans under (sc-20651; SC-22667 review).
-///
-/// The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the packed
-/// rows packed, everything else prices the dense fallback. Passing the real device (rather than a
-/// fixed policy) keeps the plan's pricing the pricing of *this* load.
-///
-/// The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
-/// `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal — so
-/// pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a plan this
-/// loader itself priced. Masked, an fp8 row takes the exact dense decode (`weight_scale` applied)
-/// through the shared reader on every host — which is why a memory contract must price an fp8 row
-/// at the DiT's dense width, never at its stored byte.
-///
-/// One definition for both callers is the point: pricing and loading cannot disagree about which
-/// rows stay packed, because that disagreement *is* the fit gate falsely admitting or rejecting.
+/// Device policy shared by native import pricing and projection construction.
 pub(crate) fn native_import_residency(device: &Device) -> CandleCodecResidency {
     CandleCodecResidency::probe(device)
 }
@@ -1251,18 +1259,16 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     if w.overlay_has(&weight_key) {
         return Ok(QLinear::dense(linear(w, base, bias)?));
     }
-    if w.planned(&weight_key).is_some_and(|p| {
-        matches!(
-            p.codec,
-            candle_gen::gen_core::TensorCodecSpec::ConvRotInt8 { .. }
-        )
-    }) {
+    if w.logical
+        .as_ref()
+        .is_some_and(|r| r.has_native_projection(&weight_key))
+    {
         let bias = bias.then(|| w.get(&format!("{base}.bias"))).transpose()?;
         let reader = w.logical.as_ref().expect("planned weight has a reader");
         let projection = w
             .read_source_unchanged(|| {
                 reader
-                    .convrot_projection(&weight_key, bias)
+                    .native_projection(&weight_key, bias)
                     .map_err(|e| Error::Msg(e.to_string()))
             })?
             .ok_or_else(|| Error::Msg(format!("{weight_key}: missing native projection")))?;
@@ -1311,6 +1317,12 @@ pub fn linear_detect_planned(
     bias: bool,
     plan: &DitPlan,
 ) -> Result<QLinear> {
+    if w.logical
+        .as_ref()
+        .is_some_and(|reader| reader.has_native_projection(&format!("{base}.weight")))
+    {
+        return linear_detect(w, base, bias);
+    }
     if !plan.is_nvfp4() {
         let inner = linear_detect(w, base, bias)?;
         return Ok(match plan.probe() {
@@ -1394,7 +1406,9 @@ pub fn linear_detect_planned(
                 let weight = weight.to_dtype(w.dtype())?;
                 Ok(QLinear::dense(Linear::new(weight, dense_bias)))
             }
-            LogicalTensor::PackedConvRot { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
+            LogicalTensor::PackedConvRot { .. }
+            | LogicalTensor::PackedMxFp8 { .. }
+            | LogicalTensor::PackedScalarFp8 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
                     "krea NVFP4: `{weight_key}` is planned as `{}` but the reader returned a \
                      packed fp8 container; the plan and reader disagree about this row's codec",
@@ -3734,6 +3748,7 @@ mod tests {
         let sm120 = CandleCodecResidency {
             fp8_e4m3_native: false,
             nvfp4_native: true,
+            mxfp8_native: false,
         };
 
         let cases: [(

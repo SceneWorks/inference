@@ -69,10 +69,7 @@ impl QLinear {
     /// are recovered from the weight shape (`[out, in]`).
     pub fn dense(linear: Linear) -> Self {
         // `weight()` is `[out, in]`; read the dims before moving `linear` into the adapter.
-        let (out_dim, in_dim) = {
-            let d = linear.weight().dims();
-            (d[0], d[1])
-        };
+        let (out_dim, in_dim) = linear.weight_dims().expect("a projection has rank two");
         Self::Adapt(AdaptLinear::from_dense(linear, in_dim, out_dim))
     }
 

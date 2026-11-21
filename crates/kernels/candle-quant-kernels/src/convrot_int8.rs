@@ -91,6 +91,15 @@ impl ConvRotLinear {
         &self.device
     }
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_inner(x, None)
+    }
+
+    /// Add a caller-owned bias in the same FP32 epilogue as a checkpoint-owned bias.
+    pub fn forward_with_bias(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x, Some(bias))
+    }
+
+    fn forward_inner(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         {
             let d = self.descriptor;
@@ -104,14 +113,19 @@ impl ConvRotLinear {
             let rotated = crate::convrot::convrot_rotate(x, &self.rotation)?
                 .to_dtype(x.dtype())?
                 .reshape((x.elem_count() / d.in_features, d.in_features))?;
-            let out = self.linear.forward_kitchen(&rotated, x.dtype())?;
+            let out = match bias {
+                Some(b) => self
+                    .linear
+                    .forward_kitchen_with_bias(&rotated, x.dtype(), Some(b))?,
+                None => self.linear.forward_kitchen(&rotated, x.dtype())?,
+            };
             let mut shape = x.dims().to_vec();
             *shape.last_mut().unwrap() = d.out_features;
             out.reshape(shape)
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = x;
+            let _ = (x, bias);
             candle_core::bail!("ConvRot INT8 requires native CUDA; no floating fallback")
         }
     }

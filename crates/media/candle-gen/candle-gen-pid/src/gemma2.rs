@@ -85,10 +85,7 @@ fn validate_packed_tier(w: &Weights, prefix: &str, cfg: &Gemma2Config) -> Result
     });
     let bases = bases.collect::<Vec<_>>();
     let packed = bases.iter().any(|base| {
-        w.contains(&format!("{base}.scales"))
-            || w.require(&format!("{base}.weight"))
-                .map(|weight| weight.dtype() == DType::U32)
-                .unwrap_or(false)
+        w.contains(&format!("{base}.scales")) || w.is_affine_codes(&format!("{base}.weight"))
     });
     if !packed {
         return Ok(None);

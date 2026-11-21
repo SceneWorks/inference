@@ -19,52 +19,12 @@
 //! or a test, **wrong in a loader** (sc-12301, and sc-12274 for the NVFP4 lane: 32.00 MiB × N).
 
 use super::cublaslt::{
-    quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
-    quantize_weight_int8_per_channel, CublasLt,
+    quantize_activation_int8, quantize_weight_int8, quantize_weight_int8_per_channel, CublasLt,
 };
 use candle_core::{Device, Result, Tensor};
 use std::sync::Arc;
 
-/// An fp8 E4M3 linear: `y = (X · Wᵀ) · scale_w · scale_x` with a per-tensor-quantized weight and
-/// dynamic per-tensor activation quant. Optional bias added back in the output dtype.
-pub struct Fp8Linear {
-    w_fp8: Tensor, // (N, K) F8E4M3
-    scale_w: f32,
-    bias: Option<Tensor>,
-    lt: Arc<CublasLt>,
-}
-
-impl Fp8Linear {
-    /// Quantize a dense `(N, K)` weight to fp8 E4M3 once and bind it to a cuBLASLt handle.
-    pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
-        let qw = quantize_weight_fp8(weight)?;
-        Ok(Self {
-            w_fp8: qw.q,
-            scale_w: qw.scale,
-            bias,
-            lt,
-        })
-    }
-
-    /// Build sharing an existing handle for the device (constructs a fresh handle when `None`).
-    pub fn from_device(weight: &Tensor, bias: Option<Tensor>, dev: &Device) -> Result<Self> {
-        Self::new(weight, bias, Arc::new(CublasLt::new(dev)?))
-    }
-
-    /// `x`: `(..., K)`; flattened to `(M, K)` for the GEMM, then reshaped back. Output bf16.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (flat, restore) = flatten_tokens(x)?;
-        let qx = quantize_activation_fp8(&flat)?;
-        let y = self
-            .lt
-            .matmul_fp8(&self.w_fp8, self.scale_w, &qx.q, qx.scale)?;
-        let y = restore(y)?;
-        match &self.bias {
-            Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
-            None => Ok(y),
-        }
-    }
-}
+pub use crate::fp8_linear::Fp8Linear;
 
 /// The weight dequant granularity of an [`Int8Linear`] — the sc-9300 extension from a single
 /// per-tensor scalar to a `[out]` per-output-channel vector. Both fold `scale_w · scale_x` onto the
@@ -199,6 +159,14 @@ impl Int8Linear {
     /// Kitchen's per-token quantization, exact int32 cuBLASLt GEMM and FP32 epilogue.
     /// Bias is added BEFORE the one output-dtype rounding. No host-fold fallback.
     pub fn forward_kitchen(&self, rotated: &Tensor, dtype: candle_core::DType) -> Result<Tensor> {
+        self.forward_kitchen_with_bias(rotated, dtype, self.bias.as_ref())
+    }
+    pub fn forward_kitchen_with_bias(
+        &self,
+        rotated: &Tensor,
+        dtype: candle_core::DType,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let WeightScale::Kitchen(sw) = &self.scale_w else {
             candle_core::bail!("not a native Kitchen INT8 projection")
         };
@@ -212,7 +180,7 @@ impl Int8Linear {
             .matmul_int8_staged(w, &qx)?
             .to_dtype(candle_core::DType::F32)?;
         let y = acc.broadcast_mul(&sx)?.broadcast_mul(sw)?;
-        let y = match &self.bias {
+        let y = match bias {
             Some(b) => y.broadcast_add(&b.to_dtype(dtype)?.to_dtype(candle_core::DType::F32)?)?,
             None => y,
         };
@@ -247,19 +215,4 @@ impl Int8Linear {
     }
 }
 
-/// Collapse leading dims to a `(M, K)` matrix and return a closure that restores the original
-/// leading shape on the `(M, N)` output.
-fn flatten_tokens(x: &Tensor) -> Result<(Tensor, impl Fn(Tensor) -> Result<Tensor>)> {
-    let dims = x.dims().to_vec();
-    let k = *dims.last().expect("linear input has a last dim");
-    let m: usize = dims[..dims.len() - 1].iter().product();
-    let flat = x.reshape((m, k))?;
-    let lead = dims[..dims.len() - 1].to_vec();
-    let restore = move |y: Tensor| -> Result<Tensor> {
-        let n = y.dim(1)?;
-        let mut out_shape = lead.clone();
-        out_shape.push(n);
-        y.reshape(out_shape)
-    };
-    Ok((flat, restore))
-}
+use crate::fp8_linear::flatten_tokens;

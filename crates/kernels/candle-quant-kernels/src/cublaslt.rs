@@ -56,6 +56,11 @@ pub const F8E4M3_MAX: f32 = 448.0;
 /// int8 symmetric range.
 pub const I8_MAX: f32 = 127.0;
 
+/// Leading dimensions supported by the cuBLASLt 8-bit tensor-core GEMM.
+pub fn eight_bit_layout_supported(shape: &[usize]) -> bool {
+    matches!(shape, [n, k] if *n > 0 && *k > 0 && n.is_multiple_of(16) && k.is_multiple_of(16))
+}
+
 /// Dynamic per-tensor **fp8 E4M3** activation quant (v1, pure candle ops — a fused amax→scale→cast
 /// kernel is a later optimization if the bench shows it dominates). `scale = absmax / 448`, then
 /// `q = cast_f8e4m3(x / scale)`.
@@ -146,6 +151,12 @@ pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weig
 /// here. Neither re-spells `(8, 9)`.
 pub const FP8_COMPUTE_CAP_FLOOR: (i32, i32) = (8, 9);
 
+pub(crate) const SCALAR_FP8_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "candle_quant_kernels_scalar_fp8",
+    src: include_str!("scalar_fp8.cu"),
+    cc_floor: FP8_COMPUTE_CAP_FLOOR,
+};
+
 /// Whether a `(major, minor)` compute capability meets [`FP8_COMPUTE_CAP_FLOOR`].
 pub fn compute_cap_meets_fp8_floor(cap: (i32, i32)) -> bool {
     cap >= FP8_COMPUTE_CAP_FLOOR
@@ -160,6 +171,10 @@ pub fn compute_cap_meets_fp8_floor(cap: (i32, i32)) -> bool {
 /// same reason: `CublasLt::meets_nvfp4_floor` applies it to a bound handle, while the
 /// logical-weight residency policy (sc-20641) decides packed-vs-dense at *plan* time, before any
 /// GEMM handle exists, and reads the capability straight off the `Device`. Neither re-spells 12.0.
+pub fn compute_cap_meets_mxfp8_floor(cap: (i32, i32)) -> bool {
+    cap >= (10, 0)
+}
+
 pub const NVFP4_COMPUTE_CAP_FLOOR: (i32, i32) = (12, 0);
 
 /// Whether a `(major, minor)` compute capability meets [`NVFP4_COMPUTE_CAP_FLOOR`].
@@ -1026,6 +1041,7 @@ mod cuda_impl {
                 unsafe {
                     self.run(
                         sys::cudaDataType_t::CUDA_R_8I,
+                        sys::cudaDataType_t::CUDA_R_8I,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
                         sys::cudaDataType_t::CUDA_R_32I,
                         sys::cudaDataType_t::CUDA_R_32I,
@@ -1123,6 +1139,50 @@ mod cuda_impl {
             }
             check_alignment(k, n)?;
             let mut out = unsafe { self.stream.alloc::<half::bf16>(m * n) }.map_err(drv_err)?;
+            if w.is_e5m2() {
+                if !x.is_e5m2() {
+                    candle_core::bail!("E5M2 weights require E5M2 activation codes");
+                }
+                use cudarc::driver::{LaunchConfig, PushKernelArg};
+                let (m32, n32, k32) = (
+                    u32::try_from(m).map_err(candle_core::Error::wrap)?,
+                    u32::try_from(n).map_err(candle_core::Error::wrap)?,
+                    u32::try_from(k).map_err(candle_core::Error::wrap)?,
+                );
+                let module = super::SCALAR_FP8_SOURCE
+                    .compiled(&self.device)
+                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                let kernel = module
+                    .function("scalar_e5m2_gemm")
+                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                unsafe {
+                    self.stream
+                        .launch_builder(&kernel)
+                        .arg(&x.buf)
+                        .arg(&w.buf)
+                        .arg(&mut out)
+                        .arg(&m32)
+                        .arg(&n32)
+                        .arg(&k32)
+                        .arg(&scale_x)
+                        .arg(&scale_w)
+                        .launch(LaunchConfig {
+                            grid_dim: (n32.div_ceil(32), m32.div_ceil(16), 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(drv_err)?;
+                }
+                return Ok(Tensor::from_storage(
+                    Storage::Cuda(CudaStorage {
+                        slice: CudaStorageSlice::BF16(out),
+                        device: self.device.clone(),
+                    }),
+                    (m, n),
+                    BackpropOp::none(),
+                    false,
+                ));
+            }
             let sa = self.upload_scalar(scale_w)?;
             let sb = self.upload_scalar(scale_x)?;
             {
@@ -1133,6 +1193,7 @@ mod cuda_impl {
                 let (d_ptr, _gd) = out.device_ptr_mut(&self.stream);
                 unsafe {
                     self.run(
+                        w.dtype,
                         sys::cudaDataType_t::CUDA_R_8F_E4M3,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                         sys::cudaDataType_t::CUDA_R_32F,
@@ -1143,7 +1204,7 @@ mod cuda_impl {
                         a_ptr,
                         b_ptr,
                         d_ptr,
-                        Some((sa_ptr, sb_ptr)),
+                        Some((sa_ptr, sb_ptr, false)),
                         Alpha::F32(1.0),
                     )?;
                 }
@@ -1300,6 +1361,180 @@ mod cuda_impl {
                 Ok(())
             };
             probe().is_ok()
+        }
+
+        /// Quantize into the FP8 GEMM operand on-device. Use a calibrated checkpoint input
+        /// scale when present, otherwise use the dynamic per-tensor absmax.
+        pub fn scaled_fp8_activation(
+            &self,
+            x: &Tensor,
+            input_scale: Option<f32>,
+            e5m2: bool,
+        ) -> Result<(DevFp8, f32)> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (rows, cols) = x.dims2()?;
+            if !x.device().same_device(&Device::Cuda(self.device.clone())) {
+                candle_core::bail!("FP8 activation and GEMM context are on different devices");
+            }
+            let xf = Self::flux3_f32_input(x)?;
+            let scale = match input_scale {
+                Some(s) => s,
+                None => (xf.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?
+                    / if e5m2 { 57344.0 } else { super::F8E4M3_MAX })
+                .max(f32::MIN_POSITIVE),
+            };
+            let len = u32::try_from(xf.elem_count()).map_err(candle_core::Error::wrap)?;
+            let compiled = super::SCALAR_FP8_SOURCE
+                .compiled(&self.device)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let kernel = compiled
+                .function(if e5m2 {
+                    "scalar_e5m2_quantize"
+                } else {
+                    "scalar_fp8_quantize"
+                })
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let (storage, _) = xf.storage_and_layout();
+            let Storage::Cuda(cs) = &*storage else {
+                candle_core::bail!("expected CUDA activation")
+            };
+            let CudaStorageSlice::F32(src) = &cs.slice else {
+                candle_core::bail!("expected F32 activation")
+            };
+            let mut buf =
+                unsafe { self.stream.alloc::<float8::F8E4M3>(len as usize) }.map_err(drv_err)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(src)
+                    .arg(&mut buf)
+                    .arg(&scale)
+                    .arg(&len)
+                    .launch(LaunchConfig::for_num_elems(len))
+                    .map_err(drv_err)?;
+            }
+            Ok((
+                DevFp8 {
+                    buf,
+                    rows,
+                    cols,
+                    dtype: if e5m2 {
+                        sys::cudaDataType_t::CUDA_R_8F_E5M2
+                    } else {
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3
+                    },
+                },
+                scale,
+            ))
+        }
+
+        /// Block-scaled CUDA GEMM over the checkpoint's original E4M3 weights and E8M0 scale atoms.
+        pub fn mxfp8_linear(
+            &self,
+            w: &DevFp8,
+            weight_scales: &Tensor,
+            x: &Tensor,
+            logical_n: usize,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m, k) = x.dims2()?;
+            let mp = m.next_multiple_of(32);
+            let kp = k.next_multiple_of(32);
+            if mp == 0 || kp != w.cols || logical_n.next_multiple_of(32) != w.rows {
+                candle_core::bail!("MXFP8 input and weight geometry differ");
+            }
+            let n = w.rows;
+            let blocks = kp / 32;
+            let scale_stride = blocks.next_multiple_of(4);
+            if weight_scales.dims() != [n.next_multiple_of(128), scale_stride] {
+                candle_core::bail!("MXFP8 weight scale shape differs from stored grid");
+            }
+            let (m32, k32, kp32, mp32) = (
+                u32::try_from(m).map_err(candle_core::Error::wrap)?,
+                u32::try_from(k).map_err(candle_core::Error::wrap)?,
+                u32::try_from(kp).map_err(candle_core::Error::wrap)?,
+                u32::try_from(mp).map_err(candle_core::Error::wrap)?,
+            );
+            let xf = Self::flux3_f32_input(x)?;
+            let (xs, _) = xf.storage_and_layout();
+            let Storage::Cuda(xbuf) = &*xs else {
+                candle_core::bail!("MXFP8 activation must be CUDA")
+            };
+            let CudaStorageSlice::F32(xbuf) = &xbuf.slice else {
+                candle_core::bail!("expected FP32 activation")
+            };
+            let (ws, wl) = weight_scales.storage_and_layout();
+            let Storage::Cuda(wb) = &*ws else {
+                candle_core::bail!("MXFP8 scales must be CUDA")
+            };
+            let CudaStorageSlice::U8(wb) = &wb.slice else {
+                candle_core::bail!("expected E8M0 bytes")
+            };
+            let mut codes = unsafe { self.stream.alloc::<u8>(mp * kp) }.map_err(drv_err)?;
+            let mut scales = self
+                .stream
+                .alloc_zeros::<u8>(mp.next_multiple_of(128) * scale_stride)
+                .map_err(drv_err)?;
+            let module = super::SCALAR_FP8_SOURCE
+                .compiled(&self.device)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let kernel = module
+                .function("mxfp8_activation")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let warps = u32::try_from(mp * blocks).map_err(candle_core::Error::wrap)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(xbuf)
+                    .arg(&mut codes)
+                    .arg(&mut scales)
+                    .arg(&m32)
+                    .arg(&k32)
+                    .arg(&kp32)
+                    .arg(&mp32)
+                    .launch(LaunchConfig {
+                        grid_dim: (warps.div_ceil(8), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let mut out = unsafe { self.stream.alloc::<half::bf16>(mp * n) }.map_err(drv_err)?;
+            {
+                let (a, _a) = w.buf.device_ptr(&self.stream);
+                let (b, _b) = codes.device_ptr(&self.stream);
+                let (sa, _sa) = wb.device_ptr(&self.stream);
+                let (sb, _sb) = scales.device_ptr(&self.stream);
+                let (d, _d) = out.device_ptr_mut(&self.stream);
+                unsafe {
+                    self.run(
+                        w.dtype,
+                        w.dtype,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        sys::cudaDataType_t::CUDA_R_32F,
+                        sys::cudaDataType_t::CUDA_R_16BF,
+                        mp,
+                        kp,
+                        n,
+                        a,
+                        b,
+                        d,
+                        Some((sa + wl.start_offset() as u64, sb, true)),
+                        Alpha::F32(1.),
+                    )?;
+                }
+            }
+            Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::BF16(out),
+                    device: self.device.clone(),
+                }),
+                (mp, n),
+                BackpropOp::none(),
+                false,
+            )
+            .narrow(0, 0, m)?
+            .narrow(1, 0, logical_n)
         }
 
         /// Stage an fp8 weight/activation tensor (`F8E4M3`) as an owned device buffer + its shape.
@@ -1507,7 +1742,8 @@ mod cuda_impl {
         #[allow(clippy::too_many_arguments)]
         unsafe fn run(
             &self,
-            io_dtype: sys::cudaDataType_t,
+            a_dtype: sys::cudaDataType_t,
+            b_dtype: sys::cudaDataType_t,
             compute: sys::cublasComputeType_t,
             scale_dtype: sys::cudaDataType_t,
             out_dtype: sys::cudaDataType_t,
@@ -1520,6 +1756,7 @@ mod cuda_impl {
             scales: Option<(
                 cudarc::driver::sys::CUdeviceptr,
                 cudarc::driver::sys::CUdeviceptr,
+                bool,
             )>,
             alpha: Alpha,
         ) -> Result<()> {
@@ -1541,7 +1778,21 @@ mod cuda_impl {
                 &transb,
             )?;
 
-            if let Some((sa, sb)) = scales {
+            if let Some((sa, sb, block_scaled)) = scales {
+                if block_scaled {
+                    let mode =
+                        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+                    set_attr(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                        &mode,
+                    )?;
+                    set_attr(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                        &mode,
+                    )?;
+                }
                 set_attr(
                     desc,
                     sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
@@ -1556,9 +1807,9 @@ mod cuda_impl {
 
             // Layouts (see module doc): A=(K,N) col-major ld=K, B=(K,M) col-major ld=K,
             // D=(N,M) col-major ld=N.
-            let a_layout = lt::create_matrix_layout(io_dtype, k as u64, n as u64, k as i64)
+            let a_layout = lt::create_matrix_layout(a_dtype, k as u64, n as u64, k as i64)
                 .map_err(cublas_err)?;
-            let b_layout = lt::create_matrix_layout(io_dtype, k as u64, m as u64, k as i64)
+            let b_layout = lt::create_matrix_layout(b_dtype, k as u64, m as u64, k as i64)
                 .map_err(cublas_err)?;
             let d_layout = lt::create_matrix_layout(out_dtype, n as u64, m as u64, n as i64)
                 .map_err(cublas_err)?;
@@ -1777,26 +2028,54 @@ mod cuda_impl {
     /// GEMM does not re-clone the operand — the difference between the bench's honest compute number
     /// and the naive per-call one.
     pub struct DevFp8 {
+        dtype: sys::cudaDataType_t,
         buf: cudarc::driver::CudaSlice<float8::F8E4M3>,
         rows: usize,
         cols: usize,
     }
 
     impl DevFp8 {
+        pub fn is_e5m2(&self) -> bool {
+            self.dtype == sys::cudaDataType_t::CUDA_R_8F_E5M2
+        }
         fn stage(lt: &CublasLt, t: &Tensor) -> Result<Self> {
-            expect_dtype(t, DType::F8E4M3)?;
+            if !matches!(t.dtype(), DType::U8 | DType::F8E4M3) {
+                candle_core::bail!("expected E4M3FN or E5M2 code bytes");
+            }
             let (rows, cols) = t.dims2()?;
             let t = t.contiguous()?;
-            let (storage, _l) = t.storage_and_layout();
+            if !t.device().same_device(&Device::Cuda(lt.device.clone())) {
+                candle_core::bail!("FP8 operand and cuBLASLt context are on different devices");
+            }
+            let (storage, layout) = t.storage_and_layout();
+            let start = layout.start_offset();
             let buf = match &*storage {
                 Storage::Cuda(cs) => match &cs.slice {
-                    CudaStorageSlice::F8E4M3(s) => s.try_clone().map_err(drv_err)?,
-                    _ => candle_core::bail!("DevFp8::stage: expected F8E4M3 storage"),
+                    CudaStorageSlice::F8E4M3(s) => lt
+                        .stream
+                        .clone_dtod(&s.slice(start..start + rows * cols))
+                        .map_err(drv_err)?,
+                    CudaStorageSlice::U8(s) => {
+                        // E5M2 has no candle storage variant. Both formats use single,
+                        // byte-aligned codes; the GEMM descriptor supplies their real type.
+                        let s = s.slice(start..start + rows * cols);
+                        let bytes = unsafe { s.transmute::<float8::F8E4M3>(rows * cols) }.unwrap();
+                        lt.stream.clone_dtod(&bytes).map_err(drv_err)?
+                    }
+                    _ => candle_core::bail!("DevFp8::stage: unsupported FP8 storage"),
                 },
                 _ => candle_core::bail!("DevFp8::stage: not a CUDA tensor"),
             };
-            let _ = lt;
-            Ok(Self { buf, rows, cols })
+            Ok(Self {
+                buf,
+                rows,
+                cols,
+                dtype: if t.dtype() == DType::U8 {
+                    sys::cudaDataType_t::CUDA_R_8F_E5M2
+                } else {
+                    sys::cudaDataType_t::CUDA_R_8F_E4M3
+                },
+            })
         }
     }
 
@@ -2140,7 +2419,12 @@ mod cuda_impl {
                 .map(|b| float8::F8E4M3::from_bits(*b))
                 .collect();
             let buf = self.stream.clone_htod(&codes).map_err(drv_err)?;
-            Ok(DevFp8 { buf, rows, cols })
+            Ok(DevFp8 {
+                buf,
+                rows,
+                cols,
+                dtype: sys::cudaDataType_t::CUDA_R_8F_E4M3,
+            })
         }
 
         /// Upload a small host f32 vector (FP8R per-output weight scales).
@@ -2208,6 +2492,7 @@ mod cuda_impl {
             }
             drop(x_storage);
             let xq = DevFp8 {
+                dtype: sys::cudaDataType_t::CUDA_R_8F_E4M3,
                 buf: q,
                 rows: m,
                 cols: k,
@@ -2223,6 +2508,7 @@ mod cuda_impl {
                 let (d_ptr, _gd) = acc.device_ptr_mut(&self.stream);
                 unsafe {
                     self.run(
+                        w.dtype,
                         sys::cudaDataType_t::CUDA_R_8F_E4M3,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                         sys::cudaDataType_t::CUDA_R_32F,
@@ -2233,7 +2519,7 @@ mod cuda_impl {
                         a_ptr,
                         b_ptr,
                         d_ptr,
-                        Some((sa_ptr, sb_ptr)),
+                        Some((sa_ptr, sb_ptr, false)),
                         Alpha::F32(1.0),
                     )?;
                 }
@@ -2404,7 +2690,7 @@ mod cuda_impl {
     }
 
     fn check_alignment(k: usize, n: usize) -> Result<()> {
-        if !k.is_multiple_of(16) || !n.is_multiple_of(16) {
+        if !super::eight_bit_layout_supported(&[n, k]) {
             candle_core::bail!("cuBLASLt 8-bit: K ({k}) and N ({n}) must be multiples of 16");
         }
         Ok(())
@@ -2424,13 +2710,6 @@ mod cuda_impl {
         }
         if !n.is_multiple_of(NVFP4_N_ALIGN) {
             candle_core::bail!("cuBLASLt NVFP4: N ({n}) must be a multiple of {NVFP4_N_ALIGN}");
-        }
-        Ok(())
-    }
-
-    fn expect_dtype(t: &Tensor, want: DType) -> Result<()> {
-        if t.dtype() != want {
-            candle_core::bail!("expected {want:?}, got {:?}", t.dtype());
         }
         Ok(())
     }

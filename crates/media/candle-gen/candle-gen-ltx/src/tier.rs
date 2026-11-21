@@ -350,6 +350,22 @@ impl VaeRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeRemapBackend {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<
+        Option<std::sync::Arc<dyn candle_gen::candle_nn::linear::NativeLinearWeight>>,
+    > {
+        let mapped = Self::remap(name);
+        self.inner
+            .clone()
+            .set_device(dev.clone())
+            .set_dtype(dtype)
+            .native_linear_weight_with_shape(&mapped.0, shape)
+    }
     fn get(
         &self,
         s: candle_gen::candle_core::Shape,
@@ -411,6 +427,22 @@ impl VaeEncoderRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeEncoderRemapBackend {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<
+        Option<std::sync::Arc<dyn candle_gen::candle_nn::linear::NativeLinearWeight>>,
+    > {
+        let mapped = Self::remap(name);
+        self.inner
+            .clone()
+            .set_device(dev.clone())
+            .set_dtype(dtype)
+            .native_linear_weight_with_shape(&mapped.0, shape)
+    }
     fn get(
         &self,
         s: candle_gen::candle_core::Shape,
@@ -492,6 +524,22 @@ impl AudioVaeRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for AudioVaeRemapBackend {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<
+        Option<std::sync::Arc<dyn candle_gen::candle_nn::linear::NativeLinearWeight>>,
+    > {
+        let mapped = Self::remap(name);
+        self.inner
+            .clone()
+            .set_device(dev.clone())
+            .set_dtype(dtype)
+            .native_linear_weight_with_shape(&mapped.0, shape)
+    }
     fn get(
         &self,
         shape: candle_gen::candle_core::Shape,
@@ -570,6 +618,22 @@ impl VocoderRemapBackend {
 }
 
 impl candle_gen::candle_nn::var_builder::SimpleBackend for VocoderRemapBackend {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<
+        Option<std::sync::Arc<dyn candle_gen::candle_nn::linear::NativeLinearWeight>>,
+    > {
+        let mapped = Self::remap(name);
+        self.inner
+            .clone()
+            .set_device(dev.clone())
+            .set_dtype(dtype)
+            .native_linear_weight_with_shape(&mapped.0, shape)
+    }
     fn get(
         &self,
         shape: candle_gen::candle_core::Shape,

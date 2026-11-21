@@ -25,6 +25,9 @@ use crate::quant_eval::Ltx25QuantMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AdvancedOperatorKind {
+    Fp8E4M3,
+    Fp8E5M2,
+    MxFp8,
     Dense,
     MlxAffine,
     Int8ConvRotIgemm,
@@ -34,6 +37,9 @@ pub enum AdvancedOperatorKind {
 impl AdvancedOperatorKind {
     pub const fn id(self) -> &'static str {
         match self {
+            Self::Fp8E4M3 => candle_gen::gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id,
+            Self::Fp8E5M2 => candle_gen::gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id,
+            Self::MxFp8 => candle_gen::gen_core::checkpoint_codec::MXFP8_CODEC.codec_id,
             Self::Dense => "dense-linear",
             Self::MlxAffine => "mlx-affine-dequant",
             Self::Int8ConvRotIgemm => "int8-convrot-rht-cublaslt-igemm",
@@ -158,6 +164,7 @@ pub fn inspect_transformer_source(
                 &CandleCodecResidency {
                     fp8_e4m3_native: false,
                     nvfp4_native: true,
+                    mxfp8_native: false,
                 },
             )
             .map_err(|error| invalid(error.to_string()))?;
@@ -327,6 +334,7 @@ impl AdvancedQuantSource {
                 let residency = CandleCodecResidency {
                     fp8_e4m3_native: false,
                     nvfp4_native: true,
+                    mxfp8_native: false,
                 };
                 let plan = plan_logical_weights(path, &IdentityKeyMapping, &residency)
                     .map_err(|error| invalid(error.to_string()))?;

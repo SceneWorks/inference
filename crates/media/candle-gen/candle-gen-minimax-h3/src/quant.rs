@@ -196,6 +196,19 @@ pub fn lin(
     let scales_key = format!("{base}.scales");
     let bias_key = format!("{base}.bias");
 
+    if let Some(layer) = w.native_linear(base, bias)? {
+        let (out, inp) = layer.weight_dims()?;
+        let bytes = match layer.native_resident_bytes() {
+            Some(bytes) => bytes as usize,
+            None => dense_bytes(layer.try_weight()?),
+        };
+        let base_bytes = bytes + layer.bias().map(dense_bytes).unwrap_or(0);
+        return Ok(TieredLinear {
+            linear: AdaptLinear::from_dense(layer, inp, out),
+            base_bytes,
+        });
+    }
+
     if let Some(native) = candle_gen::quant::W4A8Linear::from_weights(w, base, bias)? {
         let base_bytes = native.resident_bytes()
             + if bias {

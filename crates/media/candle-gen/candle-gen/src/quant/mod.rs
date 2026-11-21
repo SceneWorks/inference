@@ -404,7 +404,7 @@ impl DenseLinear {
     /// [`Self::Transposed`] this transposes `weight_t` back once (not per forward).
     fn out_in_weight_bias(&self) -> Result<(Tensor, Option<Tensor>)> {
         match self {
-            Self::Linear(l) => Ok((l.weight().clone(), l.bias().cloned())),
+            Self::Linear(l) => Ok((l.try_weight()?.clone(), l.bias().cloned())),
             Self::Transposed { weight_t, bias } => Ok((weight_t.t()?.contiguous()?, bias.clone())),
         }
     }
@@ -412,7 +412,7 @@ impl DenseLinear {
     /// `in_features` (the contraction / last-dim) — the axis the quantize-skip predicate tests.
     fn in_features(&self) -> Result<usize> {
         match self {
-            Self::Linear(l) => l.weight().dim(1),
+            Self::Linear(l) => Ok(l.weight_dims()?.1),
             Self::Transposed { weight_t, .. } => weight_t.dim(0),
         }
     }
@@ -450,7 +450,10 @@ impl DenseLinear {
         let dt = x.dtype();
         match self {
             Self::Linear(l) => {
-                let w = l.weight().to_dtype(dt)?;
+                if l.is_native() {
+                    return l.forward(x);
+                }
+                let w = l.try_weight()?.to_dtype(dt)?;
                 let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
                 Self::Linear(Linear::new(w, b)).forward(x)
             }
@@ -519,6 +522,9 @@ pub struct QuantForward {
 #[derive(Clone)]
 pub enum QLinear {
     Dense(DenseLinear),
+    /// Native per-tensor-scaled E4M3FN codes bound to a shared cuBLASLt context.
+    #[cfg(feature = "cuda")]
+    Fp8(std::sync::Arc<Fp8Linear>),
     /// Native packed codebook W4A8; never folded into a GGUF or dense weight.
     W4A8(std::sync::Arc<W4A8Linear>),
     ConvRot(std::sync::Arc<convrot_int8::ConvRotLinear>),
@@ -538,6 +544,8 @@ pub enum QLinear {
 impl std::fmt::Debug for QLinear {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => f.write_str("QLinear::Fp8"),
             Self::Dense(_) => f.write_str("QLinear::Dense"),
             Self::ConvRot(q) => f.debug_tuple("QLinear::ConvRot").field(q).finish(),
             Self::W4A8(q) => f.debug_tuple("QLinear::W4A8").field(q).finish(),
@@ -589,6 +597,30 @@ impl QLinear {
             _ => copy.to_device(device)?,
         }
         Ok(copy)
+    }
+
+    pub fn native_format_id(&self) -> Option<&'static str> {
+        match self {
+            Self::Dense(DenseLinear::Linear(l)) => l.native_format_id(),
+            Self::ConvRot(_) => Some(gen_core::convrot_int8::CODEC_ID),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(base) => Some(base.format_id()),
+            _ => None,
+        }
+    }
+
+    /// The execution device of an immutable E4M3FN projection, if present.
+    pub fn native_device(&self) -> Option<&Device> {
+        if let Self::Dense(DenseLinear::Linear(l)) = self {
+            if l.is_native() {
+                return Some(l.device());
+            }
+        }
+        #[cfg(feature = "cuda")]
+        if let Self::Fp8(base) = self {
+            return Some(base.device());
+        }
+        None
     }
 
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
@@ -719,6 +751,8 @@ impl QLinear {
     /// candle's `QMatMul::forward` (with per-site leading-dim flatten / dtype cast-back).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
+            #[cfg(feature = "cuda")]
+            Self::Fp8(q) => q.forward(x)?.to_dtype(x.dtype()),
             Self::Dense(l) => __model_proof_output!(l.forward(x)),
             Self::W4A8(q) => __model_proof_output!(q.forward(x)),
             Self::ConvRot(q) => q.forward(x),
@@ -786,6 +820,8 @@ impl QLinear {
     pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward_upcast(x),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => self.forward(x),
             Self::Quantized { .. } | Self::ConvRot(_) | Self::W4A8(_) => self.forward(x),
         }
     }
@@ -886,6 +922,9 @@ impl QLinear {
         skip_indivisible: bool,
     ) -> Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
+        if self.native_device().is_some() {
+            return Ok(()); // source precision is fixed; retain the existing operator.
+        }
         if matches!(self, Self::ConvRot(_)) {
             candle_core::bail!("ConvRot refuses re-quantization to {quant:?}");
         }
@@ -960,6 +999,16 @@ impl QLinear {
     /// for the leaves it must keep dense — e.g. FLUX.2's control branch `control_img_in` (260
     /// in-features is not a multiple of the block 32, so it can't quantize) (sc-7460).
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(DenseLinear::Linear(layer)) = self {
+            *layer = layer.to_device(device)?;
+            return Ok(());
+        }
+        if self
+            .native_device()
+            .is_some_and(|owner| !owner.same_device(device))
+        {
+            candle_core::bail!("checkpoint projection is bound to its execution device");
+        }
         if let Self::ConvRot(q) = self {
             if !q.device().same_device(device) {
                 candle_core::bail!("ConvRot refuses cross-device migration of its packed base");
@@ -970,6 +1019,9 @@ impl QLinear {
             if !q.device().same_device(device) {
                 candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
             }
+            return Ok(());
+        }
+        if self.native_device().is_some() {
             return Ok(());
         }
         if let Self::Dense(dense) = self {
@@ -1000,10 +1052,7 @@ impl QLinear {
 
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
-        matches!(
-            self,
-            Self::Quantized { .. } | Self::ConvRot(_) | Self::W4A8(_)
-        )
+        !matches!(self, Self::Dense(_)) || self.native_device().is_some()
     }
 
     /// The GGUF block type of a quantized projection's resident weight (`None` when dense) — lets a
@@ -1012,6 +1061,8 @@ impl QLinear {
     pub fn quant_dtype(&self) -> Option<GgmlDType> {
         match self {
             Self::Quantized { weight, .. } => Some(weight.dtype()),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => None,
             Self::Dense(_) | Self::ConvRot(_) | Self::W4A8(_) => None,
         }
     }
@@ -1028,6 +1079,8 @@ impl QLinear {
                 weight: QuantWeight::Matmul(_),
                 ..
             } => Some(MatmulStrategy::Int8Fast),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => None,
             Self::Dense(_) | Self::ConvRot(_) | Self::W4A8(_) => None,
         }
     }
@@ -1432,6 +1485,9 @@ pub fn linear_from_weights_gs(
     bias: bool,
     group_size: usize,
 ) -> crate::Result<QLinear> {
+    if let Some(native) = weights.native_linear(base, bias)? {
+        return Ok(QLinear::from_dense(DenseLinear::Linear(native)));
+    }
     if weights.contains(&format!("{base}.comfy_quant"))
         && weights.contains(&format!("{base}.weight_scale"))
     {

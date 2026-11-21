@@ -26,9 +26,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, Var, D};
 use candle_gen::candle_nn::{Embedding, Linear};
+use candle_gen::loader::MappedWeights;
 use candle_gen::quant::PackedConfig;
 
 use crate::quant::{QEmbedding, QLinear};
@@ -47,7 +47,7 @@ pub struct Weights {
 }
 
 enum WeightStorage {
-    Mmap(MmapedSafetensors),
+    Mmap(MappedWeights),
     /// Training-only live tensors. Each value is the tensor handle owned by the corresponding
     /// returned [`Var`], so rebuilding a model from this map preserves the backward edge.
     Owned(HashMap<String, Tensor>),
@@ -61,7 +61,7 @@ impl Weights {
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
         let st = candle_gen::mmap_safetensors_multi(&files)?;
         Ok(Self {
-            storage: WeightStorage::Mmap(st),
+            storage: WeightStorage::Mmap(MappedWeights::new(st, &files, device)?),
             device: device.clone(),
             dtype,
             packed: read_packed_config(dir)?,
@@ -73,7 +73,7 @@ impl Weights {
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let st = candle_gen::mmap_safetensors_multi(&[path])?;
         Ok(Self {
-            storage: WeightStorage::Mmap(st),
+            storage: WeightStorage::Mmap(MappedWeights::new(st, &[path.to_owned()], device)?),
             device: device.clone(),
             dtype,
             packed: read_packed_config(path.parent().unwrap_or_else(|| Path::new(".")))?,
@@ -131,7 +131,10 @@ impl Weights {
 
     /// Load `name` at the component dtype.
     pub fn get(&self, name: &str) -> Result<Tensor> {
-        self.load_native(name)?.to_dtype(self.dtype)
+        match &self.storage {
+            WeightStorage::Mmap(st) => st.read(name, self.dtype, &self.device),
+            WeightStorage::Owned(_) => self.load_native(name)?.to_dtype(self.dtype),
+        }
     }
 
     /// Load `name` at its **native** stored dtype (no cast) on the component device — used for the
@@ -142,12 +145,15 @@ impl Weights {
 
     /// Load `name` forcing f32 (norm weights and other precision-sensitive scalars).
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
-        self.load_native(name)?.to_dtype(DType::F32)
+        match &self.storage {
+            WeightStorage::Mmap(st) => st.read(name, DType::F32, &self.device),
+            WeightStorage::Owned(_) => self.load_native(name)?.to_dtype(DType::F32),
+        }
     }
 
     pub fn contains(&self, name: &str) -> bool {
         match &self.storage {
-            WeightStorage::Mmap(st) => st.get(name).is_ok(),
+            WeightStorage::Mmap(st) => st.mmap().get(name).is_ok(),
             WeightStorage::Owned(tensors) => tensors.contains_key(name),
         }
     }
@@ -167,7 +173,7 @@ impl Weights {
 
     fn load_native(&self, name: &str) -> Result<Tensor> {
         match &self.storage {
-            WeightStorage::Mmap(st) => st.load(name, &self.device),
+            WeightStorage::Mmap(st) => st.mmap().load(name, &self.device),
             WeightStorage::Owned(tensors) => tensors.get(name).cloned().ok_or_else(|| {
                 candle_gen::candle_core::Error::Msg(format!("missing tensor `{name}`"))
             }),
@@ -214,6 +220,9 @@ ArtifactInput,
 /// Build a [`Linear`] from `{base}.weight` (+ `{base}.bias` when `bias`), inferring in/out dims from
 /// the stored tensor shape (`[out, in]`, PyTorch/HF convention).
 pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
+    if let WeightStorage::Mmap(st) = &w.storage {
+        return st.linear(base, bias, w.dtype(), w.device());
+    }
     let weight = w.get(&format!("{base}.weight"))?;
     let bias = if bias {
         Some(w.get(&format!("{base}.bias"))?)

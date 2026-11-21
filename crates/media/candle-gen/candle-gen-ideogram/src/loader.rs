@@ -28,9 +28,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
+use candle_gen::loader::MappedWeights;
 use candle_gen::quant::{PackedConfig, MLX_GROUP_SIZE};
 
 use crate::quant::{QEmbedding, QLinear};
@@ -41,7 +41,7 @@ use crate::quant::{QEmbedding, QLinear};
 /// ([`crate::adapters::install_turbo_lora_additive`]), so a base (dense or packed) stays a clean,
 /// disk-backed mmap that the offload/eviction machinery can drop and restore cheaply (sc-11104).
 pub struct Weights {
-    st: MmapedSafetensors,
+    st: MappedWeights,
     device: Device,
     dtype: DType,
     /// The MLX group size the packed shapes can't disambiguate. `Some` when a `quantization` block is
@@ -71,7 +71,7 @@ impl Weights {
         validate_unique_tensor_names(&files)?;
         let st = candle_gen::mmap_safetensors_multi(&files)?;
         Ok(Self {
-            st,
+            st: MappedWeights::new(st, &files, device)?,
             device: device.clone(),
             dtype,
             packed_group_size: read_packed_group_size(dir),
@@ -80,22 +80,22 @@ impl Weights {
 
     /// Load `name` at the component dtype on the component device (straight from the mmap).
     pub fn get(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)?.to_dtype(self.dtype)
+        self.st.read(name, self.dtype, &self.device)
     }
 
     /// Load `name` forcing f32 — norm weights and the packed triple's `.scales`/`.biases`.
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)?.to_dtype(DType::F32)
+        self.st.read(name, DType::F32, &self.device)
     }
 
     /// Load `name` at its **native** stored dtype (no cast) on the component device — used for the
     /// packed triple's u32 codes (casting would reinterpret the bit-packed nibbles).
     pub fn get_native(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)
+        self.st.mmap().load(name, &self.device)
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.st.get(name).is_ok()
+        self.st.mmap().get(name).is_ok()
     }
 
     pub fn device(&self) -> &Device {
@@ -155,21 +155,14 @@ dir.join("config.json"),
 /// Build a [`Linear`] from `{base}.weight` (+ `{base}.bias` when `bias`), inferring in/out dims from
 /// the stored tensor shape (`[out, in]`, PyTorch/HF convention).
 pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
-    let weight = w.get(&format!("{base}.weight"))?;
-    let bias = if bias {
-        Some(w.get(&format!("{base}.bias"))?)
-    } else {
-        None
-    };
-    Ok(Linear::new(weight, bias))
+    w.st.linear(base, bias, w.dtype(), w.device())
 }
 
 /// Wrap a loaded dense [`Linear`] as the shared [`QLinear`] (`AdaptLinear`), recovering the logical
 /// `[out, in]` from the weight shape so a residual installer can shape-check without re-reading it.
-fn dense_adapt(l: Linear) -> QLinear {
-    let dims = l.weight().dims();
-    let (out, in_) = (dims[0], dims[1]);
-    QLinear::from_dense(l, in_, out)
+fn dense_adapt(l: Linear) -> Result<QLinear> {
+    let (out, in_) = l.weight_dims()?;
+    Ok(QLinear::from_dense(l, in_, out))
 }
 
 /// **Packed-detecting** [`QLinear`] loader (sc-9412, additive route sc-11104). In order:
@@ -213,7 +206,7 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         return Ok(QLinear::from_packed(packed, in_, out));
     }
     // (3) Dense path unchanged.
-    Ok(dense_adapt(linear(w, base, bias)?))
+    dense_adapt(linear(w, base, bias)?)
 }
 
 /// **Packed-detecting** [`QEmbedding`] loader (sc-9412): packed straight from the MLX triple when

@@ -251,11 +251,12 @@ fn cpu_cast_mmap_var_builder(
     device: &Device,
 ) -> CResult<VarBuilder<'static>> {
     let tensors = candle_gen::mmap_safetensors_multi(files)?;
-    Ok(VarBuilder::from_backend(
-        Box::new(CpuCastMmap { tensors }),
-        dtype,
-        device.clone(),
-    ))
+    let backend: Box<dyn SimpleBackend> =
+        match candle_gen::loader::ProjectionSource::from_mapped(tensors, files, device)? {
+            Ok(source) => Box::new(source),
+            Err(tensors) => Box::new(CpuCastMmap { tensors }),
+        };
+    Ok(VarBuilder::from_backend(backend, dtype, device.clone()))
 }
 
 /// Load a checkpoint to a CPU tensor map and widen every tensor to f32 there. Adapter merging and the

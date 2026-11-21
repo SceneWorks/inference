@@ -26,6 +26,7 @@
 //! `from_mmaped_safetensors`. Do NOT change the sort key (e.g. to a numeric shard index): it would
 //! silently pick a different shard's copy of a duplicated key and corrupt weight loading.
 
+pub use candle_checkpoint::{MappedWeights, ProjectionSource};
 use std::path::{Path, PathBuf};
 
 use candle_core::safetensors::MmapedSafetensors;
@@ -254,7 +255,7 @@ pub fn mmap_var_builder(
     // SAFETY: see the function-level doc — no process may truncate or modify the mapped files while
     // the mapping is live (accepted residual risk). Standard candle loading path.
     __model_proof_inspect!(
-        Ok(unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? }),
+        Ok(candle_checkpoint::mmap_var_builder(files, dtype, device)?),
         |_| {
             gen_core::model_input_proof::record_reader_paths(
                 "candle-gen::loader::mmap_var_builder",

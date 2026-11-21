@@ -126,8 +126,8 @@ impl Base {
     /// verifies shape and dtype only, exactly as it did before this seam existed.
     fn device(&self) -> Option<Device> {
         match self {
-            Base::Dense(l) => Some(l.weight().device().clone()),
-            Base::Packed(_) => None,
+            Base::Dense(l) => Some(l.device().clone()),
+            Base::Packed(q) => q.native_device().cloned(),
             Base::Nvfp4(q) => Some(q.device().clone()),
             Base::ConvRot(q) => Some(q.device().clone()),
             Base::W4A8(q) => Some(q.device().clone()),
@@ -814,6 +814,13 @@ impl AdaptLinear {
     /// Wrap an already-built dense `candle_nn::Linear` with its logical `[out, in]` dims — the seam a
     /// caller uses when it holds a `Linear` directly (e.g. a folded-delta reference, or a test grid).
     pub fn from_dense(l: Linear, in_dim: usize, out_dim: usize) -> Self {
+        if l.is_native() {
+            return Self::from_packed(
+                QLinear::from_dense(super::DenseLinear::Linear(l)),
+                in_dim,
+                out_dim,
+            );
+        }
         Self {
             base: Base::Dense(l),
             out_features: out_dim,
@@ -873,6 +880,7 @@ impl AdaptLinear {
     /// Distinguish descriptor-driven integer execution from affine packed Q8.
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self.base, Base::ConvRot(_))
+            || matches!(&self.base,Base::Packed(q) if q.native_format_id()==Some(gen_core::convrot_int8::CODEC_ID))
     }
 
     /// Packed W4A8 base; residuals remain additive in the original, unrotated input basis.
@@ -985,41 +993,30 @@ impl AdaptLinear {
                 adapters: Vec::new(),
             })
         } else {
-            let w = vb.get_unchecked(&format!("{name}.weight"))?;
-            let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-            Ok(Self {
-                base: Base::Dense(Linear::new(w, None)),
-                out_features,
-                in_features,
-                adapters: Vec::new(),
-            })
+            Self::dense(vb, name)
         }
     }
 
     /// Bias-less **dense** `[out, in]` projection from `{name}.weight` (a component that never packs,
     /// e.g. Anima's conditioner q/k/v/o — dense bf16 in every tier).
     pub fn dense(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
-        let w = vb.get_unchecked(&format!("{name}.weight"))?;
-        let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-        Ok(Self {
-            base: Base::Dense(Linear::new(w, None)),
-            out_features,
-            in_features,
-            adapters: Vec::new(),
-        })
+        Self::from_builder(vb, name, false)
     }
 
-    /// **Dense** `[out, in]` projection with bias from `{name}.weight` + `{name}.bias`.
     pub fn dense_bias(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
-        let w = vb.get_unchecked(&format!("{name}.weight"))?;
-        let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
-        let b = vb.get_unchecked(&format!("{name}.bias"))?;
-        Ok(Self {
-            base: Base::Dense(Linear::new(w, Some(b))),
-            out_features,
-            in_features,
-            adapters: Vec::new(),
-        })
+        Self::from_builder(vb, name, true)
+    }
+
+    fn from_builder(vb: &VarBuilder, name: &str, bias: bool) -> candle_core::Result<Self> {
+        let sub = vb.pp(name);
+        let b = bias.then(|| sub.get_unchecked("bias")).transpose()?;
+        let layer = if let Some(op) = sub.native_linear_weight("weight")? {
+            Linear::from_native(op, b)
+        } else {
+            Linear::new(sub.get_unchecked("weight")?, b)
+        };
+        let (out_features, in_features) = layer.weight_dims()?;
+        Ok(Self::from_dense(layer, in_features, out_features))
     }
 
     /// `x·Wᵀ (+ b)` plus every attached additive residual, in push order. A disabled residual is
@@ -1086,6 +1083,10 @@ impl AdaptLinear {
     /// Whether the base is an **NVFP4** projection (sc-21483). Distinct from [`Self::is_packed`],
     /// which stays the MLX-packed (`Q4_1`/`Q8_0`) predicate its existing callers key off — an NVFP4
     /// base holds no GGUF block weight and has no [`super::MatmulStrategy`].
+    pub fn is_fp8(&self) -> bool {
+        matches!(&self.base,Base::Packed(q) if q.native_format_id().is_some_and(|id|[gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id,gen_core::checkpoint_codec::FP8_E5M2_SCALAR_CODEC.codec_id,gen_core::checkpoint_codec::MXFP8_CODEC.codec_id].contains(&id)))
+    }
+
     pub fn is_nvfp4(&self) -> bool {
         self.base.is_nvfp4()
     }
@@ -1249,7 +1250,10 @@ impl AdaptLinear {
     /// Dense/MLX-packed bases keep the historical unchecked behaviour (their installers carry
     /// their own shape screening) and always return `Ok`.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
-        if matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
+        if self.is_fp8()
+            || self.is_convrot_int8()
+            || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
+        {
             return self.push_lora_checked(a, b, scale);
         }
         self.adapters.push(Adapter::Lora {
@@ -1327,6 +1331,7 @@ impl AdaptLinear {
     fn admission_subject(&self) -> &'static str {
         match &self.base {
             Base::Dense(_) => "dense base",
+            Base::Packed(q) if q.native_device().is_some() => "FP8 base",
             Base::Packed(_) => "MLX-packed base",
             Base::Nvfp4(_) => "NVFP4 base",
             Base::ConvRot(_) => "ConvRot INT8 base",
@@ -1445,7 +1450,10 @@ impl AdaptLinear {
     /// **On an NVFP4 base this delegates to [`Self::push_lokr_structured_checked`]** — same
     /// structural closure as [`Self::push_lora`] (sc-11045 fix round, MAJOR 7).
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
-        if matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
+        if self.is_fp8()
+            || self.is_convrot_int8()
+            || matches!(self.base, Base::Nvfp4(_) | Base::External { .. })
+        {
             return self.push_lokr_structured_checked(factors);
         }
         self.adapters.push(Adapter::LokrStructured { factors });
@@ -1481,6 +1489,7 @@ impl AdaptLinear {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
             // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
+            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {
@@ -1509,6 +1518,7 @@ impl AdaptLinear {
     ) -> candle_core::Result<()> {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
+            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {
@@ -1530,6 +1540,7 @@ impl AdaptLinear {
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
+            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {

@@ -205,6 +205,13 @@ pub struct LogicalWeightPlan {
 }
 
 impl LogicalWeightPlan {
+    /// True when the source already specifies a codec other than a dense numeric cast.
+    pub fn has_encoded_weights(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|row| !matches!(row.codec, TensorCodecSpec::Dense))
+    }
+
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
     }

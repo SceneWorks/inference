@@ -84,7 +84,10 @@ impl QLinear {
         match self {
             Self::Dense(l) => {
                 let dt = x.dtype();
-                let w = l.weight().to_dtype(dt)?;
+                if l.is_native() {
+                    return l.forward(x);
+                }
+                let w = l.try_weight()?.to_dtype(dt)?;
                 let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
                 __model_proof_output!(Linear::new(w, b).forward(x))
             }
