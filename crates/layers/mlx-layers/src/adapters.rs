@@ -698,7 +698,7 @@ impl Adapter {
                     ));
                 }
                 let y = factors.residual(x)?;
-                if (override_scale - factors.scale).abs() <= f32::EPSILON || factors.scale == 0.0 {
+                if override_scale == factors.scale || factors.scale == 0.0 {
                     return Ok(y);
                 }
                 let ratio = override_scale / factors.scale;
@@ -1973,5 +1973,24 @@ mod tests {
             .residual_with_scale(&x, 0.5)
             .expect_err("zero-baked LokrStructured must reject nonzero override");
         assert!(err.to_string().contains("baked factors.scale is 0.0"));
+
+        let small = Adapter::LokrStructured {
+            factors: LokrFactors {
+                w1: Array::ones::<f32>(&[2, 2]).unwrap(),
+                w2: Array::from_slice(&[5e-8f32; 4], &[2, 2]),
+                a: 2,
+                b: 2,
+                c: 2,
+                d: 2,
+                scale: 5e-8,
+            },
+        };
+        let x_ones = Array::ones::<f32>(&[1, 4]).unwrap();
+        let pos = small.residual_with_scale(&x_ones, 5e-8).unwrap();
+        let neg = small.residual_with_scale(&x_ones, -5e-8).unwrap();
+        let pos_vals: &[f32] = pos.as_slice();
+        let neg_vals: &[f32] = neg.as_slice();
+        assert!(pos_vals[0] > 0.0);
+        assert_eq!(neg_vals[0], -pos_vals[0]);
     }
 }

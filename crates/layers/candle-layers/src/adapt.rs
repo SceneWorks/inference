@@ -645,7 +645,7 @@ impl Adapter {
                     ));
                 }
                 let y = factors.residual(x)?;
-                if (override_scale - factors.scale).abs() <= f64::EPSILON || factors.scale == 0.0 {
+                if override_scale == factors.scale || factors.scale == 0.0 {
                     Ok(y)
                 } else {
                     y * (override_scale / factors.scale)
@@ -2288,21 +2288,60 @@ mod tests {
     #[test]
     fn lokr_structured_zero_baked_scale_rejects_nonzero_override() {
         let dev = Device::Cpu;
+        let w1 = Tensor::ones((2, 2), DType::F32, &dev).unwrap();
+        let w2 = Tensor::ones((2, 2), DType::F32, &dev).unwrap();
         let adapter = Adapter::LokrStructured {
-            factors: LokrFactors {
-                w1: Tensor::zeros((2, 2), DType::F32, &dev).unwrap(),
-                w2: Tensor::zeros((2, 2), DType::F32, &dev).unwrap(),
-                a: 2,
-                b: 2,
-                c: 2,
-                d: 2,
-                scale: 0.0,
-            },
+            factors: LokrFactors::build(
+                0.0,
+                (4, 4),
+                Some(&w1),
+                None,
+                None,
+                Some(&w2),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap(),
         };
         let x = Tensor::zeros((1, 4), DType::F32, &dev).unwrap();
         let err = adapter
             .residual_with_scale(&x, 0.5)
             .expect_err("zero-baked LokrStructured must reject nonzero override");
         assert!(err.to_string().contains("baked factors.scale is 0.0"));
+
+        let small = Adapter::LokrStructured {
+            factors: LokrFactors::build(
+                5e-17,
+                (4, 4),
+                Some(&w1),
+                None,
+                None,
+                Some(&w2),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap(),
+        };
+        let x_ones = Tensor::ones((1, 4), DType::F32, &dev).unwrap();
+        let pos = small
+            .residual_with_scale(&x_ones, 5e-17)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let neg = small
+            .residual_with_scale(&x_ones, -5e-17)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(pos[0] > 0.0);
+        assert_eq!(neg[0], -pos[0]);
     }
 }

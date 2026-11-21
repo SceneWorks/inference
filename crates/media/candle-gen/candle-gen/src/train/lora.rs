@@ -3367,29 +3367,15 @@ mod adapter_noise_tests {
         let dev = Device::Cpu;
         let w = Tensor::zeros((4, 3), DType::F32, &dev).unwrap();
         let base = Linear::new(w, None);
-        let mut adapt = AdaptLinear::from_dense(base);
-        let down1 = candle_core::Var::zeros((3, 2), DType::F32, &dev).unwrap();
-        let up1 = candle_core::Var::zeros((2, 4), DType::F32, &dev).unwrap();
-        adapt
-            .attach_trainable_lora(
-                down1.as_tensor().clone(),
-                up1.as_tensor().clone(),
-                1.0,
-                false,
-            )
-            .unwrap();
+        let mut adapt = AdaptLinear::from_dense(base, 3, 4);
+        let down1 = candle_core::Var::zeros((2, 3), DType::F32, &dev).unwrap();
+        let up1 = candle_core::Var::zeros((4, 2), DType::F32, &dev).unwrap();
+        adapt.push_trainable_lora(down1.as_tensor().clone(), up1.as_tensor().clone(), 1.0);
         assert!(LoraLinear::from_adapt_linear(adapt.clone(), "blk.0.attn.to_q".into()).is_ok());
 
-        let down2 = candle_core::Var::zeros((3, 2), DType::F32, &dev).unwrap();
-        let up2 = candle_core::Var::zeros((2, 4), DType::F32, &dev).unwrap();
-        adapt
-            .attach_trainable_lora(
-                down2.as_tensor().clone(),
-                up2.as_tensor().clone(),
-                1.0,
-                false,
-            )
-            .unwrap();
+        let down2 = candle_core::Var::zeros((2, 3), DType::F32, &dev).unwrap();
+        let up2 = candle_core::Var::zeros((4, 2), DType::F32, &dev).unwrap();
+        adapt.push_trainable_lora(down2.as_tensor().clone(), up2.as_tensor().clone(), 1.0);
         let err = LoraLinear::from_adapt_linear(adapt, "blk.0.attn.to_q".into())
             .expect_err("multiple trainable adapters must be rejected");
         assert!(err.to_string().contains("multiple trainable adapters"));

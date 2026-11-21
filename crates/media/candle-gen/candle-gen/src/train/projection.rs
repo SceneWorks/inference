@@ -124,6 +124,7 @@ impl candle_core::CustomOp1 for FrozenPackedInput {
 }
 
 /// Apply a two-dimensional factor without materializing one copy per leading batch.
+#[cfg(test)]
 pub(crate) fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
     crate::ensure_reference_math_hook();
     candle_layers::adapt::apply_factor(x, w)
