@@ -93,6 +93,76 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertIn('github.run_id', bridge['concurrency']['group'])
         self.assertIn('github.run_attempt', bridge['concurrency']['group'])
 
+    @unittest.skipUnless(os.name == "posix", "uses local Git and Bash; does not contact Actions")
+    def test_wan_full_history_uses_fresh_attempt_and_leaves_reused_shallow_checkout(self):
+        job = document("model-inference-proofs.yml")["jobs"]["prove"]
+        steps = job["steps"]
+        create = next(s for s in steps if s.get("id") == "wan_checkout")
+        source = next(s for s in steps if s.get("id") == "source")
+        cleanup = next(s for s in steps if s.get("name") == "Remove the owned Wan checkout")
+        self.assertEqual(create["if"], "matrix.asset_setup == 'wan-curated-tier1'")
+        self.assertIn("format('wan-src-{0}-{1}', github.run_id, github.run_attempt) || '.'", job["env"]["MODEL_PROOF_CWD"])
+        self.assertEqual(source["with"]["path"], "${{ env.MODEL_PROOF_CWD }}")
+        self.assertEqual(source["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(source["with"]["fetch-depth"], "${{ matrix.asset_setup == 'wan-curated-tier1' && '0' || '1' }}")
+        self.assertIs(source["with"]["persist-credentials"], False)
+        self.assertLess(steps.index(create), steps.index(source))
+        self.assertEqual(cleanup["if"], "always() && steps.wan_checkout.outcome == 'success'")
+        for step in steps:
+            if step.get("working-directory"):
+                self.assertEqual(step["working-directory"], source["with"]["path"])
+            # All Wan-reachable script commands must resolve inside the selected source on both OSes.
+            if (step.get("name") in {"Install reviewed CPython 3.12 on Windows", "Select Rustup proxies on Linux and macOS",
+                    "Select real pinned Rust toolchain on Windows", "Report actual host and pinned toolchain (no model execution)",
+                    "Validate owned evidence tree before any upload"} or "Run exact registered model tests" in step.get("name", "")):
+                self.assertEqual(step.get("working-directory"), source["with"]["path"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            origin = Path(temporary) / "origin"
+            workspace = Path(temporary) / "workspace"
+            def git(path, *args):
+                return subprocess.check_output(["git", "-c", "user.name=proof-test", "-c", "user.email=proof@localhost",
+                                                "-C", str(path), *args], text=True).strip()
+            origin.mkdir()
+            git(origin, "init", "-q", "-b", "main")
+            (origin / "source").write_text("before migration")
+            git(origin, "add", "source")
+            git(origin, "commit", "-qm", "trusted base")
+            base = git(origin, "rev-parse", "HEAD")
+            (origin / "source").write_text("after migration")
+            git(origin, "commit", "-qam", "candidate")
+            head = git(origin, "rev-parse", "HEAD")
+            git(origin, "clone", "-q", "--depth=1", origin.as_uri(), str(workspace))
+            marker = workspace / "listener-owned"
+            marker.write_text("preserve")
+            env = dict(os.environ, GITHUB_RUN_ID="42", GITHUB_RUN_ATTEMPT="3", MODEL_PROOF_CWD="wan-src-42-3")
+            def run_step(step, check=True):
+                return subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=workspace,
+                                      env=env, check=check, capture_output=True)
+            run_step(create)
+            self.assertNotEqual(run_step(create, check=False).returncode, 0)
+            owned = workspace / env["MODEL_PROOF_CWD"]
+            git(owned, "init", "-q")
+            git(owned, "remote", "add", "origin", origin.as_uri())
+            # Pinned checkout v5 uses this full-history refspec without --unshallow on fresh repos.
+            git(owned, "fetch", "-q", "--prune", "--no-recurse-submodules", "origin",
+                "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
+            git(owned, "checkout", "-q", "--detach", head)
+            git(owned, "merge-base", "--is-ancestor", base, head)
+            self.assertEqual(git(owned, "rev-parse", "HEAD"), head)
+            self.assertNotEqual(git(owned, "rev-parse", "HEAD^{tree}"), git(owned, "rev-parse", base + "^{tree}"))
+            self.assertEqual(git(owned, "rev-parse", "HEAD^{tree}"), git(origin, "rev-parse", "HEAD^{tree}"))
+            self.assertEqual(git(owned, "rev-parse", "--is-shallow-repository"), "false")
+            env["MODEL_PROOF_CWD"] = "."
+            self.assertNotEqual(run_step(cleanup, check=False).returncode, 0)
+            self.assertTrue(owned.is_dir())
+            env["MODEL_PROOF_CWD"] = owned.name
+            run_step(cleanup)
+            self.assertFalse(owned.exists())
+            self.assertEqual(git(workspace, "rev-parse", "--is-shallow-repository"), "true")
+            self.assertEqual(git(workspace, "rev-parse", "HEAD"), head)
+            self.assertEqual(marker.read_text(), "preserve")
+
     def test_owned_paths_and_runner_context_are_step_not_job_environment(self):
         for filename, name in (('model-inference-proofs.yml', 'prove'), ('real-weights.yml', 'model-proof-execute')):
             with self.subTest(workflow=filename):
@@ -146,7 +216,8 @@ class ModelWorkflowRoutes(unittest.TestCase):
             self.assertIn('rustc -vV', report['run'])
             self.assertIn('command -v cargo', report['run'])
             self.assertIn('command -v rustc', report['run'])
-            selected.append((posix, windows))
+            # Both endpoints run the same selector; the Wan route runs it in its fresh checkout.
+            selected.append(tuple({k: v for k, v in s.items() if k != "working-directory"} for s in (posix, windows)))
         self.assertEqual(selected[0], selected[1])
 
     def test_bridge_preserves_iris_asset_setup_from_validated_plan(self):

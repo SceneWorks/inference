@@ -90,6 +90,9 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
+      # Keep full history for Wan in its own fresh repository. Reused listeners may have a
+      # shallow index with linked objects that Git cannot repack during an all-ref unshallow.
+      MODEL_PROOF_CWD: ${{ matrix.asset_setup == 'wan-curated-tier1' && format('wan-src-{0}-{1}', github.run_id, github.run_attempt) || '.' }}
       FLUX1_HUB: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
       MODEL_PROOF_BACKEND: ${{ inputs.backend }}
       MODEL_PROOF_REQUEST: ${{ inputs.request }}
@@ -104,11 +107,24 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: 'true'
       CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
     steps:
+      - name: Select Git Bash on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Create the fresh Wan checkout directory
+        if: matrix.asset_setup == 'wan-curated-tier1'
+        id: wan_checkout
+        shell: bash
+        run: mkdir -- "$MODEL_PROOF_CWD"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        id: source
         with:
+          path: ${{ env.MODEL_PROOF_CWD }}
           ref: ${{ github.sha }}
           # The Wan controller verifies the fixed migration base as an ancestor before building.
-          fetch-depth: ${{ fromJSON(inputs.request).selection == 'wan-curated-tier1' && '0' || '1' }}
+          fetch-depth: ${{ matrix.asset_setup == 'wan-curated-tier1' && '0' || '1' }}
           persist-credentials: false
       - name: Check out the exact pre-migration engine for the paired proof
         if: matrix.asset_setup == 'flux1-comparison'
@@ -117,12 +133,6 @@ jobs:
           ref: 2b09938e33370915d4f853389961709b8bbf8bf9
           path: flux1-baseline
           persist-credentials: false
-      - name: Select Git Bash on Windows
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
-          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Install pinned uv on Windows
         if: runner.os == 'Windows'
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
@@ -130,6 +140,7 @@ jobs:
           version: '0.12.3'
           enable-cache: false
       - name: Install reviewed CPython 3.12 on Windows
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os == 'Windows'
         shell: cmd
         run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
@@ -156,14 +167,17 @@ jobs:
           printf 'MODEL_PROOF_EVIDENCE=%s\n' "$OWNED_PROOF_EVIDENCE" >> "$GITHUB_ENV"
           printf 'MODEL_PROOF_RUNNER_ENVIRONMENT=%s\n' "$ACTUAL_RUNNER_ENVIRONMENT" >> "$GITHUB_ENV"
       - name: Select Rustup proxies on Linux and macOS
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os != 'Windows'
         shell: bash
         run: source scripts/ci/real-weights/model-proof-execute/posix-rust.sh
       - name: Select real pinned Rust toolchain on Windows
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os == 'Windows'
         shell: powershell
         run: . ./scripts/ci/real-weights/model-proof-execute/windows-rust.ps1
       - name: Report actual host and pinned toolchain (no model execution)
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         shell: bash
         run: source scripts/ci/real-weights/model-proof-execute/host.sh
       - name: Require Python 3.12 on macOS
@@ -262,6 +276,7 @@ jobs:
           if errorlevel 1 exit /b %ERRORLEVEL%
           "%REVIEWED_PYTHON%" -I scripts\ci\stage_pinned_hub_snapshots.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
       - name: Run exact registered model tests under external guards (Linux/macOS)
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -270,6 +285,7 @@ jobs:
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
       - name: Run exact registered model tests under external guards (Windows CUDA)
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         if: runner.os == 'Windows'
         shell: cmd
         run: |
@@ -282,8 +298,9 @@ jobs:
           set "RUSTC_WRAPPER="
           "%REVIEWED_PYTHON%" -I "scripts\ci\%MODEL_PROOF_SCRIPT%" --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
       - name: Validate owned evidence tree before any upload
+        working-directory: ${{ env.MODEL_PROOF_CWD }}
         id: evidence
-        if: always()
+        if: always() && (matrix.asset_setup != 'wan-curated-tier1' || steps.source.outcome == 'success')
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
@@ -297,6 +314,13 @@ jobs:
           name: model-proof-${{ github.sha }}-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.MODEL_PROOF_EVIDENCE }}
           if-no-files-found: error
+      - name: Remove the owned Wan checkout
+        if: always() && steps.wan_checkout.outcome == 'success'
+        shell: bash
+        run: |
+          checkout="wan-src-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test "$MODEL_PROOF_CWD" = "$checkout"
+          rm -rf -- "$checkout"
 
   inventory:
     name: Manual CPU-only FLUX.1 asset inventory
