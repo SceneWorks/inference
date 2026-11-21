@@ -633,7 +633,7 @@ impl LogicalWeightReader {
         }
     }
 
-    pub fn set_int8_context(&mut self, context: candle_quant_kernels::Int8Context) {
+    pub fn set_int8_context(&self, context: candle_quant_kernels::Int8Context) {
         self.resources.set_int8_context(context)
     }
 

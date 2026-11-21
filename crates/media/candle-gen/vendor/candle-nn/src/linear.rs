@@ -83,6 +83,7 @@ impl Linear {
     pub fn from_var_builder(vb: &crate::VarBuilder<'_>, with_bias: bool) -> Result<Self> {
         let bias = with_bias.then(|| vb.get_unchecked("bias")).transpose()?;
         if let Some(op) = vb.native_linear_weight("weight")? {
+            let bias = bias.map(|b| b.to_device(op.device())).transpose()?;
             return Ok(Self::from_native(op, bias));
         }
         let weight = vb.get_unchecked("weight")?;
@@ -181,7 +182,12 @@ impl Linear {
     }
     pub fn to_device(&self, device: &candle::Device) -> Result<Self> {
         if self.device().same_device(device) {
-            return Ok(self.clone());
+            return match &self.bias {
+                Some(bias) if !bias.device().same_device(device) => {
+                    Ok(self.clone().with_bias(Some(bias.to_device(device)?)))
+                }
+                _ => Ok(self.clone()),
+            };
         }
         let base = match &self.weight {
             Weight::Dense(t) => Self::new(t.to_device(device)?, None),
@@ -259,7 +265,7 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: crate::VarBuilder) -> Result<Li
             up: bound,
         },
     )?;
-    layer.bias = Some(bs);
+    layer.bias = Some(bs.to_device(layer.device())?);
     Ok(layer)
 }
 

@@ -110,6 +110,10 @@ impl ProjectionSource {
         Ok(Self(reader, self.1.clone()))
     }
 
+    pub fn into_reader(self) -> (Arc<MmapedSafetensors>, Arc<LogicalWeightReader>) {
+        (self.0.st.clone(), self.0)
+    }
+
     pub fn mmap(&self) -> &MmapedSafetensors {
         &self.0.st
     }

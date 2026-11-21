@@ -382,8 +382,11 @@ impl Pipeline {
                 // CPU either way). The TE + VAE stay dense bf16.
                 Some(q) => {
                     let cpu = Device::Cpu;
-                    let mut transformer =
-                        Sd3Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
+                    let mut transformer = Sd3Transformer::new(
+                        &self.cfg,
+                        self.component_vb_on("transformer", &self.device)?
+                            .stage_dense_on(cpu),
+                    )?;
                     transformer.quantize_onto(q, &self.device)?;
                     transformer
                 }

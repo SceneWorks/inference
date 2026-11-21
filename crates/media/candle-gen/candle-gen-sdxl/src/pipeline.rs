@@ -761,7 +761,9 @@ impl Pipeline {
                 // onto the compute device. Building the tower on the accelerator first would require
                 // the dense tier to fit before Q4/Q8 could make it smaller.
                 let cpu = Device::Cpu;
-                let vb = ldm.builder(component, self.dtype, &cpu);
+                let vb = ldm
+                    .builder(component, self.dtype, &self.device)
+                    .stage_dense_on(cpu);
                 let mut tower = crate::clip::ClipTextTransformer::new_gs(
                     vb,
                     &which.vendored_config(),
@@ -868,7 +870,12 @@ impl Pipeline {
             } else {
                 &self.device
             };
-            let vs = ldm.builder(SdxlComponent::Unet, self.dtype, build_device);
+            let vs = ldm.builder(SdxlComponent::Unet, self.dtype, &self.device);
+            let vs = if self.quant.is_some() {
+                vs.stage_dense_on(cpu.clone())
+            } else {
+                vs
+            };
             let mut vendored = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
             if !self.adapters.is_empty() {
                 let linear = crate::adapters::install_additive(

@@ -417,6 +417,16 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 .join(format!("scalar-{e5}-{}.safetensors", sx.is_some()));
             safetensors::tensor::serialize_to_file(tensors, None, &path)?;
             let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), DType::BF16, &dev)?;
+            {
+                let staged = vb.clone().stage_dense_on(Device::Cpu).pp("linear");
+                let native = candle_gen::candle_nn::linear_no_bias(16, 16, staged.clone())?;
+                assert!(native.is_native() && native.device().same_device(&dev));
+                assert!(staged.get_unchecked("weight_scale")?.device().is_cpu());
+                let repaired = native
+                    .with_bias(Some(Tensor::zeros(16, DType::BF16, &Device::Cpu)?))
+                    .to_device(&dev)?;
+                assert!(repaired.bias().unwrap().device().same_device(&dev));
+            }
             let lin = candle_gen::candle_nn::linear_no_bias(16, 16, vb.pp("linear"))?;
             assert_eq!(
                 lin.native_format_id(),

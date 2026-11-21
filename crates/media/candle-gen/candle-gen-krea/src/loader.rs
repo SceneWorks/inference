@@ -57,7 +57,7 @@ use crate::quant::{QEmbedding, QLinear};
 /// touching the untargeted bulk of the model. Overlay tensors are stored CPU-side (where the merge runs)
 /// and moved to `device` / cast to the requested dtype on read, exactly like the mmap path.
 pub struct Weights {
-    st: MmapedSafetensors,
+    st: std::sync::Arc<MmapedSafetensors>,
     /// Present for a single-file source. The mmap keeps reads lazy; this lstat/target fingerprint adds
     /// the mutation guard required when the same mapping is revisited for successive block windows.
     pinned_source: Option<candle_gen::gen_core::PinnedWeightsFile>,
@@ -108,16 +108,8 @@ pub struct Weights {
     /// scale values, geometry) is enforced by the shared reader's codec decode. This is distinct
     /// from the MLX affine [`packed`](Self::packed) tier and inline FP8.
     native_nvfp4: bool,
-    /// The shared logical-weight reader over the compiled mapped-read plan, for a **single-file
-    /// native** checkpoint (`None` for the directory/packed-tier path, which is diffusers-keyed
-    /// and has its own tier machinery).
-    ///
-    /// The plan it holds is the descriptor authority the import reads: which layers are NVFP4,
-    /// which companion tensors carry their two scale levels, what stored/logical geometry each
-    /// has, and — priced per layer by [`CandleCodecResidency`] — whether each row materializes
-    /// packed-native or as the declared dense fallback. Materialization itself goes through
-    /// [`LogicalWeightReader::read`] (sc-21482): the provider owns **mapping and construction**,
-    /// the codec owns classification and decode, and the reader measures the receipt.
+    /// The source codec plan for encoded directory shards and component files, or the family-mapped
+    /// plan for a native single-file DiT. Plain snapshots can use the mmap directly.
     logical: Option<LogicalWeightReader>,
 }
 
@@ -192,6 +184,7 @@ impl Weights {
             }
             None => (candle_gen::mmap_safetensors_multi(&files)?, None),
         };
+        let (st, logical) = LogicalWeightReader::from_snapshot(st, &files, device)?;
         Ok(Self {
             st,
             pinned_source: None,
@@ -205,17 +198,21 @@ impl Weights {
             convrot: false,
             plain_int8: false,
             native_nvfp4: false,
-            logical: None,
+            logical,
         })
     }
 
-    /// mmap a single `.safetensors` file (used by the committed parity fixtures). Dense-only (no
-    /// packed config), so the packed path is never taken for a single-file fixture. Diffusers-keyed —
-    /// for a **native-mmdit-keyed** dense single file use [`from_native_file`](Self::from_native_file).
+    /// Open a diffusers-keyed component file, including its encoded projections. Native-mmdit
+    /// single-file DiTs use the family mapping in [`Self::from_native_file`].
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
         let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
+        let (st, logical) = LogicalWeightReader::from_snapshot(
+            st,
+            &[pinned_source.loader_path().to_owned()],
+            device,
+        )?;
         Ok(Self {
             st,
             pinned_source: Some(pinned_source),
@@ -229,7 +226,7 @@ impl Weights {
             convrot: false,
             plain_int8: false,
             native_nvfp4: false,
-            logical: None,
+            logical,
         })
     }
 
@@ -410,7 +407,7 @@ impl Weights {
         )
         .map_err(|error| Error::Msg(error.to_string()))?;
         let result = Self {
-            st,
+            st: st.into(),
             pinned_source: Some(pinned_source.clone()),
             device: device.clone(),
             dtype,
@@ -589,7 +586,7 @@ impl Weights {
     ///
     /// This is the surface the SceneWorks half consumes to distinguish a source stored `nvfp4-v1`
     /// from a run that executed it as packed W4A4 or as dense BF16. `Ok(None)` when the source has
-    /// no plan (the directory/packed-tier path); `Err` when the pinned file changed under the load,
+    /// no encoded rows or family plan; `Err` when the pinned file changed under the load,
     /// so facts are never reported about bytes that are gone.
     pub fn checkpoint_weight_facts(&self) -> Result<Option<CheckpointWeightFacts>> {
         let Some(logical) = self.logical.as_ref() else {
@@ -654,6 +651,12 @@ impl Weights {
     /// convention added in sc-14023.
     pub fn is_plain_int8(&self) -> bool {
         self.plain_int8
+    }
+
+    /// Keep native operators on their plan device while ordinary parameters stage for a component fold.
+    pub(crate) fn stage_dense_on(mut self, device: &Device) -> Self {
+        self.device = device.clone();
+        self
     }
 
     /// Whether this native checkpoint carries prepacked ComfyUI Kitchen NVFP4 projection triplets.
@@ -746,18 +749,17 @@ impl Weights {
     ///   returned the stored `U8` nibble buffer at shape `[rows, cols / 2]`, cast to the component
     ///   dtype — silently wrong weights, not a dense decode. Refusing is strictly better.
     ///
-    /// Production reachability was audited: the only non-`linear_detect_planned` reads of a
-    /// projection `.weight` on a native file are `KreaTrainDit::load_inference`'s `lora_proj`
-    /// (reached from [`crate::control_provider`]'s `ControlDitSource::Native`, which does not yet
-    /// support an NVFP4 control DiT) and [`crate::control`]'s `ControlBranch::from_base` — whose
-    /// every production caller sources `Weights::from_dir`, the directory/packed-tier path, which
-    /// compiles no plan at all and so cannot reach this arm. The refusal names the escape hatch
-    /// for anything new: re-open the checkpoint under a `CandleCodecResidency` whose
-    /// `nvfp4_native` is `false`, so the plan prices — and the receipt reports — the dense
-    /// fallback the caller wants.
+    /// Directory components use the generic projection reader for coefficient accesses. The
+    /// native single-file DiT uses its family-mapped plan and the packed-read contract above.
     pub fn get(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(self.dtype);
+        }
+        if !self.native_keys {
+            if let Some(reader) = self.logical.as_ref().filter(|r| r.planned(name).is_some()) {
+                return self
+                    .read_source_unchanged(|| reader.read_dense(name, self.dtype, &self.device));
+            }
         }
         if self.planned(name).is_some_and(|t| {
             t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
@@ -812,6 +814,12 @@ impl Weights {
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(DType::F32);
+        }
+        if !self.native_keys {
+            if let Some(reader) = self.logical.as_ref().filter(|r| r.planned(name).is_some()) {
+                return self
+                    .read_source_unchanged(|| reader.read_dense(name, DType::F32, &self.device));
+            }
         }
         if self.planned(name).is_some_and(|t| {
             t.codec_id == candle_gen::gen_core::checkpoint_codec::INT8_PER_ROW_CODEC.codec_id
@@ -1265,8 +1273,10 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         .as_ref()
         .is_some_and(|r| r.has_native_projection(&weight_key))
     {
-        let bias = bias.then(|| w.get(&format!("{base}.bias"))).transpose()?;
         let reader = w.logical.as_ref().expect("planned weight has a reader");
+        let bias = bias
+            .then(|| w.get(&format!("{base}.bias"))?.to_device(reader.device()))
+            .transpose()?;
         let projection = w
             .read_source_unchanged(|| {
                 reader
@@ -1568,6 +1578,47 @@ mod tests {
     const G: usize = 64;
 
     /// A `Weights` over one dense `[64, 64]` f32 tensor with **no logical plan** — so
+    #[test]
+    fn snapshot_directory_and_component_file_share_scaled_fp8_precision() -> Result<()> {
+        use ::safetensors::tensor::{serialize_to_file, Dtype as Stored, TensorView};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("model.safetensors");
+        let codes = [0x38_u8; 16 * 16];
+        let scale = (1.0_f32 + 2.0_f32.powi(-9)).to_le_bytes();
+        serialize_to_file(
+            [
+                (
+                    "proj.weight",
+                    TensorView::new(Stored::F8_E4M3, vec![16, 16], &codes).unwrap(),
+                ),
+                (
+                    "proj.weight_scale",
+                    TensorView::new(Stored::F32, vec![], &scale).unwrap(),
+                ),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        for source in [
+            Weights::from_file(&path, &Device::Cpu, DType::F32)?,
+            Weights::from_dir(tmp.path(), &Device::Cpu, DType::F32)?,
+        ] {
+            assert_eq!(
+                source.planned("proj.weight").unwrap().codec_id,
+                candle_gen::gen_core::checkpoint_codec::FP8_E4M3_SCALAR_CODEC.codec_id
+            );
+            assert_eq!(
+                source.get("proj.weight")?.flatten_all()?.to_vec1::<f32>()?,
+                vec![f32::from_le_bytes(scale); 256]
+            );
+            assert_eq!(source.get_f32("proj.weight")?.dtype(), DType::F32);
+            assert!(source.checkpoint_weight_facts()?.is_some());
+        }
+        Ok(())
+    }
+
     /// `planned(key)` is `None` for every key.
     fn unplanned_weights(tmp: &tempfile::TempDir, key: &str) -> Weights {
         let dev = Device::Cpu;
