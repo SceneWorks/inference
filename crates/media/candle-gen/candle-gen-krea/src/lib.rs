@@ -824,42 +824,7 @@ impl Generator for KreaGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        let id = self.descriptor.id;
-        if req.prompt.trim().is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        self.descriptor.capabilities.validate_request(id, req)?;
-        if !request_uses_cfg(id, req)
-            && req
-                .negative_prompt
-                .as_ref()
-                .is_some_and(|text| !text.trim().is_empty())
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id}: a negative prompt requires nonzero CFG"
-            )));
-        }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        // The Edit variant needs 1..=2 source references (image 1, then image 2). The capability floor
-        // above accepts a single `Reference` on Turbo/Raw (img2img latent-init) but rejects a
-        // MultiReference there; only `krea_2_edit` advertises both, so resolve + count-check here.
-        if matches!(self.descriptor.id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
-            resolve_edit_references(req)?;
-        }
-        // Multi-phase denoise (epic 13879, sc-13887): Raw-only, from pure noise, ≥1-step phases. The
-        // per-phase adapter-index bounds are checked at generate (they need the loaded adapter count).
-        validate_phases(id, req)?;
-        Ok(())
+        validate_krea_request(&self.descriptor, req)
     }
 
     fn generate(
@@ -886,6 +851,12 @@ impl Generator for KreaGenerator {
                 &self.file_pin_spec,
                 req,
             )?)
+        } else if self.descriptor.id == KREA_2_TURBO_ID {
+            Some(pipeline::compile_turbo_plan(
+                &self.descriptor,
+                &self.file_pin_spec,
+                req,
+            )?)
         } else {
             None
         };
@@ -901,14 +872,65 @@ impl Generator for KreaGenerator {
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
-        plan.check_load_spec(&self.file_pin_spec)?;
-        if req.phases.is_none() || plan.adapter_phases().is_empty() {
-            return Err(gen_core::Error::Unsupported(
-                "Candle Krea's planned entry requires a multi-phase Raw render".into(),
-            ));
+        match (
+            self.descriptor.id,
+            req.phases.is_some(),
+            plan.adapter_phases().is_empty(),
+        ) {
+            (KREA_2_TURBO_ID, false, true) | (KREA_2_RAW_ID, true, false) => {
+                plan.check_load_spec(&self.file_pin_spec)?;
+            }
+            _ => {
+                return Err(gen_core::Error::Unsupported(
+                    "Candle Krea planned execution supports ordinary Turbo and multi-phase Raw"
+                        .into(),
+                ));
+            }
         }
         self.render(req, Some(plan), scope, on_progress)
     }
+}
+
+fn validate_krea_request(
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    let id = descriptor.id;
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: prompt must not be empty"
+        )));
+    }
+    descriptor.capabilities.validate_request(id, req)?;
+    if !request_uses_cfg(id, req)
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: a negative prompt requires nonzero CFG"
+        )));
+    }
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    // The Edit variant needs 1..=2 source references (image 1, then image 2). The capability floor
+    // above accepts a single `Reference` on Turbo/Raw (img2img latent-init) but rejects a
+    // MultiReference there; only `krea_2_edit` advertises both, so resolve + count-check here.
+    if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+        resolve_edit_references(req)?;
+    }
+    // Multi-phase denoise (epic 13879, sc-13887): Raw-only, from pure noise, ≥1-step phases. The
+    // per-phase adapter-index bounds are checked at generate (they need the loaded adapter count).
+    validate_phases(id, req)?;
+    Ok(())
 }
 
 impl KreaGenerator {
@@ -962,6 +984,13 @@ impl KreaGenerator {
             Vec::new()
         };
         let reference = img2img_reference(req);
+        let run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
+        let turbo = run
+            .as_ref()
+            .filter(|_| self.descriptor.id == KREA_2_TURBO_ID);
+        let multiphase = run
+            .as_ref()
+            .filter(|run| !run.plan().adapter_phases().is_empty());
 
         let has_higher_rung_controls = req.memory.as_ref().is_some_and(|memory| {
             gen_core::GenerationMemory {
@@ -1012,6 +1041,7 @@ impl KreaGenerator {
                     )));
                 }
             }
+            let run = turbo.expect("ordinary Turbo requests have a compiled plan");
             // Keep Krea's established text → DiT → VAE phase bodies disjoint. The shared owner
             // contributes the request-scoped warm-cache transition; this pipeline retains the
             // three-stage execution needed by every cumulative memory rung.
@@ -1030,26 +1060,22 @@ impl KreaGenerator {
                                 text_encoder: self.text_load_quant,
                             },
                             req,
+                            run,
                             on_progress,
                             &self.checkpoint_facts,
                         )
                     },
                 )
             })?;
-            let pag_report = match &resolved_pag {
-                Some(pag) => {
-                    let executed_steps = pipeline::executed_steps_for_request(false, None, req)?;
-                    Some(pag.execution_report(executed_steps))
-                }
-                None => None,
-            };
+            let pag_report = resolved_pag
+                .as_ref()
+                .map(|pag| pag.execution_report(run.plan().executed_steps() as u32));
             let mut report =
                 gen_core::GenerationReport::from_output(GenerationOutput::Images(images));
             report.pag = pag_report;
             return Ok(report);
         }
 
-        let multiphase = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         let encode_multiphase = |run: &gen_core::RenderRun<'_, '_>, text: &pipeline::KreaText| {
             candle_gen::synchronize_result(
                 &self.device,
@@ -1092,7 +1118,7 @@ impl KreaGenerator {
                 // text phase drops.
                 KreaTextPhase::Resident if multiphase.is_some() => Ok(KreaEncoded::Resident),
                 KreaTextPhase::Sequential(text) if multiphase.is_some() => {
-                    let run = multiphase.as_ref().expect("phase run exists in this arm");
+                    let run = multiphase.expect("phase run exists in this arm");
                     let (context, negative) = run.encode(|| encode_multiphase(run, text))?;
                     Ok(KreaEncoded::MultiPhase { context, negative })
                 }
@@ -1106,11 +1132,24 @@ impl KreaGenerator {
                         &self.device,
                     )?))
                 }
-                KreaTextPhase::Sequential(text) => Ok(KreaEncoded::Sequential(
-                    pipeline::encode_residency(text, raw, req)?,
-                )),
+                KreaTextPhase::Sequential(text) => {
+                    if let Some(run) = turbo {
+                        run.begin_conditioning()?;
+                    }
+                    Ok(KreaEncoded::Sequential(pipeline::encode_residency(
+                        text, raw, req,
+                    )?))
+                }
             },
-            |_| Ok(self.device.synchronize()?),
+            |encoded| {
+                self.device.synchronize()?;
+                if matches!(encoded, Some(KreaEncoded::Sequential(_))) {
+                    if let Some(run) = turbo {
+                        run.end_conditioning()?;
+                    }
+                }
+                Ok(())
+            },
             |heavy, encoded, on_progress| match (heavy, encoded) {
                 // Both physical residencies evaluate the exact DiT already selected by the
                 // loader. Only the borrowed request phase selection changes across evaluations.
@@ -1118,7 +1157,7 @@ impl KreaGenerator {
                     KreaHeavyPhase::Sequential(heavy),
                     KreaEncoded::MultiPhase { context, negative },
                 ) => {
-                    let run = multiphase.as_ref().expect("phase encoding requires a run");
+                    let run = multiphase.expect("phase encoding requires a run");
                     self.file_pin_spec.read_files_unchanged(
                         self.file_pin_spec.file_source_paths(),
                         || {
@@ -1136,7 +1175,7 @@ impl KreaGenerator {
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident)
                     if multiphase.is_some() =>
                 {
-                    let run = multiphase.as_ref().expect("phase run exists in this arm");
+                    let run = multiphase.expect("phase run exists in this arm");
                     deferred_encoding.set(false);
                     let comps = &resident.components;
                     let (context, negative) = run.encode(|| {
@@ -1175,6 +1214,7 @@ impl KreaGenerator {
                         req,
                         reference,
                         &self.device,
+                        turbo,
                         on_progress,
                     ))
                 }
@@ -1207,19 +1247,16 @@ impl KreaGenerator {
                         } else {
                             pipeline::render_base(comps, req, &self.device, on_progress)
                         }
-                    } else if let Some((reference, strength)) = reference {
-                        let vae_encoder = resident.img2img_encoder()?;
-                        pipeline::render_img2img(
-                            comps,
-                            &vae_encoder,
-                            req,
-                            reference,
-                            strength,
-                            &self.device,
-                            on_progress,
-                        )
                     } else {
-                        pipeline::render(comps, req, &self.device, on_progress)
+                        let encoder = reference.map(|_| resident.img2img_encoder()).transpose()?;
+                        let source = reference.zip(encoder.as_deref()).map(
+                            |((image, strength), encoder)| pipeline::TurboReference {
+                                encoder,
+                                image,
+                                strength,
+                            },
+                        );
+                        pipeline::render_turbo(comps, source, req, &self.device, turbo, on_progress)
                     };
                     synchronize(result)
                 }
@@ -1227,10 +1264,13 @@ impl KreaGenerator {
             },
         )?;
         let pag_report = match (&resolved_pag, plan) {
-            (Some(pag), Some(plan)) => Some(pag.execution_report_for_prefix(
-                plan.executed_steps() as u32,
-                plan.sigmas().len().saturating_sub(1) as u32,
-            )),
+            (Some(pag), Some(plan)) if !plan.adapter_phases().is_empty() => {
+                Some(pag.execution_report_for_prefix(
+                    plan.executed_steps() as u32,
+                    plan.sigmas().len().saturating_sub(1) as u32,
+                ))
+            }
+            (Some(pag), Some(plan)) => Some(pag.execution_report(plan.executed_steps() as u32)),
             (Some(pag), None) => {
                 let raw_schedule = raw || (edit && !turbo_edit);
                 let img2img_strength = if edit {
@@ -1330,18 +1370,9 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
-            // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
-            // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
-            // and the shared Turbo+Raw edit) plus the pose-control provider — to hand
-            // `candle_gen::run_flow_sampler` a `PreviewHook`, so all three descriptors derived from
-            // this one (Turbo here, `raw_descriptor`, `edit_descriptor`) genuinely emit per-step
-            // latent previews. The same lockstep rule as the offload bit above applies, in the same
-            // direction: never advertise ahead of the wiring. What is new is that it is now
-            // enforced rather than merely written down — `candle-gen-catalog`'s
-            // `preview_advertising` guard derives from the Krea sources whether the routes actually
-            // pass a hook and fails the build if this flag and that fact disagree in EITHER
-            // direction. The trainer's periodic sample render is deliberately outside that set: it
-            // renders from a synthetic request that carries no sink.
+            // Every shipped Krea route passes a PreviewHook to the shared sampler, including
+            // the shared Turbo t2i/img2img path. The trainer's periodic sample render carries no
+            // sink. The catalog's preview_advertising guard checks this capability against the code.
             supports_preview: true,
             pag: Some(turbo_pag_capability()),
             ..Default::default()
@@ -3764,6 +3795,15 @@ const CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: registered_krea_begin_request,
     };
 
+fn compile_turbo_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let descriptor = descriptor();
+    validate_krea_request(&descriptor, req)?;
+    pipeline::compile_turbo_plan(&descriptor, spec, req).map(Some)
+}
+
 fn compile_raw_render_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
@@ -3785,6 +3825,10 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(TURBO_REGISTRATION)
+        .register_render_plan(gen_core::RenderPlanRegistration {
+            provider_id: KREA_2_TURBO_ID,
+            compile: compile_turbo_render_plan,
+        })
         .register_generator(RAW_REGISTRATION)
         .register_render_plan(gen_core::RenderPlanRegistration {
             provider_id: KREA_2_RAW_ID,
@@ -7847,6 +7891,179 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             registry.compile_render_plan(KREA_2_RAW_ID, &spec, &request),
             Err(gen_core::Error::Unsupported(message)) if message.contains("diff-patch")
         ));
+    }
+
+    #[test]
+    fn turbo_plan_uses_native_schedule_and_exact_source_before_load() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut spec = valid_imported_spec(fixture.path(), "model.safetensors");
+        let registry = crate::provider_registry().unwrap();
+        let request = GenerationRequest {
+            prompt: "A courtyard".into(),
+            width: 512,
+            height: 768,
+            steps: Some(8),
+            seed: Some(u64::MAX),
+            count: 2,
+            ..Default::default()
+        };
+        assert!(matches!(
+            registry.compile_render_plan(KREA_2_TURBO_ID, &spec, &request),
+            Err(gen_core::Error::Unsupported(message)) if message.contains("finalized file source pins")
+        ));
+        spec.prepare_file_sources().unwrap();
+        let plan = registry
+            .compile_render_plan(KREA_2_TURBO_ID, &spec, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.denoise_sigmas(), crate::schedule::turbo_sigmas(8));
+        assert_eq!(plan.executed_steps(), 8);
+        assert_eq!(plan.capture_sigma(), 0.0);
+        assert_eq!(plan.packed_tokens(), (512 / 16) * (768 / 16));
+        assert_eq!(plan.base_seed(), u64::MAX);
+        assert_eq!(plan.image_count(), 2);
+        assert_eq!(plan.sampler(), "euler");
+        assert!(plan.check_request(&descriptor(), &request).is_ok());
+        assert!(plan.check_load_spec(&spec).is_ok());
+        let run = gen_core::RenderRun::new(&plan, &request.cancel, None);
+        run.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+        let seeds = run
+            .images(
+                &mut |_| {},
+                Ok::<_, gen_core::Error>,
+                |_, seed, _| Ok(seed),
+                |_, seed, _| Ok(seed),
+            )
+            .unwrap();
+        assert_eq!(seeds, [u64::MAX, 0]);
+
+        let shifted = GenerationRequest {
+            scheduler: Some("karras".into()),
+            scheduler_shift: Some(1.3),
+            ..request
+        };
+        let shifted_plan = registry
+            .compile_render_plan(KREA_2_TURBO_ID, &spec, &shifted)
+            .unwrap()
+            .unwrap();
+        let native = crate::schedule::turbo_sigmas(8);
+        let expected = candle_gen::resolve_flow_schedule_with_shift(
+            Some("karras"),
+            Some(1.3),
+            crate::schedule::TURBO_MU as f32,
+            8,
+            &native,
+        )
+        .unwrap();
+        assert_eq!(shifted_plan.denoise_sigmas(), expected);
+        let mut other = valid_imported_spec(fixture.path(), "other.safetensors");
+        other.prepare_file_sources().unwrap();
+        assert!(matches!(
+            plan.check_load_spec(&other),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn turbo_hires_plans_clip_the_reference_window_and_keep_terminal_noop() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/unused-krea-plan-fixture".into()));
+        let registry = crate::provider_registry().unwrap();
+        let base = GenerationRequest {
+            prompt: "A courtyard".into(),
+            width: 512,
+            height: 512,
+            steps: Some(8),
+            seed: Some(19),
+            ..Default::default()
+        };
+        let fidelity = 1.0 - 0.4;
+        for steps in [1, 5] {
+            let refine = GenerationRequest {
+                width: 768,
+                height: 768,
+                steps: Some(steps),
+                sampler: Some("heun".into()),
+                ..base.clone()
+            };
+            let reference = gen_core::ProducedReference {
+                from_pass: 0,
+                width: refine.width,
+                height: refine.height,
+                strength: Some(fidelity),
+            };
+            let compiled = registry
+                .compile_multi_pass_render_plan(
+                    KREA_2_TURBO_ID,
+                    &spec,
+                    &[
+                        gen_core::PlannedPassRequest {
+                            request: &base,
+                            produced_reference: None,
+                        },
+                        gen_core::PlannedPassRequest {
+                            request: &refine,
+                            produced_reference: Some(reference),
+                        },
+                    ],
+                )
+                .unwrap()
+                .unwrap();
+            let [first, second] = compiled.passes() else {
+                unreachable!()
+            };
+            assert_eq!(first.executed_steps(), 8);
+            assert_eq!(second.pass_index(), 1);
+            assert_eq!(second.produced_reference(), Some(reference));
+            assert_eq!(second.sampler(), "heun");
+            let expected = crate::schedule::turbo_sigmas(steps as usize);
+            let start = pipeline::init_time_step(steps as usize, Some(fidelity));
+            assert_eq!(second.denoise_sigmas(), &expected[start..]);
+            assert_eq!(second.executed_steps(), if steps == 1 { 0 } else { 2 });
+            assert_eq!(compiled.total_executed_steps(), 8 + second.executed_steps());
+            assert!(second.check_load_spec(&spec).is_ok());
+            let mut live = refine;
+            live.conditioning = vec![Conditioning::Reference {
+                image: Image {
+                    width: reference.width,
+                    height: reference.height,
+                    pixels: vec![93; (reference.width * reference.height * 3) as usize],
+                },
+                strength: reference.strength,
+            }];
+            assert!(second.check_request(&descriptor(), &live).is_ok());
+            let single = registry
+                .compile_render_plan(KREA_2_TURBO_ID, &spec, &live)
+                .unwrap()
+                .unwrap();
+            assert_eq!(single.denoise_sigmas(), second.denoise_sigmas());
+            if let Conditioning::Reference { image, .. } = &mut live.conditioning[0] {
+                image.pixels[0] ^= 1;
+            }
+            assert!(single.check_request(&descriptor(), &live).is_err());
+            assert!(second.check_request(&descriptor(), &live).is_ok());
+            if let Conditioning::Reference { strength, .. } = &mut live.conditioning[0] {
+                *strength = Some(0.4);
+            }
+            assert!(second.check_request(&descriptor(), &live).is_err());
+        }
+    }
+
+    #[test]
+    fn turbo_planner_preserves_phase_and_edit_route_boundaries() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/unused-krea-plan-fixture".into()));
+        let registry = crate::provider_registry().unwrap();
+        let mut request = phase_req(vec![phase(8, None)]);
+        assert!(matches!(
+            registry.compile_render_plan(KREA_2_TURBO_ID, &spec, &request),
+            Err(gen_core::Error::Unsupported(message)) if message.contains("krea_2_raw")
+        ));
+        request.phases = None;
+        for id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+            assert!(registry
+                .compile_render_plan(id, &spec, &request)
+                .unwrap()
+                .is_none());
+        }
     }
 
     /// Multi-phase is Raw-only in v1: Turbo/edit reject it (Turbo is CFG-free single-phase; edit is out
