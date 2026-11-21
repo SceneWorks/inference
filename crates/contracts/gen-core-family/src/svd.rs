@@ -39,6 +39,65 @@ pub enum Execution {
     Candle { cfg: bool },
 }
 
+fn checked_bytes(n: u128) -> Result<u64> {
+    u64::try_from(n).map_err(|_| Error::Unsupported("SVD tensor size overflows".into()))
+}
+
+#[derive(Default)]
+struct DecodeBuffers {
+    device: u128,
+    host: u128,
+    output: gen_core::VideoOutputConversion,
+}
+
+fn candle_decode_buffers(
+    frames: u32,
+    chunk: u32,
+    rgb_frame: u128,
+    domain: MemoryBudgetDomain,
+) -> Result<DecodeBuffers> {
+    let frames = u128::from(frames);
+    let chunk = u128::from(chunk);
+    let tail = (frames - 1) % chunk + 1;
+    let f32_bytes = std::mem::size_of::<f32>() as u128;
+    // NCHW -> HWC -> flatten copies the non-contiguous frame before to_vec1 copies
+    // its pixels into Image. The chunk's narrow and squeeze are views of the same host u8.
+    let flat_frame = if rgb_frame > 3 { rgb_frame } else { 0 };
+    let mut buffers = DecodeBuffers {
+        output: gen_core::VideoOutputConversion {
+            // decoded_chunk_to_images keeps both its borrowed f32 chunk and its scaled
+            // f32 chunk until the returned images have been copied from the CPU tensor.
+            device_bytes: checked_bytes(2 * f32_bytes * tail * rgb_frame)?,
+            host_bytes: checked_bytes(tail * rgb_frame + flat_frame)?,
+        },
+        ..Default::default()
+    };
+    // Earlier full chunks have fewer returned frames than the latest full chunk.
+    // A final short chunk can have less staging, but more accumulated frame vectors.
+    let full_start = (frames / chunk - 1) * chunk;
+    for (start, count) in [(full_start, chunk), (frames - tail, tail)] {
+        let samples = count * rgb_frame;
+        let previous = start * rgb_frame;
+        let round = crate::candle_round_rgb8_live_bytes(
+            checked_bytes(samples)?,
+            checked_bytes(samples * f32_bytes)?,
+        )?;
+        let device_copy = 2 * f32_bytes * samples;
+        let host_copy = previous + samples + samples + flat_frame; // returned RGB + host u8 + HWC
+        for (device, host) in [(u128::from(round), previous), (device_copy, host_copy)] {
+            if domain == MemoryBudgetDomain::DeviceVram {
+                buffers.device = buffers.device.max(device);
+                buffers.host = buffers.host.max(host);
+            } else if device + host > buffers.device + buffers.host {
+                // CPU and unified memory charge both parts of one simultaneously-live stage.
+                buffers.device = device;
+                buffers.host = host;
+            }
+        }
+    }
+    Ok(buffers)
+}
+
 pub fn plan_layout(
     req: &GenerationRequest,
     reference: &Image,
@@ -76,20 +135,32 @@ pub fn plan_layout(
         Execution::Candle { cfg: true } => 2 * latent_and_embed + time_ids + guidance,
         Execution::Candle { cfg: false } => latent_and_embed + time_ids,
     };
-    let checked_bytes =
-        |n| u64::try_from(n).map_err(|_| Error::Unsupported("SVD tensor size overflows".into()));
+    if frames == 0 {
+        return Err(Error::Unsupported(
+            "SVD requires at least one output frame".into(),
+        ));
+    }
     let chunk_frames = decode_chunk.max(1).min(frames);
-    let live_decoded_frames = match execution {
-        // MLX concatenates the decoded chunks into a full f32 clip before converting to RGB8.
-        Execution::Mlx => frames,
-        // Candle materializes packed RGB8 and releases each decoded tensor before the next chunk.
-        Execution::Candle { .. } => chunk_frames,
+    let rgb_frame = u128::from(req.width) * u128::from(req.height) * 3;
+    let rgb = rgb_frame * u128::from(frames);
+    let buffers = match execution {
+        Execution::Mlx => {
+            // concatenate aliases its sole input. With multiple evaluated chunks it writes
+            // a second complete f32 clip while reading the first clip's chunk backings.
+            let decoded = rgb * f32_bytes * if chunk_frames < frames { 2 } else { 1 };
+            // frames_to_images owns the decoded, rescaled, clipped and rounded f32 arrays.
+            // The final contiguous u8 is borrowed for the per-image copies on unified memory.
+            DecodeBuffers {
+                device: decoded,
+                host: 0,
+                output: gen_core::VideoOutputConversion {
+                    device_bytes: checked_bytes(rgb * (4 * f32_bytes + 1))?,
+                    host_bytes: 0,
+                },
+            }
+        }
+        Execution::Candle { .. } => candle_decode_buffers(frames, chunk_frames, rgb_frame, domain)?,
     };
-    let decoded_tensor_bytes = u128::from(req.width)
-        * u128::from(req.height)
-        * u128::from(live_decoded_frames)
-        * 3
-        * f32_bytes;
     let mut layout = VideoPlanLayout::single(
         phase.identity.geometry,
         &phase,
@@ -119,7 +190,9 @@ pub fn plan_layout(
         domain,
     );
     layout.phases[0].retained_bytes = checked_bytes(retained)?;
-    layout.phases[0].decoded_tensor_bytes = checked_bytes(decoded_tensor_bytes)?;
+    layout.phases[0].decoded_tensor_bytes = checked_bytes(buffers.device)?;
+    layout.phases[0].decoded_host_bytes = checked_bytes(buffers.host)?;
+    layout.output_conversion = buffers.output;
     Ok(layout)
 }
 
@@ -163,4 +236,35 @@ pub fn project_resident_context(
     validate(&projected)?;
     *context = projected;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candle_accounts_for_the_latest_full_chunk_and_partial_last_chunk_per_budget() {
+        let pixel_bytes = 1024 * 576 * 3;
+        // (frames, chunk, last, peak f32/rounding storage, accumulated RGB at that peak,
+        //  independent host peak during the per-frame HWC conversion)
+        for (frames, chunk, last, device, previous, host) in [
+            (1, 1, 1, 29, 0, 3),
+            (5, 2, 1, 58, 2, 7),
+            (9, 4, 1, 116, 4, 13),
+            (8, 4, 4, 116, 4, 13),
+        ] {
+            for domain in MemoryBudgetDomain::ALL {
+                let data = candle_decode_buffers(frames, chunk, pixel_bytes, domain).unwrap();
+                assert_eq!(data.device, device * pixel_bytes);
+                let peak_host = if domain == MemoryBudgetDomain::DeviceVram {
+                    host
+                } else {
+                    previous
+                };
+                assert_eq!(data.host, peak_host * pixel_bytes);
+                assert_eq!(u128::from(data.output.device_bytes), 8 * last * pixel_bytes);
+                assert_eq!(u128::from(data.output.host_bytes), (last + 1) * pixel_bytes);
+            }
+        }
+    }
 }

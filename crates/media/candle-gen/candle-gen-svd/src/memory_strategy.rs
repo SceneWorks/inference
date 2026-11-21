@@ -984,6 +984,20 @@ mod tests {
             ),
             (5, 5, 5)
         );
+        let rgb_frame = 256 * 320 * 3;
+        assert_eq!(phase.decoded_tensor_bytes, 5 * 29 * rgb_frame);
+        assert_eq!(layout.output_conversion.device_bytes, 5 * 8 * rgb_frame);
+        assert_eq!(layout.output_conversion.host_bytes, 6 * rgb_frame);
+        use gen_core::MemoryBudgetDomain::{DeviceVram, HostRam, UnifiedMemory};
+        for budget in [DeviceVram, HostRam, UnifiedMemory] {
+            let expected = match (layout.domain, budget) {
+                (DeviceVram, HostRam) => 18 + 11 * rgb_frame,
+                (DeviceVram, DeviceVram) => 5 * 29 * rgb_frame,
+                (device, queried) if device == queried => 18 + 5 * 29 * rgb_frame,
+                _ => 0,
+            };
+            assert_eq!(plan.minimum_decode_live_bytes(budget).unwrap(), expected);
+        }
         assert_eq!(phase.latent_bytes, 5 * 32 * 40 * 4 * 4);
         let embed = 1024 * 4;
         let ids = 3 * 4;
@@ -1040,8 +1054,10 @@ mod tests {
         );
         assert_eq!(
             other.layout().phases[0].decoded_tensor_bytes,
-            256 * 320 * 3 * 4
+            29 * rgb_frame
         );
+        assert_eq!(other.layout().output_conversion.device_bytes, 8 * rgb_frame);
+        assert_eq!(other.layout().output_conversion.host_bytes, 2 * rgb_frame);
         if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
             image.pixels[0] ^= 1;
         }

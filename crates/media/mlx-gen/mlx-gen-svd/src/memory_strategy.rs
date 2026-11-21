@@ -892,6 +892,20 @@ mod tests {
             ),
             (5, 5, 5)
         );
+        let rgb_frame = 256 * 320 * 3;
+        assert_eq!(phase.decoded_tensor_bytes, 5 * rgb_frame * 4);
+        assert_eq!(layout.output_conversion.device_bytes, 5 * rgb_frame * 17);
+        assert_eq!(layout.output_conversion.host_bytes, 0);
+        assert_eq!(
+            plan.minimum_decode_live_bytes(gen_core::MemoryBudgetDomain::UnifiedMemory)
+                .unwrap(),
+            18 + 5 * rgb_frame * 18,
+        );
+        assert_eq!(
+            plan.minimum_decode_live_bytes(gen_core::MemoryBudgetDomain::HostRam)
+                .unwrap(),
+            0
+        );
         assert_eq!(phase.latent_bytes, 5 * 32 * 40 * 4 * 4);
         let embed = 1024 * 4;
         let ids = 3 * 4;
@@ -934,7 +948,11 @@ mod tests {
         );
         assert_eq!(
             other.layout().phases[0].decoded_tensor_bytes,
-            25 * 256 * 320 * 3 * 4
+            2 * 25 * rgb_frame * 4
+        );
+        assert_eq!(
+            other.layout().output_conversion.device_bytes,
+            25 * rgb_frame * 17
         );
         if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
             image.pixels[0] ^= 1;
