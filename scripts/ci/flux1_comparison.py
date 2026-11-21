@@ -39,6 +39,37 @@ def git(root, *args):
     return subprocess.check_output(["git", *args], cwd=root, text=True, encoding="utf-8").strip()
 
 
+def add_source_worktree(source, root, revision):
+    """Reuse the exact Actions checkout without fetching from it as a remote."""
+    proof.unlinked_path(root, root.parent)
+    if root.exists() or git(source, "rev-parse", "HEAD") != revision:
+        raise ValueError("proof requires a new worktree from the exact source checkout")
+    # Local clone transport can ask a reused runner checkout to serve missing
+    # historical promisor objects. The linked worktree needs only the exact
+    # checked-out tree, whose files were already materialized by Actions.
+    subprocess.run(
+        ["git", "worktree", "add", "--quiet", "--detach", str(root), revision],
+        cwd=source, env=dict(os.environ, GIT_NO_LAZY_FETCH="1"),
+        check=True, timeout=120,
+    )
+    observed = {"revision": git(root, "rev-parse", "HEAD"),
+                "tree": git(root, "rev-parse", "HEAD^{tree}")}
+    if observed["revision"] != revision or git(root, "status", "--porcelain"):
+        raise ValueError("proof worktree does not match the exact clean checkout")
+    return observed
+
+
+def remove_source_worktrees(work, sources):
+    """Deregister the owned worktrees before deleting the rest of the attempt."""
+    for arm, source in sources.items():
+        root = work / arm
+        marker = root / ".git"
+        proof.unlinked_path(marker, work)
+        if marker.is_file():
+            subprocess.run(["git", "worktree", "remove", "--force", str(root)],
+                           cwd=source, check=True, timeout=120)
+
+
 def variants(tier):
     return ("dev",) if tier == ENG4B else evidence.VARIANTS
 
@@ -116,11 +147,8 @@ def plan(backend, value, head, tier):
 
 def build(work, sources, arm, backend, tier, env):
     root = work / arm
-    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(sources[arm]), str(root)], check=True)
     sha = git(sources[arm], "rev-parse", "HEAD")
-    subprocess.run(["git", "checkout", "--quiet", "--detach", sha], cwd=root, check=True)
-    if git(root, "rev-parse", "HEAD") != sha:
-        raise ValueError("unexpected source revision")
+    source_identity = add_source_worktree(sources[arm], root, sha)
     package = overlay.install(root, backend, arm, tier)
     # Record the exact controlled source delta, including the untracked binary.
     probe_source = f"crates/media/{'mlx-gen' if backend == 'mlx' else 'candle-gen'}/{package}/src/bin/flux1-pair.rs"
@@ -145,7 +173,7 @@ def build(work, sources, arm, backend, tier, env):
             cmd += ["--features", "cuda"]
     subprocess.run(cmd, env=env, cwd=root, check=True)
     binary = target / profile / ("flux1-pair.exe" if os.name == "nt" else "flux1-pair")
-    return binary, {"revision": sha, "tree": git(root, "rev-parse", "HEAD^{tree}"),
+    return binary, {**source_identity,
                     "overlay_sha256": hashlib.sha256(changes).hexdigest(), "toolchain": tc,
                     "binary_sha256": fixture.sha(binary), "build_command": cmd,
                     "macos_deployment_target": env.get("MACOSX_DEPLOYMENT_TARGET") if backend == "mlx" else None}
@@ -333,13 +361,13 @@ def execute(args, contract):
                "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"], "arms": {}, "logs": {}}
     work = tmp / f"f1p-{receipt['run_id']}-{receipt['run_attempt']}"
+    sources = {"head": ROOT, "base": ROOT / "flux1-baseline"}
     created_work = False
     primary_error = None
     try:
         proof.unlinked_path(work, tmp)
         work.mkdir()
         created_work = True
-        sources = {"head": ROOT, "base": ROOT / "flux1-baseline"}
         if git(sources["base"], "rev-parse", "HEAD") != contract.get("base", BASE):
             raise ValueError("baseline is not the profile's exact reviewed engine")
         if tier in fixture.ENG4B_TIERS and git(sources["base"], "rev-parse", "HEAD^{tree}") != contract["base_tree"]:
@@ -454,8 +482,9 @@ def execute(args, contract):
         write(artifact / "receipt.json", receipt)
         if created_work:
             try:
+                remove_source_worktrees(work, sources)
                 remove_work(work, tmp)
-            except (OSError, ValueError) as cleanup_error:
+            except (OSError, ValueError, subprocess.SubprocessError) as cleanup_error:
                 receipt["cleanup_failure"] = str(cleanup_error)
                 receipt["accepted"] = False
                 write(artifact / "receipt.json", receipt)

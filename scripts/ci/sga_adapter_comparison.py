@@ -100,13 +100,8 @@ def overlay_identity(overlay):
 def build(work, origin, arm, contract, profile, env):
     root = work / arm
     expected = contract[arm]
-    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(origin), str(root)],
-                   check=True, timeout=90)
-    subprocess.run(["git", "checkout", "--quiet", "--detach", expected["revision"]], cwd=root,
-                   check=True, timeout=90)
-    observed = {"revision": paired.git(root, "rev-parse", "HEAD"),
-                "tree": paired.git(root, "rev-parse", "HEAD^{tree}")}
-    if observed != expected or paired.git(root, "status", "--porcelain"):
+    observed = paired.add_source_worktree(origin, root, expected["revision"])
+    if observed != expected:
         raise ValueError("comparison build checkout does not match its exact clean Git tree")
     backend = contract["backend"]
     overlay = profile.overlay(lambda path: subprocess.check_output(["git", "show", f"HEAD:{path}"],
@@ -276,8 +271,9 @@ def execute(args, contract):
         raise
     finally:
         try:
+            paired.remove_source_worktrees(work, {"base": baseline, "head": ROOT})
             paired.remove_work(work, tmp)
-        except (OSError, ValueError):
+        except (OSError, ValueError, subprocess.SubprocessError):
             receipt["accepted"] = False
             receipt["cleanup_failed"] = True
             raise

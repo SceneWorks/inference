@@ -9,6 +9,7 @@ import os
 import stat
 from pathlib import Path
 import struct
+import subprocess
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -21,6 +22,42 @@ from scripts.media_campaign_supervisor import RunResult
 
 
 class FluxPairTests(unittest.TestCase):
+    def test_private_checkout_does_not_clone_missing_promisor_history(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            original, runner = root / "original", root / "runner"
+            original.mkdir()
+            comparison.git(original, "init", "--quiet")
+            comparison.git(original, "config", "user.name", "Proof Test")
+            comparison.git(original, "config", "user.email", "proof@example.invalid")
+            comparison.git(original, "config", "uploadpack.allowFilter", "true")
+            path = original / "source"
+            path.write_text("old source\n", encoding="utf-8")
+            comparison.git(original, "add", "source")
+            comparison.git(original, "commit", "--quiet", "-m", "old source")
+            missing = comparison.git(original, "rev-parse", "HEAD:source")
+            path.write_text("current source\n", encoding="utf-8")
+            comparison.git(original, "commit", "--quiet", "-am", "current source")
+            subprocess.run(["git", "clone", "--quiet", "--filter=blob:none",
+                            original.as_uri(), str(runner)], check=True, timeout=60)
+            self.assertIn("?" + missing,
+                          comparison.git(runner, "rev-list", "--objects", "--missing=print", "HEAD"))
+            original.rename(root / "offline")
+            expected = {"revision": comparison.git(runner, "rev-parse", "HEAD"),
+                        "tree": comparison.git(runner, "rev-parse", "HEAD^{tree}")}
+            work = root / "proof"
+            work.mkdir()
+            candidate = work / "head"
+            with self.assertRaisesRegex(ValueError, "exact source checkout"):
+                comparison.add_source_worktree(runner, candidate, "0" * 40)
+            self.assertEqual(comparison.add_source_worktree(runner, candidate, expected["revision"]), expected)
+            self.assertEqual((candidate / "source").read_text(encoding="utf-8"), "current source\n")
+            (candidate / "source").write_text("private probe\n", encoding="utf-8")
+            comparison.remove_source_worktrees(work, {"head": runner})
+            self.assertFalse(candidate.exists())
+            self.assertNotIn(str(candidate), comparison.git(runner, "worktree", "list", "--porcelain"))
+            self.assertEqual((runner / "source").read_text(encoding="utf-8"), "current source\n")
+
     def test_source_widths_and_variant_difference(self):
         dev, schnell = (fixture.geometry(v) for v in evidence.VARIANTS)
         self.assertEqual({k: len(v) for k, v in dev.items()},
