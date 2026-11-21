@@ -57,6 +57,8 @@ const _: fn() = || {
 pub mod cublaslt;
 pub mod decode_attention;
 pub mod flux3_quant;
+#[cfg(feature = "cuda")]
+pub mod fp8_linear;
 pub mod fused_decode;
 pub mod gated_delta;
 pub mod gdn_prep;
@@ -136,6 +138,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    cublaslt::SCALAR_FP8_SOURCE,
     cublaslt::W4A8_DEQUANT_SOURCE,
     cublaslt::KITCHEN_INT8_SOURCE,
     flux3_quant::FLUX3_QUANT_SRC,

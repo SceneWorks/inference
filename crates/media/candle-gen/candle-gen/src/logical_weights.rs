@@ -151,27 +151,6 @@ impl CandleCodecResidency {
             nvfp4_native: cuda_meets_sm120_floor(device),
         }
     }
-
-    /// This policy with the fp8 E4M3 native leg **masked off** (sc-11045 fix round, MAJOR 10 —
-    /// the E3 packed-FP8 seam has no provider consumer yet).
-    ///
-    /// The engine can *price and read* a packed E4M3 row (`LogicalTensor::PackedFp8E4M3`, the
-    /// `matmul_fp8` operands), but no provider construction path consumes one: krea's
-    /// `linear_detect_planned` and flux2's `PlannedDitWeights::qlinear` both answer the arm with a
-    /// typed refusal, and `Fp8Linear` has neither a packed-parts constructor nor an `AdaptLinear`
-    /// base arm to ride the shared additive seam. On an `sm_89+` host the unmasked policy
-    /// therefore made a **mixed fp8+NVFP4 native file hard-error at construction on a plan the
-    /// engine itself priced**. Until the consumer is wired, providers importing native single
-    /// files plan — and price admission — under this masked policy: fp8 rows take the exact dense
-    /// decode on every host, NVFP4 keeps its own floor, and the provider refusal arms become
-    /// unreachable-but-typed. The unmasked pricing (and the cuda packed read it selects) stays
-    /// tested engine capability for the future consumer.
-    pub fn with_dense_fp8(self) -> Self {
-        Self {
-            fp8_e4m3_native: false,
-            ..self
-        }
-    }
 }
 
 /// Whether one NVFP4 layer's **stored layout** is one the cuBLASLt FP4 GEMM accepts, independent of
@@ -219,7 +198,7 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         // where the fallback is the dense decode both backends share.
         if self.fp8_e4m3_native
             && codec.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id
-            && stored_shape.len() == 2
+            && crate::quant::cublaslt::eight_bit_layout_supported(stored_shape)
         {
             return ResidencyMode::Packed;
         }
@@ -504,6 +483,8 @@ pub fn read_logical_weights(
 ///   attributed to its owner's codec row only once that owner has materialized.
 pub struct LogicalWeightReader {
     st: MmapedSafetensors,
+    #[cfg(feature = "cuda")]
+    fp8_context: std::sync::Mutex<Option<crate::quant::Int8Context>>,
     plan: LogicalWeightPlan,
     device: Device,
     /// Logical key → index into `plan.tensors`, built once at [`Self::open`].
@@ -594,10 +575,75 @@ impl LogicalWeightReader {
             plan,
             device: device.clone(),
             by_logical_key,
+            #[cfg(feature = "cuda")]
+            fp8_context: Default::default(),
             measured: std::sync::Mutex::new(BTreeMap::new()),
             demoted: std::sync::Mutex::new(BTreeMap::new()),
             capability,
         })
+    }
+
+    /// Whether the native projection constructor owns this row of the compiled plan.
+    pub fn has_native_projection(&self, key: &str) -> bool {
+        self.planned(key).is_some_and(|row| {
+            row.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id
+                && row.residency.mode == ResidencyMode::Packed
+        })
+    }
+
+    /// Build an adapter-capable projection from the checkpoint codes when this row's plan
+    /// selected native execution. Unhandled rows remain available to their existing owner.
+    pub fn native_projection(
+        &self,
+        key: &str,
+        bias: Option<Tensor>,
+    ) -> Result<Option<crate::quant::AdaptLinear>> {
+        if !self.has_native_projection(key) {
+            return Ok(None);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let LogicalTensor::PackedFp8E4M3 {
+                codes,
+                weight_scale,
+                input_scale,
+                ..
+            } = self.read(key)?
+            else {
+                return Err(CandleError::Msg(format!(
+                    "{key}: expected packed FP8 operand"
+                )));
+            };
+            let (out_dim, in_dim) = codes.dims2()?;
+            let lt = {
+                let mut context = self
+                    .fp8_context
+                    .lock()
+                    .map_err(|_| CandleError::Msg("FP8 context lock poisoned".into()))?;
+                if context.is_none() {
+                    *context = Some(crate::quant::Int8Context::new(&self.device)?);
+                }
+                context
+                    .as_ref()
+                    .expect("context initialized")
+                    .handle_for(&self.device)?
+                    .clone()
+            };
+            let base =
+                crate::quant::Fp8Linear::from_parts(codes, weight_scale, input_scale, bias, lt)?;
+            Ok(Some(crate::quant::AdaptLinear::from_packed(
+                crate::quant::QLinear::Fp8(std::sync::Arc::new(base)),
+                in_dim,
+                out_dim,
+            )))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = bias;
+            Err(CandleError::Unsupported(format!(
+                "{key}: packed FP8 requires CUDA"
+            )))
+        }
     }
 
     /// Record that the provider served `logical_key` — a row the plan priced
@@ -2200,7 +2246,7 @@ mod tests {
         write_safetensors(
             &path,
             &[
-                ("model.a.weight", "F8_E4M3", &[2, 4], vec![0x38; 8]),
+                ("model.a.weight", "F8_E4M3", &[16, 16], vec![0x38; 256]),
                 (
                     "model.a.weight_scale",
                     "F32",
@@ -2243,7 +2289,7 @@ mod tests {
             .collect();
         // Eligible: packed at stored bytes (8), its 4-byte scale retained on the companion row.
         assert_eq!(by_key["a.weight"].residency.mode, ResidencyMode::Packed);
-        assert_eq!(by_key["a.weight"].residency.resident_bytes, 8);
+        assert_eq!(by_key["a.weight"].residency.resident_bytes, 256);
         let scale_row = plan
             .companions
             .iter()
@@ -2258,8 +2304,8 @@ mod tests {
         // Packed vs dense pricing differs end to end.
         let dense_plan = plan_dense(&path);
         assert!(plan.resident_bytes() < dense_plan.resident_bytes());
-        assert_eq!(dense_plan.resident_bytes(), 3 * 16);
-        assert_eq!(plan.resident_bytes(), (8 + 4) + 16 + 16);
+        assert_eq!(dense_plan.resident_bytes(), 512 + 2 * 16);
+        assert_eq!(plan.resident_bytes(), (256 + 4) + 16 + 16);
 
         // The probed policy on this machine's devices: CPU (and Metal) are dense-only.
         assert_eq!(
@@ -2305,59 +2351,6 @@ mod tests {
             8 + 4 + 4,
             "a retained input_scale is priced too"
         );
-    }
-
-    /// **sc-11045 fix round (MAJOR 10): the fp8 mask.** `with_dense_fp8` prices every fp8 row
-    /// dense — the pricing the providers with no packed-fp8 consumer plan under — while leaving
-    /// the NVFP4 leg untouched, so a mixed fp8+NVFP4 file plans "fp8 dense decode + NVFP4 packed"
-    /// instead of hard-erroring at the provider's typed packed-fp8 refusal.
-    ///
-    /// # Mutation
-    ///
-    /// Make `with_dense_fp8` return `self` unchanged: the fp8 row prices `Packed` and the first
-    /// two asserts go red.
-    #[test]
-    fn the_fp8_mask_prices_fp8_dense_and_leaves_nvfp4_alone() {
-        let masked = CandleCodecResidency {
-            fp8_e4m3_native: true,
-            nvfp4_native: true,
-        }
-        .with_dense_fp8();
-        assert!(!masked.fp8_e4m3_native);
-        assert_eq!(
-            masked.residency(
-                &FP8_E4M3_SCALAR_CODEC,
-                &TensorCodecSpec::ScalarFp8 {
-                    scale: ScalarScaleSource::Unit,
-                    input_scale: None,
-                    full_precision_matrix_mult: false,
-                },
-                &[64, 64],
-            ),
-            ResidencyMode::Dense,
-            "a masked policy prices the eligible fp8 row dense"
-        );
-        assert_eq!(
-            masked.residency(
-                &NVFP4_CODEC,
-                &TensorCodecSpec::Nvfp4 {
-                    block_scale: "s".into(),
-                    global_scale: "s2".into(),
-                    input_scale: None,
-                    stored_shape: [64, 64],
-                    logical_shape: [64, 64],
-                    logical_shape_declared: true,
-                    full_precision_matrix_mult: false,
-                },
-                &[64, 32],
-            ),
-            ResidencyMode::Packed,
-            "the mask must not touch the NVFP4 leg"
-        );
-        // And the capability rendered from the masked policy licenses no native fp8 label.
-        let capability = masked.native_execution_capability();
-        assert!(!capability.executes_natively(FP8_E4M3_SCALAR_CODEC.codec_id));
-        assert!(capability.executes_natively(NVFP4_CODEC.codec_id));
     }
 
     /// AC1 (Candle). A header-declared NVFP4 golden fixture — packed E2M1 values, block-16 FP8
@@ -3171,8 +3164,11 @@ mod tests {
             "a rank-2 projection is the packed leg's operand"
         );
         for stored in [
-            vec![2048_usize],         // a bias / modulation vector — the real rank-1 case
-            vec![],                   // a scalar
+            vec![16, 7],
+            vec![7, 16],
+            vec![0, 16],
+            vec![2048_usize], // a bias / modulation vector — the real rank-1 case
+            vec![],           // a scalar
             vec![4_usize, 2048, 512], // a rank-3 payload
         ] {
             assert_eq!(

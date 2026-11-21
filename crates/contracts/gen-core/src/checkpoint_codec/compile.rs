@@ -167,6 +167,26 @@ pub fn compile_logical_weight_plan_with_metadata(
         descriptors.insert(base, descriptor);
     }
 
+    if mapping.inline_fp8_scales() {
+        for header in by_name.values() {
+            let Some(base) = header.name.strip_suffix(".weight") else {
+                continue;
+            };
+            let format = match header.dtype {
+                Dtype::F8_E4M3 => ComfyQuantFormat::Float8E4M3Fn,
+                Dtype::F8_E5M2 => ComfyQuantFormat::Float8E5M2,
+                _ => continue,
+            };
+            descriptors
+                .entry(base.to_owned())
+                .or_insert(ComfyQuantDescriptor {
+                    format,
+                    full_precision_matrix_mult: false,
+                    orig_shape: None,
+                });
+        }
+    }
+
     let companion_owner = |name: &str| -> Option<(String, CompanionRole)> {
         if let Some(base) = name.strip_suffix(DESCRIPTOR_SUFFIX) {
             return Some((base.to_owned(), CompanionRole::Descriptor));

@@ -10,6 +10,12 @@ use super::*;
 /// real implementation.
 pub trait LogicalKeyMapping {
     fn mapping_id(&self) -> &'static str;
+
+    /// This dialect requires per-matrix scalar FP8 companions even without a Comfy descriptor.
+    fn inline_fp8_scales(&self) -> bool {
+        false
+    }
+
     /// The canonical logical key for one on-disk key, or `None` when the key is foreign to this
     /// dialect (the plan compiler refuses; nothing is skipped silently).
     fn logical_key(&self, physical_key: &str) -> Option<String>;

@@ -307,7 +307,7 @@ impl Weights {
     ) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes)
+        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes, false)
     }
 
     /// Open a native Krea file through a caller-owned pin. Registry-backed lazy/sequential loads keep
@@ -334,6 +334,7 @@ impl Weights {
         device: &Device,
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
+        stage_dense_on_cpu: bool,
     ) -> Result<Self> {
         let residency = native_import_residency(device);
         Self::from_pinned_native_file_with_residency(
@@ -342,6 +343,7 @@ impl Weights {
             dtype,
             shapes,
             residency,
+            stage_dense_on_cpu,
         )
     }
 
@@ -368,6 +370,7 @@ impl Weights {
                 fp8_e4m3_native: false,
                 nvfp4_native: true,
             },
+            false,
         )
     }
 
@@ -377,6 +380,7 @@ impl Weights {
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
         residency: CandleCodecResidency,
+        stage_dense_on_cpu: bool,
     ) -> Result<Self> {
         pinned_source
             .ensure_unchanged()
@@ -386,6 +390,13 @@ impl Weights {
         let mapping = KreaNativeToDiffusersMapping::new(&native_prefix, shapes);
         let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)
             .map_err(|error| Error::Msg(error.to_string()))?;
+        // Only dense masters need CPU staging for an explicitly requested GGML conversion.
+        // Codec-declared checkpoints retain their source representation on the compute device.
+        let device = if stage_dense_on_cpu && !logical_plan.has_encoded_weights() {
+            &Device::Cpu
+        } else {
+            device
+        };
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
         // A BLOCK-PADDED checkpoint (NVFP4, MXFP8) whose architecture's logical shape was never
         // declared is NOT refused here: the plan stays legal, because a plan is also a *pricing*
@@ -1460,24 +1471,9 @@ pub(crate) fn detect_native_prefix_from_keys<'a>(
     }
 }
 
-/// The residency policy every planned single-file Krea import — the loader AND the memory
-/// contract that prices it — plans under (sc-20651; SC-22667 review).
-///
-/// The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the packed
-/// rows packed, everything else prices the dense fallback. Passing the real device (rather than a
-/// fixed policy) keeps the plan's pricing the pricing of *this* load.
-///
-/// The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
-/// `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal — so
-/// pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a plan this
-/// loader itself priced. Masked, an fp8 row takes the exact dense decode (`weight_scale` applied)
-/// through the shared reader on every host — which is why a memory contract must price an fp8 row
-/// at the DiT's dense width, never at its stored byte.
-///
-/// One definition for both callers is the point: pricing and loading cannot disagree about which
-/// rows stay packed, because that disagreement *is* the fit gate falsely admitting or rejecting.
+/// Device policy shared by native import pricing and projection construction.
 pub(crate) fn native_import_residency(device: &Device) -> CandleCodecResidency {
-    CandleCodecResidency::probe(device).with_dense_fp8()
+    CandleCodecResidency::probe(device)
 }
 
 /// Read `{dir}/config.json`'s `quantization` block: `Ok(Some(cfg))` for a packed tier, `Ok(None)` for
@@ -1573,6 +1569,17 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     if w.overlay_has(&weight_key) {
         return Ok(QLinear::dense(linear(w, base, bias)?));
     }
+    if let Some(reader) = &w.logical {
+        if reader.has_native_projection(&weight_key) {
+            let b = bias.then(|| w.get(&format!("{base}.bias"))).transpose()?;
+            if let Some(proj) = reader
+                .native_projection(&weight_key, b)
+                .map_err(|err| Error::Msg(err.to_string()))?
+            {
+                return Ok(QLinear::Adapt(proj));
+            }
+        }
+    }
     // (1.5) INT8-ConvRot (sc-9300 loader + sc-9601 rotation): a ConvRot checkpoint whose native
     // `{base}.weight_scale` sibling is present → build a per-output-channel int8 projection from the
     // stored int8 codes + row scale + the `convrot_groupsize` in the `comfy_quant` descriptor. Detect on
@@ -1660,6 +1667,12 @@ pub fn linear_detect_planned(
     bias: bool,
     plan: &DitPlan,
 ) -> Result<QLinear> {
+    if w.logical
+        .as_ref()
+        .is_some_and(|reader| reader.has_native_projection(&format!("{base}.weight")))
+    {
+        return linear_detect(w, base, bias);
+    }
     if !plan.is_nvfp4() {
         let inner = linear_detect(w, base, bias)?;
         return Ok(match plan.probe() {

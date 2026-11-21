@@ -28371,7 +28371,7 @@
     "package": "candle-gen-flux2",
     "target": "candle_gen_flux2",
     "target_kind": "lib",
-    "fqn": "single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
+    "fqn": "single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
     "source": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs",
     "cargo_target_metadata": {
       "name": "candle_gen_flux2",
@@ -28390,8 +28390,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "CPU tiny Flux2 projection/DiT/caption/vision/control models and fitted RGB preview tensors; crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
-    "configuration_source": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
+    "fixture_identity": "CPU tiny Flux2 projection/DiT/caption/vision/control models and fitted RGB preview tensors; crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -28399,7 +28399,7 @@
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy/fixed_cpu",
+        "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu/fixed_cpu",
         "environment": {},
         "cargo_features": [
           "model-inference-proof"
@@ -28417,7 +28417,7 @@
     "configuration_kind": "feature-only",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/single_file.rs::single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu",
       "requirements": []
     }
   },

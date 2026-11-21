@@ -150,7 +150,7 @@ fn linked_and_managed_copies_share_one_plan_and_one_render() {
     // (codec, residency) → logical-key rows, compiled under the same policy the provider loads
     // with (the probed floors, fp8 leg masked — MAJOR 10).
     let device = candle_gen::default_device().expect("device");
-    let residency = CandleCodecResidency::probe(&device).with_dense_fp8();
+    let residency = CandleCodecResidency::probe(&device);
     let cfg = Flux2Variant::Klein9b.config();
     let mapping = Flux2BflToDiffusersMapping::new(&cfg);
     let plan_managed = plan_logical_weights(&managed, &mapping, &residency).expect("managed plan");

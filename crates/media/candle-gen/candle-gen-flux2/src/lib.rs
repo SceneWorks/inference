@@ -553,8 +553,7 @@ impl Pipeline {
     /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
         let mut dit = match (&self.comfyui_dit, &self.klein_dit) {
-            (Some(dit_file), _) => self.load_comfyui_dit(dit_file),
-            (None, Some(dit_file)) => self.load_klein_planned_dit(dit_file),
+            (Some(dit_file), _) | (None, Some(dit_file)) => self.load_planned_dit(dit_file),
             (None, None) => self.load_one_quantizable(
                 "transformer",
                 self.quant,
@@ -744,143 +743,69 @@ impl Pipeline {
         }
     }
 
-    /// Build the DiT from an in-place ComfyUI FLUX.2-dev fp8-mixed single-file (sc-10680): dequant the
-    /// inline-scale fp8 MLPs + remap the BFL keys into an in-memory map ([`convert::build_comfyui_dit_map`])
-    /// at the compute dtype (f32), then route by `self.quant` exactly as [`load_one_quantizable`]'s
-    /// dense-tier regime does — the snapshot `transformer/` dir simply replaced by the single file:
-    /// - **quant** (the 32B dev path): stage the dense f32 DiT in CPU RAM, then fold each projection onto
-    ///   the GPU (`quantize`); the dense f32 32B never lands on the GPU (it would not fit).
-    /// - **no quant** (small fixtures only): build dense on-device.
-    fn load_comfyui_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
-        dit_file.read_unchanged(|dit_path| {
-            // Every tensor is remapped/materialized before the post-read fingerprint check runs.
-            let mmap = candle_gen::mmap_safetensors(dit_path).map_err(|e| {
-                CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
-            })?;
-            #[cfg(test)]
-            run_comfyui_dit_load_test_hook(&mmap)?;
-            let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
-            match self.quant {
-                Some(q) => {
-                    let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
-                    let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
-                    dit.quantize(q, &self.device)?;
-                    self.device.synchronize()?;
-                    Ok(dit)
-                }
-                None => {
-                    let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
-                    let dit = Flux2Transformer::new(&self.cfg, vb)?;
-                    self.device.synchronize()?;
-                    Ok(dit)
-                }
+    /// Both BFL dialects use the same plan, device policy, projection constructors and receipt.
+    fn load_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
+        let (dit, facts) = dit_file.read_unchanged(|path| -> CResult<_> {
+            let mapping = if self.variant.is_dev() {
+                #[cfg(test)]
+                run_comfyui_dit_load_test_hook(&candle_gen::mmap_safetensors(path)?)?;
+                single_file::Flux2BflToDiffusersMapping::for_dev(&self.cfg)
+            } else {
+                single_file::Flux2BflToDiffusersMapping::new(&self.cfg)
+            };
+            let residency = single_file::klein_import_residency(&self.device);
+            let plan =
+                candle_gen::logical_weights::plan_logical_weights(path, &mapping, &residency)?;
+            let fold = self.quant.filter(|_| !plan.has_encoded_weights());
+            let device = if fold.is_some() {
+                &Device::Cpu
+            } else {
+                &self.device
+            };
+            let ctx = if plan.tensors.iter().any(|row| {
+                row.codec_id == gen_core::checkpoint_codec::NVFP4_CODEC.codec_id
+                    && row.residency.mode == gen_core::checkpoint_codec::ResidencyMode::Packed
+            }) {
+                candle_gen::quant::Nvfp4Context::new(device)?
+            } else {
+                candle_gen::quant::Nvfp4Context::none()
+            };
+            let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
+                path,
+                plan,
+                device,
+                residency.native_execution_capability(),
+            )?;
+            let src = single_file::PlannedDitWeights::new(
+                reader,
+                device.clone(),
+                self.dtype,
+                ctx,
+                crate::nvfp4_roles::KleinRoleTable::new(&self.cfg),
+            );
+            let mut dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
+            if let Some(quant) = fold {
+                dit.quantize(quant, &self.device)?;
             }
-        })
-    }
-
-    /// Build the klein DiT from a universal BFL-keyed single file through the shared logical-weight
-    /// seam (epic 11037, sc-21485): plan the file's own descriptors against the engine codec table
-    /// and this device's residency policy, open the shared reader over the compiled plan, and let
-    /// the one transformer constructor tree consume Dense / `PackedNvfp4` logical projections. The
-    /// fused-QKV row slices and the AdaLN half swap arrive as plan-declared transforms
-    /// ([`single_file::Flux2BflToDiffusersMapping`]) — no provider-local format parsing, no
-    /// re-classification, no load-time quant fold (the packed rows are already quantized).
-    ///
-    /// On success the import's three correlated checkpoint facts (sc-21484, epic E8) are bound to
-    /// the verified source pin and retained on the pipeline; read them back through
-    /// [`Flux2Generator::checkpoint_weight_facts`].
-    fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
-        candle_gen::gen_core::__model_input_choose!(
-            dit_file.read_unchanged(|dit_path| {
-            let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
-            // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
-            // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
-            let residency = single_file::klein_import_residency(&self.device);
-            let plan =
-                candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
-            let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
-                dit_path,
-                plan,
-                &self.device,
-                residency.native_execution_capability(),
-            )?;
-            let ctx = candle_gen::quant::Nvfp4Context::new(&self.device)?;
-            let src = single_file::PlannedDitWeights::new(
-                reader,
-                self.device.clone(),
-                self.dtype,
-                ctx,
-                crate::nvfp4_roles::KleinRoleTable::new(&self.cfg),
-            );
-            let dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
-            // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
-            // off the shared reader after the full materialization, so a contradiction between the
-            // stored codec inventory and what this run executed fails the load instead of shipping
-            // a dishonest report. Bound to the verified pin (`with_verified_source` re-verifies it,
-            // so facts are never reported about bytes that changed under the load) and RETAINED on
-            // the pipeline — the krea precedent — so a consumer reads them through
-            // [`Flux2Generator::checkpoint_weight_facts`] rather than scraping stderr.
+            self.device.synchronize()?;
             let facts = src
                 .checkpoint_weight_facts()?
-                .with_verified_source(dit_file)
-                .map_err(|error| CandleError::Msg(error.to_string()))?;
-            // Last-write-wins through the shared sink (sc-11045 fix round): a staged provider that
-            // re-materializes reports the read that just finished, never a stale first one.
-            self.klein_facts.publish(facts);
-            self.device.synchronize()?;
-            Ok(dit)
-        }),
-            (dit_file.read_unchanged(|dit_path| {
-            let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
-            // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
-            // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
-            let residency = single_file::klein_import_residency(&self.device);
-            let plan =
-                candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
-            let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
-                dit_path,
-                plan,
-                &self.device,
-                residency.native_execution_capability(),
-            )?;
-            let ctx = candle_gen::quant::Nvfp4Context::new(&self.device)?;
-            let src = single_file::PlannedDitWeights::new(
-                reader,
-                self.device.clone(),
-                self.dtype,
-                ctx,
-                crate::nvfp4_roles::KleinRoleTable::new(&self.cfg),
-            );
-            let dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
-            // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
-            // off the shared reader after the full materialization, so a contradiction between the
-            // stored codec inventory and what this run executed fails the load instead of shipping
-            // a dishonest report. Bound to the verified pin (`with_verified_source` re-verifies it,
-            // so facts are never reported about bytes that changed under the load) and RETAINED on
-            // the pipeline — the krea precedent — so a consumer reads them through
-            // [`Flux2Generator::checkpoint_weight_facts`] rather than scraping stderr.
-            let facts = src
-                .checkpoint_weight_facts()?
-                .with_verified_source(dit_file)
-                .map_err(|error| CandleError::Msg(error.to_string()))?;
-            // Last-write-wins through the shared sink (sc-11045 fix round): a staged provider that
-            // re-materializes reports the read that just finished, never a stale first one.
-            self.klein_facts.publish(facts);
-            self.device.synchronize()?;
-            Ok(dit)
-        })).inspect(|_| {
-                candle_gen::gen_core::model_input_proof::record_inputs(
-                    "candle-gen-flux2::Pipeline::load_klein_planned_dit/verified-weights",
-                    candle_gen::gen_core::model_input_proof::InputRole::ModelWeights,
-                    &[candle_gen::gen_core::model_input_proof::InputIdentity::validated(
-                        dit_file.loader_path(),
-                        *dit_file.content_sha256(),
-                        "gen-core::ArtifactSeal",
-                        "same existing finalized pin across actual native DiT materialization and original pre/post path checks; not an opened-handle or ABA guarantee",
-                    )],
-                );
-            })
-        )
+                .with_verified_source(dit_file)?;
+            Ok((dit, facts))
+        })?;
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_inputs(
+            "candle-gen-flux2::Pipeline::load_klein_planned_dit/verified-weights",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &[gen_core::model_input_proof::InputIdentity::validated(
+                dit_file.loader_path(),
+                *dit_file.content_sha256(),
+                "gen-core::ArtifactSeal",
+                "pinned before and after native DiT construction",
+            )],
+        );
+        self.klein_facts.publish(facts);
+        Ok(dit)
     }
 
     fn load_components(&self) -> CResult<Components> {

@@ -39,85 +39,10 @@ use crate::config::Flux2Config;
 use crate::nvfp4_roles::{KleinExecutionRole, KleinRoleTable};
 use crate::quant::QLinear;
 
-/// Top-level (non-block) 1:1 renames: BFL physical → diffusers logical. The klein community
-/// convention — no `guidance_in.*` (klein is CFG-free-distilled; a file that carries one refuses
-/// as unmapped, which is how a dev checkpoint stays out of the klein provider).
-const TOP_RENAMES: &[(&str, &str)] = &[
-    ("img_in.weight", "x_embedder.weight"),
-    ("txt_in.weight", "context_embedder.weight"),
-    (
-        "time_in.in_layer.weight",
-        "time_guidance_embed.timestep_embedder.linear_1.weight",
-    ),
-    (
-        "time_in.out_layer.weight",
-        "time_guidance_embed.timestep_embedder.linear_2.weight",
-    ),
-    (
-        "double_stream_modulation_img.lin.weight",
-        "double_stream_modulation_img.linear.weight",
-    ),
-    (
-        "double_stream_modulation_txt.lin.weight",
-        "double_stream_modulation_txt.linear.weight",
-    ),
-    (
-        "single_stream_modulation.lin.weight",
-        "single_stream_modulation.linear.weight",
-    ),
-    ("final_layer.linear.weight", "proj_out.weight"),
-];
-
-/// The fused-AdaLN physical key and its diffusers logical key. Declared as a **half-swap
-/// transform**, never a rename: BFL stores `(shift, scale)`, the diffusers `norm_out.linear` reads
-/// `(scale, shift)`.
-const ADALN_SOURCE: &str = "final_layer.adaLN_modulation.1.weight";
-const ADALN_TARGET: &str = "norm_out.linear.weight";
-
-/// Per-double-block 1:1 renames (physical suffix → diffusers suffix under
-/// `transformer_blocks.{i}.`), excluding the fused `qkv` tensors declared as row-slice transforms.
-/// Klein community per-head-norm spelling is `.weight` (the BFL-official dev export spells those
-/// `.scale` and is NOT this dialect).
-const DOUBLE_RENAMES: &[(&str, &str)] = &[
-    ("img_attn.norm.query_norm.weight", "attn.norm_q.weight"),
-    ("img_attn.norm.key_norm.weight", "attn.norm_k.weight"),
-    ("img_attn.proj.weight", "attn.to_out.0.weight"),
-    ("img_mlp.0.weight", "ff.linear_in.weight"),
-    ("img_mlp.2.weight", "ff.linear_out.weight"),
-    (
-        "txt_attn.norm.query_norm.weight",
-        "attn.norm_added_q.weight",
-    ),
-    ("txt_attn.norm.key_norm.weight", "attn.norm_added_k.weight"),
-    ("txt_attn.proj.weight", "attn.to_add_out.weight"),
-    ("txt_mlp.0.weight", "ff_context.linear_in.weight"),
-    ("txt_mlp.2.weight", "ff_context.linear_out.weight"),
-];
-
-/// Fused-qkv physical suffix → the three diffusers row-slice target suffixes, per stream.
-const DOUBLE_QKV: &[(&str, [&str; 3])] = &[
-    (
-        "img_attn.qkv.weight",
-        ["attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight"],
-    ),
-    (
-        "txt_attn.qkv.weight",
-        [
-            "attn.add_q_proj.weight",
-            "attn.add_k_proj.weight",
-            "attn.add_v_proj.weight",
-        ],
-    ),
-];
-
-/// Per-single-block 1:1 renames (diffusers keeps the fused single block, so `linear1` is a rename
-/// rather than a split).
-const SINGLE_RENAMES: &[(&str, &str)] = &[
-    ("linear1.weight", "attn.to_qkv_mlp_proj.weight"),
-    ("linear2.weight", "attn.to_out.weight"),
-    ("norm.query_norm.weight", "attn.norm_q.weight"),
-    ("norm.key_norm.weight", "attn.norm_k.weight"),
-];
+use crate::convert::{
+    ADALN_SOURCE, ADALN_TARGET, COMFY_DOUBLE_RENAMES, COMFY_GUIDANCE_RENAMES, COMFY_SINGLE_RENAMES,
+    DOUBLE_QKV, DOUBLE_RENAMES, SINGLE_RENAMES, TOP_RENAMES,
+};
 
 /// Split `bare` as `{table_prefix}.{index}.{suffix}`, returning
 /// `(index, suffix)`; `None` when it is not under `table_prefix` or has no well-formed index.
@@ -156,6 +81,7 @@ fn block_suffix<'k>(bare: &'k str, table_prefix: &str) -> Option<(usize, &'k str
 #[derive(Clone, Copy, Debug)]
 pub struct Flux2BflToDiffusersMapping<'a> {
     cfg: &'a Flux2Config,
+    dev: bool,
 }
 
 impl<'a> Flux2BflToDiffusersMapping<'a> {
@@ -163,7 +89,19 @@ impl<'a> Flux2BflToDiffusersMapping<'a> {
     pub const MAPPING_ID: &'static str = "flux2-bfl-to-diffusers-v1";
 
     pub const fn new(cfg: &'a Flux2Config) -> Self {
-        Self { cfg }
+        Self { cfg, dev: false }
+    }
+
+    pub(crate) const fn for_dev(cfg: &'a Flux2Config) -> Self {
+        Self { cfg, dev: true }
+    }
+
+    fn bare<'k>(&self, key: &'k str) -> &'k str {
+        if self.dev {
+            key.strip_prefix("model.diffusion_model.").unwrap_or(key)
+        } else {
+            key
+        }
     }
 
     fn inner(&self) -> usize {
@@ -224,18 +162,33 @@ impl<'a> Flux2BflToDiffusersMapping<'a> {
 
 impl LogicalKeyMapping for Flux2BflToDiffusersMapping<'_> {
     fn mapping_id(&self) -> &'static str {
-        Self::MAPPING_ID
+        if self.dev {
+            "flux2-comfyui-to-diffusers-v1"
+        } else {
+            Self::MAPPING_ID
+        }
+    }
+
+    fn inline_fp8_scales(&self) -> bool {
+        self.dev
     }
 
     fn logical_key(&self, physical_key: &str) -> Option<String> {
-        let bare = physical_key;
-        for (src, dst) in TOP_RENAMES {
+        let bare = self.bare(physical_key);
+        for (src, dst) in TOP_RENAMES
+            .iter()
+            .chain(COMFY_GUIDANCE_RENAMES.iter().filter(|_| self.dev))
+        {
             if bare == *src {
                 return Some((*dst).to_owned());
             }
         }
         if let Some((index, suffix)) = block_suffix(bare, "double_blocks") {
-            for (src, dst) in DOUBLE_RENAMES {
+            for (src, dst) in if self.dev {
+                COMFY_DOUBLE_RENAMES
+            } else {
+                DOUBLE_RENAMES
+            } {
                 if suffix == *src {
                     return Some(format!("transformer_blocks.{index}.{dst}"));
                 }
@@ -243,7 +196,11 @@ impl LogicalKeyMapping for Flux2BflToDiffusersMapping<'_> {
             return None;
         }
         if let Some((index, suffix)) = block_suffix(bare, "single_blocks") {
-            for (src, dst) in SINGLE_RENAMES {
+            for (src, dst) in if self.dev {
+                COMFY_SINGLE_RENAMES
+            } else {
+                SINGLE_RENAMES
+            } {
                 if suffix == *src {
                     return Some(format!("single_transformer_blocks.{index}.{dst}"));
                 }
@@ -258,7 +215,7 @@ impl LogicalKeyMapping for Flux2BflToDiffusersMapping<'_> {
     }
 
     fn logical_transform(&self, physical_key: &str) -> Option<LogicalTransformDeclaration> {
-        let bare = physical_key;
+        let bare = self.bare(physical_key);
         let inner = self.inner();
         if bare == ADALN_SOURCE {
             // BFL packs `(shift, scale)`; diffusers reads `(scale, shift)`. This tensor is dense
@@ -375,6 +332,16 @@ impl PlannedDitWeights {
         } else {
             None
         };
+        if let Some(projection) = self
+            .reader
+            .native_projection(&weight_key, dense_bias.clone())
+            .map_err(|err| candle_gen::candle_core::Error::Msg(err.to_string()))?
+        {
+            if projection.base_shape() != (out_dim, in_dim) {
+                candle_gen::candle_core::bail!("flux2 single-file: {weight_key} has shape {:?}, expected [{out_dim}, {in_dim}]", projection.base_shape());
+            }
+            return Ok(projection);
+        }
         match self
             .reader
             .read(&weight_key)
@@ -433,8 +400,7 @@ impl PlannedDitWeights {
             }
             LogicalTensor::PackedFp8E4M3 { .. } => {
                 Err(candle_gen::candle_core::Error::Msg(format!(
-                    "flux2 single-file: `{weight_key}` was planned as packed fp8, which this \
-                     loader does not construct; replan with a dense residency policy"
+                    "flux2 single-file: `{weight_key}` packed FP8 row bypassed the native projection constructor"
                 )))
             }
         }
@@ -456,15 +422,11 @@ impl PlannedDitWeights {
     }
 }
 
-/// The residency policy every klein single-file consumer — the loader AND the fit-gate pricing —
-/// plans under (sc-11045 fix round, MAJOR 10): the device's probed floors with the fp8 E4M3
-/// native leg **masked off**, because this provider constructs no packed-fp8 projection
-/// ([`PlannedDitWeights::qlinear`]'s arm is a typed refusal). One definition, two call sites, so
-/// pricing and loading cannot disagree about what an fp8 row holds resident.
+/// Device policy shared by admission and native projection construction.
 pub(crate) fn klein_import_residency(
     device: &Device,
 ) -> candle_gen::logical_weights::CandleCodecResidency {
-    candle_gen::logical_weights::CandleCodecResidency::probe(device).with_dense_fp8()
+    candle_gen::logical_weights::CandleCodecResidency::probe(device)
 }
 
 /// Cross the representation the role table + context facts predicted for `base` against the one
@@ -638,23 +600,14 @@ mod tests {
             .is_some());
     }
 
-    /// **sc-11045 fix round (MAJOR 10): a mixed fp8+NVFP4-class native file loads instead of
-    /// hard-erroring.** On an `sm_89+` host the unmasked engine policy prices a described E4M3
-    /// row `Packed`, and this provider's `qlinear` answers `PackedFp8E4M3` with a typed refusal —
-    /// so the provider plans under [`klein_import_residency`]'s masked policy, where the same row
-    /// prices `Dense` and materializes through the codec's exact dense decode
-    /// (`weight_scale` applied), while the NVFP4 leg keeps its own floor untouched.
-    ///
-    /// # Mutation
-    ///
-    /// Drop `.with_dense_fp8()` from `klein_import_residency` and pass an `sm_89`-shaped policy:
-    /// the plan prices the row `Packed` and the construction below dies at the typed fp8 refusal.
+    /// The CPU decode applies the scale, while an eligible CUDA host prices native execution.
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
-    fn a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy() {
+    fn a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu() {
         use candle_gen::gen_core::checkpoint_codec::ResidencyMode;
 
-        let cfg = tiny_cfg();
+        let mut cfg = tiny_cfg();
+        cfg.in_channels = 16;
         let (inner, in_channels) = (cfg.inner_dim(), cfg.in_channels);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("klein-fp8-mixed.safetensors");
@@ -689,13 +642,8 @@ mod tests {
         ]);
         ::safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
-        // The sm_89+sm_120 host, as this provider masks it: fp8 dense, NVFP4 preserved.
-        let residency = CandleCodecResidency {
-            fp8_e4m3_native: true,
-            nvfp4_native: true,
-        }
-        .with_dense_fp8();
         let cpu = Device::Cpu;
+        let residency = klein_import_residency(&cpu);
         let mapping = mapping_for(&cfg);
         let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
         let row = plan
@@ -706,7 +654,7 @@ mod tests {
         assert_eq!(
             row.residency.mode,
             ResidencyMode::Dense,
-            "the masked policy prices the fp8 row dense"
+            "a CPU prices the fp8 row dense"
         );
         // The UNMASKED policy would have priced it Packed — the arm the refusal guards.
         let unmasked = plan_logical_weights(
@@ -758,7 +706,7 @@ mod tests {
         }
 
         #[cfg(feature = "model-inference-proof")]
-        println!("\nMODEL_INFERENCE_BODY_COMPLETED single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy");
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED single_file::tests::a_mixed_fp8_row_decodes_with_its_checkpoint_scale_on_cpu");
     }
 
     #[test]

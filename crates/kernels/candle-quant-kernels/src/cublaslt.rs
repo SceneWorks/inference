@@ -56,6 +56,11 @@ pub const F8E4M3_MAX: f32 = 448.0;
 /// int8 symmetric range.
 pub const I8_MAX: f32 = 127.0;
 
+/// Leading dimensions supported by the cuBLASLt 8-bit tensor-core GEMM.
+pub fn eight_bit_layout_supported(shape: &[usize]) -> bool {
+    matches!(shape, [n, k] if *n > 0 && *k > 0 && n.is_multiple_of(16) && k.is_multiple_of(16))
+}
+
 /// Dynamic per-tensor **fp8 E4M3** activation quant (v1, pure candle ops — a fused amax→scale→cast
 /// kernel is a later optimization if the bench shows it dominates). `scale = absmax / 448`, then
 /// `q = cast_f8e4m3(x / scale)`.
@@ -145,6 +150,12 @@ pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weig
 /// would allocate the handle's 32 MiB workspace — read the capability off the device and apply it
 /// here. Neither re-spells `(8, 9)`.
 pub const FP8_COMPUTE_CAP_FLOOR: (i32, i32) = (8, 9);
+
+pub(crate) const SCALAR_FP8_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "candle_quant_kernels_scalar_fp8",
+    src: include_str!("scalar_fp8.cu"),
+    cc_floor: FP8_COMPUTE_CAP_FLOOR,
+};
 
 /// Whether a `(major, minor)` compute capability meets [`FP8_COMPUTE_CAP_FLOOR`].
 pub fn compute_cap_meets_fp8_floor(cap: (i32, i32)) -> bool {
@@ -1302,6 +1313,53 @@ mod cuda_impl {
             probe().is_ok()
         }
 
+        /// Quantize into the FP8 GEMM operand on-device. Use a calibrated checkpoint input
+        /// scale when present, otherwise use the dynamic per-tensor absmax.
+        pub fn scaled_fp8_activation(
+            &self,
+            x: &Tensor,
+            input_scale: Option<f32>,
+        ) -> Result<(DevFp8, f32)> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (rows, cols) = x.dims2()?;
+            if !x.device().same_device(&Device::Cuda(self.device.clone())) {
+                candle_core::bail!("FP8 activation and GEMM context are on different devices");
+            }
+            let xf = Self::flux3_f32_input(x)?;
+            let scale = match input_scale {
+                Some(s) => s,
+                None => (xf.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()? / super::F8E4M3_MAX)
+                    .max(f32::MIN_POSITIVE),
+            };
+            let len = u32::try_from(xf.elem_count()).map_err(candle_core::Error::wrap)?;
+            let compiled = super::SCALAR_FP8_SOURCE
+                .compiled(&self.device)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let kernel = compiled
+                .function("scalar_fp8_quantize")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let (storage, _) = xf.storage_and_layout();
+            let Storage::Cuda(cs) = &*storage else {
+                candle_core::bail!("expected CUDA activation")
+            };
+            let CudaStorageSlice::F32(src) = &cs.slice else {
+                candle_core::bail!("expected F32 activation")
+            };
+            let mut buf =
+                unsafe { self.stream.alloc::<float8::F8E4M3>(len as usize) }.map_err(drv_err)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(src)
+                    .arg(&mut buf)
+                    .arg(&scale)
+                    .arg(&len)
+                    .launch(LaunchConfig::for_num_elems(len))
+                    .map_err(drv_err)?;
+            }
+            Ok((DevFp8 { buf, rows, cols }, scale))
+        }
+
         /// Stage an fp8 weight/activation tensor (`F8E4M3`) as an owned device buffer + its shape.
         pub fn stage_fp8(&self, t: &Tensor) -> Result<DevFp8> {
             DevFp8::stage(self, t)
@@ -1787,15 +1845,21 @@ mod cuda_impl {
             expect_dtype(t, DType::F8E4M3)?;
             let (rows, cols) = t.dims2()?;
             let t = t.contiguous()?;
-            let (storage, _l) = t.storage_and_layout();
+            if !t.device().same_device(&Device::Cuda(lt.device.clone())) {
+                candle_core::bail!("FP8 operand and cuBLASLt context are on different devices");
+            }
+            let (storage, layout) = t.storage_and_layout();
+            let start = layout.start_offset();
             let buf = match &*storage {
                 Storage::Cuda(cs) => match &cs.slice {
-                    CudaStorageSlice::F8E4M3(s) => s.try_clone().map_err(drv_err)?,
+                    CudaStorageSlice::F8E4M3(s) => lt
+                        .stream
+                        .clone_dtod(&s.slice(start..start + rows * cols))
+                        .map_err(drv_err)?,
                     _ => candle_core::bail!("DevFp8::stage: expected F8E4M3 storage"),
                 },
                 _ => candle_core::bail!("DevFp8::stage: not a CUDA tensor"),
             };
-            let _ = lt;
             Ok(Self { buf, rows, cols })
         }
     }
@@ -2404,7 +2468,7 @@ mod cuda_impl {
     }
 
     fn check_alignment(k: usize, n: usize) -> Result<()> {
-        if !k.is_multiple_of(16) || !n.is_multiple_of(16) {
+        if !super::eight_bit_layout_supported(&[n, k]) {
             candle_core::bail!("cuBLASLt 8-bit: K ({k}) and N ({n}) must be multiples of 16");
         }
         Ok(())

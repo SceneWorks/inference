@@ -519,6 +519,9 @@ pub struct QuantForward {
 #[derive(Clone)]
 pub enum QLinear {
     Dense(DenseLinear),
+    /// Native per-tensor-scaled E4M3FN codes bound to a shared cuBLASLt context.
+    #[cfg(feature = "cuda")]
+    Fp8(std::sync::Arc<Fp8Linear>),
     /// Native packed codebook W4A8; never folded into a GGUF or dense weight.
     W4A8(std::sync::Arc<W4A8Linear>),
     Quantized {
@@ -537,6 +540,8 @@ pub enum QLinear {
 impl std::fmt::Debug for QLinear {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => f.write_str("QLinear::Fp8"),
             Self::Dense(_) => f.write_str("QLinear::Dense"),
             Self::W4A8(q) => f.debug_tuple("QLinear::W4A8").field(q).finish(),
             Self::Quantized { weight, bias, .. } => f
@@ -587,6 +592,15 @@ impl QLinear {
             _ => copy.to_device(device)?,
         }
         Ok(copy)
+    }
+
+    /// The execution device of an immutable E4M3FN projection, if present.
+    pub fn fp8_device(&self) -> Option<&Device> {
+        #[cfg(feature = "cuda")]
+        if let Self::Fp8(base) = self {
+            return Some(base.device());
+        }
+        None
     }
 
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
@@ -717,6 +731,8 @@ impl QLinear {
     /// candle's `QMatMul::forward` (with per-site leading-dim flatten / dtype cast-back).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
+            #[cfg(feature = "cuda")]
+            Self::Fp8(q) => q.forward(x)?.to_dtype(x.dtype()),
             Self::Dense(l) => __model_proof_output!(l.forward(x)),
             Self::W4A8(q) => __model_proof_output!(q.forward(x)),
             Self::Quantized {
@@ -783,6 +799,8 @@ impl QLinear {
     pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward_upcast(x),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => self.forward(x),
             Self::Quantized { .. } | Self::W4A8(_) => self.forward(x),
         }
     }
@@ -883,6 +901,9 @@ impl QLinear {
         skip_indivisible: bool,
     ) -> Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
+        if self.fp8_device().is_some() {
+            candle_core::bail!("source FP8 projection refuses re-quantization to {quant:?}");
+        }
         if matches!(self, Self::W4A8(_)) {
             candle_core::bail!("W4A8 refuses re-quantization to {quant:?}");
         }
@@ -954,6 +975,12 @@ impl QLinear {
     /// for the leaves it must keep dense — e.g. FLUX.2's control branch `control_img_in` (260
     /// in-features is not a multiple of the block 32, so it can't quantize) (sc-7460).
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if self
+            .fp8_device()
+            .is_some_and(|owner| !owner.same_device(device))
+        {
+            candle_core::bail!("FP8 projection is bound to its execution device");
+        }
         if let Self::W4A8(q) = self {
             if !q.device().same_device(device) {
                 candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
@@ -988,7 +1015,7 @@ impl QLinear {
 
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Quantized { .. } | Self::W4A8(_))
+        !matches!(self, Self::Dense(_))
     }
 
     /// The GGUF block type of a quantized projection's resident weight (`None` when dense) — lets a
@@ -997,6 +1024,8 @@ impl QLinear {
     pub fn quant_dtype(&self) -> Option<GgmlDType> {
         match self {
             Self::Quantized { weight, .. } => Some(weight.dtype()),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => None,
             Self::Dense(_) | Self::W4A8(_) => None,
         }
     }
@@ -1013,6 +1042,8 @@ impl QLinear {
                 weight: QuantWeight::Matmul(_),
                 ..
             } => Some(MatmulStrategy::Int8Fast),
+            #[cfg(feature = "cuda")]
+            Self::Fp8(_) => None,
             Self::Dense(_) | Self::W4A8(_) => None,
         }
     }
