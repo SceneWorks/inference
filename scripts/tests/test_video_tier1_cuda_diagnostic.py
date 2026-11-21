@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scripts.ci import video_tier1_comparison as proof
 from scripts.ci import video_tier1_cuda_diagnostic as diagnostic
@@ -26,6 +26,86 @@ class TargetedCudaTests(unittest.TestCase):
                       **dict.fromkeys(("stdoutCapBytes", "stderrCapBytes", "eventCapBytes"), 4 * proof.MIB))
         _, _, prior = followup.bind("controller", "candle-cuda", selection, read, policy)
         return diagnostic.bind("controller", "candle-cuda", selection, tracked or read, prior)
+
+    def test_continuation_has_three_independent_fixed_schedules_and_frozen_rank_interval(self):
+        for cohort, name, count in ((proof.cohorts.WAN, diagnostic.TIMING_CONTINUATION, 80),
+                                    (proof.cohorts.MOCHI_SVD, diagnostic.TIMING_CONTINUATION, 80),
+                                    (proof.cohorts.MOCHI_SVD, diagnostic.MEMORY_CONTINUATION, 6)):
+            _, previous = self.binding(cohort)
+            cases, current = diagnostic.continuation(name, cohort, previous)
+            self.assertEqual(len(proof.phases(cases, current)), count)
+            for case in cases:
+                retained = current["retained"][case]
+                rows = list(proof.schedule(case, current))
+                if name == diagnostic.TIMING_CONTINUATION:
+                    self.assertEqual(len(rows), 80)
+                    self.assertEqual([r[1] for r in rows[::2]].count("base"), 20)
+                else:
+                    self.assertEqual(tuple(r[0] for r in rows[::2]), diagnostic.CONTINUATION_MEMORY[case])
+                data = {}
+                for position, arm, key, repeats in rows:
+                    ns = 110 if arm == "head" and position > 26 else 100
+                    data[key] = {"initial": {"sha256": retained["initial_sha256"]},
+                        "terminal": {"sha256": retained["terminal_sha256"]}, "trace": [],
+                        "trace_sha256": retained["trace_sha256"], "samples": [{"outer_steps": 4, "elapsed_ns": ns}] * repeats,
+                        "peaks": {"pool": 100}, "cuda_process": {"lower": 50, "upper": 200, "basis": "wddm-bounded",
+                        "dedicated": {"adapter": retained["dedicated_adapter"], "sampled_peak_bytes": 100}}}
+                result = proof.compare_case(case, current, data)
+                if name == diagnostic.TIMING_CONTINUATION:
+                    self.assertEqual(result["timing"]["interval"], [1, 1.1])
+                    self.assertFalse(result["accepted"])
+                    self.assertNotIn("dedicated_process_memory", result)
+                    data[f"{case}-timing-p27-head"]["samples"] = data[f"{case}-timing-p27-base"]["samples"]
+                    self.assertTrue(proof.compare_case(case, current, data)["accepted"])
+                else:
+                    self.assertNotIn("timing", result)
+                    self.assertEqual(len(result["dedicated_process_memory"]["pairs"]), len(rows) // 2)
+                    self.assertTrue(result["accepted"])
+        _, prior = self.binding(proof.cohorts.WAN)
+        with self.assertRaises(ValueError):
+            diagnostic.continuation(diagnostic.MEMORY_CONTINUATION, proof.cohorts.WAN, prior)
+
+    def test_native_conditioning_is_complete_disjoint_and_within_the_owned_child(self):
+        for case, count in diagnostic.TIMING_CALLS.items():
+            row = {"conditioning_ns": [20] * count, "conditioning_end_ns": 21 * count,
+                   "measured_start_ns": 21 * count + 1, "measured_end_ns": 31 * count + 2}
+            measured = [{"elapsed_ns": 10}] * count
+            diagnostic.verify_conditioning(row, measured, case, 1)
+            for delta in ({"conditioning_ns": [20] * (count - 1)}, {"conditioning_ns": [22] * count},
+                          {"measured_start_ns": 1}, {"measured_end_ns": 30 * count},
+                          {"measured_end_ns": 2_000_000_000}, {"conditioning_ns": [True] * count}):
+                with self.assertRaises(ValueError):
+                    diagnostic.verify_conditioning(dict(row, **delta), measured, case, 1)
+
+    def test_dedicated_only_retry_is_immediate_fresh_and_keeps_owned_pid_identity(self):
+        from scripts.ci import wddm_process_memory as w
+        from scripts.ci.scail_plural import wddm_retry
+        _, extension = self.binding(proof.cohorts.MOCHI_SVD)
+        adapter = extension["retained"]["cuda-svd-euler-cfg"]["dedicated_adapter"]
+        policy = SimpleNamespace(poll_millis=125)
+        for stamp, missing in ((110, 0), (104, 1), (100, 1)):
+            with self.subTest(stamp=stamp), patch.object(w, "_query") as query, \
+                 patch.object(wddm_retry.time, "monotonic_ns", side_effect=[100, 150, 160, 165, 170]), \
+                 patch.object(wddm_retry.time, "sleep", side_effect=AssertionError("delayed retry")), \
+                 patch.object(wddm_retry, "local_filetime", side_effect=[105, 115]):
+                job = MagicMock()
+                job.members.return_value = {42}
+                job.root_identity.return_value = (99, False)
+                query.return_value.__enter__.return_value.side_effect = [[100, 10], None, [stamp, 10]]
+                cuda = SimpleNamespace(dedicated=w.DedicatedSamples(adapter, adapter["cuda_uuid"]))
+                monitor = diagnostic.DedicatedRetryObserver(cuda, policy)
+                for _ in range(2):
+                    cuda.dedicated.poll(job, cuda_active=True)
+                raw = cuda.dedicated.record
+                observation = monitor.fit_observation()
+                evidence = dict(fit_observation=observation, pid=42, cuda_attribution={"wddm_dedicated": raw})
+                diagnostic.verify_retry(evidence, policy, adapter)
+                self.assertEqual(raw["missing_active_polls"], missing)
+                self.assertEqual(observation["reason"], diagnostic.RETRY_REASON)
+                for change in ({"pid": 24}, {"created_filetime": 111}, {"adapter": {}}, {"reason": "other"}):
+                    with self.assertRaises(ValueError):
+                        diagnostic.verify_retry(dict(evidence, fit_observation=dict(observation, **change)), policy, adapter)
+                cuda.dedicated.close()
 
     def test_exact_adjacent_schedule_and_retained_sources_across_all_cuda_cohorts(self):
         recovered, unresolved, original = 0, 0, 0

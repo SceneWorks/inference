@@ -77,7 +77,8 @@ def validate_retry(diagnostics, record, poll_millis):
 
 
 class SameTickSamples:
-    def __init__(self, gauge, poll_millis):
+    def __init__(self, gauge, poll_millis, *, immediate=False):
+        self.immediate = immediate
         self.gauge = gauge
         self.record = gauge.record
         self.tick_ns = poll_millis * 1_000_000
@@ -105,7 +106,8 @@ class SameTickSamples:
         remaining = self.tick_ns - (time.monotonic_ns() - started)
         retried = False
         if remaining > 0:
-            time.sleep(min(0.015, remaining / 2_000_000_000))
+            if not self.immediate:
+                time.sleep(min(0.015, remaining / 2_000_000_000))
             if time.monotonic_ns() - started < self.tick_ns:
                 self.gauge.poll(owner, cuda_active=cuda_active)
                 retried = True

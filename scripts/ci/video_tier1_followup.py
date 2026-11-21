@@ -67,6 +67,14 @@ def bind(head, backend, selection, tracked, policy):
 
 
 def groups(case, name=NAME):
+    if name == targeted.TIMING_CONTINUATION:
+        if case in targeted.TIMING_CALLS:
+            yield "timing", range(1, targeted.CONTINUATION_PAIRS + 1), targeted.TIMING_CALLS[case]
+        return
+    if name == targeted.MEMORY_CONTINUATION:
+        if case in targeted.CONTINUATION_MEMORY:
+            yield "memory", targeted.CONTINUATION_MEMORY[case], 1
+        return
     if name == targeted.NAME:
         if case in targeted.TIMING_CALLS:
             yield "timing", range(1, targeted.TIMING_PAIRS + 1), targeted.TIMING_CALLS[case]
@@ -100,8 +108,10 @@ def timing(base, head, ceiling, *, pairs=TIMING_PAIRS, calls=CALLS, ranks=(3, 10
 
 
 def compare(case, retained, observations, settings, name=NAME):
-    diagnostic = name == targeted.NAME
+    diagnostic = name in targeted.DIAGNOSTICS
     source = "targeted-diagnostic" if diagnostic else "follow-up"
+    if name in targeted.CONTINUATIONS:
+        source = name
     schedule = {phase: (slots, calls) for phase, slots, calls in groups(case, name)}
     initial_ok = all(r["initial"]["sha256"] == retained["initial_sha256"] for r in observations.values())
     parity_ok = all(r["terminal"]["sha256"] == retained["terminal_sha256"] and r["trace_sha256"] == retained["trace_sha256"]
@@ -117,20 +127,25 @@ def compare(case, retained, observations, settings, name=NAME):
         slots, calls = schedule["timing"]
         base, head = ([observations[f"{case}-timing-p{i}-{arm}"] for i in slots]
                       for arm in ("base", "head"))
-        measured = timing(base, head, settings["seconds_ratio_ceiling"], pairs=len(slots), calls=calls,
-                          ranks=(6, 15) if diagnostic else (3, 10))
+        ranks = (6, 15) if diagnostic else (3, 10)
+        if name == targeted.TIMING_CONTINUATION:
+            ranks = (14, 27)
+        measured = timing(base, head, settings["seconds_ratio_ceiling"], pairs=len(slots), calls=calls, ranks=ranks)
         measured["outer_steps"] = base[0]["samples"][0]["outer_steps"]
         for arm in ("base", "head"):
             measured[arm + "_mean_seconds_per_outer_step"] = [
                 v / (1e9 * measured["outer_steps"]) for v in measured[arm + "_mean_ns"]]
         result["timing"] = {"source": source, **measured}
-    else:
+    elif name != targeted.MEMORY_CONTINUATION:
         result["timing"] = {"source": retained.get("timing_source", "retained"), **retained["timing"]}
-    verdicts.append(result["timing"]["verdict"])
-    if case in MEMORY:
+    if "timing" in result:
+        verdicts.append(result["timing"]["verdict"])
+    if case in MEMORY and name != targeted.TIMING_CONTINUATION:
         slots = []
         for i, previous in enumerate(retained["dedicated_metrics"]["pairs"], 1):
             if i not in schedule.get("memory", ((), 1))[0]:
+                if name == targeted.MEMORY_CONTINUATION:
+                    continue
                 if previous["verdict"] != "pass":
                     raise ValueError("retained slot lacks a completed process-memory comparison")
                 slots.append({"source": "retained", "pair": i, **previous})
@@ -146,7 +161,7 @@ def compare(case, retained, observations, settings, name=NAME):
             slots.append({"source": source, "pair": i, "base_bytes": dedicated["base"]["sampled_peak_bytes"],
                           "head_bytes": dedicated["head"]["sampled_peak_bytes"], "ratio": dedicated["ratio"],
                           "verdict": verdict, "native": native})
-        if len(slots) != 5:
+        if len(slots) != (len(targeted.CONTINUATION_MEMORY[case]) if name == targeted.MEMORY_CONTINUATION else 5):
             raise ValueError("incomplete original process-memory slot set")
         result["dedicated_process_memory"] = {"pairs": slots, "verdict": evidence.peak_verdict(slots), "ceiling": 1.02}
         verdicts.append(result["dedicated_process_memory"]["verdict"])

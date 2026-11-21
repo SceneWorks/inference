@@ -89,7 +89,7 @@ def compare_case(case, extension, observations):
 def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     if (backend not in LANES or not isinstance(value, dict)
             or set(value) not in ({"selection", "base", "policy"}, {"selection", "base", "policy", "followup"})
-            or value["selection"] not in allowed or ("followup" in value and value["followup"] not in (followup.NAME, targeted.NAME))):
+            or value["selection"] not in allowed or ("followup" in value and value["followup"] not in (followup.NAME, *targeted.DIAGNOSTICS))):
         raise ValueError("expected a fixed video Tier 1 proof selection")
     selection = value["selection"]
     base = BASE if selection == SELECTION else cohorts.VIDEO_BASE
@@ -102,8 +102,15 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     extra_contract = {}
     if "followup" in value:
         cases, engine_head, extension = followup.bind(head, backend, selection, tracked, value["policy"])
-        if value["followup"] == targeted.NAME:
+        if value["followup"] in targeted.DIAGNOSTICS:
             cases, extension = targeted.bind(head, backend, selection, tracked, extension)
+            if value["followup"] in targeted.CONTINUATIONS:
+                cases, extension = targeted.continuation(value["followup"], selection, extension)
+                if value["followup"] == targeted.TIMING_CONTINUATION:
+                    extension["conditioning_module_sha256"] = hashlib.sha256(tracked(head, targeted.CONDITIONING_TEMPLATE)).hexdigest()
+                else:
+                    retry = tracked(head, "scripts/ci/scail_plural/wddm_retry.py")
+                    extension["same_tick_retry_sha256"] = hashlib.sha256(retry).hexdigest()
         subprocess.run(["git", "merge-base", "--is-ancestor", base, engine_head], cwd=ROOT, check=True)
         subprocess.run(["git", "merge-base", "--is-ancestor", engine_head, head], cwd=ROOT, check=True)
         if (paired.git(ROOT, "rev-parse", engine_head + "^{tree}") != extension["historical_head_tree"]
@@ -124,7 +131,7 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
         raise ValueError("video Tier 1 CUDA requires a GPU reserve and caps its child at 12 GiB")
     reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
     budget = (1 + len(phases(cases, extension))) * policy.deadline_seconds + reserve
-    if extension and extension["name"] == targeted.NAME:
+    if extension and extension["name"] in targeted.DIAGNOSTICS:
         # Two bounded clock queries outside each timing child, inside the claim.
         timing_roles = sum(1 for case in cases for _, _, _, repeats in schedule(case, extension) if repeats > 1)
         budget += timing_roles * 2 * targeted.CLOCK_TIMEOUT
@@ -162,7 +169,7 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
         raw = tracked(rev, "rust-toolchain.toml")
         toolchains[arm] = {"declaration_sha256": hashlib.sha256(raw).hexdigest(),
                            "channel": tomllib.loads(raw.decode())["toolchain"]["channel"]}
-    module_hashes = {arm: overlay_hashes(head, backend, arm, cases, selection, engine_head=engine_head) for arm in ARMS}
+    module_hashes = {arm: overlay_hashes(head, backend, arm, cases, selection, engine_head=engine_head, extension=extension) for arm in ARMS}
     return {"runner": LANES[backend], "asset_setup": selection, "backend": backend,
             "base": base, "base_tree": paired.git(ROOT, "rev-parse", base + "^{tree}"),
             "head": engine_head, "head_tree": paired.git(ROOT, "rev-parse", engine_head + "^{tree}"), "request": value, **extra_contract,
@@ -235,10 +242,24 @@ def overlay_source(head, backend, arm):
     return blob.replace(token, argument)
 
 
-def overlay_hashes(head, backend, arm, cases, selection, *, engine_head=None):
+def compiled_overlay(head, backend, arm, model, engine_head, extension):
+    module, blob, edits = cohorts.overlay_files(head, backend, arm, model, tracked, overlay_source, engine_head=engine_head)
+    if extension and extension["name"] in targeted.CONTINUATIONS:
+        previous = extension["prior_targeted"]["measured_targets"][arm][model]
+        if hashlib.sha256(blob).hexdigest() != previous["module_sha256"]:
+            raise ValueError("fixture differs from the module used by the historical executable")
+        if extension["name"] == targeted.TIMING_CONTINUATION:
+            if blob.count(b"pair.measure(") != 1:
+                raise ValueError("expected one call to the unmodified historical measurement helper")
+            wrapper = tracked(head, targeted.CONDITIONING_TEMPLATE)
+            blob = blob.replace(b"pair.measure(", b"pair.measure_conditioned(") + b"\n" + wrapper
+    return module, blob, edits
+
+
+def overlay_hashes(head, backend, arm, cases, selection, *, engine_head=None, extension=None):
     checksums = {}
     for model in cohorts.models(cases):
-        module, blob, edits = cohorts.overlay_files(head, backend, arm, model, tracked, overlay_source, engine_head=engine_head)
+        module, blob, edits = compiled_overlay(head, backend, arm, model, engine_head, extension)
         if selection == SELECTION:
             return hashlib.sha256(blob).hexdigest()
         for path, data in {module: blob, **edits}.items():
@@ -258,7 +279,8 @@ def checkout_and_overlay(work, contract, arm):
     hashes = {}
     changed = set()
     for model in cohorts.models(contract["cases"]):
-        module, blob, edits = cohorts.overlay_files(contract.get("controller_revision", contract["head"]), backend, arm, model, tracked, overlay_source, engine_head=contract["head"])
+        module, blob, edits = compiled_overlay(contract.get("controller_revision", contract["head"]), backend, arm, model,
+                                              contract["head"], contract.get("followup"))
         entry = module.parent / "lib.rs"
         for path in (module, entry, *edits):
             proof.unlinked_path(root / path, root)
@@ -392,6 +414,10 @@ def evaluate(observed, case, backend, policy, settings, stdout, guard, cuda_pool
             or guard["peak_host_bytes"] > policy.child_footprint_cap_bytes
             or guard["admission"]["policySha256"] != policy.sha256):
         raise ValueError("supervisor did not record an admitted bounded execution")
+    if settings.get("campaign") == targeted.TIMING_CONTINUATION:
+        targeted.verify_conditioning(observed["conditioning"], facts["samples"], case, guard["elapsed_seconds"])
+    if settings.get("campaign") == targeted.MEMORY_CONTINUATION:
+        targeted.verify_retry(guard, policy, adapter)
     validate_admission(guard["admission"], policy_sha256=policy.sha256)
     peaks = {"process_footprint_bytes": guard["peak_host_bytes"]}
     allocator_peak = observed["result"]["allocator_peak_bytes"]
@@ -439,7 +465,7 @@ def execute(args, contract):
                "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"],
                "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                "builds": {}, "fixtures": {}, "observations": {}, "execution_order": [], "comparisons": {}, "logs": {}}
-    diagnostic = contract["request"].get("followup") == targeted.NAME
+    diagnostic = contract["request"].get("followup") in targeted.DIAGNOSTICS
     completed_comparison = False
     if diagnostic:
         receipt.update(eligible_for_domain_reuse=False, final_fixtures={})
@@ -499,13 +525,15 @@ def execute(args, contract):
                     if repeats == followup.CALLS:
                         env["VIDEO_TIER1_GROUPED_TIMING"] = "1"
                     diagnostics = None
-                    if contract["request"].get("followup") == targeted.NAME and repeats > 1:
+                    if contract["request"].get("followup") in targeted.DIAGNOSTICS and repeats > 1:
                         env["VIDEO_TIER1_GROUPED_TIMING"] = "targeted-cuda"
                         diagnostics = {"before": targeted.clock_snapshot(policy.cuda_device_uuid)}
                     out = work / name
                     started = time.monotonic_ns()
                     latest = last_start - (targeted.CLOCK_TIMEOUT if diagnostics is not None else 0)
+                    memory_retry = contract["request"].get("followup") == targeted.MEMORY_CONTINUATION
                     paired.invoke(binary, root, out, env, policy, lease_env, last_child_start=latest,
+                                  observer=targeted.DedicatedRetryObserver if memory_retry else None,
                                   arguments=(cohorts.FQN[model], "--exact", "--ignored", "--nocapture", "--test-threads=1"),
                                   capture_cuda_basis=True, dedicated_adapter=adapter)
                     ended = time.monotonic_ns()
@@ -515,12 +543,14 @@ def execute(args, contract):
                         order["clock_diagnostics"] = diagnostics
                     receipt["execution_order"].append(order)
                     observed = read_observed(out, case)
+                    if contract["request"].get("followup") == targeted.TIMING_CONTINUATION:
+                        observed["conditioning"] = json.loads(evidence.owned_file(out, "conditioning.json", 16 * 1024).read_bytes())
                     info = {"observed": observed}
                     guard = json.loads(evidence.owned_file(out, "supervisor.json", 16 * MIB).read_bytes())
                     pool = (json.loads(evidence.owned_file(out, "cuda-pool.json", 4096).read_bytes())
                             if backend == "candle-cuda" else None)
                     stdout = evidence.owned_file(out, "stdout.log", policy.stdout_cap_bytes).read_text(encoding="utf-8")
-                    info["result"] = evaluate(observed, case, backend, policy, dict(SETTINGS, samples_per_child=repeats),
+                    info["result"] = evaluate(observed, case, backend, policy, dict(SETTINGS, samples_per_child=repeats, campaign=contract["request"].get("followup")),
                                               stdout, guard, pool, adapter)
                     receipt["observations"][name] = info
                     results[name] = info["result"]
@@ -705,7 +735,7 @@ def verify_execution_order(actual, contract, *, complete):
         start, end = measurement["start_ns"], measurement["end_ns"]
         if not (evidence.positive_int(start) and evidence.positive_int(end) and previous <= start < end):
             raise ValueError("overlapping or unordered process timings")
-        if extension and extension["name"] == targeted.NAME and "-timing-" in measurement["phase"]:
+        if extension and extension["name"] in targeted.DIAGNOSTICS and "-timing-" in measurement["phase"]:
             targeted.verify_clocks(measurement, contract["request"]["policy"]["cudaDeviceUuid"])
         previous = end
 
@@ -755,7 +785,7 @@ def verify(args, contract):
     if backend == "candle-cuda" and receipt.get("observations"):
         from scripts.ci import wddm_process_memory
         wddm_process_memory.validate_adapter(receipt.get("dedicated_adapter"), contract["request"]["policy"]["cudaDeviceUuid"])
-    diagnostic = contract["request"].get("followup") == targeted.NAME
+    diagnostic = contract["request"].get("followup") in targeted.DIAGNOSTICS
     complete = receipt["accepted"]
     if diagnostic:
         complete = diagnostic_reuse(receipt)
@@ -792,7 +822,7 @@ def verify(args, contract):
                     if filename not in logs:
                         raise ValueError("missing evidence for completed observation")
                     return (output / filename).read_text(encoding="utf-8")
-                observed = evaluate(row["observed"], case, backend, policy, dict(SETTINGS, samples_per_child=repeats), read("stdout.log"),
+                observed = evaluate(row["observed"], case, backend, policy, dict(SETTINGS, samples_per_child=repeats, campaign=contract["request"].get("followup")), read("stdout.log"),
                                     json.loads(read("supervisor.json")),
                                     json.loads(read("cuda-pool.json")) if backend == "candle-cuda" else None,
                                     receipt.get("dedicated_adapter"))
