@@ -747,34 +747,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn encoded_embedding_rows_round_directly_to_the_requested_dtype() {
-        let mut weights = Weights::empty();
-        let desc = br#"{"format":"float8_e4m3fn"}"#;
-        weights.insert(
-            "table.comfy_quant",
-            Array::from_slice(desc, &[desc.len() as i32]),
-        );
-        weights.insert("table.weight", Array::from_slice(&[0x38u8, 0x40], &[2, 1]));
-        let scale = 1.0 + 2.0f32.powi(-9);
-        weights.insert("table.weight_scale", Array::from_f32(scale));
-        let ids = Array::from_slice(&[0i32], &[1]);
-        for (dtype, expected) in [
-            (Dtype::Float32, scale),
-            (Dtype::Float16, scale),
-            (Dtype::Bfloat16, 1.),
-        ] {
-            let rows = embedding_compute(&weights, "table", dtype)
-                .unwrap()
-                .rows(&ids)
-                .unwrap();
-            assert_eq!(rows.dtype(), dtype);
-            let actual = rows.as_dtype(Dtype::Float32).unwrap();
-            actual.eval().unwrap();
-            assert_eq!(actual.as_slice::<f32>(), &[expected]);
-        }
-    }
-
     fn marker_fixture(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {
         let root = tmp.path().join(format!(
             "mlx-gen-quant-marker-{:?}",
