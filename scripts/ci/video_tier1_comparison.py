@@ -20,6 +20,7 @@ from scripts.ci import flux1_comparison as paired
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci import video_tier1_cohorts as cohorts
 from scripts.ci import video_tier1_evidence as evidence
+from scripts.ci import video_tier1_followup as followup
 from scripts.ci.flux1_pair.fixture import sha
 from scripts.ci.model_proof_resources import execution_claim
 from scripts.media_campaign_supervisor import load_policy, validate_admission
@@ -47,7 +48,9 @@ def tracked(revision, path):
     return subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=ROOT)
 
 
-def protocol(selection):
+def protocol(selection, extension=None):
+    if extension:
+        return selection + "-" + followup.NAME
     return "wan-curated-tier1-v2" if selection == SELECTION else selection + "-v1"
 
 
@@ -55,20 +58,36 @@ def seal_name(selection):
     return "WAN_PAIR_RECEIPT_SHA256" if selection == SELECTION else "VIDEO_PAIR_RECEIPT_SHA256"
 
 
+def schedule(case, extension=None):
+    groups = followup.groups(case) if extension else (("", range(1, SETTINGS["pairs"] + 1), 1),)
+    for group, slots, repeats in groups:
+        for slot in slots:
+            order = ARMS if slot % 2 else ARMS[::-1]
+            prefix = f"{case}-{group}" if group else case
+            for arm in order:
+                yield slot, arm, f"{prefix}-p{slot}-{arm}", repeats
+
+
 def measurements(case):
-    for index in range(SETTINGS["pairs"]):
-        order = ARMS if index % 2 == 0 else ARMS[::-1]
-        for arm in order:
-            yield index, arm, f"{case}-p{index + 1}-{arm}"
+    for slot, arm, name, _ in schedule(case):
+        yield slot - 1, arm, name
 
 
-def phases(cases):
-    return tuple(name for case in cases for _, _, name in measurements(case))
+def phases(cases, extension=None):
+    return tuple(name for case in cases for _, _, name, _ in schedule(case, extension))
+
+
+def compare_case(case, extension, observations):
+    if extension:
+        return followup.compare(case, extension["retained"][case], observations, SETTINGS)
+    base, head = ([observations[name] for _, a, name, _ in schedule(case) if a == arm] for arm in ARMS)
+    return evidence.compare(base, head, SETTINGS)
 
 
 def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
-    if (backend not in LANES or not isinstance(value, dict) or set(value) != {"selection", "base", "policy"}
-            or value["selection"] not in allowed):
+    if (backend not in LANES or not isinstance(value, dict)
+            or set(value) not in ({"selection", "base", "policy"}, {"selection", "base", "policy", "followup"})
+            or value["selection"] not in allowed or ("followup" in value and value["followup"] != followup.NAME)):
         raise ValueError("expected a fixed video Tier 1 proof selection")
     selection = value["selection"]
     base = BASE if selection == SELECTION else cohorts.VIDEO_BASE
@@ -77,6 +96,17 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     cases = cohorts.cases(selection, backend)
     source = proof.repository_identity(head)
     subprocess.run(["git", "merge-base", "--is-ancestor", base, head], cwd=ROOT, check=True)
+    engine_head, extension = head, None
+    extra_contract = {}
+    if "followup" in value:
+        cases, engine_head, extension = followup.bind(head, backend, selection, tracked, value["policy"])
+        subprocess.run(["git", "merge-base", "--is-ancestor", base, engine_head], cwd=ROOT, check=True)
+        subprocess.run(["git", "merge-base", "--is-ancestor", engine_head, head], cwd=ROOT, check=True)
+        if (paired.git(ROOT, "rev-parse", engine_head + "^{tree}") != extension["historical_head_tree"]
+                or paired.git(ROOT, "rev-parse", base + "^{tree}") != extension["historical_base_tree"]):
+            raise ValueError("historical engine trees differ from the retained source contract")
+        subprocess.run(["git", "merge-base", "--is-ancestor", extension["reviewed_source"], head], cwd=ROOT, check=True)
+        extra_contract = {"followup": extension, "controller_revision": head, "controller_tree": source["tree"]}
     with TemporaryDirectory() as directory:
         path = Path(directory) / "policy.json"
         proof.write_json(path, value["policy"])
@@ -89,7 +119,7 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
     if backend == "candle-cuda" and (policy.child_gpu_cap_bytes > 12 * GIB or policy.gpu_free_reserve_bytes < GIB):
         raise ValueError("video Tier 1 CUDA requires a GPU reserve and caps its child at 12 GiB")
     reserve = paired.RELEASE_RESERVE_SECONDS + (policy.term_grace_millis + policy.poll_millis) / 1000
-    budget = (1 + len(phases(cases))) * policy.deadline_seconds + reserve
+    budget = (1 + len(phases(cases, extension))) * policy.deadline_seconds + reserve
     # Bind both the random generator and its production source-header capture before
     # resource scheduling. Reads only tracked Git objects during the hosted plan.
     directory = cohorts.DIRECTORY[selection]
@@ -120,14 +150,14 @@ def plan(backend, value, head, allowed=tuple(cohorts.CASES)):
             fixtures[case].update(depth=descriptor.depth, outer_steps=spec["outer_steps"],
                                   tensor_shape=spec["tensor_shape"], case_spec_sha256=evidence.canonical_hash(spec))
     toolchains = {}
-    for arm, rev in (("base", base), ("head", head)):
+    for arm, rev in (("base", base), ("head", engine_head)):
         raw = tracked(rev, "rust-toolchain.toml")
         toolchains[arm] = {"declaration_sha256": hashlib.sha256(raw).hexdigest(),
                            "channel": tomllib.loads(raw.decode())["toolchain"]["channel"]}
-    module_hashes = {arm: overlay_hashes(head, backend, arm, cases, selection) for arm in ARMS}
+    module_hashes = {arm: overlay_hashes(head, backend, arm, cases, selection, engine_head=engine_head) for arm in ARMS}
     return {"runner": LANES[backend], "asset_setup": selection, "backend": backend,
             "base": base, "base_tree": paired.git(ROOT, "rev-parse", base + "^{tree}"),
-            "head": source["revision"], "head_tree": source["tree"], "request": value,
+            "head": engine_head, "head_tree": paired.git(ROOT, "rev-parse", engine_head + "^{tree}"), "request": value, **extra_contract,
             "fixture_contracts": fixtures, "toolchain_contracts": toolchains, "fixture_inputs_sha256": inputs,
             "fixture_source_sha256": module_hashes, "cases": list(cases),
             "fqn": cohorts.FQN[cohorts.BY_NAME[cases[0]].model], "settings": SETTINGS,
@@ -197,10 +227,10 @@ def overlay_source(head, backend, arm):
     return blob.replace(token, argument)
 
 
-def overlay_hashes(head, backend, arm, cases, selection):
+def overlay_hashes(head, backend, arm, cases, selection, *, engine_head=None):
     checksums = {}
     for model in cohorts.models(cases):
-        module, blob, edits = cohorts.overlay_files(head, backend, arm, model, tracked, overlay_source)
+        module, blob, edits = cohorts.overlay_files(head, backend, arm, model, tracked, overlay_source, engine_head=engine_head)
         if selection == SELECTION:
             return hashlib.sha256(blob).hexdigest()
         for path, data in {module: blob, **edits}.items():
@@ -220,7 +250,7 @@ def checkout_and_overlay(work, contract, arm):
     hashes = {}
     changed = set()
     for model in cohorts.models(contract["cases"]):
-        module, blob, edits = cohorts.overlay_files(contract["head"], backend, arm, model, tracked, overlay_source)
+        module, blob, edits = cohorts.overlay_files(contract.get("controller_revision", contract["head"]), backend, arm, model, tracked, overlay_source, engine_head=contract["head"])
         entry = module.parent / "lib.rs"
         for path in (module, entry, *edits):
             proof.unlinked_path(root / path, root)
@@ -389,7 +419,7 @@ def execute(args, contract):
         raise ValueError("video paired proofs require the self-hosted resource lease")
     temporary = Path(os.environ["RUNNER_TEMP"])
     output = proof.owned_output(args.output, temporary)
-    receipt = {"protocol": protocol(selection), **contract, "accepted": False,
+    receipt = {"protocol": protocol(selection, contract.get("followup")), **contract, "accepted": False,
                "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"],
                "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                "builds": {}, "fixtures": {}, "observations": {}, "execution_order": [], "comparisons": {}, "logs": {}}
@@ -403,6 +433,12 @@ def execute(args, contract):
         adapter = None
         if backend == "candle-cuda":
             adapter = receipt["dedicated_adapter"] = cuda_adapter(policy)
+        if contract.get("followup"):
+            extension = contract["followup"]
+            if receipt["hardware"] != extension["prior_hardware"]:
+                raise ValueError("follow-up physical device or driver differs from the original job")
+            if adapter is not None and any(adapter != r["dedicated_adapter"] for r in extension["retained"].values()):
+                raise ValueError("follow-up counter differs from the retained physical adapter")
         paths = {}
         for case in contract["cases"]:
             descriptor = cohorts.BY_NAME[case]
@@ -411,6 +447,8 @@ def execute(args, contract):
                 cohorts.fixture(descriptor.model).make_fixture(path, case)
             paths[case] = path
             receipt["fixtures"][case] = inspect_fixture(path, case, contract["fixture_contracts"][case])
+            if contract.get("followup") and receipt["fixtures"][case] != contract["followup"]["retained"][case]["fixture"]:
+                raise ValueError("regenerated fixture differs from retained proof")
         builds = {}
         for arm in ARMS:
             root, binary, env, receipt["builds"][arm] = build(work, contract, arm, policy)
@@ -429,8 +467,8 @@ def execute(args, contract):
                              original_deadline_monotonic=deadline) as claim:
             receipt["physical_claim"] = claim
             for case in contract["cases"]:
-                results = {arm: [] for arm in ARMS}
-                for _, arm, name in measurements(case):
+                results = {}
+                for _, arm, name, repeats in schedule(case, contract.get("followup")):
                     model = cohorts.BY_NAME[case].model
                     root, binaries, build_environment = builds[arm]
                     binary = binaries[model]
@@ -438,6 +476,8 @@ def execute(args, contract):
                     prefix = "WAN" if selection == SELECTION else "VIDEO"
                     env.update({prefix + "_PAIR_CASE": case, prefix + "_PAIR_FIXTURE": str(paths[case]),
                                 "MODEL_INFERENCE_CASE_FQN": cohorts.FQN[model]})
+                    if repeats == followup.CALLS:
+                        env["VIDEO_TIER1_GROUPED_TIMING"] = "1"
                     out = work / name
                     started = time.monotonic_ns()
                     paired.invoke(binary, root, out, env, policy, lease_env, last_child_start=last_start,
@@ -451,10 +491,11 @@ def execute(args, contract):
                     pool = (json.loads(evidence.owned_file(out, "cuda-pool.json", 4096).read_bytes())
                             if backend == "candle-cuda" else None)
                     stdout = evidence.owned_file(out, "stdout.log", policy.stdout_cap_bytes).read_text(encoding="utf-8")
-                    info["result"] = evaluate(observed, case, backend, policy, SETTINGS, stdout, guard, pool, adapter)
+                    info["result"] = evaluate(observed, case, backend, policy, dict(SETTINGS, samples_per_child=repeats),
+                                              stdout, guard, pool, adapter)
                     receipt["observations"][name] = info
-                    results[arm].append(info["result"])
-                receipt["comparisons"][case] = evidence.compare(results["base"], results["head"], SETTINGS)
+                    results[name] = info["result"]
+                receipt["comparisons"][case] = compare_case(case, contract.get("followup"), results)
                 if receipt["fixtures"][case] != inspect_fixture(paths[case], case, contract["fixture_contracts"][case]):
                     raise ValueError("fixture content changed across the adjacent measurements")
         if not claim.get("post_execution_verified"):
@@ -466,7 +507,7 @@ def execute(args, contract):
         receipt["failure"] = proof.redact(str(error), dict(os.environ))
         raise
     finally:
-        errors = paired.retain_logs(work, output, receipt, phases(contract["cases"]))
+        errors = paired.retain_logs(work, output, receipt, phases(contract["cases"], contract.get("followup")))
         if errors:
             receipt.update(accepted=False, log_errors=errors)
         proof.write_json(output / "receipt.json", receipt)
@@ -520,6 +561,8 @@ def check_complete_provenance(receipt, contract):
     for case in contract["cases"]:
         observed = receipt["fixtures"][case]
         verify_fixture_identity(observed, contract["fixture_contracts"][case])
+        if contract.get("followup") and observed != contract["followup"]["retained"][case]["fixture"]:
+            raise ValueError("measured fixture differs from retained proof")
         if observed != shared_fixtures.setdefault(observed["variant"], observed):
             raise ValueError("cases sharing a frozen fixture used different bytes")
     claim = receipt["physical_claim"]
@@ -528,6 +571,8 @@ def check_complete_provenance(receipt, contract):
     with TemporaryDirectory() as directory:
         policy = read_policy(Path(directory), "policy.json", contract["request"]["policy"])
     hardware = receipt["hardware"]
+    if contract.get("followup") and hardware != contract["followup"]["prior_hardware"]:
+        raise ValueError("follow-up hardware differs from the retained job")
     if hardware != paired.hardware(backend, policy):
         raise ValueError("physical hardware differs from live runner")
     if backend == "mlx":
@@ -568,7 +613,7 @@ def check_complete_provenance(receipt, contract):
         for model in models:
             verify_target(targets[model], backend, model, arm)
     actual = receipt["execution_order"]
-    if not isinstance(actual, list) or [r.get("phase") for r in actual] != list(phases(contract["cases"])):
+    if not isinstance(actual, list) or [r.get("phase") for r in actual] != list(phases(contract["cases"], contract.get("followup"))):
         raise ValueError("measurement order differs from fixed adjacent counterbalanced pairs")
     previous = 0
     for measurement in actual:
@@ -589,7 +634,7 @@ def verify(args, contract):
     if hashlib.sha256(raw).hexdigest() != os.environ.get(seal_name(contract["request"]["selection"])):
         raise ValueError("artifact differs from supervisor receipt bound in this job")
     receipt = json.loads(raw)
-    if (receipt.get("protocol") != protocol(contract["request"]["selection"]) or type(receipt.get("accepted")) is not bool
+    if (receipt.get("protocol") != protocol(contract["request"]["selection"], contract.get("followup")) or type(receipt.get("accepted")) is not bool
             or any(receipt.get(k) != v for k, v in contract.items())
             or receipt.get("run_id") != os.environ["GITHUB_RUN_ID"]
             or receipt.get("run_attempt") != os.environ["GITHUB_RUN_ATTEMPT"]):
@@ -598,7 +643,7 @@ def verify(args, contract):
     limits = paired.retained_log_limits(contract["request"]["policy"])
     if backend == "candle-cuda":
         limits["cuda-pool.json"] = 4096
-    entries = {f"{phase}.{suffix}": cap for phase in phases(contract["cases"]) for suffix, cap in limits.items()}
+    entries = {f"{phase}.{suffix}": cap for phase in phases(contract["cases"], contract.get("followup")) for suffix, cap in limits.items()}
     logs = receipt["logs"]
     if not logs.keys() <= entries.keys() or set(p.name for p in output.iterdir()) != {"receipt.json", *logs}:
         raise ValueError("unexpected proof upload contents")
@@ -613,17 +658,18 @@ def verify(args, contract):
         check_complete_provenance(receipt, contract)
     required = {name for name in entries if not name.endswith(".guard.jsonl")}
     observations = receipt["observations"]
-    if not observations.keys() <= set(phases(contract["cases"])):
+    if not observations.keys() <= set(phases(contract["cases"], contract.get("followup"))):
         raise ValueError("unregistered observation")
     if receipt["accepted"] and (receipt.get("failure") or not required <= logs.keys()
-            or set(observations) != set(phases(contract["cases"])) or not receipt["physical_claim"]["post_execution_verified"]
+            or set(observations) != set(phases(contract["cases"], contract.get("followup"))) or not receipt["physical_claim"]["post_execution_verified"]
             or set(receipt["fixtures"]) != set(contract["cases"]) or set(receipt["comparisons"]) != set(contract["cases"])):
         raise ValueError("accepted comparison lacks logs, fixture identity, measurements or release")
     with TemporaryDirectory() as directory:
         policy = read_policy(Path(directory), "policy.json", contract["request"]["policy"])
         for case in contract["cases"]:
-            results = {arm: [] for arm in ARMS}
-            for _, arm, name in measurements(case):
+            results = {}
+            expected_schedule = list(schedule(case, contract.get("followup")))
+            for _, arm, name, repeats in expected_schedule:
                 row = observations.get(name)
                 if row is None or "result" not in row:
                     if receipt["accepted"]:
@@ -634,15 +680,15 @@ def verify(args, contract):
                     if filename not in logs:
                         raise ValueError("missing evidence for completed observation")
                     return (output / filename).read_text(encoding="utf-8")
-                observed = evaluate(row["observed"], case, backend, policy, SETTINGS, read("stdout.log"),
+                observed = evaluate(row["observed"], case, backend, policy, dict(SETTINGS, samples_per_child=repeats), read("stdout.log"),
                                     json.loads(read("supervisor.json")),
                                     json.loads(read("cuda-pool.json")) if backend == "candle-cuda" else None,
                                     receipt.get("dedicated_adapter"))
                 if observed != row["result"]:
                     raise ValueError("recorded measurements differ from raw observations")
-                results[arm].append(observed)
-            if all(len(arm) == SETTINGS["pairs"] for arm in results.values()):
-                result = evidence.compare(results["base"], results["head"], SETTINGS)
+                results[name] = observed
+            if len(results) == len(expected_schedule):
+                result = compare_case(case, contract.get("followup"), results)
                 if receipt["comparisons"].get(case) != result or (receipt["accepted"] and not result["accepted"]):
                     raise ValueError("unverified paired conclusion")
 

@@ -24,8 +24,7 @@ impl Pair {
         })
     }
 
-    // The supervisor pairs fresh processes. This process returns one synchronized
-    // measurement after its own warmup on the exact same tensors and solver.
+    // Every call uses the same live model, inputs and synchronized denoise boundary.
     fn measure(
         &self,
         initial: Vec<f32>,
@@ -66,7 +65,18 @@ impl Pair {
             .copied()
             .eq(expected.iter().map(|&i| (i, STEPS as u64))));
         assert!(elapsed_ns > 0);
-        let samples = [json!({"elapsed_ns":elapsed_ns,"outer_steps":steps.last().unwrap().0})];
+        let completed = steps.last().unwrap().0;
+        let mut samples = vec![json!({"elapsed_ns":elapsed_ns,"outer_steps":completed})];
+        if env::var_os("VIDEO_TIER1_GROUPED_TIMING").is_some() {
+            for _ in 1..16 {
+                let (ns, next_trace, next_shape, next_values) = run()?;
+                assert!(ns > 0);
+                assert_eq!(next_trace, trace);
+                assert_eq!(next_shape, shape);
+                assert!(values.iter().map(|v| v.to_bits()).eq(next_values.iter().map(|v| v.to_bits())));
+                samples.push(json!({"elapsed_ns":ns,"outer_steps":completed}));
+            }
+        }
         let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
         assert_eq!(bytes.len(), initial_bytes.len());
         assert!(

@@ -169,6 +169,17 @@ fn curated_tier1() -> ProofResult<()> {
         .as_object_mut()
         .unwrap()
         .extend(model_settings.as_object().unwrap().clone());
+    let mut samples = vec![json!({"elapsed_ns":measured.elapsed_ns,"outer_steps":complete})];
+    if env::var_os("VIDEO_TIER1_GROUPED_TIMING").is_some() {
+        for _ in 1..16 {
+            let next = sweep::<false>(&model, &inputs, &job, &resource, &condition)?;
+            assert!(next.elapsed_ns > 0 && next.trace.is_empty());
+            assert_eq!(next.completed, complete);
+            assert_eq!(next.initial, measured.initial);
+            assert_eq!(next.terminal, measured.terminal);
+            samples.push(json!({"elapsed_ns":next.elapsed_ns,"outer_steps":complete}));
+        }
+    }
     let peak = peak(&pair)?;
     assert!(peak > 0 && measured.elapsed_ns > 0);
     fs::write(pair.out.join("state-0.f32"), &measured.initial)?;
@@ -180,7 +191,7 @@ fn curated_tier1() -> ProofResult<()> {
         pair.out.join("result.json"),
         serde_json::to_vec(&json!({
             "case":pair.case,"trace":diagnostic.trace,"settings":settings,"tensor_shape":[count,16,2,4,8],
-            "warmups":1,"samples":[{"elapsed_ns":measured.elapsed_ns,"outer_steps":complete}],"allocator_peak_bytes":peak
+            "warmups":1,"samples":samples,"allocator_peak_bytes":peak
         }))?,
     )?;
     println!("\nMODEL_INFERENCE_BODY_COMPLETED {FQN}");

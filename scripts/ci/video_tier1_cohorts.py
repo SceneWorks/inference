@@ -68,11 +68,11 @@ def package(backend, model):
     return ("mlx-gen-" if backend == "mlx" else "candle-gen-") + model
 
 
-def overlay_files(head, backend, arm, model, tracked, wan_source):
+def overlay_files(head, backend, arm, model, tracked, wan_source, *, engine_head=None):
     """The shared checkout writes only these fixed targets. All inputs come from Git blobs."""
     src = PurePosixPath("crates", "media", "mlx-gen" if backend == "mlx" else "candle-gen",
                         package(backend, model), "src")
-    revision = head if arm == "head" else VIDEO_BASE
+    revision = (engine_head or head) if arm == "head" else VIDEO_BASE
     if model == "scail2":
         from scripts.ci.scail_pair import overlay
         module = src / "scail_pair_fixture.rs"
