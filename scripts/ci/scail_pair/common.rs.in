@@ -82,4 +82,5 @@ struct Sweep {
     terminal: Vec<u8>,
     trace: Vec<Value>,
     elapsed_ns: u64,
+    completed: u32,
 }

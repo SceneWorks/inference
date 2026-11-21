@@ -79,9 +79,11 @@ def case_spec(case):
     repl = "replacement" in case
     count = 2 if repl else 1
     n = 2 if repl else 0
+    solver = ("mlx_gen_wan::scheduler::" + ("FlowDpmpp2m" if repl else "FlowUniPC")
+              if mlx else "FlowScheduler::UniPC")
     settings = {"seed": SEED, "steps": 4, "shift": 5.0, "guidance": 5.0,
                 "requested_sampler": "dpm++" if repl else "unipc",
-                "effective_sampler": "Dpmpp2m" if mlx and repl else "UniPC",
+                "effective_sampler": solver,
                 "replace": repl, "extra_references": n, "width": 64, "height": 32,
                 "frames": 9 if repl else 5, "segment_len": 5, "segment_overlap": 1,
                 "weight_dtype": "BF16", "compute_dtype": "F32", "depth": 1, "width_channels": 5120,
@@ -103,7 +105,7 @@ def case_spec(case):
         ([1, 2, 4], [n, 120 if repl else 0, 0], False),
         ([2, 2, 4], [n+1, 0, 0], False), ([2, 2, 4], [n+1, 0, 120], True)]
     for seg in range(count):
-        trace.append({"event": "window", "start": 4*seg, "end": 4*seg+5, "seed": SEED+seg})
+        trace.append({"event": "window", "start": 4*seg, "end": 4*seg+5, "seed": SEED+seg, "scheduler": solver})
         for i in range(4):
             for arm in ("positive", "negative"):
                 trace.append({"event": "forward", "context": arm, "history": bool(seg), "t_bits": timesteps[i]})

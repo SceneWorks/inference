@@ -6,6 +6,7 @@ fn sweep<const OBSERVE: bool>(
     condition: &Conditioning,
 ) -> ProofResult<Sweep> {
     let segments = @SEGMENTS@;
+    let total_steps = u32::try_from(job.steps * segments.len())?;
     let trace = RefCell::new(Vec::new());
     let cancel = &CancelFlag::default();
     let mut sweep = Sweep::default();
@@ -27,15 +28,13 @@ fn sweep<const OBSERVE: bool>(
         };
         let on_progress = &mut |event| {
             if let Progress::Step { current, total } = event {
-                trace
-                    .borrow_mut()
-                    .push(json!({"event":"step","current":current,"total":total}));
+                sweep.completed += 1;
+                assert_eq!((current, total), (sweep.completed, total_steps));
+                if OBSERVE {
+                    trace.borrow_mut().push(json!({"event":"step","current":current,"total":total}));
+                }
             }
         };
-        trace
-            .borrow_mut()
-            .push(json!({"event":"window","start":seg_start,"end":seg_end,
-                                      "seed":job.seed.wrapping_add(seg_idx as u64)}));
         let (lat_t, lat_h, lat_w) = (
             shape(&pose_latent)[1],
             shape(&condition.ref_latent)[2],
@@ -44,6 +43,12 @@ fn sweep<const OBSERVE: bool>(
         @BINDINGS@
         @CFG@
         sync(resource)?;
+        let seed = std::cell::Cell::new(None);
+        let mut solver: Option<String> = None;
+        let record_seed = |value: u64| {
+            if OBSERVE { seed.set(Some(value)); }
+            value
+        };
         let start = Instant::now();
         let mut initial_sample = None;
         let (initial, latent) = (|| -> NativeResult<(State, State)> {
@@ -137,14 +142,11 @@ fn curated_tier1() -> ProofResult<()> {
     let measured = sweep::<false>(&model, &inputs, &job, &resource, &condition)?;
     assert_eq!(diagnostic.initial, measured.initial);
     assert_eq!(diagnostic.terminal, measured.terminal);
-    let events = diagnostic
-        .trace
-        .iter()
-        .filter(|e| matches!(e["event"].as_str(), Some("window" | "step")));
-    assert!(events.eq(measured.trace.iter()));
-    let complete = measured.trace.last().unwrap()["current"].as_u64().unwrap();
+    let complete = measured.completed;
     let count = if replacement { 2 } else { 1 };
     assert_eq!(complete, 4 * count);
+    assert_eq!(diagnostic.completed, complete);
+    assert!(measured.trace.is_empty());
     if replacement {
         // Independently verify the serialized layout and the selected previous
         // tail. A self-consistent reuse of the wrong history cell must fail.
@@ -159,7 +161,7 @@ fn curated_tier1() -> ProofResult<()> {
         }
     }
     let mut settings = json!({"seed":job.seed,"steps":job.steps,"shift":job.shift,"guidance":job.guidance,
-        "requested_sampler":requested,"effective_sampler":format!("{:?}",job.sampler),"replace":job.replace_flag,
+        "requested_sampler":requested,"effective_sampler":diagnostic.trace[0]["scheduler"],"replace":job.replace_flag,
         "extra_references":job.additional.len(),"width":job.width,"height":job.height,"frames":frames.len(),
         "segment_len":job.segment_len,"segment_overlap":job.segment_overlap,
         "text_shape":shape(&condition.context),"clip_shape":shape(&condition.clip_fea)});

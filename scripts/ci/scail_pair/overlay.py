@@ -14,6 +14,15 @@ BASE_DENOISE = {
     "candle-cuda": "d5e271e2a7c9506d90534e2c9225923d02adc38a7dd7611e5544945f1e309f65",
 }
 
+CANDLE_SAMPLER_READBACK = """
+#[cfg(feature = "model-inference-proof")]
+impl FlowScheduler {
+    pub fn scail_pair_sampler(&self) -> Sampler {
+        self.sampler
+    }
+}
+"""
+
 
 def _git(revision, path):
     return subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=ROOT).decode()
@@ -140,6 +149,46 @@ def render(read, params, backend, arm):
     module = _once(module, "@BINDINGS@", bindings)
     module = _once(module, "@CFG@", prep)
     digest = _digest(body)
+    # Bind the diagnostic to the original RNG argument, regardless of where the
+    # segment seed was derived. Both monomorphizations pass the value through.
+    rng_arg = (r"(random::key\()([^;]+?)(\)\?;)" if mlx else
+               r"(candle_gen_wan::pipeline::create_noise\(\s*)([^,]+?)(\s*,)")
+    body, n = re.subn(rng_arg, r"\1record_seed(\2)\3", body)
+    if n != 1:
+        raise ValueError("expected one native RNG seed argument")
+    if mlx:
+        # Scheduler trait objects erase their concrete type. In the diagnostic
+        # instantiation retain the type at the native factory's Box::new calls.
+        scheduler = read("crates/media/mlx-gen/mlx-gen-wan/src/scheduler.rs")
+        factory = _span(scheduler, "pub fn make_scheduler(", "\n}\n") + "\n}"
+        factory = _once(factory, "pub fn make_scheduler(kind:",
+                        "fn observed_scheduler(witness: &mut Option<String>, kind:")
+        factory = _once(factory, "    match kind {", """
+    use mlx_gen_wan::scheduler::{FlowDpmpp2m, FlowMatchEuler, FlowUniPC};
+    fn boxed<T: WanScheduler + 'static>(s: T, witness: &mut Option<String>) -> Box<dyn WanScheduler> {
+        *witness = Some(std::any::type_name::<T>().to_owned());
+        Box::new(s)
+    }
+    match kind {""")
+        factory, n = re.subn(r"=> Box::new\((Flow\w+::new\([^()]+\))\),",
+                             r"=> boxed(\1, witness),", factory)
+        if n != 3:
+            raise ValueError("expected three native concrete MLX scheduler constructors")
+        module = _once(module, "@FACTORY@", factory)
+        constructor = "make_scheduler(job.sampler, NUM_TRAIN_TIMESTEPS)"
+        body = _once(body, constructor, "if OBSERVE { observed_scheduler(&mut solver, job.sampler,"
+                     " NUM_TRAIN_TIMESTEPS) } else { " + constructor + " }")
+    else:
+        constructor = "let mut sched = FlowScheduler::new(job.sampler, job.steps, job.shift);"
+        body = _once(body, constructor, constructor + """
+        if OBSERVE { solver = Some(format!("FlowScheduler::{:?}", sched.scail_pair_sampler())); }""")
+    boundary = "let mut latent = apply_clean_history(" if arm == "base" else "let latent = denoise_segment("
+    body = _once(body, boundary, """
+        if OBSERVE {
+            trace.borrow_mut().push(json!({"event":"window","start":seg_start,"end":seg_end,
+                "seed":seed.get().expect("native RNG draw"),"scheduler":solver.take().expect("native solver")}));
+        }
+        """ + boundary)
     # Capture the actual first scheduler sample (a retained handle only). On the
     # untimed diagnostic sweep inspect every subsequent scheduler sample as well:
     # the pre-forward clean-history rewrite cannot mask a missing post-step pin.
@@ -160,6 +209,8 @@ def render(read, params, backend, arm):
     changes = {src+"generate.rs": generate + '\n#[cfg(test)]\n#[path = "scail_pair_fixture.rs"]\npub(crate) mod scail_pair_fixture;\n',
                src+"model.rs": model + _observed_model(model, mlx)}
     if not mlx:
+        scheduler = "crates/media/candle-gen/candle-gen-wan/src/scheduler.rs"
+        changes[scheduler] = read(scheduler) + CANDLE_SAMPLER_READBACK
         pipeline = src+"pipeline.rs"
         changes[pipeline] = read(pipeline) + '''
 #[cfg(test)]

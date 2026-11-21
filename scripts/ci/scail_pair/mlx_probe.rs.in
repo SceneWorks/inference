@@ -54,4 +54,7 @@ fn load(pair: &Pair) -> ProofResult<(Scail2Dit, Inputs, Resource, Value)> {
     ))
 }
 
+use mlx_gen_wan::scheduler::WanScheduler;
+@FACTORY@
+
 @RUN@
