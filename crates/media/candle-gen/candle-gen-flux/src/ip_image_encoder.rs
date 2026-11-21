@@ -153,7 +153,7 @@ mod tests {
             w.require("vision_model.post_layernorm.bias").unwrap(),
             LN_EPS,
         );
-        let visual_projection = Linear::new(w.require("visual_projection.weight").unwrap(), None);
+        let visual_projection = w.linear("visual_projection", false).unwrap();
         let enc = FluxIpImageEncoder {
             encoder,
             post_ln,

@@ -1,5 +1,28 @@
 //! Recurrent Neural Networks
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use candle::{DType, Device, IndexOp, Module, Result, Tensor};
+
+/// PyTorch gate matrices use names such as `weight_ih_l0`. An authored projection may also
+/// expose the same gate as a module with a `.weight` leaf. Preserve the supplied initialization
+/// for ordinary training builders, and retain checkpoint operands as a single fused gate GEMM.
+fn gate_projection(
+    vb: &crate::VarBuilder,
+    shape: (usize, usize),
+    key: &str,
+    init: crate::Init,
+) -> Result<crate::Linear> {
+    let module_weight = format!("{key}.weight");
+    let key = if vb.contains_tensor(&module_weight) {
+        module_weight.as_str()
+    } else {
+        key
+    };
+    Ok(
+        match vb.native_linear_weight_with_shape(key, Some(shape))? {
+            Some(native) => crate::Linear::from_native(native, None),
+            None => crate::Linear::new(vb.get_with_hints(shape, key, init)?, None),
+        },
+    )
+}
 
 /// Trait for Recurrent Neural Networks.
 #[allow(clippy::upper_case_acronyms)]
@@ -119,8 +142,8 @@ impl LSTMConfig {
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug)]
 pub struct LSTM {
-    w_ih: Tensor,
-    w_hh: Tensor,
+    w_ih: crate::Linear,
+    w_hh: crate::Linear,
     b_ih: Option<Tensor>,
     b_hh: Option<Tensor>,
     hidden_dim: usize,
@@ -142,12 +165,14 @@ impl LSTM {
             Direction::Forward => "",
             Direction::Backward => "_reverse",
         };
-        let w_ih = vb.get_with_hints(
+        let w_ih = gate_projection(
+            &vb,
             (4 * hidden_dim, in_dim),
             &format!("weight_ih_l{layer_idx}{direction_str}"), // Only a single layer is supported.
             config.w_ih_init,
         )?;
-        let w_hh = vb.get_with_hints(
+        let w_hh = gate_projection(
+            &vb,
             (4 * hidden_dim, hidden_dim),
             &format!("weight_hh_l{layer_idx}{direction_str}"), // Only a single layer is supported.
             config.w_hh_init,
@@ -208,8 +233,8 @@ impl RNN for LSTM {
     }
 
     fn step(&self, input: &Tensor, in_state: &Self::State) -> Result<Self::State> {
-        let w_ih = input.matmul(&self.w_ih.t()?)?;
-        let w_hh = in_state.h.matmul(&self.w_hh.t()?)?;
+        let w_ih = self.w_ih.forward(input)?;
+        let w_hh = self.w_hh.forward(&in_state.h)?;
         let w_ih = match &self.b_ih {
             None => w_ih,
             Some(b_ih) => w_ih.broadcast_add(b_ih)?,
@@ -289,8 +314,8 @@ impl GRUConfig {
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug)]
 pub struct GRU {
-    w_ih: Tensor,
-    w_hh: Tensor,
+    w_ih: crate::Linear,
+    w_hh: crate::Linear,
     b_ih: Option<Tensor>,
     b_hh: Option<Tensor>,
     hidden_dim: usize,
@@ -307,12 +332,14 @@ impl GRU {
         config: GRUConfig,
         vb: crate::VarBuilder,
     ) -> Result<Self> {
-        let w_ih = vb.get_with_hints(
+        let w_ih = gate_projection(
+            &vb,
             (3 * hidden_dim, in_dim),
             "weight_ih_l0", // Only a single layer is supported.
             config.w_ih_init,
         )?;
-        let w_hh = vb.get_with_hints(
+        let w_hh = gate_projection(
+            &vb,
             (3 * hidden_dim, hidden_dim),
             "weight_hh_l0", // Only a single layer is supported.
             config.w_hh_init,
@@ -361,8 +388,8 @@ impl RNN for GRU {
     }
 
     fn step(&self, input: &Tensor, in_state: &Self::State) -> Result<Self::State> {
-        let w_ih = input.matmul(&self.w_ih.t()?)?;
-        let w_hh = in_state.h.matmul(&self.w_hh.t()?)?;
+        let w_ih = self.w_ih.forward(input)?;
+        let w_hh = self.w_hh.forward(&in_state.h)?;
         let w_ih = match &self.b_ih {
             None => w_ih,
             Some(b_ih) => w_ih.broadcast_add(b_ih)?,

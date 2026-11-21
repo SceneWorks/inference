@@ -3,7 +3,7 @@
 //! builds and asserts the pixels are byte-identical:
 //!
 //! * **A (in place):** the tree's `vae/qwen_image_vae.safetensors` (native WAN-VAE keys) loaded via
-//!   [`crate::comfyui::remap_vae_wan_to_diffusers`] + `VarBuilder::from_tensors` — the sc-10830 path.
+//!   [`candle_gen::comfyui_vae::remap_vae_wan_to_diffusers`] + `VarBuilder::from_tensors` — the sc-10830 path.
 //! * **B (snapshot):** a diffusers-format Qwen-Image `vae/` dir mmapped the way the registry lane
 //!   loads it (`sorted_safetensors` → `mmap_var_builder`).
 //!
@@ -35,7 +35,8 @@ use crate::ENC_DTYPE;
 fn load_inplace(native_file: &std::path::Path, device: &Device) -> QwenVae {
     let map = candle_gen::candle_core::safetensors::load(native_file, &Device::Cpu)
         .expect("load native WAN-VAE safetensors");
-    let map = crate::comfyui::remap_vae_wan_to_diffusers(map).expect("remap native WAN-VAE keys");
+    let map = candle_gen::comfyui_vae::remap_vae_wan_to_diffusers(map)
+        .expect("remap native WAN-VAE keys");
     let vb = VarBuilder::from_tensors(map, ENC_DTYPE, device);
     QwenVae::new(vb).expect("build QwenVae from in-place remapped VAE")
 }

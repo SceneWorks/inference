@@ -57,6 +57,7 @@
 //!   one accepted sampler difference (DDIM eta=0 vs the adapter's euler_ancestral) is the sc-3673
 //!   launch-portable-determinism choice. Parity is locked by `tests/conformance.rs::realvisxl_conformance`.
 
+use gen_core_family::sdxl_ldm::SdxlComponent;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -750,17 +751,17 @@ impl Pipeline {
         // packed — every Linear (attn q/k/v/out_proj, MLP fc1/fc2) loads straight from the packed parts —
         // and the stock dense builder otherwise (byte-identical, pinned by the vendored-vs-stock parity
         // test). The `group_size` is threaded from the component config (sc-9410).
-        let ldm_map = self.ldm.as_ref().map(|components| match which {
-            Clip::L => &components.clip_l,
-            Clip::BigG => &components.clip_bigg,
-        });
-        let text_model: CandleModule = if let Some(map) = ldm_map {
+        let text_model: CandleModule = if let Some(ldm) = &self.ldm {
+            let component = match which {
+                Clip::L => SdxlComponent::ClipL,
+                Clip::BigG => SdxlComponent::ClipBigG,
+            };
             let tower = if let Some(quant) = self.quant {
                 // Stage the dense fused CLIP map in system RAM, then fold each projection directly
                 // onto the compute device. Building the tower on the accelerator first would require
                 // the dense tier to fit before Q4/Q8 could make it smaller.
                 let cpu = Device::Cpu;
-                let vb = VarBuilder::from_tensors(map.clone(), self.dtype, &cpu);
+                let vb = ldm.builder(component, self.dtype, &cpu);
                 let mut tower = crate::clip::ClipTextTransformer::new_gs(
                     vb,
                     &which.vendored_config(),
@@ -769,7 +770,7 @@ impl Pipeline {
                 tower.quantize_onto(quant, &self.device)?;
                 tower
             } else {
-                let vb = VarBuilder::from_tensors(map.clone(), self.dtype, &self.device);
+                let vb = ldm.builder(component, self.dtype, &self.device);
                 crate::clip::ClipTextTransformer::new_gs(
                     vb,
                     &which.vendored_config(),
@@ -794,7 +795,7 @@ impl Pipeline {
                     // safetensors load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it
                     // halves the text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change.
                     // The embeddings are cast to `dtype` below.
-                    let stock = stable_diffusion::build_clip_transformer(
+                    let stock = crate::loaders::load_stock_clip(
                         clip_cfg,
                         snapshot_file(&self.root, weights_sub)?,
                         &self.device,
@@ -861,27 +862,25 @@ impl Pipeline {
         // Linear weights. Detect it and load the vendored packed-detecting UNet straight from the packed
         // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
         let unet = if let Some(ldm) = &self.ldm {
-            let mut raw = ldm.unet.clone();
-            let table = crate::adapters::build_sdxl_kohya_table(&raw);
             let cpu = Device::Cpu;
             let build_device = if self.quant.is_some() {
                 &cpu
             } else {
                 &self.device
             };
-            let vs = VarBuilder::from_tensors(raw.clone(), self.dtype, build_device);
+            let vs = ldm.builder(SdxlComponent::Unet, self.dtype, build_device);
             let mut vendored = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
             if !self.adapters.is_empty() {
                 let linear = crate::adapters::install_additive(
                     &mut vendored,
                     &self.adapters,
-                    &table,
+                    &ldm.kohya_targets,
                     build_device,
                 )?;
                 let conv = crate::adapters::install_additive_conv(
                     &mut vendored,
                     &self.adapters,
-                    &table,
+                    &ldm.kohya_targets,
                     build_device,
                 )?;
                 crate::adapters::guard_each_adapter_matched(
@@ -892,7 +891,6 @@ impl Pipeline {
             if let Some(quant) = self.quant {
                 vendored.quantize_onto(quant, &self.device)?;
             }
-            raw.clear();
             SdxlUnet::Vendored(Arc::new(vendored))
         } else {
             match self.detect_packed_unet()? {
@@ -921,8 +919,7 @@ impl Pipeline {
                         // than the fused kernel — so the old stock fold path is retired and adapted renders
                         // always take the i32-overflow-safe vendored math path.
                         let unet =
-                            self.config
-                                .build_unet(unet_file, &self.device, 4, true, self.dtype)?;
+                            crate::loaders::load_flash_unet(unet_file, &self.device, self.dtype)?;
                         SdxlUnet::Stock(Arc::new(unet))
                     } else {
                         // Math-path attention (the default — no `flash-attn` feature — AND every adapted
@@ -950,7 +947,7 @@ impl Pipeline {
             // A generic fused A1111 checkpoint may carry the original SDXL VAE, whose fp16 decode is
             // numerically unstable. Consume the checkpoint's own VAE truthfully, but keep it at f32;
             // `decode_image` casts the latent at this boundary.
-            let vs = VarBuilder::from_tensors(ldm.vae.clone(), DType::F32, &self.device);
+            let vs = ldm.builder(SdxlComponent::Vae, DType::F32, &self.device);
             SdxlVaeDecoder::new(vs, 3, &sdxl_vae_config())?
         } else {
             let source = self.vae_fix.as_ref().ok_or_else(|| {
@@ -1193,7 +1190,7 @@ impl Pipeline {
 
     fn load_vae_encoder(&self) -> Result<crate::unet::VaeMomentsEncoder> {
         if let Some(ldm) = &self.ldm {
-            let vs = VarBuilder::from_tensors(ldm.vae.clone(), DType::F32, &self.device);
+            let vs = ldm.builder(SdxlComponent::Vae, DType::F32, &self.device);
             Ok(crate::unet::VaeMomentsEncoder::new(vs, VAE_SCALE)?)
         } else {
             let source = self.vae_fix.as_ref().ok_or_else(|| {

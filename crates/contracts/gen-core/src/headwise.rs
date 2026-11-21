@@ -1,6 +1,7 @@
 //! Head-major coefficient planes for a predictor which multiplies unquantized features by
 //! BF16-rounded weights. Packed FP8 planes retain the published E4M3 codes and F32 head scales.
 use std::borrow::Cow;
+pub type PackedHeads<'a> = (Cow<'a, [u8]>, Cow<'a, [f32]>);
 #[derive(Clone)]
 pub enum HeadwiseWeights {
     Bf16(Vec<u16>),
@@ -70,7 +71,7 @@ pub struct HeadwiseProjection<'a> {
 impl HeadwiseProjection<'_> {
     /// A contiguous head batch borrows original payload and calibration. An arbitrary gather
     /// keeps both in the same source representation and follows the requested head order.
-    pub fn packed(&self) -> Option<(Cow<'_, [u8]>, Cow<'_, [f32]>)> {
+    pub fn packed(&self) -> Option<PackedHeads<'_>> {
         let HeadwiseWeights::Fp8 { codes, scales } = self.plane else {
             return None;
         };

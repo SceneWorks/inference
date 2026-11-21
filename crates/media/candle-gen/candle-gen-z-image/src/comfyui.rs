@@ -26,10 +26,13 @@
 //! upstream by SceneWorks (`sceneworks-core::base_weights`, sc-10662); this module
 //! is handed the files already identified as a Z-Image DiT and VAE.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+#[cfg(test)]
+use candle_gen::candle_core::Tensor;
+use candle_gen::candle_core::{DType, Device};
 use candle_gen::{CandleError, Result};
 
 /// The four external inputs for an in-place ComfyUI Z-Image load (sc-10668): the
@@ -347,6 +350,7 @@ const VAE_LEVELS: usize = 4;
 /// Errors if a fused `qkv` weight is not `[3·DIM, DIM]` — a shape we do not
 /// recognize is a wrong-file/wrong-family signal, surfaced rather than mis-split
 /// (no silent fallback).
+#[cfg(test)]
 pub fn remap_dit_comfyui_to_diffusers(
     src: HashMap<String, Tensor>,
 ) -> Result<HashMap<String, Tensor>> {
@@ -373,6 +377,7 @@ pub fn remap_dit_comfyui_to_diffusers(
 }
 
 /// Row-split a fused `[3·DIM, DIM]` projection into its q, k, v thirds.
+#[cfg(test)]
 fn split_fused_qkv(key: &str, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     let dims = qkv.dims();
     if dims != [3 * DIT_DIM, DIT_DIM] {
@@ -435,6 +440,7 @@ fn remap_dit_key(key: &str) -> String {
 ///
 /// Errors on an attention weight whose trailing dims are not `1×1` (an unexpected
 /// VAE shape — surfaced, not reshaped blindly).
+#[cfg(test)]
 pub fn remap_vae_ldm_to_diffusers(src: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
     let mut out = HashMap::with_capacity(src.len());
     for (key, tensor) in src {
@@ -561,6 +567,7 @@ fn is_vae_attn_proj_weight(diffusers_key: &str) -> bool {
 
 /// `[C, C, 1, 1]` conv weight → `[C, C]` Linear weight. Errors if the trailing
 /// spatial dims are not 1×1.
+#[cfg(test)]
 fn squeeze_conv1x1_to_linear(key: &str, w: &Tensor) -> Result<Tensor> {
     let dims = w.dims();
     match dims {

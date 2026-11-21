@@ -186,7 +186,8 @@ impl Fp8Linear {
     /// The legacy dynamically quantized recipe returns BF16 as before.
     pub fn forward_with_bias(&self, x: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         use candle_core::DType;
-        let source = self.input_scale.is_some() || self.block_scales.is_some();
+        let source =
+            self.input_scale.is_some() || self.block_scales.is_some() || self.row_scales.is_some();
         let output_dtype = if source { x.dtype() } else { DType::BF16 };
         if !matches!(output_dtype, DType::BF16 | DType::F16 | DType::F32) {
             candle_core::bail!("unsupported FP8 projection output {output_dtype:?}");
@@ -197,8 +198,13 @@ impl Fp8Linear {
             candle_core::bail!("FP8 input width or device differs from weight");
         }
         let y = if let Some(scales) = &self.row_scales {
-            self.lt
-                .flux3_fp8_rowwise_linear(&flat, &self.w_fp8, scales)?
+            if f32_accumulator {
+                self.lt
+                    .flux3_fp8_rowwise_linear_f32(&flat, &self.w_fp8, scales)?
+            } else {
+                self.lt
+                    .flux3_fp8_rowwise_linear(&flat, &self.w_fp8, scales)?
+            }
         } else if let Some(scales) = &self.block_scales {
             if f32_accumulator {
                 self.lt

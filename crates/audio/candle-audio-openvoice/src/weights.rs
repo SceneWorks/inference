@@ -49,6 +49,14 @@ pub fn load_state_dict(pth: &Path, device: &Device) -> Result<HashMap<String, Te
 /// A [`VarBuilder`] over the resolved state dict, rooted at the top (`dec.*`, `enc_q.*`, `flow.*`,
 /// `ref_enc.*`), on `device` (f32 — the checkpoint's dtype).
 pub fn state_var_builder(pth: &Path, device: &Device) -> Result<VarBuilder<'static>> {
+    if candle_audio::weights::is_safetensors(pth) {
+        let vb = candle_audio::weights::normalized_state_builder(pth, DType::F32, device)?;
+        return Ok(if vb.contains_tensor("model.ref_enc.proj.weight") {
+            vb.pp("model")
+        } else {
+            vb
+        });
+    }
     let tensors = load_state_dict(pth, device)?;
     Ok(VarBuilder::from_tensors(tensors, DType::F32, device))
 }

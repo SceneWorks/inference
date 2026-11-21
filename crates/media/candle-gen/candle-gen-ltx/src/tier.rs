@@ -676,7 +676,12 @@ pub(crate) fn ltx25_transformer_vb(
     dtype: DType,
     device: &Device,
 ) -> CResult<VarBuilder<'static>> {
-    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    let inner = candle_gen::loader::mmap_var_builder_with_geometry(
+        &[path.to_owned()],
+        dtype,
+        device,
+        true,
+    )?;
     Ok(rename_vb(inner, dtype, device, remap_transformer_key))
 }
 

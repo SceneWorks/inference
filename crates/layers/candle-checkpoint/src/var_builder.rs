@@ -16,9 +16,13 @@ use std::sync::Arc;
 
 #[derive(Default)]
 struct SourceMapping {
+    legacy_convrot: bool,
     transforms: BTreeMap<String, gen_core::checkpoint_codec::LogicalTransformDeclaration>,
 }
 impl LogicalKeyMapping for SourceMapping {
+    fn legacy_convrot_geometry(&self) -> bool {
+        self.legacy_convrot
+    }
     fn mapping_id(&self) -> &'static str {
         "candle-constructor-v1"
     }
@@ -65,6 +69,26 @@ impl SourcePlan {
     }
 }
 impl ProjectionSource {
+    pub fn selected_var_builder(
+        self,
+        keys: impl IntoIterator<Item = String>,
+        dtype: DType,
+        dev: &Device,
+    ) -> VarBuilder<'static> {
+        let names = keys
+            .into_iter()
+            .map(|key| (key.clone(), (key.clone(), SourceView::Whole(key))))
+            .collect();
+        VarBuilder::from_backend(
+            Box::new(Remapped {
+                source: MappedWeights::Checkpoint(self),
+                names,
+            }),
+            dtype,
+            dev.clone(),
+        )
+    }
+
     pub fn reader(&self) -> &LogicalWeightReader {
         &self.0
     }
@@ -190,16 +214,40 @@ impl ProjectionSource {
         }) {
             return Ok(Err(st));
         }
-        let mut tables = Vec::new();
-        for path in files {
-            if let Some(table) =
-                gen_core::safetensors_path_quantization_metadata(path).map_err(Error::wrap)?
-            {
-                tables.push(table);
+        let tables = st.quantization_tables()?;
+        let mut headers = BTreeMap::new();
+        for (name, view) in st.tensors() {
+            let header = gen_core::weightsmeta::SafetensorsTensorHeader {
+                name: name.clone(),
+                dtype: gen_core::weightsmeta::Dtype::parse(&format!("{:?}", view.dtype()))
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "unsupported source dtype {:?} for {name}",
+                            view.dtype()
+                        ))
+                    })?,
+                shape: view.shape().to_vec(),
+                data_bytes: view.data().len() as u64,
+            };
+            if headers.insert(name.clone(), header).is_some() {
+                candle_core::bail!("duplicate tensor across checkpoint shards: {name}")
             }
         }
-        let Some(headers) =
-            ProjectionSourceHeaders::read(files, selected, &tables).map_err(Error::wrap)?
+        let Some(headers) = ProjectionSourceHeaders::select(headers, selected, &tables, |names| {
+            names
+                .iter()
+                .map(|&name| {
+                    let view = st
+                        .get(name)
+                        .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+                    if view.data().len() > 65_536 {
+                        return Err(format!("{name}: descriptor exceeds 65536 bytes").into());
+                    }
+                    Ok((name.to_owned(), view.data().to_vec()))
+                })
+                .collect()
+        })
+        .map_err(Error::wrap)?
         else {
             return Ok(Err(st));
         };
@@ -242,10 +290,7 @@ impl SourceLinear {
         let (rows, cols) = self.dims();
         source
             .reader()
-            .dense_coefficients(&self.key, None, self.dtype, dev)?
-            .reshape(((), cols))?
-            .narrow(0, first, rows)?
-            .force_contiguous()
+            .dense_matrix_slice(&self.key, first, rows, cols, self.dtype, dev)
     }
 }
 #[cfg(feature = "cuda")]
@@ -302,6 +347,11 @@ impl NativeLinearWeight for SourceLinear {
     fn resident_bytes(&self) -> u64 {
         self.resident_bytes
     }
+    fn retained_coefficients(&self, t: &Tensor) -> Result<()> {
+        self.source
+            .reader()
+            .record_coefficient_cache(&self.key, self.first_row, t)
+    }
     fn dense_weight(&self) -> Result<Tensor> {
         if let Some(first) = self.first_row {
             return self.slice_coefficients(&self.source, self.device(), first);
@@ -352,14 +402,6 @@ impl ProjectionSource {
         }
         #[cfg(feature = "cuda")]
         {
-            if self
-                .reader()
-                .planned(name)
-                .is_some_and(|r| matches!(r.codec, gen_core::TensorCodecSpec::RowwiseFp8 { .. }))
-                && (dtype != DType::BF16 || transpose)
-            {
-                return Ok(None);
-            }
             let convrot = if transpose {
                 None
             } else {
@@ -540,6 +582,11 @@ impl MappedWeights {
 #[derive(Debug, Clone)]
 pub enum SourceView {
     Whole(String),
+    Transposed(String),
+    Reshape {
+        name: String,
+        shape: Vec<usize>,
+    },
     Rows {
         name: String,
         first: usize,
@@ -554,7 +601,11 @@ pub enum SourceView {
 impl SourceView {
     fn name(&self) -> &str {
         match self {
-            Self::Whole(name) | Self::Rows { name, .. } | Self::Matrix { name, .. } => name,
+            Self::Whole(name)
+            | Self::Transposed(name)
+            | Self::Reshape { name, .. }
+            | Self::Rows { name, .. }
+            | Self::Matrix { name, .. } => name,
         }
     }
 }
@@ -595,6 +646,8 @@ impl SimpleBackend for Remapped {
                     .read_dense(logical, dtype, dev)?;
                 return match view {
                     SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
+                    SourceView::Transposed(_) => t.t()?.contiguous(),
+                    SourceView::Reshape { shape, .. } => t.reshape(shape.as_slice()),
                     _ => Ok(t),
                 };
             }
@@ -604,6 +657,8 @@ impl SimpleBackend for Remapped {
             SourceView::Whole(_) => Ok(t),
             SourceView::Rows { first, rows, .. } => t.narrow(0, *first, *rows)?.contiguous(),
             SourceView::Matrix { rows, cols, .. } => t.reshape((*rows, *cols)),
+            SourceView::Transposed(_) => t.t()?.contiguous(),
+            SourceView::Reshape { shape, .. } => t.reshape(shape.as_slice()),
         }
     }
     fn get(&self, shape: Shape, name: &str, _: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
@@ -634,6 +689,23 @@ impl SimpleBackend for Remapped {
         let MappedWeights::Checkpoint(src) = &self.source else {
             return Ok(None);
         };
+        if matches!(view, SourceView::Transposed(_)) {
+            let stored = src.mmap().get(physical)?;
+            let [cols, rows] = stored.shape() else {
+                candle_core::bail!("{name}: transposed projection requires a matrix");
+            };
+            let dims = (*rows, *cols);
+            if shape.is_some_and(|expected| expected != dims) {
+                candle_core::bail!(
+                    "{name}: transposed projection has shape {dims:?}, expected {shape:?}"
+                );
+            }
+            return src.native_linear_weight_transposed(physical, dims, dtype, dev);
+        }
+        if matches!(view, SourceView::Reshape { .. }) {
+            // Matrix contractions use SourceView::Matrix, which declares the exact geometry.
+            return Ok(None);
+        }
         if let SourceView::Matrix { rows, cols, .. } = view {
             if shape.is_some_and(|s| s != (*rows, *cols)) {
                 candle_core::bail!(
@@ -717,9 +789,26 @@ pub fn mmap_var_builder(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
+    mmap_var_builder_with_geometry(files, dtype, device, false)
+}
+pub fn mmap_var_builder_with_geometry(
+    files: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+    legacy_convrot: bool,
+) -> Result<VarBuilder<'static>> {
     // SAFETY: callers must keep the supplied checkpoint files unmodified while mapped.
     let st = unsafe { MmapedSafetensors::multi(files)? };
-    let backend: Box<dyn SimpleBackend> = match ProjectionSource::from_mapped(st, files, device)? {
+    let backend: Box<dyn SimpleBackend> = match ProjectionSource::from_mapped_for(
+        st,
+        files,
+        device,
+        |_| true,
+        SourceMapping {
+            legacy_convrot,
+            ..Default::default()
+        },
+    )? {
         Ok(source) => Box::new(source),
         Err(plain) => Box::new(plain),
     };

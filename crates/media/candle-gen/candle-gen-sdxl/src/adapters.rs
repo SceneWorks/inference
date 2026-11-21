@@ -845,6 +845,14 @@ fn fold_conv_lora_file(
     Ok(())
 }
 
+pub(crate) fn add_kohya_target(table: &mut BTreeMap<String, String>, name: &str, rank: usize) {
+    if let Some(dotted) = name.strip_suffix(".weight") {
+        if matches!(rank, 2 | 4) {
+            table.insert(dotted.replace('.', "_"), dotted.to_string());
+        }
+    }
+}
+
 /// Build the kohya `flattened → dotted` table from a UNet weight **file** without loading tensor data
 /// (sc-11682) — reads only the safetensors header (names + shapes; capped, no mmap), so the dense
 /// additive lanes can resolve community `lora_unet_<flat>` keys against an **mmap** base without first
@@ -854,12 +862,7 @@ pub(crate) fn build_sdxl_kohya_table_from_file(
 ) -> Result<BTreeMap<String, String>> {
     let mut table = BTreeMap::new();
     for header in candle_gen::gen_core::safetensors_path_tensor_headers(file)? {
-        if let Some(dotted) = header.name.strip_suffix(".weight") {
-            let rank = header.shape.len();
-            if rank == 2 || rank == 4 {
-                table.insert(dotted.replace('.', "_"), dotted.to_string());
-            }
-        }
+        add_kohya_target(&mut table, &header.name, header.shape.len());
     }
     Ok(table)
 }

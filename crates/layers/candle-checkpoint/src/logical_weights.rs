@@ -167,6 +167,46 @@ impl CandleCodecResidency {
         Self::DENSE
     }
 
+    /// Probe the visible default CUDA ordinal used by the media loader without creating a
+    /// device context, cuBLAS handle or workspace. Unprobed devices receive dense admission.
+    pub fn default_device_for_admission() -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            use candle_core::cuda_backend::cudarc::driver::{
+                result, sys::CUdevice_attribute as Attr,
+            };
+            static POLICY: std::sync::OnceLock<CandleCodecResidency> = std::sync::OnceLock::new();
+            *POLICY.get_or_init(|| {
+                let cap = || {
+                    result::init().ok()?;
+                    let dev = result::device::get(0).ok()?;
+                    // SAFETY: dev is a successfully enumerated CUdevice; both attributes are scalar.
+                    unsafe {
+                        Some((
+                            result::device::get_attribute(
+                                dev,
+                                Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                            )
+                            .ok()?,
+                            result::device::get_attribute(
+                                dev,
+                                Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                            )
+                            .ok()?,
+                        ))
+                    }
+                };
+                cap()
+                    .map(Self::from_cuda_compute_cap)
+                    .unwrap_or(Self::DENSE)
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::DENSE
+        }
+    }
+
     /// Eligibility from a CUDA capability already measured by the process (e.g. NVML at startup).
     pub fn from_cuda_compute_cap(cap: (i32, i32)) -> Self {
         Self {
@@ -396,6 +436,41 @@ impl LogicalTensor {
 pub struct LogicalWeights {
     pub tensors: HashMap<String, LogicalTensor>,
     pub receipt: LogicalWeightReceipt,
+}
+
+#[cfg(feature = "cuda")]
+fn matrix_slice_range(
+    row: &gen_core::checkpoint_codec::LogicalTensorPlan,
+    shape: &[usize],
+    source_len: usize,
+    first: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<std::ops::Range<usize>> {
+    let key = &row.logical_key;
+    let Some(len) = rows.checked_mul(cols).filter(|n| *n > 0) else {
+        candle_core::bail!("{key}: invalid slice shape")
+    };
+    if shape != row.shape
+        || shape.len() < 2
+        || !(shape.last() == Some(&cols)
+            || (first == 0 && shape.first() == Some(&rows) && source_len == len))
+        || !source_len.is_multiple_of(len)
+        || !first.is_multiple_of(rows)
+    {
+        candle_core::bail!(
+            "{key}: matrix slice does not partition checkpoint shape {:?}",
+            shape
+        );
+    }
+    let start = first
+        .checked_mul(cols)
+        .ok_or_else(|| CandleError::Msg(format!("{key}: row offset overflow")))?;
+    let end = start
+        .checked_add(len)
+        .filter(|&v| v <= source_len)
+        .ok_or_else(|| CandleError::Msg(format!("{key}: slice is outside checkpoint")))?;
+    Ok(start..end)
 }
 
 fn decode_scaled_fp8(bytes: &[u8], element: fn(u8) -> f32, scale: f32) -> Vec<f32> {
@@ -725,6 +800,68 @@ impl LogicalWeightReader {
         Ok(Some(layer))
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn dense_matrix_slice(
+        &self,
+        key: &str,
+        first: usize,
+        rows: usize,
+        cols: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let row = self
+            .planned(key)
+            .ok_or_else(|| CandleError::Msg(format!("unknown source tensor {key}")))?;
+        let TensorCodecSpec::ScalarFp8 { scale, .. } = &row.codec else {
+            candle_core::bail!("{key}: scalar FP8 slice required")
+        };
+        let view = self.st.get(&row.physical_key)?;
+        let range = matrix_slice_range(row, view.shape(), view.data().len(), first, rows, cols)?;
+        let decode = match row.encoding {
+            WeightEncoding::Fp8E4M3 => gen_core::fp8_e4m3fn_to_f32,
+            WeightEncoding::Fp8E5M2 => gen_core::fp8_e5m2_to_f32,
+            _ => candle_core::bail!("{key}: invalid scalar FP8 encoding"),
+        };
+        let sw = match scale {
+            ScalarScaleSource::Unit => 1.,
+            ScalarScaleSource::Companion { physical_key } => scalar_at(&self.st, physical_key)?,
+        };
+        cst::read_source_bytes(&view.data()[range], |bytes| {
+            upload_values(
+                decode_scaled_fp8(bytes, decode, sw),
+                &[rows, cols],
+                device,
+                dtype,
+            )
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn record_coefficient_cache(
+        &self,
+        key: &str,
+        first: Option<usize>,
+        t: &Tensor,
+    ) -> Result<()> {
+        let encoding = match t.dtype() {
+            DType::BF16 => WeightEncoding::DenseBf16,
+            DType::F16 => WeightEncoding::DenseF16,
+            DType::F32 => WeightEncoding::DenseF32,
+            DType::F64 => WeightEncoding::DenseF64,
+            d => candle_core::bail!("{key}: unexpected decoded coefficient dtype {d:?}"),
+        };
+        self.accounting
+            .record_coefficient_cache(
+                key,
+                first,
+                t.dims(),
+                encoding,
+                (t.elem_count() * t.dtype().size_in_bytes()) as u64,
+            )
+            .map_err(CandleError::wrap)
+    }
+
     /// Load one contiguous matrix from a scalar-coded stacked operand, without uploading the rest.
     #[cfg(feature = "cuda")]
     pub(crate) fn fp8_matrix_slice(
@@ -748,29 +885,8 @@ impl LogicalWeightReader {
         if row.transform.is_some() {
             return Ok(None);
         }
-        let Some(len) = rows.checked_mul(cols).filter(|n| *n > 0) else {
-            candle_core::bail!("{key}: invalid slice shape")
-        };
         let view = self.st.get(&row.physical_key)?;
-        if view.shape() != row.shape
-            || view.shape().len() < 2
-            || !(view.shape().last() == Some(&cols)
-                || (first == 0 && view.shape().first() == Some(&rows) && view.data().len() == len))
-            || !view.data().len().is_multiple_of(len)
-            || !first.is_multiple_of(rows)
-        {
-            candle_core::bail!(
-                "{key}: matrix slice does not partition checkpoint shape {:?}",
-                view.shape()
-            );
-        }
-        let start = first
-            .checked_mul(cols)
-            .ok_or_else(|| CandleError::Msg(format!("{key}: row offset overflow")))?;
-        let end = start
-            .checked_add(len)
-            .filter(|&v| v <= view.data().len())
-            .ok_or_else(|| CandleError::Msg(format!("{key}: slice is outside checkpoint")))?;
+        let range = matrix_slice_range(row, view.shape(), view.data().len(), first, rows, cols)?;
         if !self
             .native_execution_capability()
             .executes_natively(row.codec_id)
@@ -794,7 +910,7 @@ impl LogicalWeightReader {
             .as_deref()
             .map(|key| scalar_at(&self.st, key))
             .transpose()?;
-        let codes = cst::read_source_bytes(&view.data()[start..end], |bytes| {
+        let codes = cst::read_source_bytes(&view.data()[range], |bytes| {
             Tensor::from_raw_buffer(bytes, expected.1, &[rows, cols], &self.device)
         })?;
         let resident = codes.elem_count() as u64 + scalar_bytes + if sx.is_some() { 4 } else { 0 };
@@ -1052,9 +1168,9 @@ fn upload_values(
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
+    Tensor::from_vec(values, shape, &Device::Cpu)?
         .to_dtype(dtype)?
-        .to_device(device)?)
+        .to_device(device)
 }
 
 /// Run the planned codec on one stored tensor — the per-layer dispatch.
@@ -1375,7 +1491,10 @@ fn decode(
             if tensor.residency.mode != ResidencyMode::Packed
                 || shape != source_shape
                 || companion.dtype() != StDtype::F32
-                || companion.shape() != [geometry.out_features, 1]
+                || match (geometry.flat_scales, companion.shape()) {
+                    (true, [n]) | (false, [n, 1]) => *n != geometry.out_features,
+                    _ => true,
+                }
             {
                 return Err(CandleError::Msg(format!(
                     "{}: expected native ConvRot I8 matrix and F32 row scales",
@@ -1396,12 +1515,10 @@ fn decode(
                     tensor.logical_key
                 )));
             }
-            let slice = gen_core::convrot_int8::ConvRotInt8::from_geometry(
-                geometry.rotation_group,
-                &[n, k],
-                &[n, 1],
-            )
-            .map_err(CandleError::Msg)?;
+            let slice = gen_core::convrot_int8::ConvRotInt8 {
+                out_features: n,
+                ..*geometry
+            };
             let scale_bytes = &companion.data()[start * 4..(start + n) * 4];
             cst::read_source_bytes(scale_bytes, |bytes| {
                 slice.validate_scale_values(

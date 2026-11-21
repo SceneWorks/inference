@@ -9,6 +9,7 @@ use std::{
 };
 
 type Snapshot = Arc<dyn Fn() -> crate::Result<CheckpointWeightFacts> + Send + Sync>;
+type Readers = BTreeMap<Vec<PathBuf>, Vec<Arc<crate::CheckpointReadAccounting>>>;
 type Sources = BTreeMap<Vec<PathBuf>, Snapshot>;
 thread_local! {
     static CURRENT: RefCell<Option<CheckpointReceiptScope>> = const { RefCell::new(None) };
@@ -17,7 +18,7 @@ thread_local! {
 #[derive(Clone, Default)]
 pub struct CheckpointReceiptScope {
     sources: Arc<Mutex<Sources>>,
-    readers: Arc<Mutex<BTreeMap<Vec<PathBuf>, Vec<Arc<crate::CheckpointReadAccounting>>>>>,
+    readers: Arc<Mutex<Readers>>,
 
     prepared: Option<Arc<LoadSpec>>,
     primary: Option<PathBuf>,
@@ -157,11 +158,9 @@ impl CheckpointReceiptScope {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         for (paths, group) in readers {
-            for reader in group {
-                let value = reader.facts()?;
-                if value.receipt().tensor_count != 0 {
-                    facts.push(self.bind(&paths, value)?);
-                }
+            let value = crate::CheckpointReadAccounting::combined(&group)?;
+            if value.receipt().tensor_count != 0 {
+                facts.push(self.bind(&paths, value)?);
             }
         }
         Ok(facts)

@@ -2505,6 +2505,25 @@ mod cuda_impl {
             w: &DevFp8,
             w_scales: &cudarc::driver::CudaSlice<f32>,
         ) -> Result<Tensor> {
+            self.rowwise_gemm::<half::bf16>(x, w, w_scales)
+        }
+
+        /// Rowwise FP8 accumulate and scales without intermediate output rounding.
+        pub fn flux3_fp8_rowwise_linear_f32(
+            &self,
+            x: &Tensor,
+            w: &DevFp8,
+            w_scales: &cudarc::driver::CudaSlice<f32>,
+        ) -> Result<Tensor> {
+            self.rowwise_gemm::<f32>(x, w, w_scales)
+        }
+
+        fn rowwise_gemm<T: Fp8Output>(
+            &self,
+            x: &Tensor,
+            w: &DevFp8,
+            w_scales: &cudarc::driver::CudaSlice<f32>,
+        ) -> Result<Tensor> {
             use cudarc::driver::{LaunchConfig, PushKernelArg};
             let (m, k) = x.dims2()?;
             let n = w.rows;
@@ -2523,7 +2542,7 @@ mod cuda_impl {
             let epilogue = kernels
                 .function("flux3_fp8_rowwise_epilogue")
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            let xf = Self::flux3_f32_input(x)?;
+            let xf = Self::flux3_f32_input(&x.to_dtype(DType::BF16)?)?;
             let (x_storage, _) = xf.storage_and_layout();
             let x_slice = match &*x_storage {
                 Storage::Cuda(cs) => match &cs.slice {
@@ -2586,7 +2605,7 @@ mod cuda_impl {
                     )?;
                 }
             }
-            let mut out = unsafe { self.stream.alloc::<half::bf16>(m * n) }.map_err(drv_err)?;
+            let mut out = unsafe { self.stream.alloc::<T>(m * n) }.map_err(drv_err)?;
             let total = (m * n) as u32;
             unsafe {
                 self.stream
@@ -2595,6 +2614,7 @@ mod cuda_impl {
                     .arg(&sa)
                     .arg(w_scales)
                     .arg(&mut out)
+                    .arg(&T::F32)
                     .arg(&mi)
                     .arg(&ni)
                     .launch(LaunchConfig {
@@ -2606,7 +2626,7 @@ mod cuda_impl {
             }
             Ok(Tensor::from_storage(
                 Storage::Cuda(CudaStorage {
-                    slice: CudaStorageSlice::BF16(out),
+                    slice: T::storage(out),
                     device: self.device.clone(),
                 }),
                 (m, n),

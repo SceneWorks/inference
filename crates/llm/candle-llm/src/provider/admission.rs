@@ -352,6 +352,20 @@ impl PricedDecoder {
         }
     }
 
+    /// Resolve the decoder namespace against every logical key before native rows and
+    /// their physical companions are removed from the dense-copy inventory.
+    pub(super) fn snapshot_root(&self, tensors: &SnapshotTensors) -> Option<String> {
+        match self {
+            Self::Causal(cfg) => Some(crate::models::llama::decoder_root(cfg, "", |key| {
+                tensors.contains_key(key)
+            })),
+            Self::Qwen35(..) => qwen35_dense_prefix(|key| tensors.contains_key(key))
+                .ok()
+                .map(str::to_owned),
+            Self::Prism | Self::Refused => None,
+        }
+    }
+
     pub(super) fn is_packed(&self) -> bool {
         matches!(self, Self::Prism)
     }
@@ -396,21 +410,7 @@ pub(super) type SnapshotTensors = std::collections::HashMap<String, TensorHeader
 /// JSON header only. An unreadable directory or header is [`CoreError::Load`] (the load would
 /// fail reading it too).
 pub(super) fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors> {
-    let io_error =
-        |error: std::io::Error| CoreError::Load(format!("checkpoint admission: {error}"));
-    let mut shards: Vec<_> = if read_json(dir, "config.json")
-        .as_ref()
-        .is_some_and(|v| v["model_type"] == "sensenova_loop")
-    {
-        crate::sensenova_loop::shards(dir)
-    } else {
-        std::fs::read_dir(dir)
-            .map_err(io_error)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("safetensors"))
-            .collect()
-    };
-    shards.sort();
+    let shards = snapshot_shards(dir)?;
     let mut tensors = SnapshotTensors::new();
     for shard in shards {
         let malformed = || {
@@ -447,6 +447,90 @@ pub(super) fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors>
     Ok(tensors)
 }
 
+fn snapshot_shards(dir: &Path) -> CoreResult<Vec<std::path::PathBuf>> {
+    let io_error =
+        |error: std::io::Error| CoreError::Load(format!("checkpoint admission: {error}"));
+    let mut shards: Vec<_> = if read_json(dir, "config.json")
+        .as_ref()
+        .is_some_and(|v| v["model_type"] == "sensenova_loop")
+    {
+        crate::sensenova_loop::shards(dir)
+    } else {
+        std::fs::read_dir(dir)
+            .map_err(io_error)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+            .collect()
+    };
+    shards.sort();
+    Ok(shards)
+}
+
+/// Replace the physical bytes of a checkpoint-authored projection with the chosen device's
+/// plan. Leave unrecognized coefficient roles conservatively priced at f32 and account for
+/// a tied output head separately from its input embedding.
+pub(super) fn price_checkpoint_rows(
+    dir: &Path,
+    device: &Device,
+    decoder: &PricedDecoder,
+    root: Option<&str>,
+    tensors: &mut SnapshotTensors,
+) -> CoreResult<Option<(u64, u64)>> {
+    if !tensors.iter().any(|(key, t)| {
+        key.ends_with(".comfy_quant")
+            || (t.dtype.starts_with("F8_") && !core_llm::modelopt::is_companion(key))
+    }) {
+        return Ok(None);
+    }
+    let files = snapshot_shards(dir)?;
+    let Ok(source) = Weights::checkpoint_source(&files, device).map_err(to_core)? else {
+        return Ok(None);
+    };
+    let plan = source.reader().plan();
+    let mut resident = plan
+        .companions
+        .iter()
+        .map(|c| c.resident_bytes)
+        .sum::<u64>();
+    let overflow = || CoreError::Load("checkpoint admission: resident size overflow".into());
+    for row in &plan.tensors {
+        let key = &row.logical_key;
+        let head = key == "lm_head.weight" || key.ends_with(".lm_head.weight");
+        let embedding = key.ends_with("embed_tokens.weight");
+        let (projection, tied) = match decoder {
+            PricedDecoder::Causal(cfg) => (
+                root.is_some_and(|root| crate::models::llama::loads_quantized(cfg, root, key)),
+                cfg.tie_word_embeddings,
+            ),
+            PricedDecoder::Qwen35(cfg, _) => (
+                root.is_some_and(|root| crate::models::qwen35::loads_quantized(cfg, root, key)),
+                cfg.tie_word_embeddings,
+            ),
+            _ => (false, false),
+        };
+        let coeff_bytes = || {
+            row.shape
+                .iter()
+                .try_fold(4u64, |a, &b| a.checked_mul(b as u64))
+                .ok_or_else(overflow)
+        };
+        let bytes = if projection || head {
+            row.residency.resident_bytes
+        } else if embedding && tied {
+            coeff_bytes()?
+                .checked_add(row.residency.resident_bytes)
+                .ok_or_else(overflow)?
+        } else {
+            row.residency.resident_bytes.max(coeff_bytes()?)
+        };
+        resident = resident.checked_add(bytes).ok_or_else(overflow)?;
+    }
+    for key in plan.all_physical_keys() {
+        tensors.remove(key);
+    }
+    Ok(Some((plan.source_bytes, resident)))
+}
+
 /// The quantized projection copy a snapshot load builds on the device beside its resident source
 /// tensors (E6, sc-24140): exactly the tensors the loader stores in `format`, chosen by the
 /// loader's own rule — for a `CausalLm` the layer projections
@@ -464,10 +548,14 @@ pub(super) fn snapshot_tensor_headers(dir: &Path) -> CoreResult<SnapshotTensors>
 /// their source ([`snapshot_cast_copy_bytes`]). `None` on overflow.
 pub(super) fn snapshot_quantized_copy_bytes<'a>(
     decoder: &PricedDecoder,
+    root: Option<&str>,
     format: CopyFormat,
     tensors: &'a SnapshotTensors,
 ) -> Option<(u64, std::collections::HashSet<&'a str>)> {
     use crate::models::{llama, qwen35, split_layer_key};
+    let Some(root) = root else {
+        return Some((0, Default::default()));
+    };
     let mut total = 0u64;
     let mut consumed = std::collections::HashSet::new();
     let mut add = |bytes: u64| -> Option<()> {
@@ -476,10 +564,9 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
     };
     match decoder {
         PricedDecoder::Causal(cfg) => {
-            let root = llama::decoder_root(cfg, "", |key| tensors.contains_key(key));
             for (key, tensor) in tensors {
                 // The loader's own selection — the rule the preparer stores blocks by, too.
-                if !llama::loads_quantized(cfg, &root, key) {
+                if !llama::loads_quantized(cfg, root, key) {
                     continue;
                 }
                 let Some((_, layer, suffix)) = split_layer_key(key) else {
@@ -563,9 +650,7 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
             }
         }
         PricedDecoder::Qwen35(cfg, _) => {
-            let Ok(prefix) = qwen35_dense_prefix(|key| tensors.contains_key(key)) else {
-                return Some((0, consumed));
-            };
+            let prefix = root;
             // In a ModelOpt checkpoint a weight without `.weight_scale` loads dense, as its
             // source's cast (`keyed_projection`), never in the load's format.
             let modelopt = tensors

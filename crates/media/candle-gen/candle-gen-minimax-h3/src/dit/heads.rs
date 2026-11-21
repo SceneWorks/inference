@@ -126,34 +126,42 @@ impl LinearBias {
     /// The dtype is deliberately not a parameter: these tensors are the mixed-precision half of the
     /// checkpoint (see the module docs), so the bytes on disk are the contract.
     ///
-    /// # This loader stays DENSE on every tier, deliberately (sc-20267)
-    ///
-    /// `mlx_gen_minimax_h3::convert::DENSE_BY_POLICY` leaves the float32 I/O heads,
-    /// `context_embedder` and `norm_out.linear` dense in **every** published tier, and this raw
-    /// `Weights::require` is exactly why it must: `require` hands back whatever tensor is at the
-    /// key, so a packed `{prefix}.weight` would arrive as a stream of u32 codes where a float is
-    /// expected and be multiplied as garbage — the sc-14980 Mage `pos_embed` failure, which
-    /// produced **no load error at all**. Adding a packed path here is therefore not an
-    /// improvement; it is the thing the converter's dense set exists to make unnecessary. The two
-    /// loaders that DO pack are [`crate::dit::layers::LinearNoBias`] and
-    /// [`crate::dit::block::AdaLnProjection`], and they are the complete set.
-    ///
-    /// [`crate::quant::guard_dense`] turns that class into a loud, attributable load error rather
-    /// than leaving it to the shape check below (which happens to catch a Q4 pack, since `[out,
-    /// in/8] != [out, in]`, but says nothing about *why*).
+    /// A source-encoded matrix takes its compute dtype from its paired floating bias.
+    /// Its projection receives the model geometry, including any logical MXFP8 edge tiles.
+    /// Dense heads and the affine tier's dense-only policy retain their published contract.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
         in_features: usize,
         out_features: usize,
     ) -> Result<Self> {
-        let projection = match w.native_linear(prefix, true)? {
-            Some(layer) => layer,
-            None => {
-                crate::quant::guard_dense(w, crate::quant::DIT, prefix)?;
-                w.linear(prefix, true)?
+        let bias_key = format!("{prefix}.bias");
+        let encoded_bias = w.source_format_id(&bias_key).is_some();
+        let dtype = if encoded_bias {
+            // With encoded bias and weight, no dense operand retains the role dtype.
+            // H3 keeps its I/O and timestep projections in F32; context and final norm use BF16.
+            if gen_core_h3::h3_projection_keeps_fp32(prefix) {
+                DType::F32
+            } else {
+                DType::BF16
             }
+        } else {
+            w.require(&bias_key)?.dtype()
         };
+        let projection =
+            match w.native_linear_shaped(prefix, true, Some((out_features, in_features)), dtype)? {
+                Some(layer) => layer,
+                None => {
+                    crate::quant::guard_dense(w, crate::quant::DIT, prefix)?;
+                    if encoded_bias {
+                        let weight = w.require(&format!("{prefix}.weight"))?;
+                        let bias = w.read_dense_with_shape(&bias_key, None, weight.dtype())?;
+                        candle_gen::candle_nn::Linear::new(weight, Some(bias))
+                    } else {
+                        w.linear(prefix, true)?
+                    }
+                }
+            };
         if projection.weight_dims()? != (out_features, in_features) {
             return Err(CandleError::Msg(format!("minimax-h3 dit {prefix}.weight: expected [{out_features}, {in_features}], got {:?}",projection.weight_dims()?)));
         }
@@ -877,6 +885,140 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use std::collections::HashMap;
+
+    #[test]
+    fn source_head_uses_logical_mx_edges_and_the_original_bias_precision() {
+        use safetensors::{tensor::TensorView, Dtype};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut codes = vec![0; 32 * 32];
+        // Poison outside the 3x5 model shape to distinguish byte-strided source rows.
+        for row in 0..32 {
+            for col in 0..32 {
+                codes[row * 32 + col] = if row < 3 && col < 5 {
+                    0x38 + row as u8
+                } else {
+                    0x7e
+                };
+            }
+        }
+        let scales = [127; 128 * 4];
+        let desc = br#"{"format":"mxfp8"}"#;
+        for (bias_dtype, bias_data, dtype) in [
+            (
+                Dtype::F32,
+                (1.0f32 + 1. / 512.).to_le_bytes().repeat(3),
+                DType::F32,
+            ),
+            (Dtype::F16, 0x3c02u16.to_le_bytes().repeat(3), DType::F16),
+            (Dtype::BF16, 0x3f81u16.to_le_bytes().repeat(3), DType::BF16),
+        ] {
+            let path = tmp.path().join(format!("{dtype:?}.safetensors"));
+            safetensors::tensor::serialize_to_file(
+                [
+                    (
+                        "proj_in.weight",
+                        TensorView::new(Dtype::F8_E4M3, vec![32, 32], &codes).unwrap(),
+                    ),
+                    (
+                        "proj_in.weight_scale",
+                        TensorView::new(Dtype::U8, vec![128, 4], &scales).unwrap(),
+                    ),
+                    (
+                        "proj_in.comfy_quant",
+                        TensorView::new(Dtype::U8, vec![desc.len()], desc).unwrap(),
+                    ),
+                    (
+                        "proj_in.bias",
+                        TensorView::new(bias_dtype, vec![3], &bias_data).unwrap(),
+                    ),
+                ],
+                &None,
+                &path,
+            )
+            .unwrap();
+            let w = Weights::from_files_native_int8(&[path], &Device::Cpu).unwrap();
+            let head = LinearBias::from_weights(&w, "proj_in", 5, 3).unwrap();
+            assert_eq!(head.dtype(), dtype);
+            assert_eq!(head.bias().dtype(), dtype);
+            assert_eq!(head.projection.weight_dims().unwrap(), (3, 5));
+            assert_eq!(head.nbytes(), 18 * dtype.size_in_bytes());
+            assert_eq!(
+                w.materialized_bytes("proj_in.weight").unwrap(),
+                (15 * dtype.size_in_bytes()) as u64
+            );
+            assert_eq!(
+                head.projection
+                    .try_weight()
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap(),
+                vec![vec![1.; 5], vec![1.125; 5], vec![1.25; 5]]
+            );
+            let bias = if dtype == DType::BF16 {
+                1. + 1. / 128.
+            } else {
+                1. + 1. / 512.
+            };
+            assert_eq!(
+                head.bias()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                vec![bias; 3]
+            );
+            assert!(w
+                .native_linear_shaped("proj_in", true, Some((33, 5)), dtype)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn bare_encoded_bias_uses_head_precision_with_dense_or_encoded_weights() {
+        use safetensors::{tensor::TensorView, Dtype};
+        let tmp = tempfile::tempdir().unwrap();
+        for (key, weight_dtype, code, expected) in [
+            ("proj_in", Dtype::F8_E5M2, vec![0x3c], DType::F32),
+            ("context_embedder", Dtype::F8_E5M2, vec![0x3c], DType::BF16),
+            (
+                "proj_out",
+                Dtype::F16,
+                0x3c00u16.to_le_bytes().to_vec(),
+                DType::F16,
+            ),
+        ] {
+            let path = tmp.path().join(format!("{key}.safetensors"));
+            safetensors::tensor::serialize_to_file(
+                [
+                    (
+                        format!("{key}.weight"),
+                        TensorView::new(weight_dtype, vec![1, 1], &code).unwrap(),
+                    ),
+                    (
+                        format!("{key}.bias"),
+                        TensorView::new(Dtype::F8_E5M2, vec![1], &[0x40]).unwrap(),
+                    ),
+                ],
+                &None,
+                &path,
+            )
+            .unwrap();
+            let w = Weights::from_files_native_int8(&[path], &Device::Cpu).unwrap();
+            let head = LinearBias::from_weights(&w, key, 1, 1).unwrap();
+            assert_eq!(head.dtype(), expected);
+            assert_eq!(head.bias().dtype(), expected);
+            assert_eq!(
+                head.bias()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                [2.]
+            );
+        }
+    }
 
     fn seeded(shape: &[usize], seed: u32) -> Tensor {
         let n: usize = shape.iter().product();

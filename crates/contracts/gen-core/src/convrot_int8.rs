@@ -24,6 +24,8 @@ pub const MAX_DESCRIPTOR_BYTES: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConvRotInt8 {
     pub out_features: usize,
+    /// Source shape [N], permitted only by the legacy descriptor convention.
+    pub flat_scales: bool,
     pub in_features: usize,
     pub rotation_group: usize,
 }
@@ -53,11 +55,22 @@ impl ConvRotInt8 {
         weight: &[usize],
         scales: &[usize],
     ) -> Result<Self, String> {
+        Self::from_source_geometry(rotation_group, weight, scales, false)
+    }
+    pub fn from_source_geometry(
+        rotation_group: usize,
+        weight: &[usize],
+        scales: &[usize],
+        legacy: bool,
+    ) -> Result<Self, String> {
         if weight.len() != 2 || weight.contains(&0) {
             return Err("ConvRot INT8 weight must be nonempty [out, in]".into());
         }
         let (n, k) = (weight[0], weight[1]);
-        if !matches!(rotation_group, 64 | 256)
+        if !(matches!(rotation_group, 64 | 256)
+            || legacy
+                && rotation_group.is_power_of_two()
+                && rotation_group.trailing_zeros().is_multiple_of(2))
             || !k.is_multiple_of(rotation_group)
             || k > i32::MAX as usize / (128 * 128)
             || n > i32::MAX as usize
@@ -67,11 +80,12 @@ impl ConvRotInt8 {
                 "ConvRot INT8 invalid rotation group, tail, or integer GEMM geometry".into(),
             );
         }
-        if scales != [n, 1] {
+        if scales != [n, 1] && !(legacy && scales == [n]) {
             return Err("ConvRot INT8 weight_scale must be F32 [out, 1] (not group scales)".into());
         }
         Ok(Self {
             out_features: n,
+            flat_scales: scales.len() == 1,
             in_features: k,
             rotation_group,
         })

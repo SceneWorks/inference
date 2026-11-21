@@ -42,7 +42,22 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
 /// pickle metadata (no storage reads) so the report is honest about what the snapshot holds.
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
     passthrough_report(spec, "Kokoro", is_kokoro_snapshot, |source| {
-        let pth = source.join(CHECKPOINT_FILE);
+        let pth = candle_audio::weights::checkpoint_file(source.join(CHECKPOINT_FILE));
+        if candle_audio::weights::is_safetensors(&pth) {
+            let header = candle_audio::weights::read_safetensors_header(&pth)
+                .map_err(|e| CoreError::Msg(e.to_string()))?;
+            for section in SECTIONS {
+                if !header.keys().any(|k| k.starts_with(&format!("{section}."))) {
+                    return Err(CoreError::Msg(format!(
+                        "missing checkpoint section {section:?}"
+                    )));
+                }
+            }
+            return Ok(header
+                .keys()
+                .filter(|k| k.as_str() != "__metadata__")
+                .count());
+        }
         let mut num_tensors = 0usize;
         for section in SECTIONS {
             let infos = read_pth_tensor_info(&pth, false, Some(section)).map_err(|e| {

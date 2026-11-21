@@ -25,7 +25,11 @@ impl Router {
     fn load(w: &Weights, prefix: &str, hidden: usize) -> Result<Self> {
         let read = |suffix: &str, shape: &[usize]| {
             let key = format!("{prefix}.{suffix}");
-            let tensor = w.require(&key)?;
+            let tensor = w.plain(&key).ok_or_else(|| {
+                Error::Config(format!(
+                    "SenseNova-Loop requires the published F32 router coefficient {key}"
+                ))
+            })?;
             if tensor.dtype() != DType::F32 || tensor.dims() != shape {
                 return Err(Error::Config(format!(
                     "SenseNova-Loop requires {key} to be F32 {shape:?}, found {:?} {:?}",

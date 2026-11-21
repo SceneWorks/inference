@@ -200,12 +200,17 @@ fn component_vb(root: &Path, device: &Device, sub: &str) -> CResult<VarBuilder<'
 /// casts that tensor on CPU, uploads the final f32 bytes, and drops the host tensor when `get` returns.
 /// It therefore does not need the whole 47.2 GB shared package in host memory at once.
 struct CpuCastMmap {
-    tensors: cst::MmapedSafetensors,
+    tensors: candle_gen::loader::MappedWeights,
 }
 
 impl CpuCastMmap {
     fn load_cpu(&self, name: &str, dtype: DType) -> CoreResult<Tensor> {
-        let tensor = self.tensors.load(name, &Device::Cpu)?;
+        if let candle_gen::loader::MappedWeights::Checkpoint(src) = &self.tensors {
+            if src.reader().planned(name).is_some() {
+                return src.reader().read_dense(name, dtype, &Device::Cpu);
+            }
+        }
+        let tensor = self.tensors.mmap().load(name, &Device::Cpu)?;
         let tensor = if tensor.dtype() == dtype {
             tensor
         } else {
@@ -217,6 +222,21 @@ impl CpuCastMmap {
 }
 
 impl SimpleBackend for CpuCastMmap {
+    fn native_linear_weight(
+        &self,
+        name: &str,
+        shape: Option<(usize, usize)>,
+        dtype: DType,
+        dev: &Device,
+    ) -> CoreResult<Option<std::sync::Arc<dyn candle_gen::candle_nn::linear::NativeLinearWeight>>>
+    {
+        match &self.tensors {
+            candle_gen::loader::MappedWeights::Checkpoint(src) => {
+                src.native_linear_weight(name, shape, dtype, dev)
+            }
+            _ => Ok(None),
+        }
+    }
     fn get(
         &self,
         shape: Shape,
@@ -240,7 +260,7 @@ impl SimpleBackend for CpuCastMmap {
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
-        self.tensors.get(name).is_ok()
+        self.tensors.mmap().get(name).is_ok()
     }
 }
 
@@ -251,11 +271,8 @@ fn cpu_cast_mmap_var_builder(
     device: &Device,
 ) -> CResult<VarBuilder<'static>> {
     let tensors = candle_gen::mmap_safetensors_multi(files)?;
-    let backend: Box<dyn SimpleBackend> =
-        match candle_gen::loader::ProjectionSource::from_mapped(tensors, files, device)? {
-            Ok(source) => Box::new(source),
-            Err(tensors) => Box::new(CpuCastMmap { tensors }),
-        };
+    let tensors = candle_gen::loader::MappedWeights::new(tensors, files, device)?;
+    let backend = Box::new(CpuCastMmap { tensors });
     Ok(VarBuilder::from_backend(backend, dtype, device.clone()))
 }
 
@@ -1641,7 +1658,9 @@ mod tests {
         // target-device transfer is already CPU/F32.
         let mapped =
             unsafe { cst::MmapedSafetensors::multi(std::slice::from_ref(&source)) }.unwrap();
-        let backend = CpuCastMmap { tensors: mapped };
+        let backend = CpuCastMmap {
+            tensors: candle_gen::loader::MappedWeights::Plain(mapped),
+        };
         let prepared = backend.load_cpu("weight", DType::F32).unwrap();
         assert_eq!(prepared.dtype(), DType::F32);
         assert!(prepared.device().is_cpu());

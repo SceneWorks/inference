@@ -1194,12 +1194,11 @@ impl Pipeline {
     /// generator), so the txt2img / Turbo path never pays for it.
     pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
         let vb = if let Some(sources) = &self.comfyui {
-            let vb = sources.builder(
+            sources.builder(
                 crate::comfyui::CombinedComponent::Vae,
                 ENC_DTYPE,
                 &self.device,
-            )?;
-            vb
+            )?
         } else if self.component_is_packed("vae")? {
             self.vae_vb_dequantized(ENC_DTYPE)?
         } else {

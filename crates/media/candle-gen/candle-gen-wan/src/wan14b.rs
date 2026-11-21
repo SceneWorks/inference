@@ -205,50 +205,32 @@ impl Pipeline {
         }
     }
 
-    fn comfyui_scaled_builder(
-        &self,
-        file: &Path,
-        dtype: DType,
-        rename: impl Fn(&str) -> String,
-    ) -> CResult<VarBuilder<'static>> {
-        let mut has_scale = false;
-        let vb =
-            candle_gen::loader::remap_file_var_builder(file, dtype, &self.device, |key, _| {
-                has_scale |= key.ends_with(".scale_weight") || key.ends_with(".weight_scale");
-                if key == "freqs" || key.ends_with(".freqs") {
-                    return Ok(Vec::new());
-                }
-                Ok(vec![candle_gen::loader::SourceView::Whole(rename(key))])
-            })?;
-        if !has_scale {
-            return Err(CandleError::Msg(
-                "Wan ComfyUI scaled checkpoint has no weight scale companion".into(),
-            ));
-        }
-        Ok(vb)
-    }
-
     /// Build one expert from an in-place ComfyUI file (sc-10671): load its native tensor map on CPU,
     /// remap keys + dequant the scaled-fp8 weights ([`crate::comfyui`]) into the diffusers schema, then
     /// build via `VarBuilder::from_tensors` (the in-memory path the packed/adapter loads already use).
     fn build_expert_comfyui(&self, file: &Path) -> CResult<WanTransformer> {
-        let vb = self.comfyui_scaled_builder(file, DIT_DTYPE, crate::comfyui::remap_wan_key)?;
+        let vb = crate::comfyui::scaled_builder(
+            file,
+            DIT_DTYPE,
+            &self.device,
+            crate::comfyui::remap_wan_key,
+        )?;
         Ok(WanTransformer::new(&self.dit_cfg, vb)?)
     }
 
     /// Build the UMT5 text encoder from an in-place ComfyUI file (sc-10909): load its native tensor map
-    /// on CPU, dequant the companion scaled-fp8 weights ([`crate::comfyui::dequant_comfyui_umt5`], no
+    /// on CPU, dequant the companion scaled-fp8 weights ([`crate::comfyui::scaled_builder`], no
     /// key remap — the ComfyUI file already carries the HF `UMT5EncoderModel` keys), then build via
     /// `VarBuilder::from_tensors` at [`ENC_DTYPE`] (bf16, sc-12778 — matching the snapshot TE; the
     /// scaled-fp8 dequant computes in f32 then casts to the bf16 target, as the DiT experts already do).
     fn build_te_comfyui(&self, file: &Path) -> CResult<Umt5Encoder> {
-        let vb = self.comfyui_scaled_builder(file, ENC_DTYPE, str::to_owned)?;
+        let vb = crate::comfyui::scaled_builder(file, ENC_DTYPE, &self.device, str::to_owned)?;
         Ok(Umt5Encoder::new(&self.te_cfg, vb)?)
     }
 
     /// Build the z16 VAE from an in-place ComfyUI file (sc-10909): load its native tensor map on CPU,
     /// remap the native WAN-VAE keys to the diffusers schema
-    /// ([`crate::comfyui::remap_vae_wan_to_diffusers`], values pass through as bf16), then build via
+    /// ([`candle_gen::comfyui_vae::wan_vae_var_builder`], values pass through as bf16), then build via
     /// `VarBuilder::from_tensors` at [`VAE_DTYPE`] (**bf16**, sc-12818 — the weights load bf16, the
     /// decode-floor win; `get` casts each tensor to that dtype). I2V builds the encoder too (the
     /// conditioning image's first-frame latent).

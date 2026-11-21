@@ -250,12 +250,18 @@ impl std::error::Error for ComfyQuantDescriptorError {}
 pub fn parse_comfy_quant_descriptor(
     bytes: &[u8],
 ) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
+    parse_descriptor_with_geometry(bytes, false)
+}
+pub(crate) fn parse_descriptor_with_geometry(
+    bytes: &[u8],
+    legacy: bool,
+) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
     let text = std::str::from_utf8(bytes).map_err(|_| ComfyQuantDescriptorError::NotUtf8)?;
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|error| ComfyQuantDescriptorError::NotJson {
             detail: error.to_string(),
         })?;
-    descriptor_from_json(&json)
+    parse_partial_geometry(&json, legacy)?.into_complete()
 }
 
 /// One layer descriptor as *declared*, before the completeness rules that only a standalone
@@ -422,6 +428,12 @@ pub fn descriptor_from_json(
 pub fn partial_descriptor_from_json(
     json: &serde_json::Value,
 ) -> Result<PartialComfyQuantDescriptor, ComfyQuantDescriptorError> {
+    parse_partial_geometry(json, false)
+}
+fn parse_partial_geometry(
+    json: &serde_json::Value,
+    legacy: bool,
+) -> Result<PartialComfyQuantDescriptor, ComfyQuantDescriptorError> {
     let object = json
         .as_object()
         .ok_or(ComfyQuantDescriptorError::NotAnObject)?;
@@ -445,7 +457,14 @@ pub fn partial_descriptor_from_json(
     let rotation_group = object
         .get("convrot_groupsize")
         .map(|v| match v.as_u64() {
-            Some(group @ (64 | 256)) => Ok(group as usize),
+            Some(group)
+                if matches!(group, 64 | 256)
+                    || legacy
+                        && group.is_power_of_two()
+                        && group.trailing_zeros().is_multiple_of(2) =>
+            {
+                usize::try_from(group).map_err(|_| ComfyQuantDescriptorError::ConvRot)
+            }
             _ => Err(ComfyQuantDescriptorError::ConvRot),
         })
         .transpose()?;
@@ -462,6 +481,7 @@ pub fn partial_descriptor_from_json(
         }
     };
     let per_row = match object.get("per_row") {
+        None if legacy && convrot == Some(true) => Some(true),
         None => None,
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
         Some(_) => return Err(ComfyQuantDescriptorError::NonBooleanField { field: "per_row" }),

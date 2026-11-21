@@ -28,9 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::comfy_quant::{
-    parse_comfy_quant_descriptor, validate_mxfp8_geometry, validate_nvfp4_geometry,
-    ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError,
-    Nvfp4GeometryError, PartialComfyQuantDescriptor, QuantizationMetadataError,
+    validate_mxfp8_geometry, validate_nvfp4_geometry, ComfyQuantDescriptor,
+    ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError, Nvfp4GeometryError,
+    PartialComfyQuantDescriptor, QuantizationMetadataError,
 };
 use crate::weightsmeta::{Dtype, SafetensorsTensorHeader};
 

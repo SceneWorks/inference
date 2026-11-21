@@ -389,7 +389,9 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 })
                 .collect();
             let x = Tensor::from_slice(&input, (18, 16), &dev)?.narrow(0, 1, 17)?;
-            let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+            let got = __model_proof_output!(lin.forward(&x))?
+                .flatten_all()?
+                .to_vec1::<bf16>()?;
             let mut adapted = AdaptLinear::from_dense(lin, 16, 16);
             let mut a = vec![bf16::ZERO; 16];
             a[0] = bf16::ONE;
@@ -398,7 +400,9 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 Tensor::ones((1, 16), DType::BF16, &dev)?,
                 1.0,
             )?;
-            let got_adapted = adapted.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+            let got_adapted = __model_proof_output!(adapted.forward(&x))?
+                .flatten_all()?
+                .to_vec1::<bf16>()?;
             for row in 0..17 {
                 for j in 0..16 {
                     let xij = input[(row + 1) * 16 + j].to_f32();
@@ -511,7 +515,9 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
         .map(|i| bf16::from_f32([0.25, 0.5, -1., 1.875][i % 4]))
         .collect();
     let x = Tensor::from_slice(&input, (m + 1, k), &dev)?.narrow(0, 1, m)?;
-    let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+    let got = __model_proof_output!(lin.forward(&x))?
+        .flatten_all()?
+        .to_vec1::<bf16>()?;
     for row in 0..m {
         for (j, &(col, w)) in factors.iter().enumerate() {
             assert_eq!(
@@ -521,5 +527,153 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
             );
         }
     }
+    // Publisher FP8R scales its activation per token and the weight per output.
+    let k = 16;
+    let mut codes = vec![0; k * k];
+    let mut scales = Vec::new();
+    let mut scale_bytes = Vec::new();
+    for col in 0..k {
+        codes[col * k + col] = F8E4M3::from_f32(1.5).to_bits();
+        let scale = 0.25 + col as f32 * 0.03125;
+        scales.push(scale);
+        scale_bytes.extend(scale.to_le_bytes());
+    }
+    let path = tmp.path().join("rowwise.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "proj.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![k, k], &codes)?,
+            ),
+            (
+                "proj.weight_scale",
+                TensorView::new(Dtype::F32, vec![k], &scale_bytes)?,
+            ),
+        ],
+        None,
+        &path,
+    )?;
+    let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+    let lin = candle_gen::candle_nn::linear_no_bias(k, k, vb.pp("proj"))?;
+    assert_eq!(lin.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
+    let inputs: Vec<_> = (0..17 * k)
+        .map(|i| bf16::from_f32(((i / k) as f32 - 8.) * ((i % k) as f32 - 7.5) * 0.125))
+        .collect();
+    let x = Tensor::from_slice(&inputs, (17, k), &dev)?;
+    let outputs = __model_proof_output!(lin.forward(&x))?
+        .flatten_all()?
+        .to_vec1::<bf16>()?;
+    for (row, (input, output)) in inputs
+        .chunks_exact(k)
+        .zip(outputs.chunks_exact(k))
+        .enumerate()
+    {
+        let max = input.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
+        let sx = (max / 448.).max(1e-12);
+        for col in 0..k {
+            let code = F8E4M3::from_f32((input[col].to_f32() / sx).clamp(-448., 448.)).to_f32();
+            assert_eq!(
+                output[col],
+                bf16::from_f32((code * 1.5 * sx) * scales[col]),
+                "FP8R [{row},{col}]"
+            );
+        }
+    }
+    // The BFL activation is BF16 before row quantization. Preserve the consumer's
+    // F16/F32 scale product before adding its bias, including near rounding ties.
+    let mut identity = vec![0; k * k];
+    let row_scales: Vec<f32> = (0..k).map(|j| 1. + (5 + 2 * j) as f32 / 4096.).collect();
+    for i in 0..k {
+        identity[i * k + i] = F8E4M3::from_f32(1.).to_bits();
+    }
+    let scale_bytes: Vec<u8> = row_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let bias = (-1.0f32).to_le_bytes().repeat(k);
+    let path = tmp.path().join("rowwise-typed.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "proj.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![k, k], &identity)?,
+            ),
+            (
+                "proj.weight_scale",
+                TensorView::new(Dtype::F32, vec![k], &scale_bytes)?,
+            ),
+            ("proj.bias", TensorView::new(Dtype::F32, vec![k], &bias)?),
+        ],
+        None,
+        &path,
+    )?;
+    for output in [DType::F16, DType::F32] {
+        let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&path), output, &dev)?;
+        let op = candle_gen::candle_nn::linear(k, k, vb.pp("proj"))?;
+        assert_eq!(op.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
+        let x = Tensor::from_slice(&vec![1.0f32 + 1. / 512.; k], (1, k), &dev)?.to_dtype(output)?;
+        let y = __model_proof_output!(op.forward(&x))?;
+        assert_eq!(y.dtype(), output);
+        assert_eq!(y.dims(), [1, k]);
+        let expected: Vec<f32> = row_scales
+            .iter()
+            .map(|&scale| {
+                let product = (448.0f32 * (1.0f32 / 448.0)) * scale;
+                match output {
+                    DType::F16 => half::f16::from_f32(product).to_f32() - 1.,
+                    _ => product - 1.,
+                }
+            })
+            .collect();
+        assert_eq!(
+            y.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+            expected
+        );
+    }
+    // The H3 Veda predictor has a separate per-head calibration and a frozen serial scorer.
+    // The first coefficient rounds to one in BF16 only after applying its stored FP32 scale.
+    use candle_gen::quant::veda_score::{self, Projection};
+    let valid = [127usize, 2];
+    let qs = [1., -2., 0.5, 4.];
+    let ks = [0.25, 3., -1., 2.];
+    let tiles = |values: &[f32; 4]| -> candle_core::Result<Tensor> {
+        let mut rows = vec![0f32; 4 * 128];
+        for (i, &value) in values.iter().enumerate() {
+            rows[i * 128..i * 128 + valid[i % 2]].fill(value);
+        }
+        Tensor::from_vec(rows, (2, 2, 128, 1), &dev)
+    };
+    let qcodes = [0x38, 0, 0, 0x3c, 0, 0];
+    let qscales = [1. + 1. / 512., 0.75];
+    let kcodes = [0x38, 0, 0, 0xb8, 0, 0];
+    let kscales = [0.5, 1.25];
+    let got = veda_score::tile_logits_weights(
+        &tiles(&qs)?,
+        &tiles(&ks)?,
+        &valid,
+        2,
+        Projection::Fp8 {
+            codes: &qcodes,
+            scales: &qscales,
+        },
+        Projection::Fp8 {
+            codes: &kcodes,
+            scales: &kscales,
+        },
+    )?;
+    for head in 0..2 {
+        let q =
+            bf16::from_f32(F8E4M3::from_bits(qcodes[3 * head]).to_f32() * qscales[head]).to_f32();
+        let k =
+            bf16::from_f32(F8E4M3::from_bits(kcodes[3 * head]).to_f32() * kscales[head]).to_f32();
+        for row in 0..2 {
+            let scores = &got[head * 4 + row * 2..head * 4 + row * 2 + 2];
+            let expected = [0usize, 1].map(|col| {
+                (qs[head * 2 + row] * q + qs[head * 2 + row])
+                    * (ks[head * 2 + col] * k + ks[head * 2 + col])
+            });
+            assert_eq!(scores, expected);
+            assert_eq!(scores[0] > scores[1], expected[0] > expected[1]);
+        }
+    }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16");
     Ok(())
 }

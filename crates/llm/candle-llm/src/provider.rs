@@ -47,8 +47,7 @@ use crate::models::{
 use crate::primitives::attention::EAGER_ATTN_QUERY_CHUNK_SIZE;
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::{
-    ggml_device_bytes, nvfp4_device_bytes, ProjectionFormat, ProjectionKind, QuantSpec,
-    WeightCensus,
+    ggml_device_bytes, nvfp4_device_bytes, ProjectionFormat, QuantSpec, WeightCensus,
 };
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{KvCache, StepKvCache, Weights};
@@ -1388,25 +1387,7 @@ impl LoadRecord {
     pub fn report(&self) -> core_llm::LoadReport {
         let projections = self
             .census
-            .map(|census| {
-                [
-                    ProjectionKind::Dense,
-                    ProjectionKind::Ggml,
-                    ProjectionKind::Prism,
-                    ProjectionKind::Nvfp4,
-                ]
-                .into_iter()
-                .filter_map(|kind| {
-                    let tally = census.projections.tally(kind);
-                    (tally.count > 0).then(|| core_llm::ProjectionReport {
-                        kind: kind.label().to_string(),
-                        count: tally.count,
-                        params: tally.params,
-                        resident_bytes: tally.resident_bytes,
-                    })
-                })
-                .collect()
-            })
+            .map(|census| census.projections.report())
             .unwrap_or_default();
         core_llm::LoadReport {
             requested: self.requested,
@@ -1840,7 +1821,7 @@ impl LlamaProvider {
             host_required_bytes: host_required,
             device_required_bytes: device_required,
             ..
-        } = Self::load_memory_estimate(spec, device.is_cuda())?;
+        } = Self::load_memory_estimate_for_device(spec, device.is_cuda(), true, Some(&device))?;
         let budget = load_memory_budget()?;
         // A discrete CUDA launcher's override describes device headroom. Host staging is a separate
         // allocation domain and must be checked against host capacity rather than GPU capacity.
@@ -2356,6 +2337,15 @@ impl LlamaProvider {
         cuda: bool,
         target: bool,
     ) -> CoreResult<LoadMemoryEstimate> {
+        Self::load_memory_estimate_for_device(spec, cuda, target, None)
+    }
+
+    fn load_memory_estimate_for_device(
+        spec: &LoadSpec,
+        cuda: bool,
+        target: bool,
+        device: Option<&Device>,
+    ) -> CoreResult<LoadMemoryEstimate> {
         let source = Path::new(&spec.source);
         let config = source
             .is_dir()
@@ -2425,11 +2415,32 @@ impl LlamaProvider {
                 decoder,
                 PricedDecoder::Causal(_) | PricedDecoder::Qwen35(..)
             );
+            let mut resident_payload = payload;
             let (cast, copy, held) = if builds && (cuda || format.is_some()) {
-                let tensors = snapshot_tensor_headers(source)?;
+                let mut tensors = snapshot_tensor_headers(source)?;
+                let decoder_root = decoder.snapshot_root(&tensors);
+                if let Some(device) = device {
+                    if let Some((encoded_source, encoded_resident)) = price_checkpoint_rows(
+                        source,
+                        device,
+                        &decoder,
+                        decoder_root.as_deref(),
+                        &mut tensors,
+                    )? {
+                        resident_payload = payload
+                            .checked_sub(encoded_source)
+                            .and_then(|remaining| remaining.checked_add(encoded_resident))
+                            .ok_or_else(overflow)?;
+                    }
+                }
                 let (copy, consumed) = match format {
-                    Some(format) => snapshot_quantized_copy_bytes(&decoder, format, &tensors)
-                        .ok_or_else(overflow)?,
+                    Some(format) => snapshot_quantized_copy_bytes(
+                        &decoder,
+                        decoder_root.as_deref(),
+                        format,
+                        &tensors,
+                    )
+                    .ok_or_else(overflow)?,
                     None => (0, Default::default()),
                 };
                 // Off CUDA the compute dtype is f32 and the host rule's three payloads cover it.
@@ -2447,7 +2458,7 @@ impl LlamaProvider {
             } else {
                 (0, 0, 0)
             };
-            LoadWorkingSet::resident_payload(payload, cast, copy, decoder.is_packed())
+            LoadWorkingSet::resident_payload(resident_payload, cast, copy, decoder.is_packed())
                 .holding_on_host(held)
         };
         let (host_required, device_required) =
@@ -2763,6 +2774,9 @@ impl LlamaProvider {
         }));
         if let (Decoder::Qwen35(_), Some(mtp)) = (&model, &mtp) {
             load_record.record_predictor(&mtp.weight_census());
+        }
+        if let Some(census) = &mut load_record.census {
+            census.projections.replace_native(weights.native_census());
         }
         load_record.fallbacks = load_fallbacks;
         descriptor.capabilities.tree_verify = model.tree_verify_capabilities();

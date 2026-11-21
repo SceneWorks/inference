@@ -136,12 +136,8 @@ struct MultiheadAttention {
 impl MultiheadAttention {
     fn load(vb: VarBuilder, width: usize, num_heads: usize) -> CResult<Self> {
         let head_dim = width / num_heads;
-        let in_w = vb.get((3 * width, width), "in_proj_weight")?;
-        let in_b = vb.get(3 * width, "in_proj_bias")?;
-        let in_proj = Linear::new(in_w, Some(in_b));
-        let out_w = vb.get((width, width), "out_proj.weight")?;
-        let out_b = vb.get(width, "out_proj.bias")?;
-        let out_proj = Linear::new(out_w, Some(out_b));
+        let in_proj = crate::agg::attention_in_projection(&vb, width)?;
+        let out_proj = candle_nn::linear(width, width, vb.pp("out_proj"))?;
         Ok(Self {
             in_proj,
             out_proj,
@@ -218,9 +214,7 @@ impl ResidualAttentionBlock {
 
 /// A `candle_nn::Linear` with explicit `weight`/`bias` tensors (open_clip stores both).
 fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> CResult<Linear> {
-    let w = vb.get((out_dim, in_dim), "weight")?;
-    let b = vb.get(out_dim, "bias")?;
-    Ok(Linear::new(w, Some(b)))
+    candle_nn::linear(in_dim, out_dim, vb)
 }
 
 // ---- towers ----------------------------------------------------------------------------------
@@ -233,7 +227,7 @@ struct VisionTower {
     ln_pre: LayerNorm,
     blocks: Vec<ResidualAttentionBlock>,
     ln_post: LayerNorm,
-    proj: Tensor, // (width, embed_dim)
+    proj: Linear,
 }
 
 impl VisionTower {
@@ -257,7 +251,15 @@ impl VisionTower {
             )?);
         }
         let ln_post = layer_norm(VISION_WIDTH, LN_EPS, vb.pp("ln_post"))?;
-        let proj = vb.get((VISION_WIDTH, EMBED_DIM), "proj")?;
+        let proj = if vb.contains_tensor("proj.weight") {
+            candle_nn::linear_no_bias(VISION_WIDTH, EMBED_DIM, vb.pp("proj"))?
+        } else if let Some(op) =
+            vb.native_linear_weight_transposed("proj", (EMBED_DIM, VISION_WIDTH))?
+        {
+            Linear::from_native(op, None)
+        } else {
+            Linear::new(vb.get((VISION_WIDTH, EMBED_DIM), "proj")?.t()?, None)
+        };
         Ok(Self {
             conv1,
             class_embedding,
@@ -365,7 +367,7 @@ impl DfnClipEncoder {
     pub fn encode_image(&self, pixels: &Tensor) -> CResult<Tensor> {
         let hs = self.visual.hidden_states(pixels)?; // (B, 730, width)
         let pooled = cls_pool(&hs)?; // CLS token, (B, width) — contiguous for the visual.proj matmul
-        let projected = pooled.matmul(&self.visual.proj)?; // (B, 1024)
+        let projected = self.visual.proj.forward(&pooled)?; // (B, 1024)
         l2_normalize(&projected)
     }
 
@@ -830,7 +832,8 @@ pub fn load_from_pth(weights: &Path, device: &Device) -> Result<DfnClipEncoder> 
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth(weights, DType::F32, device).map_err(AudioError::from)?;
+    let vb = candle_audio::weights::state_builder(weights, None, DType::F32, device)
+        .map_err(AudioError::from)?;
     DfnClipEncoder::load(vb, device.clone()).map_err(AudioError::from)
 }
 
@@ -838,7 +841,7 @@ pub fn load_from_pth(weights: &Path, device: &Device) -> Result<DfnClipEncoder> 
 pub fn load(source: &WeightsSource, device: &Device) -> Result<DfnClipEncoder> {
     let path: PathBuf = match source {
         WeightsSource::File(p) => p.clone(),
-        WeightsSource::Dir(d) => d.join(CLIP_WEIGHTS_PATH),
+        WeightsSource::Dir(d) => candle_audio::weights::checkpoint_file(d.join(CLIP_WEIGHTS_PATH)),
     };
     load_from_pth(&path, device)
 }

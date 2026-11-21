@@ -18,6 +18,7 @@ sceneworks-gen-core = { workspace = true }
 # families use, so the whole on-device stack resolves ONE candle build. CPU by default; the
 # `metal` / `cuda` features select a GPU backend per platform.
 candle-core = { workspace = true }
+candle-checkpoint.workspace = true
 # candle-nn (same workspace pin) for the shared neural-codec layers (`neural_codec`: Conv1d /
 # ConvTranspose1d of the DAC decoder, sc-19377). Every audio provider already depends on it.
 candle-nn = { workspace = true }
@@ -35,7 +36,7 @@ serde_json = { workspace = true }
 libc = { workspace = true }
 
 [features]
-model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "candle-core/model-inference-proof"]
+model-inference-proof = ["candle-checkpoint/model-inference-proof", "sceneworks-gen-core/model-inference-proof", "candle-core/model-inference-proof"]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere),
 # and the walking-skeleton audio models synthesize in real time on CPU (audio-backend-strategy.md).
 default = []
@@ -49,9 +50,9 @@ default = []
 testkit = []
 # Apple Metal GPU backend — a per-model implementation option on runtime-macos (the audio lane
 # ships Candle-CPU there today; see audio-backend-strategy.md). NOT in `default`.
-metal = ["candle-core/metal", "candle-nn/metal"]
+metal = ["candle-checkpoint/metal", "candle-core/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["candle-checkpoint/cuda", "candle-core/cuda", "candle-nn/cuda"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

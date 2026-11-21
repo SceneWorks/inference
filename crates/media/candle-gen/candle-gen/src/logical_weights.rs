@@ -597,6 +597,99 @@ mod tests {
         assert_eq!(facts.receipt().resident_bytes(), 68);
     }
 
+    #[test]
+    fn owned_source_uses_verified_bytes_for_scale_discovery_and_coefficients() {
+        use candle_core::safetensors::MmapedSafetensors;
+        let dir = fixture_dir();
+        let paths = [
+            dir.path().join("codes.safetensors"),
+            dir.path().join("scale.safetensors"),
+        ];
+        write_safetensors(
+            &paths[0],
+            &[("q.weight", "F8_E5M2", &[2, 2], vec![0x3c; 4])],
+        );
+        write_safetensors(
+            &paths[1],
+            &[(
+                "q.weight_scale",
+                "F32",
+                &[],
+                0.375f32.to_le_bytes().to_vec(),
+            )],
+        );
+        let st = MmapedSafetensors::from_buffers(
+            paths
+                .iter()
+                .map(|p| std::fs::read(p).map_err(candle_core::Error::wrap)),
+        )
+        .unwrap();
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let source = candle_checkpoint::ProjectionSource::from_mapped(st, &paths, &Device::Cpu)
+            .unwrap()
+            .ok()
+            .unwrap();
+        let t = source
+            .reader()
+            .read_dense("q.weight", DType::F32, &Device::Cpu)
+            .unwrap();
+        assert_eq!(
+            t.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.375; 4]
+        );
+        assert_eq!(
+            source
+                .reader()
+                .checkpoint_weight_facts()
+                .unwrap()
+                .receipt()
+                .resident_bytes(),
+            16
+        );
+    }
+
+    #[test]
+    fn cached_dense_coefficients_count_in_addition_to_the_packed_execution_operand() {
+        use gen_core::checkpoint_codec::WeightEncoding;
+        use gen_core::checkpoint_facts::ExecutionRepresentation;
+        let dir = fixture_dir();
+        let p = dir.path().join("both.safetensors");
+        write_safetensors(
+            &p,
+            &[("model.q.weight", "F8_E4M3", &[16, 16], vec![0x38; 256])],
+        );
+        let native = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            ..CandleCodecResidency::DENSE
+        };
+        let plan = plan_logical_weights(&p, &StripModel, &native).unwrap();
+        let account = gen_core::CheckpointReadAccounting::new(
+            plan.into(),
+            native.native_execution_capability(),
+            &[p],
+        );
+        account
+            .record("q.weight", ExecutionRepresentation::NativePacked, 256)
+            .unwrap();
+        for _ in 0..2 {
+            account
+                .record_coefficient_cache(
+                    "q.weight",
+                    None,
+                    &[16, 16],
+                    WeightEncoding::DenseF32,
+                    1024,
+                )
+                .unwrap();
+        }
+        let facts = account.facts().unwrap();
+        assert_eq!(facts.receipt().resident_bytes(), 1280);
+        assert_eq!(facts.receipt().source_bytes, 256);
+        assert_eq!(facts.receipt().residency.len(), 2);
+    }
+
     /// Golden: `fp8-e5m2-scalar-v1` (scaled) plus the undescribed plain cast (unit scale).
     #[test]
     fn fp8_e5m2_scalar_and_plain_cast_golden_decode_exactly() {

@@ -63,6 +63,7 @@ pub use gen_core;
 // generator macro is re-exported — a provider needing another kind belongs in a media family.
 pub use gen_core::register_generators;
 // Re-export the candle backend so provider crates share this crate's exact candle build.
+pub use candle_checkpoint;
 pub use candle_core;
 
 use thiserror::Error;

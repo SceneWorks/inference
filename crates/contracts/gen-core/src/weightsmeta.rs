@@ -627,7 +627,8 @@ pub fn safetensors_path_tensor_headers(
     Ok(tensors.into_values().collect())
 }
 
-fn collect_safetensors_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+/// Enumerate the same non-hidden shard tree consumed by recursive source inventory.
+pub fn collect_safetensors_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();

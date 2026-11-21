@@ -375,10 +375,23 @@ pub fn mmap_var_builder(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
+    mmap_var_builder_with_geometry(files, dtype, device, false)
+}
+pub fn mmap_var_builder_with_geometry(
+    files: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+    legacy_convrot: bool,
+) -> Result<VarBuilder<'static>> {
     // SAFETY: see the function-level doc — no process may truncate or modify the mapped files while
     // the mapping is live (accepted residual risk). Standard candle loading path.
     __model_proof_inspect!(
-        Ok(candle_checkpoint::mmap_var_builder(files, dtype, device)?),
+        Ok(candle_checkpoint::mmap_var_builder_with_geometry(
+            files,
+            dtype,
+            device,
+            legacy_convrot
+        )?),
         |_| {
             gen_core::model_input_proof::record_reader_paths(
                 "candle-gen::loader::mmap_var_builder",

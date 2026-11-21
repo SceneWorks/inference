@@ -41,9 +41,7 @@ pub struct VocosConfig {
 }
 
 fn linear(vb: &VarBuilder, name: &str, out: usize, inp: usize) -> Result<Linear> {
-    let w = vb.get((out, inp), &format!("{name}.weight"))?;
-    let b = vb.get(out, &format!("{name}.bias"))?;
-    Ok(Linear::new(w, Some(b)))
+    candle_nn::linear(inp, out, vb.pp(name))
 }
 
 fn layer_norm(vb: &VarBuilder, name: &str, dim: usize, eps: f64) -> Result<LayerNorm> {

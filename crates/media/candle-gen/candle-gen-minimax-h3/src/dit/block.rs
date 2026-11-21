@@ -198,8 +198,9 @@ impl AdaLnProjection {
         cfg: &MiniMaxH3DitConfig,
         dtype: DType,
     ) -> Result<Self> {
-        let loaded = crate::quant::lin(w, crate::quant::DIT, prefix, true, dtype)?;
         let want = (cfg.adaln_out_features(), cfg.time_embed_dim);
+        let loaded =
+            crate::quant::lin_shaped(w, crate::quant::DIT, prefix, true, dtype, Some(want))?;
         let got = loaded.linear.base_shape();
         if got != want {
             return Err(CandleError::Msg(format!(
@@ -379,7 +380,7 @@ impl DitBlock {
             norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
             attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
-            ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
+            ff: DitFeedForward::load(w, &format!("{prefix}.ff"), dtype, Some(cfg))?,
             adaln_proj: Some(AdaLnProjection::from_weights(
                 w,
                 &format!("{prefix}.adaln_proj.linear"),
@@ -411,7 +412,7 @@ impl DitBlock {
             norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
             attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
-            ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
+            ff: DitFeedForward::load(w, &format!("{prefix}.ff"), dtype, Some(cfg))?,
             adaln_proj: None,
             curve: Some(curve),
         })

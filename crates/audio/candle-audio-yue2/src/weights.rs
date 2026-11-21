@@ -34,14 +34,64 @@ pub enum Proj {
     Dense(Tensor),
     /// A GGML block-quantized weight, multiplied by Candle's quantized matmul.
     Ggml(Arc<QTensor>),
+    /// A source-encoded matrix, retained across device offload/reload.
+    Checkpoint(Box<CheckpointMatrix>),
     /// An FP8 E4M3 weight of the experimental FP8 AR mode (CUDA only).
     #[cfg(feature = "cuda")]
     Fp8(Box<crate::fp8::Fp8Weight>),
 }
 
+/// The source builder owns only the checkpoint mapping. Dropping the executing operand parks a
+/// layer on the host without keeping a CUDA allocation or decoding the rotated integer matrix.
+pub struct CheckpointMatrix {
+    source: VarBuilder<'static>,
+    key: String,
+    dims: (usize, usize),
+    format: &'static str,
+    operand: Option<Arc<dyn candle_nn::linear::NativeLinearWeight>>,
+    dense: std::sync::OnceLock<Tensor>,
+}
+
+impl CheckpointMatrix {
+    fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> CResult<Tensor> {
+        if let Some(op) = &self.operand {
+            return op.forward(x, bias);
+        }
+        if self.dense.get().is_none() {
+            let t = self.source.get(self.dims, &self.key)?;
+            let _ = self.dense.set(t);
+        }
+        linear(x, self.dense.get().expect("initialized"), bias).map_err(candle_err)
+    }
+
+    fn to_device(&self, device: &Device) -> CResult<Self> {
+        let source = self.source.clone().set_device(device.clone());
+        let operand = if source.device().same_device(self.source.device()) {
+            self.operand.clone()
+        } else if device.is_cpu() {
+            None
+        } else {
+            source.native_linear_weight_with_shape(&self.key, Some(self.dims))?
+        };
+        Ok(Self {
+            source,
+            key: self.key.clone(),
+            dims: self.dims,
+            format: self.format,
+            operand,
+            dense: Default::default(),
+        })
+    }
+}
+
 impl std::fmt::Debug for Proj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Proj::Checkpoint(m) => f
+                .debug_tuple("Checkpoint")
+                .field(&m.format)
+                .field(&m.dims)
+                .finish(),
             Proj::Dense(t) => f
                 .debug_tuple("Dense")
                 .field(&t.dtype())
@@ -63,6 +113,7 @@ impl Proj {
     /// quantized matmul), so the activation is converted in and the result converted back.
     pub fn forward(&self, x: &Tensor, bias: Option<&Tensor>) -> CResult<Tensor> {
         match self {
+            Proj::Checkpoint(m) => __model_proof_output!(m.forward(x, bias)),
             Proj::Dense(w) => linear(x, w, bias).map_err(candle_err),
             Proj::Ggml(q) => {
                 let dtype = x.dtype();
@@ -85,6 +136,7 @@ impl Proj {
     /// BF16 before anything offloads).
     pub fn to_device(&self, device: &Device) -> CResult<Self> {
         match self {
+            Proj::Checkpoint(m) => Ok(Proj::Checkpoint(Box::new(m.to_device(device)?))),
             Proj::Dense(t) => Ok(Proj::Dense(t.to_device(device)?)),
             Proj::Ggml(q) => {
                 let stored = to_ggml_block_tensor(q).map_err(candle_err)?;
@@ -102,6 +154,7 @@ impl Proj {
     /// The device the weight lives on.
     pub fn device(&self) -> Device {
         match self {
+            Proj::Checkpoint(m) => m.source.device().clone(),
             Proj::Dense(t) => t.device().clone(),
             Proj::Ggml(q) => q.device(),
             #[cfg(feature = "cuda")]
@@ -112,6 +165,7 @@ impl Proj {
     /// The logical `[out, in]` shape.
     pub fn dims(&self) -> Vec<usize> {
         match self {
+            Proj::Checkpoint(m) => vec![m.dims.0, m.dims.1],
             Proj::Dense(t) => t.dims().to_vec(),
             Proj::Ggml(q) => q.shape().dims().to_vec(),
             #[cfg(feature = "cuda")]
@@ -125,6 +179,16 @@ impl Proj {
     /// How the weight is held: `bf16`/`float32` for a dense one, the GGML label, or `fp8_e4m3`.
     pub fn label(&self) -> &'static str {
         match self {
+            Proj::Checkpoint(m) => m.operand.as_ref().map_or_else(
+                || {
+                    if m.dense.get().is_some() {
+                        "dense_checkpoint"
+                    } else {
+                        "mapped_checkpoint"
+                    }
+                },
+                |op| op.format_id(),
+            ),
             Proj::Dense(t) => match t.dtype() {
                 DType::BF16 => "bf16",
                 DType::F32 => "float32",
@@ -142,6 +206,14 @@ impl Proj {
     /// only); an FP8 weight's bytes plus its F32 scale.
     pub fn resident_bytes(&self) -> u64 {
         match self {
+            Proj::Checkpoint(m) => m.operand.as_ref().map_or_else(
+                || {
+                    m.dense
+                        .get()
+                        .map_or(0, |t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                },
+                |op| op.resident_bytes(),
+            ),
             Proj::Dense(t) => (t.elem_count() * t.dtype().size_in_bytes()) as u64,
             Proj::Ggml(q) => crate::precision::loaded_bytes(
                 Storage::Ggml(q.dtype()),
@@ -170,14 +242,17 @@ impl Proj {
 /// model device); a GGML block tensor is read raw on the host and rebuilt on the model device
 /// exactly as stored.
 #[derive(Clone)]
-pub(crate) struct Loader<'a> {
-    vb: VarBuilder<'a>,
+pub(crate) struct Loader {
+    vb: VarBuilder<'static>,
     storage: Option<Arc<BTreeMap<String, Storage>>>,
 }
 
-impl<'a> Loader<'a> {
+impl Loader {
     /// A loader over `vb` for the tier whose plan is `storage` (`None` = all BF16).
-    pub(crate) fn new(vb: VarBuilder<'a>, storage: Option<Arc<BTreeMap<String, Storage>>>) -> Self {
+    pub(crate) fn new(
+        vb: VarBuilder<'static>,
+        storage: Option<Arc<BTreeMap<String, Storage>>>,
+    ) -> Self {
         Self { vb, storage }
     }
 
@@ -220,7 +295,27 @@ impl<'a> Loader<'a> {
     /// The matmul weight `name` of logical shape `(out, in)`.
     pub(crate) fn matrix(&self, name: &str, (out, inp): (usize, usize)) -> CResult<Proj> {
         match self.planned(name)? {
-            Storage::Bf16 => Ok(Proj::Dense(self.vb.get((out, inp), name)?)),
+            Storage::Bf16 => {
+                let dims = (out, inp);
+                if let Some(op) = self.vb.native_linear_weight_with_shape(name, Some(dims))? {
+                    if op.dims() != dims {
+                        return Err(candle_err(format!(
+                            "{name} expected {dims:?}, got {:?}",
+                            op.dims()
+                        )));
+                    }
+                    Ok(Proj::Checkpoint(Box::new(CheckpointMatrix {
+                        source: self.vb.clone(),
+                        key: name.to_owned(),
+                        dims,
+                        format: op.format_id(),
+                        operand: Some(op),
+                        dense: Default::default(),
+                    })))
+                } else {
+                    Ok(Proj::Dense(self.vb.get(dims, name)?))
+                }
+            }
             storage @ Storage::Ggml(dtype) => {
                 let (_, want) = storage.stored(&[out, inp]);
                 let host = self.vb.clone().set_device(Device::Cpu);

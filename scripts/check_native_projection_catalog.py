@@ -170,9 +170,16 @@ def check_mlx(root: Path) -> list[str]:
     return issues
 
 
+def check_all(root: Path) -> list[str]:
+    from check_native_candle_media import check_candle_media
+    from native_projection_llm_audio import check_candle_llm_audio
+
+    return check_mlx(root) + check_candle_media(root) + check_candle_llm_audio(root)
+
+
 if __name__ == "__main__":
     import sys
-    problems = check_mlx(Path(__file__).resolve().parents[1])
+    problems = check_all(Path(__file__).resolve().parents[1])
     for problem in problems:
         print(problem, file=sys.stderr)
     raise SystemExit(bool(problems))

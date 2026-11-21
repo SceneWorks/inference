@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use candle_audio::candle_core::{DType, Device, Result as CResult, Tensor};
 use candle_audio::gen_core::{ComponentLicense, WeightsSource};
 use candle_audio::{AudioError, Result};
-use candle_nn::VarBuilder;
 
 use crate::bigvgan::{self, BigVganVocoder};
 use crate::vae::{self, MelVaeDecoder};
@@ -180,11 +179,11 @@ fn source_to_path(source: &WeightsSource, filename: &str, nested: &str) -> PathB
     match source {
         WeightsSource::File(p) => p.clone(),
         WeightsSource::Dir(d) => {
-            let nested_path = d.join(nested);
+            let nested_path = candle_audio::weights::checkpoint_file(d.join(nested));
             if nested_path.exists() {
                 nested_path
             } else {
-                d.join(filename)
+                candle_audio::weights::checkpoint_file(d.join(filename))
             }
         }
     }
@@ -198,7 +197,8 @@ pub fn load_vae_from_pth(weights: &Path, device: &Device) -> Result<MelVaeDecode
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth(weights, DType::F32, device).map_err(AudioError::from)?;
+    let vb = candle_audio::weights::state_builder(weights, None, DType::F32, device)
+        .map_err(AudioError::from)?;
     MelVaeDecoder::load(vb).map_err(AudioError::from)
 }
 
@@ -211,8 +211,9 @@ pub fn load_bigvgan_from_pth(weights: &Path, device: &Device) -> Result<BigVganV
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth_with_state(weights, DType::F32, BIGVGAN_STATE_KEY, device)
-        .map_err(AudioError::from)?;
+    let vb =
+        candle_audio::weights::state_builder(weights, Some(BIGVGAN_STATE_KEY), DType::F32, device)
+            .map_err(AudioError::from)?;
     BigVganVocoder::load(vb).map_err(AudioError::from)
 }
 
@@ -237,7 +238,8 @@ pub fn load_vae_44k_from_pth(weights: &Path, device: &Device) -> Result<MelVaeDe
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth(weights, DType::F32, device).map_err(AudioError::from)?;
+    let vb = candle_audio::weights::state_builder(weights, None, DType::F32, device)
+        .map_err(AudioError::from)?;
     MelVaeDecoder::load_with_config(vb, vae::Config::vae_44k()).map_err(AudioError::from)
 }
 
@@ -251,8 +253,13 @@ pub fn load_bigvgan_v2_from_pth(weights: &Path, device: &Device) -> Result<BigVg
             weights.display()
         )));
     }
-    let vb = VarBuilder::from_pth_with_state(weights, DType::F32, BIGVGAN_V2_STATE_KEY, device)
-        .map_err(AudioError::from)?;
+    let vb = candle_audio::weights::state_builder(
+        weights,
+        Some(BIGVGAN_V2_STATE_KEY),
+        DType::F32,
+        device,
+    )
+    .map_err(AudioError::from)?;
     BigVganVocoder::load_with_config(vb, bigvgan::Config::bigvgan_v2_44khz_128band_512x())
         .map_err(AudioError::from)
 }

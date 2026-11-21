@@ -161,12 +161,14 @@ pub fn compile_logical_weight_plan_with_metadata(
             .ok_or_else(|| LogicalWeightPlanError::DescriptorPayloadUnavailable {
                 physical_key: header.name.clone(),
             })?;
-        let descriptor = parse_comfy_quant_descriptor(payload).map_err(|defect| {
-            LogicalWeightPlanError::Descriptor {
-                layer: base.to_owned(),
-                physical_key: header.name.clone(),
-                defect,
-            }
+        let descriptor = crate::comfy_quant::parse_descriptor_with_geometry(
+            payload,
+            mapping.legacy_convrot_geometry(),
+        )
+        .map_err(|defect| LogicalWeightPlanError::Descriptor {
+            layer: base.to_owned(),
+            physical_key: header.name.clone(),
+            defect,
         })?;
         // The blob is authoritative. A file-level entry for the same layer only has to be
         // CONSISTENT with it: fields the entry omits are not a disagreement (the real-artifact
@@ -680,12 +682,13 @@ pub fn compile_logical_weight_plan_with_metadata(
                                 });
                             }
                         }
-                        let geometry = crate::convrot_int8::ConvRotInt8::from_geometry(
+                        let geometry = crate::convrot_int8::ConvRotInt8::from_source_geometry(
                             descriptor
                                 .rotation_group
                                 .expect("complete ConvRot descriptor"),
                             &header.shape,
                             &scale.shape,
+                            mapping.legacy_convrot_geometry(),
                         )
                         .map_err(|defect| {
                             LogicalWeightPlanError::CompanionMalformed {
