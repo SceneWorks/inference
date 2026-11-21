@@ -2,7 +2,7 @@
 //! `encode` then applies the fork's prompt post-processing (drop the leading system-prompt tokens).
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
