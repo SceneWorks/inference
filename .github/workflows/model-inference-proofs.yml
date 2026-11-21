@@ -13,7 +13,7 @@ on:
       flux1_pair:
         description: Compare the FLUX.1 batch against its pre-migration source in this same job
         type: choice
-        options: [none, tier1, tier2, conditional-tier1]
+        options: [none, tier1, tier2, conditional-tier1, eng4b-tier1]
         default: none
       request:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
@@ -34,7 +34,7 @@ env:
   CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
-  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
+  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2' || inputs.flux1_pair == 'eng4b-tier1') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read
@@ -111,6 +111,13 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: 2b09938e33370915d4f853389961709b8bbf8bf9
+          path: flux1-baseline
+          persist-credentials: false
+      - name: Check out the merged ENG-4a engine for the FLUX.1 ENG-4b proof
+        if: matrix.asset_setup == 'flux1-eng4b-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: e86b8d5fc493c16b2d9d852e0c9ecbdefee58294
           path: flux1-baseline
           persist-credentials: false
       - name: Select Git Bash on Windows

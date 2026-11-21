@@ -67,7 +67,15 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertEqual(set(events), {'workflow_dispatch'})
         inputs = events['workflow_dispatch']['inputs']
         self.assertEqual(set(inputs), {'backend', 'request', 'flux1_pair', 'stage_pinned_assets'})
-        self.assertEqual(inputs['flux1_pair']['options'], ['none', 'tier1', 'tier2', 'conditional-tier1'])
+        self.assertEqual(inputs['flux1_pair']['options'],
+                         ['none', 'tier1', 'tier2', 'conditional-tier1', 'eng4b-tier1'])
+        self.assertIn("inputs.flux1_pair == 'eng4b-tier1'", proof['env']['MODEL_PROOF_SCRIPT'])
+        baselines = {step['if']: step['with']['ref'] for step in proof['jobs']['prove']['steps']
+                     if step.get('with', {}).get('path') == 'flux1-baseline'}
+        self.assertEqual(baselines, {
+            "matrix.asset_setup == 'flux1-comparison'": "2b09938e33370915d4f853389961709b8bbf8bf9",
+            "matrix.asset_setup == 'flux1-eng4b-comparison'": "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294",
+        })
         self.assertEqual(inputs['flux1_pair']['default'], 'none')
         # Opt-in asset setup for the inventory job only; never on by default.
         self.assertEqual(inputs['stage_pinned_assets']['type'], 'boolean')

@@ -2,10 +2,14 @@
 from pathlib import Path
 import subprocess
 
+from scripts.ci.flux1_pair.fixture import ENG4B
+
 HERE = Path(__file__).resolve().parent
 MLX = "crates/media/mlx-gen/"
 CANDLE = "crates/media/candle-gen/"
 BASE = "2b09938e33370915d4f853389961709b8bbf8bf9"
+ENG4B_BASE = "e86b8d5fc493c16b2d9d852e0c9ecbdefee58294"
+ENG4B_BASE_TREE = "88e1369f11fbc1be2d2fb9b0063db8725463db92"
 
 
 def replace_once(root, path, old, new):
@@ -19,9 +23,18 @@ def replace_once(root, path, old, new):
 def install(root, backend, arm, tier):
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip():
         raise ValueError("overlay requires a fresh clean proof checkout")
+    eng4b = tier == ENG4B
+    if eng4b:
+        if backend != "candle-cuda" or arm not in ("base", "head"):
+            raise ValueError("ENG-4b overlay requires the Candle CUDA comparison arms")
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True,
+                                       encoding="utf-8").strip()
+        if (head == ENG4B_BASE) != (arm == "base"):
+            raise ValueError("ENG-4b overlay received the wrong source revision for its arm")
     mlx = backend == "mlx"
+    planned = arm == "head" or eng4b
     family = MLX + "mlx-gen-flux" if mlx else CANDLE + "candle-gen-flux"
-    if tier == "tier1":
+    if tier in ("tier1", ENG4B):
         if mlx:
             path = family + "/src/transformer.rs"
             replace_once(root, path, "num_layers: 19,\n            num_single_layers: 38,",
@@ -39,6 +52,8 @@ def install(root, backend, arm, tier):
             if len(text_encoder_sources) != 1:
                 raise ValueError("proof overlay requires exactly one Candle FLUX text encoder source")
             path = text_encoder_sources[0]
+            if eng4b and (path.endswith("/packed_te.rs") != (arm == "base")):
+                raise ValueError("ENG-4b overlay did not bind the expected text encoder for its arm")
             replace_once(root, path, "num_hidden_layers: 12,", "num_hidden_layers: 1,")
             replace_once(root, path, "num_layers: 24,", "num_layers: 1,")
     path = (MLX if mlx else CANDLE + "candle-gen/") + "src/sampler.rs"
@@ -65,7 +80,7 @@ def install(root, backend, arm, tier):
 }
 """
     else:
-        if arm == "head":
+        if planned:
             start = "let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {\n                if cancel.is_cancelled()"
             replace_once(root, path, start, start.replace("                if cancel.", "                pair_observe(x, sigma);\n                if cancel."))
             end = '''    if state.next_step() != sigmas.len().saturating_sub(1) {
@@ -109,7 +124,7 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     engine = "mlx_gen" if mlx else "candle_gen"
     generate = """let generator = registry.load(&model, &spec)?;
     let output = generator.generate(&request, &mut progress)?;"""
-    if arm == "head":
+    if planned:
         generate = """let plan = registry.compile_render_plan(&model, &spec, &request)?.ok_or("unregistered plan")?;
     fs::write(dir.join("plan.json"), serde_json::to_vec(&plan)?)?;
     if std::env::args().nth(1).as_deref() == Some("--preflight") {
@@ -149,6 +164,14 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     drop(generator);"""
     spec = "let spec = spec.with_quant(mlx_gen::gen_core::Quant::Q4);" if mlx and tier == "tier2" else ""
     body = template.replace("@ENGINE@", engine).replace("@PROVIDER@", engine + "_flux")
+    if eng4b:
+        # Permit compile-time and native plan-only validation without a CUDA
+        # toolchain. Rendering still refuses a non-CUDA build before any model load.
+        body = body.replace("    let model =", """    if !cfg!(feature = "cuda") && std::env::args().nth(1).as_deref() != Some("--preflight") {
+        return Err("FLUX.1 ENG-4b proof requires CUDA".into());
+    }
+    let model =""", 1)
+        cuda_proof = '#[cfg(feature = "cuda")] {\n' + cuda_proof + '\n}'
     destination = root / family / "src/bin/flux1-pair.rs"
     destination.parent.mkdir(exist_ok=True)
     with destination.open("x", encoding="utf-8") as out:
