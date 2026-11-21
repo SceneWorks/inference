@@ -34,7 +34,7 @@ env:
   CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
   CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
-  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
+  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'wan-curated-tier1' && 'wan_tier1_comparison.py' || inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read
@@ -51,6 +51,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
+          # The Wan controller verifies the fixed migration base as an ancestor before building.
+          fetch-depth: ${{ fromJSON(inputs.request).selection == 'wan-curated-tier1' && '0' || '1' }}
           persist-credentials: false
       - name: Install pinned uv on Linux
         if: runner.os == 'Linux'
@@ -105,6 +107,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
+          # The Wan controller verifies the fixed migration base as an ancestor before building.
+          fetch-depth: ${{ fromJSON(inputs.request).selection == 'wan-curated-tier1' && '0' || '1' }}
           persist-credentials: false
       - name: Check out the exact pre-migration engine for the paired proof
         if: matrix.asset_setup == 'flux1-comparison'

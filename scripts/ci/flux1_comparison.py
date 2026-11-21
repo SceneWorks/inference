@@ -122,10 +122,10 @@ def retained_log_limits(policy):
             "guard.jsonl": policy["eventCapBytes"], "supervisor.json": 16 * 1024**2}
 
 
-def retain_logs(work, artifact, receipt):
+def retain_logs(work, artifact, receipt, phases=PHASES):
     records = receipt["logs"]
     errors = []
-    for phase in PHASES:
+    for phase in phases:
         limits = retained_log_limits(receipt["request"]["policy"])
         if (receipt["request"]["policy"]["backend"] == "windows-cuda"
                 and not phase.startswith("preflight-")):
@@ -145,7 +145,8 @@ def retain_logs(work, artifact, receipt):
     return errors
 
 
-def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None):
+def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None,
+           arguments=()):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -156,7 +157,7 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
         fds = (int(fd),)
     stderr_path = out / "stderr.log"
     try:
-        guard = run_guarded([str(binary), *(["--preflight"] if preflight else [])],
+        guard = run_guarded([str(binary), *(["--preflight"] if preflight else []), *arguments],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
