@@ -1672,8 +1672,8 @@ impl Krea {
 
     /// Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE global
     /// schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
-    /// (single-forward) body, AND per-phase adapters toggled on that phase's own job-local DiT clone
-    /// — sharing the latent + sigma trajectory across every boundary. The per-phase plans (clone +
+    /// (single-forward) body and per-phase adapters selected on the matching request-local DiT,
+    /// sharing the latent and sigma trajectory across every boundary. The per-phase plans (clone +
     /// adapters + prep) are built ONCE here (`prep_neg` present per phase iff that phase uses CFG,
     /// backed by the encode-guidance neg-context gate) and reused across the count loop (one image
     /// per seed).
@@ -1703,7 +1703,7 @@ impl Krea {
             },
         )?;
         for phase_plan in &mut plans {
-            phase_plan.plan.pag = request.pag.clone();
+            phase_plan.pag = request.pag.clone();
         }
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {

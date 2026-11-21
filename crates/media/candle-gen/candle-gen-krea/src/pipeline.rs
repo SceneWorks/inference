@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::imageops::{resize_bicubic_u8, resize_lanczos_u8};
+use candle_gen::gen_core::phase::prepare_phases;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 use candle_gen::quant::Int8Context;
@@ -2263,39 +2264,40 @@ fn render_multiphase_driver<T>(
     .map_err(|error| CandleError::Msg(error.to_string()))?;
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
-    // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
-    // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
-    // files are read at install time inside the loop).
+    // Each phase's job-local adapter state can change the text-fusion leaves. Bind the
+    // prepared tensors and materialization specs to the same effective request arguments.
     let mut dit = load_dit_base_at_dtype(root, native_dit, device, quant, dit_dtype)?;
-    let phase_specs: Vec<Vec<AdapterSpec>> = resolved
-        .iter()
-        .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
-        .collect();
-
-    // Each phase can select a different adapter set, including one that alters text-fusion leaves.
-    // Establish that phase's adapter state once, build its seed/step-invariant text/RoPE state once,
-    // then retain the tensors while the per-seed loop re-applies the same adapter stack to the mutable
-    // job-local DiT. The prepared state is value-owned, so it remains correct when the next phase swaps
-    // adapters; this avoids repeating text fusion for every image in a multi-phase request.
     let pag = resolve_pag_for_id(crate::KREA_2_RAW_ID, req)?;
-    let mut phase_prepared = Vec::with_capacity(resolved.len());
-    for (phase, specs) in resolved.iter().zip(&phase_specs) {
-        materialize_multiphase_adapter_set(&mut dit, specs)?;
-        let positive = dit.prepare_conditioning(context, req.width, req.height)?;
-        let negative = if krea_uses_cfg(phase.guidance) {
-            let context = neg_context.ok_or_else(|| {
-                CandleError::Msg(
-                    "krea_2 multi-phase: a CFG phase requires the \
-                     unconditional context, but none was encoded"
-                        .into(),
-                )
-            })?;
-            Some(dit.prepare_conditioning(context, req.width, req.height)?)
-        } else {
-            None
-        };
-        phase_prepared.push((positive, negative));
-    }
+    let geometry = gen_core::MemoryGeometry {
+        width: req.width,
+        height: req.height,
+        batch: 1,
+        frames: 1,
+        reference_count: 0,
+    };
+    let phase_prepared = prepare_phases(
+        resolved
+            .iter()
+            .map(|phase| (phase.arguments(all_specs), geometry)),
+        |arguments, geometry| -> Result<_> {
+            let specs = crate::multiphase::phase_adapter_specs(arguments, all_specs);
+            materialize_multiphase_adapter_set(&mut dit, &specs)?;
+            let positive = dit.prepare_conditioning(context, geometry.width, geometry.height)?;
+            let negative = if arguments.uses_classifier_free_guidance() {
+                let context = neg_context.ok_or_else(|| {
+                    CandleError::Msg(
+                        "krea_2 multi-phase: a CFG phase requires the \
+                         unconditional context, but none was encoded"
+                            .into(),
+                    )
+                })?;
+                Some(dit.prepare_conditioning(context, geometry.width, geometry.height)?)
+            } else {
+                None
+            };
+            Ok((specs, positive, negative))
+        },
+    )?;
 
     let full_total_steps = sigmas.len().saturating_sub(1);
     let canonical_solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
@@ -2308,12 +2310,8 @@ fn render_multiphase_driver<T>(
         // seed loop because a counter is per trajectory — reusing it would starve image 2 of frames.
         let preview_counter = crate::preview::multiphase_counter(&sigmas);
         let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, &sigmas);
-        for (phase_index, ((phase, specs), (positive, negative))) in resolved
-            .iter()
-            .zip(&phase_specs)
-            .zip(&phase_prepared)
-            .enumerate()
-        {
+        for (phase_index, (phase, prepared)) in resolved.iter().zip(&phase_prepared).enumerate() {
+            let (arguments, (specs, positive, negative)) = prepared.parts();
             // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
             // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
             // prior phase installed.
@@ -2324,7 +2322,7 @@ fn render_multiphase_driver<T>(
             let sub = &sigmas[start..=end];
             let phase_steps = sub.len().saturating_sub(1);
             let mut eval_idx = 0usize;
-            let guidance = phase.guidance;
+            let guidance = arguments.guidance();
             candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
             latent = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
@@ -2356,7 +2354,7 @@ fn render_multiphase_driver<T>(
                     )?;
                     // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
                     // CFG is active; else the bare conditional velocity (single forward).
-                    let v_base = if krea_uses_cfg(guidance) {
+                    let v_base = if arguments.uses_classifier_free_guidance() {
                         let negative = negative.as_ref().ok_or_else(|| {
                             CandleError::Msg(
                                 "krea_2 multi-phase: a CFG phase requires the \

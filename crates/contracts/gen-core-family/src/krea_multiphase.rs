@@ -34,8 +34,9 @@
 //!
 //! # Adapter-seam note vs. MLX
 //!
-//! mlx-gen-krea's DiT is a cheap refcounted `Clone`, so it builds one **clone per phase** (clear the
-//! baked stack, install the phase's subset) and reuses those clones across the seed loop. candle's
+//! mlx-gen-krea's DiT is a cheap refcounted `Clone`. The driver clears the baked stack, installs
+//! the phase's subset, and reuses the clone and conditioning for matching phase dependencies.
+//! Candle's
 //! `Krea2Transformer` is deliberately NOT `Clone` (it holds a `Mutex`-backed RoPE cache and is shared as
 //! an owned value inside `Arc<Components>`, read-only across concurrent generates), so the candle driver
 //! instead builds ONE **job-local** base DiT and re-adapts it in place between phases
@@ -44,6 +45,7 @@
 //! job-local either way. This host module is backend-identical; only the driver's per-phase adapter
 //! mechanism differs.
 
+use gen_core::phase::{ConditioningBranches, PhaseAdapterScale, PhaseArguments};
 use gen_core::{AdapterSpec, Error, GenerationPhase, Result};
 
 /// A contiguous slice of the ONE shared global sigma schedule owned by one phase — an **inclusive**
@@ -175,6 +177,26 @@ pub struct ResolvedPhase {
     pub adapters: Vec<ResolvedPhaseAdapter>,
 }
 
+impl ResolvedPhase {
+    /// Resolve this phase's effective scales against the same stack the loader bound to the request.
+    pub fn arguments(&self, all_specs: &[AdapterSpec]) -> PhaseArguments {
+        let adapters = self
+            .adapters
+            .iter()
+            .map(|adapter| {
+                let scale = adapter.weight.unwrap_or(all_specs[adapter.index].scale);
+                PhaseAdapterScale::new(adapter.index, scale)
+            })
+            .collect();
+        let branches = if phase_uses_cfg(self.guidance) {
+            ConditioningBranches::PositiveAndNegative
+        } else {
+            ConditioningBranches::Positive
+        };
+        PhaseArguments::new(adapters, self.guidance, branches)
+    }
+}
+
 /// Resolve a request's `phases` into an ordered [`ResolvedPhase`] plan over ONE shared schedule.
 ///
 /// Validates the list (non-empty, every phase ≥ 1 step), slices the shared schedule
@@ -216,14 +238,21 @@ pub fn resolve_phases(
 /// **Precondition:** the phase's adapter indices were resolved against `all_specs` (same length /
 /// order), so every `index` is in range — [`resolve_phase_adapters`] guarantees this.
 pub fn phase_spec_subset(phase: &ResolvedPhase, all_specs: &[AdapterSpec]) -> Vec<AdapterSpec> {
-    phase
-        .adapters
+    phase_adapter_specs(&phase.arguments(all_specs), all_specs)
+}
+
+/// Materialize the phase arguments on legacy loaders that accept ordered adapter specs.
+/// `all_specs` must be the same stack used to resolve the phase arguments.
+pub fn phase_adapter_specs(
+    arguments: &PhaseArguments,
+    all_specs: &[AdapterSpec],
+) -> Vec<AdapterSpec> {
+    arguments
+        .adapters()
         .iter()
-        .map(|a| {
-            let mut spec = all_specs[a.index].clone();
-            if let Some(w) = a.weight {
-                spec.scale = w;
-            }
+        .map(|adapter| {
+            let mut spec = all_specs[adapter.slot()].clone();
+            spec.scale = adapter.scale();
             spec
         })
         .collect()
@@ -512,7 +541,7 @@ mod tests {
             "per-phase weight replaces the load-time scale"
         );
 
-        // A `None` weight keeps the load-time scale, and multiple adapters resolve in order.
+        // Keep the default scale, and preserve original slot order including repeated slots.
         let both = resolve_phases(
             &[phase(
                 8,
@@ -526,6 +555,10 @@ mod tests {
                         adapter: 0,
                         weight: Some(0.5),
                     },
+                    PhaseAdapter {
+                        adapter: 1,
+                        weight: Some(-0.0),
+                    },
                 ],
             )],
             3.5,
@@ -533,11 +566,22 @@ mod tests {
             "krea_2_raw",
         )
         .unwrap();
+        let args = both[0].arguments(&all);
+        assert_eq!(
+            args.adapters(),
+            [
+                PhaseAdapterScale::new(1, 1.0),
+                PhaseAdapterScale::new(0, 0.5),
+                PhaseAdapterScale::new(1, -0.0),
+            ],
+        );
         let sub = phase_spec_subset(&both[0], &all);
-        assert_eq!(sub.len(), 2);
+        assert_eq!(sub.len(), 3);
         assert_eq!(sub[0].scale, 1.0, "None keeps the load-time scale");
         assert_eq!(sub[0].kind, AdapterKind::Lokr);
         assert_eq!(sub[1].scale, 0.5);
         assert_eq!(sub[1].kind, AdapterKind::Lora);
+        assert_eq!(sub[2].kind, AdapterKind::Lokr);
+        assert_eq!(sub[2].scale.to_bits(), (-0.0_f32).to_bits());
     }
 }
