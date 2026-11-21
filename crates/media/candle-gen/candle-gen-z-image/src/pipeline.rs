@@ -6,7 +6,7 @@
 //! What this wires, and the deliberate parity choices (all grounded in the mlx provider's
 //! `model.rs`/`pipeline.rs` and Z-Image's `scheduler_config.json`):
 //!
-//! - **Components**: the three `candle-transformers::models::z_image` modules — `ZImageTextEncoder`
+//! - **Components**: the shared `ZImageTextEncoder`
 //!   (Qwen3, hidden 2560, 36 layers; returns the second-to-last hidden state, no final norm),
 //!   `ZImageTransformer2DModel` (the DiT, 16-channel latent, patch 2), and `AutoEncoderKL`
 //!   (diffusers VAE, /8 spatial, scaling 0.3611 / shift 0.1159 applied **inside** `decode`). Loaded
@@ -33,18 +33,14 @@
 //!   `req.cancel` → typed [`gen_core::Error::Canceled`], and each image is returned as a
 //!   `gen_core::Image` (RGB8) — the worker owns asset writes.
 //!
-//! **First-slice surface (sc-3693), matching the SDXL slice (sc-3675):** txt2img only. img2img
-//! (the mlx provider's `Reference` conditioning) is NOT wired on the registered path and is rejected
-//! loudly (the worker routes it to the Python fallback). LoRA/LoKr merge into the dense DiT at load
-//! (sc-5166).
-//!
 //! **Packed Q4/Q8 tiers (sc-9408, sc-9089 umbrella).** [`Pipeline::load_components`] auto-detects a
 //! pre-quantized MLX-packed tier (`SceneWorks/z-image-turbo-mlx`) by the `quantization` block in a
 //! component's `config.json` ([`Pipeline::component_is_packed`]) and loads the TE + DiT + VAE **straight
 //! from the packed parts** through the shared [`candle_gen::quant`] packed-detect (the vendored
-//! [`crate::packed_dit`] / [`crate::packed_te`] models) — no dense bf16 CPU staging. A dense
-//! `Tongyi-MAI/Z-Image-Turbo` snapshot takes the stock `candle-transformers` path unchanged (byte-exact
-//! parity, pinned by the vendored models' `parity_tests`). On-the-fly quant of a *dense* tier is still
+//! [`crate::dit`] / [`crate::text_encoder`] models) — no dense bf16 CPU staging. A dense
+//! `Tongyi-MAI/Z-Image-Turbo` snapshot uses the dense projections. The parity proofs compare the
+//! encoder and both DiT execution policies against the pinned Candle reference. On-the-fly quant of a
+//! *dense* tier is still
 //! not done (only the pre-packed tier is a quantized path). Component caching across calls is handled by
 //! the generator's `components` cache.
 
@@ -73,16 +69,15 @@ use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
-use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
 use gen_core_tokenizer::TextTokenizer;
 
 use crate::common::{self, ResizePolicy};
-use crate::dit::ZImageTransformer2DModel as DenseDit;
-use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
-use crate::packed_te::ZImageTextEncoder as PackedTe;
+use crate::dit::PreparedConditioning as PreparedDiT;
+pub(crate) use crate::dit::ZImageTransformer2DModel as DiT;
+use crate::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 
 /// Read a component's packed descriptor without constructing a pipeline. Registry admission and
 /// lazy generators use this same source of truth as component loading, so a tier-specific snapshot
@@ -117,162 +112,7 @@ ArtifactInput,
     Ok(candle_gen::quant::PackedConfig::from_config(&value))
 }
 
-/// The DiT, loaded **dense** (the stock `candle-transformers` model — a dense bf16 tier or the
-/// adapter-merged path) or **packed** (the vendored [`PackedDit`] built straight from an MLX-packed tier
-/// — sc-9408). Both expose the same `forward(x, t, cap_feats, cap_mask)` → raw velocity, so the render
-/// loops are unchanged.
-pub(crate) enum DiT {
-    // Boxed to keep the two arms comparably sized (`large_enum_variant`) — both models are heavy and
-    // the enum lives behind an `Arc` regardless.
-    Dense(Box<DenseDit>),
-    Packed(Box<PackedDit>),
-}
-
-/// Per-request geometry conditioning. Dense stock models retain their compatibility path; every
-/// vendored packed DiT receives the explicit handle that removes repeated RoPE construction.
-pub(crate) enum PreparedDiT {
-    Dense(crate::dit::PreparedConditioning),
-    Packed(crate::packed_dit::PreparedConditioning),
-}
-
-impl DiT {
-    pub(crate) fn prepare_conditioning(
-        &self,
-        x: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
-        attention_plan: AttentionPlan<'_>,
-    ) -> candle_gen::Result<PreparedDiT> {
-        match self {
-            Self::Dense(m) => Ok(PreparedDiT::Dense(
-                m.prepare_conditioning(x, cap_feats, cap_mask)?,
-            )),
-            Self::Packed(m) => Ok(PreparedDiT::Packed(m.prepare_conditioning(
-                x,
-                cap_feats,
-                cap_mask,
-                attention_plan,
-            )?)),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_prepared_with_memory(
-        &self,
-        x: &Tensor,
-        t: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
-        prepared: &PreparedDiT,
-        attention_plan: AttentionPlan<'_>,
-        transformer_window: usize,
-    ) -> candle_gen::Result<Tensor> {
-        self.forward_prepared_with_memory_and_pag(
-            x,
-            t,
-            cap_feats,
-            cap_mask,
-            prepared,
-            attention_plan,
-            transformer_window,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_prepared_with_memory_and_pag(
-        &self,
-        x: &Tensor,
-        t: &Tensor,
-        _cap_feats: &Tensor,
-        _cap_mask: &Tensor,
-        prepared: &PreparedDiT,
-        attention_plan: AttentionPlan<'_>,
-        transformer_window: usize,
-        pag: Option<common::PagStepContext<'_>>,
-    ) -> candle_gen::Result<Tensor> {
-        let velocity = match (self, prepared) {
-            (Self::Dense(m), PreparedDiT::Dense(prepared)) => {
-                m.forward_prepared_with_pag(x, t, prepared, pag)?
-            }
-            (Self::Packed(m), PreparedDiT::Packed(prepared)) => m
-                .forward_prepared_with_memory_and_pag(
-                    x,
-                    t,
-                    prepared,
-                    attention_plan,
-                    transformer_window,
-                    pag,
-                )?,
-            _ => {
-                return Err(candle_gen::CandleError::Msg(
-                    "z-image: prepared conditioning belongs to another DiT variant".into(),
-                ))
-            }
-        };
-        common::observe_component_output("dit", &velocity);
-        Ok(velocity)
-    }
-    #[cfg(test)]
-    pub(crate) fn forward_with_attention_plan(
-        &self,
-        x: &Tensor,
-        t: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
-        attention_plan: AttentionPlan<'_>,
-    ) -> candle_gen::Result<Tensor> {
-        self.forward_with_memory(
-            x,
-            t,
-            cap_feats,
-            cap_mask,
-            attention_plan,
-            crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn forward_with_memory(
-        &self,
-        x: &Tensor,
-        t: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
-        attention_plan: AttentionPlan<'_>,
-        transformer_window: usize,
-    ) -> candle_gen::Result<Tensor> {
-        match self {
-            // The stock dense DiT has no bounded-attention seam. It remains the unchunked fast path,
-            // so a cancel flag attached to the plan is intentionally not consulted here.
-            Self::Dense(m) => Ok(m.forward(x, t, cap_feats, cap_mask)?),
-            Self::Packed(m) => m.forward_with_memory(
-                x,
-                t,
-                cap_feats,
-                cap_mask,
-                attention_plan,
-                transformer_window,
-            ),
-        }
-    }
-}
-
-/// The Qwen3 text encoder, dense (stock) or packed (vendored [`PackedTe`], sc-9408). Same
-/// `forward(input_ids)` → layer[-2] hidden states contract.
-pub(crate) enum TextEnc {
-    Dense(Box<ZImageTextEncoder>),
-    Packed(Box<PackedTe>),
-}
-
-impl TextEnc {
-    pub(crate) fn forward(&self, input_ids: &Tensor) -> candle_gen::candle_core::Result<Tensor> {
-        match self {
-            Self::Dense(m) => m.forward(input_ids),
-            Self::Packed(m) => m.forward(input_ids),
-        }
-    }
-}
+pub(crate) type TextEnc = ZImageTextEncoder;
 
 /// Z-Image-Turbo is guidance-distilled to a fixed 4-step schedule; used when a request omits
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
@@ -315,10 +155,8 @@ fn predict_cfg_and_pag(
     transformer: &DiT,
     latents: &Tensor,
     t: f32,
-    cap_feats: &Tensor,
-    cap_mask: &Tensor,
     dit_prepared: &PreparedDiT,
-    uncond: Option<&(Tensor, Tensor)>,
+    has_unconditional_conditioning: bool,
     uncond_prepared: Option<&PreparedDiT>,
     guidance: f32,
     pag: Option<&gen_core::PagResolved>,
@@ -329,34 +167,26 @@ fn predict_cfg_and_pag(
     transformer_window: usize,
 ) -> Result<Tensor> {
     let t_tensor = Tensor::from_vec(vec![t], (1,), device)?;
-    let v_cond = transformer
-        .forward_prepared_with_memory(
+    let evaluate = |prepared: &PreparedDiT, pag| -> Result<Tensor> {
+        let raw = transformer.forward_prepared_with_memory_and_pag(
             latents,
             &t_tensor,
-            cap_feats,
-            cap_mask,
-            dit_prepared,
+            prepared,
             request_attention_plan_with_cancel(cancel, attention_budget),
             transformer_window,
-        )?
-        .neg()?;
-    let eps_base = match (uncond, uncond_prepared) {
-        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
-            let v_uncond = transformer
-                .forward_prepared_with_memory(
-                    latents,
-                    &t_tensor,
-                    neg_feats,
-                    neg_mask,
-                    neg_prepared,
-                    request_attention_plan_with_cancel(cancel, attention_budget),
-                    transformer_window,
-                )?
-                .neg()?;
+            pag,
+        )?;
+        common::observe_component_output("dit", &raw);
+        Ok(raw.neg()?)
+    };
+    let v_cond = evaluate(dit_prepared, None)?;
+    let eps_base = match (has_unconditional_conditioning, uncond_prepared) {
+        (true, Some(neg_prepared)) => {
+            let v_uncond = evaluate(neg_prepared, None)?;
             let delta = (&v_cond - &v_uncond)?;
             (v_uncond + (delta * guidance as f64)?)?
         }
-        (None, None) => v_cond.clone(),
+        (false, None) => v_cond.clone(),
         _ => {
             return Err(CandleError::Msg(
                 "z-image: CFG conditioning preparation mismatch".into(),
@@ -377,18 +207,7 @@ fn predict_cfg_and_pag(
         step_idx,
         total_steps,
     };
-    let v_perturbed = transformer
-        .forward_prepared_with_memory_and_pag(
-            latents,
-            &t_tensor,
-            cap_feats,
-            cap_mask,
-            dit_prepared,
-            request_attention_plan_with_cancel(cancel, attention_budget),
-            transformer_window,
-            Some(pag_ctx),
-        )?
-        .neg()?;
+    let v_perturbed = evaluate(dit_prepared, Some(pag_ctx))?;
     Ok(gen_core::guidance::pag_apply(
         &candle_gen::CandleLatentOps,
         &eps_base,
@@ -808,7 +627,7 @@ impl Pipeline {
                 "z-image transformer",
             )?;
             let map = crate::comfyui::remap_dit_comfyui_to_diffusers(map)?;
-            let mut dit = PackedDit::new(
+            let mut dit = DiT::new_inference(
                 &dit_cfg,
                 VarBuilder::from_tensors(map, self.dtype, &self.device),
             )?;
@@ -816,7 +635,7 @@ impl Pipeline {
                 crate::adapters::install_additive(&mut dit, &self.adapters)?;
             }
             candle_gen::check_cancel(cancel)?;
-            return Ok(DiT::Packed(Box::new(dit)));
+            return Ok(dit);
         }
         let packed = self.component_packed_config("transformer")?;
         let (vb, sidecars) = if stream_transformer_blocks {
@@ -849,16 +668,16 @@ impl Pipeline {
             (self.component_vb("transformer")?, None)
         };
         let mut dit = if let Some(sidecars) = sidecars {
-            PackedDit::new_block_streamed_with_sidecars(&dit_cfg, vb, sidecars)?
+            DiT::new_block_streamed_with_sidecars(&dit_cfg, vb, sidecars)?
         } else if stream_transformer_blocks {
-            PackedDit::new_block_streamed(&dit_cfg, vb)?
+            DiT::new_block_streamed(&dit_cfg, vb)?
         } else {
-            PackedDit::new(&dit_cfg, vb)?
+            DiT::new_inference(&dit_cfg, vb)?
         };
         if !self.adapters.is_empty() {
             crate::adapters::install_additive(&mut dit, &self.adapters)?;
         }
-        Ok(DiT::Packed(Box::new(dit)))
+        Ok(dit)
     }
 
     /// Load only the native AutoencoderKL decoder. Packed tiers dequantize their tiny mid-block
@@ -962,7 +781,7 @@ impl Pipeline {
         let transformer = if packed || !self.adapters.is_empty() {
             // A packed tier OR any adapter load builds the **vendored** packed-detect DiT: a packed tier
             // loads straight from the packed parts; a dense tier loads bf16 unchanged (the vendored dense
-            // forward is byte-identical to the stock model — `packed_dit::parity_tests`). Any adapters
+            // forward is byte-identical to the stock model — `dit::inference_tests`). Any adapters
             // install as **forward-time additive residuals** on that base (sc-11105, additive-everywhere
             // for epic 10765): the base is never folded — a packed base stays packed, a dense base stays
             // an unmutated mmap — so a user LoRA never pins an un-evictable folded weight (the fold path,
@@ -970,17 +789,14 @@ impl Pipeline {
             // equals the old dense fold to f32 tolerance (~1 ULP). The stock model can't carry residuals,
             // so an adapter load on a dense tier uses the vendored DiT here.
             let vb = self.component_vb("transformer")?;
-            let mut dit = PackedDit::new(&dit_cfg, vb)?;
+            let mut dit = DiT::new_inference(&dit_cfg, vb)?;
             if !self.adapters.is_empty() {
                 crate::adapters::install_additive(&mut dit, &self.adapters)?;
             }
-            DiT::Packed(Box::new(dit))
+            dit
         } else {
-            // Dense tier, no adapters: the stock candle-transformers model (byte-identical fast path).
-            DiT::Dense(Box::new(DenseDit::new(
-                &dit_cfg,
-                self.component_vb("transformer")?,
-            )?))
+            // Keep the legacy composable normalization and attention for plain resident dense renders.
+            DiT::new(&dit_cfg, self.component_vb("transformer")?)?
         };
 
         // The VAE packs only its 8 tiny (512×64) mid-block attention projections; rather than vendor the
@@ -1060,10 +876,10 @@ impl Pipeline {
                 self.dtype,
                 "z-image text encoder",
             )?;
-            return Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+            return Ok(ZImageTextEncoder::new(
                 &TextEncoderConfig::z_image(),
                 VarBuilder::from_tensors(map, self.dtype, &self.device),
-            )?)));
+            )?);
         };
 
         source.read_unchanged(|source| self.load_text_encoder_from_source(source))
@@ -1071,15 +887,15 @@ impl Pipeline {
 
     fn load_text_encoder_from_source(&self, source: &WeightsSource) -> Result<TextEnc> {
         if self.text_encoder_is_packed(source)? {
-            return Ok(TextEnc::Packed(Box::new(PackedTe::new(
+            return Ok(ZImageTextEncoder::new_packed(
                 &TextEncoderConfig::z_image(),
                 self.text_encoder_vb(source, false)?,
-            )?)));
+            )?);
         }
-        Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+        Ok(ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
             self.text_encoder_vb(source, true)?,
-        )?)))
+        )?)
     }
 
     fn text_encoder_is_packed(&self, source: &WeightsSource) -> Result<bool> {
@@ -1702,10 +1518,8 @@ impl Pipeline {
                         transformer,
                         latents,
                         t,
-                        &cap_feats,
-                        &cap_mask,
                         &dit_prepared,
-                        None,
+                        false,
                         None,
                         1.0,
                         pag,
@@ -1893,10 +1707,8 @@ impl Pipeline {
                         transformer,
                         latents,
                         t,
-                        &cap_feats,
-                        &cap_mask,
                         &dit_prepared,
-                        uncond.as_ref(),
+                        uncond.is_some(),
                         uncond_prepared.as_ref(),
                         guidance,
                         pag,
@@ -2081,10 +1893,8 @@ impl Pipeline {
                         &components.transformer,
                         latents,
                         t,
-                        &cap_feats,
-                        &cap_mask,
                         &dit_prepared,
-                        None,
+                        false,
                         None,
                         1.0,
                         pag,
@@ -2321,10 +2131,8 @@ impl Pipeline {
                         &components.transformer,
                         latents,
                         t,
-                        &cap_feats,
-                        &cap_mask,
                         &dit_prepared,
-                        uncond.as_ref(),
+                        uncond.is_some(),
                         uncond_prepared.as_ref(),
                         guidance,
                         pag,
@@ -2595,7 +2403,7 @@ mod tests {
         cfg.set_use_accelerated_attn(false);
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
-        let transformer = DiT::Packed(Box::new(PackedDit::new(&cfg, vb).unwrap()));
+        let transformer = DiT::new_inference(&cfg, vb).unwrap();
 
         let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &device).unwrap();
         let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &device).unwrap();

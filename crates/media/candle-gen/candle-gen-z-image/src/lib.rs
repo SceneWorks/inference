@@ -43,19 +43,13 @@ mod common;
 mod dit;
 mod memory_strategy;
 mod pipeline;
-// The packed-load seam (sc-9408, sc-9089 umbrella): re-exports the shared `candle_gen::quant::QLinear`
-// (F-025 / sc-9005) + the thin dense-or-packed `QEmbedding` wrapper over the shared module, plus the
-// vendored inference DiT + Qwen3 TE that build their projections from it. Used only when the snapshot is
-// a pre-quantized MLX-packed tier (`SceneWorks/z-image-turbo-mlx`); a dense snapshot keeps the stock
-// candle-transformers models.
-mod packed_dit;
-mod packed_te;
 // The per-step latent-preview seam (epic 16948, sc-16957): the REUSED epic-16624 Z-Image 16-channel
 // fit plus the `[1, 16, 1, h, w]` → `[1, 16, h, w]` frame-axis drop that reaches it. Public because
 // [`control`] and [`edit`] are themselves public, name-driven entry points, so a consumer that stages
 // its own denoise against them needs the same projector rather than a second copy of the fit.
 pub mod preview;
 mod quant;
+mod text_encoder;
 mod training;
 mod training_adapter;
 
