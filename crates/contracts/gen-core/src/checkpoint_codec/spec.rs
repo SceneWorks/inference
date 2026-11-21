@@ -134,8 +134,8 @@ pub trait CodecResidencyPolicy {
     ) -> ResidencyMode;
 }
 
-/// The always-dense policy: every codec decodes to its dense resident encoding. MLX (no packed
-/// fp8/int8 matmul on the seam) and any backend without the matching hardware use this.
+/// Price dense coefficient consumers at their decoded element width. Backends with native
+/// projection operators supply a device- and geometry-specific policy instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DenseResidencyPolicy;
 

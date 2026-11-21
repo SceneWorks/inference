@@ -579,6 +579,52 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
             );
         }
     }
+    // The H3 Veda predictor has a separate per-head calibration and a frozen serial scorer.
+    // The first coefficient rounds to one in BF16 only after applying its stored FP32 scale.
+    use candle_gen::quant::veda_score::{self, Projection};
+    let valid = [127usize, 2];
+    let qs = [1., -2., 0.5, 4.];
+    let ks = [0.25, 3., -1., 2.];
+    let tiles = |values: &[f32; 4]| -> candle_core::Result<Tensor> {
+        let mut rows = vec![0f32; 4 * 128];
+        for (i, &value) in values.iter().enumerate() {
+            rows[i * 128..i * 128 + valid[i % 2]].fill(value);
+        }
+        Tensor::from_vec(rows, (2, 2, 128, 1), &dev)
+    };
+    let qcodes = [0x38, 0, 0, 0x3c, 0, 0];
+    let qscales = [1. + 1. / 512., 0.75];
+    let kcodes = [0x38, 0, 0, 0xb8, 0, 0];
+    let kscales = [0.5, 1.25];
+    let got = veda_score::tile_logits_weights(
+        &tiles(&qs)?,
+        &tiles(&ks)?,
+        &valid,
+        2,
+        Projection::Fp8 {
+            codes: &qcodes,
+            scales: &qscales,
+        },
+        Projection::Fp8 {
+            codes: &kcodes,
+            scales: &kscales,
+        },
+    )?;
+    for head in 0..2 {
+        let q =
+            bf16::from_f32(F8E4M3::from_bits(qcodes[3 * head]).to_f32() * qscales[head]).to_f32();
+        let k =
+            bf16::from_f32(F8E4M3::from_bits(kcodes[3 * head]).to_f32() * kscales[head]).to_f32();
+        for row in 0..2 {
+            let scores = &got[head * 4 + row * 2..head * 4 + row * 2 + 2];
+            let expected = [0usize, 1].map(|col| {
+                (qs[head * 2 + row] * q + qs[head * 2 + row])
+                    * (ks[head * 2 + col] * k + ks[head * 2 + col])
+            });
+            assert_eq!(scores, expected);
+            assert_eq!(scores[0] > scores[1], expected[0] > expected[1]);
+        }
+    }
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16");
     Ok(())

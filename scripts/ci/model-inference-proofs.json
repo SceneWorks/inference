@@ -17976,7 +17976,7 @@
         ],
         "scope": "whole selected source case",
         "required_work": [
-          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling."
+          "Load real safetensors bytes via the stock native constructor. Match E4M3/E5M2 scalar, FP8R and MXFP8 outputs exactly to fixed one-hot CPU reference products, retain stored calibrations, BF16/F16/F32 output rounding and live LoRA, exercise partial rows and the E8M0 exponent ceiling. Compare per-head Veda FP8 coefficients and score ordering exactly against the independent rounded host reference."
         ]
       }
     },

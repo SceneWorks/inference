@@ -12,11 +12,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+type CoefficientLayouts = BTreeMap<(usize, Option<usize>), (Vec<usize>, WeightEncoding, u64)>;
+
 #[derive(Clone, Default)]
 struct State {
     rows: BTreeMap<usize, (ExecutionRepresentation, u64)>,
     dense_layouts: BTreeMap<usize, (Vec<usize>, usize)>,
-    coefficient_caches: BTreeMap<(usize, Option<usize>), (Vec<usize>, WeightEncoding, u64)>,
+    coefficient_caches: CoefficientLayouts,
     slices: BTreeMap<usize, MatrixSlices>,
 }
 #[derive(Clone)]
