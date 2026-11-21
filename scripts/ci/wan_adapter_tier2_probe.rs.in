@@ -1,0 +1,116 @@
+// Installed only in the exact disposable Wan Tier 2 checkouts.
+use mlx_gen::{GenerationOutput, GenerationRequest, OffloadPolicy, Progress};
+use mlx_gen_wan::{product_load, MODEL_ID_T2V_14B};
+use mlx_rs::{memory, DeviceType, Stream};
+use serde_json::json;
+use std::{env, fs::OpenOptions, io::Write, path::PathBuf, time::Instant};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let weights = PathBuf::from(env::var_os("PAIR_TIER2_SNAPSHOT").ok_or("missing Wan model")?);
+    let lightning =
+        PathBuf::from(env::var_os("PAIR_WAN_LIGHTNING").ok_or("missing Lightning pair")?);
+    if env::args().any(|arg| arg == "--preflight") {
+        let spec = product_load::product_load_spec(
+            MODEL_ID_T2V_14B,
+            &weights,
+            OffloadPolicy::Sequential,
+            true,
+            Some(&lightning),
+        )?;
+        assert_eq!(spec.adapters.len(), 2);
+        println!("SGA_WAN_PREFLIGHT wan-a14b-t2v-q4-lightning-mlx");
+        return Ok(());
+    }
+    let output = PathBuf::from(env::var_os("PAIR_OUT").ok_or("missing owned proof output")?);
+    let device = Stream::task_local_or_default().get_device()?;
+    assert!(matches!(device.get_type()?, DeviceType::Gpu));
+    assert_eq!(device.get_index()?, 0);
+    let request = GenerationRequest {
+        prompt: "A red fox trots across a snowy meadow at sunrise, filmed at ground level.".into(),
+        width: 256,
+        height: 256,
+        frames: Some(9),
+        fps: Some(16),
+        steps: Some(product_load::LIGHTNING_STEPS),
+        guidance: Some(product_load::LIGHTNING_GUIDANCE),
+        sampler: Some("unipc".into()),
+        scheduler_shift: Some(12.0),
+        seed: Some(42),
+        ..Default::default()
+    };
+    memory::clear_cache();
+    memory::reset_peak_memory();
+    let started = Instant::now();
+    let spec = product_load::product_load_spec(
+        MODEL_ID_T2V_14B,
+        &weights,
+        OffloadPolicy::Sequential,
+        true,
+        Some(&lightning),
+    )?;
+    let generator = mlx_gen_wan::provider_registry()?.load(MODEL_ID_T2V_14B, &spec)?;
+    assert_eq!(generator.descriptor().id, MODEL_ID_T2V_14B);
+    let mut progress = Vec::new();
+    let generated = generator.generate(&request, &mut |event| match event {
+        Progress::Loading(mlx_gen::LoadPhase::Renderer) => progress.push("renderer".into()),
+        Progress::Step { current, total } => progress.push(format!("{current}/{total}")),
+        Progress::Decoding => progress.push("decode".into()),
+        _ => {}
+    })?;
+    let end_to_end_ns = started.elapsed().as_nanos() as u64;
+    let mlx_peak_bytes = memory::get_peak_memory();
+    let actual = Stream::task_local_or_default().get_device()?;
+    assert!(matches!(actual.get_type()?, DeviceType::Gpu));
+    assert_eq!(actual.get_index()?, 0);
+    let reports = generator.adapter_apply_reports();
+    assert_eq!(reports.len(), spec.adapters.len());
+    let adapters: Vec<_> = reports
+        .iter()
+        .zip(&spec.adapters)
+        .map(|(report, adapter)| {
+            assert_eq!(report.adapter_path, adapter.path);
+            json!({"file":adapter.path.file_name().unwrap().to_str().unwrap(),
+               "expert":format!("{:?}",adapter.moe_expert), "scale":adapter.scale,
+               "applied":report.applied,"skipped":report.skipped})
+        })
+        .collect();
+    let GenerationOutput::Video { frames, fps, audio } = generated else {
+        return Err("Wan T2V did not return video".into());
+    };
+    assert_eq!((frames.len(), fps, audio.is_some()), (9, 16, false));
+    let mut frame_digests = Vec::new();
+    let frame_path = output.join("frame.pending");
+    for frame in &frames {
+        assert_eq!(
+            (frame.width, frame.height, frame.pixels.len()),
+            (256, 256, 256 * 256 * 3)
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&frame_path)?;
+        file.write_all(&frame.pixels)?;
+        drop(file);
+        let digest = mlx_gen::gen_core::snapshot_inventory::sha256_file(&frame_path)?;
+        std::fs::remove_file(&frame_path)?;
+        frame_digests.push(
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+    }
+    let mut result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(
+        &mut result,
+        &json!({"device":{"kind":"mlx-metal","index":0},
+        "adapters":adapters,"progress":progress,"frame_rgb8_sha256":frame_digests,
+        "end_to_end_ns":end_to_end_ns,"mlx_peak_bytes":mlx_peak_bytes}),
+    )?;
+    result.flush()?;
+    println!("SGA_WAN_REAL_COMPLETE wan-a14b-t2v-q4-lightning-mlx");
+    Ok(())
+}

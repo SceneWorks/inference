@@ -1,0 +1,151 @@
+// Installed only in the exact disposable Wan Tier 2 checkouts.
+use candle_gen::candle_core::{cuda_backend::proof_pool, DType, DeviceLocation, Tensor};
+use candle_gen::gen_core::{
+    snapshot_inventory::sha256_file, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest,
+    LoadPhase, LoadSpec, MoeExpert, OffloadPolicy, Precision, Progress, WeightsSource,
+};
+use serde_json::json;
+use std::{env, fs::OpenOptions, io::Write, path::PathBuf, time::Instant};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let path = |key| {
+        env::var_os(key)
+            .map(PathBuf::from)
+            .ok_or("missing owned proof path")
+    };
+    let weights = path("PAIR_TIER2_SNAPSHOT")?;
+    let adapters = vec![
+        AdapterSpec::new(path("PAIR_WAN_LIGHTNING_HIGH")?, 1.0, AdapterKind::Lora)
+            .with_moe_expert(MoeExpert::High),
+        AdapterSpec::new(path("PAIR_WAN_LIGHTNING_LOW")?, 1.0, AdapterKind::Lora)
+            .with_moe_expert(MoeExpert::Low),
+    ];
+    if env::args().any(|arg| arg == "--preflight") {
+        for expert in ["transformer", "transformer_2"] {
+            let raw = std::fs::read(weights.join(expert).join("quantize_config.json"))?;
+            let row: serde_json::Value = serde_json::from_slice(&raw)?;
+            assert_eq!(row["bits"], 4);
+            assert_eq!(row["quantization"]["group_size"], 64);
+        }
+        assert!(adapters.iter().all(|adapter| adapter.path.is_file()));
+        println!("SGA_WAN_PREFLIGHT wan-a14b-t2v-q4-lightning-candle");
+        return Ok(());
+    }
+    let output = path("PAIR_OUT")?;
+    let device = candle_gen::default_device()?;
+    assert_eq!(device.location(), DeviceLocation::Cuda { gpu_id: 0 });
+    let id = device.as_cuda_device()?.cuda_stream().context().uuid()?;
+    let hex: String = id
+        .bytes
+        .iter()
+        .map(|byte| format!("{:02x}", *byte as u8))
+        .collect();
+    let uuid = format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    assert_eq!(uuid, env::var("CUDA_VISIBLE_DEVICES")?);
+    // The staged generator releases all of its tensors. Keep a four-byte allocation alive
+    // until the runner reads the child pool receipt and reconciles its WDDM sample.
+    let pool_anchor = Tensor::zeros(1, DType::F32, &device)?;
+    device.synchronize()?;
+    let request = GenerationRequest {
+        prompt: "A red fox trots across a snowy meadow at sunrise, filmed at ground level.".into(),
+        width: 320,
+        height: 320,
+        frames: Some(17),
+        fps: Some(16),
+        steps: Some(4),
+        guidance: Some(1.0),
+        sampler: Some("uni_pc".into()),
+        scheduler_shift: Some(12.0),
+        seed: Some(42),
+        ..Default::default()
+    };
+    let route = "wan2_2_t2v_14b";
+    let started = Instant::now();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(weights))
+        .with_adapters(adapters)
+        .with_offload_policy(OffloadPolicy::Sequential);
+    spec.precision = Precision::Bf16;
+    let generator = candle_gen_wan::provider_registry()?.load(route, &spec)?;
+    assert_eq!(
+        (generator.descriptor().id, generator.descriptor().backend),
+        (route, "candle")
+    );
+    let mut progress = Vec::new();
+    let generated = generator.generate(&request, &mut |event| match event {
+        Progress::Loading(LoadPhase::Renderer) => progress.push("renderer".into()),
+        Progress::Step { current, total } => progress.push(format!("{current}/{total}")),
+        Progress::Decoding => progress.push("decode".into()),
+        _ => {}
+    })?;
+    let end_to_end_ns = started.elapsed().as_nanos() as u64;
+    let GenerationOutput::Video { frames, fps, audio } = generated else {
+        return Err("Wan T2V did not return video".into());
+    };
+    assert_eq!((frames.len(), fps, audio.is_some()), (17, 16, false));
+    let mut frame_digests = Vec::new();
+    let frame_path = output.join("frame.pending");
+    for frame in &frames {
+        assert_eq!(
+            (frame.width, frame.height, frame.pixels.len()),
+            (320, 320, 320 * 320 * 3)
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&frame_path)?;
+        file.write_all(&frame.pixels)?;
+        drop(file);
+        let digest = sha256_file(&frame_path)?;
+        std::fs::remove_file(&frame_path)?;
+        frame_digests.push(
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+    }
+    let mut result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("result.json"))?;
+    serde_json::to_writer(
+        &mut result,
+        &json!({"device":{"kind":"candle-cuda","index":0},
+        "cuda_device_uuid":uuid,"progress":progress,"frame_rgb8_sha256":frame_digests,
+        "end_to_end_ns":end_to_end_ns}),
+    )?;
+    result.flush()?;
+
+    let pool = proof_pool::snapshot(0)?.ok_or("CUDA pool was not installed")?;
+    assert_eq!(
+        (pool.logical_ordinal, pool.cap_bytes),
+        (0, 24 * 2_u64.pow(30))
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("cuda-pool.pending"))?;
+    serde_json::to_writer(
+        &mut file,
+        &json!({"pid":std::process::id(),"cudaDeviceUuid":uuid,
+        "poolUsedBytes":pool.used_bytes,"poolUsedHighBytes":pool.used_high_bytes,
+        "poolReservedBytes":pool.reserved_bytes,"poolReservedHighBytes":pool.reserved_high_bytes}),
+    )?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(
+        output.join("cuda-pool.pending"),
+        output.join("cuda-pool.json"),
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    drop(pool_anchor);
+    println!("SGA_WAN_REAL_COMPLETE wan-a14b-t2v-q4-lightning-candle");
+    Ok(())
+}

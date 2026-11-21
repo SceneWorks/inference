@@ -27,7 +27,9 @@ from scripts.media_campaign_supervisor import load_policy
 
 SELECTION = "sga-terminal-tier2"
 PROFILES = {("candle-cuda", "ltx25"): "ltx25_tier2_fixture",
-            ("candle-cuda", "z-image"): "z_image_tier2_fixture"}
+            ("candle-cuda", "z-image"): "z_image_tier2_fixture",
+            ("mlx", "wan"): "wan_adapter_tier2_fixture",
+            ("candle-cuda", "wan"): "wan_adapter_tier2_fixture"}
 DEVICE_KEY = {"candle-cuda": "cuda_device_uuid", "mlx": "runner"}
 ARMS = source_pair.ARMS
 ORDER = (ARMS, tuple(reversed(ARMS)))
@@ -49,7 +51,9 @@ def profile_for(backend, request):
             re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request[binding])):
         raise ValueError("terminal route requires the secondary Mac or an exact physical CUDA UUID")
     module = importlib.import_module("scripts.ci." + PROFILES[backend, request["profile"]])
-    if not isinstance(request["variant"], str) or request["variant"] not in module.CASE:
+    variant = request["variant"]
+    if (not isinstance(variant, str) or variant not in module.CASE
+            or getattr(module, "VARIANT_BACKENDS", {}).get(variant, backend) != backend):
         raise ValueError("incorrect declared native Tier 2 variant")
     return module
 
@@ -116,6 +120,10 @@ def read_sample(name, directory, profile, contract, *, upload=False):
     req = contract["request"]
     readback = profile.observe(file("stdout.log").read_text(encoding="utf-8"), file("result.json"),
                                req[DEVICE_KEY[contract["backend"]]], req["variant"])
+    measured_peaks = readback.get("peaks", {})
+    if peaks.keys() & measured_peaks.keys():
+        raise ValueError("terminal profile attempted to override an external peak observation")
+    peaks.update(measured_peaks)
     return {**readback, "peaks": peaks}
 
 
@@ -179,6 +187,8 @@ def execute(args, contract, profile):
         snapshot, receipt["assets"] = profile.staged_assets(variant, model_hub)
         child_env = {key: value for key, value in env.items() if not proof.SENSITIVE_ENVIRONMENT.search(key)}
         child_env.update(CARGO_INCREMENTAL="0", PAIR_TIER2_VARIANT=variant, PAIR_TIER2_SNAPSHOT=str(snapshot))
+        if hasattr(profile, "asset_environment"):
+            child_env.update(profile.asset_environment(variant, model_hub))
         if cuda:
             child_env.update(CUDA_VISIBLE_DEVICES=binding, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUBLAS_WORKSPACE_CONFIG=":4096:8",
                              SCENEWORKS_CUDA_PROOF_POOL_BYTES=str(contract["settings"]["pool_cap_bytes"]))
@@ -266,6 +276,8 @@ def verify(args, contract, profile):
             raise ValueError("terminal upload artifact changed")
     if not receipt["accepted"]:
         return
+    if "expected_asset_identity" in contract and receipt.get("assets") != contract["expected_asset_identity"]:
+        raise ValueError("accepted terminal receipt lacks the frozen asset content identities")
     required = set(allowed) - {f"{name}.guard.jsonl" for name, _ in SAMPLES}
     if not required <= receipt["files"].keys() or receipt["physical_claim"].get("post_execution_verified") is not True:
         raise ValueError("accepted terminal receipt lacks exact supervised sample evidence")
