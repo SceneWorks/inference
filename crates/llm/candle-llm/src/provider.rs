@@ -2418,10 +2418,15 @@ impl LlamaProvider {
             let mut resident_payload = payload;
             let (cast, copy, held) = if builds && (cuda || format.is_some()) {
                 let mut tensors = snapshot_tensor_headers(source)?;
+                let decoder_root = decoder.snapshot_root(&tensors);
                 if let Some(device) = device {
-                    if let Some((encoded_source, encoded_resident)) =
-                        price_checkpoint_rows(source, device, &decoder, &mut tensors)?
-                    {
+                    if let Some((encoded_source, encoded_resident)) = price_checkpoint_rows(
+                        source,
+                        device,
+                        &decoder,
+                        decoder_root.as_deref(),
+                        &mut tensors,
+                    )? {
                         resident_payload = payload
                             .checked_sub(encoded_source)
                             .and_then(|remaining| remaining.checked_add(encoded_resident))
@@ -2429,8 +2434,13 @@ impl LlamaProvider {
                     }
                 }
                 let (copy, consumed) = match format {
-                    Some(format) => snapshot_quantized_copy_bytes(&decoder, format, &tensors)
-                        .ok_or_else(overflow)?,
+                    Some(format) => snapshot_quantized_copy_bytes(
+                        &decoder,
+                        decoder_root.as_deref(),
+                        format,
+                        &tensors,
+                    )
+                    .ok_or_else(overflow)?,
                     None => (0, Default::default()),
                 };
                 // Off CUDA the compute dtype is f32 and the host rule's three payloads cover it.

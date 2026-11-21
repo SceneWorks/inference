@@ -352,6 +352,20 @@ impl PricedDecoder {
         }
     }
 
+    /// Resolve the decoder namespace against every logical key before native rows and
+    /// their physical companions are removed from the dense-copy inventory.
+    pub(super) fn snapshot_root(&self, tensors: &SnapshotTensors) -> Option<String> {
+        match self {
+            Self::Causal(cfg) => Some(crate::models::llama::decoder_root(cfg, "", |key| {
+                tensors.contains_key(key)
+            })),
+            Self::Qwen35(..) => qwen35_dense_prefix(|key| tensors.contains_key(key))
+                .ok()
+                .map(str::to_owned),
+            Self::Prism | Self::Refused => None,
+        }
+    }
+
     pub(super) fn is_packed(&self) -> bool {
         matches!(self, Self::Prism)
     }
@@ -459,6 +473,7 @@ pub(super) fn price_checkpoint_rows(
     dir: &Path,
     device: &Device,
     decoder: &PricedDecoder,
+    root: Option<&str>,
     tensors: &mut SnapshotTensors,
 ) -> CoreResult<Option<(u64, u64)>> {
     if !tensors.iter().any(|(key, t)| {
@@ -472,13 +487,6 @@ pub(super) fn price_checkpoint_rows(
         return Ok(None);
     };
     let plan = source.reader().plan();
-    let causal_root = match decoder {
-        PricedDecoder::Causal(cfg) => Some(crate::models::llama::decoder_root(cfg, "", |k| {
-            tensors.contains_key(k)
-        })),
-        _ => None,
-    };
-    let hybrid_root = qwen35_dense_prefix(|key| tensors.contains_key(key)).ok();
     let mut resident = plan
         .companions
         .iter()
@@ -491,14 +499,11 @@ pub(super) fn price_checkpoint_rows(
         let embedding = key.ends_with("embed_tokens.weight");
         let (projection, tied) = match decoder {
             PricedDecoder::Causal(cfg) => (
-                causal_root
-                    .as_ref()
-                    .is_some_and(|root| crate::models::llama::loads_quantized(cfg, root, key)),
+                root.is_some_and(|root| crate::models::llama::loads_quantized(cfg, root, key)),
                 cfg.tie_word_embeddings,
             ),
             PricedDecoder::Qwen35(cfg, _) => (
-                hybrid_root
-                    .is_some_and(|root| crate::models::qwen35::loads_quantized(cfg, root, key)),
+                root.is_some_and(|root| crate::models::qwen35::loads_quantized(cfg, root, key)),
                 cfg.tie_word_embeddings,
             ),
             _ => (false, false),
@@ -543,10 +548,14 @@ pub(super) fn price_checkpoint_rows(
 /// their source ([`snapshot_cast_copy_bytes`]). `None` on overflow.
 pub(super) fn snapshot_quantized_copy_bytes<'a>(
     decoder: &PricedDecoder,
+    root: Option<&str>,
     format: CopyFormat,
     tensors: &'a SnapshotTensors,
 ) -> Option<(u64, std::collections::HashSet<&'a str>)> {
     use crate::models::{llama, qwen35, split_layer_key};
+    let Some(root) = root else {
+        return Some((0, Default::default()));
+    };
     let mut total = 0u64;
     let mut consumed = std::collections::HashSet::new();
     let mut add = |bytes: u64| -> Option<()> {
@@ -555,10 +564,9 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
     };
     match decoder {
         PricedDecoder::Causal(cfg) => {
-            let root = llama::decoder_root(cfg, "", |key| tensors.contains_key(key));
             for (key, tensor) in tensors {
                 // The loader's own selection — the rule the preparer stores blocks by, too.
-                if !llama::loads_quantized(cfg, &root, key) {
+                if !llama::loads_quantized(cfg, root, key) {
                     continue;
                 }
                 let Some((_, layer, suffix)) = split_layer_key(key) else {
@@ -642,9 +650,7 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
             }
         }
         PricedDecoder::Qwen35(cfg, _) => {
-            let Ok(prefix) = qwen35_dense_prefix(|key| tensors.contains_key(key)) else {
-                return Some((0, consumed));
-            };
+            let prefix = root;
             // In a ModelOpt checkpoint a weight without `.weight_scale` loads dense, as its
             // source's cast (`keyed_projection`), never in the load's format.
             let modelopt = tensors

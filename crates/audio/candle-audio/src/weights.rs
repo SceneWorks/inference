@@ -562,6 +562,75 @@ mod tests {
     }
 
     #[test]
+    fn registered_audio_model_keeps_request_time_checkpoint_facts_per_instance() {
+        use gen_core::{
+            AudioEmbedder, AudioEmbedderDescriptor, AudioEmbedderRegistration, AudioTrack,
+            LoadSpec, ProviderRegistryBuilder, WeightsSource,
+        };
+
+        struct LazySource(PathBuf);
+        const DESC: AudioEmbedderDescriptor = AudioEmbedderDescriptor {
+            id: "checkpoint_scope_fixture",
+            family: "audio-embed",
+            backend: "candle",
+            embedding_dim: 1,
+            space: "fixture",
+            mac_only: false,
+        };
+        impl AudioEmbedder for LazySource {
+            fn descriptor(&self) -> &AudioEmbedderDescriptor {
+                &DESC
+            }
+            fn embed(&self, _: &AudioTrack) -> gen_core::Result<Vec<f32>> {
+                unreachable!("metadata fixture reads on the text path")
+            }
+            fn embed_text(&self, _: &str) -> gen_core::Result<Vec<f32>> {
+                // Exercise only deferred coefficient materialization. No model forward is required.
+                let source = AudioCheckpoint::open(&self.0, &Device::Cpu)
+                    .map_err(crate::AudioError::from)?;
+                let coefficients = source
+                    .coefficients(DType::F32, &Device::Cpu, |name| name == "scale")
+                    .map_err(crate::AudioError::from)?;
+                Ok(vec![coefficients["scale"].elem_count() as f32])
+            }
+        }
+        let registry = ProviderRegistryBuilder::new()
+            .register_audio_embedder(AudioEmbedderRegistration {
+                descriptor: || DESC,
+                load: |spec| {
+                    let WeightsSource::Dir(path) = &spec.weights else {
+                        return Err(gen_core::Error::Msg("directory expected".into()));
+                    };
+                    Ok(Box::new(LazySource(path.join("model.safetensors"))))
+                },
+            })
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let value = Tensor::from_raw_buffer(&[0x38; 2], DType::F8E4M3, &[2], &Device::Cpu).unwrap();
+        candle_core::safetensors::save(
+            &HashMap::from([("scale", value)]),
+            dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_owned()));
+        let first = registry.load_audio_embedder(DESC.id, &spec).unwrap();
+        let second = registry.load_audio_embedder(DESC.id, &spec).unwrap();
+        assert!(first.checkpoint_weight_facts().is_none());
+        assert_eq!(first.embed_text("").unwrap(), [2.0]);
+        assert_eq!(
+            first
+                .checkpoint_weight_facts()
+                .unwrap()
+                .receipt()
+                .resident_bytes(),
+            8
+        );
+        assert_eq!(first.checkpoint_weight_facts_by_source().len(), 1);
+        assert!(second.checkpoint_weight_facts_by_source().is_empty());
+    }
+
+    #[test]
     fn recurrent_gate_constructors_read_bare_and_module_encoded_matrices() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rnn.safetensors");

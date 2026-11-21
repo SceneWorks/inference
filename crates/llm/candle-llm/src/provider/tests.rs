@@ -16,6 +16,45 @@ use core_llm::ProposerKind;
 use std::collections::HashMap;
 
 #[test]
+fn a_checkpoint_embedding_keeps_the_decoder_prefix_for_remaining_quantized_copies() {
+    use super::{
+        price_checkpoint_rows, snapshot_quantized_copy_bytes, snapshot_tensor_headers, CopyFormat,
+        PricedDecoder,
+    };
+    use crate::models::qwen35::{tests::prism_text_config, Qwen35Config};
+    use candle_core::{DType, Device};
+    let decoder =
+        PricedDecoder::Qwen35(Qwen35Config::from_json(&prism_text_config()).unwrap(), None);
+    let dir = tempfile::tempdir().unwrap();
+    let device = Device::Cpu;
+    let embedding = "model.language_model.embed_tokens.weight";
+    let gate = "model.language_model.layers.0.mlp.gate_proj.weight";
+    let encoded = Tensor::from_raw_buffer(&[0x38; 32], DType::F8E4M3, &[1, 32], &device).unwrap();
+    let plain = Tensor::zeros((32, 32), DType::F32, &device).unwrap();
+    candle_core::safetensors::save(
+        &std::collections::HashMap::from([(embedding, encoded), (gate, plain)]),
+        dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let mut headers = snapshot_tensor_headers(dir.path()).unwrap();
+    let root = decoder.snapshot_root(&headers);
+    assert_eq!(root.as_deref(), Some("model.language_model"));
+    price_checkpoint_rows(dir.path(), &device, &decoder, root.as_deref(), &mut headers)
+        .unwrap()
+        .unwrap();
+    assert!(!headers.contains_key(embedding));
+    let (bytes, consumed) = snapshot_quantized_copy_bytes(
+        &decoder,
+        root.as_deref(),
+        CopyFormat::Ggml(crate::primitives::QuantSpec::q8()),
+        &headers,
+    )
+    .unwrap();
+    assert!(bytes > 0);
+    assert!(consumed.contains(gate));
+}
+
+#[test]
 fn actual_cpu_provider_exposes_its_owned_release_fence() {
     let (cfg, weights) = tiny_llama_parts();
     let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;

@@ -250,6 +250,8 @@ pub enum Projection {
 pub enum ProjectionKind {
     /// Native fp8_e4m3 projection.
     Fp8E4m3,
+    /// FP8 E4M3 with a separate weight scale on each output row.
+    Fp8Rowwise,
     /// Native fp8_e5m2 projection.
     Fp8E5m2,
     /// Native mxfp8 projection.
@@ -272,6 +274,7 @@ impl ProjectionKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Fp8E4m3 => "fp8_e4m3",
+            Self::Fp8Rowwise => "fp8_e4m3_rowwise",
             Self::Fp8E5m2 => "fp8_e5m2",
             Self::MxFp8 => "mxfp8",
             Self::ConvRot => "convrot_int8",
@@ -320,6 +323,8 @@ impl ProjectionTally {
 pub struct ProjectionCensus {
     /// Native fp8_e4m3 operands.
     pub fp8_e4m3: ProjectionTally,
+    /// Native FP8 E4M3 row-scaled operands.
+    pub fp8_rowwise: ProjectionTally,
     /// Native fp8_e5m2 operands.
     pub fp8_e5m2: ProjectionTally,
     /// Native mxfp8 operands.
@@ -352,6 +357,7 @@ impl ProjectionCensus {
     /// same checkpoint outside the causal decoder's weight census.
     pub(crate) fn replace_native(&mut self, source: Self) {
         self.fp8_e4m3 = source.fp8_e4m3;
+        self.fp8_rowwise = source.fp8_rowwise;
         self.fp8_e5m2 = source.fp8_e5m2;
         self.mxfp8 = source.mxfp8;
         self.convrot_int8 = source.convrot_int8;
@@ -364,6 +370,7 @@ impl ProjectionCensus {
             ProjectionKind::Prism,
             ProjectionKind::Nvfp4,
             ProjectionKind::Fp8E4m3,
+            ProjectionKind::Fp8Rowwise,
             ProjectionKind::Fp8E5m2,
             ProjectionKind::MxFp8,
             ProjectionKind::ConvRot,
@@ -392,6 +399,7 @@ impl ProjectionCensus {
     /// Add one projection.
     pub fn record(&mut self, p: &Projection) {
         let tally = match p.kind() {
+            ProjectionKind::Fp8Rowwise => &mut self.fp8_rowwise,
             ProjectionKind::Fp8E4m3 => &mut self.fp8_e4m3,
             ProjectionKind::Fp8E5m2 => &mut self.fp8_e5m2,
             ProjectionKind::MxFp8 => &mut self.mxfp8,
@@ -420,6 +428,7 @@ impl ProjectionCensus {
     /// The tally for one kind.
     pub fn tally(&self, kind: ProjectionKind) -> &ProjectionTally {
         match kind {
+            ProjectionKind::Fp8Rowwise => &self.fp8_rowwise,
             ProjectionKind::Fp8E4m3 => &self.fp8_e4m3,
             ProjectionKind::Fp8E5m2 => &self.fp8_e5m2,
             ProjectionKind::MxFp8 => &self.mxfp8,
@@ -440,6 +449,7 @@ impl ProjectionCensus {
             &self.prism,
             &self.nvfp4,
             &self.fp8_e4m3,
+            &self.fp8_rowwise,
             &self.fp8_e5m2,
             &self.mxfp8,
             &self.convrot_int8,
@@ -453,6 +463,7 @@ impl ProjectionCensus {
     pub fn merge(&mut self, other: &Self) {
         self.dense.add(&other.dense);
         self.fp8_e4m3.add(&other.fp8_e4m3);
+        self.fp8_rowwise.add(&other.fp8_rowwise);
         self.fp8_e5m2.add(&other.fp8_e5m2);
         self.mxfp8.add(&other.mxfp8);
         self.convrot_int8.add(&other.convrot_int8);
@@ -473,6 +484,7 @@ impl ProjectionCensus {
     pub fn resident_quantization(&self) -> core_llm::ResidentQuantization {
         use core_llm::ResidentQuantization as R;
         if self.fp8_e4m3.count > 0
+            || self.fp8_rowwise.count > 0
             || self.fp8_e5m2.count > 0
             || self.mxfp8.count > 0
             || self.convrot_int8.count > 0
@@ -550,6 +562,7 @@ impl WeightCensus {
 impl Projection {
     pub(crate) fn from_native(linear: Linear) -> Result<Self> {
         let kind = match linear.native_format_id() {
+            Some("fp8-e4m3-rowwise-v1") => ProjectionKind::Fp8Rowwise,
             Some("fp8-e4m3-scalar-v1") => ProjectionKind::Fp8E4m3,
             Some("fp8-e5m2-scalar-v1") => ProjectionKind::Fp8E5m2,
             Some("mxfp8-v1") => ProjectionKind::MxFp8,

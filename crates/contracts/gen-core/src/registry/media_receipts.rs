@@ -31,7 +31,7 @@ macro_rules! scope_model {
                 if facts.is_empty(){self.inner.checkpoint_weight_facts_by_source()}else{facts}
             }
             $(fn $method(&self,$($arg:$ty),*) -> $ret {
-                self.scope.with(||self.inner.$method($($arg),*))
+                self.scope.with_prepared(||self.inner.$method($($arg),*))
             })*
         }
     }

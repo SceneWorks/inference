@@ -164,6 +164,14 @@ def check_candle_llm_audio(root: Path) -> list[str]:
 
     audit(discovered, AUDIO_ROUTES, lambda name: audio / ("candle-audio-" + name) / "src", "Candle audio")
     audit(registered_text, TEXT_ROUTES, lambda name: text, "Candle text")
+    registry = source(crates / "contracts/gen-core/src/registry/providers.rs")
+    scopes = source(crates / "contracts/gen-core/src/registry/media_receipts.rs")
+    for fn, trait in (("audio_embedder", "AudioEmbedder"), ("voice_embedder", "VoiceEmbedder"),
+                      ("transcriber", "Transcriber"), ("audio_transform", "AudioTransform")):
+        if not re.search(r"dyn\s+" + trait + r"\s*,\s*super::media_receipts::load_" + fn, registry):
+            errors.append(f"{trait} registry load no longer retains its checkpoint receipts")
+        if not re.search(r"scope_model!\(\s*load_" + fn + r"\s*,\s*" + trait, scopes):
+            errors.append(f"{trait} deferred work has no owning checkpoint scope")
     sources = [text, audio / "candle-audio/src", *(audio / ("candle-audio-" + name) / "src" for name in sorted(discovered))]
     for folder in sources:
         for path in sorted(folder.rglob("*.rs")):
