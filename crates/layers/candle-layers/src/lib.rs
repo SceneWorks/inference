@@ -34,6 +34,12 @@ pub use convrot::{convrot_fht_f32, convrot_rotate};
 pub use cublaslt::{CublasLt, W4A8DecodeTile};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
+pub use llm_projection::{
+    from_ggml_block_tensor, to_ggml_block_tensor, KvProjection, Projection, ProjectionCensus,
+    ProjectionFormat, ProjectionKind, ProjectionTally, Q8RowEmbedding, QuantSpec, QuantizedLinear,
+    WeightCensus,
+};
+pub use prism::{GdnRowMap, PrismPackedWeight, PrismRegistry};
 pub use quant::{
     DenseLinear, MatmulStrategy, PackedConfig, QEmbedding, QLinear, QuantForward, QuantWeight,
 };
