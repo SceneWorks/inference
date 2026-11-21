@@ -237,42 +237,175 @@ pub fn adapter_stack_upcast_resident_bytes(
     if adapters.is_empty() || mode == AdapterResidencyMode::Folded {
         return Some(0);
     }
+    adapters.iter().try_fold(0_u64, |total, adapter| {
+        let file = upcast_adapter_file_residency(&adapter.path, compute_width, lora_copy)?;
+        Some(total.saturating_add(file.device_bytes))
+    })
+}
+
+/// Installed factor storage and the LoKr dimensions needed by consumers which keep alternate
+/// request-specific variants. Both come from the same bounded metadata read.
+pub struct UpcastAdapterFileResidency {
+    pub device_bytes: u64,
+    pub lokr: Vec<LokrKroneckerDims>,
+    /// Peak extra host bytes to read, cast and multiply one right-factor source. The normalized
+    /// right matrix itself is priced by its dimensions. Only selective readers need this bound.
+    pub lokr_read_scratch_bytes: u64,
+}
+
+pub fn upcast_adapter_file_residency(
+    path: &std::path::Path,
+    compute_width: u64,
+    lora_copy: UpcastLoraCopy,
+) -> Option<UpcastAdapterFileResidency> {
+    upcast_adapter_file_residency_inner(path, compute_width, lora_copy, None)
+}
+
+/// Price an additive provider which groups LoKr keys by canonical projection and whose installer
+/// ignores unmaterialized groups. A matched malformed group is still the installer's error.
+/// Aliases for the same factor can have different dimensions, so price the largest possible
+/// components without depending on the adapter loader's key iteration order.
+pub fn upcast_adapter_file_residency_with_lokr_modules(
+    path: &std::path::Path,
+    compute_width: u64,
+    lora_copy: UpcastLoraCopy,
+    classify: impl Fn(&str) -> Option<(String, &'static str)>,
+) -> Option<UpcastAdapterFileResidency> {
+    upcast_adapter_file_residency_inner(path, compute_width, lora_copy, Some(&classify))
+}
+
+type LokrModuleClassifier<'a> = dyn Fn(&str) -> Option<(String, &'static str)> + 'a;
+
+fn upcast_adapter_file_residency_inner(
+    path: &std::path::Path,
+    compute_width: u64,
+    lora_copy: UpcastLoraCopy,
+    classify: Option<&LokrModuleClassifier<'_>>,
+) -> Option<UpcastAdapterFileResidency> {
+    if safetensors_path_bytes(path) == 0 {
+        return None;
+    }
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path).ok()?;
     let lora_copy_width = match lora_copy {
         UpcastLoraCopy::Cached if compute_width != UPCAST_FACTOR_WIDTH => compute_width,
         _ => 0,
     };
     let lora_per_element = UPCAST_FACTOR_WIDTH.saturating_add(lora_copy_width);
-    adapters.iter().try_fold(0_u64, |total, adapter| {
-        if safetensors_path_bytes(&adapter.path) == 0 {
-            return None;
+    let classify_key = |name: &str| match classify {
+        Some(classify) => classify(name),
+        None => lokr_factor(name).map(|(module, factor)| (module.to_owned(), factor)),
+    };
+    let is_lokr = headers
+        .iter()
+        .any(|header| classify_key(&header.name).is_some());
+    let mut bytes = 0_u64;
+    let mut modules: std::collections::BTreeMap<
+        String,
+        Vec<(&str, &crate::SafetensorsTensorHeader)>,
+    > = std::collections::BTreeMap::new();
+    for header in &headers {
+        match (is_lokr, classify_key(&header.name)) {
+            (true, Some((module, factor))) => {
+                modules.entry(module).or_default().push((factor, header))
+            }
+            (true, None) => bytes = bytes.saturating_add(header.data_bytes),
+            (false, _) if header.is_float() => {
+                let elements = header.element_count().ok()?;
+                bytes = bytes.saturating_add(elements.saturating_mul(lora_per_element));
+            }
+            (false, _) => bytes = bytes.saturating_add(header.data_bytes),
         }
-        let headers = crate::weightsmeta::safetensors_path_tensor_headers(&adapter.path).ok()?;
-        let is_lokr = headers.iter().any(|h| lokr_factor(&h.name).is_some());
-        let mut bytes = 0_u64;
-        let mut modules: std::collections::BTreeMap<&str, Vec<(&str, &[usize])>> =
-            std::collections::BTreeMap::new();
-        for header in &headers {
-            match (is_lokr, lokr_factor(&header.name)) {
-                (true, Some((module, factor))) => modules
-                    .entry(module)
-                    .or_default()
-                    .push((factor, header.shape.as_slice())),
-                (true, None) => bytes = bytes.saturating_add(header.data_bytes),
-                (false, _) if header.is_float() => {
-                    let elements = header.element_count().ok()?;
-                    bytes = bytes.saturating_add(elements.saturating_mul(lora_per_element));
-                }
-                (false, _) => bytes = bytes.saturating_add(header.data_bytes),
+    }
+    let mut lokr = Vec::with_capacity(modules.len());
+    let mut lokr_read_scratch_bytes = 0;
+    for factors in modules.values() {
+        let dims = if classify.is_some() {
+            let Some((dims, scratch)) = selective_lokr_bounds(factors) else {
+                continue;
+            };
+            lokr_read_scratch_bytes = lokr_read_scratch_bytes.max(scratch);
+            dims
+        } else {
+            LokrKroneckerDims::from_factor_shapes(|name| {
+                factors
+                    .iter()
+                    .find(|(factor, _)| *factor == name)
+                    .map(|(_, header)| header.shape.as_slice())
+            })?
+        };
+        bytes = bytes.saturating_add(dims.resident_bytes(compute_width));
+        lokr.push(dims);
+    }
+    (bytes > 0).then_some(UpcastAdapterFileResidency {
+        device_bytes: bytes,
+        lokr,
+        lokr_read_scratch_bytes,
+    })
+}
+
+#[derive(Default)]
+struct LokrOperandBounds {
+    rows: u64,
+    columns: u64,
+    f32_bytes: u64,
+    read_scratch_bytes: u64,
+}
+
+fn selective_lokr_bounds(
+    factors: &[(&str, &crate::SafetensorsTensorHeader)],
+) -> Option<(LokrKroneckerDims, u64)> {
+    let bound = |name| {
+        let mut bounds = LokrOperandBounds::default();
+        let mut found = false;
+        for &(factor, header) in factors {
+            if factor != name {
+                continue;
+            }
+            let &[rows, columns] = header.shape.as_slice() else {
+                continue;
+            };
+            let f32_bytes = (rows as u64)
+                .saturating_mul(columns as u64)
+                .saturating_mul(4);
+            // Buffer, possible alignment copy, decoded operand and its F32 cast. The decoded
+            // element width does not exceed max(stored width, F32 width) on this reader.
+            let bytes = header.data_bytes;
+            let scratch = bytes
+                .saturating_mul(2)
+                .saturating_add(bytes.max(f32_bytes))
+                .saturating_add(f32_bytes);
+            bounds.rows = bounds.rows.max(rows as u64);
+            bounds.columns = bounds.columns.max(columns as u64);
+            bounds.f32_bytes = bounds.f32_bytes.max(f32_bytes);
+            bounds.read_scratch_bytes = bounds.read_scratch_bytes.max(scratch);
+            found = true;
+        }
+        found.then_some(bounds)
+    };
+    let leg = |full, left, right| {
+        let full = bound(full);
+        let pair = bound(left).zip(bound(right));
+        match (full, pair) {
+            (None, None) => None,
+            (Some(full), None) => Some((full.rows, full.columns, full.read_scratch_bytes)),
+            (full, Some((left, right))) => {
+                // A remains live when reading B. During the product both F32 operands stay live,
+                // and its normalized result is already accounted for in the retained right bank.
+                let scratch = left
+                    .read_scratch_bytes
+                    .max(left.f32_bytes.saturating_add(right.read_scratch_bytes));
+                let full = full.unwrap_or_default();
+                Some((
+                    full.rows.max(left.rows),
+                    full.columns.max(right.columns),
+                    full.read_scratch_bytes.max(scratch),
+                ))
             }
         }
-        for factors in modules.values() {
-            let dims = LokrKroneckerDims::from_factor_shapes(|name| {
-                factors.iter().find(|(f, _)| *f == name).map(|(_, s)| *s)
-            })?;
-            bytes = bytes.saturating_add(dims.resident_bytes(compute_width));
-        }
-        (bytes > 0).then(|| total.saturating_add(bytes))
-    })
+    };
+    let (a, c, _) = leg("lokr_w1", "lokr_w1_a", "lokr_w1_b")?;
+    let (b, d, scratch) = leg("lokr_w2", "lokr_w2_a", "lokr_w2_b")?;
+    Some((LokrKroneckerDims { a, b, c, d }, scratch))
 }
 
 /// Exact ordered identity of the load-time adapter stack used by provider request handshakes.

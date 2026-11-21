@@ -26,9 +26,12 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::adapters::loader::PhaseAdapterSource;
 use mlx_gen::array::scalar;
-use mlx_gen::gen_core::phase::{prepare_phases, PhaseArguments, PreparedPhase};
-use mlx_gen::gen_core::MemoryGeometry;
+use mlx_gen::gen_core::phase::{
+    prepare_phases, PhaseArguments, PhasePreparationCache, PrepareArguments, PreparedPhase,
+};
+use mlx_gen::gen_core::{MemoryGeometry, RenderRun};
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
@@ -39,9 +42,11 @@ use mlx_gen::{
     Progress, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 
-use std::path::Path;
+use std::collections::{btree_map::Entry, BTreeMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::control::Krea2ControlBranch;
 use crate::loader::{
@@ -117,6 +122,7 @@ where
 
 /// Turbo text-to-image knobs, resolved from the [`crate::model`] request. Dimensions are validated at
 /// the Generator layer (multiple-of-16, in the resolution range) before the pipeline runs.
+#[derive(Clone)]
 pub struct TurboOptions {
     pub width: u32,
     pub height: u32,
@@ -327,9 +333,16 @@ pub struct T2iPlan {
 /// [`KreaHeavy::prepare_multiphase`] and reused across the seed/count loop; [`KreaHeavy::render_multiphase`]
 /// drives the phases in order, threading the latent across the shared-boundary sigmas.
 pub struct MultiPhasePlan {
-    prepared: PreparedPhase<(Krea2Transformer, T2iPlan)>,
+    bank: Arc<Mutex<Krea2Transformer>>,
+    prepared: PreparedPhase<T2iPlan>,
     pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     slice: PhaseSlice,
+}
+
+/// Owner-local immutable residual bank and conditioning for one compiled request.
+pub(crate) struct MultiPhaseRun {
+    dit: Krea2Transformer,
+    phases: Vec<PreparedPhase<T2iPlan>>,
 }
 
 // Preserve the public plan's ability to move to a new owner by value.
@@ -407,6 +420,26 @@ pub struct ControlPlan {
     guidance: f32,
     sigmas: Option<Vec<f32>>,
     ctrl_tokens: Array,
+}
+
+fn load_phase_adapter_sources<'a>(
+    sources: &mut BTreeMap<PathBuf, PhaseAdapterSource>,
+    specs: &[AdapterSpec],
+    phases: impl IntoIterator<Item = &'a PhaseArguments>,
+    mut pin: impl FnMut(&Path) -> mlx_gen::gen_core::Result<mlx_gen::PinnedWeightsFile>,
+) -> Result<()> {
+    for key in phases.into_iter().flat_map(PhaseArguments::adapters) {
+        let spec = specs.get(key.slot()).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "krea: phase adapter slot {} is outside the installed stack",
+                key.slot()
+            ))
+        })?;
+        if let Entry::Vacant(entry) = sources.entry(spec.path.clone()) {
+            entry.insert(PhaseAdapterSource::load(pin(&spec.path)?)?);
+        }
+    }
+    Ok(())
 }
 
 impl KreaHeavy {
@@ -1357,24 +1390,8 @@ impl KreaHeavy {
         )
     }
 
-    /// Build the **count-invariant** render state for each distinct phase preparation key. Each
-    /// key gets a job-local adapted DiT and its step-invariant [`T2iPlan`], with negative preparation
-    /// only when the phase uses CFG. The seed/count loop reuses the resulting plans.
-    ///
-    /// **Why per-phase clones + why job-safe.** The resident DiT ([`Self`]) is shared read-only across
-    /// concurrent generates and its adapters are load-time-baked (immutable at runtime). To *toggle*
-    /// adapters without racing that shared DiT, the request owns its adapted clones
-    /// ([`Krea2Transformer`] `Clone` is a shallow, refcounted copy — the weight tensors stay shared, only
-    /// the adapter-stack structs are duplicated). On the clone we `clear_adapters` (drop the baked stack)
-    /// then re-install the phase's subset via the low-rank strict loader — so the phase's adapter set is
-    /// authoritative regardless of what was baked, and the base weights (shared with the resident) are
-    /// never mutated (adapters are forward-time residuals). Uses the low-rank strict path, not the
-    /// diff-patch variant, since a `.diff` fold would mutate the shared dense base.
-    ///
-    /// The prep is built from *this phase's* clone (not the shared DiT) because an adapter may target the
-    /// text-fusion aggregator that `prepare` runs, so a base-only phase and a LoRA phase can produce
-    /// different fused contexts. `ctx_neg` must be `Some` whenever any phase uses CFG (the caller encodes
-    /// it under exactly that condition).
+    /// Prepare the public phase helpers over a single request-local factor bank. Callers can move
+    /// an exclusive phase handle to another owner. The shared bank is Send but not Sync.
     pub fn prepare_multiphase(
         &self,
         phases: &[ResolvedPhase],
@@ -1384,52 +1401,23 @@ impl KreaHeavy {
         width: u32,
         height: u32,
     ) -> Result<Vec<MultiPhasePlan>> {
-        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_raw")?;
-        let geometry = MemoryGeometry {
-            width,
-            height,
-            batch: 1,
-            frames: 1,
-            reference_count: 0,
-        };
-        let prepared = prepare_phases(
+        let run = self.prepare_phased_render(
             phases
                 .iter()
-                .map(|phase| (phase.arguments(all_specs), geometry)),
-            |arguments, geometry| -> Result<_> {
-                let geom = Self::geom_latent(geometry.width, geometry.height)?;
-                // The same job-local DiT and conditioning travel together to each forward.
-                let specs = crate::multiphase::phase_adapter_specs(arguments.adapters(), all_specs);
-                let dit = self.dit.clone_for_multiphase(&specs)?;
-                let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
-                let prep_neg = if arguments.uses_classifier_free_guidance() {
-                    let neg = ctx_neg.ok_or_else(|| {
-                        mlx_gen::Error::Msg(
-                            "krea_2 multi-phase: a CFG phase needs a negative context, \
-                             but none was encoded"
-                                .into(),
-                        )
-                    })?;
-                    Some(dit.prepare(neg, None, &geom)?)
-                } else {
-                    None
-                };
-                Ok((
-                    dit,
-                    T2iPlan {
-                        sigmas: None,
-                        guidance: 0.0,
-                        pag: None,
-                        prep_pos,
-                        prep_neg,
-                    },
-                ))
-            },
+                .map(|phase| phase.arguments(all_specs))
+                .collect(),
+            all_specs,
+            ctx_pos,
+            ctx_neg,
+            width,
+            height,
         )?;
+        let bank = Arc::new(Mutex::new(run.dit));
         Ok(phases
             .iter()
-            .zip(prepared)
+            .zip(run.phases)
             .map(|(phase, prepared)| MultiPhasePlan {
+                bank: Arc::clone(&bank),
                 prepared,
                 pag: None,
                 slice: phase.slice,
@@ -1437,10 +1425,181 @@ impl KreaHeavy {
             .collect())
     }
 
+    /// Materialize phase-selected factors once and prepare conditioning using the same selection
+    /// each DiT evaluation reads from its prepared branch. No shared resident weights are changed.
+    pub(crate) fn prepare_phased_render(
+        &self,
+        arguments: Vec<PhaseArguments>,
+        all_specs: &[AdapterSpec],
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        width: u32,
+        height: u32,
+    ) -> Result<MultiPhaseRun> {
+        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_raw")?;
+        let mut sources = BTreeMap::new();
+        load_phase_adapter_sources(&mut sources, all_specs, arguments.iter(), |path| {
+            mlx_gen::PinnedWeightsFile::pin(path)
+        })?;
+        let dit = self
+            .dit
+            .clone_for_phase_adapters(all_specs, &sources, arguments.iter())?;
+        let geometry = MemoryGeometry {
+            width,
+            height,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        let phases = prepare_phases(
+            arguments.into_iter().map(|arguments| (arguments, geometry)),
+            |arguments, geometry| {
+                Self::prepare_phase_conditioning(&dit, arguments, geometry, ctx_pos, ctx_neg)
+            },
+        )?;
+        Ok(MultiPhaseRun { dit, phases })
+    }
+
+    fn prepare_phase_conditioning(
+        dit: &Krea2Transformer,
+        arguments: PrepareArguments<'_>,
+        geometry: MemoryGeometry,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+    ) -> Result<T2iPlan> {
+        let geom = Self::geom_latent(geometry.width, geometry.height)?;
+        let adapters: Arc<[_]> = Arc::from(arguments.adapters());
+        let prep_pos = dit.prepare_with_phase(ctx_pos, None, &geom, Some(adapters.clone()))?;
+        let prep_neg = if arguments.uses_classifier_free_guidance() {
+            let neg = ctx_neg.ok_or_else(|| {
+                Error::Msg(
+                    "krea_2 multi-phase: a CFG phase needs a negative context, \
+                     but none was encoded"
+                        .into(),
+                )
+            })?;
+            Some(dit.prepare_with_phase(neg, None, &geom, Some(adapters))?)
+        } else {
+            None
+        };
+        Ok(T2iPlan {
+            sigmas: None,
+            guidance: 0.0,
+            pag: None,
+            prep_pos,
+            prep_neg,
+        })
+    }
+
+    /// Execute the shared phase runner with the existing Krea sampler, guidance and preview.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_multiphase_planned(
+        &self,
+        run: &RenderRun<'_, '_>,
+        file_pin_spec: &mlx_gen::LoadSpec,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let plan = run.plan();
+        let all_specs = &file_pin_spec.adapters;
+        let mut sources = BTreeMap::new();
+        let image_index = Cell::new(0usize);
+        let geometry = MemoryGeometry {
+            width: opts.width,
+            height: opts.height,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        let attention = opts.attention_plan(&req.cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
+        run.images_with_denoise_phases(
+            on_progress,
+            |seed| init_noise(opts.height, opts.width, seed),
+            |seed, latent, progress| {
+                mlx_gen::image_execution::with_output_index(image_index.get(), || {
+                    let previews = KreaPreview::new(&req.preview, plan.sigmas());
+                    run.denoise_adapter_phases(seed, latent, |phase, sigmas, seed, latent| {
+                        load_phase_adapter_sources(
+                            &mut sources,
+                            all_specs,
+                            [phase.arguments()],
+                            |path| file_pin_spec.file_pin_for(path),
+                        )?;
+                        let dit = self.dit.clone_for_phase_adapters(
+                            all_specs,
+                            &sources,
+                            [phase.arguments()],
+                        )?;
+                        // Do not extend the live-set reservation with stored fused conditioning.
+                        // Prepare under the active Denoise scope and release it at phase exit.
+                        let mut preparation = PhasePreparationCache::new();
+                        let conditioning = preparation.get_or_prepare(
+                            phase.arguments(),
+                            geometry,
+                            |arguments, geometry| {
+                                Self::prepare_phase_conditioning(
+                                    &dit, arguments, geometry, ctx_pos, ctx_neg,
+                                )
+                            },
+                        )?;
+                        let latent = Self::denoise_phase_from(
+                            &dit,
+                            conditioning,
+                            phase.arguments(),
+                            pag,
+                            phase.span().start,
+                            plan.sigmas().len().saturating_sub(1),
+                            sigmas,
+                            opts.sampler.as_deref(),
+                            opts.transformer_window_size,
+                            attention,
+                            latent,
+                            seed,
+                            &req.cancel,
+                            &previews,
+                            progress,
+                        )?;
+                        mlx_rs::transforms::eval([&latent])?;
+                        if phase.index() + 1 == plan.adapter_phases().len() {
+                            denoise_exit_fault(&latent, opts)?;
+                            if image_index.get() + 1 == plan.image_count() as usize {
+                                sources.clear();
+                            }
+                        }
+                        Ok(latent)
+                    })
+                })
+            },
+            |seed, latent, progress| {
+                let mut opts = opts.clone();
+                opts.seed = seed;
+                let index = image_index.get();
+                image_index.set(index + 1);
+                mlx_gen::image_execution::with_output_index(index, || {
+                    progress(Progress::Decoding);
+                    let image = self.decode_latents_with_tiling(
+                        &latent,
+                        decoder,
+                        opts.decode_tiling()?.as_ref(),
+                        &req.cancel,
+                    )?;
+                    decode_exit_fault(&opts)?;
+                    Ok(image)
+                })
+            },
+        )
+    }
+
     /// **Multi-phase Raw render** (epic 13879, sc-13884) — drive the ordered per-phase plans (from
     /// [`Self::prepare_multiphase`]) within ONE denoise trajectory over ONE coherent global schedule,
     /// then decode once. The `full` schedule is built ONCE for the TOTAL step budget (the sum of the
-    /// phases' steps); each phase runs `denoise_phase_from` through its matching job-local DiT
+    /// phases' steps); each phase runs `denoise_phase_from` through its matching residual selection
     /// over its contiguous slice `full[start..=end]` from the
     /// running latent — so the latent and sigma flow continuously across every boundary (the crux: no
     /// per-phase schedule, hence no seam/reset), while the ACTIVE ADAPTERS and GUIDANCE change per phase.
@@ -1467,9 +1626,12 @@ impl KreaHeavy {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
             let sub = &full[start..=end];
-            let (arguments, (dit, plan)) = mp.prepared.parts();
+            let (arguments, plan) = mp.prepared.parts();
+            let dit = mp.bank.lock().map_err(|_| {
+                Error::ProcessPoisoned("krea: phase adapter bank owner panicked".into())
+            })?;
             latent = Self::denoise_phase_from(
-                dit,
+                &dit,
                 plan,
                 arguments,
                 mp.pag.as_ref(),

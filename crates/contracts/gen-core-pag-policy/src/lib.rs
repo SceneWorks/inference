@@ -421,18 +421,31 @@ impl PagResolved {
     /// Number of denoise steps in `0..total_steps` where `step_scale > 0.0` (i.e. where a
     /// perturbed forward pass actually executes).
     pub fn active_steps(&self, total_steps: u32) -> u32 {
-        let total = total_steps as usize;
-        (0..total)
-            .filter(|&step| self.step_scale(step, total) > 0.0)
+        self.active_steps_for_prefix(total_steps, total_steps)
+    }
+
+    /// Count perturbed forwards within the executed prefix, using the full schedule for progress.
+    pub fn active_steps_for_prefix(&self, executed_steps: u32, schedule_steps: u32) -> u32 {
+        (0..executed_steps.min(schedule_steps) as usize)
+            .filter(|&step| self.step_scale(step, schedule_steps as usize) > 0.0)
             .count() as u32
     }
 
     /// Build the execution report for a completed trajectory of `total_steps` denoise steps.
     pub fn execution_report(&self, total_steps: u32) -> PagExecutionReport {
+        self.execution_report_for_prefix(total_steps, total_steps)
+    }
+
+    /// Report an executed prefix whose PAG windows use the full resolved schedule.
+    pub fn execution_report_for_prefix(
+        &self,
+        executed_steps: u32,
+        schedule_steps: u32,
+    ) -> PagExecutionReport {
         PagExecutionReport {
             layers: self.layers.clone(),
-            active_steps: self.active_steps(total_steps),
-            total_steps,
+            active_steps: self.active_steps_for_prefix(executed_steps, schedule_steps),
+            total_steps: executed_steps,
             scale: self.scale,
             adaptive_scale: self.adaptive_scale,
             start: self.start,

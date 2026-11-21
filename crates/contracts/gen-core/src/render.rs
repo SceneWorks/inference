@@ -5,9 +5,12 @@ mod passes;
 
 pub use passes::{MultiPassRenderPlan, PlannedPassRequest, ProducedReference};
 
+use crate::phase::{ConditioningBranches, PhaseAdapterScale, PhaseArguments};
 use crate::{
-    default_seed, CancelFlag, Conditioning, ControlKind, Error, GenerationRequest, Image, LoadSpec,
-    MemoryPhase, MemoryRequestScope, ModelDescriptor, Progress, Result,
+    default_seed, CancelFlag, ComposedRenderPlan, Conditioning, ControlKind, Error,
+    FeatureInvocation, FeatureParameters, FeatureRegistry, FeatureRouteStructure,
+    GenerationRequest, Image, KreaMultiphaseFeature, LoadSpec, MemoryPhase, MemoryRequestScope,
+    ModelDescriptor, Progress, Result,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,6 +59,63 @@ struct ImagePhase {
     guidance: f32,
 }
 
+/// A compiled adapter/guidance phase using absolute steps of its pass's global schedule.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdapterDenoisePhase {
+    index: usize,
+    span: Range<usize>,
+    arguments: PhaseArguments,
+}
+
+impl AdapterDenoisePhase {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn span(&self) -> Range<usize> {
+        self.span.clone()
+    }
+
+    pub fn arguments(&self) -> &PhaseArguments {
+        &self.arguments
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AdapterPhaseSampling {
+    // Legacy Krea sampling resets solver history and starts phase-local stochastic draw
+    // coordinates on the original image seed. The noisy latent and boundary sigma continue.
+    ResetSolverAndReuseImageSeed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AdapterPhaseInstallation {
+    // Every phase selects from the model's installed, immutable residuals. Their placement
+    // and any retained preparation are live-set allocations, not a weight-swap transition.
+    ImmutableResiduals,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct AdapterPhasePlan {
+    phases: Vec<AdapterDenoisePhase>,
+    need_negative: bool,
+    sampling: AdapterPhaseSampling,
+    installation: AdapterPhaseInstallation,
+    #[serde(skip)]
+    compiled_load: AdapterPhaseLoadSpec,
+}
+
+#[derive(Clone, Debug)]
+struct AdapterPhaseLoadSpec(std::sync::Arc<LoadSpec>);
+
+impl PartialEq for AdapterPhaseLoadSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_load_except_placement(&other.0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ImagePass {
     stages: [Stage; 10],
@@ -65,6 +125,8 @@ struct ImagePass {
     low_res_start: Option<crate::ResolvedLowResStartPlan>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     inert_splits: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter_phases: Option<AdapterPhasePlan>,
     capture_sigma: f32,
 }
 
@@ -94,6 +156,21 @@ struct ReferenceImageInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+struct AdapterPhaseInputs {
+    authored: Vec<AuthoredAdapterPhase>,
+    pag: Option<crate::PagConfig>,
+    text_style_gain_bits: Option<u32>,
+    output_rgba: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AuthoredAdapterPhase {
+    steps: u32,
+    guidance_bits: Option<u32>,
+    adapters: Vec<(usize, Option<u32>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct ImageInputs {
     prompt_sha256: [u8; 32],
     negative_prompt: Option<String>,
@@ -108,6 +185,8 @@ struct ImageInputs {
     source_image: Option<SourceImageInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     low_res_start: Option<LowResStartInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter_phases: Option<AdapterPhaseInputs>,
     steps: Option<u32>,
     sampler: Option<String>,
     scheduler: Option<String>,
@@ -193,11 +272,6 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
     type Error = Error;
 
     fn try_from(req: &GenerationRequest) -> Result<Self> {
-        if req.phases.is_some() {
-            return Err(Error::Unsupported(
-                "packed image plan does not support multi-phase denoise (phases)".into(),
-            ));
-        }
         let conditioning = match req.conditioning.as_slice() {
             [] => PackedImageConditioning::None,
             [Conditioning::Reference { image, strength }] => PackedImageConditioning::Reference {
@@ -311,6 +385,23 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             scale_bits: spec.scale.map(f32::to_bits),
             estimate_source: spec.estimate_source,
         });
+        let adapter_phases = req.phases.as_ref().map(|phases| AdapterPhaseInputs {
+            authored: phases
+                .iter()
+                .map(|phase| AuthoredAdapterPhase {
+                    steps: phase.steps,
+                    guidance_bits: phase.guidance.map(f32::to_bits),
+                    adapters: phase
+                        .adapters
+                        .iter()
+                        .map(|adapter| (adapter.adapter, adapter.weight.map(f32::to_bits)))
+                        .collect(),
+                })
+                .collect(),
+            pag: req.pag.clone(),
+            text_style_gain_bits: req.text_style_gain.map(f32::to_bits),
+            output_rgba: req.output_channels == crate::OutputChannels::Rgba,
+        });
         Ok(Self {
             prompt_sha256: Sha256::digest(req.prompt.as_bytes()).into(),
             negative_prompt: req.negative_prompt.clone(),
@@ -323,6 +414,7 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
             conditioning,
             source_image,
             low_res_start,
+            adapter_phases,
             steps: req.steps,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
@@ -469,6 +561,106 @@ impl RenderPlan {
                 descriptor.id
             )));
         }
+        Self::packed_image_trajectory_inner(descriptor, req, pass)
+    }
+
+    /// Compile the Krea Raw phase Feature over the provider's untrimmed global schedule.
+    ///
+    /// The Feature owns the executed step count and capture sigma. This constructor ignores
+    /// those two fields of `pass` and binds the final plan to `spec`'s ordered adapter stack.
+    pub fn krea_multiphase(
+        descriptor: &ModelDescriptor,
+        spec: &LoadSpec,
+        req: &GenerationRequest,
+        mut pass: PackedImagePass<'_>,
+    ) -> Result<Self> {
+        let authored = req.phases.as_ref().ok_or_else(|| {
+            Error::Unsupported("Krea multi-phase plan requires requested phases".into())
+        })?;
+        if !req.conditioning.is_empty()
+            || req.source_image.is_some()
+            || req.use_pid
+            || req.low_res_start.is_some()
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: multi-phase denoise requires a noise start and excludes PiD and low-res start",
+                descriptor.id
+            )));
+        }
+        pass.executed_steps = pass.sigmas.len().saturating_sub(1);
+        pass.capture_sigma = 0.0;
+        let mut plan = Self::packed_image_trajectory_inner(descriptor, req, pass)?;
+        // This is the planner itself. Derive capabilities from the descriptor without probing
+        // its registered compiler, which would recursively call this method.
+        let mut route = FeatureRouteStructure::from_descriptor_and_plan(descriptor, None);
+        route.has_render_plan = true;
+        route.has_packed_image_trajectory = true;
+        let composed = FeatureRegistry::standard().compose(
+            &route,
+            ComposedRenderPlan::from_render_plan(&route, &plan, req)?,
+            &[FeatureInvocation {
+                feature_id: KreaMultiphaseFeature::ID.to_owned(),
+                parameters: FeatureParameters::KreaMultiphase {
+                    phases: authored.clone(),
+                    loaded_adapter_count: spec.adapters.len(),
+                },
+            }],
+        )?;
+        let [lowered] = composed.passes.as_slice() else {
+            return Err(Error::Unsupported(
+                "Krea multi-phase Feature must produce one render pass".into(),
+            ));
+        };
+        let phases = lowered
+            .phases
+            .iter()
+            .map(|phase| {
+                let adapters = phase
+                    .active_adapters
+                    .iter()
+                    .map(|&(slot, override_bits)| {
+                        let scale = override_bits.map_or(spec.adapters[slot].scale, f32::from_bits);
+                        if !scale.is_finite() {
+                            return Err(Error::Unsupported(format!(
+                                "{}: adapter slot {slot} has nonfinite scale",
+                                descriptor.id
+                            )));
+                        }
+                        Ok(PhaseAdapterScale::new(slot, scale))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let branches = if phase.guidance != 0.0 {
+                    ConditioningBranches::PositiveAndNegative
+                } else {
+                    ConditioningBranches::Positive
+                };
+                Ok(AdapterDenoisePhase {
+                    index: phase.phase_index,
+                    span: phase.first_step..phase.end_step,
+                    arguments: PhaseArguments::new(adapters, phase.guidance, branches),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        plan.pass.phase.end_step = lowered.executed_steps;
+        plan.pass.capture_sigma = plan.pass.sigmas[lowered.executed_steps];
+        plan.pass.adapter_phases = Some(AdapterPhasePlan {
+            phases,
+            need_negative: authored
+                .iter()
+                .any(|phase| phase.guidance.unwrap_or(plan.guidance()) != 0.0),
+            sampling: AdapterPhaseSampling::ResetSolverAndReuseImageSeed,
+            installation: AdapterPhaseInstallation::ImmutableResiduals,
+            compiled_load: AdapterPhaseLoadSpec(std::sync::Arc::new(spec.clone())),
+        });
+        plan.preparation = Some(RenderLoadBinding::from_spec(spec));
+        Ok(plan)
+    }
+
+    fn packed_image_trajectory_inner(
+        descriptor: &ModelDescriptor,
+        req: &GenerationRequest,
+        pass: PackedImagePass<'_>,
+    ) -> Result<Self> {
         let PackedImagePass {
             pixel_stride,
             token_width,
@@ -583,6 +775,7 @@ impl RenderPlan {
                 },
                 low_res_start,
                 inert_splits: Vec::new(),
+                adapter_phases: None,
             },
             pass_index: 0,
         })
@@ -723,13 +916,54 @@ impl RenderPlan {
     fn preparation(&self) -> Option<&RenderLoadBinding> {
         self.preparation.as_ref()
     }
-    /// Freeze the exact load contract for a direct provider that is not registry loaded.
+    /// Bind an ordinary plan to its load contract. Adapter phase plans already bind the spec
+    /// whose scales they compiled. Use [`Self::rebind_load_placement`] to update their placement.
     pub fn bind_load(mut self, spec: &LoadSpec) -> Self {
-        self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        if self.pass.adapter_phases.is_none() {
+            self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        }
         self
     }
 
+    /// Update an adapter phase plan with the actual loader placement. No source, pin, adapter
+    /// slot, default scale or other load input may differ from the spec used to compile it.
+    pub fn rebind_load_placement(mut self, spec: &LoadSpec) -> Result<Self> {
+        let phases = self.pass.adapter_phases.as_ref().ok_or_else(|| {
+            Error::Unsupported("load placement rebinding requires an adapter phase plan".into())
+        })?;
+        Self::check_adapter_phase_load(phases, spec)?;
+        self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        Ok(self)
+    }
+
+    /// Check an exact load spec, including the pinned source and ordered adapter identity for
+    /// adapter phases, against the plan and its bound placement.
+    pub fn check_load_spec(&self, spec: &LoadSpec) -> Result<()> {
+        if let Some(phases) = &self.pass.adapter_phases {
+            Self::check_adapter_phase_load(phases, spec)?;
+        }
+        self.check_bound_load(&RenderLoadBinding::from_spec(spec))
+    }
+
+    fn check_adapter_phase_load(phases: &AdapterPhasePlan, spec: &LoadSpec) -> Result<()> {
+        if !phases.compiled_load.0.same_load_except_placement(spec) {
+            return Err(Error::Unsupported(
+                "adapter phase plan belongs to a different model or adapter stack".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn check_load(&self, loaded: &RenderLoadBinding) -> Result<()> {
+        if self.pass.adapter_phases.is_some() {
+            return Err(Error::Unsupported(
+                "adapter phase plans require checking the exact load spec".into(),
+            ));
+        }
+        self.check_bound_load(loaded)
+    }
+
+    fn check_bound_load(&self, loaded: &RenderLoadBinding) -> Result<()> {
         if self
             .preparation
             .as_ref()
@@ -829,10 +1063,32 @@ impl RenderPlan {
         &self.pass.sigmas[self.pass.phase.first_step..=self.pass.phase.end_step]
     }
 
+    /// Compiled request-local adapter and guidance arguments in execution order.
+    pub fn adapter_phases(&self) -> &[AdapterDenoisePhase] {
+        self.pass
+            .adapter_phases
+            .as_ref()
+            .map_or(&[], |plan| &plan.phases)
+    }
+
+    /// Preserve Krea's negative prompt encoding when any authored phase uses CFG, even
+    /// when a shorter resolved schedule leaves the last authored phase with no evaluations.
+    pub fn adapter_phases_need_negative(&self) -> bool {
+        self.pass
+            .adapter_phases
+            .as_ref()
+            .is_some_and(|plan| plan.need_negative)
+    }
+
     /// A proof-only phase boundary with no changes to geometry, model, guidance or schedule.
     /// It is compiled before load; product Feature controls introduce their own validated phases.
     #[doc(hidden)]
     pub fn with_inert_split_at(mut self, step: usize) -> Result<Self> {
+        if self.pass.adapter_phases.is_some() {
+            return Err(Error::Unsupported(
+                "inert split cannot be combined with Krea multi-phase denoise".into(),
+            ));
+        }
         if step <= self.pass.phase.first_step || step >= self.pass.phase.end_step {
             return Err(Error::Unsupported(
                 "inert split must lie inside the executed pass steps".into(),
@@ -845,10 +1101,11 @@ impl RenderPlan {
         Ok(self)
     }
 
-    /// Half-open absolute steps in the executed pass-local schedule. Keeping a single full
-    /// schedule and one request-owned solver state makes inert boundaries numerically invisible;
-    /// when `low_res_start` is active, the phase-0 -> phase-1 boundary at `K` is included.
+    /// Half-open absolute steps in the executed pass-local schedule.
     pub fn denoise_spans(&self) -> Vec<Range<usize>> {
+        if let Some(plan) = &self.pass.adapter_phases {
+            return plan.phases.iter().map(AdapterDenoisePhase::span).collect();
+        }
         let mut splits = self.pass.inert_splits.clone();
         if let Some(low_res) = &self.pass.low_res_start {
             if splits.binary_search(&low_res.k).is_err() {
@@ -864,6 +1121,13 @@ impl RenderPlan {
         }
         spans.push(first..self.pass.phase.end_step);
         spans
+    }
+
+    fn denoise_phase_count(&self) -> usize {
+        self.pass
+            .adapter_phases
+            .as_ref()
+            .map_or_else(|| self.denoise_spans().len(), |plan| plan.phases.len())
     }
 }
 
@@ -997,7 +1261,7 @@ impl<'p, 's> RenderRun<'p, 's> {
         if self.state.get() != RunState::Rendering
             || self.active_denoise_phase.get().is_some()
             || phase != self.next_denoise_phase.get()
-            || phase >= self.plan.denoise_spans().len()
+            || phase >= self.plan.denoise_phase_count()
         {
             return Err(Error::Unsupported(
                 "denoise phase is out of order or outside the compiled plan".into(),
@@ -1025,6 +1289,33 @@ impl<'p, 's> RenderRun<'p, 's> {
         self.active_denoise_phase.set(None);
         self.next_denoise_phase.set(phase + 1);
         Ok(())
+    }
+
+    /// Run the compiled adapter phases, threading the noisy latent through each shared sigma
+    /// boundary. The backend callback runs a fresh solver over each inclusive slice, from the
+    /// original image seed and local draw index zero. Any backend fence needed before leaving
+    /// a phase belongs in the callback. The scope owner tears down a failed phase.
+    pub fn denoise_adapter_phases<T, E: From<Error>>(
+        &self,
+        image_seed: u64,
+        initial: T,
+        mut body: impl FnMut(&AdapterDenoisePhase, &[f32], u64, T) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let plan = self.plan.pass.adapter_phases.as_ref().ok_or_else(|| {
+            Error::Unsupported("render plan does not contain adapter phases".into())
+        })?;
+        match plan.sampling {
+            AdapterPhaseSampling::ResetSolverAndReuseImageSeed => {
+                let mut latent = initial;
+                for phase in &plan.phases {
+                    self.begin_denoise_phase(phase.index)?;
+                    let sigmas = &self.plan.sigmas()[phase.span.start..=phase.span.end];
+                    latent = body(phase, sigmas, image_seed, latent)?;
+                    self.end_denoise_phase(phase.index)?;
+                }
+                Ok(latent)
+            }
+        }
     }
 
     pub fn encode<T, E: From<Error>>(
@@ -1082,6 +1373,11 @@ impl<'p, 's> RenderRun<'p, 's> {
         mut denoise: impl FnMut(u64, I, &mut dyn FnMut(Progress)) -> std::result::Result<D, E>,
         mut decode: impl FnMut(u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
     ) -> std::result::Result<Vec<O>, E> {
+        if self.plan.pass.adapter_phases.is_some() {
+            return Err(
+                Error::Unsupported("Krea requires phase-aware denoise execution".into()).into(),
+            );
+        }
         self.begin(RunState::Encoded, RunState::Rendering)?;
         let images = self
             .plan
@@ -1113,7 +1409,7 @@ impl<'p, 's> RenderRun<'p, 's> {
         mut decode: impl FnMut(u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
     ) -> std::result::Result<Vec<O>, E> {
         self.begin(RunState::Encoded, RunState::Rendering)?;
-        let expected_phases = self.plan.denoise_spans().len();
+        let expected_phases = self.plan.denoise_phase_count();
         let images = self
             .plan
             .count
@@ -1155,7 +1451,7 @@ impl<'p, 's> RenderRun<'p, 's> {
         mut decode: impl FnMut(&mut Dec, u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
     ) -> std::result::Result<Vec<O>, E> {
         self.begin(RunState::Encoded, RunState::Rendering)?;
-        let expected_phases = self.plan.denoise_spans().len();
+        let expected_phases = self.plan.denoise_phase_count();
         let mut denoised_batch = Vec::with_capacity(self.plan.image_count() as usize);
         for seed in self.plan.count.seeds() {
             if self.cancel.is_cancelled() {
@@ -1207,7 +1503,7 @@ impl<'p, 's> RenderRun<'p, 's> {
 
     /// Verify that an image trajectory completed all compiled denoise phases.
     pub fn finish_image_denoise_phases(&self) -> Result<()> {
-        let expected_phases = self.plan.denoise_spans().len();
+        let expected_phases = self.plan.denoise_phase_count();
         if self.active_denoise_phase.get().is_some()
             || self.next_denoise_phase.get() != expected_phases
         {

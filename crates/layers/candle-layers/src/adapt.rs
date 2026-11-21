@@ -701,6 +701,26 @@ impl LokrFactors {
         )
     }
 
+    /// Re-bake a request's absolute scale against the F32 right factor from this installation.
+    pub fn with_scaled_right(
+        &self,
+        unscaled_right: &Tensor,
+        scale: f64,
+    ) -> candle_core::Result<Self> {
+        if !scale.is_finite() {
+            candle_core::bail!("lokr: derived scale must be finite, got {scale}");
+        }
+        let w2 = (unscaled_right * scale)?
+            .contiguous()?
+            .to_device(self.w2.device())?;
+        Ok(Self {
+            w2,
+            scale,
+            prepared: Arc::default(),
+            ..self.clone()
+        })
+    }
+
     /// Build factors for a fused source projection and retain only `output_slice` in the residual.
     /// This routes BFL/ComfyUI fused FLUX QKV LoKr onto split q/k/v host projections without ever
     /// materializing the fused `[out,in]` weight delta.
@@ -797,7 +817,7 @@ impl LokrFactors {
             return Ok(None);
         }
         // Bake the full scale into `w2` (keeps `w1` a clean copy); hold f32, contiguous for the matmuls.
-        let w2 = (factor2 * scale)?.contiguous()?;
+        let w2 = (&factor2 * scale)?.contiguous()?;
         let w1 = factor1.contiguous()?;
         Ok(Some(Self {
             w1,
@@ -1326,6 +1346,24 @@ impl AdaptLinear {
         scales: Option<&ScaleContext<'_>>,
     ) -> candle_core::Result<Tensor> {
         self.apply_residuals_with_scales(x, self.base.forward(x)?, scales)
+    }
+
+    /// Evaluate an explicitly selected stack in caller order over the same frozen base. The
+    /// provider resolves sparse source slots to this projection's residuals before calling.
+    pub fn forward_with_selected_adapters<'a>(
+        &self,
+        x: &Tensor,
+        selected: impl IntoIterator<Item = candle_core::Result<(std::borrow::Cow<'a, Adapter>, f64)>>,
+    ) -> candle_core::Result<Tensor> {
+        let mut y = self.base.forward(x)?;
+        for adapter in selected {
+            let (adapter, scale) = adapter?;
+            if scale != 0.0 {
+                let residual = adapter.residual_with_scale(x, scale)?.to_dtype(y.dtype())?;
+                y = (y + residual)?;
+            }
+        }
+        Ok(y)
     }
 
     /// Dense base inspection without dequantization. Preparation refuses tracked weights.

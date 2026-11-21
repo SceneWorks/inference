@@ -135,14 +135,16 @@ fn apply_adapter_factor(x: &Tensor, w: &Tensor) -> Result<Tensor> {
 }
 
 impl ConvRotAdapter {
+    fn lora_residual(x: &Tensor, a: &Tensor, b: &Tensor, scale: f64) -> Result<Tensor> {
+        let dtype = x.dtype();
+        let a = a.to_dtype(dtype)?;
+        let b = b.to_dtype(dtype)?;
+        apply_adapter_factor(&apply_adapter_factor(x, &a)?, &b)? * scale
+    }
+
     fn residual(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Lora { a, b, scale } => {
-                let dtype = x.dtype();
-                let a = a.to_dtype(dtype)?;
-                let b = b.to_dtype(dtype)?;
-                apply_adapter_factor(&apply_adapter_factor(x, &a)?, &b)? * *scale
-            }
+            Self::Lora { a, b, scale } => Self::lora_residual(x, a, b, *scale),
             Self::Lokr { factors } => factors.residual(x),
         }
     }
@@ -366,6 +368,55 @@ impl QLinear {
             Self::ConvRotInt8(l) => __model_proof_output!(l.forward(x)),
             Self::Nvfp4(l) => __model_proof_output!(l.forward(x)),
             Self::Probed(l) => __model_proof_output!(l.forward(x)),
+        }
+    }
+
+    /// Evaluate this projection using the phase's explicitly selected source slots. The phase
+    /// may select no adapters, even when the resident base has an ordinary default stack.
+    pub(crate) fn forward_phase(
+        &self,
+        x: &Tensor,
+        phase: Option<&crate::adapters::PhaseAdapterSelection<'_>>,
+    ) -> Result<Tensor> {
+        let Some(phase) = phase else {
+            return self.forward(x);
+        };
+        match self {
+            Self::Adapt(linear) => __model_proof_output!(phase.forward_linear(self, linear, x)),
+            Self::Nvfp4(projection) => __model_proof_output!(
+                projection.forward_with(x, |linear| phase.forward_linear(self, linear, x))
+            ),
+            Self::ConvRotInt8(linear) => {
+                let mut y = linear.forward_base(x)?;
+                for (index, scale, source) in phase.selected(self) {
+                    let adapter = linear.adapters.get(index).ok_or_else(|| {
+                        candle_gen::candle_core::Error::Msg(
+                            "Krea phase adapter binding does not match the ConvRot stack".into(),
+                        )
+                    })?;
+                    let residual = match (adapter, source) {
+                        (ConvRotAdapter::Lora { a, b, .. }, None) => {
+                            if scale == 0.0 {
+                                continue;
+                            }
+                            ConvRotAdapter::lora_residual(x, a, b, scale)?
+                        }
+                        (ConvRotAdapter::Lokr { factors }, Some(source)) => {
+                            if scale.to_bits() == factors.scale.to_bits() {
+                                factors.residual(x)?
+                            } else {
+                                phase.lokr(factors, source, scale)?.residual(x)?
+                            }
+                        }
+                        _ => candle_gen::candle_core::bail!("Krea phase adapter kind mismatch"),
+                    };
+                    let residual = residual.to_dtype(y.dtype())?;
+                    y = (y + residual)?;
+                }
+                Ok(y)
+            }
+            // Probes are not part of the adapter-install surface.
+            Self::Probed(linear) => __model_proof_output!(linear.forward(x)),
         }
     }
 
