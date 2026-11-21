@@ -1,10 +1,8 @@
-//! The shared packed projection type and the VAE's dense loading seam.
+//! Dense VAE weights from packed attention projections.
 
 use candle_gen::candle_core::{Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::quant as shared;
-
-pub use candle_gen::quant::QLinear;
 
 /// Dequantize an MLX-packed triple (`{base}.weight` u32 + `{base}.scales` + `{base}.biases`) to a
 /// **dense** `[out, in]` tensor on `device` at `out_dtype` (Q4 via the exact affine grid, Q8 via the
@@ -39,7 +37,7 @@ mod tests {
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::{DType, Device};
     use candle_gen::candle_nn::Linear;
-    use candle_gen::quant::{DenseLinear, MatmulStrategy};
+    use candle_gen::quant::{DenseLinear, MatmulStrategy, QLinear};
     use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 
