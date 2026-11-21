@@ -117,10 +117,13 @@ impl QLinear {
             unreachable!()
         };
         let mut packed = shared::QLinear::from_dense(shared::DenseLinear::Linear(linear.clone()));
-        packed.quantize_dequant_onto(quant, device)?;
-        *self = Self::Packed {
-            linear: packed,
-            bits: quant.bits(),
+        packed.quantize_component(quant, shared::ComponentFold::DequantDenseOnto(device))?;
+        *self = match packed {
+            shared::QLinear::Dense(shared::DenseLinear::Linear(native)) => Self::Dense(native),
+            folded => Self::Packed {
+                linear: folded,
+                bits: quant.bits(),
+            },
         };
         Ok(())
     }

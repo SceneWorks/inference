@@ -21,6 +21,7 @@
 //! and return a [`LoraSet`] (the flat `Var` list for the optimizer + the per-target metadata for
 //! checkpoint save). This keeps the harness model-agnostic — SDXL, Z-Image, and Wan reuse it.
 
+use crate::quant::ComponentFold;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{
@@ -313,7 +314,7 @@ impl LoraLinear {
             return Ok(());
         };
         let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
-        packed.quantize(quant)?;
+        packed.quantize_component(quant, ComponentFold::DequantDense)?;
         self.base = LoraBase::Packed(packed);
         Ok(())
     }
@@ -337,8 +338,10 @@ impl LoraLinear {
             let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
             // SDXL's established quantized forward uses the dequant-dense arm; only the destination
             // changes here, so CPU staging is numerically identical to `quantize_base`.
-            packed.quantize_dequant_onto(quant, device)?;
+            packed.quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
             self.base = LoraBase::Packed(packed);
+        } else if let LoraBase::Packed(packed) = &mut self.base {
+            packed.quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         }
         for residual in &mut self.additive {
             match residual {

@@ -12,6 +12,7 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_gen::quant::{DenseLinear, QLinear};
 
 use crate::config::DitConfig;
@@ -64,7 +65,14 @@ impl Linear {
     /// is promoted to f32 for the post-matmul add.
     fn quantize(&mut self, quant: Quant) -> CResult<()> {
         // skip_indivisible = true (the `% 32` predicate), flatten_leading = true, cast_back = true.
-        self.0.quantize_int8_fast(quant, true, true, true)?;
+        self.0.quantize_component(
+            quant,
+            ComponentFold::Int8Fast {
+                skip_indivisible: true,
+                flatten_leading: true,
+                cast_back: true,
+            },
+        )?;
         Ok(())
     }
 }

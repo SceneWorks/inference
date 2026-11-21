@@ -28,6 +28,7 @@
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{self, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 
 use crate::config::Sd3Config;
 // The dense-leaf helpers stay the crate's shared `quant` seam; the residual-capable projection type is
@@ -477,15 +478,22 @@ impl JointAttention {
     /// Fold every projection (image q/k/v/out + text add_q/k/v + to_add_out) to `Q4_0`/`Q8_0`
     /// **in place** on the weights' current device (the original on-device build path).
     fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.to_q.quantize(quant)?;
-        self.to_k.quantize(quant)?;
-        self.to_v.quantize(quant)?;
-        self.to_out.quantize(quant)?;
-        self.add_q.quantize(quant)?;
-        self.add_k.quantize(quant)?;
-        self.add_v.quantize(quant)?;
+        self.to_q
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_k
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_v
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.add_q
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.add_k
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.add_v
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         if let Some(p) = &mut self.to_add_out {
-            p.quantize(quant)?;
+            p.quantize_component(quant, ComponentFold::DequantDense)?;
         }
         Ok(())
     }
@@ -515,15 +523,22 @@ impl JointAttention {
     /// CPU-stage path (sc-8504): quantize every projection **onto `device`** (dense never lands on the
     /// GPU) and migrate the dense-kept per-head q/k RMSNorms there too.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.to_q.quantize_dequant_onto(quant, device)?;
-        self.to_k.quantize_dequant_onto(quant, device)?;
-        self.to_v.quantize_dequant_onto(quant, device)?;
-        self.to_out.quantize_dequant_onto(quant, device)?;
-        self.add_q.quantize_dequant_onto(quant, device)?;
-        self.add_k.quantize_dequant_onto(quant, device)?;
-        self.add_v.quantize_dequant_onto(quant, device)?;
+        self.to_q
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.to_k
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.to_v
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.to_out
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.add_q
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.add_k
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.add_v
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         if let Some(p) = &mut self.to_add_out {
-            p.quantize_dequant_onto(quant, device)?;
+            p.quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         }
         self.migrate_norms_to(device)
     }
@@ -641,10 +656,14 @@ impl SelfAttention {
 
     /// Fold the image-only `attn2` projections (q/k/v/out) to `Q4_0`/`Q8_0` in place.
     fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.to_q.quantize(quant)?;
-        self.to_k.quantize(quant)?;
-        self.to_v.quantize(quant)?;
-        self.to_out.quantize(quant)?;
+        self.to_q
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_k
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_v
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.to_out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         Ok(())
     }
 
@@ -663,10 +682,14 @@ impl SelfAttention {
 
     /// CPU-stage path (sc-8504): quantize the `attn2` projections **onto `device`** + migrate q/k norms.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.to_q.quantize_dequant_onto(quant, device)?;
-        self.to_k.quantize_dequant_onto(quant, device)?;
-        self.to_v.quantize_dequant_onto(quant, device)?;
-        self.to_out.quantize_dequant_onto(quant, device)?;
+        self.to_q
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.to_k
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.to_v
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.to_out
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         for rn in [&mut self.norm_q, &mut self.norm_k].into_iter().flatten() {
             *rn = rms_norm_to(rn, RMS_EPS, device)?;
         }
@@ -708,8 +731,10 @@ impl FeedForward {
 
     /// Fold both projections to `Q4_0`/`Q8_0` in place (the MLP is the largest per-block footprint).
     fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.proj.quantize(quant)?;
-        self.out.quantize(quant)?;
+        self.proj
+            .quantize_component(quant, ComponentFold::DequantDense)?;
+        self.out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         Ok(())
     }
 
@@ -726,8 +751,10 @@ impl FeedForward {
 
     /// CPU-stage path (sc-8504): quantize both projections **onto `device`** (no dense GPU transient).
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.proj.quantize_dequant_onto(quant, device)?;
-        self.out.quantize_dequant_onto(quant, device)?;
+        self.proj
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
+        self.out
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         Ok(())
     }
 
@@ -1073,11 +1100,13 @@ impl Sd3Transformer {
     /// stays coherent. The small AdaLN/timestep/patch-embed leaves stay dense (negligible footprint).
     /// Mirrors `LensTransformer::quantize` (sc-5117).
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        self.context_embedder.quantize(quant)?;
+        self.context_embedder
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         for block in &mut self.blocks {
             block.quantize(quant)?;
         }
-        self.proj_out.quantize(quant)?;
+        self.proj_out
+            .quantize_component(quant, ComponentFold::DequantDense)?;
         Ok(())
     }
 
@@ -1095,11 +1124,13 @@ impl Sd3Transformer {
     /// (sc-7457). Idempotent per `QLinear`.
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         // Quantized projections onto the GPU (dequant-dense, sc-7702-safe).
-        self.context_embedder.quantize_dequant_onto(quant, device)?;
+        self.context_embedder
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         for block in &mut self.blocks {
             block.quantize_onto(quant, device)?;
         }
-        self.proj_out.quantize_dequant_onto(quant, device)?;
+        self.proj_out
+            .quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
         // Dense-kept leaves migrated to the GPU.
         self.pos_embed.migrate_to(device)?;
         self.time_text_embed.migrate_to(device)?;

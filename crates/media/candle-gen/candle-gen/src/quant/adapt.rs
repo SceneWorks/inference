@@ -1480,30 +1480,14 @@ impl AdaptLinear {
     /// residual stack is untouched — the deltas ride on top of the now-packed base. Only the **base**
     /// weight is quantized (never a residual factor), so a dense base carrying residuals stays correct.
     ///
+    /// Native checkpoint operands preserve the source precision and refuse a fold.
     /// An **NVFP4** base is a hard error, never a no-op and never a re-fold (sc-21483): re-quantizing
     /// it to `Q4`/`Q8` — or dequantizing it to BF16 to make some other path fit — would swap the
     /// projection's numeric regime out from under a caller that asked for NVFP4. `Quant::Nvfp4` is
     /// refused too: NVFP4 is packed from the bf16 master, so "re-NVFP4ing" an NVFP4 base could only
     /// mean a double quantization.
     pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
-        super::reject_rowwise_as_legacy_quant(quant)?;
-        match &mut self.base {
-            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
-            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize(quant)?;
-                self.base = Base::Packed(q);
-                Ok(())
-            }
-        }
+        self.fold(quant, super::ComponentFold::DequantDense)
     }
 
     /// As [`Self::quantize`] but folds a **dense** base to a packed base landing on an explicit `device`
@@ -1516,31 +1500,37 @@ impl AdaptLinear {
         quant: Quant,
         device: &Device,
     ) -> candle_core::Result<()> {
-        super::reject_rowwise_as_legacy_quant(quant)?;
-        match &mut self.base {
-            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
-            Base::Packed(_) => Ok(()),
-            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
-            Base::ConvRot(_) => {
-                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
-            }
-            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
-            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
-            Base::Dense(l) => {
-                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize_dequant_onto(quant, device)?;
-                self.base = Base::Packed(q);
-                Ok(())
-            }
-        }
+        self.fold(quant, super::ComponentFold::DequantDenseOnto(device))
     }
 
     /// Quantize the base projection with [`QLinear::quantize_onto`] while preserving all attached
     /// forward-time residuals.
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
+        self.fold(quant, super::ComponentFold::Int8FastOnto(device))
+    }
+
+    /// Bulk component precision retains checkpoint-native leaves and their residuals on the target.
+    pub fn quantize_component(
+        &mut self,
+        quant: Quant,
+        fold: super::ComponentFold<'_>,
+    ) -> candle_core::Result<()> {
+        super::reject_rowwise_as_legacy_quant(quant)?;
+        if matches!(&self.base, Base::ConvRot(_))
+            || matches!(&self.base, Base::Packed(q) if q.native_format_id().is_some())
+        {
+            return match fold.target() {
+                Some(device) => self.to_device(device),
+                None => Ok(()),
+            };
+        }
+        self.fold(quant, fold)
+    }
+
+    fn fold(&mut self, quant: Quant, fold: super::ComponentFold<'_>) -> candle_core::Result<()> {
         super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
-            Base::Packed(q) if q.native_device().is_some() => q.quantize(quant),
+            Base::Packed(q) if q.native_format_id().is_some() => fold.apply(q, quant),
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::ConvRot(_) => {
@@ -1550,7 +1540,7 @@ impl AdaptLinear {
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
-                q.quantize_onto(quant, device)?;
+                fold.apply(&mut q, quant)?;
                 self.base = Base::Packed(q);
                 Ok(())
             }
@@ -1629,6 +1619,65 @@ mod tests {
     use candle_core::safetensors::MmapedSafetensors;
     use candle_core::{Device, Tensor};
     use std::collections::HashMap;
+
+    #[test]
+    fn native_checkpoint_refuses_folds_and_preserves_its_operand_on_device_copy(
+    ) -> candle_core::Result<()> {
+        use candle_nn::linear::NativeLinearWeight;
+
+        struct StoredCodes;
+        impl NativeLinearWeight for StoredCodes {
+            fn forward(&self, _: &Tensor, _: Option<&Tensor>) -> candle_core::Result<Tensor> {
+                panic!("metadata-only test must never execute the operand")
+            }
+            fn dense_weight(&self) -> candle_core::Result<Tensor> {
+                panic!("a fold must refuse before decoding the checkpoint")
+            }
+            fn format_id(&self) -> &'static str {
+                gen_core::convrot_int8::CODEC_ID
+            }
+            fn resident_bytes(&self) -> u64 {
+                64 * 64 + 64 * 4
+            }
+            fn dims(&self) -> (usize, usize) {
+                (64, 64)
+            }
+            fn device(&self) -> &Device {
+                &Device::Cpu
+            }
+        }
+
+        let operand: Arc<dyn NativeLinearWeight> = Arc::new(StoredCodes);
+        let native = Linear::from_native(operand.clone(), None);
+        let mut layer = AdaptLinear::from_dense(native, 64, 64);
+        assert!(layer.is_convrot_int8());
+        for result in [
+            layer.quantize(Quant::Q8),
+            layer.quantize_onto(Quant::Q4, &Device::Cpu),
+            layer.quantize_dequant_onto(Quant::Q8, &Device::Cpu),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(operand.format_id()), "{error}");
+            assert!(error.contains("refuses re-quantization"), "{error}");
+        }
+        layer.quantize_component(Quant::Q4, crate::quant::ComponentFold::DequantDense)?;
+        layer.quantize_component(
+            Quant::Q8,
+            crate::quant::ComponentFold::Int8FastOnto(&Device::Cpu),
+        )?;
+        let copy = layer.copy_to_device(&Device::Cpu)?;
+        for projection in [&layer, &copy] {
+            let Base::Packed(QLinear::Dense(DenseLinear::Linear(linear))) = &projection.base else {
+                panic!("expected the original checkpoint projection");
+            };
+            assert!(Arc::ptr_eq(&operand, &linear.native_weight().unwrap()));
+            assert_eq!(
+                linear.native_resident_bytes(),
+                Some(operand.resident_bytes())
+            );
+        }
+        Ok(())
+    }
 
     /// Ownership only: seed valid CPU preparation entries directly, without a learned forward.
     /// A window must own its caches even for a same-device copy (CPU is the portable control).

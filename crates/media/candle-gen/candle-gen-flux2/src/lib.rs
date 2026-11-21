@@ -735,7 +735,10 @@ impl Pipeline {
             }
             Some(q) => {
                 // Dense tier: stage dense in CPU RAM, then quantize each projection onto the GPU.
-                let mut m = build(self.component_vb_on(sub, &Device::Cpu)?)?;
+                let mut m = build(
+                    self.component_vb_on(sub, &self.device)?
+                        .stage_dense_on(Device::Cpu),
+                )?;
                 quantize(&mut m, q, &self.device)?;
                 Ok(m)
             }

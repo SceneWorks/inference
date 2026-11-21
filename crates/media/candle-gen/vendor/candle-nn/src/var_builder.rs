@@ -36,6 +36,7 @@ impl<B: Backend> Clone for VarBuilderArgs<'_, B> {
 pub type VarBuilder<'a> = VarBuilderArgs<'a, Box<dyn SimpleBackend + 'a>>;
 
 struct TensorData<B: Backend> {
+    native_device: Option<Device>,
     backend: Arc<B>,
     pub device: Device,
     pub dtype: DType,
@@ -199,6 +200,7 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 impl<B: Backend> VarBuilderArgs<'_, B> {
     pub fn new_with_args(backend: B, dtype: DType, dev: &Device) -> Self {
         let data = TensorData {
+            native_device: None,
             backend: Arc::new(backend),
             device: dev.clone(),
             dtype,
@@ -293,9 +295,12 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         name: &str,
         shape: Option<(usize, usize)>,
     ) -> Result<Option<Arc<dyn crate::linear::NativeLinearWeight>>> {
-        self.data
-            .backend
-            .native_linear_weight(&self.path(name), shape, self.dtype, self.device())
+        self.data.backend.native_linear_weight(
+            &self.path(name),
+            shape,
+            self.dtype,
+            self.data.native_device.as_ref().unwrap_or(self.device()),
+        )
     }
 
     pub fn native_linear_weight_transposed(
@@ -307,7 +312,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
             &self.path(name),
             shape,
             self.dtype,
-            self.device(),
+            self.data.native_device.as_ref().unwrap_or(self.device()),
         )
     }
 
@@ -320,7 +325,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
             &self.path(name),
             shape,
             self.dtype,
-            self.device(),
+            self.data.native_device.as_ref().unwrap_or(self.device()),
         )
     }
 
@@ -376,11 +381,28 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
 
     /// Set the device of the VarBuilder.
     pub fn set_device(self, device: Device) -> Self {
+        self.with_devices(device, None)
+    }
+
+    /// Stage dense parameters on the supplied device while checkpoint-native projections
+    /// bind directly on the original execution device.
+    pub fn stage_dense_on(self, device: Device) -> Self {
+        let execution = self
+            .data
+            .native_device
+            .as_ref()
+            .unwrap_or(self.device())
+            .clone();
+        self.with_devices(device, Some(execution))
+    }
+
+    fn with_devices(self, device: Device, native_device: Option<Device>) -> Self {
         Self {
             data: Arc::new(TensorData {
                 backend: self.data.backend.clone(),
                 dtype: self.data.dtype,
                 device,
+                native_device,
             }),
             ..self
         }
@@ -393,6 +415,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
                 backend: self.data.backend.clone(),
                 dtype,
                 device: self.data.device.clone(),
+                native_device: self.data.native_device.clone(),
             }),
             dtype,
             ..self
@@ -733,6 +756,7 @@ impl<'a> VarBuilder<'a> {
         device: Device,
     ) -> Self {
         let data = TensorData {
+            native_device: None,
             backend: Arc::new(backend),
             device,
             dtype,
@@ -848,9 +872,11 @@ impl<'a> VarBuilder<'a> {
         let dtype = self.dtype();
         let device = self.device().clone();
         let path = self.path.clone();
+        let native_device = self.data.native_device.clone();
         let backend = Rename::new(self, renamer);
         let backend: Box<dyn SimpleBackend + 'a> = Box::new(backend);
         let data = TensorData {
+            native_device,
             backend: Arc::new(backend),
             device,
             dtype,

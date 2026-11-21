@@ -140,8 +140,8 @@ pub struct ProjectionResources {
 }
 
 impl ProjectionResources {
-    pub fn set_int8_context(&mut self, context: crate::Int8Context) {
-        self.int8 = std::sync::Mutex::new(Some(context));
+    pub fn set_int8_context(&self, context: crate::Int8Context) {
+        *self.int8.lock().unwrap_or_else(|e| e.into_inner()) = Some(context);
     }
     /// One lazy cuBLASLt handle/workspace for every native INT8 projection in this map.
     pub fn int8_context(&self, device: &Device) -> Result<crate::Int8Context> {

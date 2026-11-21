@@ -33,6 +33,7 @@ use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_gen::quant::{self as shared, AdaptLinear, Int8Context};
 
 /// A Linear projection that is **residual-capable** (dense or MLX-packed base + optional forward-time
@@ -187,7 +188,7 @@ impl QLinear {
             }
             _ => candle_gen::candle_core::bail!("ConvRot requires exact signed integer codes"),
         };
-        let mut resources = candle_gen::weights::ProjectionResources::default();
+        let resources = candle_gen::weights::ProjectionResources::default();
         resources.set_int8_context(context.clone());
         let packed = candle_gen::quant::convrot_int8::ConvRotLinear::from_native_parts(
             &resources,
@@ -244,7 +245,7 @@ impl QLinear {
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         match self {
             Self::Adapt(linear) => {
-                linear.quantize_dequant_onto(quant, device)?;
+                linear.quantize_component(quant, ComponentFold::DequantDenseOnto(device))?;
                 linear.to_device(device)
             }
             Self::Nvfp4(_) => candle_gen::candle_core::bail!(

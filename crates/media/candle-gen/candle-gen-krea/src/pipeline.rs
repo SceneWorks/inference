@@ -588,8 +588,9 @@ pub(crate) fn load_text_quantized_for_request(
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
     let te_cfg = KreaTeConfig::qwen3_vl_4b();
     let cpu = Device::Cpu;
-    let te_w =
-        source.read_unchanged(|weights| load_te_weights_cancelable(weights, &cpu, Some(cancel)))?;
+    let te_w = source
+        .read_unchanged(|weights| load_te_weights_cancelable(weights, device, Some(cancel)))?
+        .stage_dense_on(&cpu);
     let mut te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
     te.quantize_onto(quant, device)?;
     candle_gen::check_cancel(cancel)?;

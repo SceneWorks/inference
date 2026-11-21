@@ -15,6 +15,7 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_gen::rope::GeometryCache;
 use candle_gen::Result as GenResult;
 
@@ -229,8 +230,10 @@ impl SinEmbed {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.linear_1.quantize_onto(quant, device)?;
-        self.linear_2.quantize_onto(quant, device)
+        self.linear_1
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.linear_2
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))
     }
 }
 
@@ -293,7 +296,8 @@ impl Modulation {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.linear.quantize_onto(quant, device)
+        self.linear
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))
     }
 
     fn forward(&self, temb: &Tensor) -> Result<Vec<(Tensor, Tensor, Tensor)>> {
@@ -366,7 +370,7 @@ impl DoubleAttention {
             &mut self.add_v,
             &mut self.to_add_out,
         ] {
-            l.quantize_onto(quant, device)?;
+            l.quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         }
         self.norm_q = rms_norm_to(&self.norm_q, RMS_EPS, device)?;
         self.norm_k = rms_norm_to(&self.norm_k, RMS_EPS, device)?;
@@ -449,8 +453,10 @@ impl FeedForward {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.linear_in.quantize_onto(quant, device)?;
-        self.linear_out.quantize_onto(quant, device)
+        self.linear_in
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.linear_out
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -555,8 +561,10 @@ impl SingleBlock {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.to_qkv_mlp.quantize_onto(quant, device)?;
-        self.to_out.quantize_onto(quant, device)?;
+        self.to_qkv_mlp
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.to_out
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         self.norm_q = rms_norm_to(&self.norm_q, RMS_EPS, device)?;
         self.norm_k = rms_norm_to(&self.norm_k, RMS_EPS, device)?;
         Ok(())
@@ -620,7 +628,8 @@ impl NormOut {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.linear.quantize_onto(quant, device)
+        self.linear
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))
     }
 
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
@@ -885,14 +894,17 @@ impl Flux2Transformer {
     }
 
     fn quantize_non_blocks(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.x_embedder.quantize_onto(quant, device)?;
-        self.context_embedder.quantize_onto(quant, device)?;
+        self.x_embedder
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.context_embedder
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         self.time_embed.quantize_onto(quant, device)?;
         self.mod_img.quantize_onto(quant, device)?;
         self.mod_txt.quantize_onto(quant, device)?;
         self.mod_single.quantize_onto(quant, device)?;
         self.norm_out.quantize_onto(quant, device)?;
-        self.proj_out.quantize_onto(quant, device)?;
+        self.proj_out
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         self.device = device.clone();
         // The RoPE cache pins tables on the old device; drop it so the next forward rebuilds on
         // `device` (sc-8992). Empty at load anyway, but keep this correct if quantize ever runs after
@@ -1426,9 +1438,10 @@ impl Flux2ControlBlock {
     /// in-features), handled in [`Flux2ControlBranch::quantize`].
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
         self.base.quantize_onto(quant, device)?;
-        self.after_proj.quantize_onto(quant, device)?;
+        self.after_proj
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         if let Some(bp) = &mut self.before_proj {
-            bp.quantize_onto(quant, device)?;
+            bp.quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         }
         Ok(())
     }

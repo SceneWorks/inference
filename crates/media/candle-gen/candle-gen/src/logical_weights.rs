@@ -126,7 +126,7 @@ pub fn plan_logical_weights(
     Ok(shared::plan_logical_weights(path, mapping, policy)?)
 }
 
-pub struct LogicalWeightReader(shared::LogicalWeightReader);
+pub struct LogicalWeightReader(std::sync::Arc<shared::LogicalWeightReader>);
 
 impl std::ops::Deref for LogicalWeightReader {
     type Target = shared::LogicalWeightReader;
@@ -136,8 +136,28 @@ impl std::ops::Deref for LogicalWeightReader {
 }
 
 impl LogicalWeightReader {
+    /// Preserve one authenticated mmap for raw auxiliaries and all source-native projections.
+    pub fn from_snapshot(
+        st: candle_core::safetensors::MmapedSafetensors,
+        files: &[std::path::PathBuf],
+        device: &Device,
+    ) -> candle_core::Result<(
+        std::sync::Arc<candle_core::safetensors::MmapedSafetensors>,
+        Option<Self>,
+    )> {
+        match candle_checkpoint::ProjectionSource::from_mapped(st, files, device)? {
+            Ok(source) => {
+                let (st, reader) = source.into_reader();
+                Ok((st, Some(Self(reader))))
+            }
+            Err(st) => Ok((std::sync::Arc::new(st), None)),
+        }
+    }
+
     pub fn open(path: &Path, plan: LogicalWeightPlan, device: &Device) -> crate::Result<Self> {
-        Ok(Self(shared::LogicalWeightReader::open(path, plan, device)?))
+        Ok(Self(
+            shared::LogicalWeightReader::open(path, plan, device)?.into(),
+        ))
     }
 
     pub fn open_with_capability(
@@ -146,9 +166,10 @@ impl LogicalWeightReader {
         device: &Device,
         capability: NativeExecutionCapability,
     ) -> crate::Result<Self> {
-        Ok(Self(shared::LogicalWeightReader::open_with_capability(
-            path, plan, device, capability,
-        )?))
+        Ok(Self(
+            shared::LogicalWeightReader::open_with_capability(path, plan, device, capability)?
+                .into(),
+        ))
     }
 
     pub fn checkpoint_weight_facts(&self) -> crate::Result<CheckpointWeightFacts> {

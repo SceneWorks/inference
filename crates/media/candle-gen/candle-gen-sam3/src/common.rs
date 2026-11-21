@@ -7,6 +7,7 @@
 //! MLX side does, because MLX convs are OHWI). We only transpose *activations* NHWC↔NCHW around each
 //! conv so the transformer body stays channels-last and mirrors the MLX modules line-by-line.
 
+use candle_gen::quant::ComponentFold;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::Path;
@@ -123,7 +124,14 @@ impl Linear {
     /// ~nothing here.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
         // skip_indivisible = true (the `% 32` predicate), flatten_leading = true, cast_back = false.
-        self.0.quantize_int8_fast(quant, true, true, false)?;
+        self.0.quantize_component(
+            quant,
+            ComponentFold::Int8Fast {
+                skip_indivisible: true,
+                flatten_leading: true,
+                cast_back: false,
+            },
+        )?;
         Ok(())
     }
 }

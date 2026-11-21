@@ -11,6 +11,7 @@ use candle_gen::gen_core::{
     effective_component_quant, ComponentPrecisionFloor, PrecisionFloorComponent, Quant,
 };
 use candle_gen::quant::AdaptLinear as QLinear;
+use candle_gen::quant::ComponentFold;
 use candle_gen_boogu::loader::Weights;
 #[cfg(test)]
 use candle_nn::Linear;
@@ -143,7 +144,7 @@ pub(crate) fn quantize_onto(linear: &mut QLinear, quant: Quant, device: &Device)
             );
         }
     }
-    linear.quantize_dequant_onto(quant, device)
+    linear.quantize_component(quant, ComponentFold::DequantDenseOnto(device))
 }
 
 #[cfg(test)]

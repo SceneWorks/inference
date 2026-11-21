@@ -558,7 +558,55 @@ impl std::fmt::Debug for QLinear {
     }
 }
 
+/// The existing dense projection fold used by a component's load-time precision policy.
+#[derive(Clone, Copy)]
+pub enum ComponentFold<'a> {
+    DequantDense,
+    DequantDenseOnto(&'a Device),
+    Int8FastOnto(&'a Device),
+    Int8Fast {
+        skip_indivisible: bool,
+        flatten_leading: bool,
+        cast_back: bool,
+    },
+}
+
+impl ComponentFold<'_> {
+    fn target(&self) -> Option<&Device> {
+        match self {
+            Self::DequantDenseOnto(device) | Self::Int8FastOnto(device) => Some(device),
+            Self::DequantDense | Self::Int8Fast { .. } => None,
+        }
+    }
+
+    fn apply(self, layer: &mut QLinear, quant: Quant) -> Result<()> {
+        match self {
+            Self::DequantDense => layer.quantize(quant),
+            Self::DequantDenseOnto(device) => layer.quantize_dequant_onto(quant, device),
+            Self::Int8FastOnto(device) => layer.quantize_onto(quant, device),
+            Self::Int8Fast {
+                skip_indivisible,
+                flatten_leading,
+                cast_back,
+            } => layer.quantize_int8_fast(quant, skip_indivisible, flatten_leading, cast_back),
+        }
+    }
+}
+
 impl QLinear {
+    /// Apply a component's tier to eligible dense leaves. A stored native matrix follows
+    /// the target device through its original operator and keeps its source precision.
+    pub fn quantize_component(&mut self, quant: Quant, fold: ComponentFold<'_>) -> Result<()> {
+        reject_rowwise_as_legacy_quant(quant)?;
+        if self.native_format_id().is_some() {
+            return match fold.target() {
+                Some(device) => self.to_device(device),
+                None => Ok(()),
+            };
+        }
+        fold.apply(self, quant)
+    }
+
     /// Copy an already prepared projection without repacking or changing its arithmetic.
     /// Block streaming keeps the host copy alive and uploads only runtime-format bytes.
     pub fn copy_to_device(&self, device: &Device) -> Result<Self> {
@@ -922,11 +970,8 @@ impl QLinear {
         skip_indivisible: bool,
     ) -> Result<()> {
         reject_rowwise_as_legacy_quant(quant)?;
-        if self.native_device().is_some() {
-            return Ok(()); // source precision is fixed; retain the existing operator.
-        }
-        if matches!(self, Self::ConvRot(_)) {
-            candle_core::bail!("ConvRot refuses re-quantization to {quant:?}");
+        if let Some(format) = self.native_format_id() {
+            candle_core::bail!("{format} refuses re-quantization to {quant:?}");
         }
         if matches!(self, Self::W4A8(_)) {
             candle_core::bail!("W4A8 refuses re-quantization to {quant:?}");

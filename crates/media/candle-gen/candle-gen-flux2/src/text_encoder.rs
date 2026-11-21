@@ -16,6 +16,7 @@
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::ComponentFold;
 use candle_llm::decode::{
     generate_speculative_with, FinishReason, GenerationConfig, LogitsScope, NoProposer,
     SpeculativePrompt, StepModel, StepOutput, StepRequest,
@@ -73,10 +74,14 @@ impl Attention {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.q_proj.quantize_onto(quant, device)?;
-        self.k_proj.quantize_onto(quant, device)?;
-        self.v_proj.quantize_onto(quant, device)?;
-        self.o_proj.quantize_onto(quant, device)?;
+        self.q_proj
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.k_proj
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.v_proj
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.o_proj
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
         if let Some(n) = &self.q_norm {
             self.q_norm = Some(rms_norm_to(n, self.eps, device)?);
         }
@@ -192,9 +197,12 @@ impl Mlp {
     }
 
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.gate.quantize_onto(quant, device)?;
-        self.up.quantize_onto(quant, device)?;
-        self.down.quantize_onto(quant, device)
+        self.gate
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.up
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))?;
+        self.down
+            .quantize_component(quant, ComponentFold::Int8FastOnto(device))
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
