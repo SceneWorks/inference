@@ -29,69 +29,7 @@ pub mod facts;
 /// Canonical backend linear projection type alias on the shared `mlx-layers` spine (`BACK-1`, `BACK-4`).
 pub type Linear = AdaptableLinear;
 
-/// Request-scoped / per-pass adapter scale overrides (`PIPE-14`, `BACK-1`, `BACK-4`).
-///
-/// Shared resident modules remain immutable during a run; callers pass `ScaleContext` into
-/// [`AdaptableLinear::forward_with_scales`], [`AdaptableLinear::forward_split_with_scales`], or
-/// [`AdaptableLinear::forward_upcast_with_scales`] to override or modulate adapter scales per
-/// request or per pass without mutating `&self`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ScaleContext<'a> {
-    /// Optional per-adapter scale overrides indexed by adapter position in [`AdaptableLinear::adapters`].
-    pub adapter_scales: Option<&'a [f32]>,
-    /// Optional uniform scale multiplier applied across all adapters (defaults to `1.0` when `None`).
-    pub uniform_scale: Option<f32>,
-    /// Pass index for multi-pass pipelines (e.g., conditional / unconditional / guidance passes).
-    pub pass: usize,
-}
-
-impl<'a> ScaleContext<'a> {
-    /// Default pass-0 context with no scale overrides.
-    pub const fn new() -> Self {
-        Self {
-            adapter_scales: None,
-            uniform_scale: None,
-            pass: 0,
-        }
-    }
-
-    /// Override per-adapter scales by position.
-    pub const fn with_adapter_scales(adapter_scales: &'a [f32]) -> Self {
-        Self {
-            adapter_scales: Some(adapter_scales),
-            uniform_scale: None,
-            pass: 0,
-        }
-    }
-
-    /// Apply a uniform scale multiplier across all installed adapters for this request/pass.
-    pub const fn with_uniform_scale(scale: f32) -> Self {
-        Self {
-            adapter_scales: None,
-            uniform_scale: Some(scale),
-            pass: 0,
-        }
-    }
-
-    /// Attach a pass index to this scale context.
-    pub const fn with_pass(mut self, pass: usize) -> Self {
-        self.pass = pass;
-        self
-    }
-
-    /// Resolve the effective scale for adapter at `index` with installed `default_scale`.
-    #[inline]
-    pub fn scale_for(&self, index: usize, default_scale: f32) -> f32 {
-        let base = self
-            .adapter_scales
-            .and_then(|s| s.get(index).copied())
-            .unwrap_or(default_scale);
-        match self.uniform_scale {
-            Some(mult) => base * mult,
-            None => base,
-        }
-    }
-}
+pub use gen_core::phase::ScaleContext;
 
 /// Affine Q4/Q8 matmul over an already-packed `[out, in]` weight, with an optional dense output
 /// bias. With P3 selected, the biased case first attempts the strict exact native epilogue. Any

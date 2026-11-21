@@ -103,6 +103,7 @@ pub mod moss_image;
 mod moss_image_assets;
 pub mod moss_image_edit;
 pub mod numeric;
+pub mod phase;
 pub mod registry;
 pub mod render;
 pub use render::{

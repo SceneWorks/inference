@@ -27,6 +27,8 @@ use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::phase::{prepare_phases, PhaseArguments, PreparedPhase};
+use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
@@ -310,6 +312,7 @@ pub struct KreaHeavy {
 /// Count-invariant t2i render state (F-073): the step-invariant prep(s) — the positive prep and, on the
 /// Raw CFG path, the unconditional one. Built once per request by [`KreaHeavy::prepare_t2i`], reused for
 /// every seed in the count loop.
+#[derive(Clone)]
 pub struct T2iPlan {
     pub(crate) sigmas: Option<Vec<f32>>,
     pub(crate) guidance: f32,
@@ -319,16 +322,30 @@ pub struct T2iPlan {
 }
 
 /// One phase's job-local render state for a multi-phase Raw job (epic 13879, sc-13884): the phase's
-/// **own DiT clone** (adapter stack set to the phase's adapters — a shallow, refcounted clone that
-/// shares the resident weight tensors), its step-invariant [`T2iPlan`] (built from that clone), its
-/// guidance, and its contiguous slice of the ONE shared global schedule. Built once per request by
+/// adapted DiT (a shallow clone that shares the resident weight tensors), the step-invariant
+/// [`T2iPlan`] built from it, and the phase arguments and schedule slice. Built once per request by
 /// [`KreaHeavy::prepare_multiphase`] and reused across the seed/count loop; [`KreaHeavy::render_multiphase`]
 /// drives the phases in order, threading the latent across the shared-boundary sigmas.
 pub struct MultiPhasePlan {
-    dit: Krea2Transformer,
-    pub(crate) plan: T2iPlan,
-    guidance: f32,
+    prepared: PreparedPhase<(Krea2Transformer, T2iPlan)>,
+    pub(crate) pag: Option<mlx_gen::gen_core::PagResolved>,
     slice: PhaseSlice,
+}
+
+// Preserve the public plan's ability to move to a new owner by value.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<MultiPhasePlan>();
+};
+
+#[cfg(test)]
+fn phase_arguments_for_test(guidance: f32) -> PhaseArguments {
+    ResolvedPhase {
+        guidance,
+        slice: PhaseSlice { start: 0, end: 1 },
+        adapters: Vec::new(),
+    }
+    .arguments(&[])
 }
 
 /// Count-invariant img2img render state (F-073): the seed-independent clean reference latent (VAE-encoded
@@ -489,7 +506,7 @@ impl KreaHeavy {
             latent,
             timestep,
             plan,
-            guidance,
+            &phase_arguments_for_test(guidance),
             None,
             window,
             mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -502,12 +519,12 @@ impl KreaHeavy {
         latent: &Array,
         timestep: &Array,
         plan: &T2iPlan,
-        guidance: f32,
+        arguments: &PhaseArguments,
         pag_step: Option<PagStep<'_>>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let negative = if krea_uses_cfg(guidance) {
+        let negative = if arguments.uses_classifier_free_guidance() {
             Some(plan.prep_neg.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "krea_2 multi-phase: a CFG phase requires the \
@@ -524,7 +541,7 @@ impl KreaHeavy {
             timestep,
             &plan.prep_pos,
             negative,
-            guidance,
+            arguments.guidance(),
             pag_step,
             window,
             attention,
@@ -1288,7 +1305,8 @@ impl KreaHeavy {
     fn denoise_phase_from(
         dit: &Krea2Transformer,
         plan: &T2iPlan,
-        guidance: f32,
+        arguments: &PhaseArguments,
+        pag: Option<&mlx_gen::gen_core::PagResolved>,
         phase_step_offset: usize,
         full_total_steps: usize,
         sub_sigmas: &[f32],
@@ -1323,13 +1341,13 @@ impl KreaHeavy {
                         current_eval,
                         phase_steps,
                     );
-                let pag_step = PagStep::for_step(plan.pag.as_ref(), step_idx, full_total_steps);
+                let pag_step = PagStep::for_step(pag, step_idx, full_total_steps);
                 let v = Self::multiphase_velocity_budgeted(
                     dit,
                     x,
                     &t,
                     plan,
-                    guidance,
+                    arguments,
                     pag_step,
                     block_window,
                     attention,
@@ -1339,14 +1357,13 @@ impl KreaHeavy {
         )
     }
 
-    /// Build the **count-invariant** per-phase render state for a multi-phase Raw job (epic 13879,
-    /// sc-13884): for each phase, a **job-local DiT clone** whose adapter stack is set to that phase's
-    /// adapters, plus the step-invariant [`T2iPlan`] (prep_pos, and prep_neg iff the phase uses CFG)
-    /// built from that clone. Built ONCE per request and reused across the seed/count loop.
+    /// Build the **count-invariant** render state for each distinct phase preparation key. Each
+    /// key gets a job-local adapted DiT and its step-invariant [`T2iPlan`], with negative preparation
+    /// only when the phase uses CFG. The seed/count loop reuses the resulting plans.
     ///
     /// **Why per-phase clones + why job-safe.** The resident DiT ([`Self`]) is shared read-only across
     /// concurrent generates and its adapters are load-time-baked (immutable at runtime). To *toggle*
-    /// adapters between phases without racing that shared DiT, each phase gets its OWN cheap clone
+    /// adapters without racing that shared DiT, the request owns its adapted clones
     /// ([`Krea2Transformer`] `Clone` is a shallow, refcounted copy — the weight tensors stay shared, only
     /// the adapter-stack structs are duplicated). On the clone we `clear_adapters` (drop the baked stack)
     /// then re-install the phase's subset via the low-rank strict loader — so the phase's adapter set is
@@ -1368,47 +1385,63 @@ impl KreaHeavy {
         height: u32,
     ) -> Result<Vec<MultiPhasePlan>> {
         validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2_raw")?;
-        let geom = Self::geom_latent(width, height)?;
-        let mut plans = Vec::with_capacity(phases.len());
-        for phase in phases {
-            // A cheap (refcounted) job-local clone whose adapter stack we own for this job.
-            let specs = crate::multiphase::phase_spec_subset(phase, all_specs);
-            let dit = self.dit.clone_for_multiphase(&specs)?;
-            // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
-            let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
-            let prep_neg = if krea_uses_cfg(phase.guidance) {
-                let neg = ctx_neg.ok_or_else(|| {
-                    mlx_gen::Error::Msg(
-                        "krea_2 multi-phase: a CFG phase needs a negative context, \
-                         but none was encoded"
-                            .into(),
-                    )
-                })?;
-                Some(dit.prepare(neg, None, &geom)?)
-            } else {
-                None
-            };
-            plans.push(MultiPhasePlan {
-                dit,
-                plan: T2iPlan {
-                    sigmas: None,
-                    guidance: 0.0,
-                    pag: None,
-                    prep_pos,
-                    prep_neg,
-                },
-                guidance: phase.guidance,
+        let geometry = MemoryGeometry {
+            width,
+            height,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        let prepared = prepare_phases(
+            phases
+                .iter()
+                .map(|phase| (phase.arguments(all_specs), geometry)),
+            |arguments, geometry| -> Result<_> {
+                let geom = Self::geom_latent(geometry.width, geometry.height)?;
+                // The same job-local DiT and conditioning travel together to each forward.
+                let specs = crate::multiphase::phase_adapter_specs(arguments.adapters(), all_specs);
+                let dit = self.dit.clone_for_multiphase(&specs)?;
+                let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
+                let prep_neg = if arguments.uses_classifier_free_guidance() {
+                    let neg = ctx_neg.ok_or_else(|| {
+                        mlx_gen::Error::Msg(
+                            "krea_2 multi-phase: a CFG phase needs a negative context, \
+                             but none was encoded"
+                                .into(),
+                        )
+                    })?;
+                    Some(dit.prepare(neg, None, &geom)?)
+                } else {
+                    None
+                };
+                Ok((
+                    dit,
+                    T2iPlan {
+                        sigmas: None,
+                        guidance: 0.0,
+                        pag: None,
+                        prep_pos,
+                        prep_neg,
+                    },
+                ))
+            },
+        )?;
+        Ok(phases
+            .iter()
+            .zip(prepared)
+            .map(|(phase, prepared)| MultiPhasePlan {
+                prepared,
+                pag: None,
                 slice: phase.slice,
-            });
-        }
-        Ok(plans)
+            })
+            .collect())
     }
 
     /// **Multi-phase Raw render** (epic 13879, sc-13884) — drive the ordered per-phase plans (from
     /// [`Self::prepare_multiphase`]) within ONE denoise trajectory over ONE coherent global schedule,
     /// then decode once. The `full` schedule is built ONCE for the TOTAL step budget (the sum of the
-    /// phases' steps); each phase runs the shared `denoise_phase_from` primitive through its OWN
-    /// job-local DiT clone (its adapter set) over its contiguous slice `full[start..=end]` from the
+    /// phases' steps); each phase runs `denoise_phase_from` through its matching job-local DiT
+    /// over its contiguous slice `full[start..=end]` from the
     /// running latent — so the latent and sigma flow continuously across every boundary (the crux: no
     /// per-phase schedule, hence no seam/reset), while the ACTIVE ADAPTERS and GUIDANCE change per phase.
     /// This is the full "*N* steps Raw (CFG on) + *M* steps Raw+turbo-LoRA (CFG off)" workflow.
@@ -1434,10 +1467,12 @@ impl KreaHeavy {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
             let sub = &full[start..=end];
+            let (arguments, (dit, plan)) = mp.prepared.parts();
             latent = Self::denoise_phase_from(
-                &mp.dit,
-                &mp.plan,
-                mp.guidance,
+                dit,
+                plan,
+                arguments,
+                mp.pag.as_ref(),
                 start,
                 full_total_steps,
                 sub,
@@ -2981,7 +3016,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                0.0,
+                &phase_arguments_for_test(0.0),
                 pag_step,
                 None,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -2991,7 +3026,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                0.0,
+                &phase_arguments_for_test(0.0),
                 pag_step,
                 window,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -3029,7 +3064,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                1.0,
+                &phase_arguments_for_test(1.0),
                 pag_step,
                 None,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -3039,7 +3074,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                1.0,
+                &phase_arguments_for_test(1.0),
                 pag_step,
                 window,
                 mlx_gen::attention::AttentionPlan::UNBOUNDED,
@@ -3169,7 +3204,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &cfg_t2i,
-                guidance,
+                &phase_arguments_for_test(guidance),
                 None,
                 None,
                 bounded_attention(),
@@ -3182,7 +3217,7 @@ mod tests {
                 &latent,
                 &timestep,
                 &plain_t2i,
-                0.0,
+                &phase_arguments_for_test(0.0),
                 None,
                 None,
                 bounded_attention(),
