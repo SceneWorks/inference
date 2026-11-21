@@ -629,6 +629,9 @@ def verify_cuda_claim(claim, hardware, policy):
                 or card["index"] != claim["physical_index"] or card["total_mib"] != baseline["admitted_total_mib"]
                 or not check(card, [])):
             raise ValueError("invalid selected CUDA admission sample: " + str(state["reason"] or "card identity"))
+    max_used = max(row["selected_card"]["used_mib"] for row in samples["samples"])
+    if not max_used <= baseline["reserved_baseline_mib"] <= baseline["admitted_total_mib"]:
+        raise ValueError("CUDA reserved baseline falls outside observed usage and card capacity")
     if claim.get("admission_utilization_percent") != [s["selected_card"]["utilization_percent"] for s in samples["samples"]]:
         raise ValueError("CUDA utilization readings differ from the admission samples")
 

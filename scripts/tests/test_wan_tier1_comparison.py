@@ -220,6 +220,8 @@ class WanEvidenceTests(unittest.TestCase):
             lambda c: c.update(isolated_benchmark_claim=True),
             lambda c: c.update(physical_index=0),
             lambda c: c.update(device_uuid="GPU-other"),
+            lambda c: c["admission_baseline"].update(reserved_baseline_mib=34157),
+            lambda c: c["admission_baseline"].update(reserved_baseline_mib=97888),
             lambda c: c["admission_background_activity"]["samples"].pop(),
             lambda c: c["admission_background_activity"]["samples"][1]["predicates"].update(unique_uuid=False),
             lambda c: c["admission_background_activity"]["samples"][1]["selected_card"].update(free_mib=200),
