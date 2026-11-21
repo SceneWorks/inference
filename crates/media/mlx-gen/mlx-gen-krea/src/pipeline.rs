@@ -905,7 +905,8 @@ impl KreaHeavy {
         };
         prep.guidance = run.plan().guidance();
         prep.pag = pag.cloned();
-        if run.plan().executed_steps() > 0 {
+        let denoise = run.plan().executed_steps() > 0;
+        if denoise {
             mlx_rs::transforms::eval(
                 prep.prep_pos
                     .conditioning_arrays()
@@ -935,6 +936,9 @@ impl KreaHeavy {
                 }
             },
             |seed, initial, progress| {
+                if !denoise {
+                    return Ok(initial);
+                }
                 mlx_gen::image_execution::with_output_index(output_index.get(), || {
                     let latent = self.denoise_turbo_from(
                         &prep,
@@ -2845,7 +2849,8 @@ mod tests {
             body.find(token)
                 .unwrap_or_else(|| panic!("missing {token}"))
         };
-        let active = offset("if run.plan().executed_steps() > 0");
+        let active = offset("if denoise {");
+        assert!(offset("let denoise = run.plan().executed_steps() > 0;") < active);
         let zero = offset("else if let Some(clean) = &clean");
         let end_conditioning = offset("run.end_conditioning()");
         assert!(offset("self.prepare_img2img(") < active);
@@ -2859,8 +2864,12 @@ mod tests {
             assert!((active..zero).contains(&offset(prepared)));
         }
         assert!((zero..end_conditioning).contains(&offset("eval([clean])")));
-        assert!(offset("run.end_conditioning()") < offset("run.images("));
-        assert!(offset("self.denoise_turbo_from(") < offset("denoise_exit_fault("));
+        let run_images = offset("run.images(");
+        let identity = offset("if !denoise {\n                    return Ok(initial);");
+        let sample = offset("self.denoise_turbo_from(");
+        assert!(end_conditioning < run_images);
+        assert!(run_images < identity && identity < sample);
+        assert!(sample < offset("denoise_exit_fault("));
         assert!(offset("self.decode_latents_with_tiling(") < offset("decode_exit_fault("));
     }
 
