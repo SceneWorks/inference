@@ -23,6 +23,7 @@ struct MatrixSlices {
     rows: usize,
     cols: usize,
     count: usize,
+    shared_scales: bool,
     measured: BTreeMap<usize, u64>,
 }
 
@@ -184,6 +185,31 @@ impl CheckpointReadAccounting {
         cols: usize,
         resident_bytes: u64,
     ) -> Result<()> {
+        self.record_slice(key, first, rows, cols, resident_bytes, false)
+    }
+
+    /// Record a view into a shared FP8 bank. The retained scalar operands are the same arrays
+    /// for every active view; charge them once when producing the combined receipt.
+    pub fn record_shared_matrix_slice(
+        &self,
+        key: &str,
+        first: usize,
+        rows: usize,
+        cols: usize,
+        resident_bytes: u64,
+    ) -> Result<()> {
+        self.record_slice(key, first, rows, cols, resident_bytes, true)
+    }
+
+    fn record_slice(
+        &self,
+        key: &str,
+        first: usize,
+        rows: usize,
+        cols: usize,
+        resident_bytes: u64,
+        shared_scales: bool,
+    ) -> Result<()> {
         let i = self.index(key)?;
         let row = &self.plan.tensors[i];
         if !matches!(
@@ -220,9 +246,13 @@ impl CheckpointReadAccounting {
             rows,
             cols,
             count,
+            shared_scales,
             measured: BTreeMap::new(),
         });
-        if partition.rows != rows || partition.cols != cols {
+        if partition.rows != rows
+            || partition.cols != cols
+            || partition.shared_scales != shared_scales
+        {
             return Err(format!("{key}: incompatible projection slice widths").into());
         }
         partition.measured.insert(first, resident_bytes);
@@ -306,6 +336,7 @@ impl CheckpointReadAccounting {
         for (&i, p) in &state.slices {
             let original = &self.plan.tensors[i];
             let plan = plan.to_mut();
+            let mut shared_scale_bytes = 0u64;
             for c in &mut plan.companions {
                 if c.owner_physical_key == original.physical_key
                     && matches!(
@@ -314,7 +345,12 @@ impl CheckpointReadAccounting {
                             | crate::checkpoint_codec::CompanionRole::InputScale
                     )
                 {
-                    c.resident_bytes = 4 * p.count as u64;
+                    c.resident_bytes = if p.shared_scales {
+                        shared_scale_bytes += 4;
+                        4
+                    } else {
+                        4 * p.count as u64
+                    };
                 }
             }
             for slice in 0..p.count {
@@ -335,6 +371,12 @@ impl CheckpointReadAccounting {
                     n
                 };
                 if let Some(&bytes) = p.measured.get(&first) {
+                    let bytes = if p.measured.first_key_value().map(|(key, _)| *key) == Some(first)
+                    {
+                        bytes
+                    } else {
+                        bytes.saturating_sub(shared_scale_bytes)
+                    };
                     measured
                         .to_mut()
                         .rows

@@ -2688,6 +2688,12 @@ fn build_ffn(
     let per_expert = ["weight", "scales", "biases"]
         .iter()
         .any(|part| w.contains(&format!("{expert0}.{part}")));
+    let gate_projection = |key: String| -> Result<Projection> {
+        if let Some(p) = Projection::native(w, &key, false)? {
+            return Ok(p);
+        }
+        Projection::load(req(key)?, None)
+    };
     let (gate, up, down) = if cfg.quantization.is_some() || per_expert {
         let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
         for e in 0..moe.num_experts {
@@ -2705,33 +2711,43 @@ fn build_ffn(
         // The fused bank stays fused (sc-24446): one gathered matmul over gate‖up rows, its
         // output split per token. Splitting the weights here held a second, gathered copy of
         // the whole bank (~44 GB on Qwen3.6-35B-A3B).
-        let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
-        if gate_up.shape() != [e, 2 * mi, h] {
-            return Err(Error::Config(format!(
-                "qwen3_5_moe: `{}` is {:?}; expected [{e}, {}, {h}] from config",
-                lp("mlp.experts.gate_up_proj"),
-                gate_up.shape(),
-                2 * mi
-            )));
-        }
-        return Ok(Ffn::Moe(SparseMoe::fused(
-            req(lp("mlp.gate.weight"))?,
-            SwitchLinear::load(gate_up, quant)?,
-            SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
+        let gate_key = lp("mlp.experts.gate_up_proj");
+        let down_key = lp("mlp.experts.down_proj");
+        let gate_up = SwitchLinear::from_checkpoint(
+            w,
+            &gate_key,
+            [e, 2 * mi, h],
+            || req(gate_key.clone()),
+            quant,
+        )?;
+        let down = SwitchLinear::from_checkpoint(
+            w,
+            &down_key,
+            [e, h, mi],
+            || req(down_key.clone()),
+            quant,
+        )?;
+        return Ok(Ffn::Moe(SparseMoe::with_gate_up(
+            gate_projection(lp("mlp.gate.weight"))?,
+            crate::primitives::moe::GateUp::Fused(gate_up),
+            down,
             shared_expert(&proj_q, &lp)?,
-            Some(req(lp("mlp.shared_expert_gate.weight"))?),
+            Some(gate_projection(lp("mlp.shared_expert_gate.weight"))?),
             routing(moe),
         )?));
     };
-    Ok(Ffn::Moe(SparseMoe::new(
-        req(lp("mlp.gate.weight"))?,
-        gate,
-        up,
+    Ok(Ffn::Moe(SparseMoe::with_gate_up(
+        gate_projection(lp("mlp.gate.weight"))?,
+        crate::primitives::moe::GateUp::Split { gate, up },
         down,
         shared_expert(&proj_q, &lp)?,
-        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        Some(gate_projection(lp("mlp.shared_expert_gate.weight"))?),
         routing(moe),
     )?))
+}
+
+pub(crate) fn stacked_expert_key(key: &str) -> bool {
+    key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj")
 }
 
 /// The always-on shared expert of the MoE layer under `lp`.

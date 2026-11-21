@@ -115,6 +115,17 @@ pub struct PlannedResidency {
 /// generation, feature gates). A layer whose descriptor sets `full_precision_matrix_mult` never
 /// runs a packed matmul, so a policy must answer [`ResidencyMode::Dense`] for it.
 pub trait CodecResidencyPolicy {
+    /// An architecture can declare a physical tensor as stacked matrices for a routed operator.
+    fn residency_for_key(
+        &self,
+        _key: &str,
+        codec: &CheckpointCodecRegistration,
+        spec: &TensorCodecSpec,
+        shape: &[usize],
+    ) -> ResidencyMode {
+        self.residency(codec, spec, shape)
+    }
+
     fn residency(
         &self,
         codec: &CheckpointCodecRegistration,

@@ -140,8 +140,12 @@ impl Weights {
             .cloned()
             .into_iter()
             .collect();
-        let source_reads =
-            mlx_layers::source::prepare_sources(&mut tensors, &[path.to_owned()], &declarations)?;
+        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+            &mut tensors,
+            &[path.to_owned()],
+            &declarations,
+            crate::models::qwen35::stacked_expert_key,
+        )?;
         Ok(Self {
             source_reads,
             ..Self::from_map(tensors)
@@ -190,8 +194,12 @@ impl Weights {
             crate::model_input_proof::InputRole::ModelWeights,
             &__input_paths,
         );
-        let source_reads =
-            mlx_layers::source::prepare_sources(&mut tensors, &shards, &declarations)?;
+        let source_reads = mlx_layers::source::prepare_sources_with_experts(
+            &mut tensors,
+            &shards,
+            &declarations,
+            crate::models::qwen35::stacked_expert_key,
+        )?;
         Ok(Self {
             source_reads,
             ..Self::from_map(tensors)

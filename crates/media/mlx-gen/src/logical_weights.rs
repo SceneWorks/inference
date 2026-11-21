@@ -895,6 +895,9 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+mod fp8_metal_proof;
+
+#[cfg(test)]
 mod tests {
     use super::test_support::{bf16_bytes, write_safetensors};
     use super::*;

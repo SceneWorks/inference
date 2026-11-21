@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 
@@ -82,10 +82,39 @@ struct Row {
     packed_observed: AtomicBool,
     has_weight_scale: bool,
     has_input_scale: bool,
+    slice: Option<(usize, usize, usize)>,
+    children: Mutex<Vec<Weak<Row>>>,
 }
 #[derive(Clone, Debug)]
 pub struct Observation(Arc<Row>);
 impl Observation {
+    /// Each expert selected from a rank-three source has its own materialization boundary.
+    pub fn expert(&self, index: usize, rows: usize, cols: usize) -> Result<Self> {
+        if self.0.logical_shape.len() != 3
+            || self.0.logical_shape[1..] != [rows, cols]
+            || index >= self.0.logical_shape[0]
+        {
+            return Err("expert source geometry changed since planning".into());
+        }
+        let row = Arc::new(Row {
+            accounting: self.0.accounting.clone(),
+            key: self.0.key.clone(),
+            logical_shape: vec![rows, cols],
+            packed_bytes: AtomicU64::new(0),
+            packed_observed: AtomicBool::new(false),
+            has_weight_scale: self.0.has_weight_scale,
+            has_input_scale: self.0.has_input_scale,
+            slice: Some((index * rows, rows, cols)),
+            children: Default::default(),
+        });
+        self.0
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(&row));
+        Ok(Self(row))
+    }
+
     pub fn bind(&self, codes: &Array, scale: &Array, input: Option<&Array>) -> Result<()> {
         let row = &self.0;
         let bytes = codes.nbytes()
@@ -110,15 +139,35 @@ impl Observation {
         if !row.packed_observed.load(Ordering::Relaxed) {
             let bytes = row.packed_bytes.load(Ordering::Relaxed);
             if bytes != 0 {
-                row.accounting
-                    .record(&row.key, ExecutionRepresentation::NativePacked, bytes)
-                    .map_err(|e| Error::Msg(e.to_string()))?;
+                match row.slice {
+                    Some((start, rows, cols)) => row
+                        .accounting
+                        .record_shared_matrix_slice(&row.key, start, rows, cols, bytes),
+                    None => row.accounting.record(
+                        &row.key,
+                        ExecutionRepresentation::NativePacked,
+                        bytes,
+                    ),
+                }
+                .map_err(|e| Error::Msg(e.to_string()))?;
                 row.packed_observed.store(true, Ordering::Relaxed);
             }
         }
         Ok(())
     }
     pub fn materialized(&self, array: &Array) -> Result<()> {
+        if array.ndim() == 3 && array.dtype() == Dtype::Uint8 {
+            for child in self
+                .0
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(Weak::upgrade)
+            {
+                Self(child).record_packed()?;
+            }
+        }
         if self.0.packed_bytes.load(Ordering::Relaxed) != 0
             && matches!(array.dtype(), Dtype::Uint8 | Dtype::Int8)
         {
@@ -188,6 +237,8 @@ impl SourceReads {
                         packed_observed: AtomicBool::new(false),
                         has_weight_scale,
                         has_input_scale,
+                        slice: None,
+                        children: Default::default(),
                     })),
                 )
             })
@@ -221,7 +272,49 @@ pub fn prepare_sources(
     paths: &[PathBuf],
     tables: &[String],
 ) -> Result<SourceReads> {
-    use gen_core::comfy_quant::ComfyQuantFormat;
+    prepare_sources_with_experts(tensors, paths, tables, |_| false)
+}
+
+pub fn prepare_sources_with_experts(
+    tensors: &mut HashMap<String, Array>,
+    paths: &[PathBuf],
+    tables: &[String],
+    expert_key: impl Fn(&str) -> bool,
+) -> Result<SourceReads> {
+    struct Layout<F>(F);
+    impl<F: Fn(&str) -> bool> CodecResidencyPolicy for Layout<F> {
+        fn residency(
+            &self,
+            c: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            shape: &[usize],
+        ) -> ResidencyMode {
+            MlxCodecResidency.residency(c, spec, shape)
+        }
+        fn residency_for_key(
+            &self,
+            key: &str,
+            c: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            shape: &[usize],
+        ) -> ResidencyMode {
+            if shape.len() == 3
+                && (self.0)(key)
+                && metal_available()
+                && matches!(
+                    spec,
+                    TensorCodecSpec::ScalarFp8 {
+                        full_precision_matrix_mult: false,
+                        ..
+                    }
+                )
+            {
+                ResidencyMode::Packed
+            } else {
+                self.residency(c, spec, shape)
+            }
+        }
+    }
     if tables.is_empty()
         && !tensors
             .values()
@@ -234,26 +327,40 @@ pub fn prepare_sources(
         |k| tensors.contains_key(k),
         tables,
         registry(),
-        &MlxCodecResidency,
+        &Layout(&expert_key),
     )
     .map_err(|e| Error::Msg(e.to_string()))?
     else {
         return Ok(SourceReads::default());
     };
+    bind_source_layout(tensors, &plan, expert_key)?;
+    Ok(SourceReads::new(Arc::new(plan), paths))
+}
+
+/// Attach validated physical layouts to an existing tensor map without creating a load receipt.
+/// Memory pricing uses the same row geometry with shape-only, neutral array placeholders.
+pub fn bind_source_layout(
+    tensors: &mut HashMap<String, Array>,
+    plan: &LogicalWeightPlan,
+    expert_key: impl Fn(&str) -> bool,
+) -> Result<()> {
+    use gen_core::comfy_quant::ComfyQuantFormat;
     for t in &plan.tensors {
         let key = &t.logical_key;
         let Some(array) = tensors.get(key).cloned() else {
             return Err(format!("{key}: selected source disappeared").into());
         };
-        let base = key.strip_suffix(".weight");
+        let base = key
+            .strip_suffix(".weight")
+            .or_else(|| key.strip_suffix("_weight"))
+            .or_else(|| (t.shape.len() == 2 || expert_key(key)).then_some(key.as_str()));
         let (format, scale, sx) = match &t.codec {
             TensorCodecSpec::ConvRotInt8 { geometry, .. } => {
                 let base = base.ok_or("missing ConvRot projection base")?;
-                tensors
-                    .entry(format!("{base}.comfy_quant"))
-                    .or_insert_with(|| {
-                        crate::convrot_int8::descriptor_array(geometry.rotation_group)
-                    });
+                tensors.insert(
+                    format!("{base}.comfy_quant"),
+                    crate::convrot_int8::descriptor_array(geometry.rotation_group),
+                );
                 continue;
             }
             TensorCodecSpec::RowwiseFp8 { scale } => {
@@ -315,5 +422,5 @@ pub fn prepare_sources(
             }
         }
     }
-    Ok(SourceReads::new(Arc::new(plan), paths))
+    Ok(())
 }

@@ -77,6 +77,22 @@ pub enum Projection {
 }
 
 impl Projection {
+    pub(crate) fn expert_shape(&self) -> Result<[i32; 2]> {
+        match self {
+            Self::Native(p) => Ok(p.shape()),
+            Self::Dense { weight, bias: None } => weight
+                .shape()
+                .try_into()
+                .map_err(|_| Error::Config("expert requires a rank-two matrix".into())),
+            Self::Quantized(q) if q.bias.is_none() && q.scales.ndim() == 2 => {
+                Ok([q.scales.shape()[0], q.scales.shape()[1] * q.group_size])
+            }
+            _ => Err(Error::Unsupported(
+                "expert projection has unsupported layout or additive bias".into(),
+            )),
+        }
+    }
+
     /// Bind a described packed projection before a model casts a source to its compute dtype.
     pub(crate) fn native(
         w: &super::weights::Weights,

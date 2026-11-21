@@ -59,11 +59,79 @@ impl Weights {
             ..Self::from_map(tensors)
         })
     }
+    /// Construct a header-backed pricing view without registering materialization against a live model.
+    pub fn from_pricing_map(
+        mut tensors: HashMap<String, Array>,
+        plan: Option<&gen_core::LogicalWeightPlan>,
+    ) -> Result<Self> {
+        if let Some(plan) = plan {
+            mlx_layers::source::bind_source_layout(&mut tensors, plan, |_| false)?;
+        }
+        Ok(Self::from_map(tensors))
+    }
+
     /// Transfer the same measured source rows when a media pipeline delegates its encoder to MLX LLM.
     pub fn into_language_weights(self) -> mlx_llm::primitives::Weights {
         let reads = self.source_reads.clone();
         mlx_llm::primitives::Weights::from_observed_map(self.into_tensors(), reads)
     }
+    /// A component remap shares the physical source's receipt and rotation handles.
+    pub fn component_view(&self) -> Self {
+        Self {
+            source_reads: self.source_reads.clone(),
+            ..Self::empty()
+        }
+    }
+
+    pub fn alias_source_row(&mut self, from: &str, to: &str) {
+        self.source_reads.alias(from, to);
+    }
+
+    /// Bind a potentially nonstandard source name before an architecture renames or splits it.
+    pub fn source_projection(&self, key: &str) -> Result<Option<mlx_layers::NativeProjection>> {
+        let base = key
+            .strip_suffix(".weight")
+            .or_else(|| key.strip_suffix("_weight"))
+            .unwrap_or(key);
+        if !self.tensors.contains_key(&format!("{base}.comfy_quant"))
+            && self.planned_fp8(base).is_none()
+            && self.planned_convrot(base).is_none()
+        {
+            return Ok(None);
+        }
+        Ok(mlx_layers::NativeProjection::from_key(
+            self, base, key, false,
+        )?)
+    }
+
+    pub fn insert_source_projection(
+        &mut self,
+        key: &str,
+        projection: mlx_layers::NativeProjection,
+    ) -> Result<()> {
+        let base = key.strip_suffix(".weight").ok_or_else(|| {
+            Error::Msg(format!("native projection target {key} must name a weight"))
+        })?;
+        match projection {
+            mlx_layers::NativeProjection::Fp8(p) => {
+                let input = matches!(
+                    p.format,
+                    gen_core::comfy_quant::ComfyQuantFormat::Float8E4M3Fn
+                        | gen_core::comfy_quant::ComfyQuantFormat::Float8E5M2
+                );
+                self.insert_fp8(base, p, true, input);
+            }
+            mlx_layers::NativeProjection::ConvRot(p) => {
+                self.convrot_rotations
+                    .borrow_mut()
+                    .entry(p.descriptor().rotation_group)
+                    .or_insert_with(|| p.rotation().clone());
+                self.insert_convrot(base, p.descriptor(), p.codes().clone(), p.scales().clone());
+            }
+        }
+        Ok(())
+    }
+
     /// An empty weights container — for building small in-memory fixtures (e.g. checkpoint-remap unit
     /// tests that assert `remap_*_keys` produces the aliased names without a real snapshot).
     pub fn empty() -> Self {

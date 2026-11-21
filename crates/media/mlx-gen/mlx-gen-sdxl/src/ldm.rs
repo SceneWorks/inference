@@ -2,7 +2,6 @@
 
 pub(crate) mod pricing;
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use gen_core_family::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
@@ -21,11 +20,11 @@ pub struct LdmComponents {
 
 fn component_map<'a>(
     component: SdxlComponent,
-    unet: &'a mut HashMap<String, Array>,
-    clip_l: &'a mut HashMap<String, Array>,
-    clip_bigg: &'a mut HashMap<String, Array>,
-    vae: &'a mut HashMap<String, Array>,
-) -> &'a mut HashMap<String, Array> {
+    unet: &'a mut Weights,
+    clip_l: &'a mut Weights,
+    clip_bigg: &'a mut Weights,
+    vae: &'a mut Weights,
+) -> &'a mut Weights {
     match component {
         SdxlComponent::Unet => unet,
         SdxlComponent::ClipL => clip_l,
@@ -61,17 +60,71 @@ pub(crate) fn component_header_source(path: &Path) -> Result<pricing::FusedHeade
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
-    let mut source = Weights::from_file(path)?;
+    split_ldm_source(Weights::from_file(path)?)
+}
+
+fn split_ldm_source(mut source: Weights) -> Result<LdmComponents> {
     let keys: Vec<String> = source.keys().map(str::to_owned).collect();
-    let mut unet = HashMap::new();
-    let mut clip_l = HashMap::new();
-    let mut clip_bigg = HashMap::new();
-    let mut vae = HashMap::new();
+    let mut unet = source.component_view();
+    let mut clip_l = source.component_view();
+    let mut clip_bigg = source.component_view();
+    let mut vae = source.component_view();
 
     for source_key in keys {
         let Some(remap) = remap_sdxl_ldm_key(&source_key) else {
             continue;
         };
+        // Companion names are bound as a unit with their source projection; mapping them
+        // individually would invalidate the captured operator if visited after its matrix.
+        if [
+            ".comfy_quant",
+            ".weight_scale",
+            ".input_scale",
+            ".scale_weight",
+            ".scale_input",
+        ]
+        .iter()
+        .any(|s| source_key.ends_with(s))
+        {
+            continue;
+        }
+        if let Some(p) = source.source_projection(&source_key)? {
+            match remap {
+                TensorRemap::Rename(c, target) | TensorRemap::Squeeze(c, target) => {
+                    let dest = component_map(c, &mut unet, &mut clip_l, &mut clip_bigg, &mut vae);
+                    dest.alias_source_row(&source_key, &target);
+                    dest.insert_source_projection(&target, p)?;
+                }
+                TensorRemap::SplitQkv(c, targets) => {
+                    let rows = p.shape()[0];
+                    if rows % 3 != 0 {
+                        return Err(Error::Msg(format!(
+                            "{source_key}: QKV row count {rows} is not divisible by three"
+                        )));
+                    }
+                    let dest = component_map(c, &mut unet, &mut clip_l, &mut clip_bigg, &mut vae);
+                    // All three views retain this source matrix. Charge it once at the split.
+                    p.materialize()?;
+                    for (index, target) in targets.into_iter().enumerate() {
+                        let lo = index as i32 * (rows / 3);
+                        dest.insert_source_projection(&target, p.slice_rows(lo, lo + rows / 3)?)?;
+                    }
+                }
+                TensorRemap::Transpose(c, target) => {
+                    let dest = component_map(c, &mut unet, &mut clip_l, &mut clip_bigg, &mut vae);
+                    let mlx_gen::NativeProjection::Fp8(fp) = p else {
+                        return Err(Error::Unsupported(format!("{source_key}: an OpenCLIP transposed projection would move the ConvRot input rotation to the output axis")));
+                    };
+                    let fp = fp
+                        .transposed_scalar()
+                        .map_err(|e| Error::Unsupported(format!("{source_key}: {e}")))?;
+                    dest.alias_source_row(&source_key, &target);
+                    dest.insert_source_projection(&target, mlx_gen::NativeProjection::Fp8(fp))?;
+                }
+            }
+            source.remove(&source_key);
+            continue;
+        }
         let value = source
             .remove(&source_key)
             .ok_or_else(|| Error::MissingTensor(source_key.clone()))?;
@@ -116,10 +169,10 @@ pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
         }
     }
     Ok(LdmComponents {
-        unet: Weights::from_map(unet),
-        clip_l: Weights::from_map(clip_l),
-        clip_bigg: Weights::from_map(clip_bigg),
-        vae: Weights::from_map(vae),
+        unet,
+        clip_l,
+        clip_bigg,
+        vae,
     })
 }
 
@@ -195,6 +248,49 @@ pub(crate) fn component_load_floor_from_headers(
 mod tests {
     use super::*;
     use mlx_rs::Dtype;
+
+    #[test]
+    fn fused_openclip_maps_original_convrot_rows_and_scales_to_each_qkv_projection() {
+        let mut source = Weights::empty();
+        for key in [
+            "model.diffusion_model.input_blocks.7.0.out_layers.3.weight",
+            "first_stage_model.decoder.up.1.block.2.nin_shortcut.weight",
+            "conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
+        ] {
+            source.insert(key, Array::from_f32(1.0));
+        }
+        let base = "conditioner.embedders.1.model.transformer.resblocks.9.attn.in_proj";
+        let codes: Vec<i8> = (0..6 * 64).map(|i| (i / 64) as i8 - 3).collect();
+        source.insert(
+            format!("{base}_weight"),
+            Array::from_slice(&codes, &[6, 64]),
+        );
+        source.insert(
+            format!("{base}.weight_scale"),
+            Array::from_slice(&[1f32, 2., 3., 4., 5., 6.], &[6, 1]),
+        );
+        let desc =
+            br#"{"format":"int8_tensorwise","convrot":true,"per_row":true,"convrot_groupsize":64}"#;
+        source.insert(
+            format!("{base}.comfy_quant"),
+            Array::from_slice(desc, &[desc.len() as i32]),
+        );
+        let parts = split_ldm_source(source).unwrap();
+        for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
+            let key = format!("text_model.encoder.layers.9.self_attn.{name}_proj.weight");
+            let mlx_gen::NativeProjection::ConvRot(op) =
+                parts.clip_bigg.source_projection(&key).unwrap().unwrap()
+            else {
+                panic!("expected a typed ConvRot projection")
+            };
+            assert_eq!(op.descriptor().in_features, 64);
+            assert_eq!(op.codes().as_slice::<i8>(), &codes[i * 128..(i + 1) * 128]);
+            assert_eq!(
+                op.scales().as_slice::<f32>(),
+                &[(2 * i + 1) as f32, (2 * i + 2) as f32]
+            );
+        }
+    }
 
     #[test]
     #[ignore = "real fused SDXL checkpoint; set SDXL_LDM_CHECKPOINT"]

@@ -81,6 +81,7 @@ pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 #[derive(Debug, Clone)]
 pub struct LinearBias {
     weight: Array,
+    native: Option<mlx_gen::NativeProjection>,
     bias: Array,
     /// Forward-time LoRA/LoKr residuals on this projection (SW-7096). Empty unless an install
     /// routes here — only the image DiT does.
@@ -182,12 +183,18 @@ impl LinearBias {
         in_features: i32,
         out_features: i32,
     ) -> Result<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?.clone();
+        let key = format!("{prefix}.weight");
+        let native = w.source_projection(&key)?;
+        let weight = w.require(&key)?.clone();
         let bias = w.require(&format!("{prefix}.bias"))?.clone();
-        if weight.shape() != [out_features, in_features] {
+        let logical = native
+            .as_ref()
+            .map(|p| p.shape().to_vec())
+            .unwrap_or_else(|| weight.shape().to_vec());
+        if logical != [out_features, in_features] {
             return Err(Error::Msg(format!(
                 "minimax-h3 dit {prefix}.weight: expected [{out_features}, {in_features}], got {:?}",
-                weight.shape()
+                logical
             )));
         }
         if bias.shape() != [out_features] {
@@ -198,6 +205,7 @@ impl LinearBias {
         }
         Ok(Self {
             weight,
+            native,
             bias,
             adapters: ResidualSlot::default(),
         })
@@ -205,7 +213,11 @@ impl LinearBias {
 
     /// This projection's adapter slot (SW-7096), created on first use at its `[out, in]` shape.
     pub fn adaptable_mut(&mut self) -> Option<&mut mlx_gen::adapters::AdaptableLinear> {
-        let (out, inp) = (self.weight.shape()[0], self.weight.shape()[1]);
+        let [out, inp] = self
+            .native
+            .as_ref()
+            .map(|p| p.shape())
+            .unwrap_or([self.weight.shape()[0], self.weight.shape()[1]]);
         self.adapters.slot_mut(out, inp)
     }
 
@@ -221,12 +233,25 @@ impl LinearBias {
 
     /// The dtype the published bytes carry — f32 for the fp32-kept heads, bf16 otherwise.
     pub fn dtype(&self) -> Dtype {
-        self.weight.dtype()
+        if self.native.is_some() {
+            self.bias.dtype()
+        } else {
+            self.weight.dtype()
+        }
     }
 
     /// Device bytes this projection holds.
     pub fn nbytes(&self) -> usize {
-        self.weight.nbytes() + self.bias.nbytes()
+        self.native
+            .as_ref()
+            .map(|p| match p {
+                mlx_gen::NativeProjection::ConvRot(q) => q.nbytes(),
+                mlx_gen::NativeProjection::Fp8(q) => {
+                    q.codes().nbytes() + q.scales().nbytes() + q.input_scale().nbytes()
+                }
+            })
+            .unwrap_or_else(|| self.weight.nbytes())
+            + self.bias.nbytes()
     }
 
     /// `y = x · Wᵀ + b`, with `x` cast to the weight's own dtype first.
@@ -239,8 +264,10 @@ impl LinearBias {
     /// runs as TF32 on NAX, which rounded `time_embedder`'s output to 2.8e-3 rel-L2 (SW-7092) —
     /// the tensor every AdaLN projection reads. See [`uses_precise_dispatch`].
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let x = x.as_dtype(self.weight.dtype())?;
-        let y = if uses_precise_dispatch(self.weight.dtype()) {
+        let x = x.as_dtype(self.dtype())?;
+        let y = if let Some(proj) = &self.native {
+            proj.forward_with_bias(&x, Some(&self.bias))?
+        } else if uses_precise_dispatch(self.weight.dtype()) {
             mlx_gen::nn::linear_precise(&x, &self.weight, Some(&self.bias))?
         } else {
             mlx_gen::nn::linear(&x, &self.weight, &self.bias)?

@@ -28,6 +28,7 @@ impl From<String> for Error {
 }
 
 pub use convrot_int8::MlxWeightSource;
+pub use gen_core::comfy_quant::ComfyQuantFormat;
 
 #[derive(Clone, Debug)]
 pub enum NativeProjection {
