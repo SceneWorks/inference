@@ -202,11 +202,20 @@ def preflight(cuda_uuid, *, diagnostic=None, expected_luid=None):
     return adapter
 
 
-def _creation_time(owner, pid):
+def _creation_time(owner, pid, expected):
     rows = owner.member_identities([pid])["processes"]
-    if len(rows) == 1 and rows[0]["pid"] == pid and rows[0]["status"] == "owned-identity-resolved":
-        return rows[0]["createdFileTime"]
-    return None
+    if len(rows) != 1 or rows[0]["pid"] != pid:
+        raise ValueError("unexpected owned process identity")
+    row = rows[0]
+    created = row["createdFileTime"]
+    if created is not None and expected is not None and created != expected:
+        raise ValueError("owned process identity changed")
+    if row["status"] == "owned-identity-resolved" and type(created) is int and created > 0:
+        return created
+    if (row["status"] in ("left-job-before-open", "open-unavailable", "owned-identity-partial")
+            and owner.exited_root_and_empty(pid) is True):
+        return None
+    raise ValueError("owned process identity is unavailable")
 
 
 class DedicatedSamples:
@@ -231,21 +240,33 @@ class DedicatedSamples:
             return
         try:
             members = owner.members()
-            if not members:  # the process exited before this observation
+            if not members:
+                if row["pid"] is not None and owner.exited_root_and_empty(row["pid"]) is not True:
+                    raise ValueError("owned process disappeared before its confirmed exit")
                 return
             if len(members) != 1:
                 raise ValueError("direct render does not have exactly one owned process")
             pid = next(iter(members))
-            created = _creation_time(owner, pid)
-            if not created or (row["pid"] is not None and (pid, created) != (row["pid"], row["created_filetime"])):
-                raise ValueError("owned process identity changed or is unavailable")
+            if row["pid"] is not None and row["pid"] != pid:
+                raise ValueError("owned process identity changed")
+            created = _creation_time(owner, pid, row["created_filetime"])
+            if created is None:  # original root exited before this read; no new observation
+                return
             if self.query is None:
                 context = _query(row["adapter"], pid)
                 self.read = context.__enter__()
                 self.query = context
                 row.update(pid=pid, created_filetime=created)
             sample = self.read()
-            if owner.members() != {pid} or _creation_time(owner, pid) != created:
+            after = owner.members()
+            if not after and owner.exited_root_and_empty(pid) is True:
+                return  # discard a counter read that straddled the confirmed exit
+            if after != {pid}:
+                raise ValueError("owned process identity changed during PDH read")
+            confirmed = _creation_time(owner, pid, created)
+            if confirmed is None:
+                return
+            if confirmed != created:
                 raise ValueError("owned process identity changed during PDH read")
             if sample is None:
                 if cuda_active or row["samples"]:

@@ -1,7 +1,10 @@
 """Windows byte-gauge and CUDA identity contracts, with no native/model execution."""
 from contextlib import contextmanager
 import ctypes
-from unittest import TestCase
+import os
+import subprocess
+import sys
+from unittest import TestCase, skipUnless
 from unittest.mock import MagicMock, patch
 import uuid
 
@@ -158,6 +161,102 @@ class WindowsDedicatedMemoryTests(TestCase):
                 self.assertRegex(probe.record["error"], "identity changed")
                 self.assertFalse(probe.record["samples"])
                 probe.close()
+
+    def test_root_exit_requires_the_assigned_process_handle_and_an_empty_job(self):
+        from scripts.media_campaign_windows import WindowsJob
+        job = WindowsJob.__new__(WindowsJob)
+        job.members = MagicMock()
+        job._root = MagicMock(pid=PID)
+        for pid, status, members, exited in ((PID, 0, set(), True), (PID, None, set(), False),
+                                             (PID + 1, 0, set(), False), (PID, 0, {PID + 1}, False)):
+            job._root.poll.return_value = status
+            job.members.return_value = members
+            self.assertEqual(job.exited_root_and_empty(pid), exited)
+
+    def test_final_poll_requires_original_root_exit_and_empty_job_and_discards_unbracketed_data(self):
+        for stage in ("before-open", "after-read", "during-recheck", "before-poll"):
+            for confirmed in (True, False):
+                with self.subTest(stage=stage, confirmed=confirmed), patch.object(wddm, "_query") as query:
+                    job = owner()
+                    job.exited_root_and_empty.return_value = confirmed
+                    reader = query.return_value.__enter__.return_value
+                    reader.side_effect = [[10, 64], [11, 72], [12, 9999]]
+                    probe = wddm.DedicatedSamples(ADAPTER, GPU)
+                    probe.poll(job, cuda_active=True)
+                    probe.poll(job, cuda_active=True)
+                    resolved = job.member_identities.return_value
+                    departed = {"processes": [{"pid": PID, "status": "left-job-before-open", "createdFileTime": None}]}
+                    if stage == "before-open":
+                        job.member_identities.return_value = departed
+                    elif stage == "after-read":
+                        job.members.side_effect = [{PID}, set()]
+                    elif stage == "during-recheck":
+                        job.member_identities.side_effect = [resolved, departed]
+                    else:
+                        job.members.return_value = set()
+                    probe.poll(job, cuda_active=True)
+                    job.exited_root_and_empty.assert_called_once_with(PID)
+                    self.assertEqual(probe.record["samples"], [[10, 64], [11, 72]])
+                    self.assertEqual(wddm.sampled_peak(probe.record, pid=PID, adapter=ADAPTER),
+                                     72 if confirmed else None)
+                    probe.close()
+
+    def test_later_exit_cannot_clear_live_alias_changed_creation_time_or_earlier_missing_gauge(self):
+        for problem in ("foreign-handle", "reused-pid", "descendant", "gap"):
+            with self.subTest(problem=problem), patch.object(wddm, "_query") as query:
+                job = owner()
+                job.exited_root_and_empty.return_value = True
+                query.return_value.__enter__.return_value.side_effect = [[10, 64], [11, 72], None]
+                probe = wddm.DedicatedSamples(ADAPTER, GPU)
+                probe.poll(job, cuda_active=True)
+                probe.poll(job, cuda_active=True)
+                row = job.member_identities.return_value["processes"][0]
+                if problem == "foreign-handle":
+                    row.update(status="opened-handle-not-in-job", createdFileTime=None)
+                elif problem == "reused-pid":
+                    row.update(status="owned-identity-partial", createdFileTime=1111)
+                elif problem == "descendant":
+                    job.members.return_value = {PID + 1}
+                probe.poll(job, cuda_active=True)
+                job.members.return_value = set()
+                probe.poll(job, cuda_active=True)
+                self.assertIsNone(wddm.sampled_peak(probe.record, pid=PID, adapter=ADAPTER))
+                probe.close()
+
+    @skipUnless(os.name == "nt", "requires a real Windows Job and original process handle")
+    def test_native_exit_between_job_snapshot_and_identity_open(self):
+        from scripts.media_campaign_windows import WindowsJob
+        job = WindowsJob()
+        child = None
+        try:
+            child = subprocess.Popen([sys.executable, "-I", "-c", "import sys; sys.stdin.buffer.read(1)"],
+                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     creationflags=0x00000004)
+            job.assign_and_resume(child)
+            self.assertFalse(job.exited_root_and_empty(child.pid))
+            with patch.object(wddm, "_query") as query:
+                query.return_value.__enter__.return_value.side_effect = [[10, 64], [11, 72]]
+                probe = wddm.DedicatedSamples(ADAPTER, GPU)
+                self.addCleanup(probe.close)
+                probe.poll(job, cuda_active=True)
+                probe.poll(job, cuda_active=True)
+                identify = job.member_identities
+                def exit_before_open(pids):
+                    child.stdin.close()
+                    self.assertEqual(child.wait(timeout=5), 0)
+                    return identify(pids)
+                with patch.object(job, "member_identities", side_effect=exit_before_open):
+                    probe.poll(job, cuda_active=True)
+                self.assertTrue(job.exited_root_and_empty(child.pid))
+                self.assertFalse(job.exited_root_and_empty(child.pid + 1))
+                self.assertEqual(wddm.sampled_peak(probe.record, pid=child.pid, adapter=ADAPTER), 72)
+        finally:
+            job.close()
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                child.stdin.close()
 
     def test_verify_rejects_malformed_or_cross_device_preflight(self):
         for change in ({"cuda_uuid": GPU[:-1] + "1"}, {"luid": "other"}, {"physical_node": True},

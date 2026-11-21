@@ -169,6 +169,7 @@ class WindowsJob:
 
     def __init__(self):
         self.kernel, self.psapi = _apis()
+        self._root = None
         self.handle = self.kernel.CreateJobObjectW(None, None)
         if not self.handle:
             raise _failed("CreateJobObjectW")
@@ -182,6 +183,7 @@ class WindowsJob:
     def assign_and_resume(self, child: subprocess.Popen[bytes]) -> None:
         if not self.kernel.AssignProcessToJobObject(self.handle, child._handle):
             raise _failed("AssignProcessToJobObject")
+        self._root = child
         snapshot = self.kernel.CreateToolhelp32Snapshot(0x00000004, 0)  # SNAPTHREAD
         if not snapshot or snapshot == ctypes.c_void_p(-1).value:
             raise _failed("CreateToolhelp32Snapshot")
@@ -210,6 +212,10 @@ class WindowsJob:
                 self.kernel.CloseHandle(thread)
         finally:
             self.kernel.CloseHandle(snapshot)
+
+    def exited_root_and_empty(self, pid: int) -> bool:
+        """Check the original Popen process handle and the same non-breakaway Job."""
+        return self._root is not None and self._root.pid == pid and self._root.poll() is not None and not self.members()
 
     def members(self) -> set[int]:
         for capacity in (16, 64, 256, 1024):
