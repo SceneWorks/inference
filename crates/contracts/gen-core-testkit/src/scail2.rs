@@ -70,35 +70,59 @@ pub fn assert_registered_characters_and_windows(
         } else {
             0
         };
-        let floats = if mlx { 84 } else { 81 + 5 + 13 };
-        let decoder_bytes = floats * 64 * 32 * 3 * 4;
+        let rgb = 64 * 32 * 3;
+        let stacks = 90 * 2 * 4 * rgb;
+        let retained = &layout.retained_allocations;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0],
+            gen_core::PricedAllocation::new("scail2_driving_rgb_and_masks", host, stacks)
+        );
+        let output = if mlx { 84 } else { 89 };
+        let (round_peak, export, host_staging) = if mlx {
+            (84 * 4 * rgb, (84 * 4 + 84) * rgb, 0)
+        } else {
+            // 81 first frames + all 13 in second backing + distinct 5 history + 89 stitched.
+            let retained = (81 + 13 + 5 + 89) * 4 * rgb;
+            (
+                retained + 89 * (6 * 4 + 1) * rgb,
+                retained + 89 * 4 * rgb,
+                (89 + 1) * rgb,
+            )
+        };
         assert_eq!(
             layout.phases.last().unwrap().decoded_tensor_bytes,
-            decoder_bytes
+            round_peak
         );
-        let rgb = 64 * 32 * 3;
-        let (output, device, host_staging) = if mlx {
-            (84, (84 * 4 + 84) * rgb, 0)
-        } else {
-            (89, (81 + 13 + 5 + 89 + 89) * 4 * rgb, (89 + 1) * rgb)
-        };
-        assert_eq!(layout.output_conversion.device_bytes, device);
+        assert_eq!(layout.output_conversion.device_bytes, export);
         assert_eq!(layout.output_conversion.host_bytes, host_staging);
         let host_buffers = output * rgb + host_staging;
-        assert_eq!(
-            plan.minimum_live_bytes(layout.domain).unwrap(),
-            source_on_device
-                + device
-                + if layout.domain == host {
-                    host_buffers
-                } else {
-                    0
-                }
-        );
+        let expected = source_on_device
+            + if host == layout.domain { stacks } else { 0 }
+            + round_peak.max(
+                export
+                    + if host == layout.domain {
+                        host_buffers
+                    } else {
+                        0
+                    },
+            );
+        let minimum = plan.minimum_decode_live_bytes(layout.domain).unwrap();
+        assert_eq!(minimum, expected);
+        let mut budget = gen_core::MemoryBudget {
+            total_bytes: expected - 1,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        assert!(!budget.fits(minimum));
+        budget.total_bytes += 1;
+        assert!(budget.fits(minimum));
+        assert_eq!(plan.minimum_live_bytes(layout.domain).unwrap(), minimum);
         if host != layout.domain {
             assert_eq!(
                 plan.minimum_live_bytes(host).unwrap(),
-                source_bytes + host_buffers
+                source_bytes + stacks + host_buffers
             );
         }
         assert_eq!(layout.references.len(), 2 * characters as usize + 2);
@@ -208,6 +232,12 @@ pub fn assert_registered_characters_and_windows(
                 }
             }
         }
+        let mut malformed = req.clone();
+        malformed.conditioning.swap(0, 1);
+        assert!(
+            matches!(registry.compile_video_plan(generator.descriptor().id,&spec,&malformed),
+            Err(gen_core::Error::Unsupported(reason)) if reason.contains("without a preceding Reference"))
+        );
         req.video_mode = Some("replacement".into());
         assert_eq!(
             registry

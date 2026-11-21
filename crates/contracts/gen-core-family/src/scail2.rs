@@ -218,6 +218,7 @@ pub fn video_layout(
             latent_bytes,
             retained_bytes,
             decoded_tensor_bytes,
+            decoded_host_bytes: 0,
             decoded_frames,
             decode_chunk_frames,
             source: segment.source,
@@ -240,6 +241,29 @@ pub fn video_layout(
         device_bytes: rgb_bytes(device_planes)?,
         host_bytes: rgb_bytes(host_planes)?,
     };
+    if tail == SegmentTail::AlignedRemainder {
+        // Candle rounds the entire stitched tensor before copying the first frame to the
+        // returned RGB vectors. Its eager nearest-even intermediates coexist with the
+        // decoded pieces, packed overlap and stitched tensor, independently of host export.
+        let last = phases.last_mut().unwrap();
+        let rounding =
+            crate::candle_round_rgb8_live_bytes(rgb_bytes(output)?, rgb_bytes(4 * float_frames)?)?;
+        last.decoded_tensor_bytes = last.decoded_tensor_bytes.max(rounding);
+    }
+    // Both providers resize every authored driving frame and mask before the first window.
+    // Candle keeps those two f32 stacks on the CPU even when only the half-size conditioned
+    // window crosses to CUDA. MLX owns them on its unified device until output conversion.
+    let stacks_domain = match (tail, domain) {
+        (SegmentTail::AlignedRemainder, gen_core::MemoryBudgetDomain::DeviceVram) => {
+            gen_core::MemoryBudgetDomain::HostRam
+        }
+        _ => domain,
+    };
+    let stacks = gen_core::PricedAllocation::new(
+        "scail2_driving_rgb_and_masks",
+        stacks_domain,
+        rgb_bytes(u64::from(geometry.frames) * 2 * 4)?,
+    );
     let role = |role, width, height, frames| gen_core::VideoReferenceLayout {
         role,
         width,
@@ -265,6 +289,7 @@ pub fn video_layout(
     ));
     Ok(gen_core::VideoPlanLayout {
         packed_components: Vec::new(),
+        retained_allocations: vec![stacks],
         output_conversion,
         domain,
         output: MemoryGeometry {
@@ -347,6 +372,57 @@ pub fn project_catalog_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scail2_stacks_price_all_target_pixels_in_their_physical_domain() {
+        use gen_core::MemoryBudgetDomain::{DeviceVram, HostRam, UnifiedMemory};
+        let images = vec![
+            gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3]
+            };
+            65
+        ];
+        let clip = gen_core::ControlClipRef {
+            frames: &images,
+            mask: &images,
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: gen_core::ReplacementMode::default(),
+        };
+        for (tail, execution, placement) in [
+            (SegmentTail::AlignedRemainder, DeviceVram, HostRam),
+            (SegmentTail::AlignedRemainder, HostRam, HostRam),
+            (SegmentTail::FullWindows, UnifiedMemory, UnifiedMemory),
+        ] {
+            let layout = video_layout(tail, execution, (512, 512), 1, clip).unwrap();
+            assert_eq!(
+                layout.retained_allocations,
+                [gen_core::PricedAllocation::new(
+                    "scail2_driving_rgb_and_masks",
+                    placement,
+                    408_944_640
+                )]
+            );
+            if execution == DeviceVram {
+                // A single piece aliases the stitched backing, and the complete 65-frame
+                // sequence rounds before host RGB export. Neither the raw nor resized host
+                // carrier contributes to these CUDA bytes.
+                let peak = layout.phases[0].decoded_tensor_bytes;
+                assert_eq!(peak, 1_482_424_320);
+                let mut budget = gen_core::MemoryBudget {
+                    total_bytes: peak - 1,
+                    committed_bytes: 0,
+                    reclaimable_bytes: 0,
+                    reserved_headroom_bytes: 0,
+                };
+                assert!(!budget.fits(peak));
+                budget.total_bytes += 1;
+                assert!(budget.fits(peak));
+            }
+        }
+    }
 
     #[test]
     fn clean_history_is_present_only_for_reencodable_overlaps() {

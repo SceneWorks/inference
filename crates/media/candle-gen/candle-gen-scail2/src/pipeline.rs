@@ -676,8 +676,7 @@ fn registered_inputs<'a>(
     (u32, u32),
 )> {
     let characters =
-        gen_core::generator::Scail2CharacterReferences::from_request(descriptor.id, req)
-            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        gen_core::generator::Scail2CharacterReferences::from_request(descriptor.id, req)?;
     let driving = req.control_clip().ok_or_else(|| {
         CandleError::Msg(
             "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
@@ -1179,6 +1178,19 @@ fn replace_flag_for_request(req: &GenerationRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scail2_output_rounds_rgb8_half_ties_to_even() {
+        let pixels =
+            Tensor::new(&[0.49f32, 0.5, 1.5, 2.5, 3.5, 254.5, 255.0], &Device::Cpu).unwrap();
+        assert_eq!(
+            candle_gen::round_rgb8(&pixels)
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap(),
+            [0, 0, 2, 2, 4, 254, 255]
+        );
+    }
+
     #[test]
     fn scail2_video_plan_projects_only_the_sealed_worker_request() {
         use crate::memory_strategy::{tests, PreparedMemory};
