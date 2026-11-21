@@ -149,6 +149,15 @@ impl From<&str> for Error {
     }
 }
 
+impl From<mlx_layers::Error> for Error {
+    fn from(e: mlx_layers::Error) -> Self {
+        match e {
+            mlx_layers::Error::Mlx(e) => Self::Mlx(e),
+            mlx_layers::Error::Msg(message) => Self::Msg(message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,14 +178,5 @@ mod tests {
             to_core(Error::Canceled),
             core_llm::Error::Canceled
         ));
-    }
-}
-
-impl From<mlx_layers::Error> for Error {
-    fn from(e: mlx_layers::Error) -> Self {
-        match e {
-            mlx_layers::Error::Mlx(e) => Self::Mlx(e),
-            mlx_layers::Error::Msg(message) => Self::Msg(message),
-        }
     }
 }
