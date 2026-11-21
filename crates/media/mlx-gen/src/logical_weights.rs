@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gen_core::checkpoint_codec::{
-    CheckpointCodecRegistration, CodecResidencyReport, LogicalKeyMapping,
+    CheckpointCodecRegistration, CodecResidencyPolicy, CodecResidencyReport, LogicalKeyMapping,
     LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
     ResidencyMode, ScalarScaleSource, TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC,
     DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_ROWWISE_CODEC, FP8_E4M3_SCALAR_CODEC,
@@ -150,6 +150,24 @@ pub fn read_logical_weights(
             transformed.physical_key,
         )));
     }
+    // This public reader also accepts externally constructed plans. Verify the execution
+    // device and projection semantics before retaining any packed view from that plan.
+    for row in plan
+        .tensors
+        .iter()
+        .filter(|r| r.residency.mode == ResidencyMode::Packed)
+    {
+        let supported = BASELINE_CODECS
+            .iter()
+            .find(|c| c.codec_id == row.codec_id)
+            .is_some_and(|codec| {
+                MlxCodecResidency.residency_for_key(&row.logical_key, codec, &row.codec, &row.shape)
+                    == ResidencyMode::Packed
+            });
+        if !supported {
+            return Err(Error::Msg(format!("{}: {} has no Packed operator for this device and geometry; replan with a dense residency policy", row.physical_key, row.codec_id)));
+        }
+    }
     let mut physical = load_planned_file(path)?;
     let mut on_disk: Vec<&str> = physical.keys().map(String::as_str).collect();
     on_disk.sort_unstable();
@@ -192,12 +210,16 @@ pub fn read_logical_weights(
                     | TensorCodecSpec::RowwiseFp8 { .. }
             )
         {
-            let base = tensor.logical_key.strip_suffix(".weight").ok_or_else(|| {
-                Error::Msg(format!(
-                    "{}: packed projection requires a weight key",
-                    tensor.logical_key
-                ))
-            })?;
+            let base = tensor
+                .logical_key
+                .strip_suffix(".weight")
+                .or_else(|| tensor.logical_key.strip_suffix("_weight"))
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: packed projection requires a weight key",
+                        tensor.logical_key
+                    ))
+                })?;
             let (mut fp8, scale, input) = bind_fp8(tensor, array, &physical)?;
             if let Some(obs) = logical.source_reads.get(&tensor.logical_key) {
                 fp8.observe(obs)?;
@@ -224,12 +246,16 @@ pub fn read_logical_weights(
                     tensor.logical_key
                 )));
             }
-            let base = tensor.logical_key.strip_suffix(".weight").ok_or_else(|| {
-                Error::Msg(format!(
-                    "{}: native projection must map to a weight",
-                    tensor.logical_key
-                ))
-            })?;
+            let base = tensor
+                .logical_key
+                .strip_suffix(".weight")
+                .or_else(|| tensor.logical_key.strip_suffix("_weight"))
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "{}: native projection must map to a weight",
+                        tensor.logical_key
+                    ))
+                })?;
             let (codes, scales, layout) = if let Some(t) = &tensor.transform {
                 let start = t.rows.start;
                 let n = t.rows.len;
@@ -543,11 +569,11 @@ fn decode(
     if let Some(refusal) = tensor.matrix_rank_refusal() {
         return Err(Error::Msg(refusal));
     }
-    // Native ConvRot was bound by the caller. Only dense decode arms can reach this point.
+    // Packed operators are bound by the caller. Only dense decode arms can reach this point.
     if tensor.residency.mode != ResidencyMode::Dense {
         return Err(Error::Msg(format!(
             "codec {}: tensor {:?} was planned with {:?} residency ({} stored bytes), but this \
-             engine decodes every codec to its dense resident form; replan with a dense residency \
+             codec uses a dense resident form on this engine; replan with a dense residency \
              policy instead of silently materializing the dense reconstruction where the plan \
              priced the stored packing",
             tensor.codec_id,
@@ -2027,30 +2053,20 @@ mod tests {
         assert_eq!(as_f32(&weights, "alpha"), [2.0]);
     }
 
-    /// **sc-20651 blocker 4: this engine refuses a `Packed` plan entry instead of dense-decoding it.**
-    ///
-    /// Every arm of `decode` produces the codec's dense resident form, because MLX has no packed
-    /// fp8/int8/fp4 matmul on this seam — so this engine's own policy is
-    /// `DenseResidencyPolicy`. The reader was *assuming* that rather than checking it. A `Packed`
-    /// entry arriving from a foreign policy (or from a policy that grows a packed row) would
-    /// materialize the dense reconstruction of a layer admission priced at its stored packing:
-    /// bf16 is 2 bytes/element against fp8's 1, so the load silently costs twice the admitted
-    /// footprint, with the receipt reporting the larger number long after admission committed to
-    /// the smaller one.
     #[test]
-    fn read_refuses_a_packed_plan_entry_rather_than_dense_decoding_it() {
+    fn read_refuses_a_foreign_packed_plan_without_a_native_operator() {
         let dir = fixture_dir();
         let path = dir.path().join("packed-plan.safetensors");
-        let descriptor = br#"{"format": "float8_e4m3fn"}"#;
+        let descriptor = br#"{"format": "int8_tensorwise", "per_row": true}"#;
         write_safetensors(
             &path,
             &[
-                ("model.q.weight", "F8_E4M3", &[2, 4], vec![0x38; 8]),
+                ("model.q.weight", "I8", &[2, 4], vec![1; 8]),
                 (
                     "model.q.weight_scale",
                     "F32",
-                    &[],
-                    1.0_f32.to_le_bytes().to_vec(),
+                    &[2, 1],
+                    1.0_f32.to_le_bytes().repeat(2),
                 ),
                 (
                     "model.q.comfy_quant",
@@ -2061,7 +2077,7 @@ mod tests {
             ],
         );
 
-        // The engine's own plan is dense, and reads.
+        // The unrotated per-row I8 matrix has a dense decoder; ConvRot uses a separate operator.
         let dense = plan_logical_weights(&path, &StripModel).expect("plan");
         assert_eq!(dense.tensors[0].residency.mode, ResidencyMode::Dense);
         eager_read(&path, &dense);
@@ -2076,7 +2092,7 @@ mod tests {
         let mut materialize = |weights: &mut Weights| weights.materialize();
         let error = read_logical_weights(&path, &packed, LogicalReadMode::Eager(&mut materialize))
             .err()
-            .expect("a packed plan entry must refuse on an engine with no packed leg");
+            .expect("the plain per-row format has no native Metal activation/GEMM contract");
         let error = error.to_string();
         assert!(error.contains("model.q.weight"), "{error}");
         assert!(error.contains("Packed"), "{error}");
