@@ -348,7 +348,7 @@ impl TryFrom<&GenerationRequest> for ImageInputs {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RenderLoadBinding {
     #[serde(skip)]
-    video_source: Option<Box<VideoSourceBinding>>,
+    video_source: Option<std::sync::Arc<VideoSourceBinding>>,
     weights: crate::WeightsSource,
     resolved_route: Option<String>,
     quant: Option<crate::Quant>,
@@ -369,6 +369,7 @@ pub struct RenderLoadBinding {
 #[derive(Clone, Debug, PartialEq)]
 struct VideoSourceBinding {
     pins: crate::PreparedFilePins,
+    inventory: Option<std::sync::Arc<crate::SourceInventory>>,
     policies: Vec<crate::MemoryDecodeGeometryPolicy>,
     authoritative: bool,
     runtime: Option<crate::MemoryDecodeQualityRuntimeIdentity>,
@@ -378,7 +379,8 @@ impl RenderLoadBinding {
     /// Capture the same source and decode-policy metadata at pre-load and at factory entry.
     pub fn from_video_spec(spec: &LoadSpec) -> Self {
         Self {
-            video_source: Some(Box::new(VideoSourceBinding {
+            video_source: Some(std::sync::Arc::new(VideoSourceBinding {
+                inventory: spec.retained_source_inventory(),
                 pins: spec.prepared_file_pins().clone(),
                 policies: spec.decode_geometry_policies.clone(),
                 authoritative: spec.decode_geometry_policy_authoritative,

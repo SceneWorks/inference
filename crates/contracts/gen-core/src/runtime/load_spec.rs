@@ -834,6 +834,12 @@ impl LoadSpec {
         Ok(())
     }
 
+    pub(crate) fn retained_source_inventory(
+        &self,
+    ) -> Option<std::sync::Arc<crate::SourceInventory>> {
+        self.source_inventory.clone()
+    }
+
     pub fn source_inventory(&self) -> Option<&crate::SourceInventory> {
         self.source_inventory.as_deref()
     }

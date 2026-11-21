@@ -419,8 +419,8 @@ pub trait Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedGeneration> {
         plan.check_provider(self.descriptor(), self.video_load_binding())?;
-        self.validate_video_plan(plan, req)?;
         plan.run(req, self.memory_strategy_contract(), scope, |scope| {
+            self.validate_video_plan(plan, req)?;
             self.generate_with_scoped_execution_report(req, Some(scope), on_progress)
         })
     }

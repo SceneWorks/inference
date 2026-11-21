@@ -28,6 +28,8 @@ pub struct VideoPhaseLayout {
     pub identity: RenderPhaseIdentity,
     pub latent_frames: u32,
     pub latent_bytes: u64,
+    /// Distinct prepared tensor storage kept alongside the latent for this whole denoise.
+    pub retained_bytes: u64,
     pub decoded_frames: u32,
     pub decode_chunk_frames: u32,
     pub source: Range<usize>,
@@ -60,6 +62,7 @@ impl VideoPlanLayout {
                 identity: phase.identity,
                 latent_frames: phase.latent_frames,
                 latent_bytes,
+                retained_bytes: 0,
                 decoded_frames,
                 decode_chunk_frames,
                 source: 0..output.frames as usize,
@@ -218,7 +221,9 @@ impl VideoRenderPlan {
         spec: &LoadSpec,
         req: &GenerationRequest,
     ) -> Result<Option<Self>> {
-        let Some(layout) = (registration.compile)(spec, req)? else {
+        let Some(layout) =
+            spec.read_prepared_files_unchanged(|| (registration.compile)(spec, req))?
+        else {
             return Ok(None);
         };
         layout.validate()?;
@@ -237,6 +242,16 @@ impl VideoRenderPlan {
     }
     pub fn geometry(&self) -> MemoryGeometry {
         self.layout.admission
+    }
+
+    /// Check the public request boundary before constructing a source-bound evidence receipt.
+    pub fn check_inputs(&self, req: &GenerationRequest) -> Result<()> {
+        if self.inputs != VideoInputs::from_request(req)? {
+            return Err(Error::Unsupported(
+                "video inputs changed after admission".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_provider(
@@ -270,7 +285,9 @@ impl VideoRenderPlan {
     ) -> Result<Self> {
         let mut load = self.load.clone();
         load.sequential_offload = spec.offload_policy == crate::OffloadPolicy::Sequential;
-        if load != RenderLoadBinding::from_video_spec(spec)
+        if self.bound
+            || (context.is_none() && req.memory != self.memory)
+            || load != RenderLoadBinding::from_video_spec(spec)
             || self.inputs != VideoInputs::from_request(req)?
             || context.is_some_and(|c| c.geometry != self.geometry())
         {
@@ -278,7 +295,9 @@ impl VideoRenderPlan {
                 "video admission crossed its load, input or geometry binding".into(),
             ));
         }
-        let Some(layout) = (self.registration.compile)(spec, req)? else {
+        let Some(layout) =
+            spec.read_prepared_files_unchanged(|| (self.registration.compile)(spec, req))?
+        else {
             return Err(Error::Unsupported("admitted video route changed".into()));
         };
         layout.validate()?;
@@ -312,45 +331,57 @@ impl VideoRenderPlan {
     }
 
     pub fn minimum_denoise_live_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
-        let inputs = if domain == MemoryBudgetDomain::HostRam
-            || domain == MemoryBudgetDomain::UnifiedMemory && self.layout.domain == domain
-        {
-            self.inputs.carrier_bytes
-        } else {
-            0
-        };
-        let latent = if domain == self.layout.domain {
-            self.layout
-                .phases
-                .iter()
-                .map(|p| p.latent_bytes)
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        inputs
-            .checked_add(latent)
-            .ok_or_else(|| Error::Unsupported("video denoise size overflow".into()))
+        let mut peak = 0;
+        for phase in &self.layout.phases {
+            peak = peak.max(crate::sum_deduplicated_live_bytes(
+                domain,
+                &[
+                    self.source_allocation(),
+                    crate::PricedAllocation::new(
+                        "video_latent",
+                        self.layout.domain,
+                        phase.latent_bytes,
+                    ),
+                    crate::PricedAllocation::new(
+                        "denoise_conditioning",
+                        self.layout.domain,
+                        phase.retained_bytes,
+                    ),
+                ],
+            )?);
+        }
+        Ok(peak)
     }
 
-    /// Independent floor on one budget. Source pixels survive until the buffered RGB
-    /// result is complete. Neither resident weights nor opaque calibrated high-water marks
-    /// participate here: the application's existing priced operation owns those charges.
-    pub fn minimum_live_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
-        let denoise = self.minimum_denoise_live_bytes(domain)?;
-        if domain != MemoryBudgetDomain::HostRam
-            && !(domain == MemoryBudgetDomain::UnifiedMemory && self.layout.domain == domain)
-        {
-            return Ok(denoise);
+    fn host_domain(&self) -> MemoryBudgetDomain {
+        if self.layout.domain == MemoryBudgetDomain::UnifiedMemory {
+            MemoryBudgetDomain::UnifiedMemory
+        } else {
+            MemoryBudgetDomain::HostRam
         }
+    }
+
+    fn source_allocation(&self) -> crate::PricedAllocation {
+        crate::PricedAllocation::new("source_rgb", self.host_domain(), self.inputs.carrier_bytes)
+    }
+
+    /// Minimum live buffers on a single physical budget. Source pixels survive until the
+    /// buffered result is complete. Existing calibrated costs and resident credits remain
+    /// with the application's priced operation.
+    pub fn minimum_live_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
         let output = self.layout.output;
         let bytes = [output.width, output.height, output.frames, output.batch, 3]
             .into_iter()
             .try_fold(1u64, |n, d| n.checked_mul(u64::from(d)))
-            .and_then(|n| n.checked_add(self.inputs.carrier_bytes))
             .ok_or_else(|| Error::Unsupported("video output size overflow".into()))?;
-        Ok(denoise.max(bytes))
+        let decode = crate::sum_deduplicated_live_bytes(
+            domain,
+            &[
+                self.source_allocation(),
+                crate::PricedAllocation::new("output_rgb", self.host_domain(), bytes),
+            ],
+        )?;
+        Ok(decode.max(self.minimum_denoise_live_bytes(domain)?))
     }
 
     pub(crate) fn run<T>(
