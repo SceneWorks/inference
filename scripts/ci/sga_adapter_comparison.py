@@ -50,6 +50,10 @@ def plan(backend, value, head):
     if head == BASE or subprocess.run(["git", "merge-base", "--is-ancestor", BASE, head],
                                       cwd=ROOT, timeout=30).returncode != 0:
         raise ValueError("candidate must descend from the exact ENG-4a baseline")
+    with TemporaryDirectory(prefix="sga-adapter-policy-") as directory:
+        policy_path = Path(directory) / "policy.json"
+        proof.write_json(policy_path, POLICY)
+        load_policy(policy_path)
     baseline_tree = paired.git(ROOT, "rev-parse", BASE + "^{tree}")
     return {"schema": 1, "protocol": "sga-adapter-tier1-v1", "runner": proof.NAX_ROUTES["nax"]["labels"],
             "asset_setup": "sga-adapter-comparison", "backend": backend, "request": value,
@@ -125,7 +129,8 @@ def attempt_identity(env):
 
 
 def validate_guard(row):
-    if (row.get("returncode") != 0 or type(row.get("pid")) is not int or row["pid"] <= 0
+    if (type(row.get("returncode")) is not int or row["returncode"] != 0
+            or type(row.get("pid")) is not int or row["pid"] <= 0
             or type(row.get("elapsed_seconds")) not in (int, float)
             or not 0 < row["elapsed_seconds"] <= POLICY["deadlineSeconds"]
             or type(row.get("peak_host_bytes")) is not int

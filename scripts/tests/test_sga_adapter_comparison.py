@@ -47,7 +47,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_evidence_must_distinguish_bare_and_both_experts(self):
         marker = "SGA_ADAPTER_TIER1_BODY " + wan.PROFILE
-        row = {"device": "mlx-metal", "shape": wan.SHAPE, "order": wan.ORDER,
+        row = {"device": {"kind": "mlx-metal", "index": 0}, "shape": wan.SHAPE, "order": wan.ORDER,
                "applied": {"high": [1, 1, 1], "low": [1, 1, 1]},
                "velocity_bits": {key: [index] * 768 for index, key in enumerate(("bare", "low", "high"))}}
         with tempfile.TemporaryDirectory() as directory:

@@ -38,7 +38,8 @@ def contract():
                      "text_shape": [64, 4096], "retained_bf16_bytes": ASSEMBLED_WEIGHT_BYTES},
         "settings": {"stage": "dense fold and one velocity per bare/high/low arm", "timestep": 900,
                      "fixture_seed": fixture.SEED, "base_dtype": "BF16", "factor_dtype": "BF16",
-                     "latent_dtype": "F32", "rank": 4, "target": TARGET, "adapters_in_load_order":
+                     "device": {"kind": "mlx-metal", "index": 0}, "latent_dtype": "F32",
+                     "rank": 4, "target": TARGET, "adapters_in_load_order":
                          [{"id": name, "scale": scale} for name, scale in ADAPTERS],
                      "expected_expert_order": ORDER},
         "tolerance": {"class": "AP13(a)", "output": "bit-exact finite F32 for all three velocities",
@@ -161,7 +162,7 @@ def observe(stdout, out):
         raise ValueError("missing unique completed Wan Metal fixture body")
     row = json.loads(out.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     if (not isinstance(row, dict) or set(row) != {"device", "order", "applied", "shape", "velocity_bits"}
-            or row["device"] != "mlx-metal" or row["order"] != ORDER
+            or row["device"] != {"kind": "mlx-metal", "index": 0} or row["order"] != ORDER
             or row["applied"] != {"high": [1, 1, 1], "low": [1, 1, 1]} or row["shape"] != SHAPE):
         raise ValueError("Wan fixture device, shape or expert route differed from its contract")
     velocities = row["velocity_bits"]

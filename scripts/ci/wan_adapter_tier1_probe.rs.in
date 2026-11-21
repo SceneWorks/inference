@@ -13,6 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = Stream::task_local_or_default();
     let device = stream.get_device()?;
     assert!(matches!(device.get_type()?, DeviceType::Gpu));
+    let device_index = device.get_index()?;
+    assert_eq!(device_index, 0);
     let mut config = WanModelConfig::wan22_t2v_14b();
     assert_eq!(
         (config.dim, config.num_heads, config.text_dim),
@@ -61,10 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(output.shape(), latent.shape());
         assert_eq!(output.dtype(), Dtype::Float32);
         eval([&output])?;
-        assert!(matches!(
-            Stream::task_local_or_default().get_device()?.get_type()?,
-            DeviceType::Gpu
-        ));
+        let actual = Stream::task_local_or_default().get_device()?;
+        assert!(matches!(actual.get_type()?, DeviceType::Gpu));
+        assert_eq!(actual.get_index()?, device_index);
         let bits: Vec<_> = output
             .as_slice::<f32>()
             .iter()
@@ -72,7 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         velocity.insert(name.to_string(), json!(bits));
     }
-    let result: Value = json!({"device": "mlx-metal", "shape": latent.shape(), "order": order,
+    let result: Value = json!({"device": {"kind": "mlx-metal", "index": device_index},
+                              "shape": latent.shape(), "order": order,
                               "applied": applied, "velocity_bits": velocity});
     let mut file = OpenOptions::new()
         .write(true)
