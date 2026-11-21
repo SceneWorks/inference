@@ -78,21 +78,20 @@ pub(crate) fn scaled_builder(
     dev: &candle_gen::candle_core::Device,
     rename: impl Fn(&str) -> String,
 ) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
-    let mut has_scale = false;
-    let builder = candle_gen::loader::remap_file_var_builder(file, dtype, dev, |key, _| {
-        has_scale |= key.ends_with(".scale_weight") || key.ends_with(".weight_scale");
-        if key == "scaled_fp8"
-            || key == "freqs"
-            || key.ends_with(".freqs")
-            || candle_gen::gen_core::checkpoint_codec::projection_companion_base(key).is_some()
-        {
-            return Ok(Vec::new());
-        }
-        Ok(vec![candle_gen::loader::SourceView::Whole(rename(key))])
-    })?;
-    if !has_scale {
+    let (builder, encoded) =
+        candle_gen::loader::remap_file_var_builder_with_source(file, dtype, dev, |key, _| {
+            if key == "scaled_fp8"
+                || key == "freqs"
+                || key.ends_with(".freqs")
+                || candle_gen::gen_core::checkpoint_codec::projection_companion_base(key).is_some()
+            {
+                return Ok(Vec::new());
+            }
+            Ok(vec![candle_gen::loader::SourceView::Whole(rename(key))])
+        })?;
+    if !encoded {
         return Err(CandleError::Msg(
-            "Wan ComfyUI scaled checkpoint has no weight scale companion".into(),
+            "Wan ComfyUI encoded checkpoint has no supported projection operands".into(),
         ));
     }
     Ok(builder)
@@ -387,6 +386,16 @@ mod tests {
             w(&[2, 2], DType::BF16),
         );
         assert!(remap_and_dequant_comfyui_expert(src, DType::BF16).is_err());
+    }
+
+    #[test]
+    fn bare_fp8_expert_uses_shared_source_without_a_scale_companion() {
+        let key = "blocks.0.self_attn.q.weight";
+        let source = HashMap::from([(key.to_owned(), w(&[2, 2], DType::F8E4M3))]);
+        let remapped = remap_and_dequant_comfyui_expert(source, DType::F32).unwrap();
+        let weight = &remapped["blocks.0.attn1.to_q.weight"];
+        assert_eq!(weight.dims(), &[2, 2]);
+        assert_eq!(weight.dtype(), DType::F32);
     }
 
     // --- UMT5 dequant (sc-10909): same scaled-fp8, but identity key remap ---

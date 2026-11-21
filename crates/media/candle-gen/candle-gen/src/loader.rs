@@ -33,8 +33,18 @@ pub fn remap_file_var_builder(
     file: &Path,
     dtype: DType,
     dev: &Device,
-    mut mapping: impl FnMut(&str, &[usize]) -> Result<Vec<SourceView>>,
+    mapping: impl FnMut(&str, &[usize]) -> Result<Vec<SourceView>>,
 ) -> Result<VarBuilder<'static>> {
+    remap_file_var_builder_with_source(file, dtype, dev, mapping).map(|(builder, _)| builder)
+}
+
+/// Return the format admission decision made by the projection reader that owns these views.
+pub fn remap_file_var_builder_with_source(
+    file: &Path,
+    dtype: DType,
+    dev: &Device,
+    mut mapping: impl FnMut(&str, &[usize]) -> Result<Vec<SourceView>>,
+) -> Result<(VarBuilder<'static>, bool)> {
     let st = mmap_safetensors(file)?;
     let mut views = std::collections::BTreeMap::new();
     for (name, tensor) in st.tensors() {
@@ -44,7 +54,8 @@ pub fn remap_file_var_builder(
         }
     }
     let files = [file.to_owned()];
-    let builder = candle_checkpoint::remapped_var_builder(st, &files, dtype, dev, views)?;
+    let builder =
+        candle_checkpoint::remapped_var_builder_with_source(st, &files, dtype, dev, views)?;
     #[cfg(feature = "model-inference-proof")]
     gen_core::model_input_proof::record_reader_paths(
         "candle-gen::loader::remap_file_var_builder",

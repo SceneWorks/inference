@@ -896,6 +896,17 @@ pub fn remapped_var_builder(
     dev: &Device,
     views: BTreeMap<String, Vec<SourceView>>,
 ) -> Result<VarBuilder<'static>> {
+    remapped_var_builder_with_source(st, files, dtype, dev, views).map(|(builder, _)| builder)
+}
+
+/// Also report whether the shared planner bound an encoded source in the selected namespace.
+pub fn remapped_var_builder_with_source(
+    st: MmapedSafetensors,
+    files: &[PathBuf],
+    dtype: DType,
+    dev: &Device,
+    views: BTreeMap<String, Vec<SourceView>>,
+) -> Result<(VarBuilder<'static>, bool)> {
     use gen_core::checkpoint_codec::{
         LogicalTransformDeclaration, LogicalTransformOutput, RowRange,
     };
@@ -943,10 +954,10 @@ pub fn remapped_var_builder(
         Ok(src) => MappedWeights::Checkpoint(src),
         Err(st) => MappedWeights::Plain(st),
     };
-    Ok(VarBuilder::from_backend(
-        Box::new(Remapped { source, names }),
-        dtype,
-        dev.clone(),
+    let encoded = matches!(&source, MappedWeights::Checkpoint(_));
+    Ok((
+        VarBuilder::from_backend(Box::new(Remapped { source, names }), dtype, dev.clone()),
+        encoded,
     ))
 }
 
