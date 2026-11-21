@@ -2265,7 +2265,7 @@ mod tests {
             (&refinement_scales, 2.0),
             (&base_scales, 5.0),
         ] {
-            let output = lin.forward_with_scales(&x, context).unwrap();
+            let output = __model_proof_output!(lin.forward_with_scales(&x, context)).unwrap();
             assert_eq!(output.to_vec2::<f32>().unwrap(), vec![vec![expected]]);
         }
 
