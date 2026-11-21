@@ -628,14 +628,22 @@ def check_complete_provenance(receipt, contract):
             raise ValueError("accepted proof package set differs from the hosted plan")
         for model in models:
             verify_target(targets[model], backend, model, arm)
-    actual = receipt["execution_order"]
-    if not isinstance(actual, list) or [r.get("phase") for r in actual] != list(phases(contract["cases"], contract.get("followup"))):
+    verify_execution_order(receipt["execution_order"], contract, complete=True)
+
+
+def verify_execution_order(actual, contract, *, complete):
+    extension = contract.get("followup")
+    expected = phases(contract["cases"], extension)
+    if (not isinstance(actual, list) or any(not isinstance(row, dict) for row in actual)
+            or [row.get("phase") for row in actual] != list(expected if complete else expected[:len(actual)])):
         raise ValueError("measurement order differs from fixed adjacent counterbalanced pairs")
     previous = 0
     for measurement in actual:
         start, end = measurement["start_ns"], measurement["end_ns"]
         if not (evidence.positive_int(start) and evidence.positive_int(end) and previous <= start < end):
             raise ValueError("overlapping or unordered process timings")
+        if extension and extension["name"] == targeted.NAME and "-timing-" in measurement["phase"]:
+            targeted.verify_clocks(measurement, contract["request"]["policy"]["cudaDeviceUuid"])
         previous = end
 
 
@@ -670,12 +678,15 @@ def verify(args, contract):
     if backend == "candle-cuda" and receipt.get("observations"):
         from scripts.ci import wddm_process_memory
         wddm_process_memory.validate_adapter(receipt.get("dedicated_adapter"), contract["request"]["policy"]["cudaDeviceUuid"])
-    if contract["request"].get("followup") == targeted.NAME:
-        for measurement in receipt["execution_order"]:
-            if "-timing-" in measurement["phase"]:
-                targeted.verify_clocks(measurement, contract["request"]["policy"]["cudaDeviceUuid"])
+    diagnostic = contract["request"].get("followup") == targeted.NAME
     if receipt["accepted"]:
         check_complete_provenance(receipt, contract)
+    elif diagnostic:
+        # An inconclusive timing metric can coexist with a usable memory pair.
+        # Prove every completed role ran in its predeclared position in that case too.
+        verify_execution_order(receipt["execution_order"], contract, complete=False)
+        if not receipt["observations"].keys() <= {role["phase"] for role in receipt["execution_order"]}:
+            raise ValueError("recorded measurements lack ordered child windows")
     required = {name for name in entries if not name.endswith(".guard.jsonl")}
     observations = receipt["observations"]
     if not observations.keys() <= set(phases(contract["cases"], contract.get("followup"))):
@@ -707,6 +718,8 @@ def verify(args, contract):
                 if observed != row["result"]:
                     raise ValueError("recorded measurements differ from raw observations")
                 results[name] = observed
+            if diagnostic and case in receipt["comparisons"] and len(results) != len(expected_schedule):
+                raise ValueError("targeted conclusion lacks its complete fixed schedule")
             if len(results) == len(expected_schedule):
                 result = compare_case(case, contract.get("followup"), results)
                 if receipt["comparisons"].get(case) != result or (receipt["accepted"] and not result["accepted"]):

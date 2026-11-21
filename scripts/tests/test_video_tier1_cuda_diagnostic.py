@@ -84,6 +84,17 @@ class TargetedCudaTests(unittest.TestCase):
         roles[case + "-memory-p4-head"]["cuda_process"]["dedicated"]["sampled_peak_bytes"] = None
         self.assertFalse(proof.compare_case(case, extension, roles)["accepted"])
 
+    def test_inconclusive_job_requires_an_ordered_prefix_before_reusing_completed_slots(self):
+        cases, extension = self.binding(proof.cohorts.SCAIL)
+        contract = {"cases": cases, "followup": extension}
+        phases = proof.phases(cases, extension)
+        roles = [{"phase": phase, "start_ns": 10 + 10 * i, "end_ns": 16 + 10 * i}
+                 for i, phase in enumerate(phases)]
+        proof.verify_execution_order(roles[:1], contract, complete=False)
+        for bad in (roles[1:], roles[::-1], [roles[0], dict(roles[1], start_ns=15)]):
+            with self.assertRaises(ValueError):
+                proof.verify_execution_order(bad, contract, complete=False)
+
     def test_selected_card_clock_samples_are_outside_each_timing_role(self):
         uuid = followup.CUDA_UUID
         with patch("scripts.media_campaign_windows.trusted_nvidia_smi", return_value="trusted-smi"), \
