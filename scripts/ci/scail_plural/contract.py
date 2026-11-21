@@ -14,6 +14,14 @@ GIB = 1024**3
 MIB = 1024**2
 SELECTION = "scail2-plural-fit"
 PROTOCOL = SELECTION + "-v1"
+CONTINUATION = "quiet-gpu0-2-to-5"
+RECOVERED_SIX = {
+    "run_id": "44935671433", "run_attempt": "1", "artifact_id": "14719969057",
+    "inference_revision": "7f6c4cca3fc053030bd71f0bfce6886adb762eb6",
+    "plan_sha256": "0bcc7e1047f960234f93ba23c04a2abfe99c2581287c4163224defe74e4751b7",
+    "archive_sha256": "83985597d8d0cf2399b2311c1f1d737058cc1c1530b1a53fce6c79faee123969",
+    "receipt_sha256": "750313a3cdb89dd4a0e4e49b31935949301b309fe9410f2bf0ce47cb4628575f",
+}
 REV = "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
 REPO = "SceneWorks/scail2-mlx"
 INVENTORY = "cbe28c27f7a594cb3da8ec54d7f293963c36188a2d371a12be6c3e7fea42f59f"
@@ -195,7 +203,7 @@ class IncompleteWddmSamples(ValueError):
     """A released render with a genuine missing poll in an otherwise valid sample series."""
 
 
-def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision):
+def measured_row(data, guard, pool, adapter, hardware, backend, count, approved, revision, *, completed_job=None):
     validate_native(data, backend, count)
     validate_admission(guard["admission"], policy_sha256=approved.sha256)
     if (
@@ -303,8 +311,8 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
                     or admission["childGpuCapBytes"] != approved.child_gpu_cap_bytes):
                 raise ValueError("rejected CUDA attempt budget differs from the approved guard")
         growth, growth_count = tenant_growth(guard, uuid)
-        stage = render_scope(guard, pool, uuid, growth_count)
-        if incomplete and stage is not None:
+        stage = render_scope(guard, pool, uuid, growth_count, completed_job=completed_job)
+        if stage is not None and (incomplete or "basis" in stage):
             scope = stage
             incomplete = False
         device = max(
@@ -326,7 +334,7 @@ def measured_row(data, guard, pool, adapter, hardware, backend, count, approved,
         raise IncompleteWddmSamples("incomplete owned WDDM poll series")
     return dict(
         machine,
-        **({"cuda_render_scope": scope} if scope is not None else {}),
+        **({("cuda_completed_job" if "basis" in scope else "cuda_render_scope"): scope} if scope is not None else {}),
         inference_revision=revision,
         witness=dict(
             axes=data["axes"],

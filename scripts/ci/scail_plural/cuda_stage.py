@@ -265,7 +265,7 @@ class RenderEnd:
                 }
 
 
-def validate_rejected_growth(guard, end, native_pool, card):
+def validate_rejected_growth(guard, end, native_pool, card, *, completed_job=False):
     """Only the original Job retiring a verified post-output pool can be retried."""
     previous = 0
     exited_at = None
@@ -274,12 +274,13 @@ def validate_rejected_growth(guard, end, native_pool, card):
         i, read, at = event["next_card_index"], event["read_ns"], event["at_ns"]
         if not (
             mark
-            and zero
             and nonnegative(i)
-            and mark["card_index"] < i <= zero["card_index"] < len(card)
+            and mark["card_index"] < i
+            and ((completed_job and i <= len(card)) or (zero and i <= zero["card_index"] < len(card)))
             and nonnegative(read)
             and nonnegative(at)
-            and max(previous, card[i - 1][0]) < read <= at <= card[i][0]
+            and max(previous, card[i - 1][0]) < read <= at
+            and (i == len(card) or at <= card[i][0])
             and type(event["pid"]) is int
             and event["pid"] == mark["pid"]
             and type(event["created_filetime"]) is int
@@ -316,12 +317,12 @@ def validate_rejected_growth(guard, end, native_pool, card):
             exited_at = i
         previous = at
     if exited_at is not None and (
-        zero["before"] != "exited_empty" or any(row[2] for row in card[exited_at:])
+        (zero is not None and zero["before"] != "exited_empty") or any(row[2] for row in card[exited_at:])
     ):
         raise ValueError("CUDA usage resumed after the original Job exited")
 
 
-def render_scope(guard, native_pool, cuda_uuid, growth_count):
+def render_scope(guard, native_pool, cuda_uuid, growth_count, *, completed_job=None):
     raw = guard["fit_observation"]
     end = raw.get("cuda_render_end")
     if end is None:
@@ -397,6 +398,10 @@ def render_scope(guard, native_pool, cuda_uuid, growth_count):
     ):
         raise ValueError("CUDA end-of-render marker differs from the owned pool")
     if zero is None:
+        if completed_job is not None and end.get("rejected_growth"):
+            from scripts.ci.scail_plural.completed_job import terminal_scope
+            claim, basis = completed_job
+            return terminal_scope(guard, end, native_pool, card, claim, basis)
         if end.get("rejected_growth"):
             raise ValueError("rejected CUDA pool attempt without a verified owned zero")
         return None

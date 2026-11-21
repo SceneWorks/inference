@@ -146,7 +146,8 @@ def retain_logs(work, artifact, receipt, phases=PHASES):
 
 
 def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None,
-           arguments=(), capture_cuda_basis=False, dedicated_adapter=None, observer=None, retain_owned_completion=False):
+           arguments=(), capture_cuda_basis=False, dedicated_adapter=None, observer=None, retain_owned_completion=False,
+           completion_claim=None):
     if last_child_start is not None and time.monotonic() >= last_child_start:
         raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
@@ -165,8 +166,13 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
-                            probe=probe, retain_owned_completion=retain_owned_completion)
+                            probe=probe, retain_owned_completion=retain_owned_completion or completion_claim is not None,
+                            claim_deadline_monotonic=completion_claim["claim_deadline_monotonic"] if completion_claim is not None else None)
+        if completion_claim is not None:
+            completion_claim["owned_execution_completion"] = guard.owned_completion
     except SupervisionError as error:
+        if completion_claim is not None and isinstance(getattr(error, "owned_completion", None), dict):
+            completion_claim["owned_execution_completion"] = error.owned_completion
         proof.write_json(out / "supervisor.json", {
             "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
             "host_memory": error.watchdog_host_memory, "child_footprint": error.watchdog_child_footprint,
