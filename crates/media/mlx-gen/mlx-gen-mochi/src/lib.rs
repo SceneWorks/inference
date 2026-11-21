@@ -96,6 +96,14 @@ mod explicit_registry_tests {
         );
         assert_eq!((phase.decoded_frames, phase.decode_chunk_frames), (9, 3));
         assert_eq!(plan.layout().output.frames, 7);
+        // All seven cropped f32 frames are live beside their concatenation. The two
+        // contiguous RGB copies (one array and the returned vectors) are a smaller peak.
+        let rgb_frame = 64 * 48 * 3;
+        assert_eq!(
+            plan.minimum_decode_live_bytes(mlx_gen::gen_core::MemoryBudgetDomain::UnifiedMemory)
+                .unwrap(),
+            14 * 4 * rgb_frame
+        );
         let invalid = GenerationRequest {
             frames: Some(8),
             ..req

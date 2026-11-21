@@ -49,6 +49,13 @@ pub fn check_layout(
     Ok(())
 }
 
+/// Candle's first temporal crop is a view, while MLX gathers the cropped frames.
+#[derive(Clone, Copy)]
+pub enum MochiDecoder {
+    Candle,
+    Mlx,
+}
+
 /// Request-owned Mochi trajectory and the actual spatial grid fed to its transformer.
 pub struct MochiVideo {
     pub phase: VideoDenoisePhase<(), MochiEuler>,
@@ -104,6 +111,7 @@ impl MochiVideo {
     pub fn layout(
         &self,
         chunk_latent_frames: usize,
+        decoder: MochiDecoder,
         domain: gen_core::MemoryBudgetDomain,
     ) -> gen_core::Result<gen_core::VideoPlanLayout> {
         let latent_frames = self.phase.latent_frames;
@@ -127,15 +135,70 @@ impl MochiVideo {
             frames: decoded_frames - (self.temporal_ratio - 1),
             ..self.phase.identity.geometry
         };
-        Ok(gen_core::VideoPlanLayout::single(
+        let chunk_frames = chunk * self.temporal_ratio;
+        let mut layout = gen_core::VideoPlanLayout::single(
             output,
             &self.phase,
             latent_bytes,
             decoded_frames,
-            chunk * self.temporal_ratio,
+            chunk_frames,
             vec![],
             domain,
-        ))
+        );
+        // A returned frame has three channels. The VAE projects into f32 on both backends.
+        let overflow = || Error::Unsupported("Mochi decoder byte count overflows".into());
+        let rgb_frame = u64::from(output.width)
+            .checked_mul(u64::from(output.height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(overflow)?;
+        let f32_frame = rgb_frame
+            .checked_mul(size_of::<f32>() as u64)
+            .ok_or_else(overflow)?;
+        let frames = u64::from(output.frames);
+        let raw = u64::from(decoded_frames);
+        let rgb = rgb_frame.checked_mul(frames).ok_or_else(overflow)?;
+        let chunked = chunk < latent_frames;
+        let (decoder_frames, conversion) = match decoder {
+            MochiDecoder::Candle => {
+                // narrow() retains the entire first chunk, including its discarded prefix.
+                // A multi-chunk cat allocates the cropped clip beside all raw chunk backings.
+                let (live, returned) = if chunked {
+                    (raw + frames, frames)
+                } else {
+                    (raw, raw)
+                };
+                let decoded = f32_frame.checked_mul(returned).ok_or_else(overflow)?;
+                // render retains the f32 video and u8 frames tensor. to_vec1 creates a flat host
+                // Vec that stays live as the individual Image.pixels buffers are copied.
+                (
+                    live,
+                    gen_core::VideoOutputConversion {
+                        device_bytes: decoded.checked_add(rgb).ok_or_else(overflow)?,
+                        host_bytes: rgb,
+                    },
+                )
+            }
+            MochiDecoder::Mlx => {
+                // take_axis gathers a new buffer while the first raw chunk is live. Later,
+                // concatenate reads all evaluated cropped chunks into one distinct f32 clip.
+                let kept_first = chunk_frames - (self.temporal_ratio - 1);
+                let crop = u64::from(chunk_frames) + u64::from(kept_first);
+                let live = if chunked { crop.max(2 * frames) } else { crop };
+                // decode_to_frames releases the f32 handle before the final copy. The u8
+                // frame tensor is already row-major: the reshape and host slice share its storage.
+                (
+                    live,
+                    gen_core::VideoOutputConversion {
+                        device_bytes: rgb,
+                        host_bytes: 0,
+                    },
+                )
+            }
+        };
+        layout.phases[0].decoded_tensor_bytes =
+            f32_frame.checked_mul(decoder_frames).ok_or_else(overflow)?;
+        layout.output_conversion = conversion;
+        Ok(layout)
     }
 }
 
@@ -275,7 +338,11 @@ mod tests {
             };
             let video = MochiVideo::new(&req, &[1, 2, 3], &[2, 2, 2], 37).unwrap();
             let layout = video
-                .layout(1, gen_core::MemoryBudgetDomain::UnifiedMemory)
+                .layout(
+                    1,
+                    MochiDecoder::Mlx,
+                    gen_core::MemoryBudgetDomain::UnifiedMemory,
+                )
                 .unwrap();
             let phase = &layout.phases[0];
             assert_eq!(layout.output.frames, frames.unwrap_or(19));
@@ -293,6 +360,57 @@ mod tests {
         }
         assert!(MochiVideo::new(&req, &[0], &[8], 37).is_err());
         assert!(MochiVideo::new(&req, &[6], &[usize::MAX, 2], 37).is_err());
+    }
+
+    #[test]
+    fn decoder_backings_and_output_staging_follow_the_backend_crop() {
+        let frame_bytes = 80 * 48 * 3;
+        for (frames, candle_live, candle_staging, mlx_live) in
+            [(1, 6, 25, 7), (7, 19, 35, 14), (19, 43, 95, 38)]
+        {
+            let req = gen_core::GenerationRequest {
+                width: 80,
+                height: 48,
+                frames: Some(frames),
+                ..Default::default()
+            };
+            let video = MochiVideo::new(&req, &[1, 2, 3], &[2, 2, 2], 37).unwrap();
+            let candle = video
+                .layout(
+                    1,
+                    MochiDecoder::Candle,
+                    gen_core::MemoryBudgetDomain::DeviceVram,
+                )
+                .unwrap();
+            assert_eq!(
+                candle.phases[0].decoded_tensor_bytes,
+                candle_live * frame_bytes * 4
+            );
+            assert_eq!(
+                candle.output_conversion.device_bytes,
+                candle_staging * frame_bytes
+            );
+            assert_eq!(
+                candle.output_conversion.host_bytes,
+                u64::from(frames) * frame_bytes
+            );
+            let mlx = video
+                .layout(
+                    1,
+                    MochiDecoder::Mlx,
+                    gen_core::MemoryBudgetDomain::UnifiedMemory,
+                )
+                .unwrap();
+            assert_eq!(
+                mlx.phases[0].decoded_tensor_bytes,
+                mlx_live * frame_bytes * 4
+            );
+            assert_eq!(
+                mlx.output_conversion.device_bytes,
+                u64::from(frames) * frame_bytes
+            );
+            assert_eq!(mlx.output_conversion.host_bytes, 0);
+        }
     }
 
     #[derive(Debug, PartialEq)]

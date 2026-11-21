@@ -303,6 +303,7 @@ fn video_layout(
     )?;
     video.layout(
         DEFAULT_DECODE_CHUNK_FRAMES,
+        gen_core_family::mochi::MochiDecoder::Candle,
         candle_gen::default_memory_budget_domain(),
     )
 }
@@ -367,6 +368,30 @@ mod explicit_registry_tests {
         );
         assert_eq!((phase.decoded_frames, phase.decode_chunk_frames), (9, 3));
         assert_eq!(plan.layout().output.frames, 7);
+        // One frame takes the non-chunked path. Its view retains three raw f32 frames
+        // from this fixture's 3x codec. Conversion also holds the u8 tensor, a flat host
+        // vector, and the returned RGB copy. CUDA charges the two host vectors separately.
+        let single_req = GenerationRequest {
+            frames: Some(1),
+            ..req.clone()
+        };
+        let single = registry
+            .compile_video_plan(super::MODEL_ID, &spec, &single_req)
+            .unwrap()
+            .unwrap();
+        let rgb_frame = 64 * 48 * 3;
+        let domain = candle_gen::default_memory_budget_domain();
+        let host = gen_core::MemoryBudgetDomain::HostRam;
+        let expected = if domain == gen_core::MemoryBudgetDomain::DeviceVram {
+            assert_eq!(
+                single.minimum_decode_live_bytes(host).unwrap(),
+                2 * rgb_frame
+            );
+            13 * rgb_frame
+        } else {
+            15 * rgb_frame
+        };
+        assert_eq!(single.minimum_decode_live_bytes(domain).unwrap(), expected);
         let invalid = GenerationRequest {
             frames: Some(8),
             ..req

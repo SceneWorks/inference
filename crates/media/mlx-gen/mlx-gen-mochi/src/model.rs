@@ -208,6 +208,7 @@ fn video_layout(
     )?;
     video.layout(
         crate::DEFAULT_DECODE_CHUNK_FRAMES,
+        gen_core_family::mochi::MochiDecoder::Mlx,
         gen_core::MemoryBudgetDomain::UnifiedMemory,
     )
 }
