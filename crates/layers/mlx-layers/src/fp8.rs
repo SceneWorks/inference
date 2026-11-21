@@ -22,7 +22,7 @@ if (MX) {
 } else {
     rounded = sc_round_fp8(xval / float(sx[ROW ? row : 0]), E5);
 }
-if (col < uint(K)) q[row * uint(K) + col] = rounded;
+if (col < uint(K)) q[row * uint(K) + col] = T(rounded);
 "#;
 
 // Four SIMD groups compute a 16-by-16 tile using 8-by-8 fragments. The tail
@@ -37,7 +37,7 @@ for (uint block = 0; block < (uint(K) + 31u)/32u; ++block) {
     for (uint i = tid; i < 512u; i += 128u) {
         uint r = i/32u, k = block*32u + i%32u;
         uint ar = row0+r, wr = col0+r;
-        act[i] = ar < uint(M) && k < uint(K) ? q[ar*uint(K)+k] : 0.0f;
+        act[i] = ar < uint(M) && k < uint(K) ? float(q[ar*uint(K)+k]) : 0.0f;
         float value = 0.0f;
         if (wr < uint(N) && k < uint(K)) {
             value = sc_decode_fp8(w[wr*uint(STRIDE)+k], E5);
@@ -64,8 +64,10 @@ simdgroup_store(sum, tile+(sg/2u)*8u*16u+(sg%2u)*8u,16);
 threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint i=tid; i < 256u; i+=128u) {
     uint row=row0+i/16u, col=col0+i%16u;
-    if (row < uint(M) && col < uint(N))
-        y[row*uint(N)+col] = MX ? tile[i] : (tile[i]*float(sx[ROW ? row : 0]))*float(sw[ROW ? col : 0]);
+    if (row < uint(M) && col < uint(N)) {
+        float value = MX ? tile[i] : (tile[i]*float(sx[ROW ? row : 0]))*float(sw[ROW ? col : 0]);
+        y[row*uint(N)+col] = T(value);
+    }
 }
 "#;
 
@@ -307,17 +309,16 @@ impl Fp8Linear {
                 ));
             }
             let (quant, project) = cache.as_ref().expect("initialized above");
+            let activation_dtype = if mx != 0 {
+                Dtype::Float32
+            } else {
+                Dtype::Float16
+            };
             let q = quant
                 .apply()
                 .inputs([&input, &sx])
-                .output_shape(
-                    [m, k],
-                    if mx != 0 {
-                        Dtype::Float32
-                    } else {
-                        Dtype::Float16
-                    },
-                )
+                .output_shape([m, k], activation_dtype)
+                .template_arg("T", activation_dtype)
                 .template_arg("K", k)
                 .template_arg("ROW", i32::from(rowwise))
                 .template_arg("MX", mx)
@@ -339,6 +340,7 @@ impl Fp8Linear {
                 .apply()
                 .inputs([&q, &self.codes, &sw, &sx])
                 .output_shape([m, n], x.dtype())
+                .template_arg("T", x.dtype())
                 .template_arg("M", m)
                 .template_arg("N", n)
                 .template_arg("K", k)
