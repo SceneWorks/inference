@@ -30,14 +30,27 @@ pub struct VideoPhaseLayout {
     pub latent_bytes: u64,
     /// Distinct prepared tensor storage kept alongside the latent for this whole denoise.
     pub retained_bytes: u64,
+    /// Known materialized decoder output and preceding stitched buffers live during decode.
+    pub decoded_tensor_bytes: u64,
     pub decoded_frames: u32,
     pub decode_chunk_frames: u32,
     pub source: Range<usize>,
     pub history_frames: usize,
 }
 
+/// Component packing resolved from the actual snapshot metadata and load request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoPackedComponent {
+    pub name: &'static str,
+    pub bits: i32,
+    pub group_size: i32,
+    /// Some when the provider distinguishes stored packing from a dense load-time conversion.
+    pub stored: Option<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoPlanLayout {
+    pub packed_components: Vec<VideoPackedComponent>,
     pub output: MemoryGeometry,
     pub admission: MemoryGeometry,
     pub phases: Vec<VideoPhaseLayout>,
@@ -56,6 +69,7 @@ impl VideoPlanLayout {
         domain: MemoryBudgetDomain,
     ) -> Self {
         Self {
+            packed_components: vec![],
             output,
             admission: phase.identity.geometry,
             phases: vec![VideoPhaseLayout {
@@ -63,6 +77,7 @@ impl VideoPlanLayout {
                 latent_frames: phase.latent_frames,
                 latent_bytes,
                 retained_bytes: 0,
+                decoded_tensor_bytes: 0,
                 decoded_frames,
                 decode_chunk_frames,
                 source: 0..output.frames as usize,
@@ -207,6 +222,7 @@ impl VideoInputs {
 #[derive(Clone, Debug)]
 pub struct VideoRenderPlan {
     registration: VideoPlanRegistration,
+    backend: &'static str,
     layout: VideoPlanLayout,
     load: RenderLoadBinding,
     inputs: VideoInputs,
@@ -218,6 +234,7 @@ pub struct VideoRenderPlan {
 impl VideoRenderPlan {
     pub(crate) fn compile(
         registration: &VideoPlanRegistration,
+        backend: &'static str,
         spec: &LoadSpec,
         req: &GenerationRequest,
     ) -> Result<Option<Self>> {
@@ -229,6 +246,7 @@ impl VideoRenderPlan {
         layout.validate()?;
         Ok(Some(Self {
             registration: *registration,
+            backend,
             layout,
             load: RenderLoadBinding::from_video_spec(spec),
             inputs: VideoInputs::from_request(req)?,
@@ -267,7 +285,10 @@ impl VideoRenderPlan {
             expected.sequential_offload = actual.sequential_offload;
             actual == &expected
         });
-        if descriptor.id != self.registration.provider_id || !matches {
+        if descriptor.id != self.registration.provider_id
+            || descriptor.backend != self.backend
+            || !matches
+        {
             return Err(Error::Unsupported(
                 "video plan and loaded source or placement differ".into(),
             ));
@@ -381,7 +402,23 @@ impl VideoRenderPlan {
                 crate::PricedAllocation::new("output_rgb", self.host_domain(), bytes),
             ],
         )?;
-        Ok(decode.max(self.minimum_denoise_live_bytes(domain)?))
+        let tensor = self
+            .layout
+            .phases
+            .iter()
+            .map(|p| p.decoded_tensor_bytes)
+            .max()
+            .unwrap_or(0);
+        let materialization = crate::sum_deduplicated_live_bytes(
+            domain,
+            &[
+                self.source_allocation(),
+                crate::PricedAllocation::new("decoder_output", self.layout.domain, tensor),
+            ],
+        )?;
+        Ok(decode
+            .max(materialization)
+            .max(self.minimum_denoise_live_bytes(domain)?))
     }
 
     pub(crate) fn run<T>(
@@ -507,3 +544,6 @@ impl MemoryRequestScope for VideoScope<'_, '_> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -106,7 +106,8 @@ pub mod numeric;
 pub mod registry;
 pub mod render;
 pub use render::video_plan::{
-    VideoPhaseLayout, VideoPlanLayout, VideoPlanRegistration, VideoReferenceLayout, VideoRenderPlan,
+    VideoPackedComponent, VideoPhaseLayout, VideoPlanLayout, VideoPlanRegistration,
+    VideoReferenceLayout, VideoRenderPlan,
 };
 pub use render::{
     MultiPassRenderPlan, PlannedPassRequest, ProducedReference, RenderLoadBinding, RenderPlan,

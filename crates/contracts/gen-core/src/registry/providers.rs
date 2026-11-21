@@ -198,7 +198,14 @@ impl ProviderRegistry {
             return Ok(None);
         };
         self.ensure_quant_supported(id, spec, "generator")?;
-        crate::VideoRenderPlan::compile(registration, spec, request)
+        let backend = self
+            .generators
+            .iter()
+            .map(|entry| (entry.descriptor)())
+            .find(|desc| desc.id == id)
+            .expect("registered video plan has an owning generator")
+            .backend;
+        crate::VideoRenderPlan::compile(registration, backend, spec, request)
     }
 
     /// Compile an ordered multi-pass request (Hires.fix: a base pass, then a pass whose reference
