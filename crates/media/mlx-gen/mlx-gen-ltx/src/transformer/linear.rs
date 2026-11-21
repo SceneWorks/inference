@@ -69,7 +69,9 @@ impl Linear {
                     AdaptableLinear::dense(to_dtype(&dense, Dtype::Float32)?, b)
                 }
             }
-            None => AdaptableLinear::dense(to_dtype(w.require(&format!("{prefix}.weight"))?, dt)?, b),
+            None => {
+                AdaptableLinear::dense(to_dtype(w.require(&format!("{prefix}.weight"))?, dt)?, b)
+            }
         };
         Ok(Self { inner })
     }
@@ -99,11 +101,8 @@ impl Linear {
     /// delegating to [`AdaptableLinear::set_adapters`]. Unlike [`push_lora`](Self::push_lora)
     /// this *replaces* the stack (one residual at a time), not append.
     pub(crate) fn set_train_lora(&mut self, a: Array, b: Array) {
-        self.inner.set_adapters(vec![Adapter::Lora {
-            a,
-            b,
-            scale: 1.0,
-        }]);
+        self.inner
+            .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
     }
 
     /// Select the active denoise pass for this linear's LoRA residuals (no-op without adapters).

@@ -98,8 +98,10 @@ mod test_fixture;
 #[cfg(test)]
 mod synthetic;
 
-// Re-export the contract crate so consumers can reach it as `mlx_llm::core_llm::…`.
+// Re-export the contract and shared MLX layer spine crates so consumers can reach them as
+// `mlx_llm::core_llm::…` and `mlx_llm::mlx_layers::…`.
 pub use core_llm;
+pub use mlx_layers;
 
 pub use config::ModelConfig;
 pub use decode::{
