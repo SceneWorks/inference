@@ -183,6 +183,7 @@ impl LinearBias {
         in_features: i32,
         out_features: i32,
     ) -> Result<Self> {
+        w.declare_projection_shape(prefix, [out_features, in_features])?;
         let key = format!("{prefix}.weight");
         let native = w.source_projection(&key)?;
         let weight = w.require(&key)?.clone();

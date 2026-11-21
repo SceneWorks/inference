@@ -100,7 +100,7 @@ REGISTER = re.compile(
     r"\(\s*([\w:]+)"
 )
 OPEN = re.compile(
-    r"Weights::from_(?:file(?:_with_fp8(?:_filter)?)?|dir|paths|source_map)\("
+    r"Weights::from_(?:file(?:_with_fp8(?:_filter)?)?|(?:dir|file)_with_projection_layout|dir|paths|source_map)\("
     r"|read_logical_weights\(|mlx_llm::text_registry\(|DitBlockStream::"
 )
 BIND = re.compile(

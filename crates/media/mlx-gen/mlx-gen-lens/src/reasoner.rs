@@ -501,7 +501,7 @@ impl LensReasoner {
     ) -> Result<Self> {
         let root = snapshot_dir.as_ref();
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
-        let w = Weights::from_dir_with_experts(
+        let w = Weights::from_dir_with_projection_layout(
             root.join("text_encoder"),
             crate::text_encoder::gpt_oss::stacked_expert_key,
         )?;

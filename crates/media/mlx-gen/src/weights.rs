@@ -87,6 +87,44 @@ impl Weights {
         self.source_reads.alias(from, to);
     }
 
+    /// Supply the model's output/input axes for a block-padded matrix. A producer's
+    /// explicit geometry must agree, and the shape must reproduce the physical 32-padded grid.
+    pub fn declare_projection_shape(&mut self, base: &str, shape: [i32; 2]) -> Result<()> {
+        let key = format!("{base}.weight");
+        let Some(row) = self.source_reads.get(&key) else {
+            return Ok(());
+        };
+        let Some((stored, declared)) = row.mxfp8_geometry() else {
+            return Ok(());
+        };
+        if shape.iter().any(|d| *d <= 0) {
+            return Err(Error::Msg(format!(
+                "{key}: non-positive model projection shape {shape:?}"
+            )));
+        }
+        let shape = shape.map(|dim| dim as usize);
+        if gen_core::mxfp8_padded_shape(shape) != stored || declared.is_some_and(|d| d != shape) {
+            return Err(Error::Msg(format!("{key}: model geometry {shape:?} conflicts with MXFP8 storage {stored:?} or declared {declared:?}")));
+        }
+        // A full-precision declaration already decoded the payload. Its cast/crop belongs to the
+        // logical dense materialization; retain its representation rather than rebinding it.
+        let dk = format!("{base}.comfy_quant");
+        if self.tensors.contains_key(&dk) {
+            self.tensors.insert(
+                dk,
+                mlx_layers::fp8::descriptor_array(
+                    gen_core::ComfyQuantFormat::Mxfp8,
+                    false,
+                    Some(&shape),
+                ),
+            );
+        } else if let Some(a) = self.tensors.get_mut(&key) {
+            use mlx_rs::ops::indexing::IndexOp;
+            *a = a.index((..shape[0] as i32, ..shape[1] as i32));
+        }
+        Ok(())
+    }
+
     /// Bind a potentially nonstandard source name before an architecture renames or splits it.
     pub fn source_projection(&self, key: &str) -> Result<Option<mlx_layers::NativeProjection>> {
         let base = key
@@ -148,9 +186,9 @@ impl Weights {
 
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_file_with_experts(path, |_| false)
+        Self::from_file_with_projection_layout(path, |_| false)
     }
-    pub fn from_file_with_experts(
+    pub fn from_file_with_projection_layout(
         path: impl AsRef<Path>,
         expert_key: impl Fn(&str) -> bool,
     ) -> Result<Self> {
@@ -463,9 +501,9 @@ path.as_ref(),
     /// `.safetensors` extension but are not shards, and sort ahead of the real file — see
     /// [`gen_core::weightsmeta::is_hidden_file`].
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::from_dir_with_experts(dir, |_| false)
+        Self::from_dir_with_projection_layout(dir, |_| false)
     }
-    pub fn from_dir_with_experts(
+    pub fn from_dir_with_projection_layout(
         dir: impl AsRef<Path>,
         expert_key: impl Fn(&str) -> bool,
     ) -> Result<Self> {
@@ -479,15 +517,15 @@ path.as_ref(),
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", dir.display()).into());
         }
-        Self::from_paths_with_experts(&files, dir, expert_key)
+        Self::from_paths_with_projection_layout(&files, dir, expert_key)
     }
 
     /// Load a previously selected shard set with the same disjoint-key and metadata behavior as
     /// [`Self::from_dir`]. The caller chooses and validates the complete path list before loading.
     pub fn from_paths(files: &[PathBuf], source_dir: &Path) -> Result<Self> {
-        Self::from_paths_with_experts(files, source_dir, |_| false)
+        Self::from_paths_with_projection_layout(files, source_dir, |_| false)
     }
-    fn from_paths_with_experts(
+    fn from_paths_with_projection_layout(
         files: &[PathBuf],
         source_dir: &Path,
         expert_key: impl Fn(&str) -> bool,
