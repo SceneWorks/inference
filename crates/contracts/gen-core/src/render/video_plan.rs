@@ -48,9 +48,18 @@ pub struct VideoPackedComponent {
     pub stored: Option<bool>,
 }
 
+/// Distinct staging allocations still live while the final RGB frame vectors are produced.
+/// Tensor views and already-counted frame backing must not be included twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoOutputConversion {
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoPlanLayout {
     pub packed_components: Vec<VideoPackedComponent>,
+    pub output_conversion: VideoOutputConversion,
     pub output: MemoryGeometry,
     pub admission: MemoryGeometry,
     pub phases: Vec<VideoPhaseLayout>,
@@ -70,6 +79,7 @@ impl VideoPlanLayout {
     ) -> Self {
         Self {
             packed_components: vec![],
+            output_conversion: Default::default(),
             output,
             admission: phase.identity.geometry,
             phases: vec![VideoPhaseLayout {
@@ -136,10 +146,21 @@ struct VideoInputs {
     conditioning_fps: Option<u32>,
     motion_bucket: Option<u32>,
     noise_aug: Option<u32>,
+    approximation: Option<crate::ApproximationRequest>,
 }
 
 impl VideoInputs {
     fn from_request(req: &GenerationRequest) -> Result<Self> {
+        if req.low_res_start.is_some()
+            || req.phases.is_some()
+            || req.use_pid
+            || req.source_image.is_some()
+        {
+            return Err(Error::Unsupported(
+                "this video route does not implement image passes or low-resolution transitions"
+                    .into(),
+            ));
+        }
         // The request keeps these original, owned RGB buffers live through decode. Prepared
         // (resized or padded) reference roles are separately resolved by the family compiler.
         let mut carrier_bytes = 0u64;
@@ -215,8 +236,25 @@ impl VideoInputs {
             conditioning_fps: req.conditioning_fps,
             motion_bucket: req.motion_bucket_id.map(f32::to_bits),
             noise_aug: req.noise_aug_strength.map(f32::to_bits),
+            approximation: req.approximation.clone(),
         })
     }
+}
+
+/// The worker can reapply independently declared execution domains after mutable scope
+/// configuration. Their generation-time checks remain with the provider.
+fn same_ladder(actual: Option<GenerationMemory>, selected: Option<GenerationMemory>) -> bool {
+    if actual == selected {
+        return true;
+    }
+    let Some(mut actual) = actual else {
+        return false;
+    };
+    let domains = actual.graph_eval_cadence.take().is_some()
+        | actual.ffn_chunk.take().is_some()
+        | actual.cfg_batching.take().is_some()
+        | actual.prefix_kv_cache.take().is_some();
+    domains && actual == selected.unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -307,10 +345,15 @@ impl VideoRenderPlan {
         let mut load = self.load.clone();
         load.sequential_offload = spec.offload_policy == crate::OffloadPolicy::Sequential;
         if self.bound
-            || (context.is_none() && req.memory != self.memory)
+            || (context.is_none() && !same_ladder(req.memory, self.memory))
             || load != RenderLoadBinding::from_video_spec(spec)
             || self.inputs != VideoInputs::from_request(req)?
-            || context.is_some_and(|c| c.geometry != self.geometry())
+            || context.is_some_and(|c| {
+                c.geometry != self.geometry()
+                    || c.low_res_start.is_some()
+                    || c.has_phases
+                    || c.use_pid
+            })
         {
             return Err(Error::Unsupported(
                 "video admission crossed its load, input or geometry binding".into(),
@@ -390,6 +433,12 @@ impl VideoRenderPlan {
     /// buffered result is complete. Existing calibrated costs and resident credits remain
     /// with the application's priced operation.
     pub fn minimum_live_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
+        Ok(self
+            .minimum_decode_live_bytes(domain)?
+            .max(self.minimum_denoise_live_bytes(domain)?))
+    }
+
+    pub fn minimum_decode_live_bytes(&self, domain: MemoryBudgetDomain) -> Result<u64> {
         let output = self.layout.output;
         let bytes = [output.width, output.height, output.frames, output.batch, 3]
             .into_iter()
@@ -400,6 +449,16 @@ impl VideoRenderPlan {
             &[
                 self.source_allocation(),
                 crate::PricedAllocation::new("output_rgb", self.host_domain(), bytes),
+                crate::PricedAllocation::new(
+                    "output_device_staging",
+                    self.layout.domain,
+                    self.layout.output_conversion.device_bytes,
+                ),
+                crate::PricedAllocation::new(
+                    "output_host_staging",
+                    self.host_domain(),
+                    self.layout.output_conversion.host_bytes,
+                ),
             ],
         )?;
         let tensor = self
@@ -416,24 +475,50 @@ impl VideoRenderPlan {
                 crate::PricedAllocation::new("decoder_output", self.layout.domain, tensor),
             ],
         )?;
-        Ok(decode
-            .max(materialization)
-            .max(self.minimum_denoise_live_bytes(domain)?))
+        Ok(decode.max(materialization))
     }
 
-    pub(crate) fn run<T>(
+    fn check_output(&self, completed: &crate::generator::CompletedGeneration) -> Result<()> {
+        let Some(crate::GenerationOutput::Video { frames, fps, .. }) = &completed.generation.output
+        else {
+            return Err(Error::Unsupported(
+                "planned video provider returned a different modality".into(),
+            ));
+        };
+        let output = self.layout.output;
+        let rgb = u64::from(output.width)
+            .checked_mul(u64::from(output.height))
+            .and_then(|n| n.checked_mul(3));
+        if frames.len() as u64 != u64::from(output.frames)
+            || *fps == 0
+            || self.inputs.fps.is_some_and(|expected| expected != *fps)
+            || frames.iter().any(|f| {
+                f.width != output.width
+                    || f.height != output.height
+                    || Some(f.pixels.len() as u64) != rgb
+            })
+        {
+            return Err(Error::Unsupported(
+                "completed video differs from its admitted output geometry or rate".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run(
         &self,
         req: &GenerationRequest,
         contract: Option<&crate::MemoryProviderContract>,
         scope: Option<&mut dyn MemoryRequestScope>,
-        body: impl FnOnce(&mut dyn MemoryRequestScope) -> Result<T>,
-    ) -> Result<T> {
+        body: impl FnOnce(&mut dyn MemoryRequestScope) -> Result<crate::generator::CompletedGeneration>,
+    ) -> Result<crate::generator::CompletedGeneration> {
         if !self.bound
             || req.memory != self.memory
             || self.inputs != VideoInputs::from_request(req)?
             || self.context.as_ref().is_some_and(|c| {
-                scope.is_none()
-                    || !contract.is_some_and(|k| k.generation_memory(&c.selection) == req.memory)
+                (scope.is_none() && c.selection.strategy.is_optimized())
+                    || !contract
+                        .is_some_and(|k| same_ladder(req.memory, k.generation_memory(&c.selection)))
             })
         {
             return Err(Error::Unsupported(
@@ -452,6 +537,7 @@ impl VideoRenderPlan {
                 "provider did not complete its admitted video phases".into(),
             ));
         }
+        self.check_output(&output)?;
         Ok(output)
     }
 }

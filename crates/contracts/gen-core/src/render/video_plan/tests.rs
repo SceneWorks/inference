@@ -24,6 +24,7 @@ fn request() -> GenerationRequest {
         width: 16,
         height: 8,
         frames: Some(5),
+        fps: Some(8),
         conditioning: vec![Conditioning::Reference {
             image: Image {
                 width: 2,
@@ -45,6 +46,10 @@ fn compile(_: &LoadSpec, req: &GenerationRequest) -> Result<Option<VideoPlanLayo
     };
     Ok(Some(VideoPlanLayout {
         packed_components: vec![],
+        output_conversion: VideoOutputConversion {
+            device_bytes: 700,
+            host_bytes: 500,
+        },
         output: geometry,
         admission: geometry,
         domain: MemoryBudgetDomain::DeviceVram,
@@ -90,6 +95,7 @@ struct Mock {
     load: RenderLoadBinding,
     forward_calls: Cell<u32>,
     latent_frames: u32,
+    output_case: usize,
 }
 impl Mock {
     fn new(spec: &LoadSpec) -> Self {
@@ -98,6 +104,7 @@ impl Mock {
             load: RenderLoadBinding::from_video_spec(spec),
             forward_calls: Cell::new(0),
             latent_frames: 2,
+            output_case: 0,
         }
     }
 }
@@ -117,13 +124,26 @@ impl Generator for Mock {
         _: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.forward_calls.set(self.forward_calls.get() + 1);
+        let mut frame = Image {
+            width: 16,
+            height: 8,
+            pixels: vec![0; 16 * 8 * 3],
+        };
+        let mut fps = 8;
+        let mut count = 5;
+        match self.output_case {
+            1 => return Ok(GenerationOutput::Images(vec![frame])),
+            2 => frame.width = 8,
+            3 => {
+                frame.pixels.pop();
+            }
+            4 => count = 4,
+            5 => fps = 12,
+            _ => {}
+        }
         Ok(GenerationOutput::Video {
-            frames: vec![Image {
-                width: 1,
-                height: 1,
-                pixels: vec![0; 3],
-            }],
-            fps: 1,
+            frames: vec![frame; count],
+            fps,
             audio: None,
         })
     }
@@ -180,6 +200,12 @@ fn cached_placement_and_real_pixels_are_bound_before_provider_work() {
     image.pixels[0] ^= 1;
     assert!(execute(&actual, &changed).is_err());
     changed = request();
+    changed.low_res_start = Some(crate::LowResStartSpec::new(1, None));
+    assert!(registry()
+        .compile_video_plan(descriptor().id, &spec, &changed)
+        .is_err());
+    assert!(execute(&actual, &changed).is_err());
+    changed.low_res_start = None;
     changed.conditioning_fps = Some(6);
     assert!(execute(&actual, &changed).is_err());
     actual.latent_frames = 1;
@@ -188,6 +214,10 @@ fn cached_placement_and_real_pixels_are_bound_before_provider_work() {
     actual.latent_frames = 2;
     assert!(execute(&actual, &req).is_ok());
     assert_eq!(actual.forward_calls.get(), 1);
+    for case in 1..=5 {
+        actual.output_case = case;
+        assert!(execute(&actual, &req).is_err());
+    }
     assert!(admitted.bind_admission(&spec, None, &req).is_err());
     spec.weights = WeightsSource::Dir("cache-B".into());
     assert!(plan.bind_admission(&spec, None, &req).is_err());
@@ -216,12 +246,17 @@ fn denoise_retained_tensor_and_terminal_rgb_use_distinct_budgets() {
     assert_eq!(
         plan.minimum_live_bytes(MemoryBudgetDomain::HostRam)
             .unwrap(),
-        6 + 16 * 8 * 3 * 5
+        6 + 500 + 16 * 8 * 3 * 5
     );
     assert_eq!(
         plan.minimum_live_bytes(MemoryBudgetDomain::UnifiedMemory)
             .unwrap(),
         0
+    );
+    assert_eq!(
+        plan.minimum_decode_live_bytes(MemoryBudgetDomain::DeviceVram)
+            .unwrap(),
+        700
     );
     plan.layout.domain = MemoryBudgetDomain::UnifiedMemory;
     assert_eq!(
@@ -233,5 +268,18 @@ fn denoise_retained_tensor_and_terminal_rgb_use_distinct_budgets() {
         plan.minimum_live_bytes(MemoryBudgetDomain::HostRam)
             .unwrap(),
         0
+    );
+    let output_bytes = 16 * 8 * 3 * 5;
+    let budget = output_bytes + 700;
+    assert!(output_bytes + 6 < budget && 700 + 500 < budget);
+    assert_eq!(
+        plan.minimum_decode_live_bytes(MemoryBudgetDomain::UnifiedMemory)
+            .unwrap(),
+        output_bytes + 6 + 700 + 500
+    );
+    assert!(
+        plan.minimum_live_bytes(MemoryBudgetDomain::UnifiedMemory)
+            .unwrap()
+            > budget
     );
 }
