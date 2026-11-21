@@ -253,3 +253,12 @@ mod tests {
         ));
     }
 }
+
+impl From<mlx_layers::Error> for Error {
+    fn from(e: mlx_layers::Error) -> Self {
+        match e {
+            mlx_layers::Error::Mlx(e) => Self::Mlx(e),
+            mlx_layers::Error::Msg(message) => Self::Msg(message),
+        }
+    }
+}

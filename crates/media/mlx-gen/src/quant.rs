@@ -382,6 +382,22 @@ pub fn packed_bits_from_metadata(
     Ok(bits)
 }
 
+/// Resolve native codec operands before family-specific casts or affine handling.
+pub fn native_lin(w: &Weights, base: &str, bias: bool) -> Result<Option<AdaptableLinear>> {
+    if w.planned_convrot(base).is_none()
+        && w.peek(&format!("{base}.comfy_quant")).is_none()
+        && !w
+            .peek(&format!("{base}.weight"))
+            .is_some_and(|v| v.dtype() == Dtype::Int8)
+    {
+        return Ok(None);
+    }
+    Ok(
+        crate::convrot_int8::ConvRotLinear::from_weights(w, base, bias)?
+            .map(AdaptableLinear::from_convrot),
+    )
+}
+
 /// Load `{base}` as an [`AdaptableLinear`] — **packed** (Q4/Q8) when `{base}.scales` is present (a
 /// pre-quantized snapshot, bit-width inferred from the shapes at `group_size`), else **dense**. `bias`
 /// additionally loads the dense `{base}.bias` (the quantization's own `{base}.biases` is distinct and
@@ -389,14 +405,32 @@ pub fn packed_bits_from_metadata(
 /// pre-quantized snapshot with no `quantization` manifest to read. Shared by the provider crates'
 /// packed loaders — each passes its own `group_size`.
 pub fn lin(w: &Weights, base: &str, bias: bool, group_size: i32) -> Result<AdaptableLinear> {
-    if let Some(native) = crate::convrot_int8::ConvRotLinear::from_weights(w, base, bias)? {
-        return Ok(AdaptableLinear::from_convrot(native));
+    let bias = bias
+        .then(|| w.require(&format!("{base}.bias")).cloned())
+        .transpose()?;
+    lin_with_bias(w, base, bias, group_size)
+}
+
+/// A projection whose architecture supplies the bias under a separate key (e.g. EVA q_bias).
+pub fn lin_with_bias(
+    w: &Weights,
+    base: &str,
+    bias: Option<Array>,
+    group_size: i32,
+) -> Result<AdaptableLinear> {
+    if w.planned_convrot(base).is_some()
+        || w.peek(&format!("{base}.comfy_quant")).is_some()
+        || w.peek(&format!("{base}.weight"))
+            .is_some_and(|v| v.dtype() == Dtype::Int8)
+    {
+        if let Some(mut native) = crate::convrot_int8::ConvRotLinear::from_weights(w, base, false)?
+        {
+            if let Some(b) = bias {
+                native.set_bias(b)?;
+            }
+            return Ok(AdaptableLinear::from_convrot(native));
+        }
     }
-    let bias = if bias {
-        Some(w.require(&format!("{base}.bias"))?.clone())
-    } else {
-        None
-    };
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
         let bits = packed_bits(wq, scales, group_size)?;

@@ -63,6 +63,9 @@ fn ln(x: &Array, eps: f32) -> Result<Array> {
 /// holding the stored dtype matters for a mixed checkpoint: Wan2.1-VACE-1.3B stores its main blocks
 /// F32 beside BF16 VACE blocks, which ran its main-block GEMMs in F32 at twice the weight memory.
 fn load_linear(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::quant::native_lin(w, prefix, true)? {
+        return Ok(native);
+    }
     let weight = load_as(w, &format!("{prefix}.weight"), dtype)?;
     let bias = load_as(w, &format!("{prefix}.bias"), dtype)?;
     Ok(AdaptableLinear::dense(weight, Some(bias)))

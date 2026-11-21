@@ -136,10 +136,12 @@ pub(crate) struct VaeAttention {
 impl VaeAttention {
     pub(crate) fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let lin = |n: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{n}.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.{n}.bias"))?.clone()),
-            ))
+            mlx_gen::quant::lin(
+                w,
+                &format!("{prefix}.{n}"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )
         };
         Ok(Self {
             gn_w: w.require(&format!("{prefix}.group_norm.weight"))?.clone(),

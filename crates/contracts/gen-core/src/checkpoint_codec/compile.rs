@@ -868,8 +868,8 @@ pub fn compile_logical_weight_plan_with_metadata(
 /// prefix (`model.diffusion_model.`). Candidates are derived from one declared layer, then the whole
 /// table must resolve under exactly one of them — a table that resolves under two prefixes, or under
 /// none, refuses instead of the compiler picking one.
-pub(super) fn resolve_metadata_prefix(
-    by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
+pub fn resolve_metadata_prefix<T>(
+    by_name: &BTreeMap<&str, T>,
     table: &BTreeMap<String, PartialComfyQuantDescriptor>,
 ) -> Result<String, LogicalWeightPlanError> {
     let (first, _) = table

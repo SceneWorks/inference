@@ -26,11 +26,8 @@
 //! MLX's `from_fp8`, E5M2 as the high byte of binary16, and E8M0 as `2^(byte - 127)`.
 //! Scale application and the final bf16 cast remain the plan's codec responsibility.
 //!
-//! Residency is priced **per layer** by the plan ([`gen_core::PlannedResidency`]): MLX has no
-//! packed fp8/int8 matmul on this seam, so its policy is [`DenseResidencyPolicy`] — every
-//! quantized layer prices at its dense bf16 form and every scale/descriptor companion is consumed.
-//! The receipt's measured bytes equal the plan's `resident_bytes()`; that pair is the
-//! packed-vs-dense pricing seam admission reads.
+//! Native ConvRot projections retain signed codes and F32 scales. Other codec rows use their
+//! declared dense fallback. Receipts measure both representations against the admitted plan.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -88,9 +85,7 @@ pub fn baseline_codec_registry() -> &'static CheckpointCodecRegistry {
 }
 
 /// Header-plus-descriptors plan for one safetensors file under the given mapping. Refuses before
-/// any array is created; the error names the exact on-disk tensor. MLX residency is always the
-/// dense fallback ([`DenseResidencyPolicy`]) — this engine has no packed fp8/int8 matmul on the
-/// codec seam.
+/// any array is created. Native row-scaled ConvRot projections are priced at stored width.
 pub fn plan_logical_weights(
     path: &Path,
     mapping: &dyn LogicalKeyMapping,
@@ -157,6 +152,7 @@ pub fn read_logical_weights(
     on_disk.sort_unstable();
     let mut planned: Vec<&str> = plan.all_physical_keys().collect();
     planned.sort_unstable();
+    planned.dedup();
     if on_disk != planned {
         let missing = planned
             .iter()
@@ -283,8 +279,6 @@ pub fn read_logical_weights(
             source_bytes: plan.source_bytes,
             materialization,
             residency,
-            // MLX serves every quantized row through its dense-side decode as *planned* (the
-            // residency policy is dense-only there), so there is never a packed pricing to demote.
             demotions: Vec::new(),
         },
     })
@@ -434,13 +428,7 @@ fn decode(
     if let Some(refusal) = tensor.matrix_rank_refusal() {
         return Err(Error::Msg(refusal));
     }
-    // Every arm below produces the codec's DENSE resident form. MLX has no packed fp8/int8/fp4
-    // matmul on this seam, so this engine plans [`DenseResidencyPolicy`] for every row — but the
-    // reader must not *assume* that. A `Packed` entry reaching here (a caller planning with a
-    // foreign policy, or a policy that grows a packed row) would dense-decode a layer admission
-    // priced at its packed stored bytes: bf16 is 2 bytes/element against fp8's 1 and NVFP4's 0.5,
-    // so the load silently costs 2–4× the admitted footprint. Refuse instead — the same direction
-    // `candle_gen::logical_weights` takes for a packed plan on a build with no CUDA fp8 leg.
+    // Native ConvRot was bound by the caller. Only dense decode arms can reach this point.
     if tensor.residency.mode != ResidencyMode::Dense {
         return Err(Error::Msg(format!(
             "codec {}: tensor {:?} was planned with {:?} residency ({} stored bytes), but this \
@@ -663,10 +651,6 @@ fn measure_residency(
             .entry(tensor.codec_id)
             .or_insert(CodecResidencyReport {
                 codec_id: tensor.codec_id,
-                // MLX plans under `DenseResidencyPolicy` only — every codec row decodes to its
-                // dense resident encoding here, so every row this backend reports is a
-                // dense fallback and none of them may ever be labelled native (sc-21484). The
-                // retained-companion assertion below is the same invariant, stated on bytes.
                 representation: if matches!(tensor.codec, TensorCodecSpec::ConvRotInt8 { .. }) {
                     ExecutionRepresentation::NativePacked
                 } else {
@@ -684,15 +668,8 @@ fn measure_residency(
         let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
             continue;
         };
-        // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
-        // this seam — so every companion is consumed by its decode and retains nothing. Adding
-        // the plan's own number in would make the receipt a *copy* of the plan on exactly the
-        // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
-        // packed policy ever reaches this backend, the read refuses rather than silently
-        // agreeing with a residency it never measured.
-        //
-        // Checked outside the `by_codec` lookup below, so a companion whose owner's row is absent
-        // still cannot smuggle a retained residency past this refusal.
+        // Native scales were measured alongside their codes. Other decoders consume their
+        // companions and cannot claim resident bytes for them.
         if companion.resident_bytes != 0 && *codec_id != gen_core::convrot_int8::CODEC_ID {
             return Err(Error::Msg(format!(
                 "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
@@ -1849,7 +1826,7 @@ mod tests {
     ///
     /// Every arm of `decode` produces the codec's dense resident form, because MLX has no packed
     /// fp8/int8/fp4 matmul on this seam — so this engine's own policy is
-    /// [`DenseResidencyPolicy`]. The reader was *assuming* that rather than checking it. A `Packed`
+    /// `DenseResidencyPolicy`. The reader was *assuming* that rather than checking it. A `Packed`
     /// entry arriving from a foreign policy (or from a policy that grows a packed row) would
     /// materialize the dense reconstruction of a layer admission priced at its stored packing:
     /// bf16 is 2 bytes/element against fp8's 1, so the load silently costs twice the admitted

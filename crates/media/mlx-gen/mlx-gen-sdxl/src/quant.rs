@@ -165,6 +165,9 @@ pub(crate) fn geglu_half_ranges(output_rows: i32) -> Result<[(i32, i32); 2]> {
 /// is per-row independent, so this is byte-identical to the dense path's split-then-quantize), else
 /// row-slice the dense weight + bias. `base` is `…transformer_blocks.{k}.ff.net.0.proj`.
 pub(crate) fn lin_geglu_half(w: &Weights, base: &str, lo: i32, hi: i32) -> Result<AdaptableLinear> {
+    if let Some(native) = mlx_gen::convrot_int8::ConvRotLinear::from_weights(w, base, true)? {
+        return Ok(AdaptableLinear::from_convrot(native.slice_rows(lo, hi)?));
+    }
     let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
     let row_slice = |a: &Array| -> Result<Array> { Ok(a.take_axis(&idx, 0)?) };
     let bias_full = w.require(&format!("{base}.bias"))?;

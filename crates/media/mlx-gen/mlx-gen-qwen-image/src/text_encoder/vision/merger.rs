@@ -9,7 +9,7 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::nn::gelu;
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -17,10 +17,8 @@ use crate::text_encoder::join;
 
 pub struct PatchMerger {
     ln_q: Array,
-    mlp0_w: Array,
-    mlp0_b: Array,
-    mlp1_w: Array,
-    mlp1_b: Array,
+    mlp0: AdaptableLinear,
+    mlp1: AdaptableLinear,
     hidden_merged: i32,
     norm_eps: f32,
 }
@@ -35,10 +33,18 @@ impl PatchMerger {
     ) -> Result<Self> {
         Ok(Self {
             ln_q: w.require(&join(prefix, "ln_q.weight"))?.clone(),
-            mlp0_w: w.require(&join(prefix, "mlp_0.weight"))?.clone(),
-            mlp0_b: w.require(&join(prefix, "mlp_0.bias"))?.clone(),
-            mlp1_w: w.require(&join(prefix, "mlp_1.weight"))?.clone(),
-            mlp1_b: w.require(&join(prefix, "mlp_1.bias"))?.clone(),
+            mlp0: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "mlp_0"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
+            mlp1: mlx_gen::quant::lin(
+                w,
+                &join(prefix, "mlp_1"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?,
             hidden_merged: embed_dim * spatial_merge_size * spatial_merge_size,
             norm_eps,
         })
@@ -47,8 +53,8 @@ impl PatchMerger {
     /// `x`: `[seq, embed]` (window-reordered) → `[seq/merge², out_hidden]`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let x = rms_norm(x, &self.ln_q, self.norm_eps)?.reshape(&[-1, self.hidden_merged])?;
-        let x = linear(&x, &self.mlp0_w, &self.mlp0_b)?;
+        let x = self.mlp0.forward(&x)?;
         let x = gelu(&x)?;
-        linear(&x, &self.mlp1_w, &self.mlp1_b)
+        self.mlp1.forward(&x)
     }
 }

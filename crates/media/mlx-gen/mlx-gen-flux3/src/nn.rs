@@ -52,6 +52,12 @@ impl Loader<'_> {
 
     /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`), stored in the compute dtype.
     pub fn linear(&self, prefix: &str) -> Result<Linear> {
+        if let Some(inner) = mlx_gen::quant::native_lin(self.weights, prefix, false)? {
+            return Ok(Linear {
+                inner,
+                compute: self.compute,
+            });
+        }
         if let Some(affine) = self
             .affine
             .filter(|a| a.targets.contains(&format!("{prefix}.weight")))

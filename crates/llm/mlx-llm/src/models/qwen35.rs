@@ -2446,6 +2446,9 @@ impl Qwen35Model {
             (prism.is_none() && w.contains(&format!("{stem}.scales"))).then(|| stem.to_string())
         };
         let proj_dense = |key: String| -> Result<Projection> {
+            if let Some(native) = Projection::native(w, &key, false)? {
+                return Ok(native);
+            }
             match stored_part(&key) {
                 Some(stem) => load_projection(w, &key, stored_spec(&stem), None, &saw_stored),
                 None => Projection::load(w.require(&key)?.as_dtype(compute())?, None),
@@ -2756,6 +2759,9 @@ fn load_projection(
     quant: Option<QuantSpec>,
     saw_stored: &Cell<bool>,
 ) -> Result<Projection> {
+    if let Some(native) = Projection::native(w, key, false)? {
+        return Ok(native);
+    }
     let base = key.strip_suffix(".weight").unwrap_or(key);
     let scales_key = format!("{base}.scales");
     let biases_key = format!("{base}.biases");

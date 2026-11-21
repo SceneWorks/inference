@@ -48,10 +48,12 @@ struct FluxImageProjModel {
 
 impl FluxImageProjModel {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let proj = AdaptableLinear::dense(
-            w.require(&format!("{prefix}.proj.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.proj.bias"))?.clone()),
-        );
+        let proj = mlx_gen::quant::lin(
+            w,
+            &format!("{prefix}.proj"),
+            true,
+            mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        )?;
         Ok(Self {
             proj,
             norm_w: w.require(&format!("{prefix}.norm.weight"))?.clone(),
@@ -90,14 +92,18 @@ impl FluxIpAdapter {
         let mut blocks = Vec::with_capacity(NUM_DOUBLE_BLOCKS);
         for i in 0..NUM_DOUBLE_BLOCKS {
             let p = format!("double_blocks.{i}.processor.ip_adapter_double_stream");
-            let k = AdaptableLinear::dense(
-                w.require(&format!("{p}_k_proj.weight"))?.clone(),
-                Some(w.require(&format!("{p}_k_proj.bias"))?.clone()),
-            );
-            let v = AdaptableLinear::dense(
-                w.require(&format!("{p}_v_proj.weight"))?.clone(),
-                Some(w.require(&format!("{p}_v_proj.bias"))?.clone()),
-            );
+            let k = mlx_gen::quant::lin(
+                w,
+                &format!("{p}_k_proj"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?;
+            let v = mlx_gen::quant::lin(
+                w,
+                &format!("{p}_v_proj"),
+                true,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )?;
             blocks.push((k, v));
         }
         // The loop always produces exactly `NUM_DOUBLE_BLOCKS` pairs (a missing key errors via

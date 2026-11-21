@@ -283,10 +283,7 @@ fn load_linear(w: &Weights, prefix: &str, quant: Option<WanQuant>) -> Result<Ada
             q.bits,
         ));
     }
-    Ok(AdaptableLinear::dense(
-        w.require(&format!("{prefix}.weight"))?.clone(),
-        Some(w.require(&format!("{prefix}.bias"))?.clone()),
-    ))
+    mlx_gen::quant::lin(w, prefix, true, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 fn f32(x: &Array) -> Result<Array> {

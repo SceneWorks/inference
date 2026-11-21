@@ -2,7 +2,6 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::SwiGluMlp;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -10,22 +9,24 @@ use mlx_gen::Result;
 use super::join;
 
 /// The shared [`SwiGluMlp`] (sc-27326) over dense, bias-less projections. A dense bias-less
-/// [`AdaptableLinear`] with no adapters forwards as `matmul(x, wᵀ)` — the op this crate's
+/// [`mlx_gen::adapters::AdaptableLinear`] with no adapters forwards as `matmul(x, wᵀ)` — the op this crate's
 /// `matmul_t` issued — so the graph is unchanged.
 pub struct QwenMlp(SwiGluMlp);
 
 impl QwenMlp {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let dense = |leaf: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, leaf))?.clone(),
-                None,
-            ))
+        let linear = |leaf: &str| {
+            mlx_gen::quant::lin(
+                w,
+                &join(prefix, leaf),
+                false,
+                mlx_gen::quant::DEFAULT_GROUP_SIZE,
+            )
         };
         Ok(Self(SwiGluMlp::new(
-            dense("gate_proj.weight")?,
-            dense("up_proj.weight")?,
-            dense("down_proj.weight")?,
+            linear("gate_proj")?,
+            linear("up_proj")?,
+            linear("down_proj")?,
         )))
     }
 
