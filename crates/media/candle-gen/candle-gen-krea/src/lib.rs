@@ -901,7 +901,7 @@ impl Generator for KreaGenerator {
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
-        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+        plan.check_load_spec(&self.file_pin_spec)?;
         if req.phases.is_none() || plan.adapter_phases().is_empty() {
             return Err(gen_core::Error::Unsupported(
                 "Candle Krea's planned entry requires a multi-phase Raw render".into(),

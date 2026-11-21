@@ -14,7 +14,7 @@ pub(crate) mod bounded_clone;
 #[path = "bounded_fs.rs"]
 pub(crate) mod bounded_fs;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceInventory {
     roots: Vec<PathBuf>,
     entries: Vec<PathBuf>,

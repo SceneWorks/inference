@@ -8,7 +8,7 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
-use mlx_gen::gen_core::{self, MemoryRequestScope, RenderLoadBinding, RenderPlan, RenderRun};
+use mlx_gen::gen_core::{self, MemoryRequestScope, RenderPlan, RenderRun};
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
@@ -1397,7 +1397,7 @@ impl Krea {
         let phase_plan = match admitted_plan {
             Some(plan) => {
                 plan.check_request(&self.descriptor, req)?;
-                plan.check_load(&RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+                plan.check_load_spec(&self.file_pin_spec)?;
                 if plan.adapter_phases().is_empty() {
                     return Err(Error::Unsupported(
                         "krea Raw planned execution requires compiled adapter phases".into(),
