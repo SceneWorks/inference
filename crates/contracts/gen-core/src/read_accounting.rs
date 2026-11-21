@@ -12,10 +12,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     rows: BTreeMap<usize, (ExecutionRepresentation, u64)>,
     dense_layouts: BTreeMap<usize, (Vec<usize>, usize)>,
+    slices: BTreeMap<usize, MatrixSlices>,
+}
+#[derive(Clone)]
+struct MatrixSlices {
+    rows: usize,
+    cols: usize,
+    count: usize,
+    measured: BTreeMap<usize, u64>,
 }
 
 pub struct CheckpointReadAccounting {
@@ -37,23 +45,33 @@ impl CheckpointReadAccounting {
         capability: NativeExecutionCapability,
         paths: &[PathBuf],
     ) -> Arc<Self> {
+        CheckpointReceiptScope::share_reader(paths, plan, capability)
+    }
+
+    pub(crate) fn create(
+        plan: Arc<LogicalWeightPlan>,
+        capability: NativeExecutionCapability,
+    ) -> Arc<Self> {
         let indices = plan
             .tensors
             .iter()
             .enumerate()
             .map(|(i, t)| (t.logical_key.clone(), i))
             .collect();
-        let tracker = Arc::new(Self {
+        Arc::new(Self {
             plan,
             capability,
             indices,
             state: Default::default(),
-        });
-        let observed = tracker.clone();
-        CheckpointReceiptScope::register(paths, move || observed.facts());
-        tracker
+        })
     }
-
+    pub(crate) fn same_plan(
+        &self,
+        plan: &LogicalWeightPlan,
+        capability: &NativeExecutionCapability,
+    ) -> bool {
+        self.plan.as_ref() == plan && &self.capability == capability
+    }
     pub fn capability(&self) -> &NativeExecutionCapability {
         &self.capability
     }
@@ -156,6 +174,61 @@ impl CheckpointReadAccounting {
         Ok(())
     }
 
+    /// A stacked expert or fused projection may retain only some contiguous source matrices.
+    /// Record one successful native construction. A reloaded expert replaces its previous measurement.
+    pub fn record_matrix_slice(
+        &self,
+        key: &str,
+        first: usize,
+        rows: usize,
+        cols: usize,
+        resident_bytes: u64,
+    ) -> Result<()> {
+        let i = self.index(key)?;
+        let row = &self.plan.tensors[i];
+        if !matches!(
+            row.codec,
+            TensorCodecSpec::ScalarFp8 {
+                full_precision_matrix_mult: false,
+                ..
+            }
+        ) || !self.capability.executes_natively(row.codec_id)
+            || row.transform.is_some()
+        {
+            return Err(format!("{key}: source does not admit native scalar matrix slices").into());
+        }
+        let payload = rows
+            .checked_mul(cols)
+            .filter(|n| *n != 0)
+            .ok_or_else(|| Error::Msg(format!("{key}: invalid slice layout")))?;
+        let count = usize::try_from(row.source_bytes)
+            .ok()
+            .filter(|n| n.is_multiple_of(payload))
+            .map(|n| n / payload)
+            .ok_or_else(|| Error::Msg(format!("{key}: invalid matrix partition")))?;
+        if !first.is_multiple_of(rows) || first / rows >= count {
+            return Err(format!("{key}: slice out of bounds").into());
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.rows.contains_key(&i) {
+            return Err(format!(
+                "{key}: a whole-matrix consumer already owns this projection layout"
+            )
+            .into());
+        }
+        let partition = state.slices.entry(i).or_insert_with(|| MatrixSlices {
+            rows,
+            cols,
+            count,
+            measured: BTreeMap::new(),
+        });
+        if partition.rows != rows || partition.cols != cols {
+            return Err(format!("{key}: incompatible projection slice widths").into());
+        }
+        partition.measured.insert(first, resident_bytes);
+        Ok(())
+    }
+
     pub fn materialized_bytes(&self, key: &str) -> Option<u64> {
         let i = self.indices.get(key)?;
         self.state
@@ -166,12 +239,12 @@ impl CheckpointReadAccounting {
             .map(|(_, n)| *n)
     }
 
-    fn receipt_for(&self, state: &State) -> LogicalWeightReceipt {
+    fn receipt_for(plan: &LogicalWeightPlan, state: &State) -> LogicalWeightReceipt {
         let mut cells: BTreeMap<_, CodecResidencyReport> = BTreeMap::new();
         let mut owners = BTreeMap::new();
         let mut demotions = Vec::new();
         for (&i, &(representation, bytes)) in &state.rows {
-            let t = &self.plan.tensors[i];
+            let t = &plan.tensors[i];
             let id = (t.codec_id, representation);
             owners.insert(t.physical_key.as_str(), id);
             let report = cells.entry(id).or_insert(CodecResidencyReport {
@@ -194,7 +267,7 @@ impl CheckpointReadAccounting {
                 });
             }
         }
-        for c in &self.plan.companions {
+        for c in &plan.companions {
             if let Some(cell) = owners
                 .get(c.owner_physical_key.as_str())
                 .and_then(|id| cells.get_mut(id))
@@ -205,13 +278,13 @@ impl CheckpointReadAccounting {
         let count = state.rows.len();
         let materialization = if count == 0 {
             LogicalReadMaterialization::Deferred
-        } else if count == self.plan.tensors.len() {
+        } else if count == plan.tensors.len() {
             LogicalReadMaterialization::Materialized
         } else {
             LogicalReadMaterialization::Partial
         };
         LogicalWeightReceipt {
-            mapping_id: self.plan.mapping_id,
+            mapping_id: plan.mapping_id,
             tensor_count: count,
             source_bytes: cells.values().map(|c| c.source_bytes).sum(),
             materialization,
@@ -220,14 +293,68 @@ impl CheckpointReadAccounting {
         }
     }
 
+    fn resolved<'a>(
+        &'a self,
+        state: &'a State,
+    ) -> (
+        std::borrow::Cow<'a, LogicalWeightPlan>,
+        std::borrow::Cow<'a, State>,
+    ) {
+        use std::borrow::Cow;
+        let mut plan = Cow::Borrowed(self.plan.as_ref());
+        let mut measured = Cow::Borrowed(state);
+        for (&i, p) in &state.slices {
+            let original = &self.plan.tensors[i];
+            let plan = plan.to_mut();
+            for c in &mut plan.companions {
+                if c.owner_physical_key == original.physical_key
+                    && matches!(
+                        c.role,
+                        crate::checkpoint_codec::CompanionRole::WeightScale
+                            | crate::checkpoint_codec::CompanionRole::InputScale
+                    )
+                {
+                    c.resident_bytes = 4 * p.count as u64;
+                }
+            }
+            for slice in 0..p.count {
+                let first = slice * p.rows;
+                let mut child = original.clone();
+                child.logical_key =
+                    format!("{}[{}..{}]", original.logical_key, first, first + p.rows);
+                child.source_bytes = (p.rows * p.cols) as u64;
+                child.shape = vec![p.rows, p.cols];
+                child.residency.mode = ResidencyMode::Packed;
+                child.residency.resident_bytes = child.source_bytes;
+                let n = if slice == 0 {
+                    plan.tensors[i] = child;
+                    i
+                } else {
+                    let n = plan.tensors.len();
+                    plan.tensors.push(child);
+                    n
+                };
+                if let Some(&bytes) = p.measured.get(&first) {
+                    measured
+                        .to_mut()
+                        .rows
+                        .insert(n, (ExecutionRepresentation::NativePacked, bytes));
+                }
+            }
+        }
+        (plan, measured)
+    }
+
     pub fn receipt(&self) -> LogicalWeightReceipt {
-        self.receipt_for(&self.state.lock().unwrap_or_else(|e| e.into_inner()))
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (plan, measured) = self.resolved(&state);
+        Self::receipt_for(&plan, &measured)
     }
 
     pub fn facts(&self) -> Result<CheckpointWeightFacts> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let receipt = self.receipt_for(&state);
-        let mut plan = std::borrow::Cow::Borrowed(self.plan.as_ref());
+        let (mut plan, measured) = self.resolved(&state);
+        let receipt = Self::receipt_for(&plan, &measured);
         for (&i, (shape, width)) in &state.dense_layouts {
             let row = &mut plan.to_mut().tensors[i];
             row.shape = shape.clone();

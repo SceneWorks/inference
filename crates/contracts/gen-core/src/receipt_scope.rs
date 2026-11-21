@@ -17,8 +17,11 @@ thread_local! {
 #[derive(Clone, Default)]
 pub struct CheckpointReceiptScope {
     sources: Arc<Mutex<Sources>>,
+    readers: Arc<Mutex<BTreeMap<Vec<PathBuf>, Vec<Arc<crate::CheckpointReadAccounting>>>>>,
+
     primary: Option<PathBuf>,
     pin: Option<PinnedWeightsFile>,
+    observed_pin: Arc<std::sync::OnceLock<std::result::Result<PinnedWeightsFile, String>>>,
 }
 
 impl CheckpointReceiptScope {
@@ -50,30 +53,67 @@ impl CheckpointReceiptScope {
         CURRENT.with(|s| s.borrow().clone())
     }
 
+    pub(crate) fn share_reader(
+        paths: &[PathBuf],
+        plan: Arc<crate::LogicalWeightPlan>,
+        capability: crate::NativeExecutionCapability,
+    ) -> Arc<crate::CheckpointReadAccounting> {
+        let Some(scope) = Self::current() else {
+            return crate::CheckpointReadAccounting::create(plan, capability);
+        };
+        let paths = source_paths(paths);
+        scope.pin_primary(&paths);
+        let mut readers = scope.readers.lock().unwrap_or_else(|e| e.into_inner());
+        let group = readers.entry(paths.clone()).or_default();
+        if let Some(existing) = group.iter().find(|r| r.same_plan(&plan, &capability)) {
+            return existing.clone();
+        }
+        let reader = crate::CheckpointReadAccounting::create(plan, capability);
+        group.push(reader.clone());
+        reader
+    }
+
+    fn pin_primary(&self, paths: &[PathBuf]) {
+        if let Some(path) = self.primary.as_ref().filter(|p| paths.contains(p)) {
+            self.observed_pin.get_or_init(|| {
+                self.pin
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| PinnedWeightsFile::pin(path))
+                    .map_err(|e| e.to_string())
+            });
+        }
+    }
+    fn bind(
+        &self,
+        paths: &[PathBuf],
+        facts: CheckpointWeightFacts,
+    ) -> crate::Result<CheckpointWeightFacts> {
+        if self
+            .primary
+            .as_ref()
+            .is_some_and(|primary| paths.contains(primary))
+        {
+            let pin = self
+                .observed_pin
+                .get()
+                .ok_or_else(|| crate::Error::Msg("missing observed checkpoint pin".into()))?
+                .as_ref()
+                .map_err(|e| crate::Error::Msg(e.clone()))?;
+            facts.with_verified_source(pin)
+        } else {
+            Ok(facts)
+        }
+    }
     /// Register a lightweight snapshot callback, replacing the previous load of the same shards.
     pub fn register(
         paths: &[PathBuf],
         snapshot: impl Fn() -> crate::Result<CheckpointWeightFacts> + Send + Sync + 'static,
     ) {
         if let Some(scope) = Self::current() {
-            let mut paths: Vec<_> = paths.iter().map(|p| absolute(p)).collect();
-            paths.sort();
-            paths.dedup();
-            let snapshot: Snapshot =
-                if let Some(primary) = scope.primary.as_ref().filter(|p| paths.contains(p)) {
-                    let pin = match &scope.pin {
-                        Some(pin) => Ok(pin.clone()),
-                        None => PinnedWeightsFile::pin(primary),
-                    }
-                    .map_err(|e| e.to_string());
-                    Arc::new(move || {
-                        snapshot()?.with_verified_source(
-                            pin.as_ref().map_err(|e| crate::Error::Msg(e.clone()))?,
-                        )
-                    })
-                } else {
-                    Arc::new(snapshot)
-                };
+            let paths = source_paths(paths);
+            scope.pin_primary(&paths);
+            let snapshot: Snapshot = Arc::new(snapshot);
             scope
                 .sources
                 .lock()
@@ -90,12 +130,25 @@ impl CheckpointReceiptScope {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut facts = Vec::new();
-        for snapshot in readers.into_values() {
+        for (paths, snapshot) in readers {
             let value = snapshot()?;
             if value.receipt().tensor_count == 0 {
                 continue;
             }
-            facts.push(value);
+            facts.push(self.bind(&paths, value)?);
+        }
+        let readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for (paths, group) in readers {
+            for reader in group {
+                let value = reader.facts()?;
+                if value.receipt().tensor_count != 0 {
+                    facts.push(self.bind(&paths, value)?);
+                }
+            }
         }
         Ok(facts)
     }
@@ -122,4 +175,11 @@ impl CheckpointReceiptScope {
 
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+}
+
+fn source_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = paths.iter().map(|p| absolute(p)).collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }

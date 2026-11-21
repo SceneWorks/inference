@@ -88,6 +88,12 @@ impl Linear {
         matches!(self.weight, Weight::Native { .. })
     }
 
+    pub fn native_weight(&self) -> Option<Arc<dyn NativeLinearWeight>> {
+        match &self.weight {
+            Weight::Native { projection, .. } => Some(projection.clone()),
+            Weight::Dense(_) => None,
+        }
+    }
     pub fn native_format_id(&self) -> Option<&'static str> {
         match &self.weight {
             Weight::Native { projection, .. } => Some(projection.format_id()),

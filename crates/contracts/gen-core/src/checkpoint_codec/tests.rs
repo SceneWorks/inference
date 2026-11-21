@@ -254,14 +254,14 @@ fn a_layer_declared_twice_must_agree() {
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
-            metadata: PartialComfyQuantDescriptor {
+            metadata: Box::new(PartialComfyQuantDescriptor {
                 convrot: None,
                 rotation_group: None,
                 format: ComfyQuantFormat::Float8E4M3Fn,
                 full_precision_matrix_mult: None,
                 per_row: None,
                 orig_shape: None,
-            },
+            }),
             disagreement: vec!["format"],
         }
     );
@@ -284,14 +284,14 @@ fn a_layer_declared_twice_must_agree() {
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
-            metadata: PartialComfyQuantDescriptor {
+            metadata: Box::new(PartialComfyQuantDescriptor {
                 convrot: None,
                 rotation_group: None,
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: Some(true),
                 per_row: None,
                 orig_shape: None,
-            },
+            }),
             disagreement: vec!["full_precision_matrix_mult"],
         }
     );
@@ -375,14 +375,14 @@ fn a_file_level_entry_that_is_a_subset_of_its_tensor_blob_corroborates_it() {
                 full_precision_matrix_mult: false,
                 orig_shape: None,
             },
-            metadata: PartialComfyQuantDescriptor {
+            metadata: Box::new(PartialComfyQuantDescriptor {
                 convrot: None,
                 rotation_group: None,
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: Some(false),
                 orig_shape: None,
-            },
+            }),
             disagreement: vec!["per_row"],
         }
     );

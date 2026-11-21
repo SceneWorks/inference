@@ -326,12 +326,52 @@ pub fn merge_adapters(
     map: &mut HashMap<String, Tensor>,
     specs: &[AdapterSpec],
 ) -> Result<MergeReport> {
+    merge_resolved(map, specs, |_, _| Ok(()))
+}
+
+/// Fetch base coefficients only for named targets whose adapter recipe requires a weight fold.
+pub(crate) fn fold_checkpoint(
+    vb: candle_gen::candle_nn::VarBuilder<'static>,
+    specs: &[AdapterSpec],
+) -> Result<candle_gen::candle_nn::VarBuilder<'static>> {
+    let mut replacements = HashMap::new();
+    merge_resolved(&mut replacements, specs, |af, map| {
+        for key in af.tensors.keys() {
+            let path = classify_lora_key(key)
+                .map(|(k, _)| k)
+                .or_else(|| classify_lokr_key(key).map(|(k, _)| k))
+                .or_else(|| {
+                    wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES)
+                        .or_else(|| wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES))
+                        .map(|(k, _)| strip_lora_prefix(k).to_owned())
+                });
+            if let Some(path) = path {
+                let key = format!("{path}.weight");
+                if !map.contains_key(&key) && vb.contains_tensor(&key) {
+                    let coefficients = vb
+                        .get_unchecked(&key)?
+                        .to_device(&candle_gen::candle_core::Device::Cpu)?;
+                    map.insert(key, coefficients);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(candle_gen::loader::overlay_var_builder(vb, replacements))
+}
+
+fn merge_resolved(
+    map: &mut HashMap<String, Tensor>,
+    specs: &[AdapterSpec],
+    mut resolve: impl FnMut(&AdapterFile, &mut HashMap<String, Tensor>) -> Result<()>,
+) -> Result<MergeReport> {
     if specs.is_empty() {
         return Ok(MergeReport::default());
     }
     let mut report = MergeReport::default();
     for (index, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
+        resolve(&af, map)?;
         let has_thirdparty_lokr = is_untagged_lycoris_lokr(&af);
         let has_thirdparty_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
         if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
