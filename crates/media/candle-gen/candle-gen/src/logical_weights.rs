@@ -17,22 +17,8 @@ pub fn component_f32_bytes(
     require_float: bool,
     is_matrix: impl Fn(&str, &[usize]) -> bool,
 ) -> gen_core::Result<u64> {
-    use gen_core::weightsmeta::{collect_safetensors_files, safetensors_path_tensor_headers};
-    let headers = safetensors_path_tensor_headers(path)?;
-    let mut paths = Vec::new();
-    if path.is_dir() {
-        collect_safetensors_files(path, &mut paths)?;
-        paths.sort();
-    } else {
-        paths.push(path.to_owned());
-    }
-    let encoded = gen_core::checkpoint_codec::projected_checkpoint_bytes(
-        &paths,
-        &headers,
-        |_| 4,
-        &CandleCodecResidency::default_device_for_admission(),
-        is_matrix,
-    )?;
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let encoded = projection_prices(path, &headers, |_| 4, is_matrix)?;
     headers.iter().try_fold(0u64, |total, h| {
         let bytes =
             if let Some(&bytes) = encoded.get(&h.name) {
@@ -50,6 +36,84 @@ pub fn component_f32_bytes(
                 "{}: component resident byte overflow",
                 path.display()
             ))
+        })
+    })
+}
+
+/// Price encoded rows in an already-inspected component. Ordinary headers keep their
+/// provider-specific pricing (affine Q4/Q8, tied embeddings or transient workspaces).
+pub fn projection_prices(
+    path: &Path,
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    width: impl Fn(&gen_core::weightsmeta::SafetensorsTensorHeader) -> u64,
+    is_matrix: impl Fn(&str, &[usize]) -> bool,
+) -> gen_core::Result<std::collections::BTreeMap<String, u64>> {
+    let mut paths = Vec::new();
+    if path.is_dir() {
+        gen_core::weightsmeta::collect_safetensors_files(path, &mut paths)?;
+        paths.sort();
+    } else {
+        paths.push(path.to_owned());
+    }
+    gen_core::checkpoint_codec::projected_checkpoint_bytes(
+        &paths,
+        headers,
+        width,
+        &CandleCodecResidency::default_device_for_admission(),
+        is_matrix,
+    )
+}
+
+/// The stock transformer and diffusion components bind rank-two Linear weights, except
+/// for their named indexed embedding tables.
+pub fn standard_linear_weight(name: &str, shape: &[usize]) -> bool {
+    let Some(module) = name
+        .strip_suffix(".weight")
+        .and_then(|prefix| prefix.rsplit('.').next())
+    else {
+        return false;
+    };
+    shape.len() == 2
+        && !matches!(
+            module,
+            "embedding"
+                | "embeddings"
+                | "position_embedding"
+                | "token_embedding"
+                | "word_embeddings"
+                | "position_embeddings"
+                | "token_type_embeddings"
+                | "embed_tokens"
+                | "embed_positions"
+                | "wte"
+                | "wpe"
+        )
+}
+
+/// Sum the subset the model opens. A retained scale follows its owning matrix when
+/// the model selects an individual leaf (such as an untied lm_head).
+pub fn selected_component_bytes(
+    path: &Path,
+    width: u64,
+    keep: impl Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let encoded = projection_prices(path, &headers, |_| width, standard_linear_weight)?;
+    headers.iter().try_fold(0u64, |sum, h| {
+        let selected = keep(&h.name)
+            || (encoded.contains_key(&h.name)
+                && gen_core::checkpoint_codec::projection_companion_base(&h.name)
+                    .is_some_and(|base| keep(&format!("{base}.weight"))));
+        if !selected {
+            return Ok(sum);
+        }
+        let bytes = match encoded.get(&h.name) {
+            Some(&bytes) => bytes,
+            None if h.is_float() => h.materialized_bytes(width)?,
+            None => h.data_bytes,
+        };
+        sum.checked_add(bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!("{}: resident byte sum overflow", path.display()))
         })
     })
 }

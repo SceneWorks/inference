@@ -486,7 +486,9 @@ impl SimpleBackend for ProjectionSource {
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(d))
             .ok_or_else(|| Error::Msg(format!("{name}: contraction overflow")))?;
-        if row.shape == [shape[0], cols] {
+        if row.shape.len() == 2 {
+            self.reader()
+                .validate_matrix_shape(name, [shape[0], cols])?;
             return self.native_linear_weight(name, Some((shape[0], cols)), dtype, dev);
         }
         if row.shape != shape {

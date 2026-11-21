@@ -108,6 +108,7 @@ pub fn kernel_dtype(device: &Device, dtype: DType) -> DType {
 /// Builds modules from the package's `model.safetensors` (an mmap, tensors read one at a time at
 /// the compute dtype) on one device.
 pub struct Loader<'a> {
+    pub expected: &'a std::collections::BTreeMap<String, gen_core_flux3::quantization::TensorSpec>,
     pub vb: &'a VarBuilder<'static>,
     pub compute: DType,
     pub device: &'a Device,
@@ -383,7 +384,7 @@ impl Loader<'_> {
 
     /// A tensor kept in f32 (the q/k RMSNorm scales).
     pub fn f32(&self, key: &str) -> Result<Tensor> {
-        to(&self.take(key)?, DType::F32)
+        Ok(self.vb.get_unchecked_dtype(key, DType::F32)?)
     }
 
     /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`). Dense packages store it in the
@@ -396,7 +397,14 @@ impl Loader<'_> {
         if let Some(publisher) = self.publisher.filter(|p| p.targets.contains(&key)) {
             return publisher.linear(&key, self.vb);
         }
-        if let Some(native) = self.vb.native_linear_weight(&key)? {
+        let expected = self
+            .expected
+            .get(&key)
+            .and_then(|spec| match spec.shape.as_slice() {
+                [n, k] => Some((*n, *k)),
+                _ => None,
+            });
+        if let Some(native) = self.vb.native_linear_weight_with_shape(&key, expected)? {
             return Ok(Linear {
                 base: Base::Checkpoint(
                     candle_gen::candle_nn::Linear::from_native(native, None),
@@ -405,7 +413,11 @@ impl Loader<'_> {
                 adapted: None,
             });
         }
-        let weight = to(&self.take(&key)?, self.compute)?;
+        let weight = match expected {
+            Some(shape) => self.vb.get(shape, &key)?,
+            None => self.take(&key)?,
+        };
+        let weight = to(&weight, self.compute)?;
         if weight.rank() != 2 {
             return Err(Error::Msg(format!(
                 "flux3: {prefix}.weight is rank {}, a Linear needs [out, in]",

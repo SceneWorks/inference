@@ -8,38 +8,14 @@
 //! tensors, decoding **per layer** (mixed checkpoints dispatch tensor-by-tensor) and measuring
 //! what each codec left resident.
 //!
-//! # Dense fallback vs native path
+//! Matrix constructors retain original E4M3/E5M2 scalar codes, BFL rowwise E4M3,
+//! MXFP8/E8M0 blocks, NVFP4 blocks or ConvRot INT8 codes according to CandleCodecResidency.
+//! Each CUDA kernel has its own device and layout requirements. Model-declared shapes
+//! determine the logical dimensions of padded blocks.
 //!
-//! * **Dense fallback** (every codec row, every device): the stored bytes are decoded on the host
-//!   through the `gen_core::comfy_quant` reference functions — E4M3FN/E5M2 element decode ×
-//!   per-tensor scale, MXFP8 block dequantization (cuBLAS 128×4 scale un-swizzle + 32-block
-//!   shared exponents + unpadding), int8 × per-row scale — in exact f32, then cast once to the
-//!   codec's resident bf16 and uploaded. Host decode is deliberate: Candle's Metal backend has no
-//!   fp8 cast kernels and its CPU/CUDA `to_dtype` covers E4M3 only, while the reference functions
-//!   cover every row identically on every lane.
-//! * **Native paths** — two codec rows have one, and each is gated on its own layout + hardware
-//!   contract by [`CandleCodecResidency`]:
-//!   * `fp8-e4m3-scalar-v1`: a CUDA device at the sm_89 floor (`CublasLt::meets_fp8_floor`, via
-//!     [`candle_quant_kernels::FP8_COMPUTE_CAP_FLOOR`]; locked decision 7), a rank-2 E4M3 weight, and no
-//!     `full_precision_matrix_mult` flag. The reader keeps the stored `F8E4M3` codes + f32 scale
-//!     resident ([`LogicalTensor::PackedScalarFp8`]), the exact operands `CublasLt::matmul_fp8`
-//!     consumes. On a build without the `cuda` feature a `Packed` fp8 plan entry is a typed
-//!     refusal — never a silent dense substitution of what admission priced as packed.
-//!   * `nvfp4-v1` (sc-20641): a CUDA device at the sm_120 floor (via
-//!     [`candle_quant_kernels::NVFP4_COMPUTE_CAP_FLOOR`]), a K/N-aligned stored layout
-//!     ([`nvfp4_layout_is_native`]) **and** a stored grid that is the layer itself (no ComfyUI
-//!     padding — the packed container carries no unpad). The reader repacks the checkpoint's nibbles and both scale
-//!     levels into the canonical [`Nvfp4Tensor`] container
-//!     ([`LogicalTensor::PackedNvfp4`]) that `Nvfp4Linear` consumes. That container is host-side,
-//!     so the repack itself compiles and is tested on every lane; only the residency *decision* is
-//!     hardware-gated.
-//!
-//!   E5M2 has no weight-side GEMM leg here and MXFP8 has no block-scaled kernel in this workspace,
-//!   so both always take the dense fallback.
-//!
-//! Residency is therefore priced per layer at plan time (packed = stored bytes + retained scales;
-//! dense = logical shape × bf16) and the receipt measures the same quantity from what was actually
-//! materialized; the reader asserts nothing silently.
+//! Coefficient consumers and full-precision projections decode supported source formats
+//! to the requested F32, BF16 or F16 dtype. Measured receipts charge the actual resident
+//! representation, retained scale operands and any dense coefficient copies.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -259,17 +235,8 @@ impl CodecResidencyPolicy for CandleCodecResidency {
                 ResidencyMode::Dense
             };
         }
-        // The scalar E4M3 row. The plain undescribed cast (unit scale) qualifies too:
-        // `matmul_fp8` takes any f32 weight scale.
-        //
-        // **Rank-2 only** — the contract this module's header already states ("a rank-2 E4M3
-        // weight"), enforced rather than merely documented. `CublasLt::matmul_fp8` is a matrix
-        // multiply: its weight-side operand is `[out, in]`. An fp8 checkpoint's rank-1 rows are
-        // real — ComfyUI casts biases and modulation vectors to fp8 alongside the projections —
-        // and planning one `Packed` hands `Nvfp4Linear`'s fp8 sibling a rank-1 container it cannot
-        // read, while MLX (dense-only) decodes the same tensor correctly. That divergence is a
-        // backend disagreement about the same file, so the floor is enforced here, at plan time,
-        // where the fallback is the dense decode both backends share.
+        // Scalar and per-token scaled multiplication both require a two-dimensional,
+        // aligned GEMM operand. Biases and positional coefficients take the dense path.
         if self.fp8_e4m3_native
             && [
                 FP8_E4M3_SCALAR_CODEC.codec_id,

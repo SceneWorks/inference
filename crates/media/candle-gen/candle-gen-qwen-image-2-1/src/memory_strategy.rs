@@ -474,19 +474,8 @@ fn component_bytes(
     float_width: u64,
     keep: &dyn Fn(&str) -> bool,
 ) -> gen_core::Result<u64> {
-    gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
-        .iter()
-        .filter(|header| keep(&header.name))
-        .try_fold(0_u64, |sum, header| {
-            let bytes = if header.is_float() {
-                header.materialized_bytes(float_width)?
-            } else {
-                header.data_bytes
-            };
-            sum.checked_add(bytes).ok_or_else(|| {
-                gen_core::Error::Msg(format!("{provider_id}: component byte sum overflow"))
-            })
-        })
+    candle_gen::logical_weights::selected_component_bytes(path, float_width, keep)
+        .map_err(|error| gen_core::Error::Msg(format!("{provider_id}: {error}")))
 }
 
 /// Width `loader::compute_dtype` materializes every float component at on this build's production

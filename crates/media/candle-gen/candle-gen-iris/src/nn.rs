@@ -266,6 +266,48 @@ impl Checkpoint {
         }
     }
 
+    /// The exported depth head is a 1×1 convolution evaluated by a matrix projection.
+    pub(crate) fn pointwise_linear(&self, channels: usize, dtype: DType) -> Result<Linear> {
+        use candle_gen::candle_nn::var_builder::SimpleBackend;
+        let bias = self.take_as("bias", dtype)?;
+        expect_shape("depth_reducer.bias", &bias, &[1])?;
+        let key = format!("{}weight", self.prefix);
+        let physical = [1, channels, 1, 1];
+        if let Source::Mmap(candle_gen::loader::MappedWeights::Checkpoint(src)) = &self.source {
+            if let Some(op) =
+                src.native_linear_weight_flattened(&key, &physical, dtype, &self.device)?
+            {
+                self.consume("weight")?;
+                self.hold(op.resident_bytes());
+                return Ok(Linear {
+                    base: Base::Native(candle_gen::candle_nn::Linear::from_native(op, Some(bias))),
+                    residuals: Vec::new(),
+                });
+            }
+            if src
+                .reader()
+                .planned(&key)
+                .is_some_and(|r| r.shape.len() == 2)
+            {
+                self.consume("weight")?;
+                let weight = src.reader().read_dense_with_shape(
+                    &key,
+                    Some((1, channels)),
+                    dtype,
+                    &self.device,
+                )?;
+                self.hold((weight.elem_count() * dtype.size_in_bytes()) as u64);
+                return Ok(Linear::from_parts(weight, Some(bias)));
+            }
+        }
+        let weight = self.take_as("weight", dtype)?;
+        expect_shape("depth_reducer.weight", &weight, &physical)?;
+        Ok(Linear::from_parts(
+            weight.reshape((1, channels))?,
+            Some(bias),
+        ))
+    }
+
     /// The stored shape of `key`, read without touching its bytes.
     fn shape_of(&self, key: &str) -> Result<&[usize]> {
         self.shapes
