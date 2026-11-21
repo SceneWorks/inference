@@ -706,15 +706,14 @@ pub fn compile_trajectory_for(req: &GenerationRequest) -> gen_core::Result<gen_c
     }
     let params = resolve_run_params(req, req.width, req.height)?;
     let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, 0);
-    let executed = params.sigmas[..keep].to_vec();
-    let executed_steps = executed.len().saturating_sub(1);
+    let executed_steps = keep.saturating_sub(1);
     let solver = gen_core::sampling::canonical_solver_or_euler(params.sampler_name.as_deref());
     let pass = gen_core::render::PackedImagePass {
         pixel_stride: SIZE_MULTIPLE,
         token_width: 64,
         sampler: solver.name(),
         guidance: params.guidance,
-        sigmas: executed,
+        sigmas: params.sigmas,
         executed_steps,
         capture_sigma,
     };

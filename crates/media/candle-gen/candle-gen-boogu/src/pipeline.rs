@@ -870,13 +870,17 @@ pub(crate) fn stage_decode(
     on_progress: &mut dyn FnMut(Progress),
     run: Option<&gen_core::RenderRun<'_, '_>>,
 ) -> Result<Vec<Image>> {
+    let base_seed = run.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |r| r.plan().base_seed(),
+    );
     let pid = candle_gen_pid::resolve_pid_decoder(
         decode_components.pid.as_deref(),
         req,
-        req.seed.unwrap_or_else(gen_core::default_seed),
+        base_seed,
         provider,
     )?;
-    if req.seed.is_none() && pid.is_some() {
+    if req.seed.is_none() && run.is_none() && pid.is_some() {
         candle_gen::execution::non_deterministic("Boogu staged PiD resolves an independent default seed; one request seed cannot reproduce both initial and decoder streams");
     }
     let decode_all = || -> Result<Vec<Image>> {

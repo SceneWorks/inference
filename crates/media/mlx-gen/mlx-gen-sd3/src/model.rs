@@ -695,7 +695,7 @@ pub(crate) fn resolved_schedule_for_request(
         pipeline::resolve_sd3_sigmas(req.scheduler.as_deref(), steps, req.scheduler_shift)?;
     let start_step = if reference.is_some() {
         mlx_gen::gen_core::sampling::init_time_step(steps, Some(strength))
-            .min(sigmas.len().saturating_sub(2))
+            .min(sigmas.len().saturating_sub(1))
     } else {
         0
     };

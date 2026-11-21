@@ -1246,6 +1246,120 @@ mod tests {
         assert!(resolve_reference(&two).is_err());
     }
 
+    #[test]
+    fn strength_one_img2img_preserves_zero_step_roundtrip_in_resident_and_staged_execution() {
+        use candle_gen::gen_core::{Conditioning, RenderRun};
+
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let (transformer, vae, cond, _uncond) = harness(&cfg, &device);
+        let inert = inert_sink();
+        let cancel = CancelFlag::default();
+        let lat = 2usize;
+        let clean = Tensor::randn(0f32, 1f32, (1, LATENT_CHANNELS, lat, lat), &device).unwrap();
+        let clean_vec = clean.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let direct = decode_image(&vae, &clean).unwrap();
+
+        for steps in [1usize, 4usize] {
+            let req = GenerationRequest {
+                prompt: "sd3 strength 1.0 zero-step endpoint".into(),
+                width: 256,
+                height: 256,
+                steps: Some(steps as u32),
+                seed: Some(42),
+                conditioning: vec![Conditioning::Reference {
+                    image: Image {
+                        width: 256,
+                        height: 256,
+                        pixels: vec![128; 256 * 256 * 3],
+                    },
+                    strength: Some(1.0),
+                }],
+                ..Default::default()
+            };
+            let plan = crate::compile_trajectory_for(Variant::Large, &req).unwrap();
+            assert_eq!(plan.executed_steps(), 0, "steps={steps}");
+            assert_eq!(plan.denoise_sigmas(), &[0.0], "steps={steps}");
+            assert_eq!(plan.denoise_spans(), vec![0..0], "steps={steps}");
+            let preview = crate::preview::hook_for_plan(&inert, &plan);
+
+            let mut resident_denoise_steps = 0usize;
+            let resident_run = RenderRun::new(&plan, &cancel, None);
+            resident_run
+                .encode(|| Ok::<_, candle_gen::CandleError>(()))
+                .unwrap();
+            resident_run.begin_rendering().unwrap();
+            let resident_img = render_core(
+                &transformer,
+                &vae,
+                &cond,
+                None,
+                1.0,
+                steps,
+                3.0,
+                (lat, lat),
+                plan.base_seed(),
+                device.clone(),
+                DType::F32,
+                Some(plan.sampler()),
+                None,
+                Some(&clean),
+                steps,
+                Some(&resident_run),
+                &cancel,
+                &mut |p: Progress| {
+                    if matches!(p, Progress::Step { .. }) {
+                        resident_denoise_steps += 1;
+                    }
+                },
+                &preview,
+            )
+            .unwrap();
+            resident_run.finish_rendering();
+            assert_eq!(resident_denoise_steps, 0, "steps={steps}");
+            assert_eq!(resident_img.pixels, direct.pixels, "steps={steps}");
+
+            let mut staged_denoise_steps = 0usize;
+            let staged_run = RenderRun::new(&plan, &cancel, None);
+            staged_run
+                .encode(|| Ok::<_, candle_gen::CandleError>(()))
+                .unwrap();
+            staged_run.begin_rendering().unwrap();
+            let staged_latent = denoise_latents(
+                &transformer,
+                &cond,
+                None,
+                1.0,
+                (lat, lat),
+                plan.base_seed(),
+                device.clone(),
+                DType::F32,
+                Some(&clean),
+                &staged_run,
+                &cancel,
+                &mut |p: Progress| {
+                    if matches!(p, Progress::Step { .. }) {
+                        staged_denoise_steps += 1;
+                    }
+                },
+                &preview,
+            )
+            .unwrap();
+            let staged_vec = staged_latent
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(staged_denoise_steps, 0, "steps={steps}");
+            assert_eq!(staged_vec, clean_vec, "steps={steps}");
+            let staged_img = staged_run
+                .decode_phase(|| decode_image(&vae, &staged_latent))
+                .unwrap();
+            staged_run.finish_rendering();
+            assert_eq!(staged_img.pixels, direct.pixels, "steps={steps}");
+        }
+    }
+
     // ---- structural end-to-end tests (random weights) ---------------------------------------------
     //
     // These exercise the FULL render core — sampler + CFG/Turbo dispatch + VAE decode — on CPU with a
@@ -1609,13 +1723,91 @@ mod tests {
             "start_step 0 must ignore the reference (σ_start = 1.0 ⇒ x_t = noise)"
         );
 
-        // Edge 2: max strength (start == steps) ⇒ the source VAE round-trip (empty denoise loop).
+        // Edge 2: max strength (start == steps) ⇒ the source VAE round-trip (empty denoise loop),
+        // across unplanned, planned resident (`render_core` with `Some(&run)`), and planned staged
+        // (`denoise_latents` + `decode_image`) execution.
         let roundtrip = render(Some(&clean), steps);
         let direct = decode_image(&vae, &clean).unwrap();
         assert_eq!(
             roundtrip.pixels, direct.pixels,
             "start_step == steps must decode exactly vae.decode(clean) (empty tail, x_t = clean)"
         );
+        let req_strength_one = GenerationRequest {
+            prompt: "sd3 strength 1.0 roundtrip".into(),
+            width: 256,
+            height: 256,
+            steps: Some(steps as u32),
+            seed: Some(7),
+            conditioning: vec![candle_gen::gen_core::Conditioning::Reference {
+                image: Image {
+                    width: 256,
+                    height: 256,
+                    pixels: vec![128; 256 * 256 * 3],
+                },
+                strength: Some(1.0),
+            }],
+            ..Default::default()
+        };
+        let plan_strength_one =
+            crate::compile_trajectory_for(Variant::Large, &req_strength_one).unwrap();
+        assert_eq!(plan_strength_one.executed_steps(), 0);
+        assert_eq!(plan_strength_one.denoise_sigmas(), &[0.0]);
+        let resident_run = candle_gen::gen_core::RenderRun::new(&plan_strength_one, &cancel, None);
+        resident_run
+            .encode(|| Ok::<_, candle_gen::CandleError>(()))
+            .unwrap();
+        resident_run.begin_rendering().unwrap();
+        let resident_roundtrip = render_core(
+            &transformer,
+            &vae,
+            &cond,
+            None,
+            1.0,
+            steps,
+            3.0,
+            (lat, lat),
+            7,
+            device.clone(),
+            DType::F32,
+            Some(plan_strength_one.sampler()),
+            None,
+            Some(&clean),
+            steps,
+            Some(&resident_run),
+            &cancel,
+            &mut |_p: Progress| {},
+            &preview,
+        )
+        .unwrap();
+        resident_run.finish_rendering();
+        assert_eq!(resident_roundtrip.pixels, direct.pixels);
+
+        let staged_run = candle_gen::gen_core::RenderRun::new(&plan_strength_one, &cancel, None);
+        staged_run
+            .encode(|| Ok::<_, candle_gen::CandleError>(()))
+            .unwrap();
+        staged_run.begin_rendering().unwrap();
+        let staged_latent = denoise_latents(
+            &transformer,
+            &cond,
+            None,
+            1.0,
+            (lat, lat),
+            7,
+            device.clone(),
+            DType::F32,
+            Some(&clean),
+            &staged_run,
+            &cancel,
+            &mut |_p: Progress| {},
+            &preview,
+        )
+        .unwrap();
+        let staged_roundtrip = staged_run
+            .decode_phase(|| decode_image(&vae, &staged_latent))
+            .unwrap();
+        staged_run.finish_rendering();
+        assert_eq!(staged_roundtrip.pixels, direct.pixels);
 
         // Edge 3: an interior strength decodes a finite, right-shaped image (the blend path is wired)
         // and differs from both the txt2img and the round-trip (it is a genuine partial denoise).

@@ -407,7 +407,7 @@ fn resolved_schedule_for_request(
     let start_step = match &reference {
         Some((_, strength)) => {
             pipeline::init_time_step(steps, Some(pipeline::resolve_img2img_strength(*strength)))
-                .min(sigmas.len().saturating_sub(2))
+                .min(sigmas.len().saturating_sub(1))
         }
         None => 0,
     };

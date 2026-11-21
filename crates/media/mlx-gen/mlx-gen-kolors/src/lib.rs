@@ -242,6 +242,90 @@ mod explicit_registry_tests {
                 "expected typed Unsupported error, got {err:?}"
             );
         }
+
+        // Curated PiD early-stop (`use_pid = true`, `pid_capture_sigma = Some(0.35)`) compiles a
+        // valid RenderPlan preserving the full EDM schedule ending at 0.0 and expressing the
+        // early stop through `executed_steps`.
+        let pid_req = GenerationRequest {
+            prompt: "a misty mountain landscape".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            use_pid: true,
+            pid_capture_sigma: Some(0.35),
+            ..Default::default()
+        };
+        let pid_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &pid_req)
+            .unwrap()
+            .expect("compiled curated PiD early-stop plan");
+        assert_eq!(pid_plan.sigmas().last(), Some(&0.0));
+        assert_eq!(pid_plan.sigmas().len(), 9);
+        assert!(pid_plan.executed_steps() < 8);
+        assert_eq!(
+            pid_plan.denoise_sigmas().len(),
+            pid_plan.executed_steps() + 1
+        );
+        assert_eq!(
+            pid_plan.capture_sigma(),
+            pid_plan.sigmas()[pid_plan.executed_steps()]
+        );
+
+        // Planned execution rejects a mutated request or mismatched load binding before
+        // materializing heavy components.
+        let tmp = tempfile::tempdir().unwrap();
+        for rel in [
+            "text_encoder/model.safetensors",
+            "unet/diffusion_pytorch_model.safetensors",
+            "vae/diffusion_pytorch_model.fp16.safetensors",
+        ] {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let view =
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F16, vec![4], &[0u8; 8])
+                    .unwrap();
+            std::fs::write(path, safetensors::serialize([("w", view)], &None).unwrap()).unwrap();
+        }
+        let seq_spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        let gen = crate::registry::load(&seq_spec).expect("sequential load defers all weights");
+        let base_req = GenerationRequest {
+            prompt: "a misty mountain landscape".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            ..Default::default()
+        };
+        let bound_plan = registry
+            .compile_render_plan(super::MODEL_ID, &seq_spec, &base_req)
+            .unwrap()
+            .expect("compiled bound plan");
+        let mut mutated_req = base_req.clone();
+        mutated_req.steps = Some(12);
+        let req_err = gen
+            .generate_planned(&mutated_req, &bound_plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            req_err.contains("compiled render plan does not match"),
+            "unexpected error: {req_err}"
+        );
+        let other_plan = registry
+            .compile_render_plan(super::MODEL_ID, &spec, &base_req)
+            .unwrap()
+            .expect("compiled plan for other spec");
+        let load_err = gen
+            .generate_planned(&base_req, &other_plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            load_err.contains("different model or adapter stack"),
+            "unexpected error: {load_err}"
+        );
     }
 }
 

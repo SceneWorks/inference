@@ -91,6 +91,7 @@ pub struct KolorsGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    loaded_spec: LoadSpec,
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
@@ -119,8 +120,12 @@ impl KolorsGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         self.validate(req)?;
+        if let Some(plan) = plan {
+            plan.check_request(&self.descriptor, req)?;
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        }
+        let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         // A pre-canceled request must not trigger the lazy multi-gigabyte component load. Render
         // has additional checkpoints after request setup, at every image, and before decode.
         if req.cancel.is_cancelled() {
@@ -335,6 +340,7 @@ pub(crate) fn compile_kolors(
             capture_sigma: 0.0,
         },
     )
+    .map(|plan| plan.bind_load(spec))
     .map(Some)
 }
 
@@ -581,6 +587,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         root,
         device,
+        loaded_spec: spec.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.

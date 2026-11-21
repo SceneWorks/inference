@@ -762,7 +762,7 @@ pub fn run_curated_sampler_with_phase_transition_spans(
                             .into_clean_estimate()
                             .map_err(crate::Error::from)?;
                         let target_dtype = x0_low.dtype();
-                        let x0_f32 = x0_low.as_dtype(Dtype::Float32)?;
+                        let x0_f32 = crate::array::contiguous(&x0_low.as_dtype(Dtype::Float32)?)?;
                         step_eval(&[&x0_f32])?;
                         let low_slice = x0_f32.as_slice::<f32>();
                         let base_seed = run.plan().base_seed();

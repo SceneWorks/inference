@@ -1134,9 +1134,11 @@ fn transition_nhwc_clean_estimate(
     }
     let b_sz = shape[0] as usize;
     let low_h = shape[1] as usize;
-    let nchw_low = x0_low
-        .transpose_axes(&[0, 3, 1, 2])?
-        .as_dtype(mlx_rs::Dtype::Float32)?;
+    let nchw_low = mlx_gen::array::contiguous(
+        &x0_low
+            .transpose_axes(&[0, 3, 1, 2])?
+            .as_dtype(mlx_rs::Dtype::Float32)?,
+    )?;
     nchw_low.eval()?;
     let low_slice = nchw_low.as_slice::<f32>();
     let vae_spatial_scale = ((low_res_plan.low_height as usize) / low_h.max(1)).max(1);
@@ -1162,7 +1164,7 @@ fn transition_nhwc_clean_estimate(
     let full_h = ((low_res_plan.full_height as usize) / vae_spatial_scale) as i32;
     let full_w = ((low_res_plan.full_width as usize) / vae_spatial_scale) as i32;
     let nchw_full = Array::from_slice(&noised, &[b_sz as i32, 4, full_h, full_w]);
-    let nhwc_full = nchw_full.transpose_axes(&[0, 2, 3, 1])?;
+    let nhwc_full = mlx_gen::array::contiguous(&nchw_full.transpose_axes(&[0, 2, 3, 1])?)?;
     if target_dtype == mlx_rs::Dtype::Float32 {
         Ok(nhwc_full)
     } else {
@@ -2400,5 +2402,81 @@ mod tests {
             controlled.as_slice::<f32>(),
             "a nonzero ControlNet residual must alter the Lightning trajectory"
         );
+    }
+
+    #[test]
+    fn transition_nhwc_clean_estimate_materializes_transposed_nhwc_planes() {
+        let req = mlx_gen::GenerationRequest {
+            prompt: "nhwc low_res_start transition".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: Some(42),
+            sampler: Some("euler".into()),
+            scheduler: Some("karras".into()),
+            low_res_start: Some(gen_core::LowResStartSpec::new(2, Some(0.5))),
+            ..Default::default()
+        };
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
+        let plan = crate::model::compile_sdxl(&spec, &req)
+            .unwrap()
+            .expect("compiled sdxl plan");
+        let low_res_plan = *plan.low_res_start().unwrap();
+        let sigma_k = plan.denoise_sigmas()[low_res_plan.k];
+        let cfg = crate::DiffusionConfig::sdxl_base();
+        let alpha = AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+        let ms = mlx_gen::gen_core::sampling::DiscreteModelSampling::sdxl(&alpha);
+
+        // Build a spatially varying, channel-distinct [1, 64, 64, 4] NHWC f32 fixture and its
+        // matching planar [1, 4, 64, 64] NCHW vector. Without `contiguous`, `transpose_axes`
+        // followed by `as_dtype(Float32)` and `as_slice` reads the physical NHWC layout as NCHW.
+        let low_h = 64usize;
+        let low_w = 64usize;
+        let mut nhwc_vec = vec![0.0f32; low_h * low_w * 4];
+        let mut nchw_vec = vec![0.0f32; 4 * low_h * low_w];
+        for y in 0..low_h {
+            for x in 0..low_w {
+                for c in 0..4 {
+                    let val = (c as f32) * 10.0 + (y as f32) * 0.1 + (x as f32) * 0.01;
+                    nhwc_vec[(y * low_w + x) * 4 + c] = val;
+                    nchw_vec[c * (low_h * low_w) + y * low_w + x] = val;
+                }
+            }
+        }
+        let x0_nhwc = Array::from_slice(&nhwc_vec, &[1, low_h as i32, low_w as i32, 4]);
+        let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+        let got_nhwc = transition_nhwc_clean_estimate(
+            &x0_nhwc,
+            gen_core::EstimateSource::EndpointEvaluation,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            &run,
+            plan.base_seed(),
+        )
+        .unwrap();
+        assert_eq!(got_nhwc.shape(), &[1, 128, 128, 4]);
+        let got_nchw =
+            mlx_gen::array::contiguous(&got_nhwc.transpose_axes(&[0, 3, 1, 2]).unwrap()).unwrap();
+        got_nchw.eval().unwrap();
+
+        let expected_nchw = gen_core::transition_clean_estimate_f32(
+            gen_core::BoundaryState::CleanEstimate {
+                latent: &nchw_vec,
+                source: gen_core::EstimateSource::EndpointEvaluation,
+            },
+            1,
+            4,
+            8,
+            &low_res_plan,
+            sigma_k,
+            &ms,
+            plan.base_seed(),
+            0,
+            plan.pass_index(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(got_nchw.as_slice::<f32>(), expected_nchw.as_slice());
     }
 }

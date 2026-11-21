@@ -131,6 +131,7 @@ pub struct BooguGenerator {
     root: PathBuf,
     variant: Variant,
     device: Device,
+    loaded_spec: LoadSpec,
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
@@ -852,6 +853,7 @@ impl Generator for BooguGenerator {
         }
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let output = self.execute_generate(req, Some(&run), on_progress)?;
         let mut report = gen_core::GenerationReport::from_output(output);
@@ -1084,6 +1086,7 @@ fn build(
         root,
         variant,
         device,
+        loaded_spec: spec.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike adapters/control above, it is
         // not rejected — `None` simply keeps the byte-exact native-VAE path.
@@ -1398,6 +1401,7 @@ mod tests {
         BooguGenerator {
             descriptor,
             root: PathBuf::from("/nonexistent"),
+            loaded_spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("/nonexistent"))),
             variant,
             device: Device::Cpu,
             pid_spec: None,

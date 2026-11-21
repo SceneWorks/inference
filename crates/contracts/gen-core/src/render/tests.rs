@@ -638,6 +638,7 @@ fn failed_phase_keeps_original_error_for_owner_teardown() {
 fn invalid_schedules_and_unaligned_geometry_refuse_before_any_stage() {
     let req = GenerationRequest::default();
     for (nodes, steps, capture) in [
+        (vec![0.0], 0, 0.0),
         (vec![1.0, 0.0], 0, 0.0),
         (vec![1.0, 0.0], 2, 0.0),
         (vec![0.5, 0.6, 0.0], 2, 0.0),
@@ -647,6 +648,19 @@ fn invalid_schedules_and_unaligned_geometry_refuse_before_any_stage() {
         assert!(RenderPlan::base_image(&descriptor(), &req, pass(nodes, steps, capture)).is_err());
     }
     assert!(plan(&GenerationRequest { width: 17, ..req }).is_err());
+
+    // Reference / source-image img2img terminal zero-step endpoint (`sigmas == [0.0]`,
+    // `executed_steps == 0`) is permitted on `packed_image_trajectory` for VAE round-trips.
+    let ref_req = GenerationRequest {
+        conditioning: vec![reference(16, 16, Some(1.0))],
+        ..Default::default()
+    };
+    let terminal_plan =
+        RenderPlan::packed_image_trajectory(&descriptor(), &ref_req, pass(vec![0.0], 0, 0.0))
+            .expect("terminal zero-step reference endpoint plan");
+    assert_eq!(terminal_plan.executed_steps(), 0);
+    assert_eq!(terminal_plan.denoise_sigmas(), &[0.0]);
+    assert_eq!(terminal_plan.denoise_spans(), vec![0..0]);
 }
 
 #[test]

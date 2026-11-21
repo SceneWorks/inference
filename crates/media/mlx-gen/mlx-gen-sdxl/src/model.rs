@@ -1371,10 +1371,15 @@ impl Sdxl {
         scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
-        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
-        let request = self.resolve_request(req)?;
+        let mut request = self.resolve_request(req)?;
+        request.base_seed = plan.base_seed();
         let output = self.residency.run_staged_request_scoped(
             request.stage_residency,
             false,
@@ -1759,8 +1764,19 @@ impl Sdxl {
             .map(|strength| resolve_strength(strength, DEFAULT_STRENGTH));
         let edm_sigmas = if request.sampling.route().is_curated() {
             let full_sigmas = request.sampling.curated_full_sigmas(&self.alpha_schedule)?;
-            match init_strength {
-                Some(strength) => curated_strength_schedule(&full_sigmas, steps, strength),
+            match init.requested_strength() {
+                Some(strength_opt) if req.low_res_start.is_some() => {
+                    let raw_strength = strength_opt.unwrap_or(DEFAULT_STRENGTH);
+                    let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                        full_sigmas.len().saturating_sub(1),
+                        Some(raw_strength),
+                    )?;
+                    full_sigmas[start..].to_vec()
+                }
+                Some(strength_opt) => {
+                    let strength = resolve_strength(strength_opt, DEFAULT_STRENGTH);
+                    curated_strength_schedule(&full_sigmas, steps, strength)
+                }
                 None => full_sigmas,
             }
         } else {
@@ -2693,16 +2709,16 @@ pub fn compile_sdxl(
         }
         None => full_sigmas,
     };
-    let (capture_sigma, keep) = match req
+    let keep = match req
         .use_pid
         .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
         .flatten()
     {
-        Some(p) => (p.sigma, p.keep),
-        None => (0.0, run_sigmas.len()),
+        Some(p) => p.keep,
+        None => run_sigmas.len(),
     };
-    let sigmas = run_sigmas[..keep].to_vec();
-    let executed_steps = sigmas.len().saturating_sub(1);
+    let executed_steps = keep.saturating_sub(1);
+    let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
     let sampler =
         mlx_gen::sampler::canonical_solver(Some(sampling.sampler_name()), mlx_gen::Solver::Euler)
             .name();
@@ -2714,7 +2730,7 @@ pub fn compile_sdxl(
             token_width: 4,
             sampler,
             guidance: sampling.guidance(),
-            sigmas,
+            sigmas: run_sigmas,
             executed_steps,
             capture_sigma,
         },

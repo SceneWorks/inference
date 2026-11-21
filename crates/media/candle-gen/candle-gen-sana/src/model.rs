@@ -69,6 +69,7 @@ pub struct SanaGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    loaded_spec: LoadSpec,
     /// Cached composed pipeline. `Mutex` because `Generator` is shared and `generate` takes `&self`.
     pipeline: Mutex<Option<std::sync::Arc<SanaPipeline>>>,
     load_seal: Arc<SanaLoadSeal>,
@@ -478,6 +479,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         root,
         device,
+        loaded_spec: spec.clone(),
         pipeline: Mutex::new(None),
         load_seal,
         memory_admission: AdmissionRegistry::new(MODEL_ID),
@@ -680,6 +682,7 @@ impl Generator for SanaGenerator {
     ) -> gen_core::Result<gen_core::GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume(req)?;
         self.load_seal.ensure_unchanged()?;

@@ -124,6 +124,7 @@ pub struct ZImage {
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    loaded_spec: LoadSpec,
     adapters: Vec<mlx_gen::AdapterSpec>,
     /// Shared request-scoped residency. The first warm request populates the pair; staged requests
     /// evict it before loading either phase.
@@ -154,6 +155,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(ZImage {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         loaded_tier,
+        loaded_spec: spec.clone(),
         adapters: spec.adapters.clone(),
         descriptor: descriptor(),
         tokenizer,
@@ -279,6 +281,8 @@ impl ZImage {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
 
         let run = gen_core::RenderRun::new(plan, &req.cancel, scope);

@@ -1098,7 +1098,10 @@ impl Pipeline {
         run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let pid_decoder =
             candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, crate::MODEL_ID)?;
         self.render_with(
@@ -1161,7 +1164,10 @@ impl Pipeline {
         run: Option<&gen_core::RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let seed = run.map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let decoder = candle_gen_pid::resolve_pid_decoder(pid, req, seed, crate::MODEL_ID)?;
         latents
             .iter()
@@ -1272,7 +1278,10 @@ impl Pipeline {
         // The DDIM path honors the request guidance exactly as before.
         let use_guide = !lightning && guidance > 1.0;
         candle_gen::execution::policy("sdxl/pipeline/use_guide", format!("{use_guide:?}").into());
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let total = steps as u32;
         let (init_w, init_h) = match run {
             Some(run) => run.plan().phase_output_size(0),

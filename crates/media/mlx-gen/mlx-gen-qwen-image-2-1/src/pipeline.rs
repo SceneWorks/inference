@@ -3,8 +3,9 @@
 //! true CFG) → unpack → latent denormalisation → RGBA decode → RGB emission.
 //!
 //! Progress, cancellation, the per-step `eval` boundary and the curated-sampler axis all come from
-//! the shared [`run_flow_sampler`] contract; this module only supplies the velocity closure and the
-//! Qwen-Image 2.1 latent layout (unpatched `[1, h·w, 64]`, `TimestepConvention::Sigma`).
+//! the shared [`run_flow_sampler`](mlx_gen::sampler::run_flow_sampler) contract; this module only
+//! supplies the velocity closure and the Qwen-Image 2.1 latent layout (unpatched `[1, h·w, 64]`,
+//! `TimestepConvention::Sigma`).
 //!
 //! The velocity closure runs upstream's prefix KV cache when [`DenoiseInputs::kv_cache`] asks for
 //! it ([`KvCacheMode`], sc-25903): the first model evaluation of each prompt branch prefills that
@@ -773,7 +774,7 @@ pub fn denoise_reported_with_pag_and_run(
             };
             let (x0_low, source) = boundary_state.into_clean_estimate().map_err(Error::from)?;
             let target_dtype = x0_low.dtype();
-            let x0_f32 = x0_low.as_dtype(Dtype::Float32)?;
+            let x0_f32 = mlx_gen::array::contiguous(&x0_low.as_dtype(Dtype::Float32)?)?;
             mlx_rs::transforms::eval([&x0_f32])?;
             let low_slice = x0_f32.as_slice::<f32>();
             let shape = x0_low.shape();

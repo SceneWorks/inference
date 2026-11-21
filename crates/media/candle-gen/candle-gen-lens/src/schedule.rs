@@ -1,7 +1,9 @@
 //! Lens sampling schedule + CFG (sc-5114). The schedule is the core flow-match Euler verbatim: the
-//! Lens `compute_empirical_mu` is **byte-identical** to gen-core's [`compute_mu`] (same calibrated
+//! Lens `compute_empirical_mu` is **byte-identical** to gen-core's
+//! [`compute_mu`](candle_gen::gen_core::sampling::compute_mu) (same calibrated
 //! constants + `>4300` branch), and the Lens `linspace(1, 1/n, n)` → dynamic-shift `set_timesteps`
-//! is exactly [`build_flow_sigmas`], exposed as [`lens_sigmas`]. Only two pieces are Lens-specific:
+//! is exactly [`build_flow_sigmas`](candle_gen::gen_core::sampling::build_flow_sigmas), exposed as
+//! [`lens_sigmas`]. Only two pieces are Lens-specific:
 //!
 //! 1. **Timestep convention** — Lens feeds the transformer the *shifted sigma* directly (the
 //!    reference `timestep / 1000`, where `scheduler.timesteps = shifted_sigma · 1000`), **not** the

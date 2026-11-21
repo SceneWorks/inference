@@ -73,8 +73,9 @@ pub fn emit_nhwc_ve_preview(
     });
 }
 
-/// Project and emit one raw k-diffusion VE-space SDXL-family latent for a compiled [`RenderPlan`],
-/// accepting either phase-0 reduced latent dimensions or full target latent dimensions.
+/// Project and emit one raw k-diffusion VE-space SDXL-family latent for a compiled
+/// [`RenderPlan`](mlx_gen::gen_core::RenderPlan), accepting either phase-0 reduced latent
+/// dimensions or full target latent dimensions.
 pub fn emit_nhwc_ve_preview_for_plan(
     sink: &PreviewSink,
     plan: &mlx_gen::gen_core::RenderPlan,

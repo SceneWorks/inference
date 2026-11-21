@@ -53,6 +53,7 @@ pub struct ZImageBaseGenerator {
     device: Device,
     dtype: DType,
     loaded_quant: Option<gen_core::Quant>,
+    loaded_spec: LoadSpec,
     /// Serializes resident cache use with request-scoped staged eviction.
     lifecycle: Mutex<()>,
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
@@ -220,8 +221,10 @@ impl Generator for ZImageBaseGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let pipe = Pipeline::load_with_text_encoder(
@@ -436,6 +439,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         dtype: DType::BF16,
         loaded_quant,
+        loaded_spec: spec.clone(),
         lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if

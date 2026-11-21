@@ -406,7 +406,10 @@ impl Pipeline {
         let use_guide = guidance > 1.0;
         candle_gen::execution::policy("kolors/pipeline/use_guide", format!("{use_guide:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.as_deref().map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let (h, w) = (req.height, req.width);
         let (init_w, init_h) = match run.as_deref() {
             Some(run) => run.plan().phase_output_size(0),
@@ -600,7 +603,10 @@ impl Pipeline {
         let use_guide = guidance > 1.0;
         candle_gen::execution::policy("kolors/pipeline/use_guide", format!("{use_guide:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = run.as_deref().map_or_else(
+            || req.seed.unwrap_or_else(gen_core::default_seed),
+            |r| r.plan().base_seed(),
+        );
         let (h, w) = (req.height, req.width);
         let (init_w, init_h) = match run.as_deref() {
             Some(run) => run.plan().phase_output_size(0),

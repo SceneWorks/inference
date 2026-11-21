@@ -468,15 +468,19 @@ impl SdxlGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         self.validate(req)?;
+        if let Some(plan) = plan {
+            plan.check_request(&self.descriptor, req)?;
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+        }
+        let mut run = plan.map(|plan| gen_core::RenderRun::new(plan, &req.cancel, scope));
         if let Some(seal) = &self.artifact_seal {
             seal.ensure_unchanged()?;
         }
         let _request = candle_gen::lock_recover(&self.request);
         let staged = staged_execution(self.file_pin_spec.offload_policy, req.memory);
         let mut effective_req = req.clone();
-        effective_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
+        effective_req.seed = Some(resolve_effective_seed(req, plan));
         if staged {
             effective_req
                 .memory
@@ -712,6 +716,13 @@ pub(crate) fn validate_low_res_start_sdxl(
     Ok(())
 }
 
+fn resolve_effective_seed(req: &GenerationRequest, plan: Option<&gen_core::RenderPlan>) -> u64 {
+    plan.map_or_else(
+        || req.seed.unwrap_or_else(gen_core::default_seed),
+        |p| p.base_seed(),
+    )
+}
+
 pub(crate) fn compile_sdxl(
     spec: &LoadSpec,
     req: &GenerationRequest,
@@ -798,6 +809,7 @@ pub(crate) fn compile_sdxl(
             capture_sigma: 0.0,
         },
     )
+    .map(|plan| plan.bind_load(spec))
     .map(Some)
 }
 
@@ -2337,5 +2349,48 @@ mod tests {
                 "compile_render_plan must reject illegal low_res_start request: {bad_low_res_req:?}"
             );
         }
+
+        // When `req.seed` is `None`, planned execution uses `plan.base_seed()` and validates
+        // request and load bindings before materializing components.
+        let unseeded_req = GenerationRequest {
+            prompt: "a lighthouse in a storm".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(8),
+            seed: None,
+            ..Default::default()
+        };
+        let unseeded_plan = registry
+            .compile_render_plan(MODEL_ID, &spec, &unseeded_req)
+            .unwrap()
+            .expect("compiled plan for unseeded request");
+        assert_eq!(
+            super::resolve_effective_seed(&unseeded_req, Some(&unseeded_plan)),
+            unseeded_plan.base_seed()
+        );
+        let mut mutated_req = unseeded_req.clone();
+        mutated_req.steps = Some(12);
+        let req_err = g
+            .generate_planned(&mutated_req, &unseeded_plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            req_err.contains("compiled render plan does not match"),
+            "unexpected error: {req_err}"
+        );
+        let other_spec = LoadSpec::new(WeightsSource::Dir("/other_nonexistent".into()))
+            .with_components(sdxl_component_specs());
+        let other_plan = registry
+            .compile_render_plan(MODEL_ID, &other_spec, &unseeded_req)
+            .unwrap()
+            .expect("compiled plan for other spec");
+        let load_err = g
+            .generate_planned(&unseeded_req, &other_plan, None, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            load_err.contains("different model or adapter stack"),
+            "unexpected error: {load_err}"
+        );
     }
 }

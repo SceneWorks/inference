@@ -1039,16 +1039,17 @@ pub fn compile_trajectory_for(
             .map(|(_, strength)| init_time_step(steps, Some(strength)))
             .unwrap_or(0)
     };
-    let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
+    let (_capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
     let start = start_step.min(keep.saturating_sub(1));
-    let denoise_sigmas = sigmas[start..keep].to_vec();
-    let executed_steps = denoise_sigmas.len().saturating_sub(1);
+    let sliced = sigmas[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
     let pass = mlx_gen::gen_core::render::PackedImagePass {
         pixel_stride: RES_MULTIPLE,
         token_width: 64,
         sampler: solver.name(),
         guidance,
-        sigmas: denoise_sigmas,
+        sigmas: sliced,
         executed_steps,
         capture_sigma,
     };

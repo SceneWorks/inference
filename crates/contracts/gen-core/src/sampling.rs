@@ -1778,8 +1778,8 @@ mod tests {
         // FLUX.2 compute_mu / compute_mu_f64 / flux2_sigmas_f32 / flux2_sigmas_f64
         let mu_f32 = compute_mu(4096, 4);
         let mu_f64 = compute_mu_f64(4096, 4);
-        assert!((mu_f32 - 2.291_179_9).abs() < 1e-5);
-        assert!((mu_f64 - 2.291_179_9).abs() < 1e-5);
+        assert!((mu_f32 - 2.291_18_f32).abs() < 1e-5);
+        assert!((mu_f64 - 2.291_18_f32).abs() < 1e-5);
         let f2_32 = flux2_sigmas_f32(4, 1024, 1024);
         let f2_64 = flux2_sigmas_f64(4, 1024, 1024);
         assert_eq!(f2_32.len(), 5);

@@ -583,8 +583,12 @@ impl Generator for ZImageGenerator {
         scope: Option<&mut dyn gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        if self.comfyui.is_none() {
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+        }
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into

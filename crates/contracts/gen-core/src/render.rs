@@ -478,6 +478,15 @@ impl RenderPlan {
             executed_steps,
             capture_sigma,
         } = pass;
+        let has_reference_or_source = req.source_image.is_some()
+            || req
+                .conditioning
+                .iter()
+                .any(|c| matches!(c, Conditioning::Reference { .. }));
+        let terminal_reference_noop = has_reference_or_source
+            && sigmas.as_slice() == [0.0]
+            && executed_steps == 0
+            && capture_sigma == 0.0;
         if pixel_stride == 0
             || token_width == 0
             || req.count == 0
@@ -487,8 +496,7 @@ impl RenderPlan {
             || !req.height.is_multiple_of(pixel_stride)
             || !guidance.is_finite()
             || !capture_sigma.is_finite()
-            || sigmas.len() < 2
-            || executed_steps == 0
+            || (!terminal_reference_noop && (sigmas.len() < 2 || executed_steps == 0))
             || executed_steps >= sigmas.len()
             || sigmas
                 .iter()

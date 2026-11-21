@@ -669,8 +669,8 @@ pub fn smart_resize(
     let factor = factor.max(1);
     let height = height.max(1);
     let width = width.max(1);
-    let mut h_bar = ((height as f64 / factor as f64).round() as usize).max(1) * factor;
-    let mut w_bar = ((width as f64 / factor as f64).round() as usize).max(1) * factor;
+    let mut h_bar = ((height as f64 / factor as f64).round_ties_even() as usize).max(1) * factor;
+    let mut w_bar = ((width as f64 / factor as f64).round_ties_even() as usize).max(1) * factor;
 
     if h_bar * w_bar > max_pixels {
         let beta = ((height * width) as f64 / max_pixels.max(1) as f64).sqrt();
@@ -904,6 +904,14 @@ mod tests {
     fn comp6_smart_resize_and_rgba_over_white_helpers() {
         let (h, w) = smart_resize(1024, 1024, 32, 32 * 32, 1024 * 1024);
         assert_eq!((h, w), (1024, 1024));
+
+        // Half-factor ties-to-even (banker's rounding, matching Python's `round()`):
+        // 238 / 28 = 8.5 -> 8 * 28 = 224; 280 / 28 = 10.0 -> 280
+        assert_eq!(smart_resize(238, 280, 28, 3136, 12_845_056), (224, 280));
+        // 42 / 28 = 1.5 -> 2 * 28 = 56; 70 / 28 = 2.5 -> 2 * 28 = 56
+        assert_eq!(smart_resize(42, 70, 28, 3136, 12_845_056), (56, 56));
+        // 98 / 28 = 3.5 -> 4 * 28 = 112
+        assert_eq!(smart_resize(98, 28, 28, 3136, 12_845_056), (112, 28));
 
         // Large dimensions clamp down to <= max_pixels while staying multiples of 32
         let (h_down, w_down) = smart_resize(2048, 2048, 32, 32 * 32, 384 * 384);

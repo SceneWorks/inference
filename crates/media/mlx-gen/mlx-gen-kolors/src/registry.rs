@@ -546,9 +546,14 @@ impl KolorsGenerator {
         scope: Option<&mut dyn mlx_gen::gen_core::MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
-        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
         self.validate(req)?;
-        let request = self.resolve_request(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&mlx_gen::gen_core::RenderLoadBinding::from_spec(
+            &self.loaded_spec,
+        ))?;
+        let run = mlx_gen::gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let mut request = self.resolve_request(req)?;
+        request.base_seed = plan.base_seed();
         let output = self.residency.run_request_scoped(
             request.stage_residency,
             false,
@@ -1243,6 +1248,13 @@ fn resolve_vp_plan(
         // Mirrors the curated init: combined-pose + img2img are strength-sliced; txt2img runs the
         // full schedule.
         match mode.curated_init() {
+            Some((_, strength)) if req.low_res_start.is_some() => {
+                let start = mlx_gen::gen_core::resolve_img2img_init_time_step(
+                    full_sigmas.len().saturating_sub(1),
+                    Some(strength),
+                )?;
+                full_sigmas[start..].to_vec()
+            }
             Some((_, strength)) => mlx_gen_sdxl::stages::curated_strength_tail(
                 &full_sigmas,
                 steps,
@@ -1743,16 +1755,16 @@ pub fn compile_kolors(
         }
         None => full_sigmas,
     };
-    let (capture_sigma, keep) = match req
+    let keep = match req
         .use_pid
         .then(|| vp_capture_plan(&run_sigmas, req.pid_capture_sigma))
         .flatten()
     {
-        Some(p) => (p.sigma, p.keep),
-        None => (0.0, run_sigmas.len()),
+        Some(p) => p.keep,
+        None => run_sigmas.len(),
     };
-    let sigmas = run_sigmas[..keep].to_vec();
-    let executed_steps = sigmas.len().saturating_sub(1);
+    let executed_steps = keep.saturating_sub(1);
+    let capture_sigma = *run_sigmas.get(executed_steps).unwrap_or(&0.0);
     let sampler = mlx_gen::sampler::canonical_solver(req.sampler.as_deref(), Solver::Euler).name();
     mlx_gen::gen_core::RenderPlan::packed_image_trajectory(
         &desc,
@@ -1762,7 +1774,7 @@ pub fn compile_kolors(
             token_width: 4,
             sampler,
             guidance,
-            sigmas,
+            sigmas: run_sigmas,
             executed_steps,
             capture_sigma,
         },

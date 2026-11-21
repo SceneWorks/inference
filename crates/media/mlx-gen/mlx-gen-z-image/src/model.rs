@@ -120,6 +120,7 @@ pub struct ZImageTurbo {
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    loaded_spec: Option<LoadSpec>,
     adapters: Vec<mlx_gen::AdapterSpec>,
     /// Request-scoped component residency (SC-15806). Construction retains the two phase loaders;
     /// each request either populates/reuses one warm pair or runs encode → drop text → load heavy →
@@ -203,6 +204,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         residency,
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         loaded_tier,
+        loaded_spec: Some(spec.clone()),
         adapters: spec.adapters.clone(),
     }))
 }
@@ -304,6 +306,7 @@ fn build_comfyui_generator(source: ComfyUiSource) -> Result<Box<dyn Generator>> 
             quant: None,
             component_precision_floors: &[],
         },
+        loaded_spec: None,
         residency: Residency::request_scoped(
             move |streamable| {
                 if streamable {
@@ -683,6 +686,10 @@ impl ZImageTurbo {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        if let Some(spec) = &self.loaded_spec {
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(spec))?;
+        }
         let resolved_pag = self.descriptor.capabilities.resolve_pag(MODEL_ID, req)?;
         mlx_gen::ios_quantum::diagnostic_metadata(
             MODEL_ID,
@@ -1040,10 +1047,11 @@ pub(crate) fn compile_trajectory_for(
         None => 0,
     };
     let sampling = crate::sampling::resolve_full_with_shift(req, shift, default_steps)?;
-    let (capture_sigma, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
+    let (_capture_sigma, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
     let start = start_step.min(keep.saturating_sub(1));
-    let sigmas = sampling.sigmas()[start..keep].to_vec();
-    let executed_steps = sigmas.len().saturating_sub(1);
+    let sigmas = sampling.sigmas()[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sigmas.get(executed_steps).unwrap_or(&0.0);
     gen_core::RenderPlan::packed_image_trajectory(
         &desc,
         req,
@@ -1138,10 +1146,11 @@ pub(crate) fn compile_control_for(
         None => 0,
     };
     let sampling = crate::sampling::resolve_full_with_shift(req, shift, default_steps)?;
-    let (capture_sigma, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
+    let (_capture_sigma, keep) = flow_capture_for_request(req, sampling.sigmas(), start_step);
     let start = start_step.min(keep.saturating_sub(1));
-    let sigmas = sampling.sigmas()[start..keep].to_vec();
-    let executed_steps = sigmas.len().saturating_sub(1);
+    let sigmas = sampling.sigmas()[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sigmas.get(executed_steps).unwrap_or(&0.0);
     gen_core::RenderPlan::packed_image_trajectory(
         &desc,
         req,

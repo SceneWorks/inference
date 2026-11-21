@@ -691,18 +691,18 @@ pub fn compile_trajectory_for(req: &GenerationRequest) -> gen_core::Result<gen_c
             "qwen_image: the lightning sampler is txt2img-only (no img2img init image)".into(),
         ));
     }
-    let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, start_step);
-    let denoise_sigmas = &params.sigmas[..keep];
-    let executed =
-        denoise_sigmas[start_step.min(denoise_sigmas.len().saturating_sub(1))..].to_vec();
-    let executed_steps = executed.len().saturating_sub(1);
+    let (_capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, start_step);
+    let start = start_step.min(keep.saturating_sub(1));
+    let sliced = params.sigmas[start..].to_vec();
+    let executed_steps = keep.saturating_sub(start).saturating_sub(1);
+    let capture_sigma = *sliced.get(executed_steps).unwrap_or(&0.0);
     let solver = gen_core::sampling::canonical_solver_or_euler(params.sampler_name.as_deref());
     let pass = gen_core::render::PackedImagePass {
         pixel_stride: SIZE_MULTIPLE,
         token_width: 64,
         sampler: solver.name(),
         guidance: params.guidance,
-        sigmas: executed,
+        sigmas: sliced,
         executed_steps,
         capture_sigma,
     };

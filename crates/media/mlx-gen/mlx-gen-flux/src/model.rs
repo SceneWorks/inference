@@ -1359,7 +1359,7 @@ pub fn transition_mlx_flux_boundary_state(
 ) -> Result<Array> {
     let (x0_low, source) = boundary_state.into_clean_estimate()?;
     let target_dtype = x0_low.dtype();
-    let x0_f32 = x0_low.as_dtype(Dtype::Float32)?;
+    let x0_f32 = mlx_gen::array::contiguous(&x0_low.as_dtype(Dtype::Float32)?)?;
     mlx_rs::transforms::eval([&x0_f32])?;
     let packed_slice = x0_f32.as_slice::<f32>();
     let repacked = gen_core::transition_packed_clean_estimate_f32(
