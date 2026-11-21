@@ -274,11 +274,18 @@ pub fn verify_transformer_tensors(
     if map.keys().any(|k| k.ends_with(".comfy_quant")) {
         let weights = Weights::from_map(map.clone());
         for base in map.keys().filter_map(|k| k.strip_suffix(".comfy_quant")) {
-            if expected_names.contains(format!("{base}.weight").as_str())
-                && mlx_gen::quant::native_lin(&weights, base, false)?.is_some()
+            if !expected_names.contains(format!("{base}.weight").as_str()) {
+                continue;
+            }
+            if let Some(projection) =
+                mlx_gen::NativeProjection::from_weights(&weights, base, false)?
             {
                 native_companions.insert(format!("{base}.comfy_quant"));
                 native_companions.insert(format!("{base}.weight_scale"));
+                if matches!(projection, mlx_gen::NativeProjection::Fp8(_)) {
+                    // The FP8 constructor already checked the optional scalar dtype, shape and value.
+                    native_companions.insert(format!("{base}.input_scale"));
+                }
             }
         }
     }
@@ -675,6 +682,35 @@ mod tests {
         c.dim = dim;
         c.ffn_dim = ffn;
         c
+    }
+
+    #[test]
+    fn verified_scalar_fp8_owns_only_its_validated_input_scale() {
+        let mut cfg = tiny_wan(4, 8);
+        cfg.num_layers = 1;
+        cfg.num_heads = 1;
+        let mut map: HashMap<_, _> = expected_transformer_tensors(&cfg)
+            .into_iter()
+            .map(|spec| (spec.name, Array::zeros::<f32>(&spec.shape).unwrap()))
+            .collect();
+        let base = "blocks.0.self_attn.q";
+        let desc = br#"{"format":"float8_e4m3fn"}"#;
+        map.insert(
+            format!("{base}.weight"),
+            Array::from_slice(&[0x38u8; 16], &[4, 4]),
+        );
+        map.insert(format!("{base}.weight_scale"), Array::from_f32(0.5));
+        map.insert(format!("{base}.input_scale"), Array::from_f32(0.25));
+        map.insert(
+            format!("{base}.comfy_quant"),
+            Array::from_slice(desc, &[desc.len() as i32]),
+        );
+        verify_transformer_tensors(&map, &cfg).unwrap();
+        map.insert(format!("{base}.input_scale"), Array::from_f32(0.0));
+        assert!(verify_transformer_tensors(&map, &cfg).is_err());
+        map.insert(format!("{base}.input_scale"), Array::from_f32(0.25));
+        map.insert("unrelated.input_scale".into(), Array::from_f32(0.25));
+        assert!(verify_transformer_tensors(&map, &cfg).is_err());
     }
 
     /// The tier is recovered from the packed **shapes**, recovering `bits` AND `group_size` — the

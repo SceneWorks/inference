@@ -284,9 +284,10 @@ impl LensText {
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
         let enc_cfg = GptOssConfig::lens();
         let text_encoder_dir = root.join("text_encoder");
-        let enc_w = Weights::from_dir_with_projection_layout(
+        let enc_w = Weights::from_dir_with_layout(
             &text_encoder_dir,
             crate::text_encoder::gpt_oss::stacked_expert_key,
+            |_, _| dtype,
         )?;
         let encoder = if streamable {
             LensTextEncoder::from_streamable_source(

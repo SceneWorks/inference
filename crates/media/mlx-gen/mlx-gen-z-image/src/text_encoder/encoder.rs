@@ -263,7 +263,7 @@ impl TextEncoder {
         let head_dim = dims.1.max(0) as u64;
         let ab = crate::quantum::ab;
         let rows = match embed_tokens {
-            mlx_gen::nn::TokenEmbedding::Native(_) => ab(4, &[b, s]) + ab(12, &[b, s, hidden]),
+            mlx_gen::nn::TokenEmbedding::Native(..) => ab(4, &[b, s]) + ab(12, &[b, s, hidden]),
             mlx_gen::nn::TokenEmbedding::Dense(w) => {
                 let width = w.item_size() as u64;
                 ab(width, &[b, s, hidden]) + if width < 4 { ab(4, &[b, s, hidden]) } else { 0 }

@@ -121,9 +121,12 @@ impl NativeProjection {
         }
     }
     pub fn rows(&self, ids: &mlx_rs::Array) -> Result<mlx_rs::Array> {
+        self.rows_as(ids, mlx_rs::Dtype::Bfloat16)
+    }
+    pub fn rows_as(&self, ids: &mlx_rs::Array, dtype: mlx_rs::Dtype) -> Result<mlx_rs::Array> {
         match self {
-            Self::ConvRot(p) => p.rows(ids),
-            Self::Fp8(p) => p.rows(ids),
+            Self::ConvRot(p) => p.rows_as(ids, dtype),
+            Self::Fp8(p) => p.rows_as(ids, dtype),
         }
     }
     pub fn materialize(&self) -> Result<()> {
