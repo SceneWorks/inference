@@ -197,18 +197,35 @@ impl<'a> GroupReader<'a> {
         }
     }
 
-    fn host(&self, name: &str) -> Result<Tensor> {
-        if !self.tensors.iter().any(|t| t == name) {
-            return Err(Error::Msg(format!(
+    fn check_group(&self, name: &str) -> Result<()> {
+        if self.tensors.iter().any(|t| t == name) {
+            Ok(())
+        } else {
+            Err(Error::Msg(format!(
                 "`{name}` is read outside its priced load group"
-            )));
+            )))
         }
+    }
+
+    fn host(&self, name: &str) -> Result<Tensor> {
+        self.check_group(name)?;
         self.source.host(name)
     }
 
-    /// `name` in the compute dtype on the device (a norm, a codebook, a base kernel).
+    /// Coefficients such as a norm, codebook or convolution kernel in the requested compute dtype.
     pub(crate) fn dense(&self, name: &str) -> Result<Tensor> {
+        self.check_group(name)?;
+        if let DraftSource::Checkpoint(s) = self.source {
+            if s.reader().planned(name).is_some() {
+                return Ok(s.on_device(self.device)?.reader().read_dense(
+                    name,
+                    self.dtype,
+                    self.device,
+                )?);
+            }
+        }
         Ok(self
+            .source
             .host(name)?
             .to_dtype(self.dtype)?
             .to_device(self.device)?)
@@ -219,11 +236,7 @@ impl<'a> GroupReader<'a> {
     pub(crate) fn proj(&self, name: &str, quant: Option<QuantSpec>) -> Result<Projection> {
         if let DraftSource::Checkpoint(source) = self.source {
             if source.reader().planned(name).is_some() {
-                if !self.tensors.iter().any(|key| key == name) {
-                    return Err(Error::Msg(format!(
-                        "`{name}` is read outside its priced load group"
-                    )));
-                }
+                self.check_group(name)?;
                 let source = source.on_device(self.device)?;
                 if let Some(op) = source.native_linear(name, self.dtype, self.device, None)? {
                     return Projection::from_native(op);

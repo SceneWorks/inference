@@ -874,7 +874,28 @@ impl AdapterBackend {
 
 struct NativeLora {
     base: std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>,
-    ops: Vec<AdapterOp>,
+    factors: Vec<LoraFactor>,
+}
+
+struct LoraFactor {
+    down: candle_nn::Linear,
+    up: candle_nn::Linear,
+    scale: f64,
+}
+
+impl LoraFactor {
+    fn new(op: &AdapterOp) -> candle_audio::candle_core::Result<Self> {
+        let linear =
+            |tensor: &Option<Tensor>| -> candle_audio::candle_core::Result<candle_nn::Linear> {
+                let weight = tensor.as_ref().expect("validated additive LoRA factors");
+                Ok(candle_nn::Linear::new(weight.to_dtype(DType::F32)?, None))
+            };
+        Ok(Self {
+            down: linear(&op.module.a)?,
+            up: linear(&op.module.b)?,
+            scale: (op.effective_scale as f32) as f64,
+        })
+    }
 }
 
 impl candle_nn::linear::NativeLinearWeight for NativeLora {
@@ -883,30 +904,30 @@ impl candle_nn::linear::NativeLinearWeight for NativeLora {
         x: &Tensor,
         bias: Option<&Tensor>,
     ) -> candle_audio::candle_core::Result<Tensor> {
+        use candle_audio::candle_core::Module;
         let base = self.base.forward(x, bias)?;
         let x = x.to_dtype(DType::F32)?;
-        let mut delta = None;
-        for op in &self.ops {
-            let a = op.module.a.as_ref().expect("validated LoRA A");
-            let b = op.module.b.as_ref().expect("validated LoRA B");
-            let down = candle_nn::Linear::new(a.to_dtype(DType::F32)?, None);
-            let up = candle_nn::Linear::new(b.to_dtype(DType::F32)?, None);
-            use candle_audio::candle_core::Module;
-            let output = up
-                .forward(&down.forward(&x)?)?
-                .affine((op.effective_scale as f32) as f64, 0.)?;
-            delta = Some(match delta {
-                None => output,
-                Some(previous) => (previous + output)?,
-            });
+        let mut result = base.to_dtype(DType::F32)?;
+        for factor in &self.factors {
+            let delta = factor
+                .up
+                .forward(&factor.down.forward(&x)?)?
+                .affine(factor.scale, 0.)?;
+            result = (result + delta)?;
         }
-        let dtype = base.dtype();
-        base.broadcast_add(&delta.expect("nonempty adapter stack").to_dtype(dtype)?)
+        result.to_dtype(base.dtype())
     }
+
     fn dense_weight(&self) -> candle_audio::candle_core::Result<Tensor> {
-        apply_adapter_ops(&self.base.dense_weight()?, &self.ops)
-            .map_err(|e| candle_audio::candle_core::Error::Msg(e.to_string()))
+        let base = self.base.dense_weight()?;
+        let mut weight = base.to_dtype(DType::F32)?;
+        for factor in &self.factors {
+            let delta = factor.up.try_weight()?.matmul(factor.down.try_weight()?)?;
+            weight = (weight + delta.affine(factor.scale, 0.)?)?;
+        }
+        weight.to_dtype(base.dtype())
     }
+
     fn format_id(&self) -> &'static str {
         self.base.format_id()
     }
@@ -919,11 +940,10 @@ impl candle_nn::linear::NativeLinearWeight for NativeLora {
     fn resident_bytes(&self) -> u64 {
         self.base.resident_bytes()
             + self
-                .ops
+                .factors
                 .iter()
-                .flat_map(|op| [op.module.a.as_ref(), op.module.b.as_ref()])
-                .flatten()
-                .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                .flat_map(|pair| [&pair.up, &pair.down])
+                .map(|linear| (linear.weight().elem_count() * std::mem::size_of::<f32>()) as u64)
                 .sum::<u64>()
     }
 }
@@ -946,15 +966,17 @@ impl candle_nn::var_builder::SimpleBackend for AdapterBackend {
         if ops.iter().any(|op| op.kind != AdapterType::Lora) {
             return Ok(None);
         }
-        Ok(self
+        let Some(base) = self
             .inner
             .native_linear_weight(name, shape, dtype, device)?
-            .map(|base| {
-                std::sync::Arc::new(NativeLora {
-                    base,
-                    ops: ops.to_vec(),
-                }) as _
-            }))
+        else {
+            return Ok(None);
+        };
+        let factors = ops
+            .iter()
+            .map(LoraFactor::new)
+            .collect::<candle_audio::candle_core::Result<_>>()?;
+        Ok(Some(std::sync::Arc::new(NativeLora { base, factors })))
     }
 
     fn get(

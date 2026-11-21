@@ -616,7 +616,7 @@ impl SparseMoe {
     /// which is at least `1 / experts` — so no clamp is taken here.
     pub fn route(&self, xf: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = self.top_k();
-        let logits = __model_proof_output!(self.router.forward(&xf))?; // [t, E]
+        let logits = __model_proof_output!(self.router.forward(xf))?; // [t, E]
         let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
         let ids = probs
             .arg_sort_last_dim(false)?
@@ -1352,7 +1352,7 @@ mod tests {
             }
             out
         }
-        let source = include_str!("moe.rs");
+        let source = include_str!("moe.rs").replace("\r\n", "\n");
         let code = &source[..source
             .find("#[cfg(test)]\nmod tests {")
             .expect("tests marker")];

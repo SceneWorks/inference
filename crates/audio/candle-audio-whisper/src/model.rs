@@ -115,6 +115,7 @@ pub fn descriptor() -> TranscriberDescriptor {
 /// `transcribe` and reused across requests (the sibling providers' lazy-load discipline).
 struct LoadedModel {
     model: Whisper,
+    tied_head: Option<candle_nn::Linear>,
     tokenizer: Tokenizer,
     config: Config,
 }
@@ -154,8 +155,15 @@ impl WhisperTranscriber {
         let vb = candle_audio::weights::mmap_var_builder(&[weights], DTYPE, &device)
             .map_err(AudioError::from)?;
         let model = Whisper::load(&vb, config.clone()).map_err(AudioError::from)?;
+        let tied_head = candle_audio::weights::native_tied_head(
+            &vb,
+            "model.decoder.embed_tokens.weight",
+            config.vocab_size,
+            config.d_model,
+        )?;
         Ok(LoadedModel {
             model,
+            tied_head,
             tokenizer,
             config,
         })
@@ -228,7 +236,8 @@ impl Transcriber for WhisperTranscriber {
             timestamps,
             device.clone(),
         )
-        .map_err(gen_core::Error::from)?;
+        .map_err(gen_core::Error::from)?
+        .with_tied_head(loaded.tied_head.as_ref());
 
         // Language: an explicit hint (mapped to its <|lang|> token), else auto-detect.
         let (language_token, detected) = match &req.options.language {

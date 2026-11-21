@@ -1993,7 +1993,6 @@ fn build_ffn(
     proj_q: &dyn Fn(String) -> Result<Projection>,
 ) -> Result<Ffn> {
     let lp = |s: &str| format!("{lp}{s}");
-    let req = |key: String| -> Result<Tensor> { dense_weight(w, &key, dtype) };
     let Some(moe) = &cfg.moe else {
         return Ok(Ffn::Dense(Mlp {
             gate: proj_q(lp("mlp.gate_proj.weight"))?,
@@ -2012,35 +2011,33 @@ fn build_ffn(
             });
         }
     } else {
+        let ne = moe.num_experts as usize;
         let mi = moe.moe_intermediate_size as usize;
-        debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
-        debug_assert_priced(&lp("mlp.experts.down_proj"), format);
-        // A prepared tier stores each stacked tensor as GGML blocks
-        // `[E, rows, blocks, block_bytes]` (sc-19375); an expert's rows are whole blocks, so it is
-        // sliced out exactly like the dense `[E, rows, cols]`.
-        let stacked = |key: String| -> Result<(Tensor, bool)> {
-            let t = w.require(&key)?;
-            match is_ggml_block_tensor(t) {
-                true => Ok((t.clone(), true)),
-                false => Ok((req(key)?, false)),
-            }
-        };
-        let (gate_up_key, down_key) = (lp("mlp.experts.gate_up_proj"), lp("mlp.experts.down_proj"));
-        let (gate_up, gate_up_stored) = stacked(gate_up_key.clone())?;
-        let (down, down_stored) = stacked(down_key.clone())?;
-        let expert = |key: &str, slice: Tensor, stored: bool| -> Result<Projection> {
-            match stored {
-                true => Projection::load_stored_blocks(key, &slice, None, format, device),
-                false => Projection::load_as(slice.contiguous()?, None, format),
-            }
-        };
-        for e in 0..moe.num_experts as usize {
-            let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
-            let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
+        let hidden = cfg.hidden_size as usize;
+        let gate_up = stacked_expert_projections(
+            w,
+            &lp("mlp.experts.gate_up_proj"),
+            dtype,
+            device,
+            format,
+            [ne, 2 * mi, hidden],
+            2,
+        )?;
+        let down = stacked_expert_projections(
+            w,
+            &lp("mlp.experts.down_proj"),
+            dtype,
+            device,
+            format,
+            [ne, hidden, mi],
+            1,
+        )?;
+        let mut gate_up = gate_up.into_iter();
+        for down in down {
             experts.push(SwiGlu {
-                gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
-                up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
-                down: expert(&down_key, dn, down_stored)?,
+                gate: gate_up.next().expect("two projections per expert"),
+                up: gate_up.next().expect("two projections per expert"),
+                down,
             });
         }
     }
@@ -2060,6 +2057,69 @@ fn build_ffn(
             routed_scaling_factor: 1.0,
         },
     )?))
+}
+
+/// Slice each expert's contiguous [out,in] rows before materializing its matrix. A scalar FP8
+/// stack carries the same publisher scales for every expert. Stored GGML blocks retain their
+/// additional trailing block dimensions and the original per-expert reconstruction path.
+fn stacked_expert_projections(
+    w: &Weights,
+    key: &str,
+    dtype: DType,
+    device: &Device,
+    format: Option<&ProjectionFormat>,
+    shape: [usize; 3],
+    parts: usize,
+) -> Result<Vec<Projection>> {
+    debug_assert_priced(key, format);
+    let [experts, full_rows, cols] = shape;
+    let rows = full_rows / parts;
+    let mut projections = Vec::with_capacity(experts * parts);
+    let encoded = w.encoded_device(key).is_some();
+    if encoded {
+        if w.shape(key) != Some(shape.as_slice()) {
+            return Err(Error::Config(format!(
+                "expert stack `{key}` has shape {:?}, expected {shape:?}",
+                w.shape(key)
+            )));
+        }
+        if let Some(first) = w.native_projection_slice(key, dtype, device, 0, rows, cols)? {
+            projections.push(first);
+            for index in 1..experts * parts {
+                let projection = w
+                    .native_projection_slice(key, dtype, device, index * rows, rows, cols)?
+                    .ok_or_else(|| {
+                        Error::Config(format!("inconsistent native slice in expert stack {key}"))
+                    })?;
+                projections.push(projection);
+            }
+            return Ok(projections);
+        }
+    }
+    let raw = if let Some(t) = w.encoded_dense(key, dtype, Some(device))? {
+        t
+    } else {
+        w.require(key)?.clone()
+    };
+    let stored = is_ggml_block_tensor(&raw);
+    let stack = if stored { raw } else { raw.to_dtype(dtype)? };
+    for expert in 0..experts {
+        let block = stack.narrow(0, expert, 1)?.squeeze(0)?;
+        for part in 0..parts {
+            let slice = block.narrow(0, part * rows, rows)?;
+            let projection = if stored {
+                Projection::load_stored_blocks(key, &slice, None, format, device)?
+            } else {
+                Projection::load_as(
+                    slice.contiguous()?,
+                    None,
+                    if encoded { None } else { format },
+                )?
+            };
+            projections.push(projection);
+        }
+    }
+    Ok(projections)
 }
 
 /// The checkpoint-native Qwen3.8 multi-token predictor.
@@ -4489,6 +4549,33 @@ pub(crate) mod tests {
     use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn stacked_checkpoint_experts_keep_row_boundaries_without_a_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let key = "model.layers.0.mlp.experts.gate_up_proj";
+        let codes =
+            Tensor::from_raw_buffer(&[0x38; 32], DType::F8E4M3, &[2, 4, 4], &device).unwrap();
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([(key, codes)]),
+            dir.path().join("experts.safetensors"),
+        )
+        .unwrap();
+        let weights = Weights::from_dir(dir.path(), &device).unwrap();
+        let ops =
+            stacked_expert_projections(&weights, key, DType::F32, &device, None, [2, 4, 4], 2)
+                .unwrap();
+        assert_eq!(ops.len(), 4);
+        for op in ops {
+            assert_eq!(op.dims(), (2, 4));
+            assert_eq!(op.resident_bytes(), Some(8 * 4));
+        }
+        assert!(
+            stacked_expert_projections(&weights, key, DType::F32, &device, None, [4, 2, 4], 2)
+                .is_err()
+        );
+    }
 
     /// The fused GDN input preparation (conv + SiLU, q/k L2 norms, gates) is bit-identical to the
     /// op chains `GatedDeltaNet::forward_at` runs without it, over decode, verify and prefill

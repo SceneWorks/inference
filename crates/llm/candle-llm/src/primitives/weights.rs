@@ -324,13 +324,56 @@ impl Weights {
             .native_linear(&row.key, dtype, device, bias)?
             .map(super::Projection::from_native)
             .transpose()?;
+        Ok(self.record_native(op))
+    }
+
+    pub(crate) fn native_projection_slice(
+        &self,
+        key: &str,
+        dtype: DType,
+        device: &Device,
+        first_row: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<super::Projection>> {
+        let Some(row) = self.encoded.get(key) else {
+            return Ok(None);
+        };
+        let source = self.source.as_ref().expect("encoded row belongs to source");
+        let op = source
+            .native_linear_slice(&row.key, device, dtype, first_row, rows, cols)?
+            .map(super::Projection::from_native)
+            .transpose()?;
+        Ok(self.record_native(op))
+    }
+
+    pub(crate) fn native_flattened_projection(
+        &self,
+        key: &str,
+        source_shape: &[usize],
+        dtype: DType,
+        bias: Option<Tensor>,
+    ) -> Result<Option<super::Projection>> {
+        use candle_nn::var_builder::SimpleBackend;
+        let Some(row) = self.encoded.get(key) else {
+            return Ok(None);
+        };
+        let source = self.source.as_ref().expect("encoded row belongs to source");
+        let op = source
+            .native_linear_weight_flattened(&row.key, source_shape, dtype, &row.device)?
+            .map(|op| super::Projection::from_native(candle_nn::Linear::from_native(op, bias)))
+            .transpose()?;
+        Ok(self.record_native(op))
+    }
+
+    fn record_native(&self, op: Option<super::Projection>) -> Option<super::Projection> {
         if let Some(op) = &op {
             self.native_census
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .record(op);
         }
-        Ok(op)
+        op
     }
 
     pub(crate) fn native_census(&self) -> super::ProjectionCensus {
@@ -433,6 +476,11 @@ impl Weights {
     /// Fetch a tensor by key if present.
     pub fn get(&self, key: &str) -> Option<&Tensor> {
         self.require(key).ok()
+    }
+
+    /// A missing optional coefficient and a malformed encoded coefficient are distinct.
+    pub(crate) fn optional(&self, key: &str) -> Result<Option<&Tensor>> {
+        self.contains(key).then(|| self.require(key)).transpose()
     }
 
     /// Whether a key is present.

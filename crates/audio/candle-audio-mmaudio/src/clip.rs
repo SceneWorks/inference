@@ -136,28 +136,7 @@ struct MultiheadAttention {
 impl MultiheadAttention {
     fn load(vb: VarBuilder, width: usize, num_heads: usize) -> CResult<Self> {
         let head_dim = width / num_heads;
-        let dims = (3 * width, width);
-        let key = if vb.contains_tensor("in_proj.weight") {
-            "in_proj.weight"
-        } else {
-            "in_proj_weight"
-        };
-        let bias = vb.get(
-            3 * width,
-            if vb.contains_tensor("in_proj.bias") {
-                "in_proj.bias"
-            } else {
-                "in_proj_bias"
-            },
-        )?;
-        let in_proj = match vb.native_linear_weight_with_shape(key, Some(dims))? {
-            Some(op) if op.dims() == dims => Linear::from_native(op, Some(bias)),
-            Some(op) => candle_audio::candle_core::bail!(
-                "CLIP in_proj expected {dims:?}, got {:?}",
-                op.dims()
-            ),
-            None => Linear::new(vb.get(dims, key)?, Some(bias)),
-        };
+        let in_proj = crate::agg::attention_in_projection(&vb, width)?;
         let out_proj = candle_nn::linear(width, width, vb.pp("out_proj"))?;
         Ok(Self {
             in_proj,

@@ -29,6 +29,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use candle_checkpoint::MappedWeights;
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -57,39 +58,37 @@ pub fn mmap_var_builder<P: AsRef<Path>>(
 /// A checkpoint whose header and original projection source remain available to models that infer
 /// their module geometry from weight names. Companion tensors belong to their logical matrix.
 pub struct AudioCheckpoint {
-    inner: Result<candle_checkpoint::ProjectionSource, MmapedSafetensors>,
+    inner: MappedWeights,
 }
 
 impl AudioCheckpoint {
     pub fn open(path: &Path, device: &Device) -> candle_core::Result<Self> {
         Ok(Self {
-            inner: candle_checkpoint::ProjectionSource::from_mapped(
-                mmap_safetensors(path)?,
-                &[path.to_owned()],
-                device,
-            )?,
+            inner: MappedWeights::new(mmap_safetensors(path)?, &[path.to_owned()], device)?,
         })
     }
 
     fn mmap(&self) -> &MmapedSafetensors {
+        self.inner.mmap()
+    }
+
+    fn source(&self) -> Option<&candle_checkpoint::ProjectionSource> {
         match &self.inner {
-            Ok(source) => source.mmap(),
-            Err(m) => m,
+            MappedWeights::Checkpoint(s) => Some(s),
+            MappedWeights::Plain(_) => None,
         }
     }
 
     fn backend(&self) -> &dyn candle_nn::var_builder::SimpleBackend {
         match &self.inner {
-            Ok(source) => source,
-            Err(m) => m,
+            MappedWeights::Checkpoint(source) => source,
+            MappedWeights::Plain(m) => m,
         }
     }
 
     pub fn names(&self) -> Vec<String> {
         let companions: std::collections::HashSet<_> = self
-            .inner
-            .as_ref()
-            .ok()
+            .source()
             .into_iter()
             .flat_map(|s| {
                 s.reader()
@@ -125,7 +124,7 @@ impl AudioCheckpoint {
     }
 
     pub fn shape(&self, name: &str) -> candle_core::Result<Vec<usize>> {
-        if let Ok(source) = &self.inner {
+        if let Some(source) = self.source() {
             if let Some(row) = source.reader().planned(name) {
                 return Ok(row.shape.clone());
             }
@@ -139,6 +138,17 @@ impl AudioCheckpoint {
 }
 
 impl candle_nn::var_builder::SimpleBackend for AudioCheckpoint {
+    fn native_linear_weight_flattened(
+        &self,
+        name: &str,
+        shape: &[usize],
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Option<std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>>>
+    {
+        self.backend()
+            .native_linear_weight_flattened(name, shape, dtype, dev)
+    }
     fn native_linear_weight_transposed(
         &self,
         name: &str,
@@ -204,6 +214,19 @@ pub fn checkpoint_linear(vb: &VarBuilder, bias: bool) -> candle_core::Result<can
         Some(op) => Ok(candle_nn::Linear::from_native(op, bias)),
         None => Ok(candle_nn::Linear::new(vb.get_unchecked("weight")?, bias)),
     }
+}
+
+/// A tied token matrix needs coefficients for embedding lookup and may also carry a native
+/// output-head GEMM. Plain weights continue using the embedding storage for both roles.
+pub fn native_tied_head(
+    vb: &VarBuilder<'_>,
+    key: &str,
+    rows: usize,
+    cols: usize,
+) -> candle_core::Result<Option<candle_nn::Linear>> {
+    Ok(vb
+        .native_linear_weight_with_shape(key, Some((rows, cols)))?
+        .map(|weight| candle_nn::Linear::from_native(weight, None)))
 }
 
 /// Resolve an optional safetensors export beside a published Torch artifact. Existing original
@@ -334,6 +357,37 @@ impl candle_nn::var_builder::SimpleBackend for NormalizedState {
             &self.inner.get_unchecked(v, dtype, dev)?,
             &self.inner.get_unchecked(g, dtype, dev)?,
         )
+    }
+    fn native_linear_weight_flattened(
+        &self,
+        name: &str,
+        shape: &[usize],
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Option<std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>>>
+    {
+        match self.keys.get(name) {
+            Some(key) => self
+                .inner
+                .native_linear_weight_flattened(key, shape, dtype, dev),
+            None => Ok(None),
+        }
+    }
+
+    fn native_linear_weight_transposed(
+        &self,
+        name: &str,
+        shape: (usize, usize),
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Option<std::sync::Arc<dyn candle_nn::linear::NativeLinearWeight>>>
+    {
+        match self.keys.get(name) {
+            Some(key) => self
+                .inner
+                .native_linear_weight_transposed(key, shape, dtype, dev),
+            None => Ok(None),
+        }
     }
     fn native_linear_weight(
         &self,
@@ -491,9 +545,9 @@ mod tests {
             .with(|| normalized_state_builder(&export, DType::F32, &dev))
             .unwrap();
         let op = candle_nn::linear_no_bias(4, 4, vb.pp("bert.proj")).unwrap();
-        let receipt = scope
-            .facts()
-            .expect("projection read measured on the owning model");
+        let measured = scope.try_snapshots().unwrap();
+        assert_eq!(measured.len(), 1);
+        let receipt = &measured[0];
         assert_eq!(receipt.receipt().tensor_count, 1);
         assert_eq!(receipt.receipt().resident_bytes(), 16 * 4);
         assert_eq!(
@@ -505,6 +559,43 @@ mod tests {
                 .unwrap(),
             vec![2.; 16]
         );
+    }
+
+    #[test]
+    fn recurrent_gate_constructors_read_bare_and_module_encoded_matrices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rnn.safetensors");
+        let device = Device::Cpu;
+        let mut source = HashMap::new();
+        for (module, rows) in [("lstm", 8usize), ("gru", 6)] {
+            for suffix in ["weight_ih_l0.weight", "weight_hh_l0"] {
+                let codes = Tensor::from_raw_buffer(
+                    &vec![0x38; rows * 2],
+                    DType::F8E4M3,
+                    &[rows, 2],
+                    &device,
+                )
+                .unwrap();
+                source.insert(format!("{module}.{suffix}"), codes);
+            }
+        }
+        candle_core::safetensors::save(&source, &path).unwrap();
+        let scope = gen_core::CheckpointReceiptScope::default();
+        let vb = scope
+            .with(|| mmap_var_builder(&[path], DType::F32, &device))
+            .unwrap();
+        candle_nn::lstm(
+            2,
+            2,
+            candle_nn::LSTMConfig::default_no_bias(),
+            vb.pp("lstm"),
+        )
+        .unwrap();
+        candle_nn::gru(2, 2, candle_nn::GRUConfig::default_no_bias(), vb.pp("gru")).unwrap();
+        let facts = scope.try_snapshots().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].receipt().tensor_count, 4);
+        assert_eq!(facts[0].receipt().resident_bytes(), (8 + 6) * 2 * 2 * 4);
     }
 
     #[test]

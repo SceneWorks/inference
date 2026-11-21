@@ -17,10 +17,7 @@ use crate::preprocess::softmax_last;
 /// exactly a patchify + linear projection: we gather each `(c, dz, dh, dw)` patch in the Conv3d
 /// weight's own memory order and matmul with the flattened weight `(768, 3·2·16·16=1536)`. This
 /// avoids a candle Conv3d (which the pinned revision does not expose) while remaining bit-faithful.
-pub struct PatchEmbed3d {
-    weight: Tensor, // (EMBED_DIM, 1536)  — Conv3d weight (768,3,2,16,16) flattened
-    bias: Tensor,   // (EMBED_DIM,)
-}
+pub struct PatchEmbed3d(Linear);
 
 impl PatchEmbed3d {
     pub fn load(vb: VarBuilder) -> CResult<Self> {
@@ -28,13 +25,18 @@ impl PatchEmbed3d {
         let p = config::PATCH_SIZE;
         let patch_elems = config::IN_CHANS * z * p * p;
         // Conv3d weight arrives as (out=768, in=3, kz=2, kh=16, kw=16); flatten trailing dims.
-        let w = vb.get(
-            (config::EMBED_DIM, config::IN_CHANS, z, p, p),
-            "proj.weight",
-        )?;
-        let weight = w.reshape((config::EMBED_DIM, patch_elems))?;
+        let shape = [config::EMBED_DIM, config::IN_CHANS, z, p, p];
+        let key = "proj.weight";
         let bias = vb.get(config::EMBED_DIM, "proj.bias")?;
-        Ok(Self { weight, bias })
+        let projection = if let Some(op) = vb.native_linear_weight_flattened(key, &shape)? {
+            Linear::from_native(op, Some(bias))
+        } else {
+            let weight = vb
+                .get(shape.as_slice(), key)?
+                .reshape((config::EMBED_DIM, patch_elems))?;
+            Linear::new(weight, Some(bias))
+        };
+        Ok(Self(projection))
     }
 
     /// `(BS, C=3, T=16, H=224, W=224)` → `(BS, 1568, 768)` patch tokens, temporal-major
@@ -53,9 +55,7 @@ impl PatchEmbed3d {
         let patch_elems = c * z * p * p;
         let x = x.reshape((bs, ntok, patch_elems))?;
         // (BS, ntok, patch_elems) · (patch_elems, EMBED_DIM) + bias
-        let wt = self.weight.t()?; // (patch_elems, EMBED_DIM)
-        let x = x.broadcast_matmul(&wt)?;
-        __model_proof_output!(x.broadcast_add(&self.bias))
+        __model_proof_output!(self.0.forward(&x))
     }
 }
 
