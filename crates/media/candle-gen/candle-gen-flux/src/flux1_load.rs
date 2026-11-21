@@ -12,7 +12,7 @@
 //! This module is the single home. Each loader takes a `label` (`"flux"`, `"flux ip-adapter"`,
 //! `"flux1 control"`) so callers keep their crafted, provider-specific diagnostics, and reuses the
 //! workspace [`candle_gen::loader`] mmap surface (F-019) for the shard listing / mmap. The genuine
-//! per-provider drift — which DiT wrapper (stock [`Flux`] vs the forked [`crate::ip_dit::IpFlux`]) is
+//! per-provider drift — which DiT wrapper (stock [`Flux`] vs the forked [`crate::transformer::FluxDit`]) is
 //! built, whether the VAE is also mirrored into a mean-encoder — stays with the caller: these helpers
 //! hand back the loaded CLIP / T5 / a DiT `VarBuilder` / the VAE and let the provider assemble its own
 //! model shape.
@@ -111,7 +111,7 @@ pub(crate) fn text_encoders(
 
 /// mmap a [`VarBuilder`] over the root BFL DiT checkpoint (`flux1-{schnell,dev}.safetensors`) for
 /// `variant` at `dtype`/`device`. The caller builds the stock [`candle_transformers::models::flux::model::Flux`]
-/// or the forked [`crate::ip_dit::IpFlux`] over it — that choice is the genuine per-provider drift, so it
+/// or the forked [`crate::transformer::FluxDit`] over it — that choice is the genuine per-provider drift, so it
 /// stays with the caller; this just resolves + mmaps the (single) checkpoint file.
 pub(crate) fn dit_vb(
     root: &Path,

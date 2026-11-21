@@ -27,11 +27,8 @@ candle-transformers = { workspace = true }
 # no longer a reason for this dep.) Backend features are forwarded below so flux + sdxl share ONE candle
 # build (the single-rev skew gate).
 candle-gen-sdxl = { path = "../candle-gen-sdxl" }
-# candle-transformers' `flux::model::Flux` exposes no per-double-block IP-injection seam (all fields
-# private), so sc-5872 vendors + forks the FLUX DiT (`ip_dit.rs`) to add the XLabs decoupled-cross-attn
-# K/V seam — exactly the "vendor the model to get a seam" move candle-gen-sdxl made for the UNet. Direct
-# candle-core/candle-nn deps (same workspace pin as candle-transformers, no dup) let the fork copy the
-# upstream model verbatim. The stock txt2img path keeps using candle-transformers' `Flux` untouched.
+# The shared FLUX DiT uses candle-core/candle-nn to preserve native fused and diffusers packed
+# projections and expose the XLabs, PuLID, and ControlNet injection points.
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 # Prompt tokenization for the dual encoders. FLUX has no chat template (plain encode), so this uses

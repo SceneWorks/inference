@@ -50,7 +50,7 @@
 //! Every **diffusers**-layout tier off the `SceneWorks/flux1-{dev,schnell}-mlx` turnkey — the packed
 //! q4/q8 tiers (a `quantization` block in a component's `config.json`, [`Pipeline::component_is_packed`])
 //! **and** the dense bf16 tier (a `transformer/` diffusers subdir with no `quantization` block and no
-//! root single-file checkpoint) — loads the CLIP + T5 + DiT through the vendored [`crate::packed_dit`] /
+//! root single-file checkpoint) — loads the CLIP + T5 + DiT through the vendored [`crate::transformer`] /
 //! [`crate::packed_te`] models over the shared [`candle_gen::quant`] packed-**detect**: on q4/q8 each
 //! weight loads **straight from the packed parts** (no dense bf16 staging); on bf16 — where no tensor has
 //! a `.scales` sibling — the SAME builders load it **dense**, so bf16 is q4/q8 minus the dequant (no
@@ -99,10 +99,8 @@ use candle_transformers::models::flux::sampling::{get_schedule, unpack, State};
 use candle_transformers::models::t5::T5EncoderModel;
 use tokenizers::Tokenizer;
 
-use crate::ip_adapter::FluxIpInjector;
-use crate::ip_dit::{DitImageInjector, IpFlux};
-use crate::packed_dit::PackedFluxDit;
 use crate::packed_te::{ClipConfig, PackedClipText, PackedT5Encoder, T5Config as PackedT5Config};
+use crate::transformer::{FluxDit, PreparedConditioning};
 use crate::Variant;
 
 /// FLUX latent channel count (the VAE's `z_channels` and the DiT's pre-pack channel count). The DiT
@@ -190,7 +188,7 @@ pub(crate) struct Pipeline {
 ///   `flux1-*.safetensors` + `ae.safetensors` (path unchanged, sc-3694).
 /// - [`Components::Packed`] — the pre-quantized **diffusers**-layout MLX tier
 ///   (`SceneWorks/flux1-schnell-mlx` q4/q8): the vendored packed-detect [`PackedClipText`] /
-///   [`PackedT5Encoder`] / [`PackedFluxDit`] built straight from the packed parts (sc-9407, no dense
+///   [`PackedT5Encoder`] / [`FluxDit`] built straight from the packed parts (sc-9407, no dense
 ///   staging), + a stock diffusers `AutoEncoderKL` fed the dequantized-to-dense VAE weights.
 ///
 /// The stock T5 encoder is behind a `Mutex` because its `forward` takes `&mut self` (position-bias
@@ -201,7 +199,7 @@ pub(crate) enum Components {
     Stock {
         clip: Arc<ClipTextTransformer>,
         t5: Arc<Mutex<T5EncoderModel>>,
-        transformer: Arc<IpFlux>,
+        transformer: Arc<FluxDit>,
         vae: Arc<AutoEncoder>,
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load and reused across encodes
         /// (sc-8991 / F-011) instead of re-parsing per prompt/branch.
@@ -210,67 +208,17 @@ pub(crate) enum Components {
     Packed {
         clip: Arc<PackedClipText>,
         t5: Arc<PackedT5Encoder>,
-        transformer: Arc<PackedFluxDit>,
+        transformer: Arc<FluxDit>,
         vae: Arc<AutoEncoderKL>,
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load (sc-8991 / F-011).
         toks: Arc<FluxTokenizers>,
     },
 }
 
-/// A borrowed reference to just the DiT of either tier — the only component the denoise loop touches.
-/// Lets [`Pipeline::denoise`] be shared by the legacy resident backbone and the unified residency
-/// render (which owns a just-loaded DiT after the text encoders were dropped).
-#[derive(Clone, Copy)]
-pub(crate) enum DitRef<'a> {
-    Stock(&'a IpFlux),
-    Packed(&'a PackedFluxDit),
-}
-
-pub(crate) enum PreparedDit {
-    Stock(crate::ip_dit::PreparedConditioning),
-    Packed(crate::ip_dit::PreparedConditioning),
-}
-
-impl PreparedDit {
-    pub(crate) fn conditioning(&self) -> &crate::ip_dit::PreparedConditioning {
+impl Components {
+    pub(crate) fn dit(&self) -> &FluxDit {
         match self {
-            Self::Stock(prepared) | Self::Packed(prepared) => prepared,
-        }
-    }
-}
-
-impl DitRef<'_> {
-    pub(crate) fn prepare_conditioning(
-        self,
-        img: &Tensor,
-        img_ids: &Tensor,
-        txt: &Tensor,
-        txt_ids: &Tensor,
-    ) -> Result<PreparedDit> {
-        match self {
-            Self::Stock(model) => Ok(PreparedDit::Stock(
-                model.prepare_conditioning(img, img_ids, txt, txt_ids)?,
-            )),
-            Self::Packed(model) => Ok(PreparedDit::Packed(
-                model.prepare_conditioning(img, img_ids, txt, txt_ids)?,
-            )),
-        }
-    }
-}
-
-/// A just-loaded DiT owned by the sequential path (epic 10765 Phase 1, sc-10769) — not `Arc`-cached,
-/// because sequential residency deliberately drops each component after its phase rather than keeping
-/// the cross-request cache.
-pub(crate) enum LoadedDit {
-    Stock(IpFlux),
-    Packed(PackedFluxDit),
-}
-
-impl LoadedDit {
-    pub(crate) fn as_ref(&self) -> DitRef<'_> {
-        match self {
-            LoadedDit::Stock(dit) => DitRef::Stock(dit),
-            LoadedDit::Packed(dit) => DitRef::Packed(dit),
+            Self::Stock { transformer, .. } | Self::Packed { transformer, .. } => transformer,
         }
     }
 }
@@ -288,7 +236,7 @@ pub(crate) enum LoadedVae {
 /// value because it is the `Heavy` of [`candle_gen::run_sequential`] (sc-12089), which loads the phase
 /// through a single closure.
 pub(crate) struct SeqHeavy {
-    dit: LoadedDit,
+    pub(crate) dit: FluxDit,
     vae: LoadedVae,
     /// The optional PiD engine — `None` both when the caller never opted in via `LoadSpec::pid` and when
     /// THIS request will not decode through it (F-177, [`Pipeline::pid_to_load`]).
@@ -403,8 +351,8 @@ impl Pipeline {
     /// `text_encoder_2/`, the DiT from the root `flux1-*.safetensors` and the VAE from `ae.safetensors`.
     /// The text-encoder / DiT-mmap / VAE loads now come from the shared FLUX.1 backbone loader
     /// (sc-9003 / F-023) — the CLIP `text_model.` prefix, the T5 config parse, and the noise geometry no
-    /// longer drift across the three FLUX.1 providers. This path builds the **stock**
-    /// `candle-transformers` `Flux` DiT (the per-provider drift: the providers build the forked `IpFlux`).
+    /// longer drift across the three FLUX.1 providers. This path builds the native layout of
+    /// [`FluxDit`] for all three providers.
     fn load_stock_components(&self) -> Result<Components> {
         // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load).
         let (clip, t5) =
@@ -412,13 +360,13 @@ impl Pipeline {
 
         // FLUX DiT (original BFL checkpoint) at the snapshot root; config differs only by the
         // guidance embedding (dev embeds the guidance scale, schnell does not). Built as the vendored
-        // `IpFlux` (with `ip = None`, byte-identical to the stock `candle-transformers` `Flux::forward`)
+        // `FluxDit` (with `ip = None`, byte-identical to the stock `candle-transformers` `Flux::forward`)
         // so the txt2img path picks up the sc-9116 i32-overflow-safe budgeted attention — the stock
         // upstream `Flux` materializes an unguarded `[…,S,S]` scores tensor that overflows i32 at 2048²
         // (S ≈ 16.9k joint tokens → `24·16.9k² ≈ 6.8e9 > i32::MAX`). The checkpoint layout is identical.
         let dit_vb =
             crate::flux1_load::dit_vb(&self.root, self.variant, self.dtype, &self.device, "flux")?;
-        let mut transformer = IpFlux::new(&flux_config(self.variant), dit_vb)?;
+        let mut transformer = FluxDit::new(&flux_config(self.variant), dit_vb)?;
         candle_gen::quant::install_dotted_adapters(
             "flux1 BFL",
             &self.adapters,
@@ -441,7 +389,7 @@ impl Pipeline {
 
     /// The **diffusers-layout** component path — packed q4/q8 (sc-9407) **and** dense bf16 (sc-10888)
     /// off the same `SceneWorks/flux1-{dev,schnell}-mlx` turnkey. The vendored packed-**detect**
-    /// [`PackedClipText`] / [`PackedT5Encoder`] / [`PackedFluxDit`] build every projection through the
+    /// [`PackedClipText`] / [`PackedT5Encoder`] / [`FluxDit`] build every projection through the
     /// shared [`QLinear::linear_detect`](candle_gen::quant::QLinear::linear_detect) /
     /// [`QEmbedding::detect`](crate::quant::QEmbedding): on a packed tier they load straight from the
     /// packed parts (q4 → `Q4_1` lossless, q8 → `Q8_0` requant — no dense staging); on the dense bf16
@@ -468,7 +416,7 @@ impl Pipeline {
         let (num_double, num_single) = self.dit_block_counts()?;
         let dit_vb = self.component_vb("transformer")?;
         let mut transformer =
-            PackedFluxDit::new(&flux_config(self.variant), num_double, num_single, dit_vb)?;
+            FluxDit::new_diffusers(&flux_config(self.variant), num_double, num_single, dit_vb)?;
         candle_gen::quant::install_dotted_adapters(
             "flux1 diffusers",
             &self.adapters,
@@ -539,7 +487,7 @@ impl Pipeline {
     /// Whether this snapshot uses the **diffusers component layout** (`transformer/`, `text_encoder*/`,
     /// `vae/` subdirs) rather than the black-forest-labs single-file layout — i.e. whether to build the
     /// vendored diffusers components ([`load_diffusers_components`](Self::load_diffusers_components)) or
-    /// the stock BFL [`IpFlux`] / `AutoEncoder` ([`load_stock_components`](Self::load_stock_components)).
+    /// the stock BFL [`FluxDit`] / `AutoEncoder` ([`load_stock_components`](Self::load_stock_components)).
     ///
     /// Three shapes off the `SceneWorks/flux1-{dev,schnell}-mlx` turnkey resolve here:
     /// - **packed q4/q8** — a `quantization` block in `transformer/config.json`
@@ -746,7 +694,7 @@ impl Pipeline {
     fn denoise(
         &self,
         run: &RenderRun<'_, '_>,
-        dit: DitRef,
+        dit: &FluxDit,
         state: &State,
         plan: &RenderPlan,
         seed: u64,
@@ -758,13 +706,8 @@ impl Pipeline {
         let b_sz = state.img.dim(0)?;
         let dev = &self.device;
         let guidance_t = Tensor::full(plan.guidance(), b_sz, dev)?;
-        // Guidance is only consumed by the dev DiT; schnell's DiT ignores the tensor. The packed DiT
-        // takes the same shape (`Option<&Tensor>` — `None` for schnell, since `guidance_embed` is off).
-        let packed_guidance = if self.variant.supports_guidance() {
-            Some(&guidance_t)
-        } else {
-            None
-        };
+        // Guidance is embedded only on dev; schnell has no guidance projection.
+        let guidance = self.variant.supports_guidance().then_some(&guidance_t);
         let prepared =
             dit.prepare_conditioning(&state.img, &state.img_ids, &state.txt, &state.txt_ids)?;
         let pag = crate::descriptor_for(self.variant)
@@ -790,7 +733,7 @@ impl Pipeline {
             );
         }
         let low_tokens = plan.phase_packed_tokens(0);
-        let mut phase1_context: Option<(Tensor, PreparedDit)> = None;
+        let mut phase1_context: Option<(Tensor, PreparedConditioning)> = None;
 
         candle_gen::run_flow_sampler_spans(
             Some(plan.sampler()),
@@ -856,47 +799,23 @@ impl Pipeline {
                     format!("{transformer_window:?}").into(),
                 );
                 let forward_one = |pag_layers: Option<&[u32]>| -> Result<Tensor> {
-                    match (dit, active_prepared) {
-                        (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                            .forward_prepared_with_memory_pag(
-                                img,
-                                active_img_ids,
-                                &state.txt,
-                                &state.txt_ids,
-                                &t_vec,
-                                &state.vec,
-                                Some(&guidance_t),
-                                None,
-                                None,
-                                None,
-                                prepared,
-                                attention_plan,
-                                transformer_window,
-                                &req.cancel,
-                                pag_layers,
-                            ),
-                        (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                            .forward_prepared_with_memory_pag(
-                                img,
-                                active_img_ids,
-                                &state.txt,
-                                &state.txt_ids,
-                                &t_vec,
-                                &state.vec,
-                                packed_guidance,
-                                None,
-                                None,
-                                None,
-                                prepared,
-                                attention_plan,
-                                transformer_window,
-                                &req.cancel,
-                                pag_layers,
-                            ),
-                        _ => Err(CandleError::Msg(
-                            "flux: prepared conditioning belongs to another DiT variant".into(),
-                        )),
-                    }
+                    dit.forward_prepared_with_memory_pag(
+                        img,
+                        active_img_ids,
+                        &state.txt,
+                        &state.txt_ids,
+                        &t_vec,
+                        &state.vec,
+                        guidance,
+                        None,
+                        None,
+                        None,
+                        active_prepared,
+                        attention_plan,
+                        transformer_window,
+                        &req.cancel,
+                        pag_layers,
+                    )
                 };
                 let out = forward_one(None)?;
                 let step_pag = pag
@@ -985,196 +904,6 @@ impl Pipeline {
         match components {
             Components::Stock { vae, .. } => vae.encode_mean(image).map_err(CandleError::from),
             Components::Packed { vae, .. } => vae.encode_mean(image).map_err(CandleError::from),
-        }
-    }
-
-    /// Injected reference-lane forward over a request-scoped heavy phase. This is the staged-residency
-    /// twin of [`FluxRefBackbone`](crate::ref_backbone::FluxRefBackbone)'s resident component dispatch:
-    /// the PuLID/IP injector rides the same attention budget, cancellation token, and block window as
-    /// plain txt2img, while the caller keeps only its small identity/control modules resident.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_injected_residency_pag(
-        &self,
-        heavy: &SeqHeavy,
-        img: &Tensor,
-        img_ids: &Tensor,
-        txt: &Tensor,
-        txt_ids: &Tensor,
-        timesteps: &Tensor,
-        pooled: &Tensor,
-        guidance: Option<&Tensor>,
-        injector: Option<&dyn DitImageInjector>,
-        attention_plan: AttentionPlan<'_>,
-        transformer_window: usize,
-        cancel: &gen_core::CancelFlag,
-        pag_layers: Option<&[u32]>,
-    ) -> Result<Tensor> {
-        match heavy.dit.as_ref() {
-            DitRef::Stock(transformer) => transformer.forward_injected_with_memory_pag(
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                attention_plan,
-                transformer_window,
-                cancel,
-                pag_layers,
-            ),
-            DitRef::Packed(transformer) => transformer.forward_injected_with_memory_pag(
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                attention_plan,
-                transformer_window,
-                cancel,
-                pag_layers,
-            ),
-        }
-    }
-
-    pub(crate) fn prepare_ref_conditioning(
-        &self,
-        heavy: &SeqHeavy,
-        img: &Tensor,
-        img_ids: &Tensor,
-        txt: &Tensor,
-        txt_ids: &Tensor,
-    ) -> Result<PreparedDit> {
-        heavy
-            .dit
-            .as_ref()
-            .prepare_conditioning(img, img_ids, txt, txt_ids)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_ip_residency_pag(
-        &self,
-        heavy: &SeqHeavy,
-        img: &Tensor,
-        img_ids: &Tensor,
-        txt: &Tensor,
-        txt_ids: &Tensor,
-        timesteps: &Tensor,
-        pooled: &Tensor,
-        guidance: Option<&Tensor>,
-        injector: &FluxIpInjector<'_>,
-        prepared: &PreparedDit,
-        attention_plan: AttentionPlan<'_>,
-        transformer_window: usize,
-        cancel: &gen_core::CancelFlag,
-        pag_layers: Option<&[u32]>,
-    ) -> Result<Tensor> {
-        match (heavy.dit.as_ref(), prepared) {
-            (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img,
-                    img_ids,
-                    txt,
-                    txt_ids,
-                    timesteps,
-                    pooled,
-                    guidance,
-                    Some(injector),
-                    None,
-                    None,
-                    prepared,
-                    attention_plan,
-                    transformer_window,
-                    cancel,
-                    pag_layers,
-                ),
-            (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img,
-                    img_ids,
-                    txt,
-                    txt_ids,
-                    timesteps,
-                    pooled,
-                    guidance,
-                    Some(injector),
-                    None,
-                    None,
-                    prepared,
-                    attention_plan,
-                    transformer_window,
-                    cancel,
-                    pag_layers,
-                ),
-            _ => Err(CandleError::Msg(
-                "flux: prepared conditioning belongs to another DiT variant".into(),
-            )),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_control_residency_pag(
-        &self,
-        heavy: &SeqHeavy,
-        img: &Tensor,
-        img_ids: &Tensor,
-        txt: &Tensor,
-        txt_ids: &Tensor,
-        timesteps: &Tensor,
-        pooled: &Tensor,
-        guidance: Option<&Tensor>,
-        injector: Option<&dyn DitImageInjector>,
-        control: Option<(&[Tensor], f64)>,
-        prepared: &PreparedDit,
-        attention_plan: AttentionPlan<'_>,
-        transformer_window: usize,
-        cancel: &gen_core::CancelFlag,
-        pag_layers: Option<&[u32]>,
-    ) -> Result<Tensor> {
-        match (heavy.dit.as_ref(), prepared) {
-            (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img,
-                    img_ids,
-                    txt,
-                    txt_ids,
-                    timesteps,
-                    pooled,
-                    guidance,
-                    None,
-                    injector,
-                    control,
-                    prepared,
-                    attention_plan,
-                    transformer_window,
-                    cancel,
-                    pag_layers,
-                ),
-            (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img,
-                    img_ids,
-                    txt,
-                    txt_ids,
-                    timesteps,
-                    pooled,
-                    guidance,
-                    None,
-                    injector,
-                    control,
-                    prepared,
-                    attention_plan,
-                    transformer_window,
-                    cancel,
-                    pag_layers,
-                ),
-            _ => Err(CandleError::Msg(
-                "flux: prepared conditioning belongs to another DiT variant".into(),
-            )),
         }
     }
 
@@ -1306,7 +1035,7 @@ impl Pipeline {
 
     /// Load ONLY the DiT for the sequential path (sc-10769) — loaded after the text encoders were
     /// dropped, so it reuses their freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE).
-    fn load_transformer_seq(&self, diffusers: bool) -> Result<LoadedDit> {
+    fn load_transformer_seq(&self, diffusers: bool) -> Result<FluxDit> {
         self.load_transformer_seq_with_memory(diffusers, false, &gen_core::CancelFlag::default())
     }
 
@@ -1315,7 +1044,7 @@ impl Pipeline {
         diffusers: bool,
         stream_transformer_blocks: bool,
         cancel: &gen_core::CancelFlag,
-    ) -> Result<LoadedDit> {
+    ) -> Result<FluxDit> {
         if stream_transformer_blocks && !self.adapters.is_empty() {
             return Err(CandleError::Msg(
                 "FLUX adapters require resident transformer blocks; disable block streaming".into(),
@@ -1356,25 +1085,23 @@ impl Pipeline {
                     let single = single?;
                     let vb =
                         VarBuilder::from_backend(Box::new(source), self.dtype, self.device.clone());
-                    return Ok(LoadedDit::Packed(
-                        PackedFluxDit::new_block_streamed_with_sidecars(
-                            &flux_config(self.variant),
-                            num_double,
-                            num_single,
-                            vb,
-                            Arc::new(double),
-                            Arc::new(single),
-                        )?,
-                    ));
+                    return Ok(FluxDit::new_diffusers_block_streamed(
+                        &flux_config(self.variant),
+                        num_double,
+                        num_single,
+                        vb,
+                        Some((Arc::new(double), Arc::new(single))),
+                    )?);
                 }
-                return Ok(LoadedDit::Packed(PackedFluxDit::new_block_streamed(
+                return Ok(FluxDit::new_diffusers_block_streamed(
                     &flux_config(self.variant),
                     num_double,
                     num_single,
                     self.component_vb("transformer")?,
-                )?));
+                    None,
+                )?);
             }
-            let mut dit = PackedFluxDit::new(
+            let mut dit = FluxDit::new_diffusers(
                 &flux_config(self.variant),
                 num_double,
                 num_single,
@@ -1386,7 +1113,7 @@ impl Pipeline {
                 &self.device,
                 |visitor| dit.visit_adaptable_mut(visitor),
             )?;
-            Ok(LoadedDit::Packed(dit))
+            Ok(dit)
         } else {
             let dit_vb = crate::flux1_load::dit_vb(
                 &self.root,
@@ -1397,9 +1124,9 @@ impl Pipeline {
             )?;
             let config = flux_config(self.variant);
             let mut dit = if stream_transformer_blocks {
-                IpFlux::new_block_streamed(&config, dit_vb)?
+                FluxDit::new_block_streamed(&config, dit_vb)?
             } else {
-                IpFlux::new(&config, dit_vb)?
+                FluxDit::new(&config, dit_vb)?
             };
             candle_gen::quant::install_dotted_adapters(
                 "flux1 BFL",
@@ -1407,7 +1134,7 @@ impl Pipeline {
                 &self.device,
                 |visitor| dit.visit_adaptable_mut(visitor),
             )?;
-            Ok(LoadedDit::Stock(dit))
+            Ok(dit)
         }
     }
 
@@ -1467,7 +1194,7 @@ impl Pipeline {
     /// DROP them → load the DiT + VAE → denoise/decode. Peak VRAM is bounded to the DiT+VAE working set
     /// instead of TE+DiT+VAE (reclaiming the ~9 GB T5-XXL on FLUX), so a card that OOMs the resident
     /// path can still render. The live render uses the shared encode, denoise, and decode routines
-    /// (`encode_residency` → [`encode_text`], [`denoise`](Self::denoise) over a [`DitRef`], and
+    /// (`encode_residency` → [`encode_text`], [`denoise`](Self::denoise) over a [`FluxDit`], and
     /// [`decode`](Self::decode)/[`decode_packed`](Self::decode_packed)); residency changes only the
     /// load/free schedule.
     ///
@@ -1589,7 +1316,7 @@ impl Pipeline {
                 let preview = crate::preview::hook_for_plan(&req.preview, plan);
                 self.denoise(
                     run,
-                    heavy.dit.as_ref(),
+                    &heavy.dit,
                     &state,
                     plan,
                     seed,

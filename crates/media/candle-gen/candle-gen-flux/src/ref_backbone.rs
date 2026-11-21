@@ -13,11 +13,9 @@
 //! [`FluxRefBackbone`] closes that gap by **reusing the exact same** [`Pipeline::load_components`]
 //! detect-and-load path the shipped txt2img generator uses, then exposing the three ops a reference lane
 //! needs on top of it — [`encode_text`](FluxRefBackbone::encode_text),
-//! [`forward_injected`](FluxRefBackbone::forward_injected) (the post-block [`DitImageInjector`] seam,
-//! now on both the BFL [`IpFlux`](crate::ip_dit::IpFlux) and the diffusers
-//! [`PackedFluxDit`](crate::packed_dit::PackedFluxDit)), and [`decode`](FluxRefBackbone::decode). So a
-//! reference lane inherits whatever tier handling the base generator has (q4/q8/bf16), with one
-//! packed-detect path and zero drift.
+//! [`forward_injected`](FluxRefBackbone::forward_injected) (the post-block [`DitImageInjector`] seam)
+//! and [`decode`](FluxRefBackbone::decode). This preserves the base generator's BFL and diffusers
+//! tier handling, including q4 and q8.
 //!
 //! PiD is **not** owned here: the PiD super-resolving decoder is a per-generation choice the reference
 //! provider builds separately (PuLID's `with_pid`), so [`decode`](FluxRefBackbone::decode) takes the
@@ -32,8 +30,8 @@ use candle_gen::Result;
 use candle_gen_pid::PidDecoder;
 
 use crate::ip_adapter::FluxIpInjector;
-use crate::ip_dit::DitImageInjector;
-use crate::pipeline::{Components, Pipeline, PreparedDit, SeqHeavy};
+use crate::pipeline::{Components, Pipeline, SeqHeavy};
+use crate::transformer::{DitImageInjector, FluxDit, PreparedConditioning};
 use crate::Variant;
 
 /// A loaded, tier-detected FLUX.1 backbone (CLIP + T5 + DiT + VAE + tokenizers) for the reference
@@ -64,6 +62,20 @@ impl Drop for FluxRefHeavy {
 }
 
 impl FluxRefBackbone {
+    fn dit<'a>(
+        &'a self,
+        heavy: Option<&'a FluxRefHeavy>,
+        missing: &'static str,
+    ) -> Result<&'a FluxDit> {
+        if let Some(heavy) = heavy {
+            return Ok(&heavy.heavy.dit);
+        }
+        self.components
+            .as_ref()
+            .map(Components::dit)
+            .ok_or_else(|| candle_gen::CandleError::Msg(missing.into()))
+    }
+
     pub(crate) fn prepare_conditioning(
         &self,
         heavy: Option<&FluxRefHeavy>,
@@ -71,29 +83,12 @@ impl FluxRefBackbone {
         img_ids: &Tensor,
         txt: &Tensor,
         txt_ids: &Tensor,
-    ) -> Result<PreparedDit> {
-        if let Some(heavy) = heavy {
-            return self.pipeline.prepare_ref_conditioning(
-                &heavy.heavy,
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-            );
-        }
-        let components = self.components.as_ref().ok_or_else(|| {
-            candle_gen::CandleError::Msg(
-                "FLUX staged conditioning preparation requires its heavy phase".into(),
-            )
-        })?;
-        match components {
-            Components::Stock { transformer, .. } => Ok(PreparedDit::Stock(
-                transformer.prepare_conditioning(img, img_ids, txt, txt_ids)?,
-            )),
-            Components::Packed { transformer, .. } => Ok(PreparedDit::Packed(
-                transformer.prepare_conditioning(img, img_ids, txt, txt_ids)?,
-            )),
-        }
+    ) -> Result<PreparedConditioning> {
+        self.dit(
+            heavy,
+            "FLUX staged conditioning preparation requires its heavy phase",
+        )?
+        .prepare_conditioning(img, img_ids, txt, txt_ids)
     }
 
     pub fn validate_native_vae_request(&self, use_pid: bool, cancel: &CancelFlag) -> Result<()> {
@@ -228,11 +223,9 @@ impl FluxRefBackbone {
     }
 
     /// The FLUX DiT velocity forward with the optional **post-block** image-stream residual injector —
-    /// the PuLID id cross-attn seam. Dispatches to the loaded tier's DiT: the BFL
-    /// [`IpFlux::forward_injected`](crate::ip_dit::IpFlux::forward_injected) (dense snapshot) or the
-    /// diffusers `PackedFluxDit::forward_injected`
-    /// (packed/dense turnkey tier). `injector = None` is the plain FLUX forward. `guidance` is the dev
-    /// per-batch embedded guidance (`None` for schnell). The two DiTs take the same argument shapes and
+    /// the PuLID id cross-attn seam. Both checkpoint layouts use [`FluxDit::forward_injected`].
+    /// `injector = None` is the plain FLUX forward. `guidance` is dev's per-batch embedded guidance
+    /// (`None` for schnell). The two layouts take the same argument shapes and
     /// inject at the same layout-agnostic block indices, so the caller's [`DitImageInjector`] is
     /// unchanged across tiers.
     #[allow(clippy::too_many_arguments)]
@@ -310,40 +303,14 @@ impl FluxRefBackbone {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-        if let Some(heavy) = heavy {
-            return self.pipeline.forward_injected_residency_pag(
-                &heavy.heavy,
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                y,
-                guidance,
-                injector,
-                plan,
-                window,
-                cancel,
-                pag_layers,
-            );
-        }
-        let components = self.components.as_ref().ok_or_else(|| {
-            candle_gen::CandleError::Msg(
-                "FLUX staged reference forward requires its heavy phase".into(),
-            )
-        })?;
-        let out = match components {
-            Components::Stock { transformer, .. } => transformer.forward_injected_with_memory_pag(
-                img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, plan, window, cancel,
-                pag_layers,
-            )?,
-            Components::Packed { transformer, .. } => transformer
-                .forward_injected_with_memory_pag(
-                    img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, plan, window,
-                    cancel, pag_layers,
-                )?,
-        };
-        Ok(out)
+        self.dit(
+            heavy,
+            "FLUX staged reference forward requires its heavy phase",
+        )?
+        .forward_injected_with_memory_pag(
+            img, img_ids, txt, txt_ids, timesteps, y, guidance, injector, plan, window, cancel,
+            pag_layers,
+        )
     }
 
     /// XLabs IP-Adapter forward over either resident or request-scoped heavy components. Both BFL and
@@ -377,32 +344,10 @@ impl FluxRefBackbone {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-        if let Some(heavy) = heavy {
-            let prepared =
-                self.pipeline
-                    .prepare_ref_conditioning(&heavy.heavy, img, img_ids, txt, txt_ids)?;
-            return self.pipeline.forward_ip_residency_pag(
-                &heavy.heavy,
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                &prepared,
-                plan,
-                window,
-                cancel,
-                None,
-            );
-        }
-        let components = self.components.as_ref().ok_or_else(|| {
-            candle_gen::CandleError::Msg("FLUX staged IP forward requires its heavy phase".into())
-        })?;
-        match components {
-            Components::Stock { transformer, .. } => transformer.forward_with_memory(
+        let dit = self.dit(heavy, "FLUX staged IP forward requires its heavy phase")?;
+        if heavy.is_some() {
+            let prepared = dit.prepare_conditioning(img, img_ids, txt, txt_ids)?;
+            return dit.forward_prepared_with_memory_pag(
                 img,
                 img_ids,
                 txt,
@@ -411,15 +356,28 @@ impl FluxRefBackbone {
                 pooled,
                 guidance,
                 Some(injector),
+                None,
+                None,
+                &prepared,
                 plan,
                 window,
                 cancel,
-            ),
-            Components::Packed { transformer, .. } => transformer.forward_ip_with_memory(
-                img, img_ids, txt, txt_ids, timesteps, pooled, guidance, injector, plan, window,
-                cancel,
-            ),
+                None,
+            );
         }
+        dit.forward_with_memory(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            pooled,
+            guidance,
+            Some(injector),
+            plan,
+            window,
+            cancel,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -434,7 +392,7 @@ impl FluxRefBackbone {
         pooled: &Tensor,
         guidance: Option<&Tensor>,
         injector: &FluxIpInjector<'_>,
-        prepared: &PreparedDit,
+        prepared: &PreparedConditioning,
         cancel: &CancelFlag,
         pag_layers: Option<&[u32]>,
     ) -> Result<Tensor> {
@@ -453,9 +411,8 @@ impl FluxRefBackbone {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-        if let Some(heavy) = heavy {
-            return self.pipeline.forward_ip_residency_pag(
-                &heavy.heavy,
+        self.dit(heavy, "FLUX staged IP forward requires its heavy phase")?
+            .forward_prepared_with_memory_pag(
                 img,
                 img_ids,
                 txt,
@@ -463,58 +420,15 @@ impl FluxRefBackbone {
                 timesteps,
                 pooled,
                 guidance,
-                injector,
+                Some(injector),
+                None,
+                None,
                 prepared,
                 plan,
                 window,
                 cancel,
                 pag_layers,
-            );
-        }
-        let components = self.components.as_ref().ok_or_else(|| {
-            candle_gen::CandleError::Msg("FLUX staged IP forward requires its heavy phase".into())
-        })?;
-        match (components, prepared) {
-            (Components::Stock { transformer, .. }, PreparedDit::Stock(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img,
-                    img_ids,
-                    txt,
-                    txt_ids,
-                    timesteps,
-                    pooled,
-                    guidance,
-                    Some(injector),
-                    None,
-                    None,
-                    prepared,
-                    plan,
-                    window,
-                    cancel,
-                    pag_layers,
-                ),
-            (Components::Packed { transformer, .. }, PreparedDit::Packed(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img,
-                    img_ids,
-                    txt,
-                    txt_ids,
-                    timesteps,
-                    pooled,
-                    guidance,
-                    Some(injector),
-                    None,
-                    None,
-                    prepared,
-                    plan,
-                    window,
-                    cancel,
-                    pag_layers,
-                ),
-            _ => Err(candle_gen::CandleError::Msg(
-                "flux: prepared conditioning belongs to another DiT variant".into(),
-            )),
-        }
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -547,43 +461,21 @@ impl FluxRefBackbone {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-        if let Some(heavy) = heavy {
-            let prepared =
-                self.pipeline
-                    .prepare_ref_conditioning(&heavy.heavy, img, img_ids, txt, txt_ids)?;
-            return self.pipeline.forward_control_residency_pag(
-                &heavy.heavy,
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                control,
-                &prepared,
-                plan,
-                window,
-                cancel,
-                None,
+        let dit = self.dit(
+            heavy,
+            "FLUX staged control forward requires its heavy phase",
+        )?;
+        if heavy.is_some() {
+            let prepared = dit.prepare_conditioning(img, img_ids, txt, txt_ids)?;
+            return dit.forward_prepared_with_memory_pag(
+                img, img_ids, txt, txt_ids, timesteps, pooled, guidance, None, injector, control,
+                &prepared, plan, window, cancel, None,
             );
         }
-        let components = self.components.as_ref().ok_or_else(|| {
-            candle_gen::CandleError::Msg(
-                "FLUX staged control forward requires its heavy phase".into(),
-            )
-        })?;
-        match components {
-            Components::Stock { transformer, .. } => transformer.forward_control_with_memory(
-                img, img_ids, txt, txt_ids, timesteps, pooled, guidance, injector, control, plan,
-                window, cancel,
-            ),
-            Components::Packed { transformer, .. } => transformer.forward_control_with_memory(
-                img, img_ids, txt, txt_ids, timesteps, pooled, guidance, injector, control, plan,
-                window, cancel,
-            ),
-        }
+        dit.forward_control_with_memory(
+            img, img_ids, txt, txt_ids, timesteps, pooled, guidance, injector, control, plan,
+            window, cancel,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -599,7 +491,7 @@ impl FluxRefBackbone {
         guidance: Option<&Tensor>,
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Tensor], f64)>,
-        prepared: &PreparedDit,
+        prepared: &PreparedConditioning,
         cancel: &CancelFlag,
         pag_layers: Option<&[u32]>,
     ) -> Result<Tensor> {
@@ -618,45 +510,14 @@ impl FluxRefBackbone {
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-        if let Some(heavy) = heavy {
-            return self.pipeline.forward_control_residency_pag(
-                &heavy.heavy,
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                control,
-                prepared,
-                plan,
-                window,
-                cancel,
-                pag_layers,
-            );
-        }
-        let components = self.components.as_ref().ok_or_else(|| {
-            candle_gen::CandleError::Msg(
-                "FLUX staged control forward requires its heavy phase".into(),
-            )
-        })?;
-        match (components, prepared) {
-            (Components::Stock { transformer, .. }, PreparedDit::Stock(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img, img_ids, txt, txt_ids, timesteps, pooled, guidance, None, injector,
-                    control, prepared, plan, window, cancel, pag_layers,
-                ),
-            (Components::Packed { transformer, .. }, PreparedDit::Packed(prepared)) => transformer
-                .forward_prepared_with_memory_pag(
-                    img, img_ids, txt, txt_ids, timesteps, pooled, guidance, None, injector,
-                    control, prepared, plan, window, cancel, pag_layers,
-                ),
-            _ => Err(candle_gen::CandleError::Msg(
-                "flux: prepared conditioning belongs to another DiT variant".into(),
-            )),
-        }
+        self.dit(
+            heavy,
+            "FLUX staged control forward requires its heavy phase",
+        )?
+        .forward_prepared_with_memory_pag(
+            img, img_ids, txt, txt_ids, timesteps, pooled, guidance, None, injector, control,
+            prepared, plan, window, cancel, pag_layers,
+        )
     }
 
     pub fn encode_control_with_memory(

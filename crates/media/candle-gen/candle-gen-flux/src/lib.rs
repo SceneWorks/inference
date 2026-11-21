@@ -58,25 +58,23 @@ mod flux1_load;
 
 // Packed-tier (MLX diffusers-layout q4/q8) load path (sc-9407, sc-9089 umbrella). `quant` is the thin
 // per-crate dense-or-packed enum delegating to the shared `candle_gen::quant` packed-load module
-// (sc-9086); `packed_dit`/`packed_te` are minimal vendored diffusers-layout FLUX.1 DiT + CLIP-L/T5-XXL
-// encoders that build every projection through it, so q4/q8 load straight from the packed parts (no
-// dense bf16 staging). The dense BFL snapshot path (stock `candle-transformers`) is unchanged.
-mod packed_dit;
+// (sc-9086). The FLUX.1 transformer and text encoder projections load q4/q8 directly from the packed
+// parts. The transformer also accepts native dense BFL weights.
 // `packed_te` is `pub` so the Mochi provider (`candle-gen-mochi`) can reuse the vendored T5-XXL encoder
 // stack (`PackedT5Encoder` / `T5Config::xxl`) — the same google/t5-v1.1-xxl geometry Mochi conditions
 // on — through its masked-forward path (`forward_masked`, added for Mochi's padded/masked encode).
 pub mod packed_te;
 mod quant;
 
-// XLabs FLUX IP-Adapter (sc-5872, epic 5480) — reference-image (identity) conditioning. `ip_dit` is the
-// forked FLUX DiT carrying the per-double-block decoupled-cross-attn seam (the stock candle-transformers
-// `Flux` has none); `ip_adapter` is the XLabs projector + K/V weights; `ip_image_encoder` is the pooled
+// XLabs FLUX IP-Adapter (sc-5872, epic 5480) — reference-image (identity) conditioning. The FLUX DiT
+// exposes the per-double-block decoupled cross-attention seam. `ip_adapter` is the XLabs projector
+// and K/V weights; `ip_image_encoder` is the pooled
 // CLIP-ViT-L tower; `ip_provider` composes them into the bespoke reference stream the worker drives
 // directly (not gen-core-registered — the `flux1_*` descriptors stay txt2img-only).
 pub mod ip_adapter;
-mod ip_dit;
 pub mod ip_image_encoder;
 pub mod ip_provider;
+mod transformer;
 pub use ip_provider::{
     compile_ip_plan, ip_load_spec, IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest,
     DEFAULT_IP_SCALE,
@@ -101,7 +99,9 @@ pub use control_provider::{
 // provider (`candle-gen-pulid`, sc-5492), which composes the FLUX backbone with the EVA-CLIP tower +
 // IDFormer + the 20 PerceiverAttentionCA modules driven through [`DitImageInjector`]. `Config` is the
 // candle-transformers FLUX config the fork reuses (so it cannot drift on hyperparameters).
-pub use ip_dit::{Config as FluxConfig, DitImageInjector, IpFlux};
+pub use transformer::{Config as FluxConfig, DitImageInjector, FluxDit};
+// Compatibility name for callers constructing the native BFL layout.
+pub use transformer::FluxDit as IpFlux;
 // FLUX backbone helpers shared with the PuLID provider so the two never drift on the parity-critical
 // tokenization / VAE decode / config (the candle twin of `mlx-gen-flux`'s shared `Flux1` surface). The
 // IP-Adapter provider reaches these as `pub(crate)`; PuLID is a separate crate, hence `pub`.
@@ -132,7 +132,7 @@ pub use pipeline::{flow_mu, BASE_SHIFT, MAX_SHIFT};
 // `mlx_gen_flux::load_flux1`. Reuses the txt2img `Pipeline`'s tier detect-and-load so the reference
 // lanes (`candle-gen-pulid`, the FLUX IP-adapter) consume the SAME `SceneWorks/flux1-dev-mlx`
 // q4/q8/bf16 turnkey tiers the base generator does, driving the post-block `DitImageInjector` seam on
-// either the BFL `IpFlux` or the diffusers `PackedFluxDit`.
+// the shared FLUX transformer across both checkpoint layouts.
 mod ref_backbone;
 pub use ref_backbone::{FluxRefBackbone, FluxRefHeavy};
 
@@ -1386,8 +1386,8 @@ mod tests {
         let v = Tensor::randn(0f32, 1f32, (b, h, total, d), &cpu).unwrap();
         let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
         let (o_txt, o_img) =
-            crate::ip_dit::pag_joint_attention_post_rope(&q, &k, &v, txt_seq, plan).unwrap();
-        let full = crate::ip_dit::scaled_dot_product_attention_planned(&q, &k, &v, plan)
+            crate::transformer::pag_joint_attention_post_rope(&q, &k, &v, txt_seq, plan).unwrap();
+        let full = crate::transformer::scaled_dot_product_attention_planned(&q, &k, &v, plan)
             .unwrap()
             .transpose(1, 2)
             .unwrap()

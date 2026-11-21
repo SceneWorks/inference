@@ -1,7 +1,7 @@
 //! The XLabs FLUX **IP-Adapter** provider (sc-5872, epic 5480) — reference-image (identity)
 //! conditioning on FLUX.1 `dev`/`schnell`, the candle (Windows/CUDA) sibling of `mlx-gen-flux`'s XLabs
 //! IP path. It composes the reused FLUX text encoders / VAE / flow-match schedule with the forked DiT
-//! ([`crate::ip_dit::IpFlux`], the only FLUX DiT with an IP seam) + the XLabs adapter
+//! ([`crate::transformer::FluxDit`], the only FLUX DiT with an IP seam) + the XLabs adapter
 //! ([`crate::ip_adapter`]) + the pooled CLIP-ViT-L image encoder ([`crate::ip_image_encoder`]).
 //!
 //! **Single distilled forward** (no true-CFG): FLUX is guidance/timestep-distilled, so — like the
@@ -421,7 +421,7 @@ impl IpAdapterFlux {
         )?;
 
         // The forked FLUX DiT (the IP seam) from the root BFL checkpoint — the genuine per-provider drift
-        // (IpFlux, not the stock Flux), so the wrapper choice stays here over the shared mmap.
+        // (FluxDit, not the stock Flux), so the wrapper choice stays here over the shared mmap.
         // XLabs adapter weights (`ip_adapter.safetensors`).
         let ipa = Weights::from_file(&paths.ip_adapter, &device, dtype).map_err(|e| {
             CandleError::Msg(format!(
@@ -710,7 +710,7 @@ impl IpAdapterFlux {
     /// sampler/scheduler driver (epic 7114 P4, sc-7123) — the IP twin of the txt2img
     /// [`crate::pipeline`] `denoise`. The `scheduler` axis re-strides FLUX's native `get_schedule(..)`
     /// over the time-shift `mu`; the `sampler` axis picks the integrator. The forked
-    /// [`IpFlux::forward`] (`Some(injector)`) replaces the stock FLUX forward, and the XLabs IP residual
+    /// [`crate::FluxDit::forward`] (`Some(injector)`) replaces the stock FLUX forward, and the XLabs IP residual
     /// injection stays INSIDE the `predict` closure so a multi-eval solver re-runs the whole step. The
     /// DEFAULT (`euler` over the native schedule) is the N1 no-op for the legacy inline flow-match Euler
     /// loop `img += pred·(σ_{i+1} − σ_i)`. FLUX feeds the raw timestep (`Sigma` convention: `t == σ`);
