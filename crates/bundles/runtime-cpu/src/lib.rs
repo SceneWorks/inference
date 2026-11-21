@@ -17,6 +17,7 @@ pub use candle_gen_catalog::media;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::vae_tiling;
 pub use candle_llm as llm;
+pub use candle_llm::candle_layers as layers;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
     VideoDecodeMemoryProfile,
@@ -624,5 +625,18 @@ mod tests {
                 waiver.provider_id
             );
         }
+    }
+
+    #[test]
+    fn bundle_reexports_shared_candle_layers_spine_in_both_partitions() {
+        assert_eq!(
+            std::any::TypeId::of::<super::layers::Linear>(),
+            std::any::TypeId::of::<super::llm::candle_layers::Linear>()
+        );
+        #[cfg(feature = "media")]
+        assert_eq!(
+            std::any::TypeId::of::<super::layers::Linear>(),
+            std::any::TypeId::of::<super::media::Linear>()
+        );
     }
 }

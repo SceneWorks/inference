@@ -35,7 +35,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::{AdaptLinear, DenseLinear, LokrFactors, QLinear};
+use crate::quant::{AdaptLinear, Base as SpineBase, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -182,59 +182,17 @@ impl AdditiveResidual {
     }
 }
 
-/// 2-D Kronecker product `kron(a[m,n], b[p,q]) = [m·p, n·q]` via broadcast — differentiable, so grads
-/// flow to `a`/`b`. `out[i·p+k, j·q+l] = a[i,j]·b[k,l]`.
-pub(crate) fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
-    let (m, n) = a.dims2()?;
-    let (p, q) = b.dims2()?;
-    let a4 = a.reshape((m, 1, n, 1))?;
-    let b4 = b.reshape((1, p, 1, q))?;
-    a4.broadcast_mul(&b4)?.reshape((m * p, n * q))
-}
+pub use candle_layers::adapt::kron2d;
 
-/// The frozen base projection behind a [`LoraLinear`] — a plain dense `Linear` (the training default,
-/// byte-identical to pre-sc-9416) or a **GGUF-quantized** [`QLinear`] loaded straight from a
-/// pre-quantized MLX tier (sc-9416, the candle SDXL packed-load). Both compute `x·Wᵀ + b`; the packed
-/// arm dequantizes-on-forward into a dense matmul (sc-7702). The packed base remains frozen, but an
-/// independent trainable LoRA residual may be installed over it (the LTX q4 trainer path).
-#[derive(Clone)]
-enum LoraBase {
-    Dense(Linear),
-    Packed(QLinear),
-}
-
-// `QLinear` holds a `QMatMul`/`QTensor` that are not `Debug`; `LoraLinear` derives `Debug` (it drops
-// into `#[derive(Debug)]` vendored modules), so summarize the base rather than recurse into the weight.
-impl std::fmt::Debug for LoraBase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Dense(l) => f.debug_tuple("Dense").field(l).finish(),
-            Self::Packed(_) => f.write_str("Packed(QLinear)"),
-        }
-    }
-}
-
-impl LoraBase {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(q) => q.forward(x),
-        }
-    }
-
-    fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
-
-/// A frozen base projection (dense or packed — `LoraBase`) with an optional trainable LoRA/LoKr
-/// residual. Implements [`Module`] so it drops into a vendored model exactly where an
+/// A frozen base projection on the shared [`candle_layers::adapt::Base`] spine (`SW-6956`, `BACK-1`)
+/// with an optional trainable LoRA/LoKr residual and per-pass additive inference residuals.
+/// Implements [`Module`] so it drops into a vendored model exactly where an
 /// `nn::Linear` was, and carries its own PEFT-style `path` (captured from the `VarBuilder` prefix at
 /// construction) so a [`LoraHost`] visitor can route adapters without threading prefixes through the
 /// module tree.
 #[derive(Debug, Clone)]
 pub struct LoraLinear {
-    base: LoraBase,
+    base: SpineBase,
     in_features: usize,
     out_features: usize,
     path: String,
@@ -263,7 +221,7 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base: LoraBase::Dense(base),
+            base: SpineBase::Dense(base),
             in_features,
             out_features,
             path,
@@ -285,7 +243,7 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base: LoraBase::Packed(base),
+            base: SpineBase::Packed(base),
             in_features,
             out_features,
             path,
@@ -296,6 +254,130 @@ impl LoraLinear {
         }
     }
 
+    /// Construct a [`LoraLinear`] directly from a shared-spine [`AdaptLinear`] at `path` (`SW-6956`),
+    /// preserving any attached forward-time additive or single trainable LoRA/LoKr residual.
+    ///
+    /// Returns an error if `adapt` contains more than one trainable adapter (`TrainableLora` or
+    /// `TrainableLokr`), because `LoraLinear` owns a single trainable slot alongside arbitrary
+    /// forward-time additive residuals.
+    pub fn from_adapt_linear(adapt: AdaptLinear, path: String) -> Result<Self> {
+        let out_features = adapt.out_features;
+        let in_features = adapt.in_features;
+        let mut adapter = None;
+        let mut frozen = None;
+        let mut additive = Vec::new();
+        for a in adapt.adapters {
+            match a {
+                candle_layers::adapt::Adapter::Lora { a, b, scale, .. } => {
+                    additive.push(AdditiveResidual::Lora {
+                        a,
+                        b,
+                        scales: vec![scale],
+                    });
+                }
+                candle_layers::adapt::Adapter::LokrStructured { factors } => {
+                    additive.push(AdditiveResidual::LokrStructured {
+                        factors,
+                        scales: vec![1.0],
+                    });
+                }
+                candle_layers::adapt::Adapter::TrainableLora {
+                    down,
+                    up,
+                    scale,
+                    frozen: is_frozen,
+                } => {
+                    if adapter.is_some() {
+                        return Err(CandleError::Msg(format!(
+                            "LoraLinear::from_adapt_linear at '{path}' cannot represent multiple trainable adapters"
+                        )));
+                    }
+                    if is_frozen {
+                        let detached = Adapter::Lora {
+                            down: down.detach(),
+                            up: up.detach(),
+                            scale,
+                        };
+                        frozen = Some(Adapter::Lora { down, up, scale });
+                        adapter = Some(detached);
+                    } else {
+                        adapter = Some(Adapter::Lora { down, up, scale });
+                        frozen = None;
+                    }
+                }
+                candle_layers::adapt::Adapter::TrainableLokr {
+                    w1,
+                    w2,
+                    base_shape: (out_f, in_f),
+                    scale,
+                    frozen: is_frozen,
+                } => {
+                    if adapter.is_some() {
+                        return Err(CandleError::Msg(format!(
+                            "LoraLinear::from_adapt_linear at '{path}' cannot represent multiple trainable adapters"
+                        )));
+                    }
+                    let live = Adapter::Lokr {
+                        w1: w1.clone(),
+                        w2: match &w2 {
+                            candle_layers::adapt::TrainableLokrW2::Full(t) => {
+                                LokrW2::Full(t.clone())
+                            }
+                            candle_layers::adapt::TrainableLokrW2::LowRank { a, b } => {
+                                LokrW2::LowRank {
+                                    a: a.clone(),
+                                    b: b.clone(),
+                                }
+                            }
+                        },
+                        out_f,
+                        in_f,
+                        scale,
+                    };
+                    if is_frozen {
+                        let detached = Adapter::Lokr {
+                            w1: w1.detach(),
+                            w2: match w2 {
+                                candle_layers::adapt::TrainableLokrW2::Full(t) => {
+                                    LokrW2::Full(t.detach())
+                                }
+                                candle_layers::adapt::TrainableLokrW2::LowRank { a, b } => {
+                                    LokrW2::LowRank {
+                                        a: a.detach(),
+                                        b: b.detach(),
+                                    }
+                                }
+                            },
+                            out_f,
+                            in_f,
+                            scale,
+                        };
+                        frozen = Some(live);
+                        adapter = Some(detached);
+                    } else {
+                        adapter = Some(live);
+                        frozen = None;
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            base: adapt.base,
+            in_features,
+            out_features,
+            path,
+            adapter,
+            frozen,
+            additive,
+            additive_pass: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Inspect the underlying shared [`candle_layers::adapt::Base`].
+    pub fn spine_base(&self) -> &SpineBase {
+        &self.base
+    }
+
     /// Whether the frozen base is a packed (GGUF-quantized) [`QLinear`] rather than a dense `Linear`
     /// (sc-9416).
     pub fn is_packed(&self) -> bool {
@@ -303,15 +385,9 @@ impl LoraLinear {
     }
 
     /// Fold only the frozen dense base to Q4/Q8, preserving trainable and forward-time residuals.
-    /// Already-packed bases are idempotent.
+    /// Already-packed bases are idempotent; non-dense/non-packed bases refuse re-quantization.
     pub fn quantize_base(&mut self, quant: crate::gen_core::Quant) -> Result<()> {
-        let LoraBase::Dense(linear) = &self.base else {
-            return Ok(());
-        };
-        let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
-        packed.quantize(quant)?;
-        self.base = LoraBase::Packed(packed);
-        Ok(())
+        Ok(self.base.quantize(quant)?)
     }
 
     /// Fold the frozen dense base from a CPU-staged model directly onto `device`, preserving every
@@ -329,13 +405,7 @@ impl LoraLinear {
                     .into(),
             ));
         }
-        if let LoraBase::Dense(linear) = &self.base {
-            let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
-            // SDXL's established quantized forward uses the dequant-dense arm; only the destination
-            // changes here, so CPU staging is numerically identical to `quantize_base`.
-            packed.quantize_dequant_onto(quant, device)?;
-            self.base = LoraBase::Packed(packed);
-        }
+        self.base.quantize_dequant_onto(quant, device)?;
         for residual in &mut self.additive {
             match residual {
                 AdditiveResidual::Lora { a, b, .. } => {
@@ -548,7 +618,7 @@ impl LoraLinear {
     /// Other packed operators and graph-retaining backward keep their native path.
     pub fn forward_bounded_packed(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let y = match &self.base {
-            LoraBase::Packed(QLinear::Quantized {
+            SpineBase::Packed(QLinear::Quantized {
                 weight: crate::quant::QuantWeight::Dequant(weight),
                 bias,
                 ..
@@ -561,13 +631,13 @@ impl LoraLinear {
     /// Dense base inspection without dequantizing packed weights.
     pub fn dense_base(&self) -> Option<&Linear> {
         match &self.base {
-            LoraBase::Dense(base) => Some(base),
-            LoraBase::Packed(_) => None,
+            SpineBase::Dense(base) => Some(base),
+            _ => None,
         }
     }
 
     pub(crate) fn replace_dense_base(&mut self, base: Linear) {
-        self.base = LoraBase::Dense(base);
+        self.base = SpineBase::Dense(base);
     }
 
     /// Apply live adapters to an externally computed frozen base output.
@@ -1213,207 +1283,10 @@ pub fn build_adapt_lokr_targets_peft(
     })
 }
 
-/// Reconstruct the LoRA weight delta `ΔW = (alpha/rank)·scale·(B·A)` as an `[out, in]` **f32** tensor
-/// — the inference-side **merge** counterpart to [`LoraLinear`]'s training **forward**, which adds the
-/// mathematically-identical residual `scale·(x·Aᵀ)·Bᵀ` with the install `scale = alpha/rank`. `down`
-/// is `A` `[rank, in]`, `up` is `B` `[out, rank]`; `scale` is the caller's per-adapter strength
-/// (`gen_core::AdapterSpec::scale`, `1.0` reconstructs the trained delta verbatim). Computed in f32 so
-/// a candle-trained adapter round-trips through inference exactly.
-///
-/// SDXL merges this into the dense UNet weight (`W += ΔW`) rather than adding it live: the ancestral
-/// sampler is chaos-sensitive and the merged forward `(W+ΔW)·x` differs from the residual form
-/// `W·x + ΔW·x` by ~1 ULP, which cascades to a visibly different image (see `candle-gen-sdxl`'s
-/// adapter merge). Holding both forms to the same f32 reconstruction keeps train and infer in lockstep.
-pub fn reconstruct_lora_delta(
-    down: &Tensor,
-    up: &Tensor,
-    alpha: f32,
-    rank: f32,
-    scale: f32,
-) -> Result<Tensor> {
-    let down = down.to_dtype(DType::F32)?;
-    let up = up.to_dtype(DType::F32)?;
-    let ba = up.matmul(&down)?; // [out, rank] · [rank, in] → [out, in]
-    let eff = (alpha as f64 / rank as f64) * scale as f64;
-    Ok((ba * eff)?)
-}
-
-/// Parse PEFT LoKr `rank`/`alpha` metadata without collapsing a present malformed value to a default.
-/// Missing rank defaults to 1 and missing alpha defaults to rank; present values must match the same
-/// finite, positive-rank contract enforced by [`reconstruct_lokr_delta`].
-pub fn parse_lokr_metadata(rank: Option<&str>, alpha: Option<&str>) -> Result<(f32, f32)> {
-    let parse = |field: &str, raw: &str| {
-        raw.trim().parse::<f32>().map_err(|_| {
-            CandleError::Msg(format!(
-                "LoKr adapter metadata `{field}` = `{raw}` is not a valid number"
-            ))
-        })
-    };
-    let rank = match rank {
-        Some(raw) => parse("rank", raw)?,
-        None => 1.0,
-    };
-    let alpha = match alpha {
-        Some(raw) => parse("alpha", raw)?,
-        None => rank,
-    };
-    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be finite and \
-             > 0 and alpha must be finite"
-        )));
-    }
-    Ok((rank, alpha))
-}
-
-/// Reconstruct the LoKr weight delta `ΔW = (alpha/rank)·scale·kron(w1, w2)` reshaped to `base_shape`
-/// (`[out, in]`), as **f32** — the inference-side merge counterpart to [`LoraLinear`]'s LoKr forward,
-/// using the *same* `kron2d` reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
-/// or a low-rank product (`w1_a·w1_b` / `w2_a·w2_b`, e.g. the trainer's zero-init `w2_a`/`w2_b` form).
-/// Errors if a leg is missing or if metadata/user scaling is invalid. Linear-only: pass 2-D factors
-/// (the SDXL trainer adapts Linears; Tucker / conv reconstruction is not handled here).
-#[allow(clippy::too_many_arguments)]
-pub fn reconstruct_lokr_delta(
-    w1: Option<&Tensor>,
-    w1_a: Option<&Tensor>,
-    w1_b: Option<&Tensor>,
-    w2: Option<&Tensor>,
-    w2_a: Option<&Tensor>,
-    w2_b: Option<&Tensor>,
-    alpha: f32,
-    rank: f32,
-    scale: f32,
-    base_shape: (usize, usize),
-) -> Result<Tensor> {
-    if !scale.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "LoKr: adapter scale must be finite (got {scale})"
-        )));
-    }
-    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be finite and \
-             > 0 and alpha must be finite"
-        )));
-    }
-    let eff = (alpha as f64 / rank as f64) * scale as f64;
-    if !eff.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "LoKr: derived (alpha/rank) * adapter scale must be finite (got {eff})"
-        )));
-    }
-    let f32d = |t: &Tensor| t.to_dtype(DType::F32);
-    let factor1 = match (w1, w1_a, w1_b) {
-        (Some(w), _, _) => f32d(w)?,
-        (_, Some(a), Some(b)) => f32d(a)?.matmul(&f32d(b)?)?,
-        _ => {
-            return Err(CandleError::Msg(
-                "lokr: w1 missing (need full lokr_w1 or lokr_w1_a·lokr_w1_b)".into(),
-            ))
-        }
-    };
-    let factor2 = match (w2, w2_a, w2_b) {
-        (Some(w), _, _) => f32d(w)?,
-        (_, Some(a), Some(b)) => f32d(a)?.matmul(&f32d(b)?)?,
-        _ => {
-            return Err(CandleError::Msg(
-                "lokr: w2 missing (need full lokr_w2 or lokr_w2_a·lokr_w2_b)".into(),
-            ))
-        }
-    };
-    let (out_f, in_f) = base_shape;
-    let delta = kron2d(&factor1, &factor2)?.reshape((out_f, in_f))?;
-    Ok((delta * eff)?)
-}
-
-/// Fuse a **conv-layer** LoRA pair into a single conv-weight delta in the trained-file **NCHW**
-/// `[out, in, kH, kW]` layout (sc-5225) — the conv analog of [`reconstruct_lora_delta`]. Community SDXL
-/// LoRAs adapt convs (resnet `conv1`/`conv2`/`conv_shortcut`, the down/up-samplers, `conv_in`/`conv_out`)
-/// by decomposing a conv into a spatial `down` (`lora_down`, `[rank, in, kH, kW]`) followed by a 1×1
-/// `up` (`lora_up`, `[out, rank, 1, 1]`); the fused weight is the composition of those two convs:
-///   `δ[o, i, y, x] = Σ_r up[o, r] · down[r, i, y, x]`,
-/// which is exactly `up[out, rank] · down[rank, in·kH·kW]` reshaped back to `[out, in, kH, kW]` —
-/// bit-identical to PEFT/diffusers' `Conv2d` LoRA fusion, uniform across 1×1 and k×k kernels — then
-/// scaled by `(alpha/rank)·scale`. Computed in **f32** (the candle SDXL merge path is f32-everywhere,
-/// matching [`reconstruct_lora_delta`]); the caller folds it into the conv weight (`W += δ`).
-///
-/// Unlike mlx-gen's `conv_lora_delta` (which returns NCHW and transposes to NHWC at the merge site,
-/// because mlx stores conv weights NHWC), candle convs are already NCHW (`candle_nn::Conv2d`), so the
-/// returned delta merges into the diffusers `{path}.weight` tensor with no transpose. A non-4-D factor
-/// (a malformed conv LoRA) is a typed error rather than a panic on the kernel-dim reshape.
-pub fn conv_lora_delta(
-    down: &Tensor,
-    up: &Tensor,
-    alpha: f32,
-    rank: f32,
-    scale: f32,
-) -> Result<Tensor> {
-    let (ds, us) = (down.dims(), up.dims());
-    if ds.len() != 4 || us.len() != 4 {
-        return Err(CandleError::Msg(format!(
-            "conv LoRA: expected 4-D factors (down [rank,in,kH,kW], up [out,rank,1,1]), got down \
-             {ds:?} up {us:?}"
-        )));
-    }
-    if us[1] != ds[0] {
-        return Err(CandleError::Msg(format!(
-            "conv LoRA: rank mismatch between factors — down[0]={} but up[1]={} (down {ds:?} up {us:?})",
-            ds[0], us[1]
-        )));
-    }
-    let (r, cin, kh, kw) = (ds[0], ds[1], ds[2], ds[3]);
-    let out = us[0];
-    let down2 = down.to_dtype(DType::F32)?.reshape((r, cin * kh * kw))?; // [rank, in·kH·kW]
-    let up2 = up.to_dtype(DType::F32)?.reshape((out, r))?; // [out, rank]
-    let ba = up2.matmul(&down2)?; // [out, in·kH·kW]
-    let eff = (alpha as f64 / rank as f64) * scale as f64;
-    Ok((ba * eff)?.reshape((out, cin, kh, kw))?)
-}
-
-/// Reconstruct a **LoHa** (LyCORIS Hadamard-product) weight delta `ΔW = scale · ((w1_a·w1_b) ⊙
-/// (w2_a·w2_b))` as an `[out, in]` **f32** tensor (sc-5225). Third-party LoHa decomposes a delta as the
-/// elementwise product of TWO low-rank products (vs LoKr's Kronecker). `w1_a`/`w2_a` are `[out, rank]`,
-/// `w1_b`/`w2_b` are `[rank, in]`; `scale` is the fully-effective multiplier (the lycoris `alpha/rank`
-/// times the caller's per-adapter strength). Mirrors LyCORIS `LohaModule.get_weight` / `HadaWeight`
-/// (`w1d=hada_w1_b, w1u=hada_w1_a`, so the product is `(hada_w1_a·hada_w1_b) ⊙ (hada_w2_a·hada_w2_b)`).
-///
-/// **Linear-only**: pass 2-D factors. The conv/tucker LoHa form (lycoris `use_cp`, `hada_t1`/`hada_t2`)
-/// is out of the candle SDXL adapter surface — like third-party LoKr, LoHa merges only into the
-/// attention/proj Linears (the conv surface is LoRA-only), so a conv-shaped LoHa is surfaced as skipped.
-///
-/// **Orientation is checked, not just element count** (sc-24157): every factor must be 2-D with
-/// `w*_a` `[out, r]` and `w*_b` `[r, in]` for `base_shape = (out, in)`. A transposed module
-/// (`[in, r]`·`[r, out]`) has the same `out·in` elements and would otherwise reshape into a
-/// scrambled `[out, in]` delta and merge silently.
-pub fn reconstruct_loha_delta(
-    w1_a: &Tensor,
-    w1_b: &Tensor,
-    w2_a: &Tensor,
-    w2_b: &Tensor,
-    scale: f32,
-    base_shape: (usize, usize),
-) -> Result<Tensor> {
-    let (out_f, in_f) = base_shape;
-    let oriented = |a: &Tensor, b: &Tensor| {
-        let (a, b) = (a.dims(), b.dims());
-        a.len() == 2 && b.len() == 2 && a[0] == out_f && b[1] == in_f && a[1] == b[0]
-    };
-    if !(oriented(w1_a, w1_b) && oriented(w2_a, w2_b)) {
-        return Err(CandleError::Msg(format!(
-            "loha: factors w1_a {:?} / w1_b {:?} / w2_a {:?} / w2_b {:?} do not reconstruct the \
-             base [out={out_f}, in={in_f}] (expected w*_a [out, r] and w*_b [r, in])",
-            w1_a.dims(),
-            w1_b.dims(),
-            w2_a.dims(),
-            w2_b.dims()
-        )));
-    }
-    let f32d = |t: &Tensor| t.to_dtype(DType::F32);
-    let m1 = f32d(w1_a)?.matmul(&f32d(w1_b)?)?; // [out, rank]·[rank, in] → [out, in]
-    let m2 = f32d(w2_a)?.matmul(&f32d(w2_b)?)?;
-    let delta = (m1 * m2)?.reshape((out_f, in_f))?;
-    Ok((delta * scale as f64)?)
-}
+pub use candle_layers::adapt::{
+    conv_lora_delta, parse_lokr_metadata, reconstruct_loha_delta, reconstruct_lokr_delta,
+    reconstruct_lora_delta,
+};
 
 /// Parsed view of the PEFT / diffusers `lora_adapter_metadata` config blob (sc-5374).
 ///
@@ -3487,5 +3360,24 @@ mod adapter_noise_tests {
         let mut g = zero_grads(&s);
         assert!(apply_gradient_noise(&mut g, &s, -0.1, 0.55, 0, 0).is_err());
         assert!(apply_gradient_noise(&mut g, &s, 0.01, -1.0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn from_adapt_linear_rejects_multiple_trainable_adapters() {
+        let dev = Device::Cpu;
+        let w = Tensor::zeros((4, 3), DType::F32, &dev).unwrap();
+        let base = Linear::new(w, None);
+        let mut adapt = AdaptLinear::from_dense(base, 3, 4);
+        let down1 = candle_core::Var::zeros((2, 3), DType::F32, &dev).unwrap();
+        let up1 = candle_core::Var::zeros((4, 2), DType::F32, &dev).unwrap();
+        adapt.push_trainable_lora(down1.as_tensor().clone(), up1.as_tensor().clone(), 1.0);
+        assert!(LoraLinear::from_adapt_linear(adapt.clone(), "blk.0.attn.to_q".into()).is_ok());
+
+        let down2 = candle_core::Var::zeros((2, 3), DType::F32, &dev).unwrap();
+        let up2 = candle_core::Var::zeros((4, 2), DType::F32, &dev).unwrap();
+        adapt.push_trainable_lora(down2.as_tensor().clone(), up2.as_tensor().clone(), 1.0);
+        let err = LoraLinear::from_adapt_linear(adapt, "blk.0.attn.to_q".into())
+            .expect_err("multiple trainable adapters must be rejected");
+        assert!(err.to_string().contains("multiple trainable adapters"));
     }
 }

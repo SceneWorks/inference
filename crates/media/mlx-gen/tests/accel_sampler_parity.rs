@@ -13,9 +13,23 @@
 //! a separate, qualitative gate.
 
 use mlx_gen::sampler::{AlphaSchedule, DiffusionSampler, LcmSampler, LightningSampler, TcdSampler};
+#[cfg(feature = "test-support")]
 use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_rs::{Array, Dtype};
+
+#[cfg(not(feature = "test-support"))]
+fn peak_rel_host(got: &Array, want: &Array, floor: Option<f32>) -> f32 {
+    let host_f32 = |a: &Array| -> Vec<f32> {
+        a.as_dtype(Dtype::Float32)
+            .unwrap()
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    };
+    gen_core_testkit::host::peak_rel_slices(&host_f32(got), &host_f32(want), floor)
+}
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

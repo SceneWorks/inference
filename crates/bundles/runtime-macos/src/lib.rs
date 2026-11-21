@@ -23,6 +23,7 @@ pub use mlx_gen_catalog::media;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::{vae_tiling, vae_tiling_unmodelled_reason};
 pub use mlx_llm as llm;
+pub use mlx_llm::mlx_layers as layers;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
     VideoDecodeMemoryProfile,
@@ -574,5 +575,18 @@ mod tests {
         );
         assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
+    }
+
+    #[test]
+    fn bundle_reexports_shared_mlx_layers_spine_in_both_partitions() {
+        assert_eq!(
+            std::any::TypeId::of::<super::layers::Linear>(),
+            std::any::TypeId::of::<super::llm::mlx_layers::Linear>()
+        );
+        #[cfg(feature = "media")]
+        assert_eq!(
+            std::any::TypeId::of::<super::layers::Linear>(),
+            std::any::TypeId::of::<super::media::Linear>()
+        );
     }
 }

@@ -57,8 +57,8 @@ carries an explicit remap in its `from_weights`. Today the Z-Image block keys al
     goldens pin. It shares the alignment predicate (`quant::is_quant_aligned`, sc-27320).
   - `mlx-gen-lens` (`src/dit/mod.rs` `Linear`) and `mlx-gen-minimax-h3` (`src/blocks.rs`
     `Linear`): dense-only, never quantized or adapted.
-  - `mlx-gen-ltx` (`src/transformer.rs` `LinearKind` + its own LoRA stack): predates the rule
-    (sc-2687) and carries its own quantized/adapter forward.
+  - `mlx-gen-ltx` (`src/transformer/linear.rs` `Linear`): now unified onto [`AdaptableLinear`]
+    on the shared `mlx-layers` spine with per-pass adapter scale scheduling (`SW-6956`).
 - A quantize cascade that leaves misaligned projections dense uses
   `AdaptableLinear::quantize_if_aligned` / `is_quant_aligned` (sc-27320) rather than re-spelling
   the `in_features % group_size == 0` predicate.
