@@ -256,6 +256,68 @@ fn krea_plan_preserves_authored_stops_across_short_and_long_native_schedules() {
 }
 
 #[test]
+fn krea_pag_receipt_counts_the_prefix_on_the_full_ddim_uniform_grid() {
+    let req = GenerationRequest {
+        scheduler: Some("ddim_uniform".into()),
+        phases: Some(vec![
+            GenerationPhase {
+                steps: 16,
+                ..Default::default()
+            },
+            GenerationPhase {
+                steps: 15,
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    };
+    let sigmas =
+        crate::sampling::flow_schedule_with_shift(req.scheduler.as_deref(), 0.0, None, 31, &[])
+            .unwrap();
+    let plan = RenderPlan::krea_multiphase(
+        &adapter_phase_descriptor(),
+        &adapter_phase_spec(),
+        &req,
+        pass(sigmas, 32, 0.0),
+    )
+    .unwrap();
+    let executed_steps = plan.executed_steps();
+    let schedule_steps = plan.sigmas().len() - 1;
+    assert_eq!((executed_steps, schedule_steps), (31, 32));
+    assert_eq!(plan.denoise_spans(), [0..16, 16..31]);
+
+    let beyond_prefix = crate::PagResolved {
+        scale: 2.0,
+        adaptive_scale: 0.0,
+        layers: vec![2],
+        start: 0.96,
+        stop: 1.0,
+    };
+    let active_edge = crate::PagResolved {
+        start: 0.9375,
+        stop: 0.95,
+        ..beyond_prefix.clone()
+    };
+    assert!(beyond_prefix.step_scale(31, schedule_steps) > 0.0);
+    assert_eq!(beyond_prefix.active_steps(executed_steps as u32), 1);
+    assert!(active_edge.step_scale(30, schedule_steps) > 0.0);
+    assert_eq!(active_edge.active_steps(executed_steps as u32), 0);
+
+    for (pag, expected_steps) in [(beyond_prefix, 0), (active_edge, 1)] {
+        let evaluated_steps = plan
+            .adapter_phases()
+            .iter()
+            .flat_map(AdapterDenoisePhase::span)
+            .filter(|&step| pag.step_scale(step, schedule_steps) > 0.0)
+            .count() as u32;
+        let receipt = pag.execution_report_for_prefix(executed_steps as u32, schedule_steps as u32);
+        assert_eq!(receipt.total_steps, 31);
+        assert_eq!(receipt.active_steps, expected_steps);
+        assert_eq!(receipt.active_steps, evaluated_steps);
+    }
+}
+
+#[test]
 fn packed_image_plan_freezes_reference_and_control_content_before_load() {
     let image = Image {
         width: 16,

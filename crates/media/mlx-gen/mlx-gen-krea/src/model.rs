@@ -1814,12 +1814,9 @@ struct KreaRequest<'r> {
 }
 
 impl KreaRequest<'_> {
-    /// Executed step count across all Krea routes (single-phase, PiD-truncated, img2img-sliced,
-    /// and multi-phase global schedule), feeding [`mlx_gen::gen_core::PagResolved::execution_report`].
-    fn executed_steps(&self) -> u32 {
-        let steps = if let Some(plan) = self.phase_plan {
-            plan.executed_steps()
-        } else if let Some((_, strength)) = self.img2img {
+    /// Executed step count for an ordinary trajectory, including PiD and img2img slicing.
+    fn single_phase_executed_steps(&self) -> u32 {
+        let steps = if let Some((_, strength)) = self.img2img {
             let start =
                 init_time_step(self.steps, Some(strength)).min(self.sigmas.len().saturating_sub(1));
             let end = self.keep.min(self.sigmas.len());
@@ -1832,9 +1829,13 @@ impl KreaRequest<'_> {
     }
 
     fn pag_execution_report(&self) -> Option<mlx_gen::gen_core::PagExecutionReport> {
-        self.pag
-            .as_ref()
-            .map(|pag| pag.execution_report(self.executed_steps()))
+        self.pag.as_ref().map(|pag| match self.phase_plan {
+            Some(plan) => pag.execution_report_for_prefix(
+                plan.executed_steps() as u32,
+                plan.sigmas().len().saturating_sub(1) as u32,
+            ),
+            None => pag.execution_report(self.single_phase_executed_steps()),
+        })
     }
 }
 
