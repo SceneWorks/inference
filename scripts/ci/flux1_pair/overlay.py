@@ -30,7 +30,15 @@ def install(root, backend, arm, tier):
             replace_once(root, path, "for i in 0..12 {", "for i in 0..1 {")
             replace_once(root, path, "pub const T5_BLOCKS: usize = 24;", "pub const T5_BLOCKS: usize = 1;")
         else:
-            path = family + "/src/packed_te.rs"
+            text_encoder_sources = [
+                path for path in (
+                    family + "/src/packed_te.rs",
+                    CANDLE + "candle-gen/src/text_encoder.rs",
+                ) if (root / path).is_file()
+            ]
+            if len(text_encoder_sources) != 1:
+                raise ValueError("proof overlay requires exactly one Candle FLUX text encoder source")
+            path = text_encoder_sources[0]
             replace_once(root, path, "num_hidden_layers: 12,", "num_hidden_layers: 1,")
             replace_once(root, path, "num_layers: 24,", "num_layers: 1,")
     path = (MLX if mlx else CANDLE + "candle-gen/") + "src/sampler.rs"
