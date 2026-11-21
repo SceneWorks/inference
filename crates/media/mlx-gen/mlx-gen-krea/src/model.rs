@@ -8,6 +8,7 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
+use mlx_gen::gen_core::{self, MemoryRequestScope, RenderLoadBinding, RenderPlan, RenderRun};
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
@@ -23,7 +24,6 @@ use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 use mlx_rs::Array;
 use std::path::Path;
 
-use crate::multiphase::{self, ResolvedPhase};
 use crate::pipeline::{
     base_schedule, maybe_apply_style_gain, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy,
     KreaText, T2iPlan, TurboOptions,
@@ -1249,6 +1249,34 @@ impl Generator for Krea {
         })
     }
 
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.generate_impl(req, Some(plan), scope, on_progress)
+            .map_err(Into::into)
+    }
+
+    fn generate_planned_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_planned_image_report(
+            self,
+            req,
+            plan,
+            scope,
+            on_progress,
+            || self.observe_loaded(),
+        )
+    }
+
     fn generate_with_execution_report(
         &self,
         req: &GenerationRequest,
@@ -1258,16 +1286,7 @@ impl Generator for Krea {
             self.descriptor(),
             &req.cancel,
             || {
-                mlx_gen::image_execution::policy_debug("Krea.precision", &self.precision);
-                mlx_gen::image_execution::policy_debug("Krea.quant", &self.quant);
-                mlx_gen::image_execution::policy_debug(
-                    "Krea.applied_adapter_controls",
-                    &applied_adapter_controls(&self.adapters),
-                );
-                mlx_gen::image_execution::policy_debug(
-                    "Krea.loaded_sequential_residency",
-                    &self.residency.is_sequential(),
-                );
+                self.observe_loaded();
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_report_observed(req, &mut progress)
@@ -1277,12 +1296,26 @@ impl Generator for Krea {
 }
 
 impl Krea {
+    fn observe_loaded(&self) {
+        mlx_gen::image_execution::policy_debug("Krea.precision", &self.precision);
+        mlx_gen::image_execution::policy_debug("Krea.quant", &self.quant);
+        mlx_gen::image_execution::policy_debug(
+            "Krea.applied_adapter_controls",
+            &applied_adapter_controls(&self.adapters),
+        );
+        mlx_gen::image_execution::policy_debug(
+            "Krea.loaded_sequential_residency",
+            &self.residency.is_sequential(),
+        );
+    }
+
     fn generate_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl(req, None, None, on_progress)
+            .map_err(Into::into)
     }
 }
 
@@ -1352,13 +1385,34 @@ impl Krea {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        admitted_plan: Option<&RenderPlan>,
+        scope: Option<&mut dyn MemoryRequestScope>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<mlx_gen::gen_core::GenerationReport> {
         validate_request(&self.descriptor, req)?;
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
-        let request = self.resolve_request(req)?;
+        let compiled;
+        let phase_plan = match admitted_plan {
+            Some(plan) => {
+                plan.check_request(&self.descriptor, req)?;
+                plan.check_load(&RenderLoadBinding::from_spec(&self.file_pin_spec))?;
+                if plan.adapter_phases().is_empty() {
+                    return Err(Error::Unsupported(
+                        "krea Raw planned execution requires compiled adapter phases".into(),
+                    ));
+                }
+                Some(plan)
+            }
+            None if req.phases.is_some() => {
+                compiled = compile_multiphase_plan(&self.descriptor, &self.file_pin_spec, req)?;
+                Some(&compiled)
+            }
+            None => None,
+        };
+        let run = phase_plan.map(|plan| RenderRun::new(plan, &req.cancel, scope));
+        let request = self.resolve_request(req, phase_plan)?;
         let pag_report = request.pag_execution_report();
 
         // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
@@ -1369,10 +1423,23 @@ impl Krea {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &KreaText| self.encode_phase(text, &request),
+            |text: &KreaText| match &run {
+                Some(run) => run.encode(|| {
+                    let ctx = self.encode_phase(text, &request)?;
+                    match &ctx.neg {
+                        Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                        None => mlx_rs::transforms::eval([&ctx.pos])?,
+                    }
+                    Ok(ctx)
+                }),
+                None => self.encode_phase(text, &request),
+            },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
             |ctx: Option<&KreaContexts>| {
+                if run.is_some() {
+                    return Ok(());
+                }
                 let Some(ctx) = ctx else { return Ok(()) };
                 match &ctx.neg {
                     Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
@@ -1383,7 +1450,13 @@ impl Krea {
             // Phase B: heavy render components (DiT + VAE + PiD). The render dispatch runs
             // identically for both residencies.
             |heavy_owned, ctx, on_progress| {
-                self.render_phase(heavy_owned.as_ref(), &ctx, &request, on_progress)
+                self.render_phase(
+                    heavy_owned.as_ref(),
+                    &ctx,
+                    &request,
+                    run.as_ref(),
+                    on_progress,
+                )
             },
         )?;
         let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
@@ -1393,7 +1466,11 @@ impl Krea {
 
     /// Everything the request resolves before the residency lifecycle: the variant's render path,
     /// steps, schedule and PiD capture, the reference roles, the CFG knobs and the multi-phase plan.
-    fn resolve_request<'r>(&self, req: &'r GenerationRequest) -> Result<KreaRequest<'r>> {
+    fn resolve_request<'r>(
+        &self,
+        req: &'r GenerationRequest,
+        phase_plan: Option<&'r RenderPlan>,
+    ) -> Result<KreaRequest<'r>> {
         let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
         mlx_gen::image_execution::policy_debug(
             "krea.transformer_window_size",
@@ -1485,13 +1562,15 @@ impl Krea {
             .guidance
             .unwrap_or(if is_raw { DEFAULT_RAW_GUIDANCE } else { 0.0 });
         let negative = req.negative_prompt.clone().unwrap_or_default();
-        let multiphase = self.resolve_multiphase(req, guidance)?;
         let pag = self
             .descriptor
             .capabilities
             .resolve_pag(self.descriptor.id, req)?;
         mlx_gen::image_execution::scalar("krea.guidance", guidance);
-        mlx_gen::image_execution::policy_debug("krea.resolved_phases", &multiphase.phases);
+        mlx_gen::image_execution::policy_debug(
+            "krea.resolved_phases",
+            &phase_plan.map(RenderPlan::adapter_phases),
+        );
         mlx_gen::image_execution::policy_debug("krea.pag", &pag);
         Ok(KreaRequest {
             req,
@@ -1508,58 +1587,8 @@ impl Krea {
             keep,
             guidance,
             negative,
-            multiphase,
+            phase_plan,
             pag,
-        })
-    }
-
-    /// Multi-phase denoise (epic 13879, sc-13884): resolve the phase list ONCE up-front so both the
-    /// text-encode phase (whether the unconditional context is needed) and the render phase drive
-    /// from the same plan. `validate_phases` has already gated this to the Raw t2i variant (no
-    /// reference/PiD, non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase
-    /// guidance, and per-phase adapter sets (indices bounds-checked against `self.adapters`). The
-    /// multi-phase schedule is ONE global Raw schedule for the TOTAL step budget (the sum of the
-    /// phases' steps); every phase runs a contiguous slice of it — the crux that keeps the sigma
-    /// trajectory continuous across boundaries (no per-phase recompute / reset).
-    ///
-    /// `encode_neg` gates the text encode's unconditional context: built iff ANY phase runs CFG
-    /// (`crate::pipeline::krea_uses_cfg`). `None` phases ⇒ the ordinary single-phase render.
-    fn resolve_multiphase(&self, req: &GenerationRequest, guidance: f32) -> Result<KreaMultiphase> {
-        let resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
-            Some(list) if !list.is_empty() => {
-                let default_guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
-                Some(multiphase::resolve_phases(
-                    list,
-                    default_guidance,
-                    self.adapters.len(),
-                    self.descriptor.id,
-                )?)
-            }
-            _ => None,
-        };
-        let sigmas = resolved
-            .as_ref()
-            .map(|resolved| -> Result<Vec<f32>> {
-                let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
-                let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
-                Ok(mlx_gen::resolve_flow_schedule_with_shift(
-                    req.scheduler.as_deref(),
-                    req.scheduler_shift,
-                    crate::schedule::dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
-                    total,
-                    &native,
-                )?)
-            })
-            .transpose()?;
-        let encode_neg = match &resolved {
-            Some(resolved) => resolved
-                .iter()
-                .any(|p| crate::pipeline::krea_uses_cfg(p.guidance)),
-            None => crate::pipeline::krea_uses_cfg(guidance),
-        };
-        Ok(KreaMultiphase {
-            phases: resolved.zip(sigmas),
-            encode_neg,
         })
     }
 
@@ -1570,7 +1599,10 @@ impl Krea {
             text,
             req,
             request.is_edit,
-            request.multiphase.encode_neg,
+            request.phase_plan.map_or_else(
+                || crate::pipeline::krea_uses_cfg(request.guidance),
+                RenderPlan::adapter_phases_need_negative,
+            ),
             &request.negative,
             &request.edit_sources,
         )?;
@@ -1602,6 +1634,7 @@ impl Krea {
         heavy: KreaHeavyRef<'_>,
         ctx: &KreaContexts,
         request: &KreaRequest<'_>,
+        run: Option<&RenderRun<'_, '_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let req = request.req;
@@ -1624,16 +1657,21 @@ impl Krea {
                     .map(|decoder| decoder as &dyn LatentDecoder)
             });
 
-        if let Some((resolved, full)) = &request.multiphase.phases {
-            return self.render_multiphase(
-                &heavy,
-                ctx,
-                request,
-                resolved,
-                full,
-                decoder,
-                on_progress,
-            );
+        if let Some(run) = run {
+            let opts = self.turbo_options(request, run.plan().executed_steps(), 0);
+            return Ok(GenerationOutput::Images(
+                heavy.heavy.render_multiphase_planned(
+                    run,
+                    &self.file_pin_spec,
+                    &ctx.pos,
+                    ctx.neg.as_ref(),
+                    &opts,
+                    decoder,
+                    request.pag.as_ref(),
+                    req,
+                    on_progress,
+                )?,
+            ));
         }
 
         let mut plan = self.build_render_plan(&heavy, ctx, request)?;
@@ -1665,66 +1703,6 @@ impl Krea {
             images.push(mlx_gen::image_execution::with_output_index(
                 n as usize,
                 || render_one(heavy.heavy, &plan, request, &opts, decoder, on_progress),
-            )?);
-        }
-        Ok(GenerationOutput::Images(images))
-    }
-
-    /// Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE global
-    /// schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
-    /// (single-forward) body and per-phase adapters selected on the matching request-local DiT,
-    /// sharing the latent and sigma trajectory across every boundary. The per-phase plans (clone +
-    /// adapters + prep) are built ONCE here (`prep_neg` present per phase iff that phase uses CFG,
-    /// backed by the encode-guidance neg-context gate) and reused across the count loop (one image
-    /// per seed).
-    #[allow(clippy::too_many_arguments)]
-    fn render_multiphase(
-        &self,
-        heavy: &KreaHeavyRef<'_>,
-        ctx: &KreaContexts,
-        request: &KreaRequest<'_>,
-        resolved: &[ResolvedPhase],
-        full: &[f32],
-        decoder: Option<&dyn LatentDecoder>,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
-        let req = request.req;
-        let mut plans = self.file_pin_spec.read_files_unchanged(
-            self.adapters.iter().map(|adapter| &adapter.path),
-            || {
-                heavy.heavy.prepare_multiphase(
-                    resolved,
-                    &self.adapters,
-                    &ctx.pos,
-                    ctx.neg.as_ref(),
-                    req.width,
-                    req.height,
-                )
-            },
-        )?;
-        for phase_plan in &mut plans {
-            phase_plan.pag = request.pag.clone();
-        }
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
-            let opts = self.turbo_options(request, full.len().saturating_sub(1), n);
-            // sc-22738: the Denoise + Decode phase EXITS live inside the render body
-            // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and decoded image
-            // actually exist; `opts` above carries the request-scoped `memory` + `provider_id` those
-            // hooks read.
-            images.push(mlx_gen::image_execution::with_output_index(
-                n as usize,
-                || {
-                    heavy.heavy.render_multiphase(
-                        &plans,
-                        full,
-                        &opts,
-                        decoder,
-                        &req.cancel,
-                        &req.preview,
-                        on_progress,
-                    )
-                },
             )?);
         }
         Ok(GenerationOutput::Images(images))
@@ -1831,7 +1809,7 @@ struct KreaRequest<'r> {
     keep: usize,
     guidance: f32,
     negative: String,
-    multiphase: KreaMultiphase,
+    phase_plan: Option<&'r RenderPlan>,
     pag: Option<mlx_gen::gen_core::PagResolved>,
 }
 
@@ -1839,8 +1817,8 @@ impl KreaRequest<'_> {
     /// Executed step count across all Krea routes (single-phase, PiD-truncated, img2img-sliced,
     /// and multi-phase global schedule), feeding [`mlx_gen::gen_core::PagResolved::execution_report`].
     fn executed_steps(&self) -> u32 {
-        let steps = if let Some((_, full)) = &self.multiphase.phases {
-            full.len().saturating_sub(1)
+        let steps = if let Some(plan) = self.phase_plan {
+            plan.executed_steps()
         } else if let Some((_, strength)) = self.img2img {
             let start =
                 init_time_step(self.steps, Some(strength)).min(self.sigmas.len().saturating_sub(1));
@@ -1858,13 +1836,6 @@ impl KreaRequest<'_> {
             .as_ref()
             .map(|pag| pag.execution_report(self.executed_steps()))
     }
-}
-
-/// The multi-phase plan (epic 13879): the resolved phases with their one global schedule, and
-/// whether any phase requires an unconditional CFG context.
-struct KreaMultiphase {
-    phases: Option<(Vec<ResolvedPhase>, Vec<f32>)>,
-    encode_neg: bool,
 }
 
 /// One image through the single-phase plan's render body.
@@ -2026,6 +1997,52 @@ fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
     }
 }
 
+fn compile_multiphase_plan(
+    descriptor: &ModelDescriptor,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<RenderPlan> {
+    let total = req.phases.as_ref().map_or(0, |phases| {
+        phases.iter().map(|phase| phase.steps as usize).sum()
+    });
+    let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        crate::schedule::dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+        total,
+        &native,
+    )?;
+    let solver = gen_core::sampling::canonical_solver_or_euler(req.sampler.as_deref());
+    Ok(RenderPlan::krea_multiphase(
+        descriptor,
+        spec,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: crate::RES_MULTIPLE,
+            token_width: 64,
+            sampler: solver.name(),
+            guidance: req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE),
+            sigmas,
+            executed_steps: total,
+            capture_sigma: 0.0,
+        },
+    )?)
+}
+
+pub(crate) fn compile_raw_render_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<RenderPlan>> {
+    if req.phases.is_none() {
+        return Ok(None);
+    }
+    let descriptor = raw_descriptor();
+    validate_request(&descriptor, req)?;
+    ensure_multiphase_allowed_for(descriptor.id, adapters_have_diff_patch_for_spec(spec)?, req)?;
+    Ok(Some(compile_multiphase_plan(&descriptor, spec, req)?))
+}
+
 /// Multi-phase request validation (epic 13879, sc-13884). Multi-phase is the **Raw t2i** variant only:
 /// an ordered phase list run from pure noise over ONE global schedule, each phase a contiguous step
 /// slice with its own guidance (per-phase CFG on/off) AND its own adapter set (per-phase LoRA/LoKr
@@ -2035,7 +2052,7 @@ fn request_uses_cfg(id: &str, req: &GenerationRequest) -> bool {
 /// - an empty phase list or a 0-step phase (a malformed trajectory).
 ///
 /// Per-phase **adapter index bounds** (against the model's loaded adapter set) are checked at
-/// `generate` time by [`crate::multiphase::resolve_phases`] (the count isn't on the descriptor). A
+/// plan compilation time (the count isn't on the descriptor). A
 /// no-op when `req.phases` is `None` (the ordinary single-phase render).
 fn validate_phases(id: &str, req: &GenerationRequest) -> Result<()> {
     let Some(phases) = req.phases.as_ref() else {
@@ -2394,6 +2411,44 @@ mod tests {
             applied_adapter_controls(&source),
             applied_adapter_controls(&reversed)
         );
+    }
+
+    #[test]
+    fn raw_multiphase_compiler_is_weights_free_and_binds_declared_solver_and_branches() {
+        let spec = LoadSpec::new(WeightsSource::Dir("unused-krea-snapshot".into()));
+        let mut request = GenerationRequest {
+            prompt: "A weights-free plan".into(),
+            width: 256,
+            height: 256,
+            sampler: Some("heun".into()),
+            phases: Some(vec![
+                gen_core::GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    ..Default::default()
+                },
+                gen_core::GenerationPhase {
+                    steps: 2,
+                    guidance: Some(2.5),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let plan = compile_raw_render_plan(&spec, &request).unwrap().unwrap();
+        assert_eq!(plan.sampler(), "heun");
+        assert_eq!(plan.executed_steps(), 3);
+        assert_eq!(plan.adapter_phases()[0].span(), 0..1);
+        assert_eq!(plan.adapter_phases()[1].span(), 1..3);
+        assert!(!plan.adapter_phases()[0]
+            .arguments()
+            .uses_classifier_free_guidance());
+        assert!(plan.adapter_phases()[1]
+            .arguments()
+            .uses_classifier_free_guidance());
+        assert!(plan.adapter_phases_need_negative());
+        request.phases = None;
+        assert!(compile_raw_render_plan(&spec, &request).unwrap().is_none());
     }
 
     /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
