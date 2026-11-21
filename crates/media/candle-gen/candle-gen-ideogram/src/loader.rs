@@ -1,5 +1,5 @@
 //! Weight loading for the Ideogram 4 DiT — a thin shape-inferring wrapper over candle's
-//! [`MmapedSafetensors`], mirroring `mlx-gen-ideogram`'s `Weights`/`lin` interface so the
+//! [`MappedWeights`], mirroring `mlx-gen-ideogram`'s `Weights`/`lin` interface so the
 //! `transformer` port stays a near-1:1 translation. [`linear`] builds a [`Linear`] from the actual
 //! `{base}.weight` (and optional `{base}.bias`) tensor shapes, so dims that aren't in the public
 //! config (e.g. the `t_embedding` MLP hidden width) need no hardcoding.
