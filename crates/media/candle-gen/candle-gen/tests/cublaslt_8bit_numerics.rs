@@ -389,7 +389,9 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 })
                 .collect();
             let x = Tensor::from_slice(&input, (18, 16), &dev)?.narrow(0, 1, 17)?;
-            let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+            let got = __model_proof_output!(lin.forward(&x))?
+                .flatten_all()?
+                .to_vec1::<bf16>()?;
             let mut adapted = AdaptLinear::from_dense(lin, 16, 16);
             let mut a = vec![bf16::ZERO; 16];
             a[0] = bf16::ONE;
@@ -398,7 +400,9 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
                 Tensor::ones((1, 16), DType::BF16, &dev)?,
                 1.0,
             )?;
-            let got_adapted = adapted.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+            let got_adapted = __model_proof_output!(adapted.forward(&x))?
+                .flatten_all()?
+                .to_vec1::<bf16>()?;
             for row in 0..17 {
                 for j in 0..16 {
                     let xij = input[(row + 1) * 16 + j].to_f32();
@@ -511,7 +515,9 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
         .map(|i| bf16::from_f32([0.25, 0.5, -1., 1.875][i % 4]))
         .collect();
     let x = Tensor::from_slice(&input, (m + 1, k), &dev)?.narrow(0, 1, m)?;
-    let got = lin.forward(&x)?.flatten_all()?.to_vec1::<bf16>()?;
+    let got = __model_proof_output!(lin.forward(&x))?
+        .flatten_all()?
+        .to_vec1::<bf16>()?;
     for row in 0..m {
         for (j, &(col, w)) in factors.iter().enumerate() {
             assert_eq!(
@@ -521,5 +527,59 @@ fn checkpoint_fp8_projection_exact_bf16() -> Result<(), Box<dyn std::error::Erro
             );
         }
     }
+    // Publisher FP8R scales its activation per token and the weight per output.
+    let k = 16;
+    let mut codes = vec![0; k * k];
+    let mut scales = Vec::new();
+    let mut scale_bytes = Vec::new();
+    for col in 0..k {
+        codes[col * k + col] = F8E4M3::from_f32(1.5).to_bits();
+        let scale = 0.25 + col as f32 * 0.03125;
+        scales.push(scale);
+        scale_bytes.extend(scale.to_le_bytes());
+    }
+    let path = tmp.path().join("rowwise.safetensors");
+    safetensors::tensor::serialize_to_file(
+        [
+            (
+                "proj.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![k, k], &codes)?,
+            ),
+            (
+                "proj.weight_scale",
+                TensorView::new(Dtype::F32, vec![k], &scale_bytes)?,
+            ),
+        ],
+        None,
+        &path,
+    )?;
+    let vb = candle_gen::mmap_var_builder(&[path], DType::BF16, &dev)?;
+    let lin = candle_gen::candle_nn::linear_no_bias(k, k, vb.pp("proj"))?;
+    assert_eq!(lin.native_format_id(), Some("fp8-e4m3-rowwise-v1"));
+    let inputs: Vec<_> = (0..17 * k)
+        .map(|i| bf16::from_f32(((i / k) as f32 - 8.) * ((i % k) as f32 - 7.5) * 0.125))
+        .collect();
+    let x = Tensor::from_slice(&inputs, (17, k), &dev)?;
+    let outputs = __model_proof_output!(lin.forward(&x))?
+        .flatten_all()?
+        .to_vec1::<bf16>()?;
+    for (row, (input, output)) in inputs
+        .chunks_exact(k)
+        .zip(outputs.chunks_exact(k))
+        .enumerate()
+    {
+        let max = input.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
+        let sx = (max / 448.).max(1e-12);
+        for col in 0..k {
+            let code = F8E4M3::from_f32((input[col].to_f32() / sx).clamp(-448., 448.)).to_f32();
+            assert_eq!(
+                output[col],
+                bf16::from_f32((code * 1.5 * sx) * scales[col]),
+                "FP8R [{row},{col}]"
+            );
+        }
+    }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cublaslt_8bit_numerics::checkpoint_fp8_projection_exact_bf16");
     Ok(())
 }

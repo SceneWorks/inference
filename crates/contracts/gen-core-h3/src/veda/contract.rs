@@ -284,7 +284,7 @@ impl Bundle {
                 if storage == Dtype::F8_E4M3 {
                     out.push(
                         gen_core::HeadwiseWeights::from_fp8(t.data, scale, 3 * dim * dim)
-                            .map_err(|e| bad(&e.to_string()))?,
+                            .map_err(|e| bad(e.to_string()))?,
                     );
                     continue;
                 }

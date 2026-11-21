@@ -114,6 +114,31 @@ fn validate_projection_fields(
     Ok(())
 }
 
+/// Plan a component that already owns validated headers and descriptor bytes (e.g. memory
+/// admission). Selection and descriptor/scale semantics are identical to the file constructor.
+pub fn plan_projection_source_headers(
+    headers: &[SafetensorsTensorHeader],
+    descriptors: &BTreeMap<String, Vec<u8>>,
+    selected: impl Fn(&str) -> bool,
+    tables: &[String],
+    registry: &CheckpointCodecRegistry,
+    policy: &dyn CodecResidencyPolicy,
+) -> crate::Result<Option<LogicalWeightPlan>> {
+    let source = headers
+        .iter()
+        .map(|h| (h.name.clone(), h.clone()))
+        .collect();
+    ProjectionSourceHeaders::select(source, selected, tables, |names| {
+        Ok(descriptors
+            .iter()
+            .filter(|(k, _)| names.contains(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    })?
+    .map(|s| s.compile(&ConstructorMapping, registry, policy))
+    .transpose()
+}
+
 /// Validated physical rows and sidecars, reusable on relocation without rescanning shard headers.
 pub struct ProjectionSourceHeaders {
     headers: Vec<SafetensorsTensorHeader>,
@@ -139,6 +164,27 @@ impl ProjectionSourceHeaders {
                 }
             }
         }
+        Self::select(source, selected, tables, |names| {
+            let mut descriptors = BTreeMap::new();
+            if !names.is_empty() {
+                for path in paths {
+                    descriptors.extend(crate::read_safetensors_tensor_payloads(
+                        path,
+                        |h| names.contains(h.name.as_str()),
+                        65_536,
+                    )?);
+                }
+            }
+            Ok(descriptors)
+        })
+    }
+
+    fn select(
+        source: BTreeMap<String, SafetensorsTensorHeader>,
+        selected: impl Fn(&str) -> bool,
+        tables: &[String],
+        read_descriptors: impl FnOnce(&BTreeSet<&str>) -> crate::Result<BTreeMap<String, Vec<u8>>>,
+    ) -> crate::Result<Option<Self>> {
         let by_name: BTreeMap<_, _> = source.keys().map(|s| (s.as_str(), ())).collect();
         let mut declarations = serde_json::Map::new();
         let mut bases = BTreeSet::new();
@@ -214,16 +260,7 @@ impl ProjectionSourceHeaders {
             .filter(|h| h.name.ends_with(".comfy_quant"))
             .map(|h| h.name.as_str())
             .collect();
-        let mut descriptors = BTreeMap::new();
-        if !names.is_empty() {
-            for path in paths {
-                descriptors.extend(crate::read_safetensors_tensor_payloads(
-                    path,
-                    |h| names.contains(h.name.as_str()),
-                    65_536,
-                )?);
-            }
-        }
+        let descriptors = read_descriptors(&names)?;
         let metadata = (!declarations.is_empty())
             .then(|| serde_json::json!({"layers":declarations}).to_string());
         Ok(Some(Self {

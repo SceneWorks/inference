@@ -167,6 +167,46 @@ impl CandleCodecResidency {
         Self::DENSE
     }
 
+    /// Probe the visible default CUDA ordinal used by the media loader without creating a
+    /// device context, cuBLAS handle or workspace. Unprobed devices receive dense admission.
+    pub fn default_device_for_admission() -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            use candle_core::cuda_backend::cudarc::driver::{
+                result, sys::CUdevice_attribute as Attr,
+            };
+            static POLICY: std::sync::OnceLock<CandleCodecResidency> = std::sync::OnceLock::new();
+            *POLICY.get_or_init(|| {
+                let cap = || {
+                    result::init().ok()?;
+                    let dev = result::device::get(0).ok()?;
+                    // SAFETY: dev is a successfully enumerated CUdevice; both attributes are scalar.
+                    unsafe {
+                        Some((
+                            result::device::get_attribute(
+                                dev,
+                                Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                            )
+                            .ok()?,
+                            result::device::get_attribute(
+                                dev,
+                                Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                            )
+                            .ok()?,
+                        ))
+                    }
+                };
+                cap()
+                    .map(Self::from_cuda_compute_cap)
+                    .unwrap_or(Self::DENSE)
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::DENSE
+        }
+    }
+
     /// Eligibility from a CUDA capability already measured by the process (e.g. NVML at startup).
     pub fn from_cuda_compute_cap(cap: (i32, i32)) -> Self {
         Self {
@@ -1052,9 +1092,9 @@ fn upload_values(
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
+    Tensor::from_vec(values, shape, &Device::Cpu)?
         .to_dtype(dtype)?
-        .to_device(device)?)
+        .to_device(device)
 }
 
 /// Run the planned codec on one stored tensor — the per-layer dispatch.
