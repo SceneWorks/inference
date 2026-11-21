@@ -59,6 +59,7 @@ pub struct Scail2FitAxes {
     pub references: u32,
     pub windows: Vec<Scail2FitWindow>,
     pub source_bytes: u64,
+    pub source_shape_sha256: String,
     pub driving_stack_bytes: u64,
     pub source_resize_bytes: u64,
     pub schedule_bytes: u64,
@@ -144,22 +145,32 @@ impl Scail2FitPrice {
 }
 
 fn execution_policy(backend: Scail2FitBackend) -> Vec<String> {
-    // Native scheduler aliases on Candle share UniPC. The policy below describes only
-    // actual native memory switches. Other environment/device/build identity belongs to
-    // the worker's authenticated hardware/runtime row.
-    match backend {
-        Scail2FitBackend::Mlx => [
+    // Source switches in the pinned MLX Metal scheduler/matmul implementation and
+    // Candle QMatMul constructor can change allocator or weight storage for equal shapes.
+    let keys: &[&str] = match backend {
+        Scail2FitBackend::Mlx => &[
             "SCAIL2_COMPUTE_BF16",
             "MLX_GEN_WAN_FFN_SEQ_CHUNK",
             "MLX_GEN_WAN_ATTN_QUERY_CHUNK",
             "MLX_GEN_WAN_EVAL_PER_BLOCK",
-        ]
-        .iter()
+            "MLX_BFS_MAX_WIDTH",
+            "MLX_MAX_OPS_PER_BUFFER",
+            "MLX_MAX_MB_PER_BUFFER",
+            "MLX_METAL_FAST_SYNCH",
+            "MLX_ENABLE_TF32",
+            "MLX_METAL_GPU_ARCH",
+        ],
+        Scail2FitBackend::Cuda => &[
+            "CANDLE_DEQUANTIZE_ALL",
+            "CANDLE_DEQUANTIZE_ALL_F16",
+            "CUBLAS_WORKSPACE_CONFIG",
+        ],
+    };
+    keys.iter()
         .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
-        .collect(),
-        Scail2FitBackend::Cuda => Vec::new(),
-    }
+        .collect()
 }
+
 fn resize_bytes(image: &crate::Image, width: u32, height: u32) -> Result<u64> {
     if (image.width, image.height) == (width, height) {
         return Ok(0);
@@ -362,6 +373,7 @@ impl Scail2FitProfile {
             });
         }
         let mut resize = 0;
+        let mut source_shapes = Sha256::new();
         let clip = req
             .control_clip()
             .ok_or_else(|| unsupported("driving clip missing"))?;
@@ -370,6 +382,8 @@ impl Scail2FitProfile {
                 .chain(&pairs.additional)
                 .flat_map(|p| [p.image, p.mask]),
         ) {
+            source_shapes.update(img.width.to_le_bytes());
+            source_shapes.update(img.height.to_le_bytes());
             resize = resize.max(resize_bytes(img, g.width, g.height)?);
         }
         let steps = req.steps.unwrap_or(40);
@@ -403,6 +417,7 @@ impl Scail2FitProfile {
                 mul(u64::from(g.width), u64::from(g.height))?,
                 mul(clip.frames.len() as u64, 2 * 3 * 4)?,
             )?,
+            source_shape_sha256: format!("{:x}", source_shapes.finalize()),
             source_resize_bytes: resize,
             schedule_bytes: mul(u64::from(steps) + 1, 8 * 8)?,
             history_order: steps.min(4),
@@ -503,7 +518,7 @@ impl Scail2FitAxes {
         let extra = add(
             add(source_delta, mul(stack_delta, 2)?)?,
             add(
-                if self.source_resize_bytes == a.source_resize_bytes {
+                if self.source_shape_sha256 == a.source_shape_sha256 {
                     0
                 } else {
                     self.source_resize_bytes
