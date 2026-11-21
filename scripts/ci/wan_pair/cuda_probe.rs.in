@@ -1,0 +1,119 @@
+@WAN_PAIR_COMMON@
+
+use crate::{gen_core, pipeline, Device, DitSource, GenerationRequest, Pipeline, Progress};
+use candle_gen::candle_core::{safetensors, DType};
+#[cfg(feature = "cuda")]
+use std::io::Write;
+
+#[cfg(feature = "cuda")]
+fn pool_proof(pair: &Pair) -> ProofResult<u64> {
+    let pool =
+        candle_gen::cuda_mempool::MemPool::device_current(0).ok_or("missing current pool")?;
+    let used = pool.used().ok_or("missing CUDA pool usage")?;
+    let used_high = pool.used_high().ok_or("missing peak CUDA pool usage")?;
+    let reserved = pool.reserved().ok_or("missing CUDA pool reservation")?;
+    let reserved_high = pool
+        .reserved_high()
+        .ok_or("missing peak CUDA pool reservation")?;
+    assert!(used > 0 && used <= used_high && used <= reserved);
+    assert!(used_high <= reserved_high && reserved <= reserved_high);
+    let proof = json!({
+        "pid":std::process::id(),"cudaDeviceUuid":env::var("CUDA_VISIBLE_DEVICES")?,
+        "poolUsedBytes":used,"poolUsedHighBytes":used_high,
+        "poolReservedBytes":reserved,"poolReservedHighBytes":reserved_high
+    });
+    let pending = pair.out.join("cuda-pool.pending");
+    let path = pair.out.join("cuda-pool.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)?;
+    file.write_all(&serde_json::to_vec(&proof)?)?;
+    file.sync_all()?;
+    drop(file);
+    assert!(!path.exists());
+    fs::rename(pending, path)?;
+    // Keep weights and the process-owned CUDA context live across supervisor sampling ticks.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    Ok(reserved_high)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn pool_proof(_: &Pair) -> ProofResult<u64> {
+    Err("the Wan paired proof requires the CUDA feature".into())
+}
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn curated_tier1() -> ProofResult<()> {
+    let pair = Pair::from_env()?;
+    assert_eq!(pair.case, "cuda-ti2v5b-t2v-heun");
+    let device = Device::new_cuda(0)?;
+    let mut model = Pipeline::load(
+        &pair.root,
+        &device,
+        Vec::new(),
+        DitSource::Snapshot,
+        gen_core::CheckpointFactsSink::new(),
+    );
+    model.dit_cfg.num_layers = 1;
+    let dit = model.build_dit()?;
+    let inputs = safetensors::load(pair.root.join("inputs.safetensors"), &device)?;
+    let positive = dit.embed_text(&inputs["positive"].unsqueeze(0)?)?;
+    let negative = dit.embed_text(&inputs["negative"].unsqueeze(0)?)?;
+    // Five pixel frames and 64 × 96 pixels correspond to [2,4,6] latent cells with
+    // the native z48 stride. The denoise witness begins directly at those cells.
+    let request = GenerationRequest {
+        width: 96,
+        height: 64,
+        frames: Some(5),
+        scheduler_shift: Some(5.0),
+        seed: Some(SEED),
+        steps: Some(STEPS as u32),
+        guidance: Some(5.0),
+        sampler: Some("heun".to_owned()),
+        ..Default::default()
+    };
+    let knobs = model.resolve_knobs(&request);
+    let (t, h, w, cos, sin) = model.geometry(&request, knobs.frames)?;
+    assert_eq!((t, h, w), (2, 4, 6));
+    assert_eq!(knobs.shift, 5.0);
+    let noise = pipeline::create_noise(SEED, model.dit_cfg.out_channels, t, h, w, &device)?;
+    assert!(noise.device().is_cuda() && positive.device().is_cuda() && negative.device().is_cuda());
+    println!("\nMODEL_INFERENCE_DEVICE wan_pair_fixture::curated_tier1 candle-cuda");
+    pair.measure(
+        || {
+            let mut trace = Vec::new();
+            let mut progress = |event| {
+                if let Progress::Step { current, total } = event {
+                    trace.push(step(current, total));
+                }
+            };
+            device.synchronize()?;
+            let start = Instant::now();
+            let latent = model.denoise(
+                &dit,
+                &positive,
+                Some(&negative),
+                knobs.guidance,
+                &cos,
+                &sin,
+                noise.clone(),
+                None,
+                &knobs,
+                @WAN_CANDLE_DENOISE_ARGS@,
+                &mut progress,
+            )?;
+            device.synchronize()?;
+            let elapsed = start.elapsed().as_nanos().try_into()?;
+            assert!(latent.device().is_cuda());
+            assert_eq!(latent.dims(), &[1, 48, 2, 4, 6]);
+            assert_eq!(latent.dtype(), DType::F32);
+            let values = latent.flatten_all()?.to_vec1::<f32>()?;
+            Ok((elapsed, trace, latent.dims().to_vec(), values))
+        },
+        || pool_proof(&pair),
+    )?;
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED wan_pair_fixture::curated_tier1");
+    Ok(())
+}
