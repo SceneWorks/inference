@@ -202,7 +202,7 @@ pub(crate) struct VerifiedLmFiles {
     pub(crate) config_json: String,
     /// A loader over exactly the verified weights file, converting dense tensors to the compute
     /// dtype and reading the tier's GGML block tensors as stored.
-    pub(crate) loader: Loader<'static>,
+    pub(crate) loader: Loader,
     /// SHA-256 of that weights file (checked against its pin or its tier manifest).
     pub(crate) weights_sha256: String,
     /// The tier the weights file holds.
@@ -634,7 +634,7 @@ impl Yue2Lm {
     #[cfg(test)]
     pub(crate) fn from_var_builder(
         config: Yue2Config,
-        vb: VarBuilder,
+        vb: VarBuilder<'static>,
         paths: MotPaths,
     ) -> gen_core::Result<Self> {
         Self::from_loader(config, &Loader::new(vb, None), paths, Tier::Bf16)

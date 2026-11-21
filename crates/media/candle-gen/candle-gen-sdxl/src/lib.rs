@@ -1268,13 +1268,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     } else {
         (None, None)
     };
+    let device = candle_gen::default_device()?;
     let (root, ldm, ldm_source_pin) = match &spec.weights {
         WeightsSource::Dir(p) => (p.clone(), None, None),
         WeightsSource::File(file) => {
             let pin = spec
                 .weights_file_pin()?
                 .expect("File weights must resolve to a pin");
-            let components = pin.read_unchanged(ldm::split_ldm_checkpoint)?;
+            let components = pin.read_unchanged(|path| ldm::split_ldm_checkpoint(path, &device))?;
             (
                 file.parent()
                     .unwrap_or_else(|| Path::new("."))
@@ -1290,7 +1291,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // component paths are read at the first `generate`), but the contract is checked up front here.
     // SDXL is fp16 (the production reference dtype) regardless of the CPU-default dtype; the device
     // is the backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
-    let device = candle_gen::default_device()?;
     Ok(Box::new(SdxlGenerator {
         descriptor: plain_descriptor(),
         root,

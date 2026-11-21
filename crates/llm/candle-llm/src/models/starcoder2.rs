@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::primitives::attention::{repeat_kv, sdpa_causal, sdpa_gqa_causal, AttnFormulation};
 use crate::primitives::decode_cache::DecodeCache;
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
-use crate::primitives::nn::{embed, gelu, layer_norm, linear};
+use crate::primitives::nn::{embed, gelu, layer_norm};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::step_kv_cache::{KvLayout, LayerKvShape, StepKvCache};
 use crate::primitives::{ContiguousKvCache, Weights};
@@ -57,6 +57,7 @@ impl StarCoder2Config {
 
 pub struct StarCoder2 {
     embed_tokens: Tensor,
+    head: crate::primitives::Projection,
     layers: Vec<StarCoder2Layer>,
     final_norm_weight: Tensor,
     final_norm_bias: Tensor,
@@ -90,7 +91,17 @@ impl StarCoder2 {
                 StarCoder2Layer::from_weights(w, &key(&format!("model.layers.{index}")), cfg, dtype)
             })
             .collect::<Result<Vec<_>>>()?;
+        let head = match w.native_projection(
+            &key("model.embed_tokens.weight"),
+            dtype,
+            embed_tokens.device(),
+            None,
+        )? {
+            Some(head) => head,
+            None => crate::primitives::Projection::load(embed_tokens.clone(), None)?,
+        };
         Ok(Self {
+            head,
             embed_tokens,
             layers,
             final_norm_weight: req(key("model.norm.weight"))?,
@@ -127,7 +138,7 @@ impl StarCoder2 {
         let state = self.normed_states(embeds, cache, offset, self.attn_formulation)?;
         let sequence = state.dim(1)?;
         let last = state.narrow(1, sequence - 1, 1)?.squeeze(1)?;
-        __model_proof_output!(linear(&last, &self.embed_tokens, None))
+        __model_proof_output!(self.head.forward(&last))
     }
 
     /// The decoder stack over `embeds` at `offset`, final-LayerNormed: `[batch, seq, hidden]`.
@@ -221,7 +232,7 @@ impl StarCoder2 {
         let state = self.normed_states(embeds, cache, offset, formulation)?;
         let sequence = state.dim(1)?;
         let last = state.narrow(1, sequence - 1, 1)?.squeeze(1)?;
-        linear(&last, &self.embed_tokens, None)
+        self.head.forward(&last)
     }
 
     /// Un-expanded attention on a static cache; the selected formulation on a growing one.
@@ -284,17 +295,14 @@ impl StepModel for StarCoder2 {
         let logits = match request.scope {
             LogitsScope::Last => {
                 let sequence = state.dim(1)?;
-                linear(
-                    &state.narrow(1, sequence - 1, 1)?.squeeze(1)?,
-                    &self.embed_tokens,
-                    None,
-                )?
+                self.head
+                    .forward(&state.narrow(1, sequence - 1, 1)?.squeeze(1)?)?
             }
             // Row-wise through the same 2-D product the last-position path runs, so a one-token
             // verify step is bit-identical to a plain decode step.
             LogitsScope::All => {
                 let (b, s, h) = state.dims3()?;
-                linear(&state.reshape((b * s, h))?, &self.embed_tokens, None)?.reshape((
+                self.head.forward(&state.reshape((b * s, h))?)?.reshape((
                     b,
                     s,
                     self.cfg.vocab_size,
@@ -326,10 +334,8 @@ struct StarCoder2Layer {
     attn: StarCoder2Attention,
     post_attn_norm_weight: Tensor,
     post_attn_norm_bias: Tensor,
-    mlp_fc_weight: Tensor,
-    mlp_fc_bias: Tensor,
-    mlp_proj_weight: Tensor,
-    mlp_proj_bias: Tensor,
+    mlp_fc_weight: crate::primitives::Projection,
+    mlp_proj_weight: crate::primitives::Projection,
     eps: f64,
 }
 
@@ -348,10 +354,16 @@ impl StarCoder2Layer {
             attn: StarCoder2Attention::from_weights(w, &key("self_attn"), cfg, dtype)?,
             post_attn_norm_weight: req(key("post_attention_layernorm.weight"))?,
             post_attn_norm_bias: req(key("post_attention_layernorm.bias"))?,
-            mlp_fc_weight: req(key("mlp.c_fc.weight"))?,
-            mlp_fc_bias: req(key("mlp.c_fc.bias"))?,
-            mlp_proj_weight: req(key("mlp.c_proj.weight"))?,
-            mlp_proj_bias: req(key("mlp.c_proj.bias"))?,
+            mlp_fc_weight: w.linear(
+                &key("mlp.c_fc.weight"),
+                dtype,
+                Some(req(key("mlp.c_fc.bias"))?),
+            )?,
+            mlp_proj_weight: w.linear(
+                &key("mlp.c_proj.weight"),
+                dtype,
+                Some(req(key("mlp.c_proj.bias"))?),
+            )?,
             eps: cfg.layer_norm_eps,
         })
     }
@@ -381,29 +393,19 @@ impl StarCoder2Layer {
             &self.post_attn_norm_bias,
             self.eps,
         ))?;
-        let mlp = gelu(&__model_proof_output!(linear(
-            &normed,
-            &self.mlp_fc_weight,
-            Some(&self.mlp_fc_bias),
-        ))?)?;
-        __model_proof_output!(hidden.broadcast_add(&__model_proof_output!(linear(
-            &mlp,
-            &self.mlp_proj_weight,
-            Some(&self.mlp_proj_bias),
-        ))?))
+        let mlp = gelu(&__model_proof_output!(self.mlp_fc_weight.forward(&normed))?)?;
+        __model_proof_output!(
+            hidden.broadcast_add(&__model_proof_output!(self.mlp_proj_weight.forward(&mlp))?)
+        )
         .map_err(Into::into)
     }
 }
 
 struct StarCoder2Attention {
-    q_weight: Tensor,
-    q_bias: Tensor,
-    k_weight: Tensor,
-    k_bias: Tensor,
-    v_weight: Tensor,
-    v_bias: Tensor,
-    o_weight: Tensor,
-    o_bias: Tensor,
+    q_weight: crate::primitives::Projection,
+    k_weight: crate::primitives::Projection,
+    v_weight: crate::primitives::Projection,
+    o_weight: crate::primitives::Projection,
     cfg: StarCoder2Config,
 }
 
@@ -417,14 +419,10 @@ impl StarCoder2Attention {
         let key = |suffix: &str| join(prefix, suffix);
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
         Ok(Self {
-            q_weight: req(key("q_proj.weight"))?,
-            q_bias: req(key("q_proj.bias"))?,
-            k_weight: req(key("k_proj.weight"))?,
-            k_bias: req(key("k_proj.bias"))?,
-            v_weight: req(key("v_proj.weight"))?,
-            v_bias: req(key("v_proj.bias"))?,
-            o_weight: req(key("o_proj.weight"))?,
-            o_bias: req(key("o_proj.bias"))?,
+            q_weight: w.linear(&key("q_proj.weight"), dtype, Some(req(key("q_proj.bias"))?))?,
+            k_weight: w.linear(&key("k_proj.weight"), dtype, Some(req(key("k_proj.bias"))?))?,
+            v_weight: w.linear(&key("v_proj.weight"), dtype, Some(req(key("v_proj.bias"))?))?,
+            o_weight: w.linear(&key("o_proj.weight"), dtype, Some(req(key("o_proj.bias"))?))?,
             cfg,
         })
     }
@@ -440,12 +438,24 @@ impl StarCoder2Attention {
     ) -> Result<Tensor> {
         let (batch, sequence, _) = hidden.dims3()?;
         let dim = self.cfg.head_dim();
-        let q = __model_proof_output!(linear(hidden, &self.q_weight, Some(&self.q_bias)))?
-            .reshape((batch, sequence, self.cfg.heads, dim))?;
-        let k = __model_proof_output!(linear(hidden, &self.k_weight, Some(&self.k_bias)))?
-            .reshape((batch, sequence, self.cfg.kv_heads, dim))?;
-        let v = __model_proof_output!(linear(hidden, &self.v_weight, Some(&self.v_bias)))?
-            .reshape((batch, sequence, self.cfg.kv_heads, dim))?;
+        let q = __model_proof_output!(self.q_weight.forward(hidden))?.reshape((
+            batch,
+            sequence,
+            self.cfg.heads,
+            dim,
+        ))?;
+        let k = __model_proof_output!(self.k_weight.forward(hidden))?.reshape((
+            batch,
+            sequence,
+            self.cfg.kv_heads,
+            dim,
+        ))?;
+        let v = __model_proof_output!(self.v_weight.forward(hidden))?.reshape((
+            batch,
+            sequence,
+            self.cfg.kv_heads,
+            dim,
+        ))?;
         // Head-major and contiguous, as llama's `project` hands them over: the growing cache returns
         // the first append's K/V unchanged, and `sdpa_gqa_causal` attends them directly — a bare
         // transpose of a multi-token GQA projection is a layout the CUDA matmul rejects (sc-24164).
@@ -474,7 +484,7 @@ impl StarCoder2Attention {
         let out = out
             .transpose(1, 2)?
             .reshape((batch, sequence, self.cfg.hidden_size))?;
-        __model_proof_output!(linear(&out, &self.o_weight, Some(&self.o_bias)))
+        __model_proof_output!(self.o_weight.forward(&out))
     }
 }
 

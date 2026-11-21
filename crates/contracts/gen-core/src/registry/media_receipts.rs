@@ -1,9 +1,13 @@
 //! Receipt scopes follow each model through both eager construction and deferred execution.
 use super::*;
 use crate::caption::{CaptionOutput, CaptionRequest};
-use crate::media::Image;
+use crate::media::{AudioTrack, Image};
 use crate::runtime::Progress;
 use crate::transform::{CompletedTransform, TransformRequest};
+use crate::{
+    AudioTransformRequest, CompletedAudioTransform, TranscribeRequest, TranscriptOutput,
+    VoiceEmbedding,
+};
 use crate::{CheckpointReceiptScope, CheckpointWeightFacts};
 
 struct Scoped<T: ?Sized> {
@@ -27,7 +31,7 @@ macro_rules! scope_model {
                 if facts.is_empty(){self.inner.checkpoint_weight_facts_by_source()}else{facts}
             }
             $(fn $method(&self,$($arg:$ty),*) -> $ret {
-                self.scope.with(||self.inner.$method($($arg),*))
+                self.scope.with_prepared(||self.inner.$method($($arg),*))
             })*
         }
     }
@@ -48,4 +52,23 @@ scope_model!(load_image_embedder,ImageEmbedder,ImageEmbedderDescriptor;
 scope_model!(load_text_embedder,TextEmbedder,TextEmbedderDescriptor;
     fn embed_text(text:&str)->Result<Vec<f32>>;
     fn embed_text_batch(texts:&[&str])->Result<Vec<Vec<f32>>>;
+);
+
+scope_model!(load_audio_embedder,AudioEmbedder,AudioEmbedderDescriptor;
+    fn embed(audio: &AudioTrack) -> Result<Vec<f32>>;
+    fn embed_text(text: &str) -> Result<Vec<f32>>;
+    fn embed_batch(audio: &[AudioTrack]) -> Result<Vec<Vec<f32>>>;
+    fn embed_text_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+);
+scope_model!(load_voice_embedder,VoiceEmbedder,VoiceEmbedderDescriptor;
+    fn embed(audio: &AudioTrack) -> Result<VoiceEmbedding>;
+);
+scope_model!(load_transcriber,Transcriber,TranscriberDescriptor;
+    fn validate(req: &TranscribeRequest) -> Result<()>;
+    fn transcribe(req: &TranscribeRequest, progress: &mut dyn FnMut(Progress)) -> Result<TranscriptOutput>;
+);
+scope_model!(load_audio_transform,AudioTransform,AudioTransformDescriptor;
+    fn validate(req: &AudioTransformRequest) -> Result<()>;
+    fn apply(req: &AudioTransformRequest, progress: &mut dyn FnMut(Progress)) -> Result<Vec<AudioTrack>>;
+    fn apply_with_execution_report(req: &AudioTransformRequest, progress: &mut dyn FnMut(Progress)) -> Result<CompletedAudioTransform>;
 );

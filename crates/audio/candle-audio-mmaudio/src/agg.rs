@@ -12,16 +12,42 @@ use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
 use crate::config;
 use crate::preprocess::softmax_last;
 
+/// PyTorch multi-head attention stores its fused input projection under a bare weight name.
+pub(crate) fn attention_in_projection(vb: &VarBuilder, width: usize) -> CResult<Linear> {
+    let dims = (3 * width, width);
+    let key = if vb.contains_tensor("in_proj.weight") {
+        "in_proj.weight"
+    } else {
+        "in_proj_weight"
+    };
+    let bias = vb.get(
+        3 * width,
+        if vb.contains_tensor("in_proj.bias") {
+            "in_proj.bias"
+        } else {
+            "in_proj_bias"
+        },
+    )?;
+    let in_proj = match vb.native_linear_weight_with_shape(key, Some(dims))? {
+        Some(op) if op.dims() == dims => Linear::from_native(op, Some(bias)),
+        Some(op) => candle_audio::candle_core::bail!(
+            "attention in_proj expected {dims:?}, got {:?}",
+            op.dims()
+        ),
+        None => Linear::new(vb.get(dims, key)?, Some(bias)),
+    };
+    Ok(in_proj)
+}
+
 /// A pre-norm transformer encoder layer with a CLS token, applied per frame to pool spatial tokens.
 pub struct SpatialAggLayer {
-    cls_token: Tensor,      // (1, 1, D)
-    in_proj_weight: Tensor, // (3D, D)
-    in_proj_bias: Tensor,   // (3D,)
-    out_proj: Linear,       // D → D
-    linear1: Linear,        // D → 4D
-    linear2: Linear,        // 4D → D
-    norm1: LayerNorm,       // pre-attn norm
-    norm2: LayerNorm,       // pre-ff norm
+    cls_token: Tensor, // (1, 1, D)
+    in_proj: Linear,
+    out_proj: Linear, // D → D
+    linear1: Linear,  // D → 4D
+    linear2: Linear,  // 4D → D
+    norm1: LayerNorm, // pre-attn norm
+    norm2: LayerNorm, // pre-ff norm
 }
 
 impl SpatialAggLayer {
@@ -29,8 +55,7 @@ impl SpatialAggLayer {
         let d = config::EMBED_DIM;
         Ok(Self {
             cls_token: vb.get((1, 1, d), "cls_token")?,
-            in_proj_weight: vb.get((3 * d, d), "self_attn.in_proj_weight")?,
-            in_proj_bias: vb.get(3 * d, "self_attn.in_proj_bias")?,
+            in_proj: attention_in_projection(&vb.pp("self_attn"), d)?,
             out_proj: linear(d, d, vb.pp("self_attn").pp("out_proj"))?,
             linear1: linear(d, config::MLP_HIDDEN, vb.pp("linear1"))?,
             linear2: linear(config::MLP_HIDDEN, d, vb.pp("linear2"))?,
@@ -45,9 +70,7 @@ impl SpatialAggLayer {
         let h = config::NUM_HEADS;
         let hd = config::HEAD_DIM;
         // Fused projection then split rows into Q/K/V.
-        let proj = x
-            .broadcast_matmul(&self.in_proj_weight.t()?)?
-            .broadcast_add(&self.in_proj_bias)?; // (B, N, 3D)
+        let proj = self.in_proj.forward(x)?; // (B, N, 3D)
         let q = proj.narrow(2, 0, d)?;
         let k = proj.narrow(2, d, d)?;
         let v = proj.narrow(2, 2 * d, d)?;

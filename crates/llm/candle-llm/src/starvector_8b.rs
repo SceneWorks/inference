@@ -24,7 +24,7 @@ use crate::decode::{
 use crate::error::{Error, Result};
 use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::{SiglipVisionConfig, SiglipVisionTower, StarCoder2, StarCoder2Config};
-use crate::primitives::nn::{layer_norm, linear, silu};
+use crate::primitives::nn::{layer_norm, silu};
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, StepKvCache, Weights};
 use core_llm::{emit_svg_done, validate_loaded_svg_context_cap};
@@ -86,10 +86,9 @@ impl StarVector8bModel {
 
 /// Exact 8B projection: Linear(1024,2048) -> SiLU -> Linear(2048,4608) -> LayerNorm([576,4608]).
 struct StarVector8bAdapter {
-    fc_weight: Tensor,
-    fc_bias: Tensor,
-    proj_weight: Tensor,
-    proj_bias: Tensor,
+    input_dtype: DType,
+    fc_weight: crate::primitives::Projection,
+    proj_weight: crate::primitives::Projection,
     norm_weight: Tensor,
     norm_bias: Tensor,
 }
@@ -98,10 +97,17 @@ impl StarVector8bAdapter {
     fn from_weights(weights: &Weights, prefix: &str) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
         Ok(Self {
-            fc_weight: weights.require(&key("c_fc.weight"))?.clone(),
-            fc_bias: weights.require(&key("c_fc.bias"))?.clone(),
-            proj_weight: weights.require(&key("c_proj.weight"))?.clone(),
-            proj_bias: weights.require(&key("c_proj.bias"))?.clone(),
+            input_dtype: weights.linear_dtype(&key("c_fc.weight"))?,
+            fc_weight: weights.linear(
+                &key("c_fc.weight"),
+                weights.linear_dtype(&key("c_fc.weight"))?,
+                Some(weights.require(&key("c_fc.bias"))?.clone()),
+            )?,
+            proj_weight: weights.linear(
+                &key("c_proj.weight"),
+                weights.linear_dtype(&key("c_proj.weight"))?,
+                Some(weights.require(&key("c_proj.bias"))?.clone()),
+            )?,
             norm_weight: weights.require(&key("norm.weight"))?.clone(),
             norm_bias: weights.require(&key("norm.bias"))?.clone(),
         })
@@ -115,14 +121,9 @@ impl StarVector8bAdapter {
                 features.dims()
             )));
         }
-        let features = features.to_dtype(self.fc_weight.dtype())?;
-        let hidden = silu(&__model_proof_output!(linear(
-            &features,
-            &self.fc_weight,
-            Some(&self.fc_bias)
-        ))?)?;
-        let hidden =
-            __model_proof_output!(linear(&hidden, &self.proj_weight, Some(&self.proj_bias)))?;
+        let features = features.to_dtype(self.input_dtype)?;
+        let hidden = silu(&__model_proof_output!(self.fc_weight.forward(&features))?)?;
+        let hidden = __model_proof_output!(self.proj_weight.forward(&hidden))?;
         let width = IMAGE_TOKENS * DECODER_HIDDEN;
         let flat = hidden.reshape((batch, width))?;
         let weight = self.norm_weight.reshape(width)?;
@@ -136,6 +137,7 @@ impl StarVector8bAdapter {
 }
 
 pub struct CandleStarVector8bProvider {
+    native_census: crate::primitives::ProjectionCensus,
     descriptor: TextLlmDescriptor,
     starvector: StarVectorDescriptor,
     model: StarVector8bModel,
@@ -201,6 +203,7 @@ impl CandleStarVector8bProvider {
             descriptor,
             starvector,
             model: StarVector8bModel::from_weights(&weights).map_err(to_core)?,
+            native_census: weights.native_census(),
             tokenizer,
             memory,
             speculative_default: crate::device::decode_defaults(&device).speculative,
@@ -348,6 +351,9 @@ impl CandleStarVector8bProvider {
 }
 
 impl TextLlm for CandleStarVector8bProvider {
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        self.native_census.checkpoint_report()
+    }
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
     }

@@ -361,31 +361,45 @@ impl AnimaComponents {
         // The DiT file carries both the Cosmos DiT and the bundled conditioner. Detect the root prefix
         // (`net` or `model.diffusion_model`), then build both from ONE VarBuilder.
         let prefix = detect_dit_prefix(&dit_path)?;
-        // A packed (Q4/Q8) DiT stores u32 codes + `.scales`, so a LoRA/LoKr has no dense `.weight` to
-        // fold into. When adapters are present on a packed tier we build the model from the mmap (the
-        // packed codes survive load) and install the adapters as **forward-time residuals** afterwards
-        // (`y = base(x) + scale·(xA)B`, sc-10640 / epic 10043). A dense tier keeps the weight-level fold,
-        // byte-for-byte unchanged, and the plain model has no adapters at all.
-        let packed_with_adapters =
-            !adapters.is_empty() && dit_path_quant_tier(&dit_path)?.is_some();
-        let dit_vb = if adapters.is_empty() || packed_with_adapters {
-            // Plain model, OR packed + adapters (residuals installed post-build): mmap the checkpoint
-            // directly — no fold, so the packed codes are never cast/materialized.
-            candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?
+        // Encoded checkpoints keep their base operators and install forward-time residuals.
+        // Dense weights retain the existing CPU coefficient fold.
+        let (dit_vb, packed_with_adapters) = if adapters.is_empty() {
+            (
+                candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?,
+                false,
+            )
         } else {
-            // Dense tier + adapters: fold every LoRA/LoKr delta into the base weights at the
-            // safetensors-key level (merge, don't residual — the DiT is chaos-sensitive), then build
-            // from the merged map. The 448 DiT + 60 conditioner targets both fold into
-            // `{prefix}.{path}.weight`; a target that fails to route hard-errors (no silent partial —
-            // sc-10274).
-            let mut base = load_dit_map(&dit_path)?;
-            let _report = apply_anima_adapters(&mut base, &prefix, adapters)?;
-            // Unify to the compute dtype + device (the fold ran in f32 on CPU) and build.
-            let merged: HashMap<String, Tensor> = base
-                .into_iter()
-                .map(|(k, v)| Ok((k, v.to_dtype(dtype)?.to_device(device)?)))
-                .collect::<Result<_>>()?;
-            VarBuilder::from_tensors(merged, dtype, device)
+            use candle_gen::loader::{mmap_safetensors, MappedWeights};
+            let mapped = MappedWeights::new(
+                mmap_safetensors(&dit_path)?,
+                std::slice::from_ref(&dit_path),
+                device,
+            )?;
+            match mapped {
+                MappedWeights::Checkpoint(source) => (
+                    VarBuilder::from_backend(Box::new(source), dtype, device.clone()),
+                    true,
+                ),
+                MappedWeights::Plain(plain) if dit_path_quant_tier(&dit_path)?.is_some() => (
+                    VarBuilder::from_backend(Box::new(plain), dtype, device.clone()),
+                    true,
+                ),
+                MappedWeights::Plain(_) => {
+                    // Dense tier + adapters: fold every LoRA/LoKr delta into the base weights at the
+                    // safetensors-key level (merge, don't residual — the DiT is chaos-sensitive), then build
+                    // from the merged map. The 448 DiT + 60 conditioner targets both fold into
+                    // `{prefix}.{path}.weight`; a target that fails to route hard-errors (no silent partial —
+                    // sc-10274).
+                    let mut base = load_dit_map(&dit_path)?;
+                    let _report = apply_anima_adapters(&mut base, &prefix, adapters)?;
+                    // Unify to the compute dtype + device (the fold ran in f32 on CPU) and build.
+                    let merged: HashMap<String, Tensor> = base
+                        .into_iter()
+                        .map(|(k, v)| Ok((k, v.to_dtype(dtype)?.to_device(device)?)))
+                        .collect::<Result<_>>()?;
+                    (VarBuilder::from_tensors(merged, dtype, device), false)
+                }
+            }
         };
         let mut dit = CosmosDiT::new(&dit_vb.pp(&prefix), DitConfig::anima())?;
         let mut conditioner = AnimaTextConditioner::new(

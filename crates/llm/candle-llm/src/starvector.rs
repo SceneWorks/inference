@@ -353,6 +353,7 @@ pub const REQUIRED_WEIGHT_KEYS: &[&str] = &[
 /// Registered native Candle provider for the exact local StarVector-1B snapshot.
 pub const PROVIDER_ID: &str = "candle-starvector-1b";
 pub struct CandleStarVectorProvider {
+    native_census: crate::primitives::ProjectionCensus,
     descriptor: core_llm::TextLlmDescriptor,
     svg: core_llm::StarVectorDescriptor,
     processor: StarVectorImageProcessor,
@@ -410,6 +411,7 @@ impl CandleStarVectorProvider {
             tokenizer,
             prompt,
             model: Mutex::new(StarVectorModel::from_weights(&weights).map_err(to_core)?),
+            native_census: weights.native_census(),
             speculative_default: crate::device::decode_defaults(&device).speculative,
             device,
         })
@@ -461,6 +463,9 @@ pub fn svg_descriptor() -> core_llm::StarVectorDescriptor {
     }
 }
 impl core_llm::TextLlm for CandleStarVectorProvider {
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        self.native_census.checkpoint_report()
+    }
     fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
         &self.descriptor
     }

@@ -53,6 +53,26 @@ pub struct DacDecoder {
 /// Load the `state_dict` section of the checkpoint, keeping only the decode-path tensors,
 /// with weight-norm pairs resolved to plain `weight`s in f32.
 fn load_decode_tensors(pth: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+    let path = candle_audio::weights::checkpoint_file(pth.to_owned());
+    let pth = path.as_path();
+    if path.extension().is_some_and(|ext| ext == "safetensors") {
+        let source = candle_audio::weights::AudioCheckpoint::open(pth, device)?;
+        let keys = source.names();
+        let prefix = if keys.iter().any(|k| k.starts_with("state_dict.decoder.")) {
+            "state_dict."
+        } else {
+            ""
+        };
+        let selected = source.coefficients(DType::F32, device, |key| {
+            key.strip_prefix(prefix)
+                .is_some_and(|n| n.starts_with("decoder.") || n.starts_with("post_quant_conv."))
+        })?;
+        let raw = selected
+            .into_iter()
+            .map(|(k, v)| (k[prefix.len()..].to_owned(), v))
+            .collect();
+        return Ok(resolve_weight_norm(raw)?);
+    }
     let tensors = PthTensors::new(pth, Some("state_dict"))
         .map_err(|e| AudioError::Msg(format!("open {}: {e}", pth.display())))?;
     let names: Vec<String> = tensors

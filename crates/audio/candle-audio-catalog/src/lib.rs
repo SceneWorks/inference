@@ -623,6 +623,56 @@ mod tests {
     /// row per provider. There is no composite any more: a provider's terms are derived from its
     /// components, so the thing that used to be asserted cannot drift and does not need asserting.
     #[test]
+    fn every_audio_provider_has_a_checkpoint_route() {
+        let registry = super::provider_registry().unwrap();
+        let actual: std::collections::BTreeSet<_> = super::registered_provider_ids(&registry)
+            .into_iter()
+            .chain(super::CRATE_API_PROVIDERS.iter().map(|s| s.to_string()))
+            .collect();
+        // The normalized state builder preserves Torch sections and weight-norm pairs.
+        let torch_and_safetensors = [
+            "kokoro_82m",
+            "openvoice_v2",
+            "clap_htsat_unfused",
+            "mmaudio_small_16k",
+            "mmaudio_large_44k",
+            "moss_ttsd_v05",
+        ];
+        // Common mmap-backed stock Linear and the provider-specific named/adapter constructors.
+        let safetensors = [
+            "acestep_v15_turbo",
+            "chatterbox_tts",
+            "chatterbox_ve",
+            "moss_sfx_v2",
+            "moss_tts_realtime",
+            "whisper_base",
+            "stable_audio_3_small_music",
+            "stable_audio_3_small_sfx",
+            "stable_audio_3_medium",
+            "stable_audio_3_small_music_base",
+            "stable_audio_3_small_sfx_base",
+            "stable_audio_3_medium_base",
+            "yue_en_cot",
+            "yue_en_icl",
+            "yue_zh_cot",
+            "yue_zh_icl",
+            "yue_jp_kr_cot",
+            "yue_jp_kr_icl",
+        ];
+        // YuE2's verified LM builder supports source-native matrices and dynamic FP8 AR; its
+        // published manifest authenticates the original bytes. SheetSage2's cover closure
+        // authenticates both exact F32 snapshots and the MERT parent hash before construction.
+        let pinned = ["yue2", "sheetsage2"];
+        let covered = torch_and_safetensors
+            .into_iter()
+            .chain(safetensors)
+            .chain(pinned)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(actual, covered);
+    }
+
+    #[test]
     fn every_shipped_provider_has_a_weight_license() {
         use std::collections::BTreeSet;
 

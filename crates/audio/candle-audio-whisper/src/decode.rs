@@ -31,6 +31,7 @@ pub struct DecodeOutput {
 /// token mask (which depends on the request's timestamp mode) is rebuilt each call.
 pub struct WhisperDecoder<'a> {
     model: &'a mut Whisper,
+    tied_head: Option<&'a candle_nn::Linear>,
     tokenizer: &'a Tokenizer,
     suppress_tokens: Tensor,
     sot_token: u32,
@@ -79,9 +80,23 @@ impl<'a> WhisperDecoder<'a> {
             no_timestamps_token,
             suppress_tokens,
             model,
+            tied_head: None,
             tokenizer,
             device,
         })
+    }
+
+    pub(crate) fn with_tied_head(mut self, head: Option<&'a candle_nn::Linear>) -> Self {
+        self.tied_head = head;
+        self
+    }
+
+    fn final_linear(&self, hidden: &Tensor) -> candle::Result<Tensor> {
+        use candle::Module;
+        match self.tied_head {
+            Some(head) => head.forward(hidden),
+            None => self.model.decoder.final_linear(hidden),
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -110,8 +125,6 @@ impl<'a> WhisperDecoder<'a> {
             .forward(&tokens, &audio_features, true)
             .map_err(AudioError::from)?;
         let logits = self
-            .model
-            .decoder
             .final_linear(&ys.i(..1).map_err(AudioError::from)?)
             .map_err(AudioError::from)?
             .i(0)
@@ -201,8 +214,6 @@ impl<'a> WhisperDecoder<'a> {
                 .map_err(AudioError::from)?;
             let (_, seq_len, _) = ys.dims3().map_err(AudioError::from)?;
             let logits = self
-                .model
-                .decoder
                 .final_linear(&ys.i((..1, seq_len - 1..)).map_err(AudioError::from)?)
                 .map_err(AudioError::from)?
                 .i(0)

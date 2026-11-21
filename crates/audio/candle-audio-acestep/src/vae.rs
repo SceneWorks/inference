@@ -262,14 +262,8 @@ fn read_prefixed_tensors(
     device: &Device,
     prefix: &str,
 ) -> Result<HashMap<String, Tensor>> {
-    let tensors = candle_audio::candle_core::safetensors::load(path, device)
-        .map_err(|e| AudioError::Msg(format!("load {}: {e}", path.display())))?;
-    let mut out = HashMap::new();
-    for (name, t) in tensors {
-        if name.starts_with(prefix) {
-            out.insert(name, t.to_dtype(DType::F32)?);
-        }
-    }
+    let source = candle_audio::weights::AudioCheckpoint::open(path, device)?;
+    let out = source.coefficients(DType::F32, device, |key| key.starts_with(prefix))?;
     if out.is_empty() {
         return Err(AudioError::Msg(format!(
             "{}: no {prefix}* tensors — not an ACE-Step Oobleck VAE checkpoint",
