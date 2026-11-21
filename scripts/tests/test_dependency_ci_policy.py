@@ -14,7 +14,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.y
 DENY = WORKFLOW.parents[2] / "deny.toml"
 METAL_CLIPPY = (
     "python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going "
-    "-p candle-llm -p candle-quant-kernels -p candle-layers -p 'candle-gen*' -p 'candle-audio*' "
+    "-p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p 'candle-gen*' -p 'candle-audio*' "
     "--all-targets --features metal -- -D warnings"
 )
 GOVERNANCE = "python3 scripts/ci/check_advisory_policy.py"

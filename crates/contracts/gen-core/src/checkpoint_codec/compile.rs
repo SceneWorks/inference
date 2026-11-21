@@ -1019,9 +1019,9 @@ pub fn compile_logical_weight_plan_with_metadata(
 
 /// Normalize layer-owned `.weight`/`_weight` and bare FP8 parameter spellings for the opted-in
 /// constructor mapping. Retain the metadata resolver's unique-prefix and whole-inventory checks.
-pub(super) fn resolve_projection_metadata_prefix(
+pub(super) fn resolve_projection_metadata_prefix<T>(
     by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
-    table: &BTreeMap<String, PartialComfyQuantDescriptor>,
+    table: &BTreeMap<String, T>,
 ) -> Result<String, LogicalWeightPlanError> {
     let mut names = BTreeSet::new();
     for (key, header) in by_name {
@@ -1059,7 +1059,7 @@ pub(super) fn resolve_projection_metadata_prefix(
             names.insert(weight);
         }
     }
-    resolve_metadata_prefix(&names.iter().map(|key| (key.as_str(), ())).collect(), table)
+    resolve_metadata_name_prefix(&names.iter().map(|key| (key.as_str(), ())).collect(), table)
 }
 
 /// Resolve the single state-dict prefix under which every `_quantization_metadata` layer name has a
@@ -1072,6 +1072,13 @@ pub(super) fn resolve_projection_metadata_prefix(
 pub fn resolve_metadata_prefix<T>(
     by_name: &BTreeMap<&str, T>,
     table: &BTreeMap<String, PartialComfyQuantDescriptor>,
+) -> Result<String, LogicalWeightPlanError> {
+    resolve_metadata_name_prefix(by_name, table)
+}
+
+fn resolve_metadata_name_prefix<T, U>(
+    by_name: &BTreeMap<&str, T>,
+    table: &BTreeMap<String, U>,
 ) -> Result<String, LogicalWeightPlanError> {
     let (first, _) = table
         .iter()

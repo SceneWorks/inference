@@ -52,6 +52,8 @@ use serde::Deserialize;
 /// [`W4A8Int8`]. It is distinct from `convrot-int8-native` (S4) and `int8-per-row-v1`: reporting
 /// either for these packed codebook codes would describe the wrong storage and weight arithmetic.
 pub const CODEC_ID: &str = "w4a8-int8-native";
+/// Authoritative publisher descriptor tag, distinct from the codec registry identifier.
+pub const FORMAT: &str = "asym_w4a8_int8";
 
 /// Maximum descriptor payload; checked before copying a descriptor off a device.
 pub const MAX_DESCRIPTOR_BYTES: usize = 4096;
@@ -142,7 +144,7 @@ impl W4A8Int8 {
         }
         let d: Descriptor =
             serde_json::from_slice(payload).map_err(|e| format!("W4A8 descriptor: {e}"))?;
-        if d.format != "asym_w4a8_int8" {
+        if d.format != FORMAT {
             return Err("expected format asym_w4a8_int8".into());
         }
         if d.group_size != GROUP_SIZE {

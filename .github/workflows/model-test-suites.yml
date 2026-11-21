@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - group: base
-            packages: '-p candle-llm -p candle-quant-kernels -p candle-layers -p candle-audio* -p runtime-cpu -p sceneworks-gen-cv'
+            packages: '-p candle-llm -p candle-quant-kernels -p candle-checkpoint -p candle-layers -p candle-audio* -p runtime-cpu -p sceneworks-gen-cv'
             targets: '--lib'
           - group: gen
             packages: '-p candle-gen*'

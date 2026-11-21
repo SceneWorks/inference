@@ -857,7 +857,10 @@ class RunGraph:
             # SW-7232/7234 add five file/header planning controls and the file-backed
             # OpenCLIP packed-source remap control. Constructors/readbacks retain source
             # bytes only; no learned projection or activation computation executes.
-            controls_sha = '8f3907d0c01d18a03179c54301c5dd758e167d30aed5d8ed0a2dbc5a2c7bc351'
+            # Include W4A8-owner delegation and Candle metadata-only owner construction
+            # controls; both inspect source storage and pre-load refusals without forwards.
+            # Exact bare-parameter declarations remain attached under component selection.
+            controls_sha = '3f1f56e054f33695e86090e9bd9b557a18d3b348b7e2c3fc30e68deb31f3b2cc'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

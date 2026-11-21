@@ -638,6 +638,24 @@ impl std::error::Error for QuantizationMetadataError {}
 pub fn parse_quantization_metadata(
     payload: &str,
 ) -> Result<BTreeMap<String, PartialComfyQuantDescriptor>, QuantizationMetadataError> {
+    let layers = quantization_metadata_layers(payload)?;
+    let mut table = BTreeMap::new();
+    for (layer, value) in layers {
+        let descriptor = partial_descriptor_from_json(&value).map_err(|defect| {
+            QuantizationMetadataError::Layer {
+                layer: layer.clone(),
+                defect,
+            }
+        })?;
+        table.insert(layer, descriptor);
+    }
+    Ok(table)
+}
+
+/// Validate the complete table namespace before a component selects its codec-owned entries.
+pub(crate) fn quantization_metadata_layers(
+    payload: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, QuantizationMetadataError> {
     let json: serde_json::Value =
         serde_json::from_str(payload).map_err(|error| QuantizationMetadataError::NotJson {
             detail: error.to_string(),
@@ -670,17 +688,7 @@ pub fn parse_quantization_metadata(
     if layers.is_empty() {
         return Err(QuantizationMetadataError::NoLayers);
     }
-    let mut table = BTreeMap::new();
-    for (layer, value) in layers {
-        let descriptor = partial_descriptor_from_json(value).map_err(|defect| {
-            QuantizationMetadataError::Layer {
-                layer: layer.clone(),
-                defect,
-            }
-        })?;
-        table.insert(layer.clone(), descriptor);
-    }
-    Ok(table)
+    Ok(layers.clone())
 }
 
 // =================================================================================================

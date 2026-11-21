@@ -351,27 +351,60 @@ impl ProjectionSourceHeaders {
         read_descriptors: impl FnOnce(&BTreeSet<&str>) -> crate::Result<BTreeMap<String, Vec<u8>>>,
     ) -> crate::Result<Option<Self>> {
         let by_name: BTreeMap<_, _> = source.values().map(|h| (h.name.as_str(), h)).collect();
+        let selected_base = |base: &str| {
+            selected(&format!("{base}.weight"))
+                || (source.contains_key(&format!("{base}_weight"))
+                    && selected(&format!("{base}_weight")))
+                || (source.contains_key(base) && selected(base))
+        };
+        let descriptor_names = source
+            .keys()
+            .filter(|name| name.ends_with(".comfy_quant"))
+            .map(String::as_str)
+            .collect();
+        // W4A8 has its own shared descriptor, geometry and operand validator. Its FP8
+        // relative scales are operands of that codec, not independent FP8 projections.
+        // Read bounded declarations once from the complete physical inventory: global
+        // metadata must resolve its full namespace before component selection.
+        let mut descriptors = read_descriptors(&descriptor_names)?;
+        let delegated: BTreeSet<String> = descriptors
+            .iter()
+            .filter_map(|(name, payload)| {
+                let json: serde_json::Value = serde_json::from_slice(payload).ok()?;
+                (json.get("format").and_then(|v| v.as_str()) == Some(crate::w4a8_int8::FORMAT))
+                    .then(|| name.strip_suffix(".comfy_quant").map(str::to_owned))
+                    .flatten()
+            })
+            .collect();
         let mut declarations = serde_json::Map::new();
         let mut bases = BTreeSet::new();
         for table in tables {
-            let entries = crate::comfy_quant::parse_quantization_metadata(table)
+            let layers: BTreeMap<_, _> = crate::comfy_quant::quantization_metadata_layers(table)
+                .map_err(|e| crate::Error::Msg(e.to_string()))?
+                .into_iter()
+                .collect();
+            let prefix = super::compile::resolve_projection_metadata_prefix(&by_name, &layers)
                 .map_err(|e| crate::Error::Msg(e.to_string()))?;
-            let prefix = super::compile::resolve_projection_metadata_prefix(&by_name, &entries)
-                .map_err(|e| crate::Error::Msg(e.to_string()))?;
-            let json: serde_json::Value =
-                serde_json::from_str(table).map_err(|e| crate::Error::Msg(e.to_string()))?;
-            for name in entries.keys() {
+            for (name, descriptor) in layers {
                 let base = format!("{prefix}{name}");
-                if selected(&format!("{base}.weight"))
-                    || (by_name.contains_key(format!("{base}_weight").as_str())
-                        && selected(&format!("{base}_weight")))
-                    || (by_name.contains_key(base.as_str()) && selected(&base))
-                {
+                if delegated.contains(&base) {
+                    if descriptor.get("format").and_then(|v| v.as_str())
+                        != Some(crate::w4a8_int8::FORMAT)
+                    {
+                        return Err(format!(
+                            "{base}: file metadata conflicts with its W4A8 descriptor"
+                        )
+                        .into());
+                    }
+                    continue;
+                }
+                crate::comfy_quant::partial_descriptor_from_json(&descriptor)
+                    .map_err(|e| crate::Error::Msg(format!("{base}: {e}")))?;
+                if selected_base(&base) {
                     bases.insert(base.clone());
-                    let descriptor = &json["layers"][name];
                     if declarations
                         .insert(base.clone(), descriptor.clone())
-                        .is_some_and(|old| old != *descriptor)
+                        .is_some_and(|old| old != descriptor)
                     {
                         return Err(format!(
                             "{base}: conflicting source declarations across shards"
@@ -391,11 +424,7 @@ impl ProjectionSourceHeaders {
                 bases.insert(h.name.clone());
             }
             if let Some(base) = h.name.strip_suffix(".comfy_quant") {
-                if selected(&format!("{base}.weight"))
-                    || (source.contains_key(&format!("{base}_weight"))
-                        && selected(&format!("{base}_weight")))
-                    || selected(&h.name)
-                {
+                if selected_base(base) || selected(&h.name) {
                     bases.insert(base.to_owned());
                 }
             }
@@ -409,6 +438,7 @@ impl ProjectionSourceHeaders {
                 }
             }
         }
+        bases.retain(|base| !delegated.contains(base));
         validate_projection_fields(&source, &bases, &selected)?;
         let mut headers: Vec<_> = source
             .into_values()
@@ -432,7 +462,7 @@ impl ProjectionSourceHeaders {
             .filter(|h| h.name.ends_with(".comfy_quant"))
             .map(|h| h.name.as_str())
             .collect();
-        let descriptors = read_descriptors(&names)?;
+        descriptors.retain(|name, _| names.contains(name.as_str()));
         let metadata = (!declarations.is_empty())
             .then(|| serde_json::json!({"layers":declarations}).to_string());
         Ok(Some(Self {
@@ -679,6 +709,198 @@ mod tests {
             plan_projection_sources(&[path], |_| true, &[], &registry, &SourceCodecResidency,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn delegated_w4a8_operands_remain_outside_the_fp8_projection_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mixed.safetensors");
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        let desc = br#"{"format":"asym_w4a8_int8","group_size":16,"convrot_groupsize":256}"#;
+        let desc_shape = [desc.len()];
+        let scale = 1.25f32.to_le_bytes();
+        for mixed in [false, true] {
+            let mut rows = vec![
+                ("model.dense.weight", "F32", &[1, 1][..], &[0; 4][..]),
+                ("model.legacy.weight", "I8", &[2, 128][..], &[0x11; 256][..]),
+                ("model.legacy.comfy_quant", "U8", &desc_shape, &desc[..]),
+                (
+                    "model.legacy.weight_s_rel",
+                    "F8_E4M3",
+                    &[2, 16][..],
+                    &[0x38; 32][..],
+                ),
+                (
+                    "model.legacy.weight_s_channel",
+                    "F32",
+                    &[2][..],
+                    &[0; 8][..],
+                ),
+                (
+                    "model.legacy.weight_codebook",
+                    "F32",
+                    &[16][..],
+                    &[0; 64][..],
+                ),
+            ];
+            if mixed {
+                rows.extend([
+                    (
+                        "model.modern.weight",
+                        "F8_E4M3",
+                        &[2, 2][..],
+                        &[0x38; 4][..],
+                    ),
+                    ("model.modern.weight_scale", "F32", &[][..], &scale[..]),
+                ]);
+            }
+            write(&path, &rows);
+            let legacy_entry = std::str::from_utf8(desc).unwrap();
+            let modern_entry = if mixed {
+                r#", "modern":{"format":"float8_e4m3fn"}"#
+            } else {
+                ""
+            };
+            let table = format!("{{\"layers\":{{\"legacy\":{legacy_entry}{modern_entry}}}}}");
+            for tables in [vec![], vec![table]] {
+                let plan = plan_projection_sources(
+                    std::slice::from_ref(&path),
+                    |_| true,
+                    &tables,
+                    &registry,
+                    &SourceCodecResidency,
+                )
+                .unwrap();
+                if mixed {
+                    let plan = plan.unwrap();
+                    assert_eq!(plan.tensors.len(), 1);
+                    assert_eq!(plan.tensors[0].physical_key, "model.modern.weight");
+                    assert!(plan.all_physical_keys().all(|key| !key.contains("legacy")));
+                } else {
+                    assert!(plan.is_none());
+                }
+                for key in ["model.modern.weight", "model.dense.weight"] {
+                    let selected = plan_projection_sources(
+                        std::slice::from_ref(&path),
+                        |name| name == key,
+                        &tables,
+                        &registry,
+                        &SourceCodecResidency,
+                    )
+                    .unwrap();
+                    assert_eq!(selected.is_some(), mixed && key == "model.modern.weight");
+                }
+                if mixed && !tables.is_empty() {
+                    // The legacy entry disambiguates the shared namespace even when it
+                    // belongs to a different codec and the caller selects only modern.
+                    let namespace = tmp.path().join("namespaces.safetensors");
+                    let mut names: Vec<_> = rows
+                        .iter()
+                        .map(|(name, dtype, shape, bytes)| {
+                            (
+                                name.replacen("model.", "model.good.", 1),
+                                *dtype,
+                                *shape,
+                                *bytes,
+                            )
+                        })
+                        .collect();
+                    names.push((
+                        "model.decoy.modern.weight".into(),
+                        "F8_E4M3",
+                        &[2, 2],
+                        &[0x38; 4],
+                    ));
+                    let view: Vec<_> = names
+                        .iter()
+                        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, *shape, *bytes))
+                        .collect();
+                    write(&namespace, &view);
+                    let plan = plan_projection_sources(
+                        std::slice::from_ref(&namespace),
+                        |name| name == "model.good.modern.weight",
+                        &tables,
+                        &registry,
+                        &SourceCodecResidency,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(plan.tensors[0].physical_key, "model.good.modern.weight");
+                    names.retain(|(name, ..)| name != "model.good.legacy.weight");
+                    let view: Vec<_> = names
+                        .iter()
+                        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, *shape, *bytes))
+                        .collect();
+                    write(&namespace, &view);
+                    assert!(plan_projection_sources(
+                        &[namespace],
+                        |name| name == "model.good.modern.weight",
+                        &tables,
+                        &registry,
+                        &SourceCodecResidency,
+                    )
+                    .is_err());
+                }
+            }
+            for key in ["model.dense.weight", "model.legacy.weight"] {
+                assert!(plan_projection_sources(
+                    std::slice::from_ref(&path),
+                    |name| name == key,
+                    &[r#"{"layers":{"legacy":{"format":"float8_e4m3fn"}}}"#.into()],
+                    &registry,
+                    &SourceCodecResidency,
+                )
+                .is_err());
+            }
+        }
+        // Delegation never suppresses invalid table envelopes or undelegated format tags.
+        for table in [
+            r#"{"format_version":2,"layers":{"legacy":{"format":"asym_w4a8_int8"}}}"#,
+            r#"{"layers":{}}"#,
+            r#"{"layers":{"missing":{"format":"asym_w4a8_int8"}}}"#,
+            r#"{"layers":{"modern":{"format":"unknown_codec"}}}"#,
+        ] {
+            assert!(plan_projection_sources(
+                std::slice::from_ref(&path),
+                |_| true,
+                &[table.into()],
+                &registry,
+                &SourceCodecResidency,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn bare_owner_selection_never_discards_its_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bare.safetensors");
+        let registry =
+            CheckpointCodecRegistry::new(BASELINE_CHECKPOINT_CODECS.iter().copied()).unwrap();
+        let key = "model.experts.gate";
+        let dk = "model.experts.gate.comfy_quant";
+        for desc in [
+            br#"{"format":"unknown_codec"}"#.as_slice(),
+            b"{",
+            br#"{"format":"float8_e4m3fn","unknown_field":true}"#,
+        ] {
+            write(
+                &path,
+                &[
+                    (key, "F8_E4M3", &[2, 2], &[0x38; 4]),
+                    (dk, "U8", &[desc.len()], desc),
+                ],
+            );
+            let input =
+                ProjectionSourceHeaders::read(std::slice::from_ref(&path), |name| name == key, &[])
+                    .unwrap()
+                    .unwrap();
+            assert!(input.descriptors.contains_key(dk));
+            assert!(input
+                .compile(&ConstructorMapping, &registry, &SourceCodecResidency)
+                .is_err());
+        }
     }
 
     #[test]
